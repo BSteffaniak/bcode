@@ -9569,6 +9569,16 @@ fn load_config_from_paths_with_overrides_and_environment(
     overrides: &ConfigLoadOverrides,
     environment: &impl ConfigEnvironment,
 ) -> Result<BcodeConfig, ConfigError> {
+    load_config_reporting_startup_fallback(paths, overrides, environment).map(|(config, _)| config)
+}
+
+/// Load like `load_config_from_paths_with_overrides_and_environment`, also returning the
+/// remembered startup selection when it supplied the model fallback.
+fn load_config_reporting_startup_fallback(
+    paths: &[PathBuf],
+    overrides: &ConfigLoadOverrides,
+    environment: &impl ConfigEnvironment,
+) -> Result<(BcodeConfig, Option<startup::StartupSelection>), ConfigError> {
     let result = (|| {
         let raw = merged_raw_config_value_with_overrides(paths, overrides)?;
         let (mut resolved, _resolution) = resolve_composed_config_value(&raw)?;
@@ -9576,12 +9586,15 @@ fn load_config_from_paths_with_overrides_and_environment(
         let mut config = validate_config_value(resolved, "composed config")?;
         // Optional domain damage does not block core startup. Onboarding inspects the typed
         // startup::load API and must obtain explicit repair before replacing invalid bytes.
-        if let Ok(Some(selection)) =
-            startup::load_from(&startup::path_with_environment(environment))
-        {
-            let _ = startup::apply_fallback(&mut config, &selection, environment);
-        }
-        Ok(config)
+        let applied = match startup::load_from(&startup::path_with_environment(environment)) {
+            Ok(Some(selection))
+                if startup::apply_fallback(&mut config, &selection, environment) =>
+            {
+                Some(selection)
+            }
+            _ => None,
+        };
+        Ok((config, applied))
     })();
     if overrides.exclusive_config_path.is_some() {
         // Parser and schema errors can contain credential values or source excerpts.

@@ -41,6 +41,21 @@ pub struct ConfigRecoverySources {
     pub model_profile: Option<String>,
     /// Any other inline, request-only, or dynamic configuration was applied.
     pub inline_overrides: bool,
+    /// Remembered startup state that supplied the model fallback at load time, retained by
+    /// value. This is state, not configuration: it is never a read source, grants no file
+    /// authority, and applies during replay only where declarative layers select no model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_selection: Option<crate::startup::StartupSelection>,
+}
+
+impl ConfigRecoverySources {
+    /// The file and selector provenance that read authority pins, without remembered state.
+    fn read_provenance(&self) -> Self {
+        Self {
+            startup_selection: None,
+            ..self.clone()
+        }
+    }
 }
 
 /// Retained authority for the daemon's exact startup loader sources.
@@ -148,7 +163,10 @@ impl ConfigSourceAuthority {
         config: &BcodeConfig,
         sources: &ConfigRecoverySources,
     ) -> Result<ConfigRecoveryReference, ConfigRecoveryError> {
-        if sources != &self.sources {
+        // A client's remembered startup choice may differ from the daemon's (re-run
+        // onboarding). It is only as strong as writing the user's own state file, so it is
+        // replayed by value rather than pinned.
+        if sources.read_provenance() != self.sources.read_provenance() {
             return Err(ConfigRecoveryError::Changed);
         }
         if sources
@@ -200,7 +218,7 @@ impl ConfigSourceAuthority {
         config: &BcodeConfig,
         sources: &ConfigRecoverySources,
     ) -> Result<(), ConfigRecoveryError> {
-        if sources == &self.sources {
+        if sources.read_provenance() == self.sources.read_provenance() {
             return self.verify(config, sources).map(|_| ());
         }
         if !self.read_only || !sources.cwd.is_absolute() || !sources.cwd.is_dir() {
@@ -743,8 +761,21 @@ fn resolve_replayed_config(
         .map_err(|_| ConfigRecoveryError::InvalidSource)?;
     crate::contexts::apply_profile_override(&mut resolved, &overrides)
         .map_err(|_| ConfigRecoveryError::InvalidSource)?;
-    crate::validate_config_value(resolved, "recovery")
-        .map_err(|_| ConfigRecoveryError::InvalidSource)
+    let mut config = crate::validate_config_value(resolved, "recovery")
+        .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    if let Some(selection) = &sources.startup_selection {
+        // Recorded only when no environment override declined the fallback, so replay needs
+        // no ambient environment or state-directory read. Declarative layers still win.
+        let environment = crate::ConfigEnvironmentSnapshot::new(
+            std::collections::BTreeMap::new(),
+            sources.cwd.clone(),
+        );
+        let _ = crate::startup::apply_fallback(&mut config, selection, &environment);
+        // Like transported configuration, replay carries no request-local provenance that
+        // would make provider authentication consult the current, possibly changed, state.
+        config.startup_selection_applied = false;
+    }
+    Ok(config)
 }
 
 /// Load current configuration and retain provenance in the same operation.
@@ -780,12 +811,10 @@ pub fn load_config_with_recovery_context(
 ) -> Result<(BcodeConfig, crate::ConfigLaunchContext), crate::ConfigError> {
     let cwd = environment.current_dir();
     let paths = crate::default_config_paths_with_environment(environment);
-    let sources = sources_from_overrides(&cwd, &paths, overrides);
-    let config = crate::load_config_from_paths_with_overrides_and_environment(
-        &paths,
-        overrides,
-        environment,
-    )?;
+    let mut sources = sources_from_overrides(&cwd, &paths, overrides);
+    let (config, startup_selection) =
+        crate::load_config_reporting_startup_fallback(&paths, overrides, environment)?;
+    sources.startup_selection = startup_selection;
     let launch = crate::ConfigLaunchContext {
         config_files: sources
             .exclusive_config_path
@@ -1088,6 +1117,81 @@ mod tests {
                 Err(ConfigRecoveryError::Changed)
             );
         }
+    }
+
+    fn remembered(model_id: &str) -> crate::startup::StartupSelection {
+        crate::startup::StartupSelection {
+            provider_plugin_id: "example.provider".into(),
+            model_id: model_id.into(),
+            base_url: None,
+            dialect: None,
+            auth_mode: None,
+            catalog_provider_id: None,
+            auth_profile: None,
+            environment_variable: None,
+            environment_auth_provider: None,
+            environment_method: None,
+            environment_credential: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn remembered_startup_state_replays_by_value_and_declarative_config_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let environment = crate::ConfigEnvironmentSnapshot::isolated(dir.path());
+        let state = crate::startup::path_with_environment(&environment);
+        let overrides = ConfigLoadOverrides::default();
+        let load = || load_config_with_recovery_context(&environment, &overrides).unwrap();
+        let declared = crate::default_config_paths_with_environment(&environment)[0].clone();
+        std::fs::create_dir_all(declared.parent().unwrap()).unwrap();
+        std::fs::write(&declared, "").unwrap();
+        crate::startup::save_to(&state, &remembered("first")).unwrap();
+
+        let (config, launch) = load();
+        let sources = launch.recovery_sources.unwrap();
+        assert_eq!(config.model.model_id.as_deref(), Some("first"));
+        assert_eq!(sources.startup_selection, Some(remembered("first")));
+        let authority = ConfigSourceAuthority::capture_read_only(&sources).unwrap();
+        let roots = [dir.path().to_owned()];
+        let reference = capture(&config, &sources, &roots).unwrap();
+
+        // Re-running onboarding changes state for new clients, never existing references,
+        // and replay does not read the state directory.
+        crate::startup::save_to(&state, &remembered("second")).unwrap();
+        let (rechosen, relaunch) = load();
+        let resources = relaunch.recovery_sources.unwrap();
+        assert!(authority.verify_workspace(&rechosen, &resources).is_ok());
+        assert!(authority.verify(&config, &resources).is_err());
+        std::fs::remove_file(&state).unwrap();
+        assert!(authority.verify(&config, &sources).is_ok());
+        let recovered = resolve(&reference, &roots).unwrap();
+        assert_eq!(recovered.model.model_id.as_deref(), Some("first"));
+        assert!(!recovered.startup_selection_applied);
+
+        // A declarative model, such as a rebuilt read-only Nix layer, wins over state.
+        std::fs::write(
+            &declared,
+            "[model]\nprovider_plugin_id = 'declared.provider'\nmodel_id = 'declared'\n",
+        )
+        .unwrap();
+        let (declarative, _) = load();
+        assert_eq!(declarative.model.model_id.as_deref(), Some("declared"));
+        assert!(authority.verify(&declarative, &sources).is_ok());
+    }
+
+    #[test]
+    fn startup_state_declined_by_environment_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut environment = crate::ConfigEnvironmentSnapshot::isolated(dir.path());
+        let state = crate::startup::path_with_environment(&environment);
+        crate::startup::save_to(&state, &remembered("first")).unwrap();
+        environment.set_var("BCODE_PROVIDER", "other.provider");
+        let (config, launch) =
+            load_config_with_recovery_context(&environment, &ConfigLoadOverrides::default())
+                .unwrap();
+        assert!(!config.startup_selection_applied);
+        assert_eq!(launch.recovery_sources.unwrap().startup_selection, None);
     }
 
     #[test]

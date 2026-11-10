@@ -910,8 +910,15 @@ mod tests {
             ..Default::default()
         };
         let roots = vec![temp.path().to_owned()];
+        // Isolated state: a remembered startup choice on the host must not leak in.
+        let environment = crate::ConfigEnvironmentSnapshot::isolated(temp.path());
         let plan = || {
-            let effective = crate::load_config_from_paths(&discovered).unwrap();
+            let effective = crate::load_config_from_paths_with_overrides_and_environment(
+                &discovered,
+                &crate::ConfigLoadOverrides::default(),
+                &environment,
+            )
+            .unwrap();
             let reference =
                 crate::recovery::capture_with_sources(&effective, &sources, &roots).unwrap();
             plan_execution_preference_with_policy(&effective, &reference, &roots, None)
