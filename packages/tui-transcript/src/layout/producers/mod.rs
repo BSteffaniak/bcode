@@ -179,6 +179,8 @@ pub enum ProducerKind {
     Permission,
     /// Interactive request.
     Interaction,
+    /// Process-local row: a pending submission or a notice (LR5).
+    Local,
 }
 
 /// Which producer renders `unit` under `cx`.
@@ -188,6 +190,7 @@ pub fn producer_kind(unit: UnitView<'_>, cx: &ItemRenderContext<'_>) -> Producer
         UnitKind::Boundary(_) => return ProducerKind::Boundary,
         UnitKind::GroupHeader { .. } => return ProducerKind::GroupHeader,
         UnitKind::HiddenMarker { .. } => return ProducerKind::HiddenMarker,
+        UnitKind::Local => return ProducerKind::Local,
         UnitKind::Item => {}
     }
     let Some(item) = unit.item else {
@@ -302,6 +305,7 @@ impl ProducerRegistry {
                 ProducerKind::PluginVisual,
                 Box::new(visual::PluginVisualProducer),
             )
+            .with(ProducerKind::Local, Box::new(message::LocalRowProducer))
     }
 
     /// Return the registry with `producer` handling `kind`.

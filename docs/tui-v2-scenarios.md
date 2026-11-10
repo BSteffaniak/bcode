@@ -31,6 +31,10 @@ required by [`tui-v2-architecture.md`](tui-v2-architecture.md), not what V1 curr
     inspector, make-default, detail cycling, bulk disclosure, Markdown visuals, inline
     interactions and inline shell expansion. See "Frame pipeline and tooling scenarios
     (phase 6)" below.
+  * `local_rows.rs` holds the process-local row scenarios (LR1–LR7): pending submissions,
+    rejection notices, draft slash-command output and the draft-to-attached transition. See
+    "Local row scenarios" below. `shell.rs` answers submissions and builtin slash commands for
+    the application drivers (`resolve_submission`, `complete_slash_command`).
   * `startup.rs` checks engine selection at startup through the root model (X7, X8) and that
     both engines attach to the same scripted session.
 * Commands:
@@ -187,7 +191,7 @@ Notes:
 | `c5_reflow_round_trip_does_not_drift` | C5 | pass | pass | — |
 | `c6_rows_inserted_above_do_not_consume_tail_space` | C6 | pass | pass | — |
 | `c7_wheel_up_inside_tail_space_keeps_tail_space` | C7, T12 | pass | pass | — |
-| `c8_staged_submission_does_not_move_view` | C8, N9 | fail-ignored | pass | Pressing Enter while following moves the view to the transcript top ("69 rows from bottom") before acceptance. Root cause not diagnosed. |
+| `c8_staged_submission_does_not_move_view` | C8, N9, LR7 | pass | pass | Submits while reading older content (LR7 correction: while following, the pending row is tail content; see `lr7_…`, where V1's C8 deviation, a jump to the transcript top while following, is recorded). |
 | `c8_accepted_submission_reveals_message_at_top` | C8, T2 | fail-ignored | pass | Follows from the staged jump: after acceptance, the view stays at the transcript top with a motion running, and the accepted message is not visible. |
 | `c8_cleared_local_command_submission_does_not_anchor` | C8, N9 | pass | pass | — |
 | `c9_tool_activity_after_submission_resumes_following` | C9, T4 | fail-ignored | pass | Depends on the accepted-submission reveal (see `c8_accepted_…`). |
@@ -517,6 +521,22 @@ time so real time spent running a test never changes an outcome:
   never forces a structural preparation.
 
 All V1 deviations recorded above still fail with this time model.
+
+## Local row scenarios
+
+Defined in `local_rows.rs`; instantiated as `v1_local_rows` and `v2_local_rows`. Rows are
+found by visible text (`You · sending`, the prompt, notice text). `ResidentSeed::Draft` starts
+without a session (`ChatSessionAttachment::Draft`); `SubmissionOutcome::Accepted` answers the
+submit effect as the daemon does when it creates the session, whose events then arrive live
+and, on V2, through the attach `Tail` window.
+
+| Scenario | Covers | V1 | V2 | V1 observation |
+|---|---|---|---|---|
+| `lr1_staged_submission_shows_pending_row` | LR1, LR2 | pass | pass | — |
+| `lr7_staged_submission_while_following_stays_on_latest_bottom` | LR7, C8 | fail-ignored | pass | V1 moves the view to the transcript top on Enter (the C8 deviation), so the pending row is not shown. |
+| `lr4_rejected_submission_notice_is_visible` | LR4, LR2 | pass | pass | — |
+| `lr1_slash_command_output_is_visible` | LR1 | pass | pass | — |
+| `lr4_draft_submission_attaches_and_streams_reply` | LR4, T2 | pass | pass | — (V2 before LR4's handoff: the submission vanished while the created session's tail window loaded. The scenario daemon answers with the production result shape — the submission record and the model receipt, with the acceptance and activation events persisted in the session — and every frame from the result to the attach is checked, because the record makes the shell forget the submission at result time.) |
 
 ## Adding a scenario
 

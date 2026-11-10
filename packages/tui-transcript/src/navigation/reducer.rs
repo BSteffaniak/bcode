@@ -822,7 +822,7 @@ impl Reducer<'_, '_, '_> {
                 .collect(),
         };
         for key in region {
-            if !key.is_boundary() && self.view.is_visible(&key) {
+            if !key.is_boundary() && !key.is_local() && self.view.is_visible(&key) {
                 admitted.insert(key);
             }
         }
@@ -836,7 +836,7 @@ impl Reducer<'_, '_, '_> {
             .admitted
             .retain(|key| view.index.contains_key(key));
         for key in view.unit_keys() {
-            if !key.is_boundary() && view.is_visible(key) {
+            if !key.is_boundary() && !key.is_local() && view.is_visible(key) {
                 self.state.admitted.insert(key.clone());
             }
         }

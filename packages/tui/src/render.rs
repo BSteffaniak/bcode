@@ -5930,7 +5930,7 @@ fn spans_width(spans: &[Span]) -> usize {
         .sum()
 }
 
-fn pending_label(state: PendingSubmissionState) -> String {
+pub fn pending_label(state: PendingSubmissionState) -> String {
     match state {
         PendingSubmissionState::Sending => "sending".to_owned(),
         PendingSubmissionState::Sent => "sent".to_owned(),

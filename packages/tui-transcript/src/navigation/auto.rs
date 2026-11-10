@@ -143,9 +143,13 @@ struct Context<'s, 'v, 'a> {
 }
 
 impl<'v> Context<'_, 'v, '_> {
-    /// Resident, visible, not a boundary and not admitted before this input.
+    /// Resident, visible, neither a boundary nor a local row (LR6) and not admitted before
+    /// this input.
     fn is_candidate(&self, key: &UnitKey) -> bool {
-        !key.is_boundary() && !self.state.admitted.contains(key) && self.view.is_visible(key)
+        !key.is_boundary()
+            && !key.is_local()
+            && !self.state.admitted.contains(key)
+            && self.view.is_visible(key)
     }
 
     fn is_assistant(&self, key: &UnitKey) -> bool {
@@ -218,7 +222,9 @@ fn queued_reveal(cx: &Context<'_, '_, '_>, plan: &mut Plan) {
 }
 
 /// Candidates after the last admitted unit, in document order with their positions. The scan
-/// walks back from the newest unit and stops at the first admitted one.
+/// walks back from the newest unit and stops at the first admitted one; local rows are never
+/// admitted and never stop it (LR6), so canonical units arriving before a pending submission
+/// row are still arrivals.
 fn arrivals<'v>(cx: &Context<'_, 'v, '_>, plan: &Plan) -> Vec<(usize, &'v UnitKey)> {
     let mut arrivals = Vec::new();
     let mut position = cx.view.index.len();
@@ -227,6 +233,9 @@ fn arrivals<'v>(cx: &Context<'_, 'v, '_>, plan: &Plan) -> Vec<(usize, &'v UnitKe
         let Some(key) = cx.key_at(position) else {
             break;
         };
+        if key.is_local() {
+            continue;
+        }
         if cx.state.admitted.contains(key) {
             break;
         }

@@ -40,7 +40,7 @@ use super::driver::{
     DamageObservation, HistoryRequest, HistoryResponse, LayoutWork, PageLimits,
     PendingHistoryRequest, RepaintObservation, RequestId, ResidentSeed, ScenarioEngine,
     ScenarioInput, ScenarioIntent, ScenarioScrollbar, ScenarioSetting, ScenarioSetup,
-    TranscriptScenarioDriver, WheelDirection, WindowWork,
+    SubmissionOutcome, TranscriptScenarioDriver, WheelDirection, WindowWork,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
 use crate::effects::{TuiEffect, TuiEffectResult};
@@ -84,6 +84,8 @@ pub struct V2Driver {
     /// First and newest canonical sequences of the session (setup plus live deliveries): the
     /// daemon double answers the host's single-event session-bound probes from them.
     session_bounds: Option<(u64, u64)>,
+    /// Submissions and slash commands awaiting the scenario's answer.
+    shell: super::shell::ShellEffects,
 }
 
 impl V2Driver {
@@ -117,7 +119,8 @@ impl V2Driver {
         self.update(RuntimeEvent::Timer(TimerId::new(TRANSCRIPT_V2_TIMER)));
     }
 
-    /// Keep V2 history loads as pending requests; drop work that needs a daemon. A new load
+    /// Keep V2 history loads as pending requests and the newest submission and slash command
+    /// for the scenario to answer; drop work that needs a daemon. A new load
     /// replaces the pending load of its lane, as the effect queue does. Per-tool default rules
     /// (make-default, `m`) are persisted to a user-state double, which succeeds and stores
     /// them, and the result is delivered as the persistence effect's result (A3).
@@ -129,6 +132,8 @@ impl V2Driver {
                     .retain(|(_, pending)| pending.lane() != load.lane());
                 self.next_request += 1;
                 self.pending.push((RequestId(self.next_request), load));
+            } else {
+                self.shell.observe(effect);
             }
         }
         if let Some(rules) = self.model.chat.app.take_pending_default_rules() {
@@ -157,9 +162,13 @@ impl V2Driver {
         )));
     }
 
-    /// Answer the attach `Tail` window with the setup's resident window.
+    /// Answer the attach `Tail` window with the setup's resident window. A draft attaches
+    /// nothing.
     fn seed(&mut self, setup: &ScenarioSetup) {
         self.sync();
+        if setup.resident == ResidentSeed::Draft {
+            return;
+        }
         let position = self
             .pending
             .iter()
@@ -173,6 +182,7 @@ impl V2Driver {
         let resident = match setup.resident {
             ResidentSeed::Latest { events: count } => setup.session.latest(count),
             ResidentSeed::Everything => events,
+            ResidentSeed::Draft => &[],
         };
         let loaded = execute(
             load,
@@ -453,6 +463,7 @@ impl TranscriptScenarioDriver for V2Driver {
                 .first()
                 .zip(setup.session.events().last())
                 .map(|(first, last)| (first.sequence, last.sequence)),
+            shell: super::shell::ShellEffects::default(),
         };
         driver.seed(setup);
         driver
@@ -683,6 +694,24 @@ impl TranscriptScenarioDriver for V2Driver {
 
     fn last_repaint(&self) -> Option<RepaintObservation> {
         self.last_repaint
+    }
+
+    fn resolve_submission(
+        &mut self,
+        outcome: &SubmissionOutcome,
+        session: &mut super::session::ScenarioSession,
+    ) {
+        let result = self.shell.submission_result(session, outcome);
+        self.update(RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
+            Box::new(result),
+        )));
+    }
+
+    fn complete_slash_command(&mut self) {
+        let result = self.shell.slash_result();
+        self.update(RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
+            Box::new(result),
+        )));
     }
 
     fn last_damage(&self) -> Option<DamageObservation> {

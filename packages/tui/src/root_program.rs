@@ -4407,10 +4407,20 @@ impl BcodeRuntimeModel {
         let own_submission = match update {
             super::history_flow::SessionStreamUpdate::Event(event) => match event.as_ref() {
                 bcode_ipc::Event::Session(event) => match &event.kind {
-                    bcode_session_models::SessionEventKind::UserMessage { text, .. } => self
-                        .chat
-                        .app
-                        .accepts_own_pending_submission(event.sequence, text),
+                    bcode_session_models::SessionEventKind::UserMessage { text, .. } => {
+                        if Some(event.session_id) == host.session()
+                            && let Some(pending) = self
+                                .chat
+                                .app
+                                .pending_submission_accepted_by(event.sequence, text)
+                        {
+                            // LR4: its row stays until the engine shows the message.
+                            host.hand_off_submission(pending, event.sequence);
+                        }
+                        self.chat
+                            .app
+                            .accepts_own_pending_submission(event.sequence, text)
+                    }
                     _ => false,
                 },
                 _ => false,
@@ -4468,6 +4478,8 @@ impl BcodeRuntimeModel {
         );
         host.sync_session(self.chat.attached_session_id(), now);
         let _ = host.sync_render_inputs(&mut self.chat.app, now);
+        // Pending submissions and process-local notices are V2 local rows (LR1–LR7).
+        host.sync_local_rows(&self.chat.app, now);
         // Transcript tooling reports through the host shell: status notices, and per-tool
         // defaults persisted to user state through the shell's effect (A3).
         let notice = host.take_notice().map(|notice| {

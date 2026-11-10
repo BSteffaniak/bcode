@@ -16,7 +16,7 @@ use bmux_tui_runtime::{Presenter as _, Program as _, RuntimeEvent};
 use super::driver::{
     HistoryRequest, HistoryResponse, PageLimits, PendingHistoryRequest, RepaintObservation,
     RequestId, ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent, ScenarioSetting,
-    ScenarioSetup, TranscriptScenarioDriver, WheelDirection,
+    ScenarioSetup, SubmissionOutcome, TranscriptScenarioDriver, WheelDirection,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
 use crate::effects::{TuiEffect, TuiEffectResult};
@@ -122,22 +122,35 @@ pub(super) fn scenario_model(
     setup: &ScenarioSetup,
     engine: bcode_config::TuiEngine,
 ) -> BcodeRuntimeModel {
+    let draft = setup.resident == ResidentSeed::Draft;
     let session_id = setup.session.id();
     let events = setup.session.events();
     let resident = match setup.resident {
         ResidentSeed::Latest { events: count } => setup.session.latest(count),
         ResidentSeed::Everything => events,
+        ResidentSeed::Draft => &[],
     };
     let has_older = resident.len() < events.len();
     let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
-    let mut app = crate::app::BmuxApp::new_with_history(Some(session_id), resident, &[], has_older);
+    let mut app = crate::app::BmuxApp::new_with_history(
+        (!draft).then_some(session_id),
+        resident,
+        &[],
+        has_older,
+    );
     // Same bounded latest-window install session attach performs.
-    app.replace_latest_transcript_window(resident, has_older);
+    if !draft {
+        app.replace_latest_transcript_window(resident, has_older);
+    }
     app.freeze_transcript_scroll_animation_for_test();
     let chat = crate::session_flow::ActiveChat {
         app,
         agents: crate::session_flow::AgentCatalog::default(),
-        attachment: crate::session_flow::ChatSessionAttachment::Attached { session_id },
+        attachment: if draft {
+            crate::session_flow::ChatSessionAttachment::Draft
+        } else {
+            crate::session_flow::ChatSessionAttachment::Attached { session_id }
+        },
         event_sender,
         event_receiver,
         event_task: None,
@@ -178,6 +191,8 @@ pub struct V1Driver {
     elapsed: Duration,
     /// Repaint scope reported by the last presentation.
     last_repaint: Option<RepaintObservation>,
+    /// Submissions and slash commands awaiting the scenario's answer.
+    shell: super::shell::ShellEffects,
 }
 
 impl V1Driver {
@@ -226,7 +241,8 @@ impl V1Driver {
         self.update(RuntimeEvent::Terminal(event));
     }
 
-    /// Keep history loads as pending requests; drop work that needs a daemon.
+    /// Keep history loads as pending requests and the newest submission and slash command for
+    /// the scenario to answer; drop work that needs a daemon.
     fn collect_effects(&mut self) {
         let (scheduled, _notes) = self.model.chat.pending_effects.drain_runtime();
         for (_schedule, effect) in scheduled {
@@ -238,8 +254,16 @@ impl V1Driver {
             ) {
                 self.next_request += 1;
                 self.pending.push((RequestId(self.next_request), effect));
+            } else {
+                self.shell.observe(effect);
             }
         }
+    }
+
+    fn complete_effect(&mut self, result: TuiEffectResult) {
+        self.update(RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
+            Box::new(result),
+        )));
     }
 
     /// Install synchronously what the production loop installs from background projection
@@ -310,6 +334,7 @@ impl TranscriptScenarioDriver for V1Driver {
             clock_origin: Instant::now(),
             elapsed: Duration::ZERO,
             last_repaint: None,
+            shell: super::shell::ShellEffects::default(),
         };
         install_scenario_clipboard(&mut driver.model);
         driver.collect_effects();
@@ -614,6 +639,20 @@ impl TranscriptScenarioDriver for V1Driver {
 
     fn last_repaint(&self) -> Option<RepaintObservation> {
         self.last_repaint
+    }
+
+    fn resolve_submission(
+        &mut self,
+        outcome: &SubmissionOutcome,
+        session: &mut super::session::ScenarioSession,
+    ) {
+        let result = self.shell.submission_result(session, outcome);
+        self.complete_effect(result);
+    }
+
+    fn complete_slash_command(&mut self) {
+        let result = self.shell.slash_result();
+        self.complete_effect(result);
     }
 
     fn focused_extent(&self) -> Option<std::ops::Range<i64>> {

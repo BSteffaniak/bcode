@@ -1211,6 +1211,14 @@ impl TranscriptEngine {
             self.window.summary().mode,
             &self.structure,
         );
+        self.splice_units(&unit_changes);
+        unit_changes
+    }
+
+    /// Apply derived unit changes to the layout cache and the measured index with exact
+    /// heights (L1, W3).
+    fn splice_units(&mut self, unit_changes: &UnitChanges) {
+        let items = transcript_items(&self.session);
         if unit_changes.is_structural() {
             let units = &self.units;
             self.layouts.retain(|key| units.contains(key));
@@ -1227,14 +1235,13 @@ impl TranscriptEngine {
         let mut measure = |key: &UnitKey| inputs.measure(layouts, key, width);
         if self
             .viewport
-            .apply_unit_changes(&unit_changes, &self.units, width, &mut measure)
+            .apply_unit_changes(unit_changes, &self.units, width, &mut measure)
             .is_err()
         {
             // D3: an inconsistent index is rebuilt in full.
             let rebuilt = self.viewport.rebuild(&self.units, width, &mut measure);
             debug_assert!(rebuilt.is_ok(), "derived units never repeat a key");
         }
-        unit_changes
     }
 
     /// Re-measure every resident unit at the current width and render configuration (L9).
@@ -1300,6 +1307,7 @@ fn transcript_items(session: &SessionView) -> &[TranscriptViewItem] {
 }
 
 mod interaction;
+mod local;
 mod selection;
 
 mod tools;
@@ -1308,6 +1316,8 @@ pub use tools::{DefaultRuleRefusal, DetailCycle, InlineInteractionPlacement};
 pub use interaction::VisibleHitRegion;
 mod submission;
 
+#[cfg(test)]
+mod local_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

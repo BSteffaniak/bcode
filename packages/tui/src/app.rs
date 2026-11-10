@@ -4011,6 +4011,13 @@ impl BmuxApp {
         self.transcript.items()
     }
 
+    /// Process-local notices in presentation order, each with the canonical entry it follows.
+    pub fn ephemeral_notices(
+        &self,
+    ) -> impl Iterator<Item = super::transcript_document::EphemeralEntryView<'_>> + '_ {
+        self.transcript.ephemeral_entries()
+    }
+
     /// Return whether one invocation has reached authoritative terminal state.
     #[must_use]
     pub fn tool_invocation_is_terminal(&self, invocation_id: &str) -> bool {
@@ -6889,6 +6896,21 @@ impl BmuxApp {
     fn committed_user_message_text(&self, sequence: u64, text: &str) -> String {
         self.shared_terminal_text_for_sequence(sequence, "You")
             .unwrap_or_else(|| text.to_owned())
+    }
+
+    /// The pending submission the committed user message at `sequence` accepts, if any. Asked
+    /// before the message is applied, because applying it forgets the pending submission.
+    #[must_use]
+    pub fn pending_submission_accepted_by(
+        &self,
+        sequence: u64,
+        text: &str,
+    ) -> Option<&PendingSubmission> {
+        let text = self.committed_user_message_text(sequence, text);
+        self.pending_submissions
+            .items()
+            .iter()
+            .find(|pending| pending.text() == text)
     }
 
     /// Whether the committed user message at `sequence` accepts one of this client's pending

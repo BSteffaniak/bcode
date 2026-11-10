@@ -12,11 +12,13 @@
 pub mod driver;
 pub mod frame;
 pub mod interaction;
+pub mod local_rows;
 pub mod navigation;
 pub mod paging;
 pub mod pipeline;
 pub mod scenarios;
 pub mod session;
+pub mod shell;
 pub mod startup;
 pub mod v1;
 pub mod v2;
@@ -221,6 +223,16 @@ impl<D: TranscriptScenarioDriver> Scenario<D> {
         self.driver.window_work()
     }
 
+    /// Answer the newest message submission as the daemon would, without presenting.
+    pub fn resolve_submission(&mut self, outcome: &driver::SubmissionOutcome) {
+        self.driver.resolve_submission(outcome, &mut self.session);
+    }
+
+    /// Run the newest (builtin) slash command and deliver its result, without presenting.
+    pub fn complete_slash_command(&mut self) {
+        self.driver.complete_slash_command();
+    }
+
     /// Apply one engine-neutral setting without presenting.
     pub fn configure(&mut self, setting: &driver::ScenarioSetting) {
         self.driver.configure(setting);
@@ -337,7 +349,6 @@ mod v1_navigation {
         c5_reflow_round_trip_does_not_drift,
         c6_rows_inserted_above_do_not_consume_tail_space,
         c7_wheel_up_inside_tail_space_keeps_tail_space,
-        #[ignore = "V1 deviation C8: a staged submission while following moves the view to the transcript top"]
         c8_staged_submission_does_not_move_view,
         #[ignore = "V1 deviation C8: after the staged submission moves to the top, acceptance never reveals the message and a motion keeps running"]
         c8_accepted_submission_reveals_message_at_top,
@@ -616,6 +627,30 @@ mod v2_interaction {
         d6_composer_typing_repaints_regionally,
         d4_scrolling_does_no_layout_work,
         d4_prepend_measures_only_new_units,
+    }
+}
+
+/// V1 instantiation of the process-local row scenarios in [`local_rows`]: V1 draws pending
+/// submissions and notices from the same host-shell state.
+mod v1_local_rows {
+    super::transcript_scenarios! { super::v1::V1Driver; in local_rows;
+        lr1_staged_submission_shows_pending_row,
+        #[ignore = "V1 deviation C8: a staged submission while following moves the view to the transcript top"]
+        lr7_staged_submission_while_following_stays_on_latest_bottom,
+        lr4_rejected_submission_notice_is_visible,
+        lr1_slash_command_output_is_visible,
+        lr4_draft_submission_attaches_and_streams_reply,
+    }
+}
+
+/// V2 instantiation of the process-local row scenarios in [`local_rows`].
+mod v2_local_rows {
+    super::transcript_scenarios! { super::v2::V2Driver; in local_rows;
+        lr1_staged_submission_shows_pending_row,
+        lr7_staged_submission_while_following_stays_on_latest_bottom,
+        lr4_rejected_submission_notice_is_visible,
+        lr1_slash_command_output_is_visible,
+        lr4_draft_submission_attaches_and_streams_reply,
     }
 }
 

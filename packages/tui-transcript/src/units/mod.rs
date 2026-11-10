@@ -11,6 +11,7 @@
 //! change.
 
 pub mod facts;
+pub mod local;
 pub mod structure;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +23,7 @@ use bcode_session_view_models::{
 
 use crate::navigation::{RemovedUnits, UnitRole};
 use crate::window::WindowMode;
+use local::{LocalKey, LocalPlacement, LocalRow};
 use structure::{ItemPlacement, UnitStructure, starts_turn};
 
 /// Edge of the resident window a [`UnitKey::Boundary`] unit stands for.
@@ -47,15 +49,17 @@ pub enum UnitKey {
     HiddenMarker(TranscriptViewItemId),
     /// Resident-window boundary row (constant height 1, U3).
     Boundary(BoundaryEdge),
+    /// Process-local row owned by the host (pending submission or notice, LR1).
+    Local(LocalKey),
 }
 
 impl UnitKey {
-    /// The transcript item id this unit is keyed by, if any.
+    /// The transcript item id this unit is keyed by, if any (never for local rows).
     #[must_use]
     pub const fn item_id(&self) -> Option<&TranscriptViewItemId> {
         match self {
             Self::Item(id) | Self::GroupHeader(id) | Self::HiddenMarker(id) => Some(id),
-            Self::Boundary(_) => None,
+            Self::Boundary(_) | Self::Local(_) => None,
         }
     }
 
@@ -63,6 +67,12 @@ impl UnitKey {
     #[must_use]
     pub const fn is_boundary(&self) -> bool {
         matches!(self, Self::Boundary(_))
+    }
+
+    /// Whether this unit is a process-local row (LR1).
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
     }
 }
 
@@ -75,6 +85,7 @@ impl fmt::Display for UnitKey {
             Self::HiddenMarker(id) => write!(f, "hidden:{}", id.get()),
             Self::Boundary(BoundaryEdge::Older) => f.write_str("boundary:older"),
             Self::Boundary(BoundaryEdge::Newer) => f.write_str("boundary:newer"),
+            Self::Local(key) => write!(f, "local:{key}"),
         }
     }
 }
@@ -98,6 +109,8 @@ pub enum UnitKind {
     },
     /// Resident-window boundary row.
     Boundary(BoundaryEdge),
+    /// Process-local row (LR1).
+    Local,
 }
 
 /// One derived unit.
@@ -193,6 +206,8 @@ pub struct Units {
     /// Position of each resident item in the document the units were derived from. Revisions
     /// never move items, so only structural derivations rebuild it.
     item_positions: BTreeMap<TranscriptViewItemId, usize>,
+    /// Process-local rows in host order with their content signatures (LR1, LR3).
+    locals: Vec<(LocalRow, u64)>,
     mode: WindowMode,
     next_revision: ViewRevision,
 }
@@ -208,6 +223,7 @@ impl Units {
             placements: BTreeMap::new(),
             by_sequence: BTreeMap::new(),
             item_positions: BTreeMap::new(),
+            locals: Vec::new(),
             mode: WindowMode::Live,
             next_revision: 1,
         }
@@ -291,6 +307,70 @@ impl Units {
             .filter(|item| &item.id == id)
     }
 
+    /// The process-local row a [`UnitKey::Local`] unit shows.
+    #[must_use]
+    pub fn local_row(&self, key: &LocalKey) -> Option<&LocalRow> {
+        self.locals
+            .iter()
+            .find(|(row, _)| &row.key == key)
+            .map(|(row, _)| row)
+    }
+
+    /// Current process-local rows in host order.
+    pub fn local_rows(&self) -> impl ExactSizeIterator<Item = &LocalRow> + '_ {
+        self.locals.iter().map(|(row, _)| row)
+    }
+
+    /// The item a unit shows: its document item (`items` must be the document the units were
+    /// derived from), or a local row's item.
+    #[must_use]
+    pub fn unit_item<'i>(
+        &'i self,
+        items: &'i [TranscriptViewItem],
+        key: &UnitKey,
+    ) -> Option<&'i TranscriptViewItem> {
+        match key {
+            UnitKey::Local(local) => self.local_row(local).map(|row| &row.item),
+            _ => key.item_id().and_then(|id| self.item(items, id)),
+        }
+    }
+
+    /// Replace the process-local rows (LR1–LR4) and re-derive units against the unchanged
+    /// document `items`. Equal rows are a no-op; a row whose content changed takes a new layout
+    /// revision, and every other unit keeps its revision (L1).
+    pub fn set_local_rows(
+        &mut self,
+        rows: Vec<LocalRow>,
+        items: &[TranscriptViewItem],
+        structure: &dyn UnitStructure,
+    ) -> UnitChanges {
+        if rows.len() == self.locals.len()
+            && rows
+                .iter()
+                .zip(&self.locals)
+                .all(|(new, (old, _))| new == old)
+        {
+            return UnitChanges::default();
+        }
+        let mut locals = Vec::with_capacity(rows.len());
+        for row in rows {
+            let signature = match self.locals.iter().find(|(old, _)| old.key == row.key) {
+                Some((old, signature)) if *old == row => *signature,
+                _ => self.issue_revision(),
+            };
+            locals.push((row, signature));
+        }
+        self.locals = locals;
+        let plan = derive(
+            items,
+            self.mode,
+            structure,
+            &self.locals,
+            &self.item_positions,
+        );
+        self.reconcile(plan, &BTreeSet::new())
+    }
+
     /// The first unit owned by a canonical sequence, if resident.
     #[must_use]
     pub fn unit_for_sequence(&self, sequence: u64) -> Option<&UnitKey> {
@@ -340,13 +420,13 @@ impl Units {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        let plan = derive(items, mode, structure);
         self.mode = mode;
         self.item_positions = items
             .iter()
             .enumerate()
             .map(|(position, item)| (item.id.clone(), position))
             .collect();
+        let plan = derive(items, mode, structure, &self.locals, &self.item_positions);
         self.reconcile(plan, &revised_ids)
     }
 
@@ -553,11 +633,98 @@ const fn boundary_unit(edge: BoundaryEdge) -> PlannedUnit {
     }
 }
 
-fn derive(items: &[TranscriptViewItem], mode: WindowMode, structure: &dyn UnitStructure) -> Plan {
+/// Where the local rows go during one derivation (LR2): before the document item at each
+/// index (an index equal to the item count is after the last item), after the newer-history
+/// boundary of a detached window, or at the tail.
+#[derive(Debug, Default)]
+struct LocalSlots<'a> {
+    before: BTreeMap<usize, Vec<&'a (LocalRow, u64)>>,
+    beyond_window: Vec<&'a (LocalRow, u64)>,
+    tail: Vec<&'a (LocalRow, u64)>,
+}
+
+impl<'a> LocalSlots<'a> {
+    fn of(
+        items: &[TranscriptViewItem],
+        mode: WindowMode,
+        locals: &'a [(LocalRow, u64)],
+        positions: &BTreeMap<TranscriptViewItemId, usize>,
+    ) -> Self {
+        let mut slots = Self::default();
+        for local in locals {
+            match &local.0.placement {
+                LocalPlacement::Tail => slots.tail.push(local),
+                LocalPlacement::After { item, sequence } => {
+                    let resident = item
+                        .as_ref()
+                        .and_then(|id| positions.get(id))
+                        .copied()
+                        .filter(|position| {
+                            items
+                                .get(*position)
+                                .is_some_and(|it| Some(&it.id) == item.as_ref())
+                        });
+                    let slot = match (resident, sequence) {
+                        (Some(position), _) => position + 1,
+                        (None, Some(sequence)) => {
+                            let after = items
+                                .iter()
+                                .rposition(|it| it.sequence.is_some_and(|seq| seq <= *sequence));
+                            let beyond = mode == WindowMode::Detached
+                                && !items
+                                    .iter()
+                                    .any(|it| it.sequence.is_some_and(|seq| seq > *sequence));
+                            if beyond {
+                                // The boundary lies past a detached window: the row belongs
+                                // after the newer-history boundary.
+                                slots.beyond_window.push(local);
+                                continue;
+                            }
+                            after.map_or(0, |position| position + 1)
+                        }
+                        (None, None) => 0,
+                    };
+                    slots.before.entry(slot).or_default().push(local);
+                }
+            }
+        }
+        slots
+    }
+}
+
+fn push_local(plan: &mut Plan, (row, signature): &(LocalRow, u64)) {
+    plan.units.push(PlannedUnit {
+        key: UnitKey::Local(row.key.clone()),
+        kind: UnitKind::Local,
+        sequence: None,
+        streaming: false,
+        role: UnitRole::Other,
+        signature: mix(0x4c, *signature),
+        members: Vec::new(),
+    });
+}
+
+fn derive(
+    items: &[TranscriptViewItem],
+    mode: WindowMode,
+    structure: &dyn UnitStructure,
+    locals: &[(LocalRow, u64)],
+    positions: &BTreeMap<TranscriptViewItemId, usize>,
+) -> Plan {
     let mut plan = Plan::default();
+    let mut slots = LocalSlots::of(items, mode, locals, positions);
     plan.units.push(boundary_unit(BoundaryEdge::Older));
     let mut run: Option<Run> = None;
     for (index, item) in items.iter().enumerate() {
+        if let Some(rows) = slots.before.remove(&index) {
+            // LR2: a local row stands between two canonical items and ends any run there.
+            if let Some(finished) = run.take() {
+                flush_run(&mut plan, items, finished, structure);
+            }
+            for row in rows {
+                push_local(&mut plan, row);
+            }
+        }
         let placement = structure.placement(item);
         plan.placements.insert(item.id.clone(), placement);
         if placement == ItemPlacement::Suppressed {
@@ -598,8 +765,14 @@ fn derive(items: &[TranscriptViewItem], mode: WindowMode, structure: &dyn UnitSt
     if let Some(finished) = run.take() {
         flush_run(&mut plan, items, finished, structure);
     }
+    for row in slots.before.into_values().flatten() {
+        push_local(&mut plan, row);
+    }
     if mode == WindowMode::Detached {
         plan.units.push(boundary_unit(BoundaryEdge::Newer));
+    }
+    for row in slots.beyond_window.into_iter().chain(slots.tail) {
+        push_local(&mut plan, row);
     }
     plan
 }

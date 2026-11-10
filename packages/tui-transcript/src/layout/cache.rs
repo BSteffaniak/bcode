@@ -277,7 +277,7 @@ impl LayoutInputs<'_> {
         let Some(unit) = self.units.entry(key) else {
             return 0;
         };
-        let item = key.item_id().and_then(|id| self.units.item(self.items, id));
+        let item = self.units.unit_item(self.items, key);
         let structure = self.structure.unit_presentation(key);
         let cx = self.render.context(key, width, structure);
         cache.measure(UnitView { unit, item }, unit.revision, &cx, self.producer)

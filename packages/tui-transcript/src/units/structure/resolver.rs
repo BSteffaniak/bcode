@@ -151,6 +151,8 @@ pub enum ResolvedUnitPresentation {
     HiddenMarker,
     /// A resident-window boundary row.
     Boundary,
+    /// A process-local row (LR5): expanded, without a disclosure target.
+    Local,
 }
 
 impl ResolvedUnitPresentation {
@@ -178,6 +180,7 @@ impl ResolvedUnitPresentation {
             }
             Self::HiddenMarker => 3u8.hash(&mut hasher),
             Self::Boundary => 4u8.hash(&mut hasher),
+            Self::Local => 5u8.hash(&mut hasher),
         }
         hasher.finish()
     }
@@ -188,7 +191,7 @@ impl ResolvedUnitPresentation {
         match self {
             Self::Item(item) => item.presentation.disclosure,
             Self::Group(group) => group.presentation.disclosure,
-            Self::HiddenMarker | Self::Boundary => Disclosure::Expanded,
+            Self::HiddenMarker | Self::Boundary | Self::Local => Disclosure::Expanded,
         }
     }
 
@@ -198,7 +201,7 @@ impl ResolvedUnitPresentation {
         match self {
             Self::Item(item) => Some(&item.target),
             Self::Group(group) => Some(&group.target),
-            Self::HiddenMarker | Self::Boundary => None,
+            Self::HiddenMarker | Self::Boundary | Self::Local => None,
         }
     }
 }
@@ -345,6 +348,7 @@ pub struct StructureResolver {
     group_signatures: BTreeMap<TranscriptViewItemId, u64>,
     hidden: ResolvedUnitPresentation,
     boundary: ResolvedUnitPresentation,
+    local: ResolvedUnitPresentation,
     fallback: ResolvedUnitPresentation,
 }
 
@@ -376,6 +380,7 @@ impl StructureResolver {
             group_signatures: BTreeMap::new(),
             hidden: ResolvedUnitPresentation::HiddenMarker,
             boundary: ResolvedUnitPresentation::Boundary,
+            local: ResolvedUnitPresentation::Local,
             fallback: ResolvedUnitPresentation::Item(ItemStructure {
                 facts: UnitFacts::default(),
                 presentation: host_defaults(),
@@ -903,6 +908,7 @@ impl StructureResolver {
             UnitKey::GroupHeader(id) => self.groups.get(id).unwrap_or(&self.fallback),
             UnitKey::HiddenMarker(_) => &self.hidden,
             UnitKey::Boundary(_) => &self.boundary,
+            UnitKey::Local(_) => &self.local,
         }
     }
 

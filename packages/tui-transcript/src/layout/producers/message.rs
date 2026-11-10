@@ -70,6 +70,8 @@ use super::{
     UnitView,
 };
 use crate::layout::geometry::{ItemFocusTarget, ItemGeometry, SourceRows};
+use crate::units::UnitKey;
+use crate::units::local::LocalKey;
 use crate::units::structure::{DisclosureTarget, ResolvedUnitPresentation};
 
 /// Cells reserved for the heading in the `gutter` speaker treatment. Wider headings clip; the
@@ -1112,6 +1114,45 @@ pub struct SystemMessageProducer;
 impl UnitProducer for SystemMessageProducer {
     fn produce(&self, unit: UnitView<'_>, cx: &ItemRenderContext<'_>) -> ProducedItem {
         produce(unit, cx)
+    }
+}
+
+/// Process-local rows (LR5), composed like the message kind their item has.
+///
+/// * A pending submission is a user message titled `You · <state>` in the
+///   `transcript.pending.label` style (V1 `push_pending_submission_rows`).
+/// * A notice is a system message titled by its display label, `System` without one (V1
+///   ephemeral notices keep their own label, such as `Activity`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalRowProducer;
+
+impl UnitProducer for LocalRowProducer {
+    fn produce(&self, unit: UnitView<'_>, cx: &ItemRenderContext<'_>) -> ProducedItem {
+        let Some((item, mut message)) = unit
+            .item
+            .and_then(|item| Some((item, describe(item, cx.theme)?)))
+        else {
+            return ProducedItem::new(common::plain_unit(unit));
+        };
+        match (&unit.unit.key, &item.kind) {
+            (UnitKey::Local(LocalKey::Submission(_)), _) => {
+                let focused = state(
+                    cx.theme,
+                    "border.focused",
+                    state(cx.theme, "state.info", Styles::of(cx.theme).text),
+                );
+                message.title_style = state(cx.theme, "transcript.pending.label", focused)
+                    .add_modifier(Modifier::BOLD);
+            }
+            (_, TranscriptViewItemKind::SystemMessage { message: system }) => {
+                message.title = system
+                    .display_label
+                    .clone()
+                    .unwrap_or_else(|| "System".to_owned());
+            }
+            _ => {}
+        }
+        produce_message(unit, cx, &message)
     }
 }
 

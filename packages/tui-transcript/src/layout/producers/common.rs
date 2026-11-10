@@ -171,7 +171,7 @@ pub fn plain_unit(unit: UnitView<'_>) -> TextBlock {
             single_row(format!("{marker} {members} {label}"))
         }
         UnitKind::HiddenMarker { count } => single_row(hidden_marker_text(count, IconSet::Unicode)),
-        UnitKind::Item => {
+        UnitKind::Item | UnitKind::Local => {
             let lines = unit.item.map_or_else(Vec::new, plain_lines);
             TextBlock::new(Text::from_lines(lines)).wrap(TextWrap::Word)
         }

@@ -233,6 +233,7 @@ pub enum UnitKey {
     GroupHeader(TranscriptViewItemId),    // keyed by first member id
     HiddenMarker(TranscriptViewItemId),   // "▸ N hidden", keyed by first hidden id
     Boundary(BoundaryEdge),               // Older | Newer resident-window boundary row
+    Local(LocalKey),                      // host-owned local row: Notice(id) | Submission(id)
 }
 ```
 
@@ -243,6 +244,27 @@ pub enum UnitKey {
 | U3 | `Boundary` units have a constant height of 1 row in every state, and state changes are paint-only revisions. `Boundary(Older)` always exists and shows "earlier messages available", "loading" or "start of session". `Boundary(Newer)` exists only in `Detached` mode ("newer messages available" or "loading"); the `Detached → Live` transition removes it as a membership change below the reader, which never moves content at or above the anchor. |
 | U4 | Unit derivation is incremental from `TranscriptChanges`; a membership change touches only affected units (D3). |
 | U5 | Structure resolution (presentation-policy rules, plugin facts, visibility floor, disclosure overrides) runs per changed unit and is memoized (D11, 256 entries). Disclosure overrides are ephemeral, bounded, oldest-first, reconciled on residency (D12). |
+
+#### Local rows
+
+The host shell owns transcript presentation that is not canonical session history: pending
+submissions (staged, sending and queued messages the session has not accepted) and
+process-local notices (daemon and client errors, slash-command output in a draft, plugin
+activity). V1 draws both from shell state (`PendingSubmissions`, the ephemeral entries of its
+presentation document). The original specification only covered session events, so V2 showed
+neither: a submission left no trace, errors were invisible and draft slash-command output was
+lost. The local-rows rules close that gap (`units::local`, `engine::local`,
+`transcript_v2_host::local_rows`).
+
+| Rule | Statement |
+|---|---|
+| LR1 | Local rows are host-owned presentation units. At the end of every update the host passes them to the engine as plain data (`LocalRow { key, placement, item }`, `TranscriptEngine::set_local_rows`); the engine never derives them from its `SessionView` and never writes them into it, so they stay out of every canonical projection. `bcode_tui_transcript` receives only renderer-neutral items (a system message for a notice, a user message for a pending submission) and has no `bcode_tui` dependency. |
+| LR2 | Order matches V1. A notice stands directly after the canonical item that precedes it in the shell's presentation order (before the next canonical item, ending any group run there); when that item is not resident it follows the last resident item at or before its recorded sequence, and without either it precedes every item. A notice whose boundary lies past a detached window follows the newer-history boundary. Pending submissions follow everything, in submission order, after the notices. |
+| LR3 | Identity is stable: `UnitKey::Local(Notice(presentation entry id))` and `UnitKey::Local(Submission(submission id))`; the row's item carries a reserved `local:` id that no session item uses. Equal rows are a no-op; a changed row (for example `sending` → `queued #1`) takes a new layout revision and every other unit keeps its revision (L1). |
+| LR4 | Membership mirrors the shell exactly: rows appear, change and leave when the shell's pending submissions and notices do (staging, sent — which V1 does not draw —, queued, acceptance, cancellation, restore, queue recovery, `/clear`, session switches; the engine reset on a session switch clears and resends them). One exception keeps a submission visible: when the shell forgets a submission because the session recorded it — its submission record arrived (the model composer's submit result carries it, so the shell forgets the submission before any session event; attach hydration does the same), its acceptance or activation event arrived, or its user message arrived — but the engine has not incorporated the canonical item yet (held during a window replacement, such as the attach of a session a draft submission created, or a detached window loading its tail, T27), the host keeps the pending row until the canonical item's sequence (the sequence of the shell session view's `submission:<id>` item, or of the user message) is resident. A submission forgotten for any other reason (cancellation, `/clear`, a session switch) has no recorded item and leaves at once. The host remembers the rows it last showed across engine resets, so a submission forgotten in the update that attaches the session it created is still handed off. The canonical user message then replaces it within one update. Bounds are the shell's: V1 caps neither list, and the host builds rows only when a fingerprint of that state changes. |
+| LR5 | Local rows render with the message producers: a notice as a system message titled by its label (`System`, or the shell's own label such as `Activity`); a pending submission as a user message titled `You · <state>` in the `transcript.pending.label` style. They have no disclosure target and are never collapsed by presentation rules. |
+| LR6 | Local rows never trigger automatic navigation and are never admitted (N10); the arrival scan passes over them, so canonical units arriving before a pending row are still arrivals (T2, T3). Acceptance reveals the canonical user message (T2, T27), never the pending row. |
+| LR7 | A local-row change is reduced as content (N11): a following reader stays on the latest bottom and sees a new tail row like any tail content; a reading position does not move; a row below the viewport is latest-bar activity (C18). C8's "staged never moves the view" therefore means no reveal, anchor or jump: while reading, a staged submission moves nothing; while following, the view stays following. |
 
 #### Item layout
 
@@ -867,6 +889,7 @@ Additional proposals raised by this specification:
 | 11-P3 | Focus bindings | `alt+u` is the single key that moves keyboard focus into the transcript (unit focus); Escape, `alt+u` again, or an unbound key returns to the composer (FO2, FO3). No `alt+t`. `ctrl+home`/`ctrl+end` keep their keys and mean direct session-start/latest loads in V2 (FO5). | Resolved by user |
 | 11-P4 | Detached live handling | Live transcript events are not applied while detached. Return to live uses the bounded tail window (W9, W10), or the buffered catch-up when paging down reaches the tail (W11). Submitting while detached loads the tail window on acceptance (T27). | Confirmed by user |
 | 11-P5 | Runtime engine switching | Dropped (user decision): the engine is chosen at startup only (EN3); each engine owns its `SessionView` (EN4). | Resolved by user |
+| 11-P6 | Host-owned local rows | Pending submissions and process-local notices are V2 local rows (LR1–LR7, section 3.3). C8 is read as "no automatic navigation": a staged submission while following is shown on the latest bottom (LR7). | Spec correction after user report ("can't send a message" with V2) |
 
 ---
 

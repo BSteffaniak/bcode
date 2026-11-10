@@ -48,6 +48,10 @@ impl TranscriptV2Host {
         self.last_frame = None;
         self.data.reset();
         self.render.engine_reset();
+        // The new engine has no local rows; the next sync sends them again. Submissions
+        // handed off belong to the session left.
+        self.local_rows = None;
+        self.handoffs.clear();
         let engine = &mut self.engine;
         // The new engine starts at the full region width; a gutter scrollbar narrows it again.
         let geometry = ViewportGeometry::new(engine.region().width, engine.geometry().height);

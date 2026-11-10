@@ -200,6 +200,7 @@ impl V2HeadlessDriver {
         let resident = match setup.resident {
             ResidentSeed::Latest { events: count } => setup.session.latest(count),
             ResidentSeed::Everything => events,
+            ResidentSeed::Draft => panic!("the headless driver has no host shell for a draft"),
         };
         let result = HistoryWindowResult {
             generation: issued.generation,

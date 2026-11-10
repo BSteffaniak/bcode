@@ -13,6 +13,12 @@ pub use session_view_terminal_adapter::SessionViewTerminalAdapter;
 pub struct TranscriptPresentationEntryId(u64);
 
 impl TranscriptPresentationEntryId {
+    /// Process-unique numeric value of this identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
     fn next() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
@@ -71,6 +77,21 @@ impl TranscriptPresentationEntry {
     pub const fn item(&self) -> &TranscriptItem {
         &self.item
     }
+}
+
+/// One process-local entry with the canonical chronology boundary it currently follows.
+#[derive(Debug, Clone, Copy)]
+pub struct EphemeralEntryView<'a> {
+    /// Stable presentation identity (kept when notices are copied between documents).
+    pub id: TranscriptPresentationEntryId,
+    /// Component or workflow that produced the entry.
+    pub source: &'a str,
+    /// Nearest canonical entry before it in presentation order.
+    pub after: Option<&'a bcode_session_view_models::TranscriptViewItemId>,
+    /// Newest canonical event sequence before it in presentation order.
+    pub after_sequence: Option<u64>,
+    /// Terminal rendering payload.
+    pub item: &'a TranscriptItem,
 }
 
 /// Zero-copy ordered view over terminal transcript payloads.
@@ -276,6 +297,33 @@ impl TranscriptDocument {
     /// Return an iterator over payloads in presentation order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &TranscriptItem> + DoubleEndedIterator {
         self.entries.iter().map(TranscriptPresentationEntry::item)
+    }
+
+    /// Process-local entries in presentation order, each with the canonical entry and newest
+    /// canonical sequence it currently follows.
+    pub fn ephemeral_entries(&self) -> impl Iterator<Item = EphemeralEntryView<'_>> + '_ {
+        let mut after = None;
+        let mut after_sequence: Option<u64> = None;
+        self.entries
+            .iter()
+            .filter_map(move |entry| match &entry.origin {
+                TranscriptPresentationOrigin::Canonical { source_item_id } => {
+                    after = Some(source_item_id);
+                    if let Some(sequence) = entry.item.event_sequence() {
+                        after_sequence = Some(after_sequence.map_or(sequence, |s| s.max(sequence)));
+                    }
+                    None
+                }
+                TranscriptPresentationOrigin::Ephemeral { source, .. } => {
+                    Some(EphemeralEntryView {
+                        id: entry.id,
+                        source,
+                        after,
+                        after_sequence,
+                        item: &entry.item,
+                    })
+                }
+            })
     }
 
     /// Identify a current plugin activity entry without interpreting its visible text.

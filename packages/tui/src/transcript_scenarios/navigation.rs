@@ -591,9 +591,14 @@ pub fn c7_wheel_up_inside_tail_space_keeps_tail_space<D: TranscriptScenarioDrive
 // ---------------------------------------------------------------------------------------------
 
 /// C8/N9: a staged ("sending") submission never moves the view before semantic acceptance.
+///
+/// The reader is reading older content: the staged submission's pending row (LR1) is tail
+/// content below the viewport and moves nothing. While following, the pending row is shown
+/// on the latest bottom like any tail content
+/// (`local_rows::lr7_staged_submission_while_following_stays_on_latest_bottom`).
 pub fn c8_staged_submission_does_not_move_view<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_everything::<D>(ScenarioSession::with_turns(10, 3), WIDTH);
-    let before = scenario.last_frame().clone();
+    let before = read_older(&mut scenario, 4);
     type_text(&mut scenario, PROMPT);
     scenario.key("enter");
     let staged = scenario.present();

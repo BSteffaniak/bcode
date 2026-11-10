@@ -27,6 +27,8 @@
 //! * [`inspector`]: the structure inspector and transcript tooling (bulk disclosure, detail
 //!   cycling, make-default, inline shell expansion; FO6, C39).
 //! * [`interactions`]: inline interaction placement inside the transcript (C37, D10).
+//! * [`local_rows`]: pending submissions and process-local notices of the host shell as
+//!   engine local rows (LR1–LR7).
 //! * [`visuals`]: Markdown images and Mermaid diagrams rendered by the host-side workers and
 //!   accepted into the render configuration (phase 6, L8, D2).
 //! * [`paint`]: viewport geometry, frame preparation, painting, commit, the latest bar and the
@@ -49,6 +51,7 @@ pub mod ingest;
 pub mod input;
 pub mod inspector;
 pub mod interactions;
+pub mod local_rows;
 pub mod paint;
 pub mod render_config;
 pub mod visuals;
@@ -148,6 +151,16 @@ pub struct TranscriptV2Host {
     glow_frame_at: Option<std::time::Instant>,
     /// Inspector panel, tooling notices and queued per-tool defaults ([`inspector`]).
     tools: inspector::HostTools,
+    /// Fingerprint of the shell state the engine's local rows were last built from; `None`
+    /// until the first sync and after an engine reset ([`local_rows`]).
+    local_rows: Option<u64>,
+    /// Accepted submissions shown until the engine incorporates their message
+    /// ([`local_rows::HandedOffSubmission`]).
+    handoffs: Vec<local_rows::HandedOffSubmission>,
+    /// Pending-submission rows the last local-row sync saw in the shell; kept across engine
+    /// resets so a submission the shell forgets in the update that attaches the session it
+    /// created is still handed off ([`local_rows`]).
+    shown_submissions: Vec<bcode_tui_transcript::units::local::LocalRow>,
     /// Scenario time replacing the wall clock for every host and frame clock read, so
     /// transcript scenarios run on scripted time ([`Self::set_scripted_now`]).
     #[cfg(test)]
@@ -191,6 +204,9 @@ impl TranscriptV2Host {
             scrollbar_drag: false,
             glow_frame_at: None,
             tools: inspector::HostTools::default(),
+            local_rows: None,
+            handoffs: Vec::new(),
+            shown_submissions: Vec::new(),
             #[cfg(test)]
             scripted_now: None,
         }

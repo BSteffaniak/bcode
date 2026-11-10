@@ -48,6 +48,24 @@ pub enum ResidentSeed {
     },
     /// The whole session, attached live.
     Everything,
+    /// No session yet: the composer targets an unpersisted draft. The canonical session is
+    /// the one the first accepted submission creates ([`SubmissionOutcome::Accepted`]).
+    Draft,
+}
+
+/// How the fake daemon answers the newest submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionOutcome {
+    /// The daemon rejects the request with the server error `code`.
+    Rejected {
+        /// Server error code.
+        code: String,
+    },
+    /// The daemon accepts the message into the scenario session, creating it when the
+    /// composer targets a draft: it appends the submission's acceptance and activation to the
+    /// canonical session and answers with the production result shape (the submission record
+    /// and the model receipt). Later events arrive live.
+    Accepted,
 }
 
 /// Semantic history request an engine emitted and is waiting on.
@@ -365,6 +383,26 @@ pub trait TranscriptScenarioDriver: Sized {
             "{:?} driver cannot open the interaction surface {interaction_id:?} ({rows} rows, {text:?})",
             Self::ENGINE
         );
+    }
+
+    /// Answer the newest message submission as the daemon would (the submit effect's result),
+    /// recording an accepted submission in the canonical `session`.
+    ///
+    /// The default panics: a driver must reach the host shell's effect queue.
+    fn resolve_submission(&mut self, outcome: &SubmissionOutcome, session: &mut ScenarioSession) {
+        let _ = session;
+        panic!(
+            "{:?} driver cannot answer submissions ({outcome:?})",
+            Self::ENGINE
+        );
+    }
+
+    /// Run the newest slash command with the production executor and deliver its result. Only
+    /// builtins that need no daemon complete.
+    ///
+    /// The default panics: a driver must reach the host shell's effect queue.
+    fn complete_slash_command(&mut self) {
+        panic!("{:?} driver cannot run slash commands", Self::ENGINE);
     }
 
     /// Rows the focused transcript unit-focus target occupies in the last presented frame,
