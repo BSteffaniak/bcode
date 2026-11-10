@@ -1008,6 +1008,17 @@ impl DecodedMarkdownImage {
         self.rgba.len()
     }
 
+    /// The validated pixels as a BMUX protocol-neutral image payload.
+    #[must_use]
+    pub fn into_payload(self) -> ImagePayload {
+        ImagePayload::Pixels {
+            bytes: self.rgba,
+            width: self.width,
+            height: self.height,
+            format: ImagePixelFormat::Rgba8,
+        }
+    }
+
     /// Adapt validated pixels into BMUX's protocol-neutral frame contribution.
     ///
     /// Placement is supplied per frame, so scroll and resize update geometry

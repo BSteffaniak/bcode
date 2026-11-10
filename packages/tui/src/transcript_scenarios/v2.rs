@@ -37,10 +37,10 @@ use bmux_tui::geometry::{Point, Rect, Size};
 use bmux_tui_runtime::{Presenter as _, Program as _, RuntimeEvent, TimerId};
 
 use super::driver::{
-    HistoryRequest, HistoryResponse, LayoutWork, PageLimits, PendingHistoryRequest,
-    RepaintObservation, RequestId, ResidentSeed, ScenarioEngine, ScenarioInput, ScenarioIntent,
-    ScenarioScrollbar, ScenarioSetting, ScenarioSetup, TranscriptScenarioDriver, WheelDirection,
-    WindowWork,
+    DamageObservation, HistoryRequest, HistoryResponse, LayoutWork, PageLimits,
+    PendingHistoryRequest, RepaintObservation, RequestId, ResidentSeed, ScenarioEngine,
+    ScenarioInput, ScenarioIntent, ScenarioScrollbar, ScenarioSetting, ScenarioSetup,
+    TranscriptScenarioDriver, WheelDirection, WindowWork,
 };
 use super::frame::{CellRect, FocusObservation, ScenarioFrame};
 use crate::effects::{TuiEffect, TuiEffectResult};
@@ -77,6 +77,10 @@ pub struct V2Driver {
     elapsed: Duration,
     /// Repaint scope reported by the last presentation.
     last_repaint: Option<RepaintObservation>,
+    /// Effective damage of the last presentation, as the terminal committed it (BMUX 15b).
+    last_damage: Option<DamageObservation>,
+    /// Every presentation rule the user-state double stores (make-default, `m`).
+    stored_rules: Vec<bcode_presentation_policy::models::PresentationRule>,
     /// First and newest canonical sequences of the session (setup plus live deliveries): the
     /// daemon double answers the host's single-event session-bound probes from them.
     session_bounds: Option<(u64, u64)>,
@@ -114,7 +118,9 @@ impl V2Driver {
     }
 
     /// Keep V2 history loads as pending requests; drop work that needs a daemon. A new load
-    /// replaces the pending load of its lane, as the effect queue does.
+    /// replaces the pending load of its lane, as the effect queue does. Per-tool default rules
+    /// (make-default, `m`) are persisted to a user-state double, which succeeds and stores
+    /// them, and the result is delivered as the persistence effect's result (A3).
     fn collect_effects(&mut self) {
         let (scheduled, _notes) = self.model.chat.pending_effects.drain_runtime();
         for (_schedule, effect) in scheduled {
@@ -124,6 +130,19 @@ impl V2Driver {
                 self.next_request += 1;
                 self.pending.push((RequestId(self.next_request), load));
             }
+        }
+        if let Some(rules) = self.model.chat.app.take_pending_default_rules() {
+            self.stored_rules.extend(rules.iter().cloned());
+            let result = TuiEffectResult::PresentationRulesPersisted {
+                rules,
+                result: Ok((
+                    std::path::PathBuf::from("scenario-user-state.toml"),
+                    self.stored_rules.clone(),
+                )),
+            };
+            self.update(RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
+                Box::new(result),
+            )));
         }
     }
 
@@ -306,6 +325,94 @@ fn daemon_page(
     }
 }
 
+/// The scenario observation of committed terminal damage.
+fn damage_observation(
+    damage: &bmux_tui::damage::Damage,
+    applied: Option<bmux_tui::terminal::AppliedScroll>,
+) -> DamageObservation {
+    let rects = |regions: &[Rect]| regions.iter().copied().map(cell_rect).collect();
+    match damage {
+        bmux_tui::damage::Damage::None => DamageObservation::None,
+        bmux_tui::damage::Damage::Full => DamageObservation::Full,
+        bmux_tui::damage::Damage::Regions(regions) => DamageObservation::Regions(rects(regions)),
+        bmux_tui::damage::Damage::Scroll {
+            region,
+            rows,
+            regions,
+        } => DamageObservation::Scroll {
+            region: cell_rect(*region),
+            rows: *rows,
+            regions: rects(regions),
+            accelerated: applied
+                .is_some_and(|applied| applied.region == *region && applied.rows == *rows),
+        },
+    }
+}
+
+/// Interactive surface double: prefers a fixed height and paints one text line per row.
+struct ScenarioSurface {
+    rows: u16,
+    text: String,
+}
+
+impl bcode_plugin_sdk::tui::PluginTuiSurface for ScenarioSurface {
+    fn id(&self) -> &'static str {
+        "scenario-interaction"
+    }
+
+    fn title(&self) -> &'static str {
+        "scenario interaction"
+    }
+
+    fn preferred_height(&mut self, _width: u16) -> u16 {
+        self.rows
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {
+        for row in 0..area.height {
+            let line = Rect::new(area.x, area.y.saturating_add(row), area.width, 1);
+            frame.write_line(
+                bmux_tui::paint::LocalRect::terminal(line),
+                &bmux_tui::text::Line::raw(format!("{}{row:02}", self.text)),
+            );
+        }
+    }
+
+    fn render_slice(
+        &mut self,
+        _logical_height: u16,
+        logical_row_offset: u16,
+        destination: Rect,
+        frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    ) {
+        // Logical rows keep their numbers across slices, so a scenario sees which rows show.
+        for row in 0..destination.height {
+            let line = Rect::new(
+                destination.x,
+                destination.y.saturating_add(row),
+                destination.width,
+                1,
+            );
+            frame.write_line(
+                bmux_tui::paint::LocalRect::terminal(line),
+                &bmux_tui::text::Line::raw(format!(
+                    "{}{:02}",
+                    self.text,
+                    logical_row_offset.saturating_add(row)
+                )),
+            );
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        _event: &Event,
+        _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        bcode_plugin_sdk::tui::PluginTuiAction::None
+    }
+}
+
 const fn cell_rect(rect: Rect) -> CellRect {
     CellRect {
         x: rect.x,
@@ -338,6 +445,8 @@ impl TranscriptScenarioDriver for V2Driver {
             origin,
             elapsed: Duration::ZERO,
             last_repaint: None,
+            last_damage: None,
+            stored_rules: Vec::new(),
             session_bounds: setup
                 .session
                 .events()
@@ -438,21 +547,35 @@ impl TranscriptScenarioDriver for V2Driver {
         let now = self.origin + self.elapsed;
         self.host_mut().set_scripted_now(now);
         self.sync();
+        // The post-copy selection clear runs on the V2 host clock (C35); deliver its timer when
+        // scenario time reaches it, as the runtime does.
+        if self
+            .model
+            .selection_clear_at_for_test()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let timer = self.model.selection_clear_timer_for_test();
+            self.update(RuntimeEvent::Timer(timer));
+        }
     }
 
     fn present(&mut self) -> ScenarioFrame {
         let mut output = Vec::new();
         let mut staged = self.terminal.fork(&mut output);
-        let full_damage = self.model.presentation_damage_is_full_for_test()
-            || self.terminal.retained_buffer().is_none();
         let report = crate::root_program::bcode_runtime_presenter(&mut staged)
             .present(&mut self.model)
             .expect("V2 scenario presentation must succeed");
         self.terminal.acknowledge(staged);
+        // The damage the terminal committed the frame with, after promotion (BMUX 15b).
+        let damage = damage_observation(
+            self.terminal.committed_damage(),
+            self.terminal.applied_scroll(),
+        );
         self.last_repaint = Some(RepaintObservation {
-            full: full_damage || report.full_repaint,
+            full: damage.is_full() || report.full_repaint,
             changed_cells: report.changed_cells,
         });
+        self.last_damage = Some(damage);
         let _update = self.model.presentation_committed(report);
         self.collect_effects();
         let buffer = self
@@ -502,9 +625,9 @@ impl TranscriptScenarioDriver for V2Driver {
         Some((window.first_sequence?, window.last_sequence?))
     }
 
-    /// Transcript selection is phase 6 in V2; the host keeps none.
+    /// The host shell's copy text, which the V2 engine's selection exports (C34).
     fn selection_text(&self) -> Option<String> {
-        None
+        self.model.selected_plain_text.clone()
     }
 
     fn configure(&mut self, setting: &ScenarioSetting) {
@@ -560,6 +683,52 @@ impl TranscriptScenarioDriver for V2Driver {
 
     fn last_repaint(&self) -> Option<RepaintObservation> {
         self.last_repaint
+    }
+
+    fn last_damage(&self) -> Option<DamageObservation> {
+        self.last_damage.clone()
+    }
+
+    /// The host shell's activity animation accepts one frame (its `activity-animation`
+    /// timed invalidation), then the update flush hands it to the V2 host (F7, D7).
+    fn accept_activity_frame(&mut self) {
+        let key = crate::invalidation::InvalidationKey::new("activity-animation");
+        let (_invalidation, _damage) = self
+            .model
+            .chat
+            .app
+            .handle_invalidations_with_damage(&[key], self.origin + self.elapsed);
+        self.sync();
+    }
+
+    fn horizontal_wheel(&mut self, right: bool, at: super::driver::CellPoint) {
+        let kind = if right {
+            MouseEventKind::ScrollRight
+        } else {
+            MouseEventKind::ScrollLeft
+        };
+        self.mouse(kind, at);
+    }
+
+    fn run_command(&mut self, route: &str) {
+        self.model.run_command_route_for_test(route);
+        self.sync();
+    }
+
+    fn open_interaction(&mut self, interaction_id: &str, rows: u16, text: &str) {
+        let keymap = self.model.settings.keymap().clone();
+        self.model.loop_state.install_interactive_surface_for_test(
+            crate::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                interaction_id,
+                Box::new(ScenarioSurface {
+                    rows,
+                    text: text.to_owned(),
+                }),
+                &keymap,
+            ),
+        );
+        self.model.request_full_redraw_for_test();
+        self.sync();
     }
 
     fn layout_work(&mut self) -> Option<LayoutWork> {

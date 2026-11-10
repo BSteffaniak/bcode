@@ -113,6 +113,10 @@ pub struct MarkdownOptions {
     pub mermaid: bool,
     /// Whether inline images render (placeholders reserve rows until accepted).
     pub images: bool,
+    /// Accepted image and Mermaid visuals by contribution id (computed outside drawing, L8).
+    /// Per unit like [`Self::details_open`]: ids start with the owning unit's
+    /// [`markdown_document_id`] and `:`, and an acceptance re-measures only that unit.
+    pub visuals: crate::layout::producers::markdown::MarkdownVisualState,
 }
 
 impl MarkdownOptions {
@@ -138,6 +142,7 @@ impl MarkdownOptions {
             details_open: _,
             mermaid,
             images,
+            visuals: _,
         } = self;
         mermaid.hash(state);
         images.hash(state);
@@ -283,17 +288,19 @@ impl RenderConfig {
         hasher.finish()
     }
 
-    /// Fingerprint of the unit-scoped inputs: the unit's `<details>` state and its accepted
-    /// plugin visual. A change re-measures only that unit.
+    /// Fingerprint of the unit-scoped inputs: the unit's `<details>` state, its accepted
+    /// Markdown visuals and its accepted plugin visual. A change re-measures only that unit.
     fn unit_fingerprint(&self, unit: &UnitKey) -> Option<u64> {
         let document_id = markdown_document_id(unit);
         let mut details = self.markdown.details_for(&document_id).peekable();
+        let mut markdown_visuals = self.markdown.visuals.revisions_for(&document_id).peekable();
         let visual = self.plugin_visuals.revision_for(unit);
-        if details.peek().is_none() && visual.is_none() {
+        if details.peek().is_none() && markdown_visuals.peek().is_none() && visual.is_none() {
             return None;
         }
         let mut hasher = StableHasher::new();
         details.for_each(|entry| entry.hash(&mut hasher));
+        markdown_visuals.for_each(|entry| entry.hash(&mut hasher));
         visual.hash(&mut hasher);
         Some(hasher.finish())
     }

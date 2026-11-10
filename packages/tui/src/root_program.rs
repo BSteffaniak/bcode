@@ -53,6 +53,8 @@ pub enum BcodeRuntimeMessage {
     PluginSurfaceInvalidated,
     /// Completed Bcode-owned background effect.
     EffectCompleted(Box<TuiEffectResult>),
+    /// Completed V2 transcript Markdown image or Mermaid worker request.
+    TranscriptV2Visual(Box<super::transcript_v2_host::visuals::VisualCompletion>),
     /// Completed attempt to open the next inline interactive surface.
     InteractiveSurfaceOpened(Result<super::interactive_surface::InteractiveSurfaceState, String>),
     /// A committed native interaction update, scoped to its original session and exchange.
@@ -104,6 +106,7 @@ impl BcodeRuntimeMessage {
             | Self::ComposerSearchCompleted(_)
             | Self::PluginSurfaceInvalidated
             | Self::EffectCompleted(_)
+            | Self::TranscriptV2Visual(_)
             | Self::InteractiveSurfaceOpened(_)
             | Self::InteractiveSurfaceResolved(_)
             | Self::NativeDurableChanged { .. }
@@ -239,6 +242,9 @@ pub struct BcodeRuntimeModel {
     presentation_damage: bmux_tui::damage::Damage,
     /// Whether the next stable temporal presentation can skip full frame preparation.
     fast_temporal_presentation: bool,
+    /// V2 only: a composer edit since the last presentation repaints the composer region alone
+    /// (F5, D6). Kept until a frame presents it, so later updates cannot drop the region.
+    composer_damage: ComposerDamage,
     /// Last successfully committed terminal hit map used for pointer routing.
     pub committed_hits: bmux_tui::hit::HitMap,
     /// Last successfully committed logical content-selection scene.
@@ -320,6 +326,15 @@ impl RootTimer {
             Self::SelectionClear(_) => unreachable!("selection timer handled above"),
         })
     }
+}
+
+/// Whether the composer region needs presenting since the last presentation (V2, F5, D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerDamage {
+    /// Nothing pending.
+    None,
+    /// A plain composer edit repaints the composer region.
+    Edited,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -663,6 +678,7 @@ impl BcodeRuntimeModel {
     ) -> (Option<std::time::Duration>, bmux_tui::damage::Damage, bool) {
         self.synchronize_selection_lifecycle();
         let interval = self.settings.bmux_runtime_config().frame_interval;
+        self.composer_damage = ComposerDamage::None;
         let damage = std::mem::replace(
             &mut self.presentation_damage,
             bmux_tui::damage::Damage::None,
@@ -873,6 +889,7 @@ impl BcodeRuntimeModel {
             composer_field: bcode_plugin_sdk::tui::FocusedTextFieldAdapter::new("chat", "composer"),
             focused_visual: None,
             committed_layout: None,
+            composer_damage: ComposerDamage::None,
             last_presented_at: None,
             exit_after_plugin_surface: false,
             plugin_surface_result: None,
@@ -1959,6 +1976,7 @@ impl BcodeRuntimeModel {
                     self.loop_state.open_session_search(&mut self.chat);
                     return super::invalidation::UiInvalidation::Structural;
                 }
+                let slash_palette_before = self.loop_state.has_slash_palette();
                 let outcome =
                     super::input::handle_key(&mut self.chat.app, self.settings.keymap(), stroke);
                 match outcome.request {
@@ -1978,7 +1996,20 @@ impl BcodeRuntimeModel {
                 }
                 self.loop_state.refresh_slash_palette(&mut self.chat);
                 self.draft_autosave.observe(&self.chat, Instant::now());
-                if outcome.redraw || submit_menu_open {
+                // With V2, a plain composer edit repaints the composer alone (F5, D6). Requests,
+                // opened menus and palettes stay structural, and an edit that resizes the
+                // composer changes the chrome layout, which repaints fully at draw time.
+                if outcome.redraw
+                    && !submit_menu_open
+                    && self.transcript_engine.v2().is_some()
+                    && matches!(outcome.request, super::input::KeyRequest::None)
+                    && !slash_palette_before
+                    && !self.loop_state.has_slash_palette()
+                    && !self.chat.app.composer_submit.is_open()
+                {
+                    self.composer_damage = ComposerDamage::Edited;
+                    super::invalidation::UiInvalidation::Paint
+                } else if outcome.redraw || submit_menu_open {
                     super::invalidation::UiInvalidation::Structural
                 } else {
                     super::invalidation::UiInvalidation::None
@@ -2387,6 +2418,14 @@ impl BcodeRuntimeModel {
     }
 
     fn refresh_selected_plain_text(&mut self) {
+        // EN5: the V2 engine owns its transcript selection and exports its logical source text.
+        if let Some(host) = self.transcript_engine.v2() {
+            self.selected_plain_text = host.selected_text().filter(|text| !text.is_empty());
+            self.chat
+                .app
+                .set_transcript_selection_pinned(self.selected_plain_text.is_some());
+            return;
+        }
         if self
             .transcript_selection
             .reconcile(&self.committed_selection)
@@ -2516,6 +2555,15 @@ impl BcodeRuntimeModel {
         }
     }
 
+    /// The clock the post-copy selection clear is scheduled on: the V2 host clock with the V2
+    /// engine (scripted in scenarios), else the wall clock.
+    fn selection_clock_now(&self) -> Instant {
+        self.transcript_engine.v2().map_or_else(
+            Instant::now,
+            super::transcript_v2_host::TranscriptV2Host::now,
+        )
+    }
+
     fn cancel_selection_clear(&mut self) {
         let id = RootTimer::SelectionClear(self.selection_clear_generation).id();
         if let Some(handle) = &self.runtime_handle {
@@ -2529,6 +2577,9 @@ impl BcodeRuntimeModel {
     fn clear_transcript_selection(&mut self) {
         self.cancel_selection_clear();
         self.transcript_selection.clear();
+        if let Some(host) = self.transcript_engine.v2_mut() {
+            let _ = host.clear_selection();
+        }
         self.invalidation = self
             .invalidation
             .merge(super::invalidation::UiInvalidation::Paint);
@@ -2583,8 +2634,9 @@ impl BcodeRuntimeModel {
                     if delay == 0 {
                         self.clear_transcript_selection();
                     } else {
-                        self.selection_clear_at =
-                            Instant::now().checked_add(Duration::from_millis(delay));
+                        self.selection_clear_at = self
+                            .selection_clock_now()
+                            .checked_add(Duration::from_millis(delay));
                     }
                 }
             }
@@ -3009,6 +3061,7 @@ impl BcodeRuntimeModel {
         handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
         let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
+        commands.extend(self.transcript_v2_visual_commands());
         if let Some(command) = self.collect_child_watch_work(handle) {
             commands.push(command);
         }
@@ -3185,9 +3238,18 @@ impl BcodeRuntimeModel {
                 super::app::TemporalDamage::Transcript => Some(layout.body()),
                 super::app::TemporalDamage::Full => None,
             });
+            let composer =
+                (self.composer_damage == ComposerDamage::Edited).then(|| layout.composer());
+            // The V2 transcript repaints its own region alone (F5, D6); it stays damaged until
+            // a frame painted it, so later updates cannot drop the region.
+            let transcript_v2 = self
+                .transcript_engine
+                .v2()
+                .is_some_and(super::transcript_v2_host::TranscriptV2Host::is_invalidated)
+                .then(|| super::transcript_v2_host::paint::transcript_region(layout));
             if !temporal_damage.contains(&super::app::TemporalDamage::Full) {
                 let damage = bmux_tui::damage::Damage::regions(
-                    regions.chain(
+                    regions.chain(transcript_v2).chain(composer).chain(
                         self.chat
                             .app
                             .composer_submit
@@ -3291,6 +3353,7 @@ impl BcodeRuntimeModel {
         if timer.as_str().starts_with("bcode.selection_clear.") {
             let damage =
                 if *timer == RootTimer::SelectionClear(self.selection_clear_generation).id() {
+                    let now = self.selection_clock_now();
                     self.clear_transcript_selection_if_due(now)
                 } else {
                     super::invalidation::UiInvalidation::None
@@ -4045,6 +4108,16 @@ fn export_plain_transcript_selection<'a>(
 /// Test-only seams used by the engine-neutral transcript scenario driver.
 #[cfg(test)]
 impl BcodeRuntimeModel {
+    /// Run one command-palette host route as the palette does after a selection.
+    pub(crate) fn run_command_route_for_test(&mut self, route: &str) {
+        self.apply_root_command_action(super::chat_loop::CommandDispatchRequest {
+            action: bcode_command::CommandAction::Host {
+                route: route.to_owned(),
+            },
+            session: bcode_command::CommandSessionRequirement::Optional,
+        });
+    }
+
     /// Run the timeline-dialog selection path for `sequence` and request a full redraw, as the
     /// dialog's update does after a selection.
     pub(crate) fn timeline_jump_for_test(&mut self, sequence: u64) {
@@ -4231,41 +4304,82 @@ impl BcodeRuntimeModel {
             Event::Key(stroke) => host.handle_key(self.settings.keymap(), *stroke, now),
             Event::Mouse(mouse) if !modal => {
                 let top_hit = super::mouse_flow::mouse_hit_id(&self.committed_hits, *mouse);
-                host.handle_mouse(
+                host.handle_pointer(
                     *mouse,
-                    self.settings.mouse_scroll_rows(),
-                    top_hit.as_deref(),
+                    super::transcript_v2_host::input::PointerInput {
+                        wheel_rows: self.settings.mouse_scroll_rows(),
+                        top_hit: top_hit.as_deref(),
+                        scene: Some(&self.committed_selection),
+                        autoscroll: self.settings.selection_autoscroll(),
+                    },
                     now,
                 )
             }
             _ => TranscriptInputOutcome::Ignored,
         };
+        let events = host.take_selection_events();
+        let damage = host.take_damage();
         if matches!(event, Event::Key(_)) && outcome != TranscriptInputOutcome::Ignored {
             // FO10: a key the transcript consumed is not a tap of a chat multi-tap sequence.
             self.chat.app.clear_pending_key_activation();
         }
+        let copied = self.apply_transcript_v2_selection_events(events);
         outcome.consumed_redraw().map(|redraw| {
-            if redraw {
+            if copied {
+                // The copy reports through the status row (V1 copy policy).
                 super::invalidation::UiInvalidation::Structural
+            } else if redraw {
+                Self::transcript_v2_invalidation(damage)
             } else {
                 super::invalidation::UiInvalidation::None
             }
         })
     }
 
+    /// The invalidation of a V2 transcript change of `damage` scope: the transcript region
+    /// alone repaints at paint level, everything else structurally (F5, D6).
+    const fn transcript_v2_invalidation(
+        damage: super::transcript_v2_host::paint::TranscriptDamage,
+    ) -> super::invalidation::UiInvalidation {
+        use super::transcript_v2_host::paint::TranscriptDamage;
+        match damage {
+            TranscriptDamage::None => super::invalidation::UiInvalidation::None,
+            TranscriptDamage::Transcript => super::invalidation::UiInvalidation::Paint,
+            TranscriptDamage::Full => super::invalidation::UiInvalidation::Structural,
+        }
+    }
+
+    /// Apply V2 selection gestures to the host shell's copy state, with V1's copy policy
+    /// (C35): a new gesture cancels a pending post-copy clear, the selected text follows the
+    /// drag, and a completed drag copies when auto-copy on release is enabled. Returns whether
+    /// a copy ran.
+    fn apply_transcript_v2_selection_events(
+        &mut self,
+        events: super::transcript_v2_host::input::SelectionEvents,
+    ) -> bool {
+        if events.started {
+            self.cancel_selection_clear();
+            self.selected_plain_text = None;
+            self.chat.app.set_transcript_selection_pinned(false);
+        }
+        if events.changed || events.completed {
+            self.refresh_selected_plain_text();
+        }
+        if events.completed && self.settings.selection().auto_copy_on_mouse_release {
+            self.copy_transcript_selection();
+            return true;
+        }
+        false
+    }
+
     /// Run a transcript command-palette route on the V2 host. Returns whether V2 handled it
     /// (always, when V2 is selected); with V1 the route runs on the V1 transcript instead.
     fn run_transcript_v2_route(&mut self, route: &str) -> bool {
-        use super::transcript_v2_host::input::TranscriptRouteOutcome;
         let Some(host) = self.transcript_engine.v2_mut() else {
             return false;
         };
         let now = host.now();
-        if host.run_transcript_route(route, now) == Some(TranscriptRouteOutcome::Unavailable) {
-            self.chat.app.set_status(format!(
-                "{route} is not available with transcript engine v2 yet"
-            ));
-        }
+        let _outcome = host.run_transcript_route(route, now);
         true
     }
 
@@ -4354,16 +4468,70 @@ impl BcodeRuntimeModel {
         );
         host.sync_session(self.chat.attached_session_id(), now);
         let _ = host.sync_render_inputs(&mut self.chat.app, now);
+        // Transcript tooling reports through the host shell: status notices, and per-tool
+        // defaults persisted to user state through the shell's effect (A3).
+        let notice = host.take_notice().map(|notice| {
+            let text = notice.text(&self.chat.app);
+            self.chat.app.set_status(text);
+        });
+        let notice = notice.is_some();
+        for rule in host.take_default_rules() {
+            self.chat.app.queue_default_rule(rule);
+        }
+        host.set_visual_workers(|| self.loop_state.markdown_visual_workers());
+        let _queued = host.schedule_markdown_visuals(
+            transcript_v2_visual_policy(&self.chat.app, &self.loop_state),
+            now,
+        );
+        // Spinner and elapsed labels advance on the host shell's accepted activity frames
+        // (F7, D7), never on wall time while drawing.
+        host.sync_activity(self.chat.app.spinner_step());
         // Each history effect supersedes earlier work in its lane; superseded requests are
         // no longer awaited by the engine.
         for effect in host.drain_effects() {
             self.chat.replace_effect(effect);
         }
-        if host.take_invalidated() {
-            super::invalidation::UiInvalidation::Structural
-        } else {
-            super::invalidation::UiInvalidation::None
+        // A selection the engine dropped (its unit left the window) is no longer copyable.
+        let selection_lost =
+            self.selected_plain_text.is_some() && host.engine().selection().is_none();
+        // The transcript stays invalidated until a frame paints it (regional damage, F5).
+        let damage = host.take_damage();
+        if selection_lost {
+            self.selected_plain_text = None;
+            self.chat.app.set_transcript_selection_pinned(false);
         }
+        if notice {
+            // Tooling notices report through the status row.
+            return super::invalidation::UiInvalidation::Structural;
+        }
+        Self::transcript_v2_invalidation(damage)
+    }
+
+    /// Runtime commands for the V2 host's started Markdown visual requests: one keyed lane
+    /// per worker kind, so at most one request per lane runs (D2; the host keeps the pending
+    /// one).
+    fn transcript_v2_visual_commands(
+        &mut self,
+    ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
+        let Some(host) = self.transcript_engine.v2_mut() else {
+            return Vec::new();
+        };
+        host.drain_visual_work()
+            .into_iter()
+            .map(|work| {
+                bmux_tui_runtime::Command::replace(
+                    bmux_tui_runtime::CommandKey::new(format!(
+                        "bcode.transcript_v2.visual.{}",
+                        work.lane().name()
+                    )),
+                    async move {
+                        Some(BcodeRuntimeMessage::TranscriptV2Visual(Box::new(
+                            work.run().await,
+                        )))
+                    },
+                )
+            })
+            .collect()
     }
 
     /// The V2 host, when V2 is selected (scenario and test observation seam).
@@ -4390,9 +4558,15 @@ impl BcodeRuntimeModel {
             return (false, false);
         };
         host.commit();
+        // The committed frame decides which Markdown visuals are visible (and prefetched).
+        let now = host.now();
+        let visuals_queued = host.schedule_markdown_visuals(
+            transcript_v2_visual_policy(&self.chat.app, &self.loop_state),
+            now,
+        );
         let effects = host.drain_effects();
         let redraw = host.is_invalidated();
-        let queued = !effects.is_empty();
+        let queued = !effects.is_empty() || visuals_queued;
         for effect in effects {
             self.chat.replace_effect(effect);
         }
@@ -4410,7 +4584,10 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
     ) -> bmux_tui_runtime::Update<Self::Message> {
         self.invalidation = super::invalidation::UiInvalidation::None;
         self.last_presented_at = Some(Instant::now());
-        self.chat.app.commit_transcript_presentation();
+        // With V2 the V1 transcript layout is neither prepared nor presented (EN5).
+        if self.transcript_engine.v2().is_none() {
+            self.chat.app.commit_transcript_presentation();
+        }
         let (transcript_v2_redraw, transcript_v2_effects) =
             self.commit_transcript_v2_presentation();
         self.loop_state.mark_presentation_committed();
@@ -4418,9 +4595,22 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             .loop_state
             .apply_deferred_session_stream_updates(&mut self.chat);
         self.schedule_deadlines();
-        let mut update = if deferred || transcript_v2_redraw {
+        let mut update = if deferred {
             self.invalidation = super::invalidation::UiInvalidation::Structural;
             self.presentation_damage = bmux_tui::damage::Damage::Full;
+            self.fast_temporal_presentation = false;
+            bmux_tui_runtime::Update::redraw()
+        } else if transcript_v2_redraw {
+            // Work the commit ran (an accepted Markdown visual, a settled motion) repaints at
+            // its own damage scope: the transcript region alone unless it changed more (F5).
+            let invalidation = self
+                .transcript_engine
+                .v2_mut()
+                .map_or(super::invalidation::UiInvalidation::Structural, |host| {
+                    Self::transcript_v2_invalidation(host.take_damage())
+                });
+            self.invalidation = invalidation;
+            self.presentation_damage = self.select_presentation_damage(invalidation, &[]);
             self.fast_temporal_presentation = false;
             bmux_tui_runtime::Update::redraw()
         } else {
@@ -4608,6 +4798,14 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                             }
                             super::keymap::BmuxAction::AppExit => self.chat.app.request_exit(),
                             super::keymap::BmuxAction::InteractionFocusActive => {
+                                // EN5: V2 reveals its reserved interaction unit (C37).
+                                if self.chat.app.tui_config().interactions.placement
+                                    == bcode_config::TuiInteractionPlacement::Transcript
+                                    && let Some(host) = self.transcript_engine.v2_mut()
+                                {
+                                    let now = host.now();
+                                    let _changed = host.reveal_inline_interaction(now);
+                                }
                                 if self.chat.app.tui_config().interactions.placement
                                     == bcode_config::TuiInteractionPlacement::Transcript
                                     && self.transcript_engine.v2().is_none()
@@ -5012,6 +5210,19 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             )) if super::transcript_v2_host::ingest::owns_effect_result(&result) => {
                 self.apply_transcript_v2_effect_result(*result)
             }
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::TranscriptV2Visual(
+                completion,
+            )) => {
+                let changed = self.transcript_engine.v2_mut().is_some_and(|host| {
+                    let now = host.now();
+                    host.complete_markdown_visual(*completion, now)
+                });
+                if changed {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
                 result,
             )) => {
@@ -5232,6 +5443,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
         }
         Ok(update)
+    }
+}
+
+/// Markdown visual policy of the V2 transcript: terminal image support and
+/// `[tui.markdown] network_images`.
+fn transcript_v2_visual_policy(
+    app: &super::app::BmuxApp,
+    loop_state: &super::chat_loop::ChatLoopState,
+) -> super::transcript_v2_host::visuals::VisualPolicy {
+    super::transcript_v2_host::visuals::VisualPolicy {
+        terminal_images: loop_state.markdown_images_supported(),
+        network_images: app.tui_config().markdown.network_images,
     }
 }
 
@@ -9088,32 +9311,36 @@ mod tests {
             "the palette action toggles focus off again"
         );
 
-        for unavailable in [
-            "transcript.inspect",
+        // Phase 6: every transcript tooling route runs on the V2 host; the hidden V1
+        // transcript (focus, inspector) never changes.
+        route(&mut model, "transcript.inspect");
+        let host = model.transcript_v2_for_test().expect("V2 host");
+        assert!(host.inspector_open(), "the palette opens the V2 inspector");
+        assert!(host.transcript_focus_active(), "entering focus on the way");
+        for route_id in [
             "tools.expandAll",
+            "tools.collapseAll",
+            "tools.resetDisclosure",
             "transcript.cycleDetail",
+            "transcript.makeDefault",
         ] {
-            model.chat.app.set_status(String::new());
-            route(&mut model, unavailable);
+            route(&mut model, route_id);
             assert!(
-                model
-                    .chat
-                    .app
-                    .status()
-                    .contains("not available with transcript engine v2"),
-                "{unavailable}: {}",
+                !model.chat.app.status().contains("not available"),
+                "{route_id}: {}",
                 model.chat.app.status()
             );
-            assert!(!model.chat.app.transcript_focus_active(), "{unavailable}");
-            assert!(!model.chat.app.inspector_open(), "{unavailable}");
+            assert!(!model.chat.app.transcript_focus_active(), "{route_id}");
+            assert!(!model.chat.app.inspector_open(), "{route_id}");
         }
         drop(model);
     }
 
-    /// With V2 selected the interactive surface is docked below the transcript, never placed
-    /// from the hidden V1 transcript layout, even with transcript placement configured.
+    /// With V2 selected and transcript placement configured, the interactive surface is placed
+    /// from the V2 engine's reserved interaction unit, never from the hidden V1 transcript
+    /// layout: without a resident interaction unit it has no visible rows.
     #[tokio::test]
-    async fn v2_docks_the_interactive_surface() {
+    async fn v2_places_the_interactive_surface_from_the_v2_transcript() {
         use bmux_tui_runtime::Presenter;
 
         struct Surface;
@@ -9170,12 +9397,11 @@ mod tests {
             .expect("surface geometry");
         assert_eq!(
             geometry.placement,
-            super::super::chat_loop::InteractiveSurfacePlacement::Pinned
+            super::super::chat_loop::InteractiveSurfacePlacement::Transcript
         );
-        let body = model.committed_layout.expect("layout").body;
         assert!(
-            geometry.destination.y >= body.bottom(),
-            "docked below the transcript: {geometry:?} body {body:?}"
+            geometry.destination.is_empty(),
+            "no resident interaction unit, no rows: {geometry:?}"
         );
         drop(model);
     }
@@ -9226,6 +9452,7 @@ mod tests {
         );
         assert!(screen(&mut v1).contains("v1 only transcript"));
         assert_ne!(v1.committed_selection.fragments().len(), 0);
+        assert_ne!(v1.chat.app.transcript_layout().total_rows(), 0);
         drop(v1);
 
         let mut v2 = root_test_model_with_history(session_id, &history);
@@ -9235,6 +9462,8 @@ mod tests {
         let painted = screen(&mut v2);
         assert!(!painted.contains("v1 only transcript"), "{painted}");
         assert_eq!(v2.committed_selection.fragments().len(), 0);
+        // The shared chrome layout is derived without preparing the V1 transcript layout.
+        assert_eq!(v2.chat.app.transcript_layout().total_rows(), 0);
         let body = v2.committed_layout.expect("committed layout").body;
         let host = v2.transcript_v2_for_test().expect("V2 host");
         let geometry = host.engine().geometry();
@@ -9247,6 +9476,52 @@ mod tests {
             Some(1)
         );
         drop(v2);
+    }
+
+    /// F5: transcript work the commit itself runs (accepting a Markdown visual, a render
+    /// configuration flush) repaints the transcript region alone, not the whole screen.
+    #[tokio::test]
+    async fn v2_work_run_at_commit_repaints_only_the_transcript_region() {
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
+        let mut model = root_test_model_with_history(session_id, &[]);
+        model.transcript_engine =
+            super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
+                bcode_config::TuiEngine::V2,
+            );
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("frame presents");
+        let _update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("frame presents");
+        // A unit-scoped render change flushed by the commit's visual scheduling.
+        assert!(
+            model
+                .transcript_v2_mut_for_test()
+                .expect("V2 host")
+                .set_markdown_details("transcript:item:x:details:0".to_owned(), true)
+        );
+        let _update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
+        let layout = model.committed_layout.expect("committed layout");
+        let region = super::super::transcript_v2_host::paint::transcript_region(layout);
+        assert!(
+            !model.presentation_damage.is_full(),
+            "{:?}",
+            model.presentation_damage
+        );
+        assert_eq!(
+            model.presentation_damage.retained_regions(),
+            [region],
+            "{:?}",
+            model.presentation_damage
+        );
+        drop(model);
     }
 
     #[tokio::test]

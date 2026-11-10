@@ -33,6 +33,7 @@ use super::item_facts::{
     invocation_id, is_attached_contribution, is_historical_request, item_facts, tool_arguments,
     tool_duration_ms,
 };
+use super::tools::{InlineInteraction, InlineSurface, InlineTools, expand_shell_output};
 use super::{ItemPlacement, MemberRendering, UnitStructure, starts_turn};
 use crate::layout::context::{StableHasher, hash_presentation};
 use crate::units::UnitKey;
@@ -111,6 +112,10 @@ pub struct ItemStructure {
     pub target: DisclosureTarget,
     /// Whether the unit may be collapsed (units awaiting a decision may not).
     pub collapsible: bool,
+    /// Rows reserved for the active inline interaction surface the host paints over the unit
+    /// (`interactions.placement = transcript`, D10); the unit then renders these blank rows
+    /// instead of its own content.
+    pub reserved_rows: Option<u32>,
 }
 
 /// Resolved structure of one group header unit.
@@ -160,6 +165,7 @@ impl ResolvedUnitPresentation {
                 hash_rendered_facts(&item.facts, &mut hasher);
                 item.rendering.hash(&mut hasher);
                 item.collapsible.hash(&mut hasher);
+                item.reserved_rows.hash(&mut hasher);
             }
             Self::Group(group) => {
                 2u8.hash(&mut hasher);
@@ -288,6 +294,8 @@ struct Entry {
     attached: bool,
     request: bool,
     superseded: bool,
+    /// Inline tooling the item supports (shell screen, pending interaction).
+    inline: InlineSurface,
 }
 
 impl Entry {
@@ -302,6 +310,7 @@ impl Entry {
             && self.invocation == other.invocation
             && self.attached == other.attached
             && self.duration_ms == other.duration_ms
+            && self.inline == other.inline
     }
 }
 
@@ -320,7 +329,9 @@ pub struct StructureResolver {
     config: StructureConfig,
     config_key: Option<u64>,
     overrides: DisclosureOverrides,
-    placed_overrides: Option<u64>,
+    /// Inline tooling state (shell expansions, the inline interaction reservation).
+    tools: InlineTools,
+    placed_overrides: Option<(u64, u64)>,
     turns: TurnFacts,
     entries: Vec<Entry>,
     positions: BTreeMap<TranscriptViewItemId, usize>,
@@ -351,6 +362,7 @@ impl StructureResolver {
             config,
             config_key: None,
             overrides: DisclosureOverrides::new(),
+            tools: InlineTools::default(),
             placed_overrides: None,
             turns: TurnFacts::default(),
             entries: Vec::new(),
@@ -371,6 +383,7 @@ impl StructureResolver {
                 group: None,
                 target: DisclosureTarget::Unit(TranscriptViewItemId::new("")),
                 collapsible: true,
+                reserved_rows: None,
             }),
         }
     }
@@ -411,7 +424,7 @@ impl StructureResolver {
         }
         if changes.changes.is_empty()
             && items.len() == self.entries.len()
-            && self.placed_overrides == Some(self.overrides.revision())
+            && self.placed_overrides == Some(self.placed_key())
         {
             return StructureUpdate::default();
         }
@@ -442,7 +455,7 @@ impl StructureResolver {
                     touched.insert(position);
                 }
             }
-            if touched.is_empty() && self.placed_overrides == Some(self.overrides.revision()) {
+            if touched.is_empty() && self.placed_overrides == Some(self.placed_key()) {
                 return StructureUpdate::default();
             }
             if !touched.is_empty() {
@@ -464,7 +477,7 @@ impl StructureResolver {
             }
             match self.splice(items) {
                 Some(dirty) => regroup = Some(dirty),
-                None if self.placed_overrides == Some(self.overrides.revision()) => {
+                None if self.placed_overrides == Some(self.placed_key()) => {
                     return StructureUpdate::default();
                 }
                 None => {}
@@ -590,6 +603,7 @@ impl StructureResolver {
             attached: is_attached_contribution(item),
             request: is_historical_request(item),
             superseded: false,
+            inline: InlineSurface::of(item),
             facts,
             base,
         }
@@ -600,7 +614,8 @@ impl StructureResolver {
     fn place(&mut self) -> StructureUpdate {
         let resident = self.entries.iter().map(|entry| &entry.id).collect();
         self.overrides.reconcile(&resident);
-        self.placed_overrides = Some(self.overrides.revision());
+        self.tools.reconcile(&resident);
+        self.placed_overrides = Some(self.placed_key());
 
         let mut placements = BTreeMap::new();
         let mut structures = BTreeMap::new();
@@ -622,7 +637,10 @@ impl StructureResolver {
                 continue;
             }
             let presentation = self.effective(entry);
-            let placement = if presentation.disclosure == Disclosure::Hidden {
+            let reserved_rows = self.tools.reserved_rows(entry.inline.interaction());
+            let placement = if presentation.disclosure == Disclosure::Hidden
+                && reserved_rows.is_none()
+            {
                 if self.config.reasoning_suppressed && entry.facts.kind == Some(UnitKind::Reasoning)
                 {
                     ItemPlacement::Suppressed
@@ -642,6 +660,7 @@ impl StructureResolver {
                     group: None,
                     target: DisclosureTarget::Unit(entry.id.clone()),
                     collapsible: !entry.facts.awaiting_decision,
+                    reserved_rows,
                 }),
             );
         }
@@ -697,6 +716,9 @@ impl StructureResolver {
         }
         if overridden {
             apply_visibility_floor(&mut presentation, &entry.facts);
+        }
+        if entry.inline == InlineSurface::Shell && self.tools.shell_expanded(&entry.id) {
+            expand_shell_output(&mut presentation);
         }
         presentation
     }
@@ -838,6 +860,10 @@ impl StructureResolver {
                     group: Some(leader.clone()),
                     target: DisclosureTarget::Unit(entry.id.clone()),
                     collapsible: !entry.facts.awaiting_decision,
+                    reserved_rows: rendering
+                        .has_unit()
+                        .then(|| self.tools.reserved_rows(entry.inline.interaction()))
+                        .flatten(),
                 }),
             );
         }
@@ -974,6 +1000,265 @@ impl StructureResolver {
     /// Drop every manual override; returns whether any existed.
     pub fn clear_overrides(&mut self) -> bool {
         self.overrides.clear()
+    }
+}
+
+/// Inline tooling, bulk disclosure and inspection (FO6, C39, D10).
+impl StructureResolver {
+    /// Revision pair that decides whether placements are current: manual overrides and inline
+    /// tooling state.
+    const fn placed_key(&self) -> (u64, u64) {
+        (self.overrides.revision(), self.tools.revision())
+    }
+
+    /// Inline tooling state (shell expansions, inline interaction reservation).
+    #[must_use]
+    pub const fn tools(&self) -> &InlineTools {
+        &self.tools
+    }
+
+    /// Record the disclosure a global detail cycle applied (the next cycle continues from it).
+    pub const fn note_detail_cycle(&mut self, disclosure: Disclosure) {
+        self.tools.set_detail_cycle(disclosure);
+    }
+
+    fn entry_of(&self, id: &TranscriptViewItemId) -> Option<&Entry> {
+        self.positions
+            .get(id)
+            .and_then(|&position| self.entries.get(position))
+    }
+
+    /// Facts of the resident item `id`, as rules saw them.
+    #[must_use]
+    pub fn item_facts(&self, id: &TranscriptViewItemId) -> Option<&UnitFacts> {
+        self.entry_of(id).map(|entry| &entry.facts)
+    }
+
+    /// Whether the resident item `id` is a tool whose output is a shell screen (C39).
+    #[must_use]
+    pub fn is_shell(&self, id: &TranscriptViewItemId) -> bool {
+        self.entry_of(id)
+            .is_some_and(|entry| entry.inline == InlineSurface::Shell)
+    }
+
+    /// Expand or collapse the shell screen of `id` inline (C39); returns whether anything
+    /// changed. Items without a shell screen never expand. Applied by the next
+    /// [`Self::update`].
+    pub fn set_shell_expanded(&mut self, id: &TranscriptViewItemId, expanded: bool) -> bool {
+        if expanded && !self.is_shell(id) {
+            return false;
+        }
+        self.tools.set_shell_expanded(id, expanded)
+    }
+
+    /// Reserve rows for the inline interaction surface, or drop the reservation (D10); returns
+    /// whether it changed. Applied by the next [`Self::update`].
+    pub fn set_inline_interaction(&mut self, interaction: Option<InlineInteraction>) -> bool {
+        self.tools.set_interaction(interaction)
+    }
+
+    /// Resident item that holds the inline interaction reservation.
+    #[must_use]
+    pub fn inline_interaction_item(&self) -> Option<&TranscriptViewItemId> {
+        let reserved = self.tools.interaction()?;
+        self.entries
+            .iter()
+            .find(|entry| entry.inline.interaction() == Some(reserved.interaction_id.as_str()))
+            .map(|entry| &entry.id)
+    }
+
+    /// Members of the group led by `leader`, in transcript order.
+    #[must_use]
+    pub fn group_members(&self, leader: &TranscriptViewItemId) -> &[TranscriptViewItemId] {
+        match self
+            .group_heads
+            .get(leader)
+            .and_then(|head| self.groups.get(head))
+        {
+            Some(ResolvedUnitPresentation::Group(group)) => &group.members,
+            _ => &[],
+        }
+    }
+
+    /// Set every resident unit and group to `disclosure` (bulk expand/collapse). Units awaiting
+    /// a decision keep their floor and hidden units stay hidden; groups are never hidden.
+    /// Returns whether any override changed. Applied by the next [`Self::update`].
+    pub fn set_all(&mut self, disclosure: Disclosure) -> bool {
+        let mut targets = Vec::new();
+        for group in self.groups.values() {
+            if let ResolvedUnitPresentation::Group(group) = group
+                && group.presentation.disclosure != disclosure
+            {
+                targets.push(group.target.clone());
+            }
+        }
+        for entry in &self.entries {
+            if entry.facts.awaiting_decision {
+                continue;
+            }
+            let current = match self.items.get(&entry.id) {
+                Some(ResolvedUnitPresentation::Item(item)) => item.presentation.disclosure,
+                _ => continue,
+            };
+            if current != Disclosure::Hidden && current != disclosure {
+                targets.push(DisclosureTarget::Unit(entry.id.clone()));
+            }
+        }
+        let mut changed = false;
+        for target in targets {
+            changed |= self.set_disclosure(&target, disclosure);
+        }
+        changed
+    }
+
+    /// Drop the manual overrides `remove` selects (focus-scoped reset); returns whether any
+    /// was dropped. Applied by the next [`Self::update`].
+    pub fn clear_matching(&mut self, remove: impl FnMut(&DisclosureTarget) -> bool) -> bool {
+        self.overrides.remove_matching(remove)
+    }
+
+    /// Explain how `target` resolved (FO6 structure inspector): facts, every resolved property
+    /// with the rule that set it, floor adjustments, the manual override and grouping notes.
+    /// `None` for targets that are not resident.
+    #[must_use]
+    pub fn inspect(&self, target: &DisclosureTarget) -> Option<Inspection> {
+        match target {
+            DisclosureTarget::Group(leader) => self.inspect_group(leader),
+            DisclosureTarget::Unit(id) | DisclosureTarget::Section(id, _) => {
+                self.inspect_unit(id, target)
+            }
+        }
+    }
+
+    fn inspect_unit(
+        &self,
+        id: &TranscriptViewItemId,
+        target: &DisclosureTarget,
+    ) -> Option<Inspection> {
+        let entry = self.entry_of(id)?;
+        let ResolvedUnitPresentation::Item(item) = self.items.get(id)? else {
+            return None;
+        };
+        let mut explained = self.config.policy.explain(&entry.facts);
+        let unit_override = self.overrides.get(&DisclosureTarget::Unit(id.clone()));
+        if let Some(disclosure) = unit_override {
+            explained.presentation.disclosure = disclosure;
+            explained
+                .floor
+                .push(format!("manual toggle: disclosure set to {disclosure:?}"));
+            // The floor applies after manual toggles, as after rules.
+            let floor = apply_visibility_floor(&mut explained.presentation, &entry.facts);
+            explained.floor.extend(floor);
+        }
+        let manual = self.overrides.get(target);
+        let mut notes = Vec::new();
+        let effective = match target {
+            DisclosureTarget::Section(_, name) => {
+                let effective = item.presentation.section(name).disclosure;
+                if let Some(manual) = manual
+                    && manual != effective
+                {
+                    explained.floor.push(format!(
+                        "visibility floor keeps section {name} {} (manual: {})",
+                        disclosure_label(effective),
+                        disclosure_label(manual)
+                    ));
+                }
+                effective
+            }
+            _ => item.presentation.disclosure,
+        };
+        if entry.inline == InlineSurface::Shell && self.tools.shell_expanded(id) {
+            notes.push("shell screen expanded inline".to_owned());
+        }
+        if let Some(group) = &item.group {
+            notes.push(format!(
+                "in {}; the group's disclosure decides whether it renders",
+                DisclosureTarget::Group(group.clone())
+            ));
+            if !matches!(target, DisclosureTarget::Section(..))
+                && effective != explained.presentation.disclosure
+            {
+                notes.push(format!(
+                    "shown {} as a member of its group (resolved {})",
+                    disclosure_label(effective),
+                    disclosure_label(explained.presentation.disclosure)
+                ));
+            }
+        }
+        Some(Inspection {
+            target: target.clone(),
+            facts: entry.facts.clone(),
+            effective,
+            manual,
+            explained,
+            notes,
+        })
+    }
+
+    fn inspect_group(&self, leader: &TranscriptViewItemId) -> Option<Inspection> {
+        let ResolvedUnitPresentation::Group(group) =
+            self.groups.get(self.group_heads.get(leader)?)?
+        else {
+            return None;
+        };
+        let target = DisclosureTarget::Group(leader.clone());
+        let mut explained = self.config.policy.explain(&group.facts);
+        let manual = self.overrides.get(&target);
+        if let Some(manual) = manual {
+            explained.floor.push(format!(
+                "manual toggle: disclosure set to {}",
+                disclosure_label(manual)
+            ));
+        }
+        if explained.presentation.disclosure == Disclosure::Hidden {
+            explained
+                .floor
+                .push("groups are never hidden: shown collapsed".to_owned());
+        }
+        let tools = group
+            .tools
+            .iter()
+            .map(|(tool, count)| format!("{tool}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(Inspection {
+            target,
+            facts: group.facts.clone(),
+            effective: group.presentation.disclosure,
+            manual,
+            explained,
+            notes: vec![format!("{} member(s): {tools}", group.members.len())],
+        })
+    }
+}
+
+/// What the structure inspector shows for one disclosure target (FO6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inspection {
+    /// The inspected target.
+    pub target: DisclosureTarget,
+    /// Facts the owning unit (or group) resolved with.
+    pub facts: UnitFacts,
+    /// The target's effective disclosure, as painted.
+    pub effective: Disclosure,
+    /// Manual override recorded for the target, before the floor.
+    pub manual: Option<Disclosure>,
+    /// Policy resolution with provenance; manual unit toggles and section floor notes are
+    /// folded into its `floor` notes.
+    pub explained: bcode_presentation_policy::ExplainedPresentation,
+    /// Grouping and inline tooling notes.
+    pub notes: Vec<String>,
+}
+
+/// Human label of a disclosure.
+#[must_use]
+pub const fn disclosure_label(disclosure: Disclosure) -> &'static str {
+    match disclosure {
+        Disclosure::Expanded => "expanded",
+        Disclosure::Summary => "summary",
+        Disclosure::Collapsed => "collapsed",
+        Disclosure::Hidden => "hidden",
     }
 }
 

@@ -58,6 +58,16 @@ impl DisclosureTarget {
             _ => Some(Disclosure::Collapsed),
         }
     }
+
+    /// Whether `other` is this target or lies under it: a unit contains its sections. Groups
+    /// contain only themselves (their members are separate unit targets).
+    #[must_use]
+    pub fn contains(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unit(id), Self::Section(other, _)) => id == other,
+            _ => self == other,
+        }
+    }
 }
 
 /// `unit:<id>`, `group:<id>` or `section:<id>:<name>`; used as a stable hit identity.
@@ -201,6 +211,17 @@ impl DisclosureOverrides {
         self.entries.clear();
         self.revision = self.revision.wrapping_add(1);
         true
+    }
+
+    /// Drop every override whose target `remove` selects; returns whether any was dropped.
+    pub fn remove_matching(&mut self, mut remove: impl FnMut(&DisclosureTarget) -> bool) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|target, _| !remove(target));
+        let changed = self.entries.len() != before;
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
     }
 
     /// Forget overrides whose items are no longer resident (D12); returns whether any were

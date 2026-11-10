@@ -11,6 +11,7 @@ pub mod disclosure;
 pub mod item_facts;
 pub mod layers;
 pub mod resolver;
+pub mod tools;
 
 use bcode_session_view_models::{TranscriptViewItem, TranscriptViewItemKind};
 
@@ -18,9 +19,10 @@ pub use disclosure::{DisclosureOverrides, DisclosureTarget, MAX_DISCLOSURE_OVERR
 pub use item_facts::{DeclaredTargetFields, HOST_TARGET_FIELDS, NoPluginFacts, PluginFactSource};
 pub use layers::{PolicyLayers, density_layer};
 pub use resolver::{
-    GroupStructure, ItemStructure, ResolvedUnitPresentation, StructureConfig, StructureResolver,
-    StructureUpdate,
+    GroupStructure, Inspection, ItemStructure, ResolvedUnitPresentation, StructureConfig,
+    StructureResolver, StructureUpdate,
 };
+pub use tools::{InlineInteraction, MAX_INLINE_INTERACTION_ROWS, MAX_SHELL_EXPANSIONS};
 
 /// How one grouped item renders under its group's current disclosure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

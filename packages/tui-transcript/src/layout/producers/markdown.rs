@@ -32,17 +32,35 @@
 //! # Asynchronous visuals
 //!
 //! Images and Mermaid diagrams reserve fixed placeholder rows in the projection (L8). The
-//! reserved rectangles are exposed as `markdown:` content keys and rendered selection
-//! fragments. Host-side workers paint accepted images over those rows, which never changes
-//! layout. Mermaid contributions are requested only when [`MarkdownOptions::mermaid`] is set.
+//! reserved rectangles are exposed as `markdown:` content keys, rendered selection fragments
+//! and [`VisualSlot`]s (the request a host-side worker needs, in item-local cells). Mermaid
+//! contributions are requested only when [`MarkdownOptions::mermaid`] is set.
+//!
+//! Host-side workers render slots outside drawing and accept the results into
+//! [`MarkdownOptions::visuals`] ([`MarkdownVisualState`]), keyed by contribution id. An
+//! accepted visual is a unit revision: its acceptance revision is part of the owning unit's
+//! fingerprint, so exactly that unit is re-projected, and the projection applies it only on an
+//! exact contribution id and source key match ([`VisualSlotRequest::source_key`]). Acceptance
+//! never changes the row count (the reservation is fixed):
+//!
+//! * [`MarkdownVisual::Image`]: the reserved rows keep only the cells left of the slot and the
+//!   body registers one frame-scoped BMUX image placement over the slot from its own retained
+//!   node while painting, so placements exist only for painted, correctly positioned content
+//!   and are clipped by the painting context (a scrolled-out unit contributes none).
+//! * [`MarkdownVisual::Notice`]: the reserved rows show the notice lines (failures, disabled
+//!   network loading), clipped at the slot.
+//!
+//! Either way the rows are rendered rows without source correspondence (ambiguity 10).
 //!
 //! [`MarkdownOptions::mermaid`]: crate::layout::context::MarkdownOptions::mermaid
+//! [`MarkdownOptions::visuals`]: crate::layout::context::MarkdownOptions::visuals
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use bcode_markdown_render::{
-    MarkdownContributionKind, MarkdownRenderOptions, MarkdownRenderResult, MarkdownTheme,
-    MermaidContributionRendering, render_markdown,
+    MarkdownContributionKind, MarkdownDestination, MarkdownRenderOptions, MarkdownRenderResult,
+    MarkdownSelectionKind, MarkdownTheme, MermaidContributionRendering, render_markdown,
 };
 use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
 use bcode_tui_theme::definition::ResolvedThemeDefinition;
@@ -50,15 +68,19 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutNode, LogicalRect,
 };
 use bmux_tui::composition::TextBlock;
+use bmux_tui::geometry::Rect;
+use bmux_tui::image::{
+    ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement,
+};
 use bmux_tui::paint::PaintCx;
 use bmux_tui::style::{Modifier, Style};
-use bmux_tui::text::{Text, TextWrap};
+use bmux_tui::text::{Line, Span, Text, TextWrap};
 
 use super::{ItemContent, ItemRenderContext, ProducedItem, ProducerWork};
 use crate::layout::SourcePosition;
 use crate::layout::geometry::{
-    ContentKeyRegion, ItemAction, ItemGeometry, ItemHitRegion, ItemSelectionFragment, SourceRow,
-    SourceRows,
+    ContentKeyRegion, ItemAction, ItemGeometry, ItemHitRegion, ItemSelectionFragment,
+    SelectableRun, SelectableRunKind, SelectableText, SourceRow, SourceRows,
 };
 
 /// Rows reserved for one inline image placeholder (L8).
@@ -72,6 +94,201 @@ pub const MERMAID_PIXELS: (u32, u32) = (1600, 1200);
 
 /// Content-key namespace of Markdown contributions (E3).
 pub const CONTENT_KEY_PREFIX: &str = "markdown:";
+
+// ---- asynchronous visuals -------------------------------------------------------------------
+
+/// What a host-side worker needs to render one reserved Markdown visual.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VisualSlotRequest {
+    /// A Mermaid diagram.
+    Mermaid {
+        /// Diagram source without the fence.
+        source: String,
+        /// Versioned renderer cache key (covers the source and the requested size).
+        cache_key: String,
+    },
+    /// An inline image.
+    Image {
+        /// Parser-semantic alt text.
+        alt: String,
+        /// Classified source; unsafe schemes are inert.
+        source: MarkdownDestination,
+        /// Safe classified destination when the image is nested in a link.
+        linked_destination: Option<MarkdownDestination>,
+    },
+}
+
+impl VisualSlotRequest {
+    /// Identity of the rendered content: an accepted visual applies to a slot only when its
+    /// source key equals the slot's (exact options match). Mermaid uses its renderer cache key;
+    /// images use their classified source.
+    #[must_use]
+    pub fn source_key(&self) -> String {
+        match self {
+            Self::Mermaid { cache_key, .. } => format!("mermaid:{cache_key}"),
+            Self::Image { source, .. } => format!("image:{}", destination_key(source)),
+        }
+    }
+}
+
+/// Stable text of a classified destination.
+fn destination_key(destination: &MarkdownDestination) -> String {
+    match destination {
+        MarkdownDestination::Web(url) => url.as_str().to_owned(),
+        MarkdownDestination::LocalPath(path) => format!("file:{}", path.to_string_lossy()),
+        MarkdownDestination::Fragment(fragment) => format!("#{fragment}"),
+        MarkdownDestination::UnresolvedRelative(source) => format!("relative:{source}"),
+        MarkdownDestination::Inert { reason } => format!("inert:{reason:?}"),
+    }
+}
+
+/// One reserved asynchronous visual of an item (L8), in item-local cells of the retained
+/// layout it was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VisualSlot {
+    /// Owner-qualified contribution id (`transcript:<unit>:...`); the acceptance key.
+    pub contribution_id: String,
+    /// Reserved rectangle: from the slot's first column to the body's right edge, over every
+    /// reserved row.
+    pub rect: LogicalRect,
+    /// What a worker renders for the slot.
+    pub request: VisualSlotRequest,
+}
+
+/// A host-accepted rendering of one visual slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownVisual {
+    /// Decoded image content placed over the slot (contained, aspect ratio preserved).
+    Image(Arc<ImagePayload>),
+    /// Text rows replacing the slot's rows (one row per line, clipped at the slot).
+    Notice(Arc<str>),
+}
+
+/// One accepted visual (L8): a worker result accepted for an exact contribution and source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedMarkdownVisual {
+    /// [`VisualSlotRequest::source_key`] of the request the result was rendered for.
+    pub source_key: String,
+    /// Acceptance revision; part of the owning unit's fingerprint.
+    pub revision: u64,
+    /// The rendering.
+    pub visual: MarkdownVisual,
+}
+
+/// Accepted Markdown visuals by owner-qualified contribution id (computed outside drawing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkdownVisualState {
+    accepted: BTreeMap<String, AcceptedMarkdownVisual>,
+}
+
+impl MarkdownVisualState {
+    /// No accepted visuals.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            accepted: BTreeMap::new(),
+        }
+    }
+
+    /// The accepted visual of a contribution, if any.
+    #[must_use]
+    pub fn accepted(&self, contribution_id: &str) -> Option<&AcceptedMarkdownVisual> {
+        self.accepted.get(contribution_id)
+    }
+
+    /// The accepted visual of `slot`, when it was rendered for the slot's exact source.
+    #[must_use]
+    pub fn for_slot(&self, slot: &VisualSlot) -> Option<&AcceptedMarkdownVisual> {
+        self.accepted_for(&slot.contribution_id, &slot.request)
+    }
+
+    fn accepted_for(
+        &self,
+        contribution_id: &str,
+        request: &VisualSlotRequest,
+    ) -> Option<&AcceptedMarkdownVisual> {
+        self.accepted
+            .get(contribution_id)
+            .filter(|accepted| accepted.source_key == request.source_key())
+    }
+
+    /// Accept a visual for a contribution, replacing any previous one.
+    pub fn accept(&mut self, contribution_id: impl Into<String>, visual: AcceptedMarkdownVisual) {
+        self.accepted.insert(contribution_id.into(), visual);
+    }
+
+    /// Drop the accepted visual of a contribution; returns whether one existed.
+    pub fn remove(&mut self, contribution_id: &str) -> bool {
+        self.accepted.remove(contribution_id).is_some()
+    }
+
+    /// Keep only visuals whose contribution id `keep` accepts (residency reconciliation).
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.accepted.retain(|id, _| keep(id));
+    }
+
+    /// Number of accepted visuals.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.accepted.len()
+    }
+
+    /// Whether no visual is accepted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.accepted.is_empty()
+    }
+
+    /// Whether the accepted visuals of Markdown document `document_id` (contribution ids
+    /// under `<document_id>:`) differ between `self` and `other`: a visual added, removed,
+    /// replaced or re-accepted.
+    #[must_use]
+    pub fn document_differs(&self, other: &Self, document_id: &str) -> bool {
+        let prefix = format!("{document_id}:");
+        let entries = |state: &'_ Self| {
+            state
+                .accepted
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(|(id, _)| id.starts_with(&prefix))
+                .map(|(id, visual)| (id.clone(), visual.clone()))
+                .collect::<Vec<_>>()
+        };
+        entries(self) != entries(other)
+    }
+
+    /// Acceptance revisions of one Markdown document's contributions (ids under
+    /// `<document_id>:`), in id order: the unit-scoped fingerprint input (L3).
+    pub fn revisions_for<'a>(
+        &'a self,
+        document_id: &str,
+    ) -> impl Iterator<Item = (&'a str, u64)> + 'a {
+        let prefix = format!("{document_id}:");
+        self.accepted
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |(id, _)| id.starts_with(&prefix))
+            .map(|(id, accepted)| (id.as_str(), accepted.revision))
+    }
+}
+
+/// BMUX image key of an accepted visual placed in contribution `contribution_id`.
+#[must_use]
+pub fn visual_image_key(contribution_id: &str) -> ImageKey {
+    ImageKey::new(format!("{CONTENT_KEY_PREFIX}{contribution_id}"))
+}
+
+/// One accepted image placed over a slot (projection-local cells).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacedImage {
+    key: ImageKey,
+    rect: LogicalRect,
+    payload: Arc<ImagePayload>,
+}
 
 /// One Markdown projection request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,18 +479,35 @@ pub struct MarkdownBody {
     /// First source byte shown by each projected line, when known.
     line_sources: Vec<Option<u64>>,
     contributions: Vec<ContributionRegion>,
+    /// Reserved asynchronous visuals (projection-local cells).
+    slots: Vec<VisualSlot>,
+    /// Accepted images placed over their slots while painting.
+    images: Vec<PlacedImage>,
+    /// Source-backed selectable text (C34), attached with the source the projection was
+    /// rendered from ([`Self::attach_selectable_source`]).
+    selectable: Option<SelectableText>,
 }
 
 impl MarkdownBody {
-    /// Wrap a BMUX projection. With `mapped`, per-row source anchors come from the
-    /// projection's selection provenance; with `mermaid_placeholders`, Mermaid contributions
-    /// were requested and occupy reserved placeholder rows.
+    /// Wrap a BMUX projection laid out at `width` cells. With `mapped`, per-row source
+    /// anchors come from the projection's selection provenance; with `mermaid_placeholders`,
+    /// Mermaid contributions were requested and occupy reserved placeholder rows. Visuals in
+    /// `visuals` accepted for the exact contribution and source of a reserved slot are applied
+    /// (module documentation).
     #[must_use]
     pub fn from_projection(
         result: &MarkdownRenderResult,
+        width: u64,
         mapped: bool,
         mermaid_placeholders: bool,
+        visuals: &MarkdownVisualState,
     ) -> Self {
+        let mut body = Self::project(result, mapped, mermaid_placeholders);
+        body.apply_visuals(result, width, mermaid_placeholders, visuals);
+        body
+    }
+
+    fn project(result: &MarkdownRenderResult, mapped: bool, mermaid_placeholders: bool) -> Self {
         let mut line_sources: Vec<Option<u64>> = vec![None; result.lines.len()];
         if mapped {
             for unit in result.selection_provenance() {
@@ -331,13 +565,196 @@ impl MarkdownBody {
             block: TextBlock::new(Text::from_lines(result.lines.clone())).wrap(TextWrap::None),
             line_sources,
             contributions,
+            slots: Vec::new(),
+            images: Vec::new(),
+            selectable: None,
         }
+    }
+
+    /// Attach the selectable source text of a mapped projection (C34): runs come from the
+    /// projection's selection provenance (already derived for the source map), merged per row
+    /// where cells and source bytes are contiguous. A merged run is kept as plain text only
+    /// when BMUX's plain-text fragments of its source reproduce the provenance cells exactly;
+    /// otherwise each unit stays its own indivisible run. Rows replaced by accepted visuals
+    /// are not selectable. Without provenance (streaming documents) nothing is attached.
+    pub fn attach_selectable_source(&mut self, result: &MarkdownRenderResult, source: &str) {
+        if !result.has_selection_source(source) {
+            return;
+        }
+        let mut units: Vec<(u64, u64, u64, std::ops::Range<usize>)> = result
+            .selection_provenance()
+            .iter()
+            .filter(|unit| {
+                matches!(
+                    unit.kind,
+                    MarkdownSelectionKind::Text | MarkdownSelectionKind::Code
+                )
+            })
+            .filter_map(
+                |unit| match (unit.rects.as_slice(), unit.source_ranges.as_slice()) {
+                    ([rect], [range]) if rect.height == 1 && rect.width > 0 => Some((
+                        u64::from(rect.y),
+                        u64::from(rect.x),
+                        u64::from(rect.width),
+                        range.clone(),
+                    )),
+                    _ => None,
+                },
+            )
+            .filter(|(row, ..)| {
+                usize::try_from(*row)
+                    .ok()
+                    .and_then(|row| self.line_sources.get(row))
+                    .is_some_and(Option::is_some)
+            })
+            .filter(|(.., range)| source.get(range.clone()).is_some())
+            .collect();
+        units.sort_by_key(|(row, x, ..)| (*row, *x));
+        let mut runs = Vec::new();
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() {
+                let (row, x, width, range) = &units[end - 1];
+                let (next_row, next_x, _, next_range) = &units[end];
+                if next_row != row || *next_x != x + width || next_range.start != range.end {
+                    break;
+                }
+                end += 1;
+            }
+            push_runs(&mut runs, &units[start..end], source);
+            start = end;
+        }
+        if !runs.is_empty() {
+            self.selectable = Some(SelectableText::new(Arc::from(source), runs));
+        }
+    }
+
+    /// Derive the reserved visual slots of the projection and apply accepted visuals to their
+    /// rows. Rows keep their count; replaced rows lose their source anchors.
+    fn apply_visuals(
+        &mut self,
+        result: &MarkdownRenderResult,
+        width: u64,
+        mermaid_placeholders: bool,
+        visuals: &MarkdownVisualState,
+    ) {
+        let mut lines: Option<Vec<Line>> = None;
+        for contribution in &result.contributions {
+            let request = match &contribution.kind {
+                MarkdownContributionKind::Image {
+                    alt,
+                    source,
+                    linked_destination,
+                    ..
+                } => VisualSlotRequest::Image {
+                    alt: alt.clone(),
+                    source: source.clone(),
+                    linked_destination: linked_destination.clone(),
+                },
+                MarkdownContributionKind::Mermaid {
+                    source,
+                    cache_key,
+                    rendering,
+                } if mermaid_placeholders
+                    && !matches!(rendering, MermaidContributionRendering::Failed(_)) =>
+                {
+                    VisualSlotRequest::Mermaid {
+                        source: source.clone(),
+                        cache_key: cache_key.clone(),
+                    }
+                }
+                _ => continue,
+            };
+            let Some(rect) = self.slot_rect(&contribution.id, width) else {
+                continue;
+            };
+            let slot = VisualSlot {
+                contribution_id: contribution.id.clone(),
+                rect,
+                request,
+            };
+            if let Some(accepted) = visuals.for_slot(&slot) {
+                let lines = lines.get_or_insert_with(|| result.lines.clone());
+                apply_visual(lines, &mut self.line_sources, &slot, accepted);
+                if let MarkdownVisual::Image(payload) = &accepted.visual {
+                    self.images.push(PlacedImage {
+                        key: visual_image_key(&slot.contribution_id),
+                        rect: slot.rect,
+                        payload: Arc::clone(payload),
+                    });
+                }
+            }
+            self.slots.push(slot);
+        }
+        if let Some(lines) = lines {
+            self.block = TextBlock::new(Text::from_lines(lines)).wrap(TextWrap::None);
+        }
+    }
+
+    /// The reserved rectangle of contribution `id`: its first column to the right edge at
+    /// `width`, over its row span. `None` without geometry or columns.
+    fn slot_rect(&self, id: &str, width: u64) -> Option<LogicalRect> {
+        let rects = self
+            .contributions
+            .iter()
+            .filter(|region| region.id == id && region.rect.height > 0)
+            .map(|region| region.rect);
+        let (x, top, bottom) = rects.fold(None, |span: Option<(u64, u64, u64)>, rect| {
+            let bottom = rect.y + rect.height;
+            Some(span.map_or((rect.x, rect.y, bottom), |(x, top, end)| {
+                (x.min(rect.x), top.min(rect.y), end.max(bottom))
+            }))
+        })?;
+        (x < width).then(|| LogicalRect::new(x, top, width - x, bottom - top))
     }
 
     /// Number of projected rows.
     #[must_use]
     pub const fn rows(&self) -> usize {
         self.line_sources.len()
+    }
+
+    /// Reserved asynchronous visuals of the projection (projection-local cells).
+    #[must_use]
+    pub fn visual_slots(&self) -> &[VisualSlot] {
+        &self.slots
+    }
+}
+
+/// Replace the rows of `slot` by `accepted`: each row keeps its cells left of the slot, then
+/// shows the notice line of that row (none for images). Replaced rows lose their anchors.
+fn apply_visual(
+    lines: &mut [Line],
+    line_sources: &mut [Option<u64>],
+    slot: &VisualSlot,
+    accepted: &AcceptedMarkdownVisual,
+) {
+    let prefix = usize::try_from(slot.rect.x).unwrap_or(usize::MAX);
+    let mut notice = match &accepted.visual {
+        MarkdownVisual::Image(_) => None,
+        MarkdownVisual::Notice(text) => Some(text.lines()),
+    };
+    let style = lines
+        .get(usize::try_from(slot.rect.y).unwrap_or(usize::MAX))
+        .and_then(|line| line.spans.first())
+        .map(|span| span.style)
+        .unwrap_or_default();
+    for row in slot.rect.y..slot.rect.y + slot.rect.height {
+        let Ok(row) = usize::try_from(row) else {
+            break;
+        };
+        let Some(line) = lines.get_mut(row) else {
+            break;
+        };
+        let mut replaced = line.truncate(prefix);
+        if let Some(text) = notice.as_mut().and_then(Iterator::next) {
+            replaced.spans.push(Span::styled(text.to_owned(), style));
+        }
+        *line = replaced;
+        if let Some(source) = line_sources.get_mut(row) {
+            *source = None;
+        }
     }
 }
 
@@ -348,11 +765,43 @@ impl Component for MarkdownBody {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.block.paint(layout, cx);
+        // Placements come from this retained node only while it is painted (B3, F4): the
+        // painting context translates and clips them, so a clipped or scrolled-out body
+        // registers nothing stale.
+        for image in &self.images {
+            let Some(rect) = clipped(image.rect, layout.size.width, layout.size.height) else {
+                continue;
+            };
+            cx.push_image(ImageContribution::Present(ImagePlacement {
+                key: image.key.clone(),
+                payload: ImagePayload::clone(&image.payload),
+                destination: rect,
+                fit: ImageFit::Contain,
+                allocation: None,
+                clip: rect,
+                lifecycle: ImageLifecycle::Frame,
+            }));
+        }
     }
 
     fn revision(&self) -> ComponentRevision {
         self.block.revision()
     }
+}
+
+/// `rect` clipped to a `width` by `height` node as a local cell rectangle; `None` when nothing
+/// of it lies inside or it is not addressable in cells.
+fn clipped(rect: LogicalRect, width: u64, height: u64) -> Option<Rect> {
+    if rect.x >= width || rect.y >= height || rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let cells = |value: u64| u16::try_from(value).ok();
+    Some(Rect::new(
+        cells(rect.x)?,
+        cells(rect.y)?,
+        cells(rect.width.min(width - rect.x))?,
+        cells(rect.height.min(height - rect.y))?,
+    ))
 }
 
 impl ItemContent for MarkdownBody {
@@ -409,6 +858,23 @@ impl ItemContent for MarkdownBody {
                 });
             }
         }
+        geometry.visual_slots = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let rect = slot.rect;
+                (rect.y < height && rect.x < width).then(|| VisualSlot {
+                    rect: LogicalRect::new(
+                        rect.x,
+                        rect.y,
+                        rect.width.min(width - rect.x),
+                        rect.height.min(height - rect.y),
+                    ),
+                    ..slot.clone()
+                })
+            })
+            .collect();
+        geometry.selectable = self.selectable.iter().cloned().collect();
         for (region, rows) in spans {
             geometry.content_keys.push(ContentKeyRegion {
                 key: format!("{CONTENT_KEY_PREFIX}{}", region.id),
@@ -440,10 +906,73 @@ pub fn markdown_projection(
         highlights: result.code_block_geometry.len() as u64,
         projections: 1,
     };
-    (
-        MarkdownBody::from_projection(&result, !request.streaming, cx.markdown.mermaid),
-        work,
-    )
+    let mut body = MarkdownBody::from_projection(
+        &result,
+        request.width.max(1),
+        !request.streaming,
+        cx.markdown.mermaid,
+        &cx.markdown.visuals,
+    );
+    if !request.streaming {
+        body.attach_selectable_source(&result, request.source);
+    }
+    (body, work)
+}
+
+/// Runs of one row-contiguous group of provenance units: one plain-text run when BMUX's
+/// plain-text fragments of the group's source reproduce the units' cells and bytes exactly,
+/// else one indivisible run per unit (C34, B3: the cells come from the projection, never from
+/// a separate measurement).
+fn push_runs(
+    runs: &mut Vec<SelectableRun>,
+    group: &[(u64, u64, u64, std::ops::Range<usize>)],
+    source: &str,
+) {
+    let (Some(first), Some(last)) = (group.first(), group.last()) else {
+        return;
+    };
+    let (row, x, ..) = first;
+    let range = first.3.start..last.3.end;
+    let width = group.iter().map(|unit| unit.2).sum::<u64>();
+    let cells = |value: u64| u16::try_from(value).ok();
+    let exact = source.get(range.clone()).is_some_and(|text| {
+        let (Some(left), Some(cells_wide)) = (cells(*x), cells(width)) else {
+            return false;
+        };
+        // The same painted-cell fragments the frame registers for a Text run (B3).
+        let fragments = bmux_tui::selection::painted_text_fragments(
+            "",
+            "",
+            Rect::new(left, 0, cells_wide, 1),
+            0,
+            text,
+            range.start,
+            0,
+        );
+        fragments.len() == group.len()
+            && fragments.iter().zip(group).all(|(fragment, unit)| {
+                u64::from(fragment.area.x) == unit.1
+                    && u64::from(fragment.area.width) == unit.2
+                    && fragment.source_range == unit.3
+            })
+    });
+    if exact {
+        runs.push(SelectableRun {
+            row: *row,
+            x: *x,
+            width,
+            source: range,
+            kind: SelectableRunKind::Text,
+        });
+    } else {
+        runs.extend(group.iter().map(|(row, x, width, range)| SelectableRun {
+            row: *row,
+            x: *x,
+            width: *width,
+            source: range.clone(),
+            kind: SelectableRunKind::Unit,
+        }));
+    }
 }
 
 /// Markdown body of `request` under `cx`.

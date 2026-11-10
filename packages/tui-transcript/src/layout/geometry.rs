@@ -126,6 +126,106 @@ pub struct ItemSelectionFragment {
     pub rendered: bool,
 }
 
+/// One run of selectable cells on one item row, mapped to bytes of its [`SelectableText`]
+/// (C34, BMUX 13).
+///
+/// Runs are read from the retained layout when the item is measured. A [`SelectableRunKind::Text`]
+/// run covers cells whose rendered graphemes are exactly the painted text's `source` bytes
+/// ([`SelectableText::painted`]), so BMUX's painted-cell fragment mechanics
+/// (`painted_text_fragments`, which advance exactly as the buffer paints) register one selection
+/// fragment per painted grapheme from it while painting; a
+/// [`SelectableRunKind::Unit`] run is one indivisible visual unit (an entity, a tab, a rendered
+/// transformation) registered as a single fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SelectableRun {
+    /// Item-local row.
+    pub row: u64,
+    /// First item-local column.
+    pub x: u64,
+    /// Width in cells.
+    pub width: u64,
+    /// Source bytes of the run in its text.
+    pub source: Range<usize>,
+    /// How the run's cells map to its source.
+    pub kind: SelectableRunKind,
+}
+
+/// How a [`SelectableRun`] maps cells to source bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SelectableRunKind {
+    /// Rendered graphemes equal the source bytes, one grapheme per fragment.
+    Text,
+    /// One indivisible visual unit covering all of `source`.
+    Unit,
+}
+
+/// Source-backed selectable text of one item part: the logical source a selection copies
+/// (C34) and the runs that place it on rows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SelectableText {
+    /// Logical source text a selection copies (Markdown source, plain text, tool output).
+    pub text: std::sync::Arc<str>,
+    /// The text as painted, when it differs from [`Self::text`] (control characters painted
+    /// as spaces). It has the same byte length, so run source ranges index both; fragments are
+    /// measured over it and copies read [`Self::text`] (C34, C36).
+    pub display: Option<std::sync::Arc<str>>,
+    /// Runs in row order.
+    pub runs: Vec<SelectableRun>,
+}
+
+impl SelectableText {
+    /// Selectable text whose painted text is `text` itself.
+    #[must_use]
+    pub const fn new(text: std::sync::Arc<str>, runs: Vec<SelectableRun>) -> Self {
+        Self {
+            text,
+            display: None,
+            runs,
+        }
+    }
+
+    /// The text as painted: [`Self::display`] when present, else [`Self::text`].
+    #[must_use]
+    pub fn painted(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.text)
+    }
+
+    /// Rows the runs cover (`0..0` without runs).
+    #[must_use]
+    pub fn rows(&self) -> Range<u64> {
+        let start = self.runs.first().map_or(0, |run| run.row);
+        let end = self.runs.last().map_or(0, |run| run.row + 1);
+        start..end.max(start)
+    }
+
+    /// The runs on item-local `rows`, found by binary search over the row-ordered runs, so a
+    /// frame visits only the runs it shows however tall the item is.
+    #[must_use]
+    pub fn runs_in_rows(&self, rows: Range<u64>) -> &[SelectableRun] {
+        let start = self.runs.partition_point(|run| run.row < rows.start);
+        let end = self.runs.partition_point(|run| run.row < rows.end);
+        self.runs.get(start..end.max(start)).unwrap_or_default()
+    }
+
+    /// The text moved by `dx` columns and `dy` rows.
+    #[must_use]
+    pub fn translated(self, dx: u64, dy: u64) -> Self {
+        Self {
+            text: self.text,
+            display: self.display,
+            runs: self
+                .runs
+                .into_iter()
+                .map(|run| SelectableRun {
+                    row: run.row + dy,
+                    x: run.x + dx,
+                    ..run
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A producer-namespaced content key covering rows (E3).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContentKeyRegion {
@@ -167,10 +267,16 @@ pub struct ItemGeometry {
     pub hit_regions: Vec<ItemHitRegion>,
     /// Selectable fragments.
     pub selection_fragments: Vec<ItemSelectionFragment>,
+    /// Source-backed selectable text parts in layout order; a part's index is its selection
+    /// content identity within the item (C34).
+    pub selectable: Vec<SelectableText>,
     /// Producer content keys.
     pub content_keys: Vec<ContentKeyRegion>,
     /// Paint-only slots.
     pub paint_slots: Vec<PaintSlot>,
+    /// Reserved asynchronous visuals (Markdown images and Mermaid diagrams, L8) that host-side
+    /// workers render outside drawing.
+    pub visual_slots: Vec<super::producers::markdown::VisualSlot>,
 }
 
 impl ItemGeometry {
@@ -216,6 +322,11 @@ impl ItemGeometry {
                     ..fragment
                 })
                 .collect(),
+            selectable: self
+                .selectable
+                .into_iter()
+                .map(|text| text.translated(dx, dy))
+                .collect(),
             content_keys: self
                 .content_keys
                 .into_iter()
@@ -230,6 +341,14 @@ impl ItemGeometry {
                 .map(|slot| PaintSlot {
                     rect: rect(slot.rect),
                     kind: slot.kind,
+                })
+                .collect(),
+            visual_slots: self
+                .visual_slots
+                .into_iter()
+                .map(|slot| super::producers::markdown::VisualSlot {
+                    rect: rect(slot.rect),
+                    ..slot
                 })
                 .collect(),
         }
@@ -310,5 +429,31 @@ mod tests {
         for query in &queries {
             assert_eq!(rows.row_for_source(query), scan(query), "{query:?}");
         }
+    }
+
+    #[test]
+    fn selectable_runs_are_found_by_row_range_and_survive_translation() {
+        let runs = (0..4_096_u64)
+            .flat_map(|row| {
+                [0, 10].map(|x| SelectableRun {
+                    row,
+                    x,
+                    width: 5,
+                    source: 0..1,
+                    kind: SelectableRunKind::Unit,
+                })
+            })
+            .collect::<Vec<_>>();
+        let text = SelectableText::new(std::sync::Arc::from("x"), runs);
+        assert_eq!(text.rows(), 0..4_096);
+        let visible = text.runs_in_rows(2_000..2_003);
+        assert_eq!(visible.len(), 6);
+        assert!(visible.iter().all(|run| (2_000..2_003).contains(&run.row)));
+        assert_eq!(text.runs_in_rows(5_000..5_010), &[] as &[SelectableRun]);
+        assert_eq!(text.runs_in_rows(3..3), &[] as &[SelectableRun]);
+        let moved = text.translated(2, 7);
+        assert_eq!(moved.runs_in_rows(7..8).len(), 2);
+        assert_eq!(moved.runs_in_rows(7..8)[0].x, 2);
+        assert_eq!(moved.painted(), "x");
     }
 }

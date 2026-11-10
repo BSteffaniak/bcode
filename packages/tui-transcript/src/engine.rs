@@ -48,9 +48,15 @@ use crate::viewport::{
 };
 use crate::window::{
     EvictionContext, HistoryPageResult, HistoryWindowResult, IssuedRequest, LiveInput, LiveOutcome,
-    PageDirection, PageRequest, ResidentWindow, StaleResult, WindowManager, WindowRequest,
+    PAGE_EVENTS, PageDirection, PageRequest, RESIDENT_CEILING_EVENTS, ResidentWindow, StaleResult,
+    WindowManager, WindowRequest,
 };
 use bcode_presentation_policy::models::Disclosure;
+
+/// Resident events above which selection endpoint pins no longer hold back the W7a ceiling
+/// trim: one page above the ceiling. Past it the selection is dropped so residency stays
+/// bounded (W7, W7a).
+const SELECTION_PIN_LIMIT_EVENTS: u64 = RESIDENT_CEILING_EVENTS + PAGE_EVENTS;
 
 /// Layout id of the transcript list component; also the id of the scroll hit region the
 /// list registers over its content.
@@ -151,6 +157,8 @@ pub struct TranscriptEngine {
     last_frame: FrameId,
     /// Last committed frame id (CK3).
     committed: Option<FrameId>,
+    /// Transcript selection (C34, W7).
+    selection: crate::selection::SelectionModel,
 }
 
 // The engine is `Send` by construction: its retained items are Send-capable BMUX elements
@@ -210,6 +218,7 @@ impl TranscriptEngine {
             attach: None,
             last_frame: FrameId::default(),
             committed: None,
+            selection: crate::selection::SelectionModel::default(),
         }
     }
 
@@ -666,6 +675,73 @@ impl TranscriptEngine {
         update
     }
 
+    /// Replace the accepted Markdown visuals (L8) and re-measure only the resident units whose
+    /// accepted visuals changed (L3), leaving every other unit's retained layout untouched and
+    /// unvisited by layout. Accepting a visual never changes a unit's height, but the units are
+    /// re-measured through the measured index like any revision. Invalidates the transcript
+    /// only when a resident unit changed.
+    pub fn set_markdown_visuals(
+        &mut self,
+        visuals: crate::layout::producers::markdown::MarkdownVisualState,
+        at: Instant,
+    ) -> EngineUpdate {
+        self.observe_time(at);
+        if self.render.markdown.visuals == visuals {
+            return EngineUpdate::default();
+        }
+        let previous = std::mem::replace(&mut self.render.markdown.visuals, visuals);
+        let current = &self.render.markdown.visuals;
+        let revised = self
+            .units
+            .keys()
+            .iter()
+            .filter(|key| {
+                !key.is_boundary()
+                    && previous.document_differs(
+                        current,
+                        &crate::layout::context::markdown_document_id(key),
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if revised.is_empty() {
+            return EngineUpdate::default();
+        }
+        let changes = UnitChanges {
+            revised,
+            ..UnitChanges::default()
+        };
+        let items = transcript_items(&self.session);
+        let width = self.geometry.width;
+        let inputs = LayoutInputs {
+            units: &self.units,
+            items,
+            structure: &self.structure,
+            render: &self.render,
+            producer: self.producer.as_ref(),
+        };
+        let layouts = &mut self.layouts;
+        let mut measure = |key: &UnitKey| inputs.measure(layouts, key, width);
+        if self
+            .viewport
+            .apply_unit_changes(&changes, &self.units, width, &mut measure)
+            .is_err()
+        {
+            let rebuilt = self.viewport.rebuild(&self.units, width, &mut measure);
+            debug_assert!(rebuilt.is_ok(), "derived units never repeat a key");
+        }
+        let effects = self.reduce_input(
+            NavInput::Geometry {
+                viewport: self.geometry,
+            },
+            &RemovedUnits::new(),
+        );
+        let mut update = self.run_effects(effects);
+        update.invalidated = true;
+        update.merge(self.settle(at));
+        update
+    }
+
     /// Replace the structure configuration (policy, plugin facts, declared targets). Every
     /// resident item is re-resolved; units whose structure changed are re-derived and
     /// re-measured in this update, and anchors on units that fold into a group follow the
@@ -737,7 +813,7 @@ impl TranscriptEngine {
             }
         }
         let motion_running = self.nav.motion.is_some();
-        FrameSnapshot {
+        let mut snapshot = FrameSnapshot {
             id: self.last_frame,
             clock,
             geometry: self.geometry,
@@ -746,7 +822,22 @@ impl TranscriptEngine {
             position,
             viewport,
             latest_bar: self.latest.state(),
-        }
+            scrollbar_track: None,
+            focus: self.focus.target().cloned(),
+            focus_rows: None,
+            hit_regions: Vec::new(),
+            selection: self
+                .selection
+                .selection()
+                .filter(|selection| !selection.is_collapsed())
+                .cloned(),
+            activity: self.activity,
+        };
+        // Derived from the retained layouts the snapshot names, once per frame (F1, F4).
+        snapshot.scrollbar_track = self.scrollbar_track(&snapshot);
+        snapshot.focus_rows = self.focus_rows(&snapshot);
+        snapshot.hit_regions = self.visible_hit_regions(&snapshot);
+        snapshot
     }
 
     /// Paint a prepared frame into `cx` at the transcript region's origin (spec 9.1 step 3).
@@ -1011,6 +1102,9 @@ impl TranscriptEngine {
             update.merge(self.run_effects(effects));
             update.invalidated = true;
         }
+        // A selection whose endpoint unit left the window (W7a ceiling, a removal) is dropped.
+        let units = &self.units;
+        update.invalidated |= self.selection.retain_resident(|key| units.contains(key));
         let total = self.viewport.index().total_height();
         self.window.observe_rows(total);
         let position = self.presented(at);
@@ -1025,7 +1119,24 @@ impl TranscriptEngine {
     }
 
     /// Run eviction against the presented position (W7). Returns the eviction's changes.
+    ///
+    /// Units holding a selection endpoint are pinned, including against the W7a ceiling trim.
+    /// When those pins alone keep the window more than one page above the ceiling (a retained
+    /// selection at the trimmed edge while durable events keep arriving), the selection is
+    /// dropped and the trim runs without it, so residency stays bounded.
     fn evict(&mut self, at: Instant) -> Option<TranscriptChanges> {
+        let changes = self.evict_with(at, true);
+        if changes.is_some()
+            || self.selection.selection().is_none()
+            || self.window.event_count() <= SELECTION_PIN_LIMIT_EVENTS
+        {
+            return changes;
+        }
+        let _ = self.selection.set(None, false);
+        self.evict_with(at, false)
+    }
+
+    fn evict_with(&mut self, at: Instant, pin_selection: bool) -> Option<TranscriptChanges> {
         let position = self.presented(at);
         let viewport_top = self
             .viewport
@@ -1038,6 +1149,20 @@ impl TranscriptEngine {
             NavMode::Holding { item, .. } => Some(item.clone()),
             NavMode::Following => None,
         };
+        // W7: the motion target and the units holding a selection endpoint are never evicted
+        // (the BMUX plan keeps everything between pinned keys and the anchor, so the whole
+        // selected range stays resident), including by the W7a ceiling trim during deferral.
+        let selection = self
+            .selection
+            .selection()
+            .filter(|_| pin_selection)
+            .into_iter()
+            .flat_map(|selection| {
+                [
+                    selection.anchor().key.unit.clone(),
+                    selection.focus().key.unit.clone(),
+                ]
+            });
         let pinned = self
             .nav
             .motion
@@ -1048,13 +1173,15 @@ impl TranscriptEngine {
                 ScrollTarget::LatestBottom => None,
             })
             .into_iter()
+            .chain(selection)
             .collect::<Vec<_>>();
         let context = EvictionContext {
             viewport_top,
             viewport_height: self.geometry.height,
             anchor: anchor.as_ref(),
             pinned: &pinned,
-            deferred: self.nav.motion.is_some(),
+            // W7: a running motion or a selection (gesture or result) defers eviction.
+            deferred: self.nav.motion.is_some() || self.selection.state().active,
             resident_rows: self.viewport.index().total_height(),
         };
         let viewport = &self.viewport;
@@ -1173,6 +1300,10 @@ fn transcript_items(session: &SessionView) -> &[TranscriptViewItem] {
 }
 
 mod interaction;
+mod selection;
+
+mod tools;
+pub use tools::{DefaultRuleRefusal, DetailCycle, InlineInteractionPlacement};
 
 pub use interaction::VisibleHitRegion;
 mod submission;

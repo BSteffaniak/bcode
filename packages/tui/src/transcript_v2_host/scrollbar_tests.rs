@@ -173,7 +173,7 @@ fn a_track_press_outside_the_resident_rows_jumps_with_one_around_window() {
     // ordinary transcript input.
     mouse(&mut host, MouseEventKind::Up(MouseButton::Left), top, at);
     assert!(!host.scrollbar_drag);
-    assert!(host.pending_click.is_none());
+    assert!(!host.pointer.is_pressed());
 }
 
 #[test]

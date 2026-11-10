@@ -494,8 +494,8 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 | W4 | Window edges are safe window starts (turn starts). Page and window requests are expanded or trimmed to the nearest safe boundary within caps; a turn larger than the caps is loaded whole by successive pages marked `UnalignedBoundary` and incorporated via the SD2 fallback. |
 | W5 | Prefetch: whenever rows between a viewport edge and the corresponding window boundary fall below `prefetch_rows = max(2 × viewport_height, 48)` and that side has more history, request a page in that direction. At most one request in flight per direction; one window replacement at a time (a replacement cancels in-flight pages by generation). |
 | W6 | Page sizing: each page is filled up to the per-request caps — 16 items, 512 events scanned, 512 KiB (D1) — and ends on a safe boundary. Requests continue until `prefetch_rows` is satisfied or the side is exhausted (see 11-P1). |
-| W7 | Eviction runs after incorporation, in the same update, only when `event_count > 1024` (max). It removes whole turns from the side opposite to the side just extended, down to 512 events (target). Never evicted: the anchor unit, the motion target unit, units holding a selection endpoint, and the *protected band*: units intersecting `[viewport top − prefetch_rows, viewport bottom + prefetch_rows]`, taken outward from the viewport and capped at 512 events in total (units nearest the viewport first, the anchor unit always included). Head-side eviction never removes live-only or streaming items; tail-side eviction in `Live` mode follows W9 (SD3). While a selection gesture or selection is active, or a motion is running, eviction is deferred, so selected source text and motion geometry stay resident; the W7a ceiling still applies: durable events applied without a page request (buffered catch-up, a `LiveState` read, live events) that take the window past 1,536 events are trimmed back to the ceiling only, under the same protections. A single turn larger than the target may be cut on its far side at an unaligned boundary (SD2 fallback for that edge). |
-| W7a | Ceiling: the window never exceeds max + one page = 1,024 + 512 = 1,536 events. No W5 prefetch or N8 page request is issued while `event_count + 512 > 1,536` and eviction cannot make room (for example while eviction is deferred). Pending movement then waits at the boundary, whose unit shows `loading`, and resumes when eviction frees room. Zero-row pages count toward the ceiling like any other page. |
+| W7 | Eviction runs after incorporation, in the same update, only when `event_count > 1024` (max). It removes whole turns from the side opposite to the side just extended, down to 512 events (target). Never evicted: the anchor unit, the motion target unit, units holding a selection endpoint, and the *protected band*: units intersecting `[viewport top − prefetch_rows, viewport bottom + prefetch_rows]`, taken outward from the viewport and capped at 512 events in total (units nearest the viewport first, the anchor unit always included). Head-side eviction never removes live-only or streaming items; tail-side eviction in `Live` mode follows W9 (SD3). While a selection gesture or selection is active, or a motion is running, eviction is deferred, so selected source text and motion geometry stay resident; the W7a ceiling still applies: durable events applied without a page request (buffered catch-up, a `LiveState` read, live events) that take the window past 1,536 events are trimmed back to the ceiling only, under the same protections. When pinned selection endpoints alone keep that trim from running and the window reaches one page above the ceiling (2,048 events), the selection is dropped and the trim runs, so residency stays bounded. A single turn larger than the target may be cut on its far side at an unaligned boundary (SD2 fallback for that edge). |
+| W7a | Ceiling: no page request takes the window past max + one page = 1,024 + 512 = 1,536 events; durable events applied without a request are trimmed back to it, except that units holding selection endpoints (W7) may hold it up to one further page (2,048 events). No W5 prefetch or N8 page request is issued while `event_count + 512 > 1,536` and eviction cannot make room (for example while eviction is deferred). Pending movement then waits at the boundary, whose unit shows `loading`, and resumes when eviction frees room. Zero-row pages count toward the ceiling like any other page. |
 | W8 | Timeline (`Around`) windows are aligned to whole turns and sized ≤ 512 events total (256 before / 256 after before alignment), so the first newer or older page never triggers eviction. |
 | W9 | Evicting the tail side in `Live` mode switches to `Detached` and discards live-only and streaming items (SD3). Returning uses `Window(Tail)`, the W10 tail request that V2 session attach also uses, which also rehydrates in-flight live state. |
 | W10 | `JumpToSessionStart` and `JumpToLatest` load `Window(Head)` / `Window(Tail)` directly with one request when the target is not resident; they never page through intermediate history. `Head`, `Tail` and `Around` share one window request shape: turn-aligned, ≤ 512 events scanned, ≤ 64 items, ≤ 512 KiB, filled until `viewport_height + prefetch_rows` rows are covered where the session allows (`Around` is centered per W8). V2 session attach uses the same `Tail` request; V1's attach request (12–64 items, 2,048 events scanned) is not reused. |
@@ -564,8 +564,45 @@ Host behavior with the V2 engine selected (phase 4):
 * Leaving a session saves its V2 reading position; attaching it again restores it (T21), and
   a session opened at a search hit shows that sequence.
 * The interactive surface is docked below the transcript until V2 reserves inline
-  interaction rows; plugin visual pointer targets, Markdown images, Mermaid diagrams and the
-  fast temporal repaint path are V1-only, and the V1 transcript body is not rendered.
+  interaction rows; plugin visual pointer targets and the fast temporal repaint path are
+  V1-only, and the V1 transcript body is not rendered.
+* Markdown images and Mermaid diagrams (phase 6): the host runs the V1 workers (bounded image
+  loader, WASM Mermaid renderer) for the reserved slots of visible units, then up to two
+  resident units on each side, outside drawing. Each worker kind has one active and one
+  replaceable pending request (D2). A result is installed only when its unit is still resident
+  at the same layout revision and the slot has the same contribution id and source key;
+  installation is a unit revision of the owning unit (L8). Ready images are BMUX image
+  placements registered by the Markdown body from its own retained node while painting, so
+  only visible, correctly positioned content contributes placements; failures and images the
+  terminal or network policy cannot show become notice rows with the V1 fallback text.
+* Frames (phase 6, F1–F7): the host shell derives only its chrome layout (header, status,
+  composer, dock) and does not prepare or commit the V1 transcript layout. The V2 frame is
+  prepared once per presentation, before drawing, at the presentation clock; painting reads the
+  snapshot only. V2 transcript changes (scrolling, motion frames, focus traversal, disclosure,
+  selection, accepted spinner frames) repaint the transcript region alone; a frame that differs
+  from the committed one only by its scroll position becomes `Damage::Scroll` with terminal
+  scroll-region acceleration (BMUX 11). Focus-kind changes, the inspector overlay, notices, a
+  changed chrome layout, theme and resize repaint in full.
+* Focus reveal (phase 6, FO7, BMUX 12): a focus move brings the target's governed rows into view
+  through BMUX's focus reveal (`reveal_top_offset`, `EnsureVisibleFrom` the approach edge, no
+  movement when the target is visible or covers the viewport), clamped to the content bottom in
+  detached windows. Target traversal stays the engine's walk over retained per-unit targets,
+  bounded to 4,096 units per step: BMUX `FocusTraversal` orders a materialized target list, and
+  building it over every resident unit on each step would make a key press scale with the
+  window.
+* Selection and copy (phase 6, C34–C36, X1): pointer gestures go through BMUX click-versus-drag
+  recognition (BMUX 14) with the default click slop (one column). A drag selects source text
+  from the scene the frame registers from the retained layouts it painted: a unit scope per
+  visible unit with selectable text and a transcript scope around them, so a drag inside a
+  unit's text stays in it and one from the space around units spans them. The selection is
+  logical (BMUX 13) and survives scrolling, paging and reflow; eviction waits while it exists
+  and the units holding its endpoints are pinned against every eviction, the W7a ceiling trim
+  included (W7). Fragments come from BMUX's painted-cell fragment helper, so zero-width and
+  control graphemes never shift hits, highlights or copied ranges (B3); only runs on visible
+  rows are visited per frame. The copied text is each selected part's source bytes (tool
+  output and diffs copy their original text, tabs included, not the sanitized painted text),
+  parts of one unit joined by a newline and units by a blank line, copied through the host
+  shell's clipboard path with V1's messages, auto-copy and post-copy clear policy (C35).
 
 ---
 

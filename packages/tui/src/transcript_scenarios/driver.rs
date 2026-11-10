@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bcode_session_models::SessionEvent;
 
-use super::frame::ScenarioFrame;
+use super::frame::{CellRect, ScenarioFrame};
 use super::session::ScenarioSession;
 
 /// Identity of the engine a driver adapts, used in failure messages and the manifest.
@@ -321,6 +321,52 @@ pub trait TranscriptScenarioDriver: Sized {
         None
     }
 
+    /// Damage the last presented frame was drawn with (spec section 8 item 15b), after
+    /// promotion (the first frame and resets are full); `None` when the engine does not report
+    /// it.
+    fn last_damage(&self) -> Option<DamageObservation> {
+        None
+    }
+
+    /// Accept one activity frame of the host shell, as its activity animation timer does
+    /// (spinner and elapsed labels, F7, D7).
+    ///
+    /// The default panics: a driver must reach the host shell's activity clock to run D7.
+    fn accept_activity_frame(&mut self) {
+        panic!("{:?} driver cannot accept activity frames", Self::ENGINE);
+    }
+
+    /// Deliver one horizontal wheel tick at `at` (toward later columns when `right`).
+    ///
+    /// The default panics: a driver must deliver horizontal wheel input to run C39.
+    fn horizontal_wheel(&mut self, right: bool, at: CellPoint) {
+        panic!(
+            "{:?} driver cannot deliver horizontal wheel input (right={right}, at={at:?})",
+            Self::ENGINE
+        );
+    }
+
+    /// Run one command-palette route (for example `tools.expandAll`) as the palette does.
+    ///
+    /// The default panics: a driver must reach the command palette's routing.
+    fn run_command(&mut self, route: &str) {
+        panic!(
+            "{:?} driver cannot run the command route {route:?}",
+            Self::ENGINE
+        );
+    }
+
+    /// Open an interactive surface for `interaction_id` that prefers `rows` rows and paints
+    /// `text` on each of them (permission or question controls, C37).
+    ///
+    /// The default panics: a driver must be able to open plugin interaction surfaces.
+    fn open_interaction(&mut self, interaction_id: &str, rows: u16, text: &str) {
+        panic!(
+            "{:?} driver cannot open the interaction surface {interaction_id:?} ({rows} rows, {text:?})",
+            Self::ENGINE
+        );
+    }
+
     /// Rows the focused transcript unit-focus target occupies in the last presented frame,
     /// relative to the transcript viewport's top row (`0`). The range is half-open and may
     /// extend above (`start < 0`) or below the viewport. `None` when no target is focused.
@@ -419,4 +465,60 @@ pub struct RepaintObservation {
     pub full: bool,
     /// Terminal cells changed by the presentation.
     pub changed_cells: usize,
+}
+
+/// Damage of one presented frame (spec section 8 items 11 and 15b), in terminal cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DamageObservation {
+    /// Nothing was presented.
+    None,
+    /// The whole surface was repainted.
+    Full,
+    /// Only these regions were repainted.
+    Regions(Vec<CellRect>),
+    /// The content of `region` moved by `rows` (positive: toward row 0) and `regions` (which
+    /// cover `region`) were repainted.
+    Scroll {
+        /// Rows whose content moved.
+        region: CellRect,
+        /// Signed rows the content moved.
+        rows: i64,
+        /// Every repainted region.
+        regions: Vec<CellRect>,
+        /// Whether the presenter moved the rows with a terminal scroll region (BMUX 11
+        /// `ScrollRegionAcceleration::Auto`) instead of rewriting them.
+        accelerated: bool,
+    },
+}
+
+impl DamageObservation {
+    /// Whether the whole surface was repainted.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Every repainted region; `None` for full damage.
+    #[must_use]
+    pub fn regions(&self) -> Option<&[CellRect]> {
+        match self {
+            Self::None => Some(&[]),
+            Self::Full => None,
+            Self::Regions(regions) | Self::Scroll { regions, .. } => Some(regions),
+        }
+    }
+
+    /// Whether no repainted region reaches outside `area`.
+    #[must_use]
+    pub fn within(&self, area: CellRect) -> bool {
+        self.regions()
+            .is_some_and(|regions| regions.iter().all(|region| area.contains_rect(*region)))
+    }
+
+    /// Whether some repainted region overlaps `area`.
+    #[must_use]
+    pub fn touches(&self, area: CellRect) -> bool {
+        self.regions()
+            .is_none_or(|regions| regions.iter().any(|region| region.overlaps(area)))
+    }
 }

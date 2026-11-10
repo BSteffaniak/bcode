@@ -10,7 +10,7 @@ use bmux_tui::geometry::{Point, Rect};
 
 use super::{LATEST_BAR_HIT, TranscriptV2Host};
 use crate::keymap::BmuxKeyMap;
-use crate::transcript_v2_host::test_fixtures::{REGION, attached, paint};
+use crate::transcript_v2_host::test_fixtures::{COMPOSER, REGION, attached, paint, style};
 
 fn press(host: &mut TranscriptV2Host, key: &str, at: Instant) {
     let keymap = BmuxKeyMap::from_config_for_engine(
@@ -155,4 +155,98 @@ fn zero_sized_regions_paint_nothing_and_hit_nothing() {
     );
     assert_eq!(frame.hits().regions(), &[]);
     assert_eq!(host.regions().viewport, None);
+}
+
+/// Wheel up by one tick at `at` and paint the settled frame one second later.
+fn wheel_up_and_settle(host: &mut TranscriptV2Host, at: Instant) -> Instant {
+    let _ = host.handle_mouse(
+        MouseEvent::new(MouseEventKind::ScrollUp, Point::new(1, REGION.y + 2)),
+        3,
+        None,
+        at,
+    );
+    at + Duration::from_secs(1)
+}
+
+#[test]
+fn f5_d6_scrolling_is_transcript_damage_and_a_pure_scroll_becomes_scroll_damage() {
+    use super::TranscriptDamage;
+    use bcode_tui_transcript::frame::FrameClock;
+    use bmux_tui::damage::{Damage, DamagePolicy};
+
+    let at = Instant::now();
+    let mut host = attached(12, at);
+    let _ = paint(&mut host, at, Duration::ZERO);
+    assert_eq!(host.take_damage(), TranscriptDamage::None);
+    // The first ticks detach and show the latest bar; the last one scrolls only.
+    let mut at = at;
+    for _ in 0..2 {
+        at = wheel_up_and_settle(&mut host, at);
+        let _ = paint(&mut host, at, Duration::ZERO);
+    }
+    assert!(host.latest_bar().visible);
+    let at = wheel_up_and_settle(&mut host, at);
+    assert_eq!(host.take_damage(), TranscriptDamage::Transcript);
+
+    let area = Rect::new(0, 0, REGION.width, COMPOSER.bottom());
+    let policy = DamagePolicy {
+        max_regions: 64,
+        max_area_percent: 100,
+    };
+    let status = Rect::new(0, REGION.bottom(), REGION.width, 1);
+    host.sync_geometry(REGION, at);
+    host.prepare(REGION, FrameClock { now: at }, &style(Duration::ZERO));
+    let damage = host.frame_damage(Damage::regions([REGION, status], area, policy), area);
+    let viewport = host.regions().viewport.expect("viewport");
+    assert_eq!(damage.scroll_shift(), Some((viewport, -3)), "{damage:?}");
+    assert!(
+        damage
+            .retained_regions()
+            .iter()
+            .any(|region| region.contains(Point::new(0, status.y))),
+        "other damaged regions are still repainted: {damage:?}"
+    );
+    // Full damage and damage without the transcript region are left alone.
+    assert!(host.frame_damage(Damage::Full, area).is_full());
+    let composer = Damage::regions([COMPOSER], area, policy);
+    assert_eq!(host.frame_damage(composer.clone(), area), composer);
+
+    // Without a scroll (the same position as committed) nothing is a scroll.
+    let _ = paint(&mut host, at, Duration::ZERO);
+    host.prepare(REGION, FrameClock { now: at }, &style(Duration::ZERO));
+    let regional = Damage::regions([REGION], area, policy);
+    assert_eq!(host.frame_damage(regional.clone(), area), regional);
+}
+
+#[test]
+fn f5_focus_kind_changes_need_full_damage() {
+    use super::TranscriptDamage;
+
+    let at = Instant::now();
+    let mut host = attached(3, at);
+    let _ = paint(&mut host, at, Duration::ZERO);
+    press(&mut host, "alt+u", at);
+    assert_eq!(host.take_damage(), TranscriptDamage::Full);
+    // Focus traversal inside the transcript repaints the transcript alone.
+    let _ = paint(&mut host, at, Duration::ZERO);
+    press(&mut host, "k", at);
+    assert_eq!(host.take_damage(), TranscriptDamage::Transcript);
+}
+
+#[test]
+fn f7_d7_activity_advances_only_on_accepted_frames() {
+    let at = Instant::now();
+    let mut host = attached(2, at);
+    let _ = paint(&mut host, at, Duration::ZERO);
+    host.sync_activity(4);
+    assert!(host.is_invalidated(), "a new accepted frame repaints");
+    let _ = paint(&mut host, at, Duration::ZERO);
+    let phase = host.last_frame().expect("frame").activity;
+    assert_eq!(phase.spinner_frame, 4);
+    // Repeating the same frame (no accepted invalidation) changes nothing, and painting later
+    // never advances the phase on wall time.
+    host.sync_activity(4);
+    assert!(!host.is_invalidated());
+    let _ = paint(&mut host, at + Duration::from_secs(5), Duration::ZERO);
+    assert_eq!(host.last_frame().expect("frame").activity, phase);
 }

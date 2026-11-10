@@ -107,6 +107,52 @@ impl DecodedMermaidImage {
     }
 }
 
+impl DecodedMermaidImage {
+    /// The pixels as a BMUX protocol-neutral image payload.
+    #[must_use]
+    pub fn into_payload(self) -> ImagePayload {
+        ImagePayload::Pixels {
+            bytes: self.rgba,
+            width: self.width,
+            height: self.height,
+            format: ImagePixelFormat::Rgba8,
+        }
+    }
+}
+
+/// Render one Mermaid diagram to bounded RGBA pixels on the calling thread.
+///
+/// One WASM-isolated render at the size [`spawn_mermaid_work`] requests, then
+/// [`rasterize_mermaid_svg`]. Callers run it on a blocking task outside the frame renderer;
+/// `cache_key` must be the request's cache key (the contribution's `cache_key`), so a result
+/// is never installed for another source.
+///
+/// # Errors
+///
+/// Returns a readable diagnostic when:
+///
+/// * `cache_key` does not match the source and size,
+/// * the renderer fails, times out, exhausts its budget or is cancelled through
+///   `cancellation`,
+/// * the SVG cannot be rasterized within the fixed dimension and pixel limits.
+pub fn render_mermaid_image(
+    renderer: &bmux_mermaid_render::WasmMermaidRenderer,
+    source: String,
+    cache_key: &str,
+    cancellation: &MermaidCancellationToken,
+) -> Result<DecodedMermaidImage, String> {
+    let request = bmux_mermaid_render::MermaidRenderRequest::svg(source, 1600, 1200);
+    if request.cache_key() != cache_key {
+        return Err("scheduled Mermaid cache key does not match its source".to_owned());
+    }
+    let output = renderer
+        .render(&request, cancellation)
+        .map_err(|error| error.to_string())?
+        .output;
+    let MermaidRenderedOutput::Svg(svg) = output;
+    rasterize_mermaid_svg(&svg).map_err(|error| error.to_string())
+}
+
 /// SVG rasterization failure.
 #[derive(Debug, thiserror::Error)]
 pub enum MermaidImageError {

@@ -204,14 +204,14 @@ fn x1_fo9_clicks_toggle_disclosures_drags_do_not_and_focus_never_moves() {
         .map(|row| painted.row(row))
         .collect::<Vec<_>>();
 
-    // Drag: no toggle.
+    // Drag beyond the click slop (one column of jitter, BMUX 14): no toggle.
     assert_eq!(
         mouse(&mut host, MouseEventKind::Down(MouseButton::Left), x, y),
         TranscriptInputOutcome::Consumed
     );
-    let _ = mouse(&mut host, MouseEventKind::Drag(MouseButton::Left), x + 1, y);
+    let _ = mouse(&mut host, MouseEventKind::Drag(MouseButton::Left), x + 2, y);
     assert_eq!(
-        mouse(&mut host, MouseEventKind::Up(MouseButton::Left), x + 1, y),
+        mouse(&mut host, MouseEventKind::Up(MouseButton::Left), x + 2, y),
         TranscriptInputOutcome::Consumed
     );
     let painted = paint(&mut host, at, Duration::ZERO);

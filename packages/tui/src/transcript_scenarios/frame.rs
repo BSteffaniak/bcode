@@ -28,6 +28,44 @@ impl CellRect {
             y: self.y.saturating_add(self.height / 2),
         }
     }
+
+    /// One past the last row.
+    #[must_use]
+    pub const fn bottom(self) -> u16 {
+        self.y.saturating_add(self.height)
+    }
+
+    /// One past the last column.
+    #[must_use]
+    pub const fn right(self) -> u16 {
+        self.x.saturating_add(self.width)
+    }
+
+    /// Whether `other` lies entirely inside this rectangle (empty rectangles always do).
+    #[must_use]
+    pub const fn contains_rect(self, other: Self) -> bool {
+        other.width == 0
+            || other.height == 0
+            || (other.x >= self.x
+                && other.y >= self.y
+                && other.right() <= self.right()
+                && other.bottom() <= self.bottom())
+    }
+
+    /// Whether the rectangles share at least one cell.
+    #[must_use]
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+
+    /// Whether row `y` lies inside the rectangle.
+    #[must_use]
+    pub const fn contains_row(self, y: u16) -> bool {
+        y >= self.y && y < self.bottom()
+    }
 }
 
 /// Which surface owns keyboard focus.

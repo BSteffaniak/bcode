@@ -24,6 +24,11 @@
 //! * [`focus`]: key resolution (focus entry, `transcript_focus` keys, scroll keys).
 //! * [`input`]: transcript keys, wheel and mouse input and the composer/transcript focus model
 //!   (spec section 6).
+//! * [`inspector`]: the structure inspector and transcript tooling (bulk disclosure, detail
+//!   cycling, make-default, inline shell expansion; FO6, C39).
+//! * [`interactions`]: inline interaction placement inside the transcript (C37, D10).
+//! * [`visuals`]: Markdown images and Mermaid diagrams rendered by the host-side workers and
+//!   accepted into the render configuration (phase 6, L8, D2).
 //! * [`paint`]: viewport geometry, frame preparation, painting, commit, the latest bar and the
 //!   optional scrollbar (phase 5, X6).
 
@@ -42,8 +47,11 @@ pub mod effects;
 pub mod focus;
 pub mod ingest;
 pub mod input;
+pub mod inspector;
+pub mod interactions;
 pub mod paint;
 pub mod render_config;
+pub mod visuals;
 
 #[cfg(test)]
 pub mod test_fixtures;
@@ -117,15 +125,29 @@ pub struct TranscriptV2Host {
     data: data::HostData,
     /// Render and structure inputs last applied to the engine ([`render_config`]).
     render: render_config::RenderInputs,
+    /// Markdown images and Mermaid diagrams: worker lanes and accepted visuals ([`visuals`]).
+    visuals: visuals::MarkdownVisuals,
     /// Terminal rectangles of the last painted frame ([`paint`]).
     regions: paint::Regions,
-    /// Primary-button press awaiting its release ([`input`], FO9).
-    pending_click: Option<input::PendingClick>,
+    /// Left-button gestures: click recognition and the selection gesture ([`input`], FO9,
+    /// X1, C34).
+    pointer: input::PointerState,
+    /// The region the frame was prepared for and not yet painted ([`paint`]).
+    prepared: Option<bmux_tui::geometry::Rect>,
+    /// The last presented frame: scroll damage is measured against it ([`paint`], BMUX 11).
+    committed_frame: Option<FrameSnapshot>,
+    /// A change since the host shell last took damage needs a full repaint rather than the
+    /// transcript region alone (focus kind, inspector, notices; F5).
+    full_damage: bool,
+    /// Host shell activity frame last accepted as the spinner/elapsed phase ([`paint`], F7).
+    activity_frame: Option<u64>,
     /// A press on the scrollbar track is being dragged; pointer input goes to the list until
     /// the release ([`input`], VP4).
     scrollbar_drag: bool,
     /// Next latest-bar glow frame ([`paint`], C21).
     glow_frame_at: Option<std::time::Instant>,
+    /// Inspector panel, tooling notices and queued per-tool defaults ([`inspector`]).
+    tools: inspector::HostTools,
     /// Scenario time replacing the wall clock for every host and frame clock read, so
     /// transcript scenarios run on scripted time ([`Self::set_scripted_now`]).
     #[cfg(test)]
@@ -159,10 +181,16 @@ impl TranscriptV2Host {
             last_frame: None,
             data: data::HostData::default(),
             render: render_config::RenderInputs::default(),
+            visuals: visuals::MarkdownVisuals::default(),
             regions: paint::Regions::default(),
-            pending_click: None,
+            pointer: input::PointerState::default(),
+            prepared: None,
+            committed_frame: None,
+            full_damage: false,
+            activity_frame: None,
             scrollbar_drag: false,
             glow_frame_at: None,
+            tools: inspector::HostTools::default(),
             #[cfg(test)]
             scripted_now: None,
         }
@@ -245,6 +273,10 @@ impl TranscriptV2Host {
     fn absorb(&mut self, update: bcode_tui_transcript::engine::EngineUpdate) {
         self.pending_requests.extend(update.requests);
         self.invalidated |= update.invalidated;
+        if update.invalidated {
+            // The open inspector follows focus and structure in the update path (F3).
+            self.refresh_inspector();
+        }
     }
 }
 

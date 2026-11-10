@@ -680,9 +680,15 @@ impl BmuxApp {
             self.set_status("Only tool units can set a per-tool default".to_owned());
             return true;
         };
+        self.queue_default_rule(rule);
+        true
+    }
+
+    /// Queue a per-tool default `rule` for persistence to user state (shared by both
+    /// transcript engines' make-default actions); the rule is applied live once stored.
+    pub fn queue_default_rule(&mut self, rule: PresentationRule) {
         self.set_status(format!("Saving {}…", default_label(&rule)));
         self.transcript_tools.queue_default(rule);
-        true
     }
 
     /// Interactive default rules to persist now, unless a persistence effect

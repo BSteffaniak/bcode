@@ -34,7 +34,10 @@ use bmux_tui::text::{Line, Span, Text, TextWrap};
 use super::{ItemContent, ProducedItem, RetainedObject, UnitProducer, UnitView};
 use crate::layout::SourcePosition;
 use crate::layout::context::ItemRenderContext;
-use crate::layout::geometry::{ItemGeometry, ItemSelectionFragment, SourceRow, SourceRows};
+use crate::layout::geometry::{
+    ItemGeometry, ItemSelectionFragment, SelectableRun, SelectableRunKind, SelectableText,
+    SourceRow, SourceRows,
+};
 use crate::units::{BoundaryEdge, UnitKind};
 use crate::window::BoundaryStatus;
 
@@ -640,6 +643,9 @@ pub struct SourceText {
     /// Byte offset of each source line in the block's newline-separated source text, recorded
     /// when the lines are known ([`Self::from_lines`]); diff rows map to lines through it.
     line_starts: Option<Arc<[usize]>>,
+    /// Logical source of the block's newline-separated text when its painted lines differ from
+    /// it (control characters painted as spaces, byte for byte); a selection copies it (C34).
+    copy_source: Option<Arc<str>>,
 }
 
 impl SourceText {
@@ -653,6 +659,7 @@ impl SourceText {
             block,
             source,
             line_starts: None,
+            copy_source: None,
         }
     }
 
@@ -678,7 +685,17 @@ impl SourceText {
             block: TextBlock::new(Text::from_lines(lines)).wrap(wrap),
             source,
             line_starts: Some(line_starts),
+            copy_source: None,
         }
+    }
+
+    /// Copy `source` instead of the painted text: the logical text the block's lines were
+    /// derived from byte for byte (control characters painted as spaces). A source whose byte
+    /// length differs from the painted text is ignored, so run ranges always index both.
+    #[must_use]
+    pub fn with_copy_source(mut self, source: impl Into<Arc<str>>) -> Self {
+        self.copy_source = Some(source.into());
+        self
     }
 
     fn position(
@@ -750,8 +767,57 @@ impl ItemContent for SourceText {
                 source: first,
                 rendered: false,
             }],
+            selectable: self.selectable(layout).into_iter().collect(),
             ..ItemGeometry::default()
         }
+    }
+}
+
+impl SourceText {
+    /// The block's newline-separated logical text with one run per measured row whose
+    /// rendered row is exactly its painted bytes (C34). Rows are read from the retained row
+    /// geometry once, when the item is measured (B6); rows whose rendering differs from their
+    /// text (none for plain blocks) are not selectable rather than mapped untruthfully. The
+    /// copied text is the copy source when one was given ([`Self::with_copy_source`]).
+    fn selectable(&self, layout: &LayoutNode) -> Option<SelectableText> {
+        let painted: Arc<str> = Arc::from(
+            self.block
+                .text()
+                .lines
+                .iter()
+                .map(Line::plain_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let width = layout.size.width;
+        let runs = self
+            .block
+            .projection_window(layout, 0..layout.size.height)
+            .indexed_rows()
+            .filter(|(_, row)| {
+                painted.get(row.source_range.clone()) == Some(&*row.line.plain_text())
+            })
+            .map(|(row, projected)| SelectableRun {
+                row,
+                x: 0,
+                width,
+                source: projected.source_range.clone(),
+                kind: SelectableRunKind::Text,
+            })
+            .collect::<Vec<_>>();
+        if runs.is_empty() {
+            return None;
+        }
+        Some(match &self.copy_source {
+            Some(source) if source.len() == painted.len() && **source != *painted => {
+                SelectableText {
+                    text: Arc::clone(source),
+                    display: Some(painted),
+                    runs,
+                }
+            }
+            _ => SelectableText::new(painted, runs),
+        })
     }
 }
 

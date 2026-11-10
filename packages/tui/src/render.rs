@@ -800,6 +800,22 @@ pub fn prepare_frame_with_bottom_dock(
     Some((refreshed, dock))
 }
 
+/// Prepare the shared chat chrome layout (header, body, status, composer and an optional
+/// bottom dock) without preparing the V1 transcript projection, for the V2 transcript engine,
+/// which lays out and paints the transcript region itself (TUI V2 spec section 7, EN5).
+pub fn prepare_chrome_with_bottom_dock(
+    app: &mut BmuxApp,
+    area: Rect,
+    dock_height: u16,
+) -> Option<(FrameLayout, Rect)> {
+    if area.is_empty() {
+        app.queue_recovery.settings_visible = false;
+    }
+    let layout = frame_layout(app, area)?;
+    app.set_composer_content_area(layout.composer_content);
+    Some(layout.with_bottom_dock(app, dock_height))
+}
+
 /// Render one TUI frame.
 #[cfg(test)]
 pub fn render(app: &mut BmuxApp, frame: &mut PaintCx<'_, '_>) {

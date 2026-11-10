@@ -419,6 +419,8 @@ impl ItemContent for ItemStack {
                 .extend(geometry.selection_fragments);
             merged.content_keys.extend(geometry.content_keys);
             merged.paint_slots.extend(geometry.paint_slots);
+            merged.visual_slots.extend(geometry.visual_slots);
+            merged.selectable.extend(geometry.selectable);
         }
         merged.source_map = SourceRows::new(source_rows);
         merged

@@ -283,6 +283,15 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
+/// The newline-separated source text of consecutive `lines` of `text` (from [`source_lines`]):
+/// the logical text a copy of their block reads (C34).
+fn source_slice<'a>(text: &'a str, lines: &[(usize, &str)]) -> &'a str {
+    match (lines.first(), lines.last()) {
+        (Some((start, _)), Some((last, line))) => text.get(*start..last + line.len()).unwrap_or(""),
+        _ => "",
+    }
+}
+
 /// Source lines of `text` with their byte offsets; one trailing newline ends the last line
 /// rather than starting an empty one.
 fn source_lines(text: &str) -> Vec<(usize, &str)> {
@@ -1229,17 +1238,21 @@ impl Composer<'_> {
         let (ranges, hidden) = preview_ranges(lines.len(), preview);
         for range in ranges {
             let base = lines[range.start].0;
+            let source = source_slice(text, &lines[range.clone()]);
             let rows = lines[range]
                 .iter()
                 .map(|(_, line)| Line::from_spans(vec![common::span(sanitize(line), style)]))
                 .collect::<Vec<_>>();
             let block = TextBlock::new(Text::from_lines(rows)).wrap(TextWrap::None);
-            let content: Box<dyn ItemContent> = Box::new(SourceText::new(
-                block,
-                TextSource::Shell {
-                    base: u64::try_from(base).unwrap_or(u64::MAX),
-                },
-            ));
+            let content: Box<dyn ItemContent> = Box::new(
+                SourceText::new(
+                    block,
+                    TextSource::Shell {
+                        base: u64::try_from(base).unwrap_or(u64::MAX),
+                    },
+                )
+                .with_copy_source(source),
+            );
             let content = match shell {
                 Some(key) => Box::new(ContentKeyed::new(content, key)),
                 None => content,
@@ -1288,6 +1301,7 @@ impl Composer<'_> {
         let (ranges, hidden) = preview_ranges(lines.len(), preview);
         for range in ranges {
             let base = range.start;
+            let source = source_slice(text, &lines[range.clone()]);
             let rows = lines[range]
                 .iter()
                 .map(|(_, line)| {
@@ -1295,13 +1309,16 @@ impl Composer<'_> {
                 })
                 .collect::<Vec<_>>();
             self.push(
-                Box::new(SourceText::from_lines(
-                    rows,
-                    TextWrap::None,
-                    TextSource::Diff {
-                        base: u64::try_from(base).unwrap_or(u64::MAX),
-                    },
-                )),
+                Box::new(
+                    SourceText::from_lines(
+                        rows,
+                        TextWrap::None,
+                        TextSource::Diff {
+                            base: u64::try_from(base).unwrap_or(u64::MAX),
+                        },
+                    )
+                    .with_copy_source(source),
+                ),
                 BODY_INDENT,
             );
         }

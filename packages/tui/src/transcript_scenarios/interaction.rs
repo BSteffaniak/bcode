@@ -44,7 +44,7 @@ const LINE_END: u16 = 40;
 const NARROW_GLYPHS: &[char] = &['▾', '▸', '│', '·', '╭', '╰', '─', '┌', '└', '⠋'];
 
 /// Driver capabilities used only by these scenarios.
-trait InteractionScenario {
+pub(super) trait InteractionScenario {
     /// Apply one engine-neutral setting.
     fn apply_setting(&mut self, setting: &ScenarioSetting);
     /// Clipboard writes so far.
@@ -92,7 +92,13 @@ impl<D: TranscriptScenarioDriver> InteractionScenario for Scenario<D> {
 // ---------------------------------------------------------------------------------------------
 
 /// Append one finished `read` call whose result carries `output`.
-fn push_tool(session: &mut ScenarioSession, call: &str, target: &str, output: &str, failed: bool) {
+pub(super) fn push_tool(
+    session: &mut ScenarioSession,
+    call: &str,
+    target: &str,
+    output: &str,
+    failed: bool,
+) {
     session.push_kind(SessionEventKind::ToolCallRequested {
         tool_call_id: call.to_owned(),
         producer_plugin_id: None,
@@ -113,7 +119,7 @@ fn push_tool(session: &mut ScenarioSession, call: &str, target: &str, output: &s
 }
 
 /// Append a permission request awaiting the user's decision.
-fn push_permission(session: &mut ScenarioSession, command: &str) {
+pub(super) fn push_permission(session: &mut ScenarioSession, command: &str) {
     session.push_kind(SessionEventKind::PermissionRequested {
         permission_id: "permission-1".to_owned(),
         tool_call_id: "call-awaiting".to_owned(),
@@ -129,7 +135,7 @@ fn push_permission(session: &mut ScenarioSession, command: &str) {
 /// Two turns of history followed by three read calls (the middle one failed).
 ///
 /// Output tokens: `ALPHAOUT1`/`ALPHAOUT2`, `BETAOUT1`/`BETAOUT2` (failed), `GAMMAOUT1`.
-fn tool_session() -> ScenarioSession {
+pub(super) fn tool_session() -> ScenarioSession {
     let mut session = ScenarioSession::with_turns(2, 2);
     session.push_user(1);
     push_tool(
@@ -157,7 +163,7 @@ fn tool_session() -> ScenarioSession {
 }
 
 /// Attach the whole of `session` at `width`×`height` and present the first frame.
-fn attach_all<D: TranscriptScenarioDriver>(
+pub(super) fn attach_all<D: TranscriptScenarioDriver>(
     session: ScenarioSession,
     width: u16,
     height: u16,
@@ -172,7 +178,7 @@ fn attach_all<D: TranscriptScenarioDriver>(
 ///
 /// Columns are counted in cells. The text before the needle must be ASCII or one of
 /// [`NARROW_GLYPHS`], so a fixture never relies on measuring arbitrary text.
-fn locate_in_row(row: &str, needle: &str, y: usize) -> Option<CellPoint> {
+pub(super) fn locate_in_row(row: &str, needle: &str, y: usize) -> Option<CellPoint> {
     let byte = row.find(needle)?;
     let prefix = &row[..byte];
     assert!(
@@ -188,7 +194,7 @@ fn locate_in_row(row: &str, needle: &str, y: usize) -> Option<CellPoint> {
 }
 
 /// Cell where `needle` first appears in `frame`, top to bottom.
-fn locate(frame: &ScenarioFrame, needle: &str) -> Option<CellPoint> {
+pub(super) fn locate(frame: &ScenarioFrame, needle: &str) -> Option<CellPoint> {
     frame
         .rows
         .iter()
@@ -198,13 +204,13 @@ fn locate(frame: &ScenarioFrame, needle: &str) -> Option<CellPoint> {
 
 /// Cell where `needle` starts in the last frame; fails the scenario when it is not visible.
 #[track_caller]
-fn find<D: TranscriptScenarioDriver>(scenario: &Scenario<D>, needle: &str) -> CellPoint {
+pub(super) fn find<D: TranscriptScenarioDriver>(scenario: &Scenario<D>, needle: &str) -> CellPoint {
     locate(scenario.last_frame(), needle)
         .unwrap_or_else(|| scenario.fail(&format!("{needle:?} is not visible")))
 }
 
 /// Cell `columns` to the right of `at`.
-const fn right_of(at: CellPoint, columns: u16) -> CellPoint {
+pub(super) const fn right_of(at: CellPoint, columns: u16) -> CellPoint {
     CellPoint {
         x: at.x.saturating_add(columns),
         y: at.y,
@@ -213,7 +219,10 @@ const fn right_of(at: CellPoint, columns: u16) -> CellPoint {
 
 /// Header cell of the tool unit whose output contains `needle`.
 #[track_caller]
-fn tool_header<D: TranscriptScenarioDriver>(scenario: &Scenario<D>, needle: &str) -> CellPoint {
+pub(super) fn tool_header<D: TranscriptScenarioDriver>(
+    scenario: &Scenario<D>,
+    needle: &str,
+) -> CellPoint {
     let output = find(scenario, needle);
     let rows = &scenario.last_frame().rows;
     (0..=usize::from(output.y))
@@ -223,7 +232,7 @@ fn tool_header<D: TranscriptScenarioDriver>(scenario: &Scenario<D>, needle: &str
 }
 
 /// Whether `needle` is visible inside the transcript area.
-fn transcript_shows(frame: &ScenarioFrame, needle: &str) -> bool {
+pub(super) fn transcript_shows(frame: &ScenarioFrame, needle: &str) -> bool {
     frame
         .transcript_rows()
         .iter()

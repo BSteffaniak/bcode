@@ -230,8 +230,8 @@ pub fn body_view<'a, 'state>(
 }
 
 /// Paint the panel into `area`; returns the body text view's painted
-/// terminal rectangle and layout.
-fn paint_panel(
+/// terminal rectangle and layout. Shared by both transcript engines' inspectors.
+pub fn paint_panel(
     area: Rect,
     lines: &[Line],
     scroll: &Cell<ScrollViewState>,

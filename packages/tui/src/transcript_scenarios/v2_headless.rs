@@ -16,9 +16,11 @@
 //! text, so markers stay observable through item chrome.
 //!
 //! The transcript region is the whole terminal: there is no composer, status row or latest bar
-//! (the host owns them). Inputs that need the host (composer typing, focus mode, drag gestures,
-//! selection) panic with the missing capability, so scenarios that need them fail loudly
-//! instead of passing vacuously; run those through [`super::v2::V2Driver`].
+//! (the host owns them). Inputs that need the host (composer typing, focus mode, drag gestures
+//! and their click-versus-drag recognition, the copy policy and the clipboard) panic with the
+//! missing capability, so scenarios that need them fail loudly instead of passing vacuously;
+//! run those through [`super::v2::V2Driver`], which covers selection and copy end to end. The
+//! selection text this driver reports is the engine's own selection export.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -394,7 +396,8 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
             }
             ScenarioInput::Click { at } => {
                 // Press and release without movement activate the region under the pointer in
-                // the committed frame (X1). Gesture routing through selection is phase 6.
+                // the committed frame (X1). Click-versus-drag recognition through the selection
+                // (BMUX 14) is the host's; the V2 driver covers it.
                 let snapshot = self
                     .committed
                     .clone()
@@ -408,7 +411,8 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
             ScenarioInput::Press { .. }
             | ScenarioInput::DragTo { .. }
             | ScenarioInput::Release { .. } => panic!(
-                "V2 driver: drag gestures need phase-6 selection and click routing (BMUX 13, 14)"
+                "V2 headless driver: drag gestures are recognized and routed by the host \
+                 (BMUX 13, 14); run selection scenarios through the V2 driver"
             ),
         }
     }
@@ -482,13 +486,10 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
         Some((window.first_sequence?, window.last_sequence?))
     }
 
+    /// The engine's selection export (C34). Only the host starts selections, so it stays
+    /// empty here; clipboard writes are the host shell's and not observed (the default panics).
     fn selection_text(&self) -> Option<String> {
-        None
-    }
-
-    /// V2 has no clipboard path before phase 6 (selection and copy), so nothing is ever written.
-    fn clipboard_writes(&self) -> Vec<String> {
-        Vec::new()
+        self.engine.selected_text()
     }
 
     fn layout_work(&mut self) -> Option<LayoutWork> {
@@ -524,7 +525,10 @@ impl TranscriptScenarioDriver for V2HeadlessDriver {
                 self.apply_structure();
             }
             ScenarioSetting::Selection { .. } | ScenarioSetting::ClipboardFails(_) => {
-                panic!("V2 driver: selection and clipboard need phase 6")
+                panic!(
+                    "V2 headless driver: the copy policy and the clipboard belong to the host \
+                     shell; run copy scenarios through the V2 driver"
+                )
             }
             ScenarioSetting::TranscriptScrollbar(_) => {
                 panic!("V2 headless driver: the scrollbar is painted and hit-tested by the host")

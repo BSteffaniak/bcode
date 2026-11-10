@@ -14,6 +14,7 @@ pub mod frame;
 pub mod interaction;
 pub mod navigation;
 pub mod paging;
+pub mod pipeline;
 pub mod scenarios;
 pub mod session;
 pub mod startup;
@@ -576,7 +577,9 @@ mod v2_navigation {
     }
 }
 
-/// V2 instantiation of the kept-behavior interaction scenarios in [`interaction`].
+/// V2 instantiation of the kept-behavior interaction scenarios in [`interaction`]. The C37 and
+/// C39 driver stubs are not instantiated: the V2 driver opens interaction surfaces and expands
+/// shell screens, and [`pipeline`] covers both criteria for V2 (`v2_pipeline`).
 mod v2_interaction {
     super::transcript_scenarios! { super::v2::V2Driver; in interaction;
         c18_latest_bar_ignores_hidden_continuation_of_visible_entry,
@@ -587,33 +590,21 @@ mod v2_interaction {
         c20_scroll_timer_and_reflow_generate_no_activity,
         c21_latest_bar_glow_settles_still_after_window,
         c21_reduced_motion_latest_bar_is_still_immediately,
-        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13)"]
         c34_drag_inside_response_stays_within_it,
-        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13)"]
         c34_drag_from_surrounding_space_spans_items,
-        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13)"]
         c34_soft_wrapped_line_selects_without_newlines,
-        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13)"]
         c36_code_selection_preserves_indentation_and_blank_lines,
-        #[ignore = "V2 pending phase 6: transcript selection and copy policy"]
         c34_selection_survives_scroll,
-        #[ignore = "V2 pending phase 6: transcript selection and copy policy"]
         c34_selection_survives_scrolling_out_of_view,
-        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13)"]
         c34_hard_line_break_copies_as_line_break,
-        #[ignore = "V2 pending phase 6: transcript selection and copy"]
         c35_release_copies_and_clears_after_delay,
-        #[ignore = "V2 pending phase 6: transcript selection and copy policy"]
         c35_failed_copy_keeps_selection,
-        #[ignore = "V2 pending phase 6: transcript selection and copy"]
         c35_new_gesture_cancels_pending_clear,
         c35_click_without_drag_does_not_copy,
         x1_click_toggles_tool_header_once_per_click,
         x1_click_toggles_section_label,
         x1_click_toggles_group_header,
-        #[ignore = "V2 pending phase 6: transcript selection (BMUX 13) and gesture routing (BMUX 14)"]
         x1_drag_from_header_selects_without_toggling,
-        #[ignore = "V2 pending phase 6: structure inspector on the V2 path (FO6 `i`, host-side split); walking and disclosure keys pass"]
         x2_focus_mode_keys_walk_and_toggle_targets,
         x2_focus_walk_scrolls_targets_into_view,
         x3_collapsed_group_reveals_failed_member,
@@ -621,15 +612,34 @@ mod v2_interaction {
         a16_floor_applies_after_manual_toggles,
         a16_awaiting_decision_stays_expanded_under_rules,
         c38_streaming_markdown_converges_to_final,
-        #[ignore = "V2 pending phase 6: regional damage observation (BMUX 15b)"]
         d6_wheel_scroll_repaints_regionally,
-        #[ignore = "V2 pending phase 6: regional damage (D6, F5); the shared host shell's composer path marks full damage (D-16, as on V1)"]
         d6_composer_typing_repaints_regionally,
         d4_scrolling_does_no_layout_work,
         d4_prepend_measures_only_new_units,
-        #[ignore = "driver: needs plugin interaction surfaces"]
-        c37_interaction_placement_and_focus_restore,
-        #[ignore = "driver: needs positioned shell captures"]
-        c39_inline_shell_expansion,
+    }
+}
+
+/// Frame pipeline, damage and transcript tooling scenarios in [`pipeline`] (phase 6) for the V2
+/// engine in the application. V1 is not instantiated: the scenarios read the terminal's committed
+/// damage, the host's command routes and inspector, and the V2 inline interaction and shell
+/// tooling (`docs/tui-v2-scenarios.md`).
+mod v2_pipeline {
+    super::transcript_scenarios! { super::v2::V2Driver; in pipeline;
+        f1_cells_hits_and_focus_come_from_one_snapshot,
+        f2_f3_presentation_is_pure_and_reads_no_clock,
+        d7_activity_labels_advance_on_accepted_frames,
+        d6_wheel_tick_is_scroll_damage_of_the_viewport,
+        d6_transcript_changes_repaint_the_transcript_region,
+        d4_focus_and_selection_do_no_layout_work,
+        fo6_inspector_follows_focus_scrolls_and_closes_first,
+        fo6_make_default_applies_the_focused_disclosure_to_its_tool,
+        fo6_detail_cycle_applies_to_every_unit,
+        fo6_bulk_disclosure_routes_apply_to_units_or_the_focused_subtree,
+        visuals_image_notice_replaces_the_placeholder,
+        visuals_mermaid_without_images_keeps_its_source,
+        c37_inline_interaction_scrolls_with_the_transcript_and_restores,
+        c39_shell_expansion_opens_up_to_128_rows,
+        #[ignore = "V2 pending phase 7: local horizontal scroll inside the inline shell screen (C39) is not implemented"]
+        c39_shell_screen_scrolls_horizontally,
     }
 }

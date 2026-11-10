@@ -20,7 +20,8 @@
 //! and plugin contributions are routed through the application's plugin presentation with the
 //! unit's resolved presentation, and the bounded rows are accepted for an exact revision
 //! ([`AcceptedPluginVisual`]). Mermaid diagrams and images keep their reserved placeholder
-//! rows: their workers are not fed to V2 yet (phase 6).
+//! rows until the host-side workers' results are accepted ([`super::visuals`]); accepted
+//! visuals reach the engine through the same configuration.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -169,13 +170,35 @@ impl TranscriptV2Host {
         if self.sync_plugin_visuals(app, &theme) {
             self.render.render_dirty = true;
         }
-        if std::mem::take(&mut self.render.render_dirty) {
-            let config = self.render_config(theme);
-            let update = self.engine.set_render_config(config, at);
-            self.absorb(update);
-            changed = true;
-        }
+        changed |= self.flush_render_config(at);
         changed
+    }
+
+    /// Hand the engine a new render configuration when its inputs changed since the last one
+    /// (`<details>` state, plugin visuals, accepted Markdown visuals, theme, Markdown and diff
+    /// options). Returns whether a configuration was applied.
+    pub(super) fn flush_render_config(&mut self, at: Instant) -> bool {
+        let visuals_changed = self.visuals.take_changed();
+        if !std::mem::take(&mut self.render.render_dirty) {
+            if !visuals_changed {
+                return false;
+            }
+            // Only accepted visuals changed: re-measure just their owning units (L3, L8).
+            let update = self
+                .engine
+                .set_markdown_visuals(self.visuals.accepted().clone(), at);
+            self.absorb(update);
+            return true;
+        }
+        let theme = self
+            .render
+            .theme
+            .clone()
+            .unwrap_or_else(|| Arc::new(ResolvedThemeDefinition::empty("default", "Default")));
+        let config = self.render_config(theme);
+        let update = self.engine.set_render_config(config, at);
+        self.absorb(update);
+        true
     }
 
     /// Open or close one Markdown `<details>` block by content key (`transcript:<unit>:...`);
@@ -196,8 +219,8 @@ impl TranscriptV2Host {
             markdown: MarkdownOptions {
                 details_open: self.render.details_open.clone(),
                 mermaid,
-                // Image workers are not fed to V2 yet: images keep their placeholder rows.
                 images: true,
+                visuals: self.visuals.accepted().clone(),
             },
             diff_viewer: diff_viewer_options(diff),
             plugin_visuals: self.render.visuals.clone(),

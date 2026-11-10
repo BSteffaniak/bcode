@@ -26,6 +26,11 @@ required by [`tui-v2-architecture.md`](tui-v2-architecture.md), not what V1 curr
   * `paging.rs` holds the resident window and paging scenarios (phase 5): prefetch, eviction,
     the resident ceiling, aligned timeline windows, direct head and tail windows, return to live,
     deep history paging and the optional scrollbar. See "Paging scenarios (phase 5)" below.
+  * `pipeline.rs` holds the frame pipeline, damage and transcript tooling scenarios (phase 6):
+    single-snapshot frames, paint purity, regional and scroll damage, activity labels, the
+    inspector, make-default, detail cycling, bulk disclosure, Markdown visuals, inline
+    interactions and inline shell expansion. See "Frame pipeline and tooling scenarios
+    (phase 6)" below.
   * `startup.rs` checks engine selection at startup through the root model (X7, X8) and that
     both engines attach to the same scripted session.
 * Commands:
@@ -228,7 +233,8 @@ focus mode, the visibility floor, streaming Markdown and repaint scope. Targets 
 unique text in the committed frame (tool output tokens such as `ALPHAOUT1`, header text such as
 `Tool result`), so no scenario reads hit regions.
 
-These scenarios use five additive driver capabilities from `driver.rs`:
+These scenarios use five additive driver capabilities from `driver.rs` (the pipeline scenarios
+add more; see "Frame pipeline and tooling scenarios (phase 6)"):
 
 * Press, drag and release inputs: `ScenarioInput::Press`, `DragTo` and `Release`.
 * `configure(&ScenarioSetting)`: presentation rules, the `[tui.selection]` copy policy,
@@ -254,34 +260,34 @@ Status values also include `stub-ignored`: the scenario is ignored with
 | `c20_scroll_timer_and_reflow_generate_no_activity` | C20 | pass | pass | — |
 | `c21_latest_bar_glow_settles_still_after_window` | C21, C20 | fail-ignored | pass | V1 deviation C20/C21, root cause not diagnosed. The glow still shows after the glow window. It reproduces with or without the driver's Markdown projection step, and also when clock advances reach V1 through the production timed-invalidation timer (paint-level, temporal path) instead of a forced structural redraw, so it is not explained by full preparation alone. Confirm in the real app. |
 | `c21_reduced_motion_latest_bar_is_still_immediately` | C21, C22 | pass | pass | — |
-| `c34_drag_inside_response_stays_within_it` | C34 | fail-ignored | pending-ignored (phase 6: transcript selection (BMUX 13)) | V1 deviation C34. A drag that starts inside a response keeps selecting into the next user item and the next response. The response-local clamp tested at unit level does not apply in the presented transcript. |
-| `c34_drag_from_surrounding_space_spans_items` | C34 | pass | pending-ignored (phase 6: transcript selection (BMUX 13)) | — |
-| `c34_soft_wrapped_line_selects_without_newlines` | C34, C36 | pass | pending-ignored (phase 6: transcript selection (BMUX 13)) | — |
-| `c36_code_selection_preserves_indentation_and_blank_lines` | C36 | pass | pending-ignored (phase 6: transcript selection (BMUX 13)) | — |
-| `c34_selection_survives_scroll` | C34 | pass | pending-ignored (phase 6: transcript selection and copy policy) | — |
-| `c34_selection_survives_scrolling_out_of_view` | C34, BMUX 13 | fail-ignored | pending-ignored (phase 6: transcript selection and copy policy) | V1 deviation C34. The selection is cleared as soon as its rows scroll out of view, so it is gone when they scroll back. |
-| `c34_hard_line_break_copies_as_line_break` | C34 | fail-ignored | pending-ignored (phase 6: transcript selection (BMUX 13)) | V1 deviation C34. Copying across a Markdown hard line break (`\` at the end of a line) joins the two lines with no separator (`…line 0S00004L001…`). |
-| `c35_release_copies_and_clears_after_delay` | C35 | pass | pending-ignored (phase 6: transcript selection and copy) | — |
-| `c35_failed_copy_keeps_selection` | C35 | pass | pending-ignored (phase 6: transcript selection and copy policy) | — |
-| `c35_new_gesture_cancels_pending_clear` | C35 | pass | pending-ignored (phase 6: transcript selection and copy) | — |
+| `c34_drag_inside_response_stays_within_it` | C34 | fail-ignored | pass | V1 deviation C34. A drag that starts inside a response keeps selecting into the next user item and the next response. The response-local clamp tested at unit level does not apply in the presented transcript. |
+| `c34_drag_from_surrounding_space_spans_items` | C34 | pass | pass | — |
+| `c34_soft_wrapped_line_selects_without_newlines` | C34, C36 | pass | pass | — |
+| `c36_code_selection_preserves_indentation_and_blank_lines` | C36 | pass | pass | — |
+| `c34_selection_survives_scroll` | C34 | pass | pass | — |
+| `c34_selection_survives_scrolling_out_of_view` | C34, BMUX 13 | fail-ignored | pass | V1 deviation C34. The selection is cleared as soon as its rows scroll out of view, so it is gone when they scroll back. |
+| `c34_hard_line_break_copies_as_line_break` | C34 | fail-ignored | pass | V1 deviation C34. Copying across a Markdown hard line break (`\` at the end of a line) joins the two lines with no separator (`…line 0S00004L001…`). |
+| `c35_release_copies_and_clears_after_delay` | C35 | pass | pass | — |
+| `c35_failed_copy_keeps_selection` | C35 | pass | pass | — |
+| `c35_new_gesture_cancels_pending_clear` | C35 | pass | pass | — |
 | `c35_click_without_drag_does_not_copy` | C35, X1 | pass | pass (see note) | — |
 | `x1_click_toggles_tool_header_once_per_click` | X1 | pass | pass (see note) | — |
 | `x1_click_toggles_section_label` | X1 | pass | pass (see note) | — |
 | `x1_click_toggles_group_header` | X1, X3 | pass | pass (see note) | — |
-| `x1_drag_from_header_selects_without_toggling` | X1, C35 | pass | pending-ignored (phase 6: transcript selection (BMUX 13) and gesture routing (BMUX 14)) | — |
-| `x2_focus_mode_keys_walk_and_toggle_targets` | X2, FO7 | pass | pending-ignored (phase 6: structure inspector on the V2 path (FO6 `i`); see note) | Covers `alt+u`, `j`, `k`, `h`, `l`, Enter, Space, `d`, `e`, `i` and Escape. `m` is not covered because its user-state write is an effect the driver drops. |
+| `x1_drag_from_header_selects_without_toggling` | X1, C35 | pass | pass | — |
+| `x2_focus_mode_keys_walk_and_toggle_targets` | X2, FO7 | pass | pass (see note) | Covers `alt+u`, `j`, `k`, `h`, `l`, Enter, Space, `d`, `e`, `i` and Escape. `m` is not covered because its user-state write is an effect the driver drops. |
 | `x2_focus_walk_scrolls_targets_into_view` | X2, C32 | pass | pass | — |
 | `x3_collapsed_group_reveals_failed_member` | X3, A16 | pass | pass | — |
 | `a16_hidden_units_leave_marker_and_failed_stays_visible` | A16, X3 | pass | pass | — |
 | `a16_floor_applies_after_manual_toggles` | A16 | pass | pass (see note) | — |
 | `a16_awaiting_decision_stays_expanded_under_rules` | A16 | pass | pass | — |
 | `c38_streaming_markdown_converges_to_final` | C38 | pass | pass | — |
-| `d6_wheel_scroll_repaints_regionally` | D6, F5 | fail-ignored | pending-ignored (phase 6: regional damage observation (BMUX 15b)) | V1 bug D-16. A wheel tick marks full damage. |
-| `d6_composer_typing_repaints_regionally` | D6, F5 | fail-ignored | pending-ignored (phase 6: regional damage (D6, F5); see note) | V1 bug D-16. A printable key in the composer marks full damage. |
+| `d6_wheel_scroll_repaints_regionally` | D6, F5 | fail-ignored | pass | V1 bug D-16. A wheel tick marks full damage. |
+| `d6_composer_typing_repaints_regionally` | D6, F5 | fail-ignored | pass (see note) | V1 bug D-16. A printable key in the composer marks full damage. |
 | `d4_scrolling_does_no_layout_work` | D4, 9.2 | stub-ignored | pass | The V1 driver has no layout-work observation (`driver: needs per-frame layout work counters`). V1 drains its layout sync statistics inside `draw_chat_frame`. |
 | `d4_prepend_measures_only_new_units` | D4, 9.2 | stub-ignored | pass | As above. |
-| `c37_interaction_placement_and_focus_restore` | C37 | stub-ignored | stub-ignored | The driver cannot open plugin interaction surfaces. V1 builds them from tool exchanges only with the bundled-plugin features enabled. |
-| `c39_inline_shell_expansion` | C39 | stub-ignored | stub-ignored | The driver cannot produce positioned shell captures. |
+| `c37_interaction_placement_and_focus_restore` | C37 | stub-ignored | not instantiated (see the pipeline table) | The V1 driver cannot open plugin interaction surfaces. V1 builds them from tool exchanges only with the bundled-plugin features enabled. |
+| `c39_inline_shell_expansion` | C39 | stub-ignored | not instantiated (see the pipeline table) | The V1 driver cannot produce positioned shell captures. |
 
 ## V2 driver
 
@@ -317,7 +323,23 @@ production keymap contributors, no daemon) with `TuiEngine::V2` selected at star
   `Program::presentation_committed`. Observations come from the committed terminal buffer
   (marker tokens per row) and from the regions the host painted (viewport and latest bar).
   Following, motion and focus come from the snapshot that frame painted.
-* `selection_text()` is always `None`: transcript selection is phase 6.
+* `selection_text()` is the host shell's copy text, which the V2 engine's selection exports;
+  `clipboard_writes()` reads the scripted clipboard shared with the V1 driver.
+* The repaint scope (`last_repaint()`) and `last_damage()` come from the damage the terminal
+  committed the frame with (`Terminal::committed_damage`, after promotion, and
+  `Terminal::applied_scroll`, BMUX 11 and 15b), not from the damage the root model requested.
+  The driver presents unconditionally, also when an update requested no presentation (the
+  runtime would not present then); such a frame is full damage with no changed cells, so
+  repeated-presentation checks count changed cells.
+* Per-tool default rules (make-default, `m`) are persisted to a user-state double that always
+  succeeds: the driver takes the shell's pending rules and delivers
+  `PresentationRulesPersisted` with every rule stored so far, so they recompile live (A3).
+* `accept_activity_frame()` delivers the host shell's `activity-animation` invalidation (one
+  accepted spinner frame) and then the V2 timer; `run_command(route)` runs a command-palette
+  host route through the root model's command dispatch; `open_interaction(id, rows, text)`
+  installs an interactive surface double for interaction `id` that prefers `rows` rows and
+  paints `text` plus its logical row number on each row; `horizontal_wheel(right, at)`
+  delivers a horizontal wheel tick.
 * `LiveState` rehydration requests (W11) become `HistoryRequest::LiveState` requests for the events
   after the newest resident sequence at issue. The daemon double answers the host's single-event
   session-bound probes (`limit = 1`, no cursor, at a session end the scripted response does not
@@ -330,10 +352,98 @@ production keymap contributors, no daemon) with `TuiEngine::V2` selected at star
 `v2_headless.rs` (`V2HeadlessDriver`) keeps the phase 2–3 driver for engine-level checks. It
 drives the engine façade without the host, with the standard producers and the bundled default
 theme (`terminal-native`). The transcript region is the whole terminal, and only the keys bound
-in every focus (FO5) are translated into navigation intents. Inputs that need the host panic.
+in every focus (FO5) are translated into navigation intents. Inputs that need the host panic:
+drag gestures (click-versus-drag recognition through the selection, BMUX 14, is the host's),
+the copy policy and the clipboard (`clipboard_writes()` keeps the panicking default).
+`selection_text()` is the engine's own selection export, which stays empty because only the
+host starts selections. The V2 driver covers selection and copy end to end.
 `v2_headless_engine` in `mod.rs` instantiates the core navigation scenarios with it, except the
 two `c17_…_latest_motion_…` scenarios, which start from a latest-bar click that only the host
 paints.
+
+## Frame pipeline and tooling scenarios (phase 6)
+
+Defined in `packages/tui/src/transcript_scenarios/pipeline.rs` and instantiated for the V2
+engine in the application only (`v2_pipeline`). Run them with
+`cargo test -p bcode_tui --lib transcript_scenarios::v2_pipeline`. V1 is not instantiated: the
+scenarios read the terminal's committed damage and the host's command routes, inspector, inline
+interaction and shell tooling in the V2 form.
+
+They use five more driver capabilities from `driver.rs` (each panics by default, so a driver
+that lacks one fails loudly):
+
+* `last_damage()`: the damage the terminal committed the last frame with (`DamageObservation`:
+  `None`, `Full`, `Regions` or `Scroll { region, rows, regions, accelerated }`), the scenario
+  form of BMUX 15b's `FrameView::damage()`.
+* `accept_activity_frame()`: one accepted activity frame of the host shell (F7, D7).
+* `run_command(route)`: one command-palette host route (bulk disclosure).
+* `open_interaction(id, rows, text)`: an interactive surface for interaction `id` (C37).
+* `horizontal_wheel(right, at)`: one horizontal wheel tick (C39).
+
+| Scenario | Covers | V2 |
+|---|---|---|
+| `f1_cells_hits_and_focus_come_from_one_snapshot` | F1, F4, B3, B12 | pass |
+| `f2_f3_presentation_is_pure_and_reads_no_clock` | F2, F3, CK1 | pass |
+| `d7_activity_labels_advance_on_accepted_frames` | F7, D7, L5 | pass |
+| `d6_wheel_tick_is_scroll_damage_of_the_viewport` | F5, D6, BMUX 11, 15b | pass |
+| `d6_transcript_changes_repaint_the_transcript_region` | F5, D6 | pass |
+| `d4_focus_and_selection_do_no_layout_work` | D4, 9.2, L5 | pass |
+| `fo6_inspector_follows_focus_scrolls_and_closes_first` | FO6, FO3, X2 | pass |
+| `fo6_make_default_applies_the_focused_disclosure_to_its_tool` | FO6, A3, X2 | pass |
+| `fo6_detail_cycle_applies_to_every_unit` | FO6, A16 | pass |
+| `fo6_bulk_disclosure_routes_apply_to_units_or_the_focused_subtree` | FO6 (bulk routes) | pass |
+| `visuals_image_notice_replaces_the_placeholder` | Markdown images, L8 | pass |
+| `visuals_mermaid_without_images_keeps_its_source` | Mermaid diagrams, L8 | pass |
+| `c37_inline_interaction_scrolls_with_the_transcript_and_restores` | C37, D10, B7 | pass |
+| `c39_shell_expansion_opens_up_to_128_rows` | C39 | pass |
+| `c39_shell_screen_scrolls_horizontally` | C39 | pending-ignored (phase 7: local horizontal scroll inside the inline shell screen is not implemented) |
+
+Notes:
+
+* `f1_…` checks that the focused unit's highlighted rows start on the row its header is painted
+  on, and that a click on that painted header toggles exactly that unit, also after the view
+  scrolled.
+* `f2_f3_…` keeps a running tool (spinner and elapsed slots) on screen and presents again after
+  the host clock moved on without an accepted activity frame: identical cells, no changed
+  terminal cells and no layout work.
+* `d7_…` advances the spinner only through `accept_activity_frame()`; the accepted frame repaints
+  inside the transcript region and does no layout work (paint slots, L5).
+* `d6_wheel_tick_…` runs with reduced motion so one tick is one frame, and checks both
+  directions: `Damage::Scroll` over the transcript viewport by the wheel rows, moved with a
+  terminal scroll region (`ScrollRegionAcceleration::Auto`), and no repainted region outside the
+  transcript region (viewport plus latest-bar row).
+* `d6_transcript_changes_…`: focus traversal, a disclosure toggle and a selection drag repaint
+  inside the transcript region; composer typing repaints outside it; entering focus mode (its
+  status hints) and a resize repaint in full.
+* `fo6_inspector_…` reads the inspector panel's title (`Inspector · unit:tool:<call>`): it opens
+  for the focused unit, follows focus, scrolls with shift+Down/Up without moving focus, and the
+  first Escape closes it while focus mode stays (FO3).
+* `fo6_make_default_…` collapses one `read` unit, presses `m`, and checks after persistence that
+  every `read` unit, also one delivered live afterwards, is collapsed, while a `list` unit keeps
+  its disclosure.
+* `fo6_detail_cycle_…` presses `alt+d` from the composer three times: collapsed, summary,
+  expanded for every unit alike, while the failed unit keeps at least its summary (A16).
+* `fo6_bulk_disclosure_…` runs `tools.collapseAll`, `tools.expandAll`, `tools.collapseAll` in
+  focus mode (focused subtree only) and `tools.resetDisclosure`.
+* The visuals scenarios run on the scenario terminal, which reports no image support: a Markdown
+  image shows its "unsupported" notice in its reserved rows (the rows stay reserved), and a
+  Mermaid diagram keeps its source-backed code block. Rendered images and diagrams need host
+  workers and terminal image support; the host's visual tests cover them
+  (`transcript_v2_host::visuals_tests`).
+* `c37_…` uses an unresolved, required tool exchange (an interaction unit) and an interaction
+  surface double of three rows: the rows are placed inside the transcript below the unit's
+  header, move with the transcript by the content shift, are not drawn once the unit scrolled
+  away, and `ctrl+i` (interaction focus) brings them back into view. Docked (`pinned`)
+  placement and off-screen focus suspension are not covered by a scenario; they are the shared
+  host shell's paths, unchanged from V1.
+* `c39_shell_expansion_…` collects the `SHELLnnn` lines of a 200-line shell output by scrolling
+  through the transcript: the preview shows fewer than 128 lines, `e` on the focused unit shows
+  exactly the newest 128 lines (contiguous, ending at the last line), and `e` again restores the
+  preview. Input never reaching a PTY is not observable here (no PTY in scenarios).
+* `c39_shell_screen_scrolls_horizontally` fails on V2 when run: horizontal wheel input over the
+  expanded shell screen does not reveal the end of a line wider than the transcript. Local
+  horizontal scroll is the remaining part of C39, which must be checked before phase 7's exit
+  (every section 10 ID checked).
 
 ## Engine selection at startup
 
@@ -360,22 +470,29 @@ Notes on V2 passes and ignores:
 * `fo5_page_up_scrolls_from_composer_focus` passes through the host keymap: Page Up scrolls the
   transcript while the composer has focus.
 * The X1 click scenarios and `a16_floor_applies_after_manual_toggles` pass through the host's
-  click routing onto the engine's retained hit regions. Their "a click neither selects nor
-  copies" halves, and `c35_click_without_drag_does_not_copy` as a whole, are vacuous until
-  phase 6 adds selection and copy.
+  BMUX click-versus-drag recognition (BMUX 14) onto the engine's retained hit regions; since
+  phase 6 their "a click neither selects nor copies" halves and
+  `c35_click_without_drag_does_not_copy` exercise the V2 selection path.
+* The C34–C36 selection scenarios and `x1_drag_from_header_selects_without_toggling` select
+  through the committed selection scene the V2 frame registers from its retained layouts, and
+  copy through the host shell's clipboard path with V1's copy policy (C35). The post-copy clear
+  runs on the V2 host clock, so the driver delivers its timer at scenario time.
+* `d6_wheel_scroll_repaints_regionally`: V2 transcript changes repaint the transcript region
+  alone; a pure scroll becomes `Damage::Scroll` at presentation (BMUX 11).
 * `d4_scrolling_does_no_layout_work` and `d4_prepend_measures_only_new_units` are the phase-3
   `LayoutWorkCounters` exit criteria (9.2): scroll-only updates and frames do no parse,
   highlight, projection, build or measurement work, and an older page measures at most its new
   units.
-* `x2_focus_mode_keys_walk_and_toggle_targets`: alt+u, the walk keys and the disclosure keys
-  pass. The scenario fails at `i`, because the structure inspector is not on the V2 path yet:
-  the V1 inspector builds its reports from V1 transcript items, so the V2 host consumes `i`,
-  shift+Up/Down and `m` without effect. FO6 lists these keys, so this is the one focus-model
-  item left open after phase 4. It is recorded against phase 6, which splits the host-side
-  objects on the V2 path.
-* `d6_composer_typing_repaints_regionally`: a printable composer key marks full damage in the
-  shared host shell's composer path (D-16, the same as on V1), not in V2. Regional damage is a
-  phase-6 exit criterion (D6, F5).
+* `x2_focus_mode_keys_walk_and_toggle_targets`: since phase 6 the V2 host has its own structure
+  inspector (`transcript_v2_host::inspector`, built from the V2 engine's structure
+  resolution), so `i` and the Escape that closes it pass on V2. shift+Up/Down scrolling and
+  `m` are covered by `fo6_inspector_…` and `fo6_make_default_…` in the pipeline table.
+* `d6_composer_typing_repaints_regionally`: with V2 the root model marks a plain composer edit
+  (no key request, no submit menu, no slash palette before or after) as a paint-level
+  invalidation that damages the composer region alone, kept until a frame presents it. Menus,
+  palettes, completion changes and requests stay structural, and an edit that resizes the
+  composer changes the chrome layout, which the V2 draw path repaints in full. The V1 path is
+  unchanged (D-16 stays a V1 deviation).
 * `x2_focus_walk_scrolls_targets_into_view` advances scenario time between key presses, so the
   animated scroll toward each focused target settles before the next press. This is a fix to the
   shared scenario: V1 freezes its scroll animation, so V1 never needed the wait.

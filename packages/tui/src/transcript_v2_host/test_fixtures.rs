@@ -116,6 +116,7 @@ pub fn style(glow_window: Duration) -> TranscriptPaintStyle<'static> {
         info: Style::new(),
         accent: Style::new(),
         focus: Style::new().add_modifier(Modifier::REVERSED),
+        selection: Style::new().add_modifier(Modifier::UNDERLINE),
         jump_key: "ctrl+end",
         glow_window,
     }

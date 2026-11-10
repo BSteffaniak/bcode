@@ -314,9 +314,25 @@ impl ProducerRegistry {
 
 impl UnitProducer for ProducerRegistry {
     fn produce(&self, unit: UnitView<'_>, cx: &ItemRenderContext<'_>) -> ProducedItem {
+        // D10: a unit holding the inline interaction surface renders only the blank rows the
+        // host paints the surface over.
+        if let crate::units::structure::ResolvedUnitPresentation::Item(item) = cx.structure
+            && let Some(rows) = item.reserved_rows
+        {
+            return ProducedItem::new(reserved_rows(rows));
+        }
         self.by_kind
             .get(&producer_kind(unit, cx))
             .unwrap_or(&self.fallback)
             .produce(unit, cx)
     }
+}
+
+/// `rows` blank rows (at least one) reserved for a surface the host paints over the unit.
+fn reserved_rows(rows: u32) -> TextBlock {
+    let rows = usize::try_from(rows.max(1)).unwrap_or(usize::MAX);
+    TextBlock::new(bmux_tui::text::Text::from_lines(vec![
+        bmux_tui::text::Line::default();
+        rows
+    ]))
 }

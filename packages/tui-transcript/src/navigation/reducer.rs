@@ -8,8 +8,10 @@
 use std::time::{Duration, Instant};
 
 use bcode_session_view_models::{TranscriptChange, TranscriptChanges};
+use bmux_tui_components::virtual_list::{
+    Edge, ItemFocusTarget, PositionEstimate as BmuxEstimate, anchor_for, reveal_top_offset,
+};
 use bmux_tui_components::virtual_list::{FractionTarget, ResolvedPosition};
-use bmux_tui_components::virtual_list::{PositionEstimate as BmuxEstimate, anchor_for};
 
 use super::auto::{AutoAction, automatic_actions};
 use super::geometry::{mode_for, resting_top, visual_top};
@@ -351,6 +353,10 @@ impl Reducer<'_, '_, '_> {
     /// C32/T19: bring the unit-local `rows` of `unit` into view from the approach edge: moving
     /// up puts their first row on the top edge, moving down their last row on the bottom edge
     /// (taller ranges keep their first row on top). Fully visible rows do not move.
+    ///
+    /// The placement is BMUX's focus reveal (FO7, BMUX 12): the rows become an
+    /// [`ItemFocusTarget`] of the unit, revealed with `EnsureVisibleFrom(edge)`; a detached
+    /// window then clamps to its content bottom (C31).
     fn place_rows(
         &mut self,
         unit: &UnitKey,
@@ -359,22 +365,18 @@ impl Reducer<'_, '_, '_> {
         at: Instant,
     ) -> bool {
         let view = self.view;
-        let Some(offset) = view.unit_offset(unit) else {
+        let current = visual_top(self.state, view, Some(at));
+        let target = ItemFocusTarget::new(unit.clone(), (), rows.clone());
+        let edge = match edge {
+            ApproachEdge::Top => Edge::Top,
+            ApproachEdge::Bottom => Edge::Bottom,
+        };
+        let Some(destination) =
+            reveal_top_offset(view.index, &target, edge, current, view.geometry())
+        else {
             return false;
         };
-        let height = view.viewport.height.max(1);
-        let start = offset.saturating_add(rows.start);
-        let end = offset.saturating_add(rows.end.max(rows.start.saturating_add(1)));
-        let current = visual_top(self.state, view, Some(at));
-        if start >= current && end <= current.saturating_add(height) {
-            return false;
-        }
-        let destination = match edge {
-            ApproachEdge::Top => start,
-            ApproachEdge::Bottom if end - start > height => start,
-            ApproachEdge::Bottom => end - height,
-        }
-        .min(view.max_top());
+        let destination = destination.min(view.max_top());
         if destination == current {
             return false;
         }

@@ -3044,6 +3044,29 @@ impl ChatLoopState {
         self.interactive_surface = Some(surface);
     }
 
+    /// Whether the terminal can present images (BMUX host image capabilities).
+    #[must_use]
+    pub fn markdown_images_supported(&self) -> bool {
+        self.markdown_image_capabilities.any_supported()
+    }
+
+    /// Handles to the host-side Markdown image loader and Mermaid renderer, shared with the V2
+    /// transcript's visual workers (both are cheap reference-counted handles; transcript
+    /// presentation state is not shared).
+    #[must_use]
+    pub fn markdown_visual_workers(&self) -> super::transcript_v2_host::visuals::VisualWorkers {
+        super::transcript_v2_host::visuals::VisualWorkers {
+            images: self
+                .markdown_presentation
+                .as_ref()
+                .map(|runtime| runtime.image_loader.clone()),
+            mermaid: self
+                .markdown_mermaid
+                .as_ref()
+                .map(|runtime| runtime.renderer.clone()),
+        }
+    }
+
     /// Configure an explicit test host and inspect cloned compositor repair state.
     #[cfg(test)]
     pub(super) const fn image_presentation_for_test(
@@ -6334,12 +6357,10 @@ pub fn draw_chat_frame<W: Write>(
         .interactive_surface
         .as_mut()
         .map(|surface| surface.preferred_height(full_transcript_area.width).max(1));
-    // The V2 transcript does not reserve inline interaction rows yet (phase 6): with V2 the
-    // interactive surface is docked below the transcript instead of being placed from the
-    // hidden V1 layout.
-    let pinned = transcript_v2.is_some()
-        || chat.app.tui_config().interactions.placement
-            == bcode_config::TuiInteractionPlacement::Pinned;
+    // With transcript placement the surface is placed over rows its interaction unit reserves:
+    // V1 reserves them in its transcript layout, V2 in its own engine (C37, D10).
+    let pinned = chat.app.tui_config().interactions.placement
+        == bcode_config::TuiInteractionPlacement::Pinned;
     let pinned_offset = if pinned {
         let previous = loop_state.pinned_interaction_viewport.clone();
         let result = loop_state.interactive_surface.as_mut().map(|surface| {
@@ -6393,19 +6414,39 @@ pub fn draw_chat_frame<W: Write>(
         })
         .flatten();
     chat.app.set_active_interaction_layout(
-        active_inline_rows.map(|(interaction_id, rows)| (interaction_id.to_owned(), rows)),
+        active_inline_rows
+            .filter(|_| transcript_v2.is_none())
+            .map(|(interaction_id, rows)| (interaction_id.to_owned(), rows)),
     );
-    let prepared =
-        render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
+    // With V2 the transcript body is the V2 engine's: only the shared chrome layout is derived,
+    // and the V1 transcript layout is not prepared (EN5, phase 6).
+    let prepared = if transcript_v2.is_some() {
+        render::prepare_chrome_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
+    } else {
+        render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
+    };
     let layout = prepared.map(|(layout, _dock)| layout);
-    if let (Some(host), Some(layout)) = (transcript_v2.as_deref_mut(), layout) {
-        let now = host.now();
-        host.sync_geometry(
-            super::transcript_v2_host::paint::transcript_region(layout),
-            now,
-        );
-        host.set_composer_area(layout.composer());
-    }
+    // Layout-dependent transcript state is synced at this frame's clock (the clock the frame is
+    // prepared at, F2). A reservation change made here repaints the transcript region in this
+    // frame (F5).
+    let transcript_v2_drawn_change =
+        if let (Some(host), Some(layout)) = (transcript_v2.as_deref_mut(), layout) {
+            let now = host
+                .presentation_frame_clock(terminal.presentation_clock())
+                .now;
+            host.sync_geometry(
+                super::transcript_v2_host::paint::transcript_region(layout),
+                now,
+            );
+            host.set_composer_area(layout.composer());
+            host.sync_inline_interaction(active_inline_rows, now)
+        } else {
+            false
+        };
+    let inspector_component_theme = transcript_v2
+        .as_ref()
+        .filter(|host| host.inspector_open())
+        .map(|_| chat.app.presented_theme().component_theme());
     let transcript_v2_chrome = transcript_v2.is_some().then(|| {
         (
             super::transcript_v2_host::focus::jump_to_latest_label(chat.app.effective_keymap()),
@@ -6414,7 +6455,7 @@ pub fn draw_chat_frame<W: Write>(
         )
     });
     // V1 Markdown images and Mermaid diagrams are placed from the V1 transcript layout, which
-    // the V2 engine replaces in the body (V2 placeholders until phase 6).
+    // the V2 engine replaces in the body (V2 registers its own placements while painting).
     let rich_presentation = layout.filter(|_| transcript_v2.is_none()).map_or_else(
         || MarkdownFramePresentation {
             rich: Vec::new(),
@@ -6423,7 +6464,7 @@ pub fn draw_chat_frame<W: Write>(
         },
         |layout| reconcile_markdown_presentation(chat, loop_state, layout.body),
     );
-    let inline_placement = (!pinned)
+    let inline_placement = (!pinned && transcript_v2.is_none())
         .then(|| {
             inline_interaction_surface_placement(
                 &chat.app,
@@ -6560,6 +6601,16 @@ pub fn draw_chat_frame<W: Write>(
         .as_ref()
         .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
         .then(Instant::now);
+    // Regional damage assumes the committed chrome layout; a changed layout (a resized
+    // composer or status row) repaints in full (F5).
+    let chrome_changed = layout != committed_layout;
+    let damage = match transcript_v2.as_deref() {
+        Some(_) if chrome_changed => bmux_tui::damage::Damage::Full,
+        Some(host) if transcript_v2_drawn_change => {
+            host.with_transcript_damage(damage, terminal.area())
+        }
+        _ => damage,
+    };
     let regions = damage.retained_regions().to_vec();
     let full_damage = damage.is_full();
     let intersects = |area: bmux_tui::geometry::Rect| {
@@ -6567,6 +6618,44 @@ pub fn draw_chat_frame<W: Write>(
             || regions
                 .iter()
                 .any(|region| !area.intersection(*region).is_empty())
+    };
+    let foreground_owns_canvas = loop_state.foreground_owns_canvas();
+    // The V2 transcript style (the canvas, as the V1 body and latest bar use).
+    let transcript_v2_style =
+        transcript_v2_chrome
+            .as_ref()
+            .map(|(jump_key, glow_window, canvas)| {
+                super::transcript_v2_host::paint::TranscriptPaintStyle {
+                    background: *canvas,
+                    text: theme.text,
+                    muted: theme.muted,
+                    info: theme.info,
+                    accent: theme.focused,
+                    focus: theme.selection,
+                    selection: theme.selection,
+                    jump_key,
+                    glow_window: *glow_window,
+                }
+            });
+    // V2 prepares its frame once, before drawing, at the presentation clock (F1, F2); the
+    // prepared frame decides whether transcript damage is a pure scroll (F5, BMUX 11).
+    let damage = match (
+        transcript_v2.as_deref_mut(),
+        layout,
+        transcript_v2_style.as_ref(),
+    ) {
+        (Some(host), Some(layout), Some(style))
+            if !foreground_owns_canvas
+                && intersects(super::transcript_v2_host::paint::transcript_region(layout)) =>
+        {
+            let region = super::transcript_v2_host::paint::transcript_region(layout);
+            let clock = host.presentation_frame_clock(terminal.presentation_clock());
+            host.prepare(region, clock, style);
+            terminal
+                .set_scroll_region_acceleration(bmux_tui::terminal::ScrollRegionAcceleration::Auto);
+            host.frame_damage(damage, terminal.area())
+        }
+        _ => damage,
     };
     let geometry = loop_state.interactive_surface.as_ref().map(|_| {
         if pinned {
@@ -6592,7 +6681,9 @@ pub fn draw_chat_frame<W: Write>(
             }
         }
     });
-    let foreground_owns_canvas = loop_state.foreground_owns_canvas();
+    // V2 places an inline surface from the frame it paints (D10), so the geometry is final only
+    // after the transcript painted.
+    let surface_geometry = std::cell::Cell::new(geometry);
     // Output may fail after emitting image protocol bytes, including at flush.
     // Keep committed residency separate from the candidate and preserve repair debt.
     let compositor = std::cell::RefCell::new(loop_state.markdown_image_compositor.clone());
@@ -6613,24 +6704,33 @@ pub fn draw_chat_frame<W: Write>(
                         intersects(area)
                             && !(v2 && (area == layout.body() || Some(area) == layout.latest_bar()))
                     });
-                    if let (Some(host), Some((jump_key, glow_window, canvas))) =
-                        (transcript_v2.as_deref_mut(), transcript_v2_chrome.as_ref())
+                    if let (Some(host), Some(style)) =
+                        (transcript_v2.as_deref_mut(), transcript_v2_style.as_ref())
                     {
                         let region = super::transcript_v2_host::paint::transcript_region(layout);
                         if intersects(region) {
-                            // The canvas, as the V1 body and latest bar use.
-                            let style = super::transcript_v2_host::paint::TranscriptPaintStyle {
-                                background: *canvas,
-                                text: theme.text,
-                                muted: theme.muted,
-                                info: theme.info,
-                                accent: theme.focused,
-                                focus: theme.selection,
-                                jump_key,
-                                glow_window: *glow_window,
-                            };
                             let now = host.now();
-                            host.paint(region, frame, &style, now);
+                            host.paint(region, frame, style, now);
+                        }
+                        if let Some(component_theme) = &inspector_component_theme {
+                            host.paint_inspector(frame, theme, component_theme);
+                        }
+                        if !pinned && geometry.is_some() {
+                            let placed = host.inline_interaction_area().map_or_else(
+                                || InteractiveSurfaceGeometry {
+                                    placement: InteractiveSurfacePlacement::Transcript,
+                                    logical_height: interaction_rows.unwrap_or(0),
+                                    visible_logical_offset: 0,
+                                    destination: surface_area,
+                                },
+                                |area| InteractiveSurfaceGeometry {
+                                    placement: InteractiveSurfacePlacement::Transcript,
+                                    logical_height: area.logical_height,
+                                    visible_logical_offset: area.visible_offset,
+                                    destination: area.destination,
+                                },
+                            );
+                            surface_geometry.set(Some(placed));
                         }
                     } else {
                         let selection_scene = super::root_program::transcript_selection_scene(
@@ -6705,7 +6805,7 @@ pub fn draw_chat_frame<W: Write>(
                     }
                 }
                 if !foreground_owns_canvas {
-                    paint_interactive_surface(loop_state, geometry, frame);
+                    paint_interactive_surface(loop_state, surface_geometry.get(), frame);
                 }
                 if !modal && let Some(snapshot) = transcript_selection.snapshot(frame.selection()) {
                     frame.paint_selection(&snapshot, theme.selection);
@@ -6718,7 +6818,7 @@ pub fn draw_chat_frame<W: Write>(
                 paint_background(frame);
                 loop_state.modal_backdrop = None;
             }
-            paint_foreground(chat, loop_state, geometry, frame);
+            paint_foreground(chat, loop_state, surface_geometry.get(), frame);
         },
         |writer| compositor.borrow_mut().prepare_output(writer),
         |writer, scene, delta| {
@@ -6753,7 +6853,7 @@ pub fn draw_chat_frame<W: Write>(
             return Err(error.into());
         }
     };
-    loop_state.interactive_surface_geometry = geometry;
+    loop_state.interactive_surface_geometry = surface_geometry.get();
     record_frame_telemetry(
         loop_state,
         &draw_stats,

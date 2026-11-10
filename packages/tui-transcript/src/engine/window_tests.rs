@@ -734,3 +734,118 @@ fn w7_w7a_eviction_waits_for_a_running_motion_and_the_ceiling_holds() {
         "eviction kept the motion target in place"
     );
 }
+
+#[test]
+fn w7_eviction_waits_for_an_active_selection() {
+    use crate::selection::{SelectionKey, TranscriptSelection, TranscriptSelectionEndpoint};
+
+    let mut host = Host::attach(2_000);
+    for _ in 0..2_000 {
+        if host.engine.window().event_count >= 1_024
+            && host.awaited_page(PageDirection::Older).is_some()
+        {
+            break;
+        }
+        host.pump(0);
+        host.wheel(-5);
+    }
+    let page = host
+        .awaited_page(PageDirection::Older)
+        .expect("older page awaited");
+    // A selection between two resident units (a finished drag): eviction is deferred.
+    let keys = host.engine.units().keys();
+    let (first, last) = (keys[1].clone(), keys[keys.len() - 2].clone());
+    let selection = TranscriptSelection::new(
+        TranscriptSelectionEndpoint::new(SelectionKey::new(first, 0), 0),
+        TranscriptSelectionEndpoint::new(SelectionKey::new(last, 0), 1),
+    );
+    let _ = host.engine.set_selection(Some(selection.clone()), false);
+    let evictions = host.engine.window_work().evictions;
+    host.answer(page);
+    assert_eq!(
+        host.engine.window_work().evictions,
+        evictions,
+        "W7: deferred while a selection exists"
+    );
+    assert_eq!(
+        host.engine.selection(),
+        Some(&selection),
+        "the selection is kept"
+    );
+    // Clearing the selection lets the next update evict.
+    let _ = host.engine.set_selection(None, false);
+    host.wheel(1);
+    assert!(host.engine.window_work().evictions > evictions);
+}
+
+/// W7: the W7a ceiling trim that still runs while a selection defers eviction never evicts a
+/// unit holding a selection endpoint; the selection survives the trim.
+#[test]
+fn w7a_ceiling_trim_keeps_selection_endpoint_units() {
+    use crate::selection::{SelectionKey, TranscriptSelection, TranscriptSelectionEndpoint};
+
+    let mut host = Host::attach(2_000);
+    let _ = host.jump(2_900, Placement::ItemTopAtTop);
+    // The selection's anchor is in the oldest resident unit, on the side the ceiling trims
+    // after newer pages; its focus is in a later one.
+    let items = host
+        .engine
+        .units()
+        .keys()
+        .iter()
+        .filter(|key| matches!(key, UnitKey::Item(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let (oldest, later) = (items[0].clone(), items[4].clone());
+    let selection = TranscriptSelection::new(
+        TranscriptSelectionEndpoint::new(SelectionKey::new(oldest.clone(), 0), 0),
+        TranscriptSelectionEndpoint::new(SelectionKey::new(later, 0), 1),
+    );
+    let _ = host.engine.set_selection(Some(selection.clone()), false);
+    // Read down to the live tail, answering newer pages only.
+    for _ in 0..1_000 {
+        if host.engine.window().mode == WindowMode::Live {
+            break;
+        }
+        let engine = &host.engine;
+        host.pending
+            .retain(|(_, request)| engine.is_awaiting(request));
+        let next = host.pending.iter().position(|(_, request)| {
+            !matches!(request, HostRequest::Page(issued) if matches!(issued.request, PageRequest::Older { .. }))
+        });
+        if let Some(index) = next {
+            let (_, request) = host.pending.remove(index);
+            host.answer(request);
+        }
+        host.wheel(50);
+    }
+    assert_eq!(host.engine.window().mode, WindowMode::Live);
+    assert_eq!(host.engine.selection(), Some(&selection));
+    // Durable live events take the window past the ceiling. The trim would remove the head,
+    // where the selection's anchor unit is pinned, so the window may pass the ceiling.
+    for _ in 0..120 {
+        host.live_turn();
+    }
+    assert!(host.engine.window().event_count > RESIDENT_CEILING_EVENTS);
+    assert!(
+        host.engine.units().contains(&oldest),
+        "W7: the selection endpoint unit stays resident"
+    );
+    assert_eq!(
+        host.engine.selection(),
+        Some(&selection),
+        "the selection survives the ceiling trim"
+    );
+    // One page above the ceiling the pins give way: the selection is dropped and the window
+    // is trimmed back to the ceiling, so residency stays bounded.
+    let evictions = host.engine.window_work().evictions;
+    for _ in 0..PAGE_EVENTS {
+        if host.engine.window_work().evictions > evictions {
+            break;
+        }
+        host.live_turn();
+    }
+    assert!(host.engine.window_work().evictions > evictions);
+    assert!(host.engine.window().event_count <= RESIDENT_CEILING_EVENTS);
+    assert_eq!(host.engine.selection(), None);
+}
