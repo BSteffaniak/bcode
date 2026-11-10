@@ -214,7 +214,7 @@ Notes:
 | `c25_collapse_above_keeps_reading_position` | C25 | pass | pass | Collapse is applied through structural rules (`kind = "tool"` collapsed). The `alt+d` cycle would collapse the reading item too. |
 | `c26_runtime_work_events_do_not_move_final_response` | C26, T23 | pass | pass | — |
 | `c27_repeated_presentation_is_idempotent` | C27, CK1 | pass | pass | — |
-| `c27_failed_presentation_does_not_commit_navigation` | C27, CK2, CK3 | fail-ignored | stub-ignored | Stub. The driver cannot inject a presentation failure (`driver: needs presentation failure injection`). |
+| `c27_failed_presentation_does_not_commit_navigation` | C27, CK2, CK3 | fail-ignored | pass | The V1 driver cannot inject a presentation failure (`driver: needs presentation failure injection`). The V2 driver's `abandon_presentation()` prepares and paints a frame whose terminal output fails, so nothing commits it. |
 | `c28_movement_kept_while_page_loads_is_spent_once` | C28, N8 | pass | pass | — |
 | `c29_direction_reversal_cancels_pending_movement` | C29, N8 | pass | pass | Checks that the reversal moves by its own tick only, that the older page is still incorporated (first resident sequence decreases), and that neither the page nor later frames spend the cancelled movement. V1 passes because it keeps no movement while a page loads. |
 | `c30_growth_while_following_is_not_a_prepend` | C30, N12 | pass | pass | — |
@@ -400,7 +400,9 @@ that lacks one fails loudly):
 | `visuals_mermaid_without_images_keeps_its_source` | Mermaid diagrams, L8 | pass |
 | `c37_inline_interaction_scrolls_with_the_transcript_and_restores` | C37, D10, B7 | pass |
 | `c39_shell_expansion_opens_up_to_128_rows` | C39 | pass |
-| `c39_shell_screen_scrolls_horizontally` | C39 | pending-ignored (phase 7: local horizontal scroll inside the inline shell screen is not implemented) |
+| `c39_shell_screen_scrolls_horizontally` | C39 | pass |
+| `e1_plugin_visual_presents_adapter_rows_instead_of_the_fallback` | E1, E5 (phase 7) | pass |
+| `c36_plugin_visual_copy_uses_the_adapter_source` | C36, E3 (phase 7) | pass |
 
 Notes:
 
@@ -415,7 +417,8 @@ Notes:
 * `d6_wheel_tick_…` runs with reduced motion so one tick is one frame, and checks both
   directions: `Damage::Scroll` over the transcript viewport by the wheel rows, moved with a
   terminal scroll region (`ScrollRegionAcceleration::Auto`), and no repainted region outside the
-  transcript region (viewport plus latest-bar row).
+  transcript region (viewport plus latest-bar row) and the status row below it, which reports
+  the reading position the tick changed (C2).
 * `d6_transcript_changes_…`: focus traversal, a disclosure toggle and a selection drag repaint
   inside the transcript region; composer typing repaints outside it; entering focus mode (its
   status hints) and a resize repaint in full.
@@ -438,16 +441,56 @@ Notes:
   surface double of three rows: the rows are placed inside the transcript below the unit's
   header, move with the transcript by the content shift, are not drawn once the unit scrolled
   away, and `ctrl+i` (interaction focus) brings them back into view. Docked (`pinned`)
-  placement and off-screen focus suspension are not covered by a scenario; they are the shared
-  host shell's paths, unchanged from V1.
+  placement and off-screen focus suspension are covered by the host chrome scenarios below.
 * `c39_shell_expansion_…` collects the `SHELLnnn` lines of a 200-line shell output by scrolling
   through the transcript: the preview shows fewer than 128 lines, `e` on the focused unit shows
   exactly the newest 128 lines (contiguous, ending at the last line), and `e` again restores the
   preview. Input never reaching a PTY is not observable here (no PTY in scenarios).
-* `c39_shell_screen_scrolls_horizontally` fails on V2 when run: horizontal wheel input over the
-  expanded shell screen does not reveal the end of a line wider than the transcript. Local
-  horizontal scroll is the remaining part of C39, which must be checked before phase 7's exit
-  (every section 10 ID checked).
+* `c39_shell_screen_scrolls_horizontally` delivers horizontal wheel ticks over a shell line
+  wider than the transcript: the screen scrolls on its own and reveals the end of the line
+  without wrapping it. Right-button focus with Left/Right/Home/Escape and the plugin shell's
+  alternate-screen replay are covered by host tests
+  (`transcript_v2_host::plugin_visuals::tests`,
+  `root_program::tests::v2_shell_alternate_screen_takes_pointer_focus_and_terminal_keys`).
+* The plugin visual scenarios (`v2_plugin_visuals`) load the bundled filesystem plugin through
+  the production static plugin host and record a file read with the plugin's artifact: the
+  adapter's rows replace the canonical fallback, and a drag over them copies the file's source
+  lines, not the rendered gutter.
+
+## Host chrome scenarios (phase 7)
+
+V2-only scenarios in `transcript_scenarios/v2/host_chrome.rs` run the application with the V2
+engine through the V2 driver (they reach the driver's model directly for configuration the
+engine-neutral contract has no setting for: key bindings, interaction placement, profiles,
+themes and the streaming policy).
+
+| Scenario | Covers | V2 |
+|---|---|---|
+| `c2_status_row_reports_the_v2_reading_position` | C2 | pass |
+| `fo5_transcript_keys_under_an_interactive_surface_move_the_v2_transcript` | FO5, EN5 | pass |
+| `fo6_user_bound_tool_keys_act_on_the_v2_transcript` | FO6 (tool keys) | pass |
+| `x4_theme_changes_after_startup_reach_composer_and_dialog_chrome` | X4 | pass |
+| `c37_pinned_surface_docks_below_the_v2_transcript` | C37 | pass |
+| `c37_offscreen_surface_retains_or_suspends_focus_from_the_v2_geometry` | C37 | pass |
+| `d13_v2_paces_live_text_with_the_shell_streaming_policy` | D13 | pass |
+
+Notes:
+
+* `c2_…` reads the label from the rows below the transcript: "N rows below latest" in tail
+  space, "N rows from bottom" while reading (the count follows each tick, so the status row is
+  repainted with the transcript), and no label once `ctrl+end` returns to the latest content.
+* `fo5_…` opens an interaction surface and checks that Page Up, `ctrl+down`, `ctrl+home` and
+  `ctrl+end` move the V2 transcript under it.
+* `fo6_user_bound_…` binds `tui.tools.collapseAll`, `expandAll` and `resetDisclosure` to keys
+  (they have no defaults) and checks they act like their palette routes.
+* `x4_…` selects profiles with different composer borders and a theme after startup and checks
+  the painted composer corner and the chrome theme dialogs read.
+* `c37_offscreen_…` counts the keys an inline surface receives: off screen it keeps receiving
+  them with `offscreen_focus = retain` and stops with `suspend`; after `ctrl+i` it receives them
+  again.
+* `d13_…` applies the paced default policy through the host shell and checks that a long live
+  delta is not shown at once, becomes fully visible on the V2 timer, and that the streaming
+  configurator's reset to immediate presentation shows pending text at once.
 
 ## Engine selection at startup
 

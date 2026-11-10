@@ -106,6 +106,19 @@ pub enum BmuxAction {
 }
 
 impl BmuxAction {
+    /// The transcript command-palette route a tool-disclosure action runs (`tools.*`): a key
+    /// bound to the action does exactly what the palette command does. `None` for every other
+    /// action.
+    #[must_use]
+    pub const fn tools_route(self) -> Option<&'static str> {
+        match self {
+            Self::ToolsExpandAll => Some("tools.expandAll"),
+            Self::ToolsCollapseAll => Some("tools.collapseAll"),
+            Self::ToolsResetDisclosure => Some("tools.resetDisclosure"),
+            _ => None,
+        }
+    }
+
     /// Stable registry identity for this built-in action.
     #[must_use]
     pub const fn id(self) -> &'static str {
@@ -389,6 +402,27 @@ fn register_host_actions(
     register_transcript_focus_actions(registry)?;
     if engine == bcode_config::TuiEngine::V2 {
         super::transcript_v2_host::focus::register_actions(registry)?;
+        register_tool_disclosure_actions(registry)?;
+    }
+    Ok(())
+}
+
+/// Register the chat-scope tool-disclosure actions (`tui.tools.*`) without default keys, so a
+/// user binding resolves to them; the V2 transcript runs each as its palette route.
+fn register_tool_disclosure_actions(
+    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
+    for action in [
+        BmuxAction::ToolsExpandAll,
+        BmuxAction::ToolsCollapseAll,
+        BmuxAction::ToolsResetDisclosure,
+    ] {
+        registry.register(bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: action.id().into(),
+            scope: BmuxScope::Chat.id().into(),
+            description: action.description().into(),
+            defaults: Vec::new(),
+        })?;
     }
     Ok(())
 }

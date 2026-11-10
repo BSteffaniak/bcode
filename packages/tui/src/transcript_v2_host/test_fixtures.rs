@@ -107,6 +107,42 @@ pub fn attached_to(session: SessionId, turns: u64, at: Instant) -> TranscriptV2H
     host
 }
 
+/// A host attached to `session` holding exactly `events` (all resident), geometry synced to
+/// [`REGION`] and the composer recorded at [`COMPOSER`].
+pub fn attached_with_events(
+    session: SessionId,
+    events: Vec<SessionEvent>,
+    at: Instant,
+) -> TranscriptV2Host {
+    let mut host = TranscriptV2Host::new();
+    host.sync_geometry(REGION, at);
+    host.set_composer_area(COMPOSER);
+    host.sync_session(Some(session), at);
+    let effects = host.drain_effects();
+    let [TuiEffect::LoadTranscriptV2History { load }] = effects.as_slice() else {
+        panic!("one tail request, got {} effects", effects.len());
+    };
+    let HostRequest::Window(issued) = load.request else {
+        panic!("window request");
+    };
+    let first = events.first().map(|event| event.sequence);
+    let last = events.last().map(|event| event.sequence);
+    let result = TuiEffectResult::TranscriptV2HistoryLoaded {
+        load: *load,
+        result: Ok(HistoryLoaded::Window(HistoryWindowResult {
+            generation: issued.generation,
+            target: issued.request,
+            events,
+            has_older: false,
+            has_newer: false,
+            first_available_sequence: first,
+            last_available_sequence: last,
+        })),
+    };
+    assert!(host.apply_effect_result(result, at));
+    host
+}
+
 /// Paint styles of the fixtures: the focus highlight is reversed video.
 pub fn style(glow_window: Duration) -> TranscriptPaintStyle<'static> {
     TranscriptPaintStyle {

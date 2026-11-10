@@ -27,8 +27,12 @@
 //! * [`inspector`]: the structure inspector and transcript tooling (bulk disclosure, detail
 //!   cycling, make-default, inline shell expansion; FO6, C39).
 //! * [`interactions`]: inline interaction placement inside the transcript (C37, D10).
+//! * [`latest_bar`]: the status row's transcript position label ("N rows below latest",
+//!   "N rows from bottom", C2).
 //! * [`local_rows`]: pending submissions and process-local notices of the host shell as
 //!   engine local rows (LR1–LR7).
+//! * [`markdown`]: Markdown contribution focus and activation (links, session links,
+//!   footnotes, fragments, `<details>`, the Mermaid source view; V1 visible parity).
 //! * [`visuals`]: Markdown images and Mermaid diagrams rendered by the host-side workers and
 //!   accepted into the render configuration (phase 6, L8, D2).
 //! * [`paint`]: viewport geometry, frame preparation, painting, commit, the latest bar and the
@@ -51,8 +55,11 @@ pub mod ingest;
 pub mod input;
 pub mod inspector;
 pub mod interactions;
+pub mod latest_bar;
 pub mod local_rows;
+pub mod markdown;
 pub mod paint;
+pub mod plugin_visuals;
 pub mod render_config;
 pub mod visuals;
 
@@ -151,6 +158,12 @@ pub struct TranscriptV2Host {
     glow_frame_at: Option<std::time::Instant>,
     /// Inspector panel, tooling notices and queued per-tool defaults ([`inspector`]).
     tools: inspector::HostTools,
+    /// Markdown activation: source view, focus highlight, notices and shell requests
+    /// ([`markdown`]).
+    markdown: markdown::MarkdownHost,
+    /// Focused shell screen and the plugin content position last requested
+    /// ([`plugin_visuals`], E3, C39).
+    content_input: plugin_visuals::ContentInput,
     /// Fingerprint of the shell state the engine's local rows were last built from; `None`
     /// until the first sync and after an engine reset ([`local_rows`]).
     local_rows: Option<u64>,
@@ -161,6 +174,11 @@ pub struct TranscriptV2Host {
     /// resets so a submission the shell forgets in the update that attaches the session it
     /// created is still handed off ([`local_rows`]).
     shown_submissions: Vec<bcode_tui_transcript::units::local::LocalRow>,
+    /// Streaming-presentation policy applied to the engine's `SessionView`; re-applied after
+    /// an engine reset ([`ingest`], D13).
+    streaming: bcode_session_view_models::StreamingPresentationPolicy,
+    /// Transcript position the status row last showed ([`latest_bar`], C2).
+    status_painted: Option<crate::render::TranscriptStatusPosition>,
     /// Scenario time replacing the wall clock for every host and frame clock read, so
     /// transcript scenarios run on scripted time ([`Self::set_scripted_now`]).
     #[cfg(test)]
@@ -204,9 +222,13 @@ impl TranscriptV2Host {
             scrollbar_drag: false,
             glow_frame_at: None,
             tools: inspector::HostTools::default(),
+            markdown: markdown::MarkdownHost::default(),
+            content_input: plugin_visuals::ContentInput::default(),
             local_rows: None,
             handoffs: Vec::new(),
             shown_submissions: Vec::new(),
+            streaming: bcode_session_view_models::StreamingPresentationPolicy::immediate(),
+            status_painted: None,
             #[cfg(test)]
             scripted_now: None,
         }

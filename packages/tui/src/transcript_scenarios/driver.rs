@@ -413,6 +413,32 @@ pub trait TranscriptScenarioDriver: Sized {
     fn focused_extent(&self) -> Option<std::ops::Range<i64>> {
         panic!("{:?} driver does not observe focus geometry", Self::ENGINE);
     }
+
+    /// Prepare and paint one frame whose presentation fails (its terminal output errors), so
+    /// the frame is never committed (C27, CK2). Nothing is recorded as a scenario frame.
+    ///
+    /// The default panics: a driver must be able to inject a presentation failure.
+    fn abandon_presentation(&mut self) {
+        panic!("driver: needs presentation failure injection");
+    }
+
+    /// Load `plugins` (bundled, statically linked) into the application's plugin host, as
+    /// startup does, so their visual adapters present tool results (E1).
+    ///
+    /// The default panics: a driver must own a plugin host to run plugin visual scenarios.
+    fn load_bundled_plugins(&mut self, plugins: &[ScenarioPlugin]) {
+        panic!(
+            "{:?} driver cannot load bundled plugins ({plugins:?})",
+            Self::ENGINE
+        );
+    }
+}
+
+/// A bundled plugin a scenario loads ([`TranscriptScenarioDriver::load_bundled_plugins`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioPlugin {
+    /// `bcode.filesystem`: file reads and edits.
+    Filesystem,
 }
 
 /// Engine-neutral configuration a scenario can apply between frames.

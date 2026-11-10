@@ -150,6 +150,22 @@ impl CanonicalToolVisual {
         item: &super::item::TranscriptItem,
         draft: &bcode_session_view_models::ToolRequestDraftView,
     ) -> Self {
+        Self::from_draft_view(
+            draft,
+            &serde_json::json!(
+                item.source_view_item_revision()
+                    .unwrap_or_else(|| item.revision())
+            ),
+        )
+    }
+
+    /// Build the native draft adapter input from a draft view whose owning view item is at
+    /// `revision` (the adapter's presentation revision).
+    #[must_use]
+    pub fn from_draft_view(
+        draft: &bcode_session_view_models::ToolRequestDraftView,
+        revision: &Value,
+    ) -> Self {
         Self::from_artifact(&ToolArtifact {
             artifact_id: format!("{}-request-draft-{}", draft.tool_call_id, draft.generation),
             producer_plugin_id: draft
@@ -168,7 +184,7 @@ impl CanonicalToolVisual {
                 "truncated": draft.truncated,
                 "streaming": true,
                 "generation": draft.generation,
-                "_bcode_presentation_revision": item.source_view_item_revision().unwrap_or_else(|| item.revision()),
+                "_bcode_presentation_revision": revision,
             }),
             refs: Vec::new(),
         })

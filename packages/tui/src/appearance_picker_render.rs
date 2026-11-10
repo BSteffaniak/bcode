@@ -21,7 +21,6 @@ use bmux_tui_components::modal_frame::{
 
 use super::appearance_picker::{APPEARANCE_PICKER_SCOPE, AppearanceAxis, AppearancePickerState};
 use super::render::TuiTheme;
-use super::structure::StructureSnapshot;
 use super::theme::ThemeCatalogEntry;
 
 /// Narrowest axis column, in cells.
@@ -231,7 +230,6 @@ pub fn render_appearance_picker_with_keymap(
     picker: &mut AppearancePickerState,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
-    structure: StructureSnapshot,
     keymap: &super::keymap::BmuxKeyMap,
 ) {
     let hint = |action| keymap.hint(APPEARANCE_PICKER_SCOPE, action);
@@ -252,7 +250,7 @@ pub fn render_appearance_picker_with_keymap(
         render_column(picker, column, frame, theme);
     }
     if let Some(preview) = body.preview {
-        render_preview(picker, preview, frame, theme, structure);
+        render_preview(picker, preview, frame, theme);
     }
     let diagnostics = picker.palettes().diagnostics();
     if let (Some(row), Some(diagnostic)) = (body.diagnostic, diagnostics.first()) {
@@ -386,12 +384,15 @@ fn render_column(
     }
 }
 
+/// Paint the preview header and, below it, the sample transcript laid out by
+/// the transcript engine's producers at the pane width (the picker's
+/// [`super::appearance_picker_sample::SamplePreview`]). The sample is clipped
+/// to the pane and registers no interactions: the preview is not interactive.
 fn render_preview(
-    picker: &AppearancePickerState,
+    picker: &mut AppearancePickerState,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
-    structure: StructureSnapshot,
 ) {
     frame.fill(LocalRect::terminal(area), " ", theme.raised);
     let palette = picker.palettes().selected_entry();
@@ -432,22 +433,28 @@ fn render_preview(
             theme.border,
         )]),
     ];
-    let sample = super::render::sample_transcript_rows(picker.sample(), area.width, structure);
-    for (offset, row) in header
-        .iter()
-        .chain(sample.iter())
-        .take(usize::from(area.height))
-        .enumerate()
-    {
-        let Ok(offset) = u16::try_from(offset) else {
-            break;
-        };
+    let mut header_rows = 0_u16;
+    for row in header.iter().take(usize::from(area.height)) {
         frame.write_line_with_fallback_style(
-            LocalRect::terminal(Rect::new(area.x, area.y + offset, area.width, 1)),
+            LocalRect::terminal(Rect::new(area.x, area.y + header_rows, area.width, 1)),
             row,
             theme.raised,
         );
+        header_rows += 1;
     }
+    let sample_rows = area.height - header_rows;
+    if sample_rows == 0 || area.width == 0 {
+        return;
+    }
+    let Some(sample) = picker.preview_mut().layout(area.width) else {
+        return;
+    };
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y + header_rows),
+        LocalRect::new(0, 0, area.width, sample_rows),
+        |cx| sample.paint(cx),
+    );
 }
 
 /// What a mouse press landed on.
@@ -542,12 +549,19 @@ mod tests {
 
     fn render_into(picker: &mut AppearancePickerState, area: Rect) -> (Buffer, String) {
         let theme = TuiTheme::for_theme_id("bcode-dark");
+        let definition = bcode_tui_theme::definition::ThemeCatalog::bundled()
+            .unwrap()
+            .resolve(&bcode_tui_theme::definition::ThemeSelection::new("bcode"))
+            .unwrap();
+        let structure = crate::appearance_picker_sample::theme_structure_config(&definition);
+        picker
+            .preview_mut()
+            .set_inputs(std::sync::Arc::new(definition), structure);
         let mut buffer = Buffer::empty(area);
         render_appearance_picker_with_keymap(
             picker,
             &mut PaintCx::new(&mut Frame::new(&mut buffer)),
             theme,
-            StructureSnapshot::default(),
             &crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
         );
         let text = (0..area.height)
@@ -609,6 +623,71 @@ mod tests {
         );
     }
 
+    /// Text of `rect` in `buffer`, one string per row, trailing blanks trimmed.
+    fn region_text(buffer: &Buffer, rect: Rect) -> Vec<String> {
+        (rect.y..rect.bottom())
+            .map(|y| {
+                (rect.x..rect.right())
+                    .filter_map(|x| buffer.get(Point::new(x, y)))
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preview_paints_the_engine_sample_below_its_header_clipped_to_the_pane() {
+        for area in [Rect::new(0, 0, 130, 44), Rect::new(0, 0, 100, 20)] {
+            let mut picker = picker(AppearanceAxis::Palette);
+            let (buffer, _) = render_into(&mut picker, area);
+            let theme = TuiTheme::for_theme_id("bcode-dark");
+            let preview = appearance_picker_layout(&picker, area, theme)
+                .preview
+                .expect("wide enough for the preview");
+            let sample_area = Rect::new(
+                preview.x,
+                preview.y + 4,
+                preview.width,
+                preview.height.saturating_sub(4),
+            );
+            // The same layout the preview retains, painted on its own.
+            let layout = picker.preview_mut().layout(preview.width).unwrap();
+            let mut expected =
+                Buffer::empty(Rect::new(0, 0, sample_area.width, sample_area.height));
+            layout.paint(&mut PaintCx::new(&mut Frame::new(&mut expected)));
+            let expected = region_text(
+                &expected,
+                Rect::new(0, 0, sample_area.width, sample_area.height),
+            );
+            assert_eq!(region_text(&buffer, sample_area), expected, "{area:?}");
+            assert!(
+                expected.iter().any(|row| row.contains("You")),
+                "{expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_without_resolved_inputs_paints_only_its_header() {
+        let mut picker = picker(AppearanceAxis::Palette);
+        let area = Rect::new(0, 0, 130, 44);
+        let mut buffer = Buffer::empty(area);
+        render_appearance_picker_with_keymap(
+            &mut picker,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            TuiTheme::for_theme_id("bcode-dark"),
+            &crate::keymap::BmuxKeyMap::from_config(&bcode_config::TuiConfig::default()),
+        );
+        let text = (0..area.height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("dusk · zen"), "{text}");
+        assert!(!text.contains("let row = 1"), "{text}");
+    }
+
     #[test]
     fn wide_picker_paints_both_columns_and_the_live_preview() {
         let (_, text) = render_into(
@@ -621,7 +700,7 @@ mod tests {
         assert!(text.contains("dusk · zen"), "{text}");
         assert!(text.contains("██ ██"), "{text}");
         assert!(text.contains("zen profile"), "{text}");
-        // The sample transcript renders through the structural pipeline.
+        // The sample transcript renders through the transcript engine's producers.
         assert!(text.contains("let row = 1"), "{text}");
     }
 

@@ -295,11 +295,7 @@ pub fn panel<'a>(
                 exclusion > 0,
             )),
     )
-    .frame(composer_frame(
-        super::render::semantic_state_theme()
-            .unit_chrome
-            .composer_border,
-    ))
+    .frame(composer_frame(theme.composer_border))
 }
 
 /// Composer shell for the theme's `borders.composer` chrome.
@@ -781,10 +777,8 @@ mod tests {
         style: Option<bcode_tui_theme::chrome::BorderStyle>,
         width: u16,
     ) -> (Vec<String>, Option<Rect>) {
-        let initial = crate::theme::resolve_initial_theme();
-        let mut presented = initial.presented(initial.accent);
-        presented.unit_chrome.composer_border = style;
-        crate::render::set_plugin_visual_theme(&presented);
+        let mut theme = TuiTheme::for_theme_id("terminal-native");
+        theme.composer_border = style;
         let state = RefCell::new(TextInputState::default());
         let policy = super::super::app::composer_policy();
         let submit = ComposerSubmit::default();
@@ -794,7 +788,7 @@ mod tests {
             &policy,
             &submit,
             ComposerPresentation {
-                theme: TuiTheme::for_theme_id("terminal-native"),
+                theme,
                 focused: false,
                 enabled: false,
                 size: area.size(),
@@ -854,7 +848,5 @@ mod tests {
                 }
             }
         }
-        let initial = crate::theme::resolve_initial_theme();
-        crate::render::set_plugin_visual_theme(&initial.presented(initial.accent));
     }
 }

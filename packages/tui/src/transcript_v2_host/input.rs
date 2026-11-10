@@ -15,6 +15,10 @@
 //!   dragging beyond the slop selects source text across virtualized units (C34, BMUX 13),
 //!   scrolling at the viewport edges through the list's `SelectionAutoScroll` action. Pointer
 //!   input never moves keyboard focus (FO2, FO9).
+//! * Markdown contributions ([`super::markdown`]): a click on a link, footnote, `<details>`
+//!   summary or Mermaid diagram focuses and activates it; the chat-scope `tui.markdown.*` keys
+//!   move, activate and copy the Markdown focus from either keyboard focus without changing
+//!   it (FO1). A click on the open Mermaid source view does nothing.
 //! * A press on the optional scrollbar track and the drag that follows go to the BMUX list,
 //!   whose scrollbar reports a fraction of the whole session that navigation maps to a
 //!   resident row or an `Around` window (`JumpToFraction`, VP4, W12, X6).
@@ -41,6 +45,7 @@ use bmux_tui::selection::{
 
 use super::TranscriptV2Host;
 use super::focus::{FocusKeyAction, ScrollKey, TranscriptKey, resolve_key};
+use super::markdown::resolve_markdown_key;
 use super::paint::{ITEM_HIT_PREFIX, LATEST_BAR_HIT, item_hit_regions};
 use crate::keymap::BmuxKeyMap;
 
@@ -150,14 +155,19 @@ impl TranscriptV2Host {
     }
 
     /// Before shell routing: with transcript focus, a paste or a key that is not a transcript
-    /// key returns focus to the composer, which then receives it (FO3). Returns whether focus
-    /// was released.
+    /// key returns focus to the composer, which then receives it (FO3). A user-bound
+    /// `tui.tools.*` key is a transcript key: it keeps focus and acts on the focused subtree
+    /// ([`Self::handle_tools_key`], FO6). Returns whether focus was released.
     pub fn release_focus_for_event(&mut self, keymap: &BmuxKeyMap, event: &Event) -> bool {
         if !self.transcript_focus_active() {
             return false;
         }
         let releases = match event {
-            Event::Key(stroke) => resolve_key(keymap, *stroke, true).is_none(),
+            Event::Key(stroke) => {
+                resolve_key(keymap, *stroke, true).is_none()
+                    && resolve_markdown_key(keymap, *stroke).is_none()
+                    && super::focus::tools_route(keymap, *stroke).is_none()
+            }
             Event::Paste(_) => true,
             _ => false,
         };
@@ -174,8 +184,16 @@ impl TranscriptV2Host {
         stroke: KeyStroke,
         at: Instant,
     ) -> TranscriptInputOutcome {
+        // A focused shell screen takes its keys first (C39).
+        if let Some(outcome) = self.shell_screen_key(keymap, stroke, at) {
+            return outcome;
+        }
         let focused = self.transcript_focus_active();
         let Some(key) = resolve_key(keymap, stroke, focused) else {
+            // Markdown keys work from either focus and keep it (FO1).
+            if let Some(markdown) = resolve_markdown_key(keymap, stroke) {
+                return TranscriptInputOutcome::from_changed(self.markdown_key(markdown, at));
+            }
             if focused {
                 let _ = self.release_focus();
             }
@@ -314,6 +332,13 @@ impl TranscriptV2Host {
             return TranscriptInputOutcome::from_changed(changed);
         }
         if let Some(outcome) = self.scrollbar_mouse(mouse, input.top_hit, at) {
+            return outcome;
+        }
+        // Shell screens take horizontal wheel input and right-button focus (C39).
+        if in_region
+            && presented
+            && let Some(outcome) = self.shell_screen_pointer(mouse, at)
+        {
             return outcome;
         }
         match mouse.kind {
@@ -668,8 +693,9 @@ impl TranscriptV2Host {
     }
 
     /// Activate what a click at `position` hits: the latest bar jumps to the latest content,
-    /// a disclosure region toggles (X1). Returns whether the transcript changed. The scrollbar
-    /// track is never an item click.
+    /// a disclosure region toggles (X1), a Markdown contribution is focused and activated.
+    /// Returns whether the transcript changed. The scrollbar track and the Mermaid source view
+    /// are never an item click.
     fn click(&mut self, position: Point, at: Instant) -> bool {
         if self
             .regions
@@ -687,14 +713,22 @@ impl TranscriptV2Host {
                 .regions
                 .scrollbar
                 .is_some_and(|track| track.contains(position))
+            || self.markdown_overlay_contains(position)
         {
             return false;
         }
         let column = u64::from(position.x - viewport.x);
         let row = u64::from(position.y - viewport.y);
-        let (update, _hit) = self.engine.click(frame, column, row, at);
-        let changed = update.invalidated;
+        let (update, hit) = self.engine.click(frame, column, row, at);
+        let mut changed = update.invalidated;
         self.absorb(update);
+        if let Some(bcode_tui_transcript::engine::ItemHit {
+            unit,
+            action: bcode_tui_transcript::layout::geometry::ItemAction::Activate(key),
+        }) = hit
+        {
+            changed |= self.activate_markdown_hit(&unit, &key, at);
+        }
         changed
     }
 

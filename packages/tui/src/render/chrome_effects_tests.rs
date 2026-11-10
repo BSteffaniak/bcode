@@ -83,7 +83,12 @@ fn status_line_joins_segments_with_the_theme_separator() {
             false,
         );
         let theme = TuiTheme::for_app(&app);
-        let wide = text(&statusline_spans(&app, 200, theme));
+        let wide = text(&statusline_spans(
+            &app,
+            200,
+            theme,
+            TranscriptStatusPosition::default(),
+        ));
         assert!(
             wide.contains(expected),
             "{icons:?}/{separators:?}: {wide:?}"
@@ -91,8 +96,18 @@ fn status_line_joins_segments_with_the_theme_separator() {
         let plain = app_with(|chrome| chrome.icons = icons, false);
         let plain_theme = TuiTheme::for_app(&plain);
         for width in [0_usize, 1, 2, 5, 12, 40, 200] {
-            let line = text(&statusline_spans(&app, width, theme));
-            let reference = text(&statusline_spans(&plain, width, plain_theme));
+            let line = text(&statusline_spans(
+                &app,
+                width,
+                theme,
+                TranscriptStatusPosition::default(),
+            ));
+            let reference = text(&statusline_spans(
+                &plain,
+                width,
+                plain_theme,
+                TranscriptStatusPosition::default(),
+            ));
             assert_eq!(
                 display_width(&line),
                 display_width(&reference),

@@ -310,3 +310,60 @@ fn f3_a_focus_move_resets_the_inspector_scroll_without_a_paint() {
         host.engine().focus_state().disclosure()
     );
 }
+
+/// FO6: a user-bound `tui.tools.*` key pressed under transcript focus is a transcript key: it
+/// does not return focus to the composer, and it acts on the focused subtree only, as the
+/// palette command does under focus.
+#[test]
+fn fo6_user_bound_tool_keys_keep_transcript_focus_and_act_on_the_focused_subtree() {
+    let at = Instant::now();
+    let mut host = attached(3, at);
+    let _ = paint(&mut host, at, Duration::ZERO);
+    let _ = host.run_transcript_route("tools.collapseAll", at);
+    let _ = host.take_notice();
+    let focused = focus_tool_unit(&mut host, at);
+    let mut config = bcode_config::TuiConfig::default();
+    config
+        .keybindings
+        .chat
+        .insert("alt+y".to_owned(), "tui.tools.expandAll".to_owned());
+    let keymap = BmuxKeyMap::from_config_for_engine(&config, bcode_config::TuiEngine::V2);
+    let stroke = parse_key_stroke("alt+y").expect("key");
+    assert!(!host.release_focus_for_event(&keymap, &bmux_tui::event::Event::Key(stroke)));
+    assert!(host.transcript_focus_active());
+    assert_eq!(host.handle_tools_key(&keymap, stroke, at), Some(true));
+    assert_eq!(
+        host.take_notice(),
+        Some(ToolNotice::Disclosure {
+            focused: true,
+            disclosure: Disclosure::Expanded,
+        })
+    );
+    let structure = host.engine().structure();
+    assert_eq!(
+        structure.effective_disclosure(&focused),
+        Some(Disclosure::Expanded)
+    );
+    let others = host
+        .engine()
+        .session_view()
+        .snapshot()
+        .transcript
+        .items
+        .iter()
+        .filter(|item| {
+            DisclosureTarget::Unit(item.id.clone()) != focused
+                && structure
+                    .item_facts(&item.id)
+                    .is_some_and(|facts| facts.kind == Some(UnitKind::Tool))
+        })
+        .map(|item| structure.effective_disclosure(&DisclosureTarget::Unit(item.id.clone())))
+        .collect::<Vec<_>>();
+    assert_ne!(others, Vec::new());
+    assert!(
+        others
+            .iter()
+            .all(|disclosure| *disclosure == Some(Disclosure::Collapsed)),
+        "{others:?}"
+    );
+}

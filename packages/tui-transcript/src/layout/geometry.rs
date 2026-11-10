@@ -60,16 +60,16 @@ impl SourceRows {
         &self.rows
     }
 
-    /// Row where `position` begins: the row of the last mapped position of the same kind at or
-    /// before it. `None` when no mapped position of that kind precedes it.
+    /// Row where `position` begins: the row of the last mapped position of the same source at
+    /// or before it ([`SourcePosition::same_source`]: the same kind, and the same identity for
+    /// plugin sources). `None` when no mapped position of that source precedes it.
     #[must_use]
     pub fn row_for_source(&self, position: &SourcePosition) -> Option<u64> {
         let end = self
             .by_position
             .partition_point(|&index| &self.rows[index].position <= position);
         let mapped = &self.rows[*self.by_position[..end].last()?];
-        (std::mem::discriminant(&mapped.position) == std::mem::discriminant(position))
-            .then_some(mapped.row)
+        mapped.position.same_source(position).then_some(mapped.row)
     }
 
     /// Source position covering `row`, with the row where it begins (at most `row`).
@@ -277,6 +277,12 @@ pub struct ItemGeometry {
     /// Reserved asynchronous visuals (Markdown images and Mermaid diagrams, L8) that host-side
     /// workers render outside drawing.
     pub visual_slots: Vec<super::producers::markdown::VisualSlot>,
+    /// Actionable Markdown contributions and fragment anchors (keyboard focus and activation
+    /// of links, footnotes, `<details>` and Mermaid diagrams).
+    pub markdown: super::producers::markdown::MarkdownGeometry,
+    /// Rows whose pointer and key input belong to their content (plugin visual rows routed to
+    /// their adapter, shell screens scrolling horizontally on their own; E1, C39).
+    pub content_targets: Vec<super::producers::visual::ContentTarget>,
 }
 
 impl ItemGeometry {
@@ -349,6 +355,15 @@ impl ItemGeometry {
                 .map(|slot| super::producers::markdown::VisualSlot {
                     rect: rect(slot.rect),
                     ..slot
+                })
+                .collect(),
+            markdown: self.markdown.translated(dx, dy),
+            content_targets: self
+                .content_targets
+                .into_iter()
+                .map(|target| super::producers::visual::ContentTarget {
+                    rect: rect(target.rect),
+                    kind: target.kind,
                 })
                 .collect(),
         }

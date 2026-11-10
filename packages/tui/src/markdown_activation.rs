@@ -15,7 +15,10 @@ pub enum MarkdownActivation {
 
 /// Failure reported by the platform opener.
 #[derive(Debug)]
-pub struct MarkdownActivationError(String);
+pub struct MarkdownActivationError(
+    /// Opener failure text.
+    pub String,
+);
 
 impl std::fmt::Display for MarkdownActivationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -43,7 +46,14 @@ pub fn activate_markdown_destination(
     })
 }
 
-fn activate_markdown_destination_with(
+/// [`activate_markdown_destination`] with `open_external` in place of the platform opener
+/// (the same classification policy; callers that must not reach the platform, such as tests,
+/// supply their own adapter).
+///
+/// # Errors
+///
+/// Returns the error `open_external` reports for a safe web or local destination.
+pub fn activate_markdown_destination_with(
     destination: &MarkdownDestination,
     open_external: impl FnOnce(&std::ffi::OsStr) -> Result<(), MarkdownActivationError>,
 ) -> Result<MarkdownActivation, MarkdownActivationError> {

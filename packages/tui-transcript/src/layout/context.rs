@@ -117,6 +117,9 @@ pub struct MarkdownOptions {
     /// Per unit like [`Self::details_open`]: ids start with the owning unit's
     /// [`markdown_document_id`] and `:`, and an acceptance re-measures only that unit.
     pub visuals: crate::layout::producers::markdown::MarkdownVisualState,
+    /// Directory relative local link destinations resolve against (the session's working
+    /// directory); without one they stay unresolved and inert.
+    pub base_directory: Option<std::path::PathBuf>,
 }
 
 impl MarkdownOptions {
@@ -143,9 +146,11 @@ impl MarkdownOptions {
             mermaid,
             images,
             visuals: _,
+            base_directory,
         } = self;
         mermaid.hash(state);
         images.hash(state);
+        base_directory.hash(state);
     }
 }
 
@@ -179,9 +184,10 @@ impl Default for DiffViewerOptions {
     }
 }
 
-/// One accepted plugin visual (L8, D9): rows a plugin adapter produced outside drawing,
-/// accepted for an exact item revision. Acceptance is an item revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One accepted plugin visual (L8, D9): what a plugin adapter produced outside drawing,
+/// accepted for an exact item revision. Acceptance is an item revision; the revision covers
+/// every field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AcceptedPluginVisual {
     /// Adapter identity.
     pub adapter: String,
@@ -189,6 +195,37 @@ pub struct AcceptedPluginVisual {
     pub revision: u64,
     /// Accepted, bounded, styled rows (renderer-neutral content, already validated).
     pub rows: Arc<[Line]>,
+    /// How the rows sit in the host chrome.
+    pub mode: crate::layout::producers::visual::VisualRenderMode,
+    /// Adapter title for the host header.
+    pub title: Option<String>,
+    /// Header title of a transcript-block visual whose adapter supplies none, chosen by the
+    /// host for the visual's source (the tool name of a request, the artifact title of a
+    /// result); the unit's label when absent.
+    pub fallback_title: Option<String>,
+    /// Configured invocation timeout in milliseconds, when the adapter knows it.
+    pub timeout_ms: Option<u64>,
+    /// Bounded producer-supplied operation target.
+    pub target: Option<String>,
+    /// Bounded one-line producer summary (`plugin` summary source).
+    pub summary: Option<String>,
+    /// Ordered, bounded named sections.
+    pub sections: Arc<[crate::layout::producers::visual::VisualSection]>,
+    /// Anchors and selection rows of `rows` (E3, C34).
+    pub correspondence: Arc<crate::layout::producers::visual::VisualCorrespondence>,
+}
+
+impl AcceptedPluginVisual {
+    /// A visual of `rows` alone (inline, no header facts, sections or correspondence).
+    #[must_use]
+    pub fn rows(adapter: impl Into<String>, revision: u64, rows: Arc<[Line]>) -> Self {
+        Self {
+            adapter: adapter.into(),
+            revision,
+            rows,
+            ..Self::default()
+        }
+    }
 }
 
 /// Accepted plugin visual rows per item (computed outside drawing, D9).
@@ -250,6 +287,8 @@ pub struct RenderConfig {
     pub diff_viewer: DiffViewerOptions,
     /// Accepted plugin visual rows.
     pub plugin_visuals: PluginVisualState,
+    /// Horizontal offsets of canonical shell screens (C39); per unit like the plugin visuals.
+    pub shell_scroll: crate::layout::producers::visual::ShellScroll,
 }
 
 impl Default for RenderConfig {
@@ -259,6 +298,7 @@ impl Default for RenderConfig {
             markdown: MarkdownOptions::default(),
             diff_viewer: DiffViewerOptions::default(),
             plugin_visuals: PluginVisualState::default(),
+            shell_scroll: crate::layout::producers::visual::ShellScroll::default(),
         }
     }
 }
@@ -289,20 +329,37 @@ impl RenderConfig {
     }
 
     /// Fingerprint of the unit-scoped inputs: the unit's `<details>` state, its accepted
-    /// Markdown visuals and its accepted plugin visual. A change re-measures only that unit.
+    /// Markdown visuals, its accepted plugin visual and its shell screen offset. A change
+    /// re-measures only that unit.
     fn unit_fingerprint(&self, unit: &UnitKey) -> Option<u64> {
         let document_id = markdown_document_id(unit);
         let mut details = self.markdown.details_for(&document_id).peekable();
         let mut markdown_visuals = self.markdown.visuals.revisions_for(&document_id).peekable();
         let visual = self.plugin_visuals.revision_for(unit);
-        if details.peek().is_none() && markdown_visuals.peek().is_none() && visual.is_none() {
+        let shell = self.shell_columns(unit);
+        if details.peek().is_none()
+            && markdown_visuals.peek().is_none()
+            && visual.is_none()
+            && shell == 0
+        {
             return None;
         }
         let mut hasher = StableHasher::new();
         details.for_each(|entry| entry.hash(&mut hasher));
         markdown_visuals.for_each(|entry| entry.hash(&mut hasher));
         visual.hash(&mut hasher);
+        if shell > 0 {
+            shell.hash(&mut hasher);
+        }
         Some(hasher.finish())
+    }
+
+    /// Columns the shell screen of `unit` is scrolled by (C39).
+    fn shell_columns(&self, unit: &UnitKey) -> u64 {
+        match unit {
+            UnitKey::Item(id) => self.shell_scroll.columns(id),
+            _ => 0,
+        }
     }
 
     /// Render context for one unit at `width`.
@@ -321,6 +378,7 @@ impl RenderConfig {
             markdown: &self.markdown,
             diff_viewer: &self.diff_viewer,
             plugin_visuals: &self.plugin_visuals,
+            shell_columns: self.shell_columns(unit),
             shared: self.shared_fingerprint(),
             unit: self.unit_fingerprint(unit),
         }
@@ -370,6 +428,8 @@ pub struct ItemRenderContext<'a> {
     pub diff_viewer: &'a DiffViewerOptions,
     /// Accepted plugin visual rows (computed outside drawing).
     pub plugin_visuals: &'a PluginVisualState,
+    /// Columns this unit's shell screen is scrolled by (C39; part of the unit fingerprint).
+    pub shell_columns: u64,
     shared: u64,
     unit: Option<u64>,
 }
@@ -506,11 +566,7 @@ mod tests {
         let mut visual = base.clone();
         visual.plugin_visuals.accept(
             id,
-            AcceptedPluginVisual {
-                adapter: "p".to_owned(),
-                revision: 1,
-                rows: Arc::from(Vec::new()),
-            },
+            AcceptedPluginVisual::rows("p", 1, Arc::from(Vec::new())),
         );
         assert_ne!(fingerprint(&visual), original);
 

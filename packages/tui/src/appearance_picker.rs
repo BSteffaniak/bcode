@@ -8,7 +8,6 @@
 //! applies it live; cancelling restores both selections the picker opened
 //! with.
 
-use bcode_tui_components::transcript::item::TranscriptItem;
 use bmux_keyboard::KeyStroke;
 
 use super::appearance_picker_axes::{PaletteAxisState, ProfileAxisState, ProfileRow};
@@ -98,7 +97,7 @@ pub enum AppearancePickerOutcome {
 pub struct AppearancePickerState {
     palettes: PaletteAxisState,
     profiles: ProfileAxisState,
-    sample: Vec<TranscriptItem>,
+    preview: super::appearance_picker_sample::SamplePreview,
     axis: AppearanceAxis,
     original_palette: Option<String>,
     /// Whether the configured profile has a row (`None` always does).
@@ -136,7 +135,7 @@ impl AppearancePickerState {
         Self {
             palettes: PaletteAxisState::new(palettes, diagnostics),
             profiles,
-            sample: super::appearance_picker_sample::sample_transcript(),
+            preview: super::appearance_picker_sample::SamplePreview::default(),
             axis,
             original_palette,
             original_profile_listed,
@@ -178,10 +177,20 @@ impl AppearancePickerState {
         &mut self.profiles
     }
 
-    /// Return the sample transcript rendered in the preview pane.
-    #[must_use]
-    pub fn sample(&self) -> &[TranscriptItem] {
-        &self.sample
+    /// Return the sample preview rendered in the preview pane.
+    pub const fn preview_mut(&mut self) -> &mut super::appearance_picker_sample::SamplePreview {
+        &mut self.preview
+    }
+
+    /// Re-resolve the preview's inputs for the selected palette (the
+    /// configured theme when none is selected) under `app`'s live profile and
+    /// structure configuration. Runs outside drawing; returns whether the
+    /// inputs changed.
+    pub fn refresh_preview(&mut self, app: &mut super::app::BmuxApp) -> bool {
+        let palette = self
+            .selected_palette()
+            .map_or_else(|| app.tui_config().theme.name.clone(), str::to_owned);
+        self.preview.refresh(app, &palette)
     }
 
     /// Return the palette active when the picker opened, if it is listed.

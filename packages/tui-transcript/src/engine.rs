@@ -159,6 +159,8 @@ pub struct TranscriptEngine {
     committed: Option<FrameId>,
     /// Transcript selection (C34, W7).
     selection: crate::selection::SelectionModel,
+    /// Markdown contribution focus and footnote return targets ([`crate::markdown`]).
+    markdown: crate::markdown::MarkdownFocusState,
 }
 
 // The engine is `Send` by construction: its retained items are Send-capable BMUX elements
@@ -219,6 +221,7 @@ impl TranscriptEngine {
             last_frame: FrameId::default(),
             committed: None,
             selection: crate::selection::SelectionModel::default(),
+            markdown: crate::markdown::MarkdownFocusState::default(),
         }
     }
 
@@ -912,8 +915,10 @@ impl TranscriptEngine {
 
     /// Activate the region a click at (`column`, `row`) of `snapshot` hits (X1): a disclosure
     /// region toggles its target (the visibility floor still applies, A16). Returns the update
-    /// and the hit; producer activations ([`ItemAction::Activate`]) are returned for the host
-    /// to handle and change nothing here.
+    /// and the hit. A Markdown contribution region ([`ItemAction::Activate`] with a
+    /// `markdown:` key) takes Markdown focus without moving the reader; activating it is the
+    /// host's next step ([`Self::activate_markdown`]). Other producer activations are returned
+    /// for the host to handle and change nothing here.
     ///
     /// Phase 6 routes pointer gestures through BMUX click activation (BMUX 14); this entry point
     /// is the activation that routing ends in.
@@ -930,7 +935,15 @@ impl TranscriptEngine {
         };
         let update = match &hit.action {
             ItemAction::ToggleDisclosure(target) => self.toggle_disclosure(target, at).0,
-            ItemAction::Activate(_) => EngineUpdate::default(),
+            ItemAction::Activate(key) => {
+                let focused = self
+                    .markdown_target_for_action(&hit.unit, key)
+                    .is_some_and(|target| self.focus_markdown(&target));
+                EngineUpdate {
+                    requests: Vec::new(),
+                    invalidated: focused,
+                }
+            }
         };
         (update, Some(hit))
     }
@@ -1306,18 +1319,24 @@ fn transcript_items(session: &SessionView) -> &[TranscriptViewItem] {
     &session.snapshot().transcript.items
 }
 
+mod content_targets;
+pub use content_targets::VisibleContentTarget;
 mod interaction;
 mod local;
+mod markdown;
 mod selection;
 
 mod tools;
 pub use tools::{DefaultRuleRefusal, DetailCycle, InlineInteractionPlacement};
 
 pub use interaction::VisibleHitRegion;
+mod streaming;
 mod submission;
 
 #[cfg(test)]
 mod local_tests;
+#[cfg(test)]
+mod markdown_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

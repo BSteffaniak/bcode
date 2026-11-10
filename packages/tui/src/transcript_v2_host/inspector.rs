@@ -293,6 +293,17 @@ impl TranscriptV2Host {
         }
     }
 
+    /// Terminal cells the open inspector panel covers in the transcript viewport; `None` while
+    /// it is closed or the viewport cannot hold it. Painting, its hit region and the occlusion
+    /// of plugin content targets beneath it all derive from this one placement (B7).
+    pub(super) fn inspector_area(&self) -> Option<bmux_tui::geometry::Rect> {
+        self.tools.inspector.as_ref()?;
+        self.regions
+            .viewport
+            .and_then(inspector_placement)
+            .map(InspectorPlacement::area)
+    }
+
     /// Paint the open inspector over the transcript viewport of the last painted frame, after
     /// the transcript (FO6). The panel occludes what it covers and registers its hit region
     /// above transcript regions; the body geometry is recorded for scrollbar input. The
@@ -303,11 +314,7 @@ impl TranscriptV2Host {
         theme: TuiTheme,
         component_theme: &bmux_tui_components::theme::ComponentTheme,
     ) {
-        let placement = self
-            .regions
-            .viewport
-            .and_then(inspector_placement)
-            .map(InspectorPlacement::area);
+        let placement = self.inspector_area();
         let Some(panel) = self.tools.inspector.as_mut() else {
             return;
         };

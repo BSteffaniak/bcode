@@ -581,7 +581,12 @@ pub struct BmuxApp {
     key_hints: String,
     jump_to_latest_key_label: String,
     tui_config: TuiConfig,
+    /// Streaming-presentation policy last applied by the host shell (host configuration,
+    /// shared by both transcript engines).
+    streaming_presentation_policy: bcode_session_view_models::StreamingPresentationPolicy,
     effective_keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    /// Advances on every effective keymap replacement (plugin visual key hints depend on it).
+    effective_keymap_generation: u64,
     diff_viewer_layout_override: Option<TuiDiffViewerLayout>,
     exit: ExitState,
     cursor: CursorBlink,
@@ -837,7 +842,11 @@ impl BmuxApp {
             key_hints: String::new(),
             jump_to_latest_key_label: "ctrl+end".to_owned(),
             tui_config: TuiConfig::default(),
+            // `SessionView` starts with immediate presentation until configuration applies one.
+            streaming_presentation_policy:
+                bcode_session_view_models::StreamingPresentationPolicy::immediate(),
             effective_keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+            effective_keymap_generation: 0,
             diff_viewer_layout_override: None,
             exit: ExitState::default(),
             cursor: CursorBlink::new(),
@@ -1029,6 +1038,7 @@ impl BmuxApp {
         if self.effective_keymap != registry {
             self.capture_stable_transcript_anchor();
             self.effective_keymap = registry;
+            self.effective_keymap_generation = self.effective_keymap_generation.wrapping_add(1);
             self.transcript_layout = TranscriptLayoutCache::default();
             self.key_hints = format!(
                 "{} send · {} interrupt · {} exit · {} palette",
@@ -1045,6 +1055,13 @@ impl BmuxApp {
     #[must_use]
     pub const fn effective_keymap(&self) -> &bcode_plugin_sdk::tui::keymap::KeymapRegistry {
         &self.effective_keymap
+    }
+
+    /// Generation of the effective keymap: it advances whenever the keymap is replaced, so
+    /// renderers caching key hints (the V2 plugin visual routing) know to refresh them.
+    #[must_use]
+    pub const fn effective_keymap_generation(&self) -> u64 {
+        self.effective_keymap_generation
     }
 
     /// Set persistent local plugin presentation state.
@@ -3503,6 +3520,7 @@ impl BmuxApp {
         &mut self,
         policy: bcode_session_view_models::StreamingPresentationPolicy,
     ) -> bool {
+        self.streaming_presentation_policy = policy.normalized();
         let changed = self
             .session_view
             .set_streaming_presentation_policy(policy.normalized());
@@ -3510,6 +3528,16 @@ impl BmuxApp {
             let _ = self.apply_session_view_terminal_adapter();
         }
         changed
+    }
+
+    /// The streaming-presentation policy the host shell last applied (configuration, the
+    /// streaming configurator's override or its reset), which every transcript engine's
+    /// `SessionView` presents live text with.
+    #[must_use]
+    pub const fn streaming_presentation_policy(
+        &self,
+    ) -> bcode_session_view_models::StreamingPresentationPolicy {
+        self.streaming_presentation_policy
     }
 
     /// Return terminal UI configuration.

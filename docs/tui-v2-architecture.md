@@ -124,7 +124,7 @@ Paths are relative to `packages/tui/src` unless noted. Rule identifiers refer to
 | Item | Placement | Justification |
 |---|---|---|
 | V2 engine | **New crate** `packages/tui-transcript/` → `bcode_tui_transcript` | A crate boundary mechanically enforces S1 (V2 cannot reach V1 internals of `bcode_tui`), lets the engine be tested headlessly without the host, and survives V1 deletion as the transcript engine. Created in phase 2 when its first code lands. Domain-named. |
-| V2 modules | `window`, `units`, `layout` (with `layout::producers`, `layout::context`), `viewport`, `navigation` (with `navigation::auto`), `focus`, `latest_bar`, `selection`, `frame`, `engine` | One module per layer; `engine` is the façade the host calls. |
+| V2 modules | `window`, `units`, `layout` (with `layout::producers`, `layout::context`), `viewport`, `navigation` (with `navigation::auto`), `focus`, `latest_bar`, `selection`, `frame`, `engine`, `sample` | One module per layer; `engine` is the façade the host calls. `sample` lays a fixed item list out through the standard producers with an explicit `RenderConfig` and `StructureConfig`, without viewport, navigation or boundary rows; the appearance-picker preview and the generated theme gallery render through it. |
 | V2 scenario support | `bcode_tui_transcript` feature `testing` (module `scenario`): deterministic engine fixtures (fixture producers, `LayoutWorkCounters` counted by the item layout cache and read with `TranscriptEngine::take_layout_work`; a scripted history source and BMUX `ProgramHarness` glue are added, together with the `bmux_tui_runtime/testing` dependency, only when a phase needs them). The V2 driver itself is `bcode_tui::transcript_scenarios::v2` (`cfg(test)`); it drives the engine façade directly in phases 2–3 and through `transcript_v2_host` from phase 4. | Keeps one scenario definition set for both engines; the engine crate never depends on `bcode_tui`. |
 | Incremental window operations | `bcode_session_view` module `window_ops`; change types in `bcode_session_view_models` (`TranscriptChanges`, `TranscriptChange`) | Semantic, renderer-neutral (A1, A4). No terminal data. |
 | Engine enum and config key | `bcode_config`: `TuiEngine` enum, `TuiConfig::engine` | Config crate owns the schema. |
@@ -575,9 +575,9 @@ Host behavior with the V2 engine selected (phase 4):
   (`tui.transcriptFocus.sessionStart` on Home, `tui.transcriptFocus.latest` on End, FO4) are
   registered only for V2, so the V1 keymap, help and keymap export are unchanged.
 * Command-palette transcript routes reach the V2 host: "Focus transcript units" toggles V2
-  transcript focus like `alt+u`, and routes V2 does not implement yet (inspector, make-default,
-  bulk disclosure) report that they are unavailable instead of changing the hidden V1
-  transcript.
+  transcript focus like `alt+u`, and the inspector, make-default and bulk disclosure routes
+  run on the V2 transcript (phase 7); a route V2 does not know is left to the host shell and
+  never changes the hidden V1 transcript.
 * Only this client's accepted submissions move the reader (T2, T27): the host shell decides,
   before it applies a durable user message, whether it accepts one of its own pending
   submissions.
@@ -585,9 +585,26 @@ Host behavior with the V2 engine selected (phase 4):
   engine still awaits it, and feeds daemon connectivity like V1 history reads.
 * Leaving a session saves its V2 reading position; attaching it again restores it (T21), and
   a session opened at a search hit shows that sequence.
-* The interactive surface is docked below the transcript until V2 reserves inline
-  interaction rows; plugin visual pointer targets and the fast temporal repaint path are
-  V1-only, and the V1 transcript body is not rendered.
+* The interactive surface sits inline in V2-reserved rows, or in the dock below the V2
+  transcript when pinned (C37); the fast temporal repaint path is V1-only, and the V1
+  transcript body is not rendered.
+* Plugin visuals (phase 7): the host routes the same items V1 routes (live request drafts,
+  plugin-owned invocation presentations, artifact results, requests without a result under
+  the declaring plugin's request schema, contributions) at the unit's body width
+  (`producers::tool::body_width`, the width the producer lays the rows out in), accepts
+  everything the adapter returns (render mode, header title and timeout, target, summary,
+  named sections, v3 content keys, v4 source ranges, selection rows) bounded and scoped to its
+  producer, with V1's per-source fallback title, and the visual producer presents it as V1
+  does. Adapter rows map v4 ranges and v3 keys to
+  `SourcePosition::PluginSource` (anchors resolve inside their own identity, E3), copy the
+  adapter's selection source (C36), and are content targets. The root model publishes the
+  presented frame's plugin visual targets, so horizontal wheel input, right-button focus and
+  the focused visual's `visual`-scope keys reach `content_event_with_host` exactly as in V1,
+  and the reading position's plugin content is retained across reflow. Cells under a host
+  overlay (the open inspector, the Mermaid source view) publish no target and reach no shell
+  screen (B7). Canonical shell
+  screens scroll horizontally on their own (C39): host-owned offsets per item reach the
+  engine through the render configuration and re-measure only that unit.
 * Markdown images and Mermaid diagrams (phase 6): the host runs the V1 workers (bounded image
   loader, WASM Mermaid renderer) for the reserved slots of visible units, then up to two
   resident units on each side, outside drawing. Each worker kind has one active and one
@@ -597,6 +614,22 @@ Host behavior with the V2 engine selected (phase 4):
   placements registered by the Markdown body from its own retained node while painting, so
   only visible, correctly positioned content contributes placements; failures and images the
   terminal or network policy cannot show become notice rows with the V1 fallback text.
+* Markdown activation (phase 7, V1 parity): actionable contributions (links with a safe web,
+  local or fragment destination, GitHub issue references, footnote references and
+  definitions, `<details>`, Mermaid diagrams) are retained per-unit targets of the Markdown
+  projection, with the same rectangles as their hit regions (B3, B12). A click focuses and
+  activates one; `tui.markdown.focusNext`/`focusPrevious` (ctrl+tab / ctrl+shift+tab) walk the
+  resident targets in document order (bounded per step, wrapping at the window ends, never
+  paging, FO8) and reveal the target through BMUX focus reveal (C32); `tui.markdown.activate`
+  (alt+enter) and `tui.markdown.copyDestination` (ctrl+alt+c) act on it. Markdown focus is a
+  paint-only highlight (L5), not keyboard focus: the keys work from either focus and keep it
+  (FO1). Links open through the host shell's safe activation boundary, `#bcode-session-<id>`
+  links switch sessions, `#fragment` links reveal the anchor (the link's unit first),
+  relative local links resolve against the session's working directory (as in V1),
+  footnotes jump to their definition and back, `<details>` state is a render input keyed by
+  unit and contribution id (a revision of that unit only, L3), and Mermaid diagrams toggle a
+  source view over the viewport that occludes the transcript beneath it and closes when the
+  diagram leaves the view. Status messages and copy reporting are V1's.
 * Frames (phase 6, F1–F7): the host shell derives only its chrome layout (header, status,
   composer, dock) and does not prepare or commit the V1 transcript layout. The V2 frame is
   prepared once per presentation, before drawing, at the presentation clock; painting reads the
@@ -625,6 +658,18 @@ Host behavior with the V2 engine selected (phase 4):
   output and diffs copy their original text, tabs included, not the sanitized painted text),
   parts of one unit joined by a newline and units by a blank line, copied through the host
   shell's clipboard path with V1's messages, auto-copy and post-copy clear policy (C35).
+* Host chrome (phase 7, V1 parity): the host shell's streaming-presentation policy (`[tui]
+  streaming`, the streaming configurator's override and reset) is applied to the V2 engine's
+  own `SessionView` at the end of every update and kept across engine resets; pacing stays in
+  `SessionView` and the host only schedules its deadline on the V2 transcript timer (D13). The
+  status row shows "N rows from bottom" / "N rows below latest" (C2) from the prepared V2
+  frame (presented offset, `LatestBarState::rows_below_latest`), passed explicitly to the
+  chrome, and a changed position damages the status row with the transcript. Chrome theme
+  inputs are kept current from the host frame path (the composer frame reads the frame's
+  theme), not from V1 layout preparation. Transcript scroll keys under an interactive surface
+  and user-bound `tui.tools.*` keys act on V2 (under transcript focus a tools key keeps focus
+  and acts on the focused subtree, as the palette command does); docked (`pinned`) surfaces take the dock below
+  the V2 transcript and off-screen focus retain/suspend follows the V2 inline geometry (C37).
 
 ---
 
@@ -773,7 +818,7 @@ check), **M** manual. Every ID must be checked before phase 7.
 | C24 | Source-backed anchors resolve after width change; unmapped rows fall back to item row. | S |
 | C25 | Structural insertion and group collapse above the viewport keep the reading position. | S |
 | C26 | Runtime-work events don't pull the final response to the bottom. | S |
-| C27 | Repeated or abandoned (prepared, not presented) preparations have no navigation side effects; only commit records (CK1–CK3). Presenter failures terminate the runtime (CK2). | S (needs a prepare-without-present driver hook) |
+| C27 | Repeated or abandoned (prepared, not presented) preparations have no navigation side effects; only commit records (CK1–CK3). Presenter failures terminate the runtime (CK2). | S (the driver's presentation-failure hook prepares and paints a frame whose output fails) |
 | C28 | Boundary input traverses available rows first; unfulfilled movement spent once against measured page rows only. | S |
 | C29 | Direction reversal cancels pending movement; unsolicited prepend preserves the reader. | S |
 | C30 | Without an anchor, never infer a prepend from row growth. | U |

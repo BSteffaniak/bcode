@@ -294,6 +294,7 @@ pub fn d6_wheel_tick_is_scroll_damage_of_the_viewport<D: TranscriptScenarioDrive
     scenario.present();
     let rows = i64::from(scenario.driver.wheel_rows());
     for (direction, shift) in [(WheelDirection::Up, -rows), (WheelDirection::Down, rows)] {
+        let before = scenario.last_frame().clone();
         scenario.wheel(direction, 1);
         let frame = scenario.present();
         let observed = damage(&scenario);
@@ -303,9 +304,19 @@ pub fn d6_wheel_tick_is_scroll_damage_of_the_viewport<D: TranscriptScenarioDrive
                 if *region == viewport && *rows == shift && *accelerated),
             || format!("a {direction:?} wheel tick is not an accelerated scroll of {viewport:?} by {shift}: {observed:?}"),
         );
-        let region = transcript_region(&frame);
+        // Besides the transcript, only the status row below it repaints: it reports the
+        // reading position, which the tick changed (C2), shown before or after it.
+        let mut region = transcript_region(&frame);
+        if [&frame, &before].iter().any(|shown| {
+            shown
+                .rows
+                .get(usize::from(region.bottom()))
+                .is_some_and(|row| row.contains("rows from bottom"))
+        }) {
+            region.height += 1;
+        }
         scenario.check(observed.within(region), || {
-            format!("a wheel tick repainted outside the transcript {region:?}: {observed:?}")
+            format!("a wheel tick repainted outside the transcript and status row {region:?}: {observed:?}")
         });
     }
 }

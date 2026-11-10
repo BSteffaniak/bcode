@@ -22,9 +22,11 @@
 //! * [`viewport`]: controlled BMUX virtual list projection of the navigation position.
 //! * [`navigation`]: navigation state, intents and the reducer.
 //! * [`focus`]: composer/transcript keyboard focus.
+//! * [`markdown`]: Markdown contribution focus and activation.
 //! * [`latest_bar`]: latest-content bar decision.
 //! * [`selection`]: transcript selection state.
 //! * [`frame`]: frame snapshot and clock.
+//! * [`sample`]: standalone layout of a fixed item list (previews, generated galleries).
 //! * [`engine`]: the façade the host calls.
 
 pub mod engine;
@@ -32,7 +34,9 @@ pub mod focus;
 pub mod frame;
 pub mod latest_bar;
 pub mod layout;
+pub mod markdown;
 pub mod navigation;
+pub mod sample;
 #[cfg(any(test, feature = "testing"))]
 pub mod scenario;
 pub mod selection;

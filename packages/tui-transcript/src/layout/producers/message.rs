@@ -336,6 +336,8 @@ impl ItemContent for Composite {
             merged.content_keys.extend(geometry.content_keys);
             merged.paint_slots.extend(geometry.paint_slots);
             merged.visual_slots.extend(geometry.visual_slots);
+            merged.markdown.extend(geometry.markdown);
+            merged.content_targets.extend(geometry.content_targets);
             merged.selectable.extend(geometry.selectable);
         }
         merged.source_map = SourceRows::new(source_rows);

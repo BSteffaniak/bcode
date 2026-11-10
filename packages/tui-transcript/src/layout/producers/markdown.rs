@@ -59,8 +59,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bcode_markdown_render::{
-    MarkdownContributionKind, MarkdownDestination, MarkdownRenderOptions, MarkdownRenderResult,
-    MarkdownSelectionKind, MarkdownTheme, MermaidContributionRendering, render_markdown,
+    MarkdownContributionKind, MarkdownDestination, MarkdownDocumentContext, MarkdownRenderOptions,
+    MarkdownRenderResult, MarkdownSelectionKind, MarkdownTheme, MermaidContributionRendering,
+    render_markdown,
 };
 use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
 use bcode_tui_theme::definition::ResolvedThemeDefinition;
@@ -276,6 +277,145 @@ impl MarkdownVisualState {
     }
 }
 
+// ---- activation targets ---------------------------------------------------------------------
+
+/// Whether a contribution can be focused and activated.
+///
+/// Links with a safe web, local or fragment destination, footnote references and definitions,
+/// `<details>` and Mermaid diagrams are; images and math are not, and inert or unresolved
+/// destinations never are.
+#[must_use]
+pub const fn contribution_actionable(kind: &MarkdownContributionKind) -> bool {
+    match kind {
+        MarkdownContributionKind::Link { destination, .. }
+        | MarkdownContributionKind::GitHubIssue { destination, .. } => matches!(
+            destination,
+            MarkdownDestination::Web(_)
+                | MarkdownDestination::LocalPath(_)
+                | MarkdownDestination::Fragment(_)
+        ),
+        MarkdownContributionKind::Details { .. }
+        | MarkdownContributionKind::FootnoteReference { .. }
+        | MarkdownContributionKind::FootnoteDefinition { .. }
+        | MarkdownContributionKind::Mermaid { .. } => true,
+        MarkdownContributionKind::Image { .. }
+        | MarkdownContributionKind::InlineMath { .. }
+        | MarkdownContributionKind::DisplayMath { .. } => false,
+    }
+}
+
+/// One actionable Markdown contribution of an item (FO7, B12).
+///
+/// Its typed payload and the cells it occupies are read from the same retained projection that
+/// paints it and registers its hit regions. Keyboard focus, activation and the focus highlight
+/// use these targets only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownTarget {
+    /// Owner-qualified contribution id (`transcript:<unit>:...`).
+    pub contribution_id: String,
+    /// Typed payload used for activation.
+    pub kind: MarkdownContributionKind,
+    /// One rectangle per visual row segment, in item-local cells, clipped to the measured
+    /// layout; never empty.
+    pub rects: Vec<LogicalRect>,
+}
+
+impl MarkdownTarget {
+    /// Item-local rows the target spans (first rectangle's row to the last one's end).
+    #[must_use]
+    pub fn rows(&self) -> std::ops::Range<u64> {
+        let start = self.rects.iter().map(|rect| rect.y).min().unwrap_or(0);
+        let end = self
+            .rects
+            .iter()
+            .map(|rect| rect.y + rect.height)
+            .max()
+            .unwrap_or(start);
+        start..end.max(start)
+    }
+
+    /// Document-order sort key: first row, then first column.
+    fn order(&self) -> (u64, u64) {
+        self.rects
+            .iter()
+            .map(|rect| (rect.y, rect.x))
+            .min()
+            .unwrap_or_default()
+    }
+}
+
+/// One internal fragment anchor (`#fragment` destination) of an item, at an item-local row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MarkdownAnchor {
+    /// GitHub-compatible fragment identifier without the leading `#`.
+    pub fragment: String,
+    /// Item-local row the anchored block starts on.
+    pub row: u64,
+}
+
+/// Markdown activation geometry of one item: actionable contributions in document order and
+/// fragment anchors, from the retained projection (L6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct MarkdownGeometry {
+    /// Actionable contributions, in document order (row, then column).
+    pub targets: Vec<MarkdownTarget>,
+    /// Fragment anchors in row order.
+    pub anchors: Vec<MarkdownAnchor>,
+}
+
+impl MarkdownGeometry {
+    /// The target of `contribution_id`, if the item has it.
+    #[must_use]
+    pub fn target(&self, contribution_id: &str) -> Option<&MarkdownTarget> {
+        self.targets
+            .iter()
+            .find(|target| target.contribution_id == contribution_id)
+    }
+
+    /// The first anchor of `fragment`, if the item has it.
+    #[must_use]
+    pub fn anchor(&self, fragment: &str) -> Option<&MarkdownAnchor> {
+        self.anchors
+            .iter()
+            .find(|anchor| anchor.fragment == fragment)
+    }
+
+    /// The geometry moved by `dx` columns and `dy` rows.
+    #[must_use]
+    pub fn translated(self, dx: u64, dy: u64) -> Self {
+        Self {
+            targets: self
+                .targets
+                .into_iter()
+                .map(|target| MarkdownTarget {
+                    rects: target
+                        .rects
+                        .into_iter()
+                        .map(|rect| {
+                            LogicalRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height)
+                        })
+                        .collect(),
+                    ..target
+                })
+                .collect(),
+            anchors: self
+                .anchors
+                .into_iter()
+                .map(|anchor| MarkdownAnchor {
+                    row: anchor.row + dy,
+                    ..anchor
+                })
+                .collect(),
+        }
+    }
+
+    /// Append the geometry of a part laid out after this one (composite items).
+    pub fn extend(&mut self, other: Self) {
+        self.targets.extend(other.targets);
+        self.anchors.extend(other.anchors);
+    }
+}
+
 /// BMUX image key of an accepted visual placed in contribution `contribution_id`.
 #[must_use]
 pub fn visual_image_key(contribution_id: &str) -> ImageKey {
@@ -424,7 +564,8 @@ pub fn syntax_palette(theme: &ResolvedThemeDefinition) -> SyntaxPalette {
 /// BMUX render options of `request` under `cx`.
 ///
 /// The options carry the theme, syntax palette, streaming flag, document-scoped `<details>`
-/// state, readable link fallbacks and placeholder reservations. The width is clamped to at
+/// state, readable link fallbacks, placeholder reservations and the base directory relative
+/// local links resolve against. The width is clamped to at
 /// least one cell; a zero-width body clips every row.
 #[must_use]
 pub fn render_options(
@@ -445,6 +586,12 @@ pub fn render_options(
         .with_rich_reserved_rows(image_rows, MERMAID_RESERVED_ROWS);
     if cx.markdown.mermaid {
         options = options.with_mermaid_contributions(MERMAID_PIXELS.0, MERMAID_PIXELS.1);
+    }
+    if let Some(base_directory) = &cx.markdown.base_directory {
+        options = options.with_document_context(MarkdownDocumentContext {
+            base_directory: Some(base_directory.clone()),
+            ..MarkdownDocumentContext::default()
+        });
     }
     if let Some(document_id) = &request.document_id {
         let details: BTreeMap<String, bool> = cx
@@ -486,6 +633,10 @@ pub struct MarkdownBody {
     /// Source-backed selectable text (C34), attached with the source the projection was
     /// rendered from ([`Self::attach_selectable_source`]).
     selectable: Option<SelectableText>,
+    /// Typed payloads of the actionable contributions, by contribution id.
+    actionable: BTreeMap<String, MarkdownContributionKind>,
+    /// Fragment anchors (projection rows).
+    anchors: Vec<MarkdownAnchor>,
 }
 
 impl MarkdownBody {
@@ -528,26 +679,27 @@ impl MarkdownBody {
             .map(|contribution| (contribution.id.as_str(), &contribution.kind))
             .collect();
         let mut contributions = Vec::new();
+        let mut actionable = BTreeMap::new();
         for geometry in &result.geometry {
             let Some(kind) = kinds.get(geometry.contribution_id.as_str()) else {
                 continue;
             };
-            let (interactive, rendered) = match kind {
-                MarkdownContributionKind::Link { .. }
-                | MarkdownContributionKind::Details { .. }
-                | MarkdownContributionKind::GitHubIssue { .. }
-                | MarkdownContributionKind::FootnoteReference { .. } => (true, false),
+            let interactive = contribution_actionable(kind);
+            if interactive {
+                actionable.insert(geometry.contribution_id.clone(), (*kind).clone());
+            }
+            let rendered = match kind {
                 // Without placeholder reservations (or after a failure), Mermaid keeps its
                 // highlighted, source-backed code block.
                 MarkdownContributionKind::Mermaid { rendering, .. }
                     if !mermaid_placeholders
                         || matches!(rendering, MermaidContributionRendering::Failed(_)) =>
                 {
-                    (false, false)
+                    false
                 }
                 MarkdownContributionKind::Image { .. }
-                | MarkdownContributionKind::Mermaid { .. } => (false, true),
-                _ => (false, false),
+                | MarkdownContributionKind::Mermaid { .. } => true,
+                _ => false,
             };
             contributions.extend(geometry.rects.iter().map(|rect| ContributionRegion {
                 id: geometry.contribution_id.clone(),
@@ -568,6 +720,15 @@ impl MarkdownBody {
             slots: Vec::new(),
             images: Vec::new(),
             selectable: None,
+            actionable,
+            anchors: result
+                .anchors
+                .iter()
+                .map(|anchor| MarkdownAnchor {
+                    fragment: anchor.fragment.clone(),
+                    row: u64::from(anchor.row),
+                })
+                .collect(),
         }
     }
 
@@ -856,8 +1017,28 @@ impl ItemContent for MarkdownBody {
                     rect,
                     action: ItemAction::Activate(format!("{CONTENT_KEY_PREFIX}{}", region.id)),
                 });
+                // The activation target keeps exactly the hit rectangles (B3, B12).
+                if let Some(kind) = self.actionable.get(&region.id) {
+                    match geometry.markdown.targets.last_mut() {
+                        Some(target) if target.contribution_id == region.id => {
+                            target.rects.push(rect);
+                        }
+                        _ => geometry.markdown.targets.push(MarkdownTarget {
+                            contribution_id: region.id.clone(),
+                            kind: kind.clone(),
+                            rects: vec![rect],
+                        }),
+                    }
+                }
             }
         }
+        geometry.markdown.targets.sort_by_key(MarkdownTarget::order);
+        geometry.markdown.anchors = self
+            .anchors
+            .iter()
+            .filter(|anchor| anchor.row < height)
+            .cloned()
+            .collect();
         geometry.visual_slots = self
             .slots
             .iter()

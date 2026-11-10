@@ -956,6 +956,9 @@ impl ChatLoopState {
             original,
             axis,
         ));
+        if let Some(picker) = self.appearance_picker.as_mut() {
+            picker.refresh_preview(&mut chat.app);
+        }
         chat.app.set_status("appearance picker opened".to_owned());
     }
 
@@ -1131,6 +1134,9 @@ impl ChatLoopState {
                     .set_status("appearance preview cancelled".to_owned());
             }
             AppearancePickerOutcome::Ignored => {}
+        }
+        if let Some(picker) = self.appearance_picker.as_mut() {
+            picker.refresh_preview(&mut chat.app);
         }
     }
 
@@ -6359,6 +6365,12 @@ pub fn draw_chat_frame<W: Write>(
     // Every painter this frame, including canvas-owning foregrounds that skip
     // the transcript renderer, uses the same focus phase.
     render::begin_focus_frame(chat.app.focus_phase(), damage.is_full());
+    // V1 keeps the chrome theme current while it prepares its transcript layout; V2 prepares no
+    // V1 layout, so the frame path keeps theme and accent changes reaching dialog and component
+    // chrome (the composer reads its theme from the frame's `TuiTheme`).
+    if transcript_v2.is_some() {
+        render::set_plugin_visual_theme(&chat.app.presented_theme());
+    }
     let frame_started = loop_state
         .telemetry
         .as_ref()
@@ -6692,6 +6704,17 @@ pub fn draw_chat_frame<W: Write>(
         }
         _ => damage,
     };
+    // The status row reports the V2 reading position of the frame just prepared (C2); a
+    // changed position repaints the status row with the transcript.
+    let (damage, transcript_v2_status_damaged) = match (transcript_v2.as_deref_mut(), layout) {
+        (Some(host), Some(layout)) => {
+            host.with_status_damage(damage, layout.status(), terminal.area())
+        }
+        _ => (damage, false),
+    };
+    let transcript_v2_chrome_inputs = transcript_v2.as_deref().map(|host| render::FrameChrome {
+        transcript_position: host.status_position(),
+    });
     let geometry = loop_state.interactive_surface.as_ref().map(|_| {
         if pinned {
             InteractiveSurfaceGeometry {
@@ -6734,11 +6757,24 @@ pub fn draw_chat_frame<W: Write>(
                 if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
                     // With V2 the transcript body and latest bar are the V2 host's: the V1
                     // transcript is neither rendered nor reconciled there (EN5).
-                    let v2 = transcript_v2.is_some();
-                    render::render_prepared_damage(&mut chat.app, frame, layout, |area| {
-                        intersects(area)
-                            && !(v2 && (area == layout.body() || Some(area) == layout.latest_bar()))
-                    });
+                    if let Some(chrome) = transcript_v2_chrome_inputs {
+                        render::render_prepared_damage_with(
+                            &mut chat.app,
+                            frame,
+                            layout,
+                            chrome,
+                            |area| {
+                                (intersects(area)
+                                    || (transcript_v2_status_damaged && area == layout.status()))
+                                    && area != layout.body()
+                                    && Some(area) != layout.latest_bar()
+                            },
+                        );
+                    } else {
+                        render::render_prepared_damage(&mut chat.app, frame, layout, |area| {
+                            intersects(area)
+                        });
+                    }
                     if let (Some(host), Some(style)) =
                         (transcript_v2.as_deref_mut(), transcript_v2_style.as_ref())
                     {
@@ -7081,11 +7117,7 @@ fn paint_foreground_pickers(
         && foreground == Some(super::foreground::Foreground::Appearance)
     {
         super::appearance_picker_render::render_appearance_picker_with_keymap(
-            picker,
-            frame,
-            theme,
-            chat.app.structure_snapshot(),
-            effective,
+            picker, frame, theme, effective,
         );
     }
 }

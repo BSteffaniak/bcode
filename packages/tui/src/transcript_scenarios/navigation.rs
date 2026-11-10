@@ -1100,10 +1100,42 @@ pub fn c27_repeated_presentation_is_idempotent<D: TranscriptScenarioDriver>() {
 /// C27/CK2–CK3: a presentation that fails does not commit navigation; events delivered after
 /// it apply to the last committed navigation state.
 ///
-/// Stub: the driver contract has no way to make a presentation fail.
+/// A reader scrolls up one tick and the frame showing it fails to present; a live append then
+/// arrives. The next presented frame shows exactly the one tick of movement from the committed
+/// reading frame (nothing of the failed frame was spent or replayed) and the live append left
+/// the reader in place (T23); a further tick whose first frame also fails moves by one tick.
 pub fn c27_failed_presentation_does_not_commit_navigation<D: TranscriptScenarioDriver>() {
-    let scenario = attach_everything::<D>(ScenarioSession::with_turns(10, 3), WIDTH);
-    scenario.fail("driver: needs presentation failure injection");
+    let mut scenario = attach_everything::<D>(ScenarioSession::with_turns(10, 3), WIDTH);
+    let reading = read_older(&mut scenario, 2);
+    let tick = scenario.wheel_rows();
+    // The tick's motion settles before the frame that would show it, so that frame differs
+    // from the committed one and its output is written (and fails).
+    scenario.wheel(WheelDirection::Up, 1);
+    scenario.advance(SETTLE);
+    scenario.driver.abandon_presentation();
+    scenario.append_live_assistant(2);
+    let after = settle(&mut scenario);
+    check_shift_eq(
+        &scenario,
+        &reading,
+        &after,
+        tick,
+        "a tick whose frame failed to present, then a live append",
+    );
+    scenario.check(!after.following_bottom, || {
+        "the reader resumed following after a failed presentation".to_owned()
+    });
+    scenario.wheel(WheelDirection::Up, 1);
+    scenario.advance(SETTLE);
+    scenario.driver.abandon_presentation();
+    let later = settle(&mut scenario);
+    check_shift_eq(
+        &scenario,
+        &after,
+        &later,
+        tick,
+        "the next tick, whose first frame also failed",
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

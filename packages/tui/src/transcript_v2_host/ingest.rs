@@ -59,6 +59,8 @@ impl TranscriptV2Host {
             .with_render_config(engine.render_config().clone())
             .with_structure_config(engine.structure().config().clone())
             .with_scrollbar(engine.scrollbar());
+        // The new engine's `SessionView` presents live text like the one it replaces (D13).
+        let _empty = self.engine.set_streaming_policy(self.streaming, at);
         self.invalidated = true;
         let Some(session) = session else {
             return;
@@ -197,21 +199,54 @@ impl TranscriptV2Host {
         self.take_history_effects()
     }
 
-    /// Earliest engine timer (motion frames, grace expiry) or history retry the host must
-    /// wake for.
-    #[must_use]
-    pub fn next_deadline(&self) -> Option<Instant> {
-        match (self.engine.next_deadline(), self.data.next_retry()) {
-            (Some(engine), Some(retry)) => Some(engine.min(retry)),
-            (engine, retry) => engine.or(retry),
+    /// Apply the host shell's streaming-presentation policy (`[tui] streaming`, the streaming
+    /// configurator's override or reset) to the engine, which paces live text with it exactly
+    /// as V1's `SessionView` does (D13). An unchanged policy is a no-op; switching to immediate
+    /// presentation shows pending text in this update.
+    pub fn sync_streaming_policy(
+        &mut self,
+        policy: bcode_session_view_models::StreamingPresentationPolicy,
+        at: Instant,
+    ) {
+        let policy = policy.normalized();
+        if policy == self.streaming {
+            return;
+        }
+        self.streaming = policy;
+        let update = self.engine.set_streaming_policy(policy, at);
+        self.absorb_presented_text(update);
+    }
+
+    /// Record released or flushed paced text: a content change of the streaming units.
+    fn absorb_presented_text(&mut self, update: bcode_tui_transcript::engine::EngineUpdate) {
+        let changed = update.invalidated;
+        self.absorb(update);
+        if changed {
+            self.record_content_change();
         }
     }
 
-    /// Fire due engine timers at `now` and re-issue due history retries the engine still
-    /// awaits (a superseded request is dropped).
+    /// Earliest engine timer (motion frames, grace expiry, paced live text) or history retry
+    /// the host must wake for.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        [
+            self.engine.next_deadline(),
+            self.data.next_retry(),
+            self.engine.next_streaming_deadline(self.now()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Fire due engine timers at `now`, release paced live text due at `now` (D13) and
+    /// re-issue due history retries the engine still awaits (a superseded request is dropped).
     pub fn advance(&mut self, now: Instant) {
         let update = self.engine.advance(now);
         self.absorb(update);
+        let presented = self.engine.advance_streaming(now);
+        self.absorb_presented_text(presented);
         for request in self.data.take_due_retries(now) {
             if self.engine.is_awaiting(&request) {
                 self.pending_requests.push(request);

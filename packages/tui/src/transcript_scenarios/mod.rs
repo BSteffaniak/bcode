@@ -13,9 +13,11 @@ pub mod driver;
 pub mod frame;
 pub mod interaction;
 pub mod local_rows;
+pub mod markdown;
 pub mod navigation;
 pub mod paging;
 pub mod pipeline;
+pub mod plugin_visuals;
 pub mod scenarios;
 pub mod session;
 pub mod shell;
@@ -570,7 +572,6 @@ mod v2_navigation {
         c25_collapse_above_keeps_reading_position,
         c26_runtime_work_events_do_not_move_final_response,
         c27_repeated_presentation_is_idempotent,
-        #[ignore = "driver: needs presentation failure injection"]
         c27_failed_presentation_does_not_commit_navigation,
         c28_movement_kept_while_page_loads_is_spent_once,
         c29_direction_reversal_cancels_pending_movement,
@@ -674,7 +675,40 @@ mod v2_pipeline {
         visuals_mermaid_without_images_keeps_its_source,
         c37_inline_interaction_scrolls_with_the_transcript_and_restores,
         c39_shell_expansion_opens_up_to_128_rows,
-        #[ignore = "V2 pending phase 7: local horizontal scroll inside the inline shell screen (C39) is not implemented"]
         c39_shell_screen_scrolls_horizontally,
+    }
+}
+
+/// Plugin visual scenarios in [`plugin_visuals`] (phase 7 parity) for the V2 engine in the
+/// application: bundled plugins loaded through the production plugin host present tool results
+/// through their visual adapters, and copies use the adapters' source rows.
+mod v2_plugin_visuals {
+    super::transcript_scenarios! { super::v2::V2Driver; in plugin_visuals;
+        e1_plugin_visual_presents_adapter_rows_instead_of_the_fallback,
+        c36_plugin_visual_copy_uses_the_adapter_source,
+    }
+}
+
+/// Markdown contribution activation scenarios in [`markdown`] (phase 7 parity). The V1-safe
+/// ones (no platform opener or system clipboard) are instantiated for both engines; the V1
+/// entries record what V1 shows in this driver. Link opening and destination copy run on V2
+/// only, whose test opener records destinations.
+mod v1_markdown {
+    super::transcript_scenarios! { super::v1::V1Driver; in markdown;
+        #[ignore = "V1 observation: a click on the details summary does not expand the block in this driver"]
+        md_details_click_toggles_the_block,
+        #[ignore = "V1 observation: the footnote jump reports success but the definition stays out of view"]
+        md_keys_jump_between_footnote_reference_and_definition,
+        #[ignore = "V1 bug: fragment navigation reports success but does not bring the section into view"]
+        md_fragment_link_navigates_to_its_section,
+    }
+}
+
+mod v2_markdown {
+    super::transcript_scenarios! { super::v2::V2Driver; in markdown;
+        md_details_click_toggles_the_block,
+        md_keys_jump_between_footnote_reference_and_definition,
+        md_fragment_link_navigates_to_its_section,
+        md_link_opens_and_its_destination_copies,
     }
 }

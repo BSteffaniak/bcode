@@ -49,6 +49,9 @@ use crate::root_program::{BcodeRuntimeMessage, BcodeRuntimeModel};
 use crate::transcript_v2_host::TranscriptV2Host;
 use crate::transcript_v2_host::effects::{HistoryLoad, HistoryLoaded};
 
+/// V2-only scenarios of the host chrome around the V2 transcript (C2, C27, C37, X4, FO5, D13).
+mod host_chrome;
+
 /// Page sizing V2 asks for: filled to the per-request caps (W6, 11-P1).
 const V2_PAGE_LIMITS: PageLimits = PageLimits {
     target_items: PageCaps::PAGE.max_items,
@@ -359,6 +362,19 @@ fn damage_observation(
     }
 }
 
+/// Terminal output that fails every write and flush ([`V2Driver::abandon_presentation`]).
+struct FailingOutput;
+
+impl std::io::Write for FailingOutput {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("scenario presentation failure"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("scenario presentation failure"))
+    }
+}
+
 /// Interactive surface double: prefers a fixed height and paints one text line per row.
 struct ScenarioSurface {
     rows: u16,
@@ -621,6 +637,20 @@ impl TranscriptScenarioDriver for V2Driver {
         }
     }
 
+    /// Run the production root presenter against terminal output that fails, as a broken
+    /// terminal would: the frame is prepared and painted, the presentation reports the error,
+    /// and neither the terminal nor the model commits it (CK2, C27).
+    fn abandon_presentation(&mut self) {
+        let mut output = FailingOutput;
+        let mut staged = self.terminal.fork(&mut output);
+        let failed = crate::root_program::bcode_runtime_presenter(&mut staged)
+            .present(&mut self.model)
+            .is_err();
+        drop(staged);
+        assert!(failed, "the presentation must fail when its output fails");
+        self.collect_effects();
+    }
+
     fn window_work(&self) -> Option<WindowWork> {
         Some(super::v2_headless::window_work(
             self.host().engine().window_work(),
@@ -795,5 +825,33 @@ impl TranscriptScenarioDriver for V2Driver {
                 .saturating_add(i64::try_from(row).unwrap_or(i64::MAX))
         };
         Some(offset(rows.start)..offset(rows.end))
+    }
+
+    /// Load the plugins through the production static plugin host and the effective keymap
+    /// adapters render and route with (as startup installs them).
+    fn load_bundled_plugins(&mut self, plugins: &[super::driver::ScenarioPlugin]) {
+        let bundled = plugins
+            .iter()
+            .map(|plugin| match plugin {
+                super::driver::ScenarioPlugin::Filesystem => {
+                    bcode_plugin::StaticBundledPlugin::new(
+                        include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+                        bcode_filesystem_plugin::static_plugin(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("bundled plugins select");
+        self.model.chat.app.set_plugin_host(std::sync::Arc::new(
+            bcode_plugin::PluginHost::load_static_plugins(&selected).expect("bundled plugins load"),
+        ));
+        let keymap = self.model.settings.keymap().registry().clone();
+        self.model.chat.app.set_effective_keymap(keymap);
+        self.model.request_full_redraw_for_test();
+        self.sync();
     }
 }

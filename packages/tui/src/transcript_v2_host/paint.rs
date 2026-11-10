@@ -31,7 +31,7 @@ pub const LATEST_BAR_HIT: &str = "transcript-v2.latest-bar";
 pub const ITEM_HIT_PREFIX: &str = "transcript-v2.item:";
 
 /// Damage bounds of transcript scroll damage: the root frame's region policy (BMUX 11).
-const DAMAGE_POLICY: DamagePolicy = DamagePolicy {
+pub(super) const DAMAGE_POLICY: DamagePolicy = DamagePolicy {
     max_regions: 64,
     max_area_percent: 100,
 };
@@ -219,6 +219,7 @@ impl TranscriptV2Host {
         }
         self.prepared = Some(region);
         self.last_frame = Some(snapshot);
+        self.prepare_markdown(viewport);
     }
 
     /// The damage of the prepared frame given the host shell's `damage` (F5, D6, BMUX 11).
@@ -323,11 +324,13 @@ impl TranscriptV2Host {
                 engine.paint_frame(snapshot, child);
                 engine.paint_selection(snapshot, child, style.selection);
                 paint_interaction(snapshot, child, style.focus);
+                self.paint_markdown_focus(child);
             },
         );
         if let Some(bar) = self.regions.latest_bar {
             paint_latest_bar(snapshot.latest_bar, bar, cx, style, snapshot.clock.now);
         }
+        self.paint_markdown_source(cx, style.background, style.info, style.text);
     }
 
     /// The frame's single clock sample (F2): the paint context's presentation clock, else

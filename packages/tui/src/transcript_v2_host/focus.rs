@@ -188,6 +188,42 @@ pub fn resolve_key(
     Some(TranscriptKey::Scroll(scroll))
 }
 
+impl super::TranscriptV2Host {
+    /// Run a user-bound tool-disclosure key (`tui.tools.expandAll`, `tui.tools.collapseAll`,
+    /// `tui.tools.resetDisclosure`; chat scope, unbound by default) as its command-palette
+    /// route, so the key does exactly what the palette command does on the V2 transcript.
+    /// With transcript focus a `transcript_focus` binding of the same key wins, as for every
+    /// other chat key (FO6). Returns whether the transcript changed, or `None` when `stroke`
+    /// is not such a key.
+    pub fn handle_tools_key(
+        &mut self,
+        keymap: &BmuxKeyMap,
+        stroke: KeyStroke,
+        at: std::time::Instant,
+    ) -> Option<bool> {
+        let route = tools_route(keymap, stroke)?;
+        if self.transcript_focus_active()
+            && keymap
+                .action(FOCUS_SCOPE, stroke)
+                .and_then(FocusKeyAction::from_id)
+                .is_some()
+        {
+            return None;
+        }
+        match self.run_transcript_route(route, at)? {
+            super::input::TranscriptRouteOutcome::Ran(changed) => Some(changed),
+        }
+    }
+}
+
+/// The command-palette route of the user-bound `tui.tools.*` key `stroke` (chat scope), if it
+/// is one.
+pub(super) fn tools_route(keymap: &BmuxKeyMap, stroke: KeyStroke) -> Option<&'static str> {
+    keymap
+        .action_for_key(BmuxScope::Chat, stroke)?
+        .tools_route()
+}
+
 /// Label of the jump-to-latest key for the latest bar ("New messages below · KEY to jump").
 #[must_use]
 pub fn jump_to_latest_label(registry: &bcode_plugin_sdk::tui::keymap::KeymapRegistry) -> String {

@@ -1149,7 +1149,13 @@ impl BcodeRuntimeModel {
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn route_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
         let damage = self.handle_basic_terminal_event(event);
-        if let Some(session_id) = self.chat.app.take_session_link_request() {
+        // Rendered `#bcode-session-<id>` links of either engine switch sessions.
+        let session_link = self.chat.app.take_session_link_request().or_else(|| {
+            self.transcript_engine
+                .v2_mut()
+                .and_then(super::transcript_v2_host::TranscriptV2Host::take_session_link_request)
+        });
+        if let Some(session_id) = session_link {
             super::session_flow::start_switch_session(
                 &mut self.chat,
                 session_id,
@@ -2623,6 +2629,21 @@ impl BcodeRuntimeModel {
         self.report_transcript_copy_result(result);
     }
 
+    /// Copy a V2 Markdown destination (`tui.markdown.copyDestination`) through the transcript
+    /// clipboard path, reporting with V1's messages.
+    fn copy_markdown_destination(&mut self, text: &str) {
+        match (self.transcript_clipboard)(text) {
+            Ok(()) => self
+                .chat
+                .app
+                .set_status("Copied Markdown destination".to_owned()),
+            Err(error) => self
+                .chat
+                .app
+                .set_status(format!("Could not copy Markdown destination: {error}")),
+        }
+    }
+
     fn report_transcript_copy_result<E: std::fmt::Display>(&mut self, result: Result<(), E>) {
         match result {
             Ok(()) => {
@@ -3377,7 +3398,11 @@ impl BcodeRuntimeModel {
                 }
             }
             "bcode.streaming_presentation" => {
-                if self.chat.app.advance_streaming_presentation(now) {
+                // With V2 the hidden V1 view still advances, but the V2 engine paces the
+                // visible transcript on its own timer (`bcode.transcript_v2`).
+                if self.chat.app.advance_streaming_presentation(now)
+                    && self.transcript_engine.v2().is_none()
+                {
                     return (
                         super::invalidation::UiInvalidation::Paint,
                         vec![super::app::TemporalDamage::Transcript],
@@ -3538,8 +3563,16 @@ fn commit_root_presentation<W: std::io::Write>(
     program.committed_selection = terminal.selection().clone();
     program.committed_visual_text.clear();
     program.committed_visual_targets.clear();
-    // Plugin visual targets and selection text come from the V1 transcript layout; with the
-    // V2 engine selected that layout is not what the body shows, so none are published.
+    // With V2, plugin visual targets come from the presented V2 frame's retained geometry, and
+    // the reading position's plugin content is retained across reflow (E1, E3). V2 copies
+    // plugin rows through its own selection, so no V1 visual text is published.
+    if let Some(host) = program.transcript_engine.v2_mut() {
+        program.committed_visual_targets = host.committed_visual_targets();
+        if let Some(presentation) = program.chat.app.plugin_presentation() {
+            host.sync_content_positions(presentation);
+        }
+    }
+    // Without V2 they come from the V1 transcript layout.
     if let Some(layout) = layout.filter(|_| program.transcript_engine.v2().is_none()) {
         let body = layout.body();
         for (offset, line) in program
@@ -4311,7 +4344,13 @@ impl BcodeRuntimeModel {
         let host = self.transcript_engine.v2_mut()?;
         let now = host.now();
         let outcome = match event {
-            Event::Key(stroke) => host.handle_key(self.settings.keymap(), *stroke, now),
+            // User-bound `tui.tools.*` keys run their palette route on V2 (FO6).
+            Event::Key(stroke) => match host.handle_tools_key(self.settings.keymap(), *stroke, now)
+            {
+                Some(true) => TranscriptInputOutcome::Redraw,
+                Some(false) => TranscriptInputOutcome::Consumed,
+                None => host.handle_key(self.settings.keymap(), *stroke, now),
+            },
             Event::Mouse(mouse) if !modal => {
                 let top_hit = super::mouse_flow::mouse_hit_id(&self.committed_hits, *mouse);
                 host.handle_pointer(
@@ -4333,7 +4372,12 @@ impl BcodeRuntimeModel {
             // FO10: a key the transcript consumed is not a tap of a chat multi-tap sequence.
             self.chat.app.clear_pending_key_activation();
         }
-        let copied = self.apply_transcript_v2_selection_events(events);
+        let markdown_copy = host.take_markdown_copy();
+        let copied = self.apply_transcript_v2_selection_events(events)
+            | markdown_copy.is_some_and(|text| {
+                self.copy_markdown_destination(&text);
+                true
+            });
         outcome.consumed_redraw().map(|redraw| {
             if copied {
                 // The copy reports through the status row (V1 copy policy).
@@ -4487,6 +4531,8 @@ impl BcodeRuntimeModel {
                 .map(|session| (session, self.chat.attachment.opening_anchor_sequence())),
         );
         host.sync_session(self.chat.attached_session_id(), now);
+        // The engine's `SessionView` paces live text with the host shell's policy (D13).
+        host.sync_streaming_policy(self.chat.app.streaming_presentation_policy(), now);
         let _ = host.sync_render_inputs(&mut self.chat.app, now);
         // Pending submissions and process-local notices are V2 local rows (LR1–LR7).
         host.sync_local_rows(&self.chat.app, now);
@@ -4496,7 +4542,15 @@ impl BcodeRuntimeModel {
             let text = notice.text(&self.chat.app);
             self.chat.app.set_status(text);
         });
-        let notice = notice.is_some();
+        // Markdown activation reports through the status row with V1's messages.
+        host.set_markdown_activate_label(
+            &self.chat.app.shortcut_hint("chat", "tui.markdown.activate"),
+        );
+        let markdown_notice = host.take_markdown_notice().map(|notice| {
+            let text = notice.text(&self.chat.app);
+            self.chat.app.set_status(text);
+        });
+        let notice = notice.is_some() || markdown_notice.is_some();
         for rule in host.take_default_rules() {
             self.chat.app.queue_default_rule(rule);
         }
@@ -4838,6 +4892,22 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                         .chat
                                         .app
                                         .focus_interaction_in_transcript(interaction_id);
+                                }
+                            }
+                            // EN5: the selected engine scrolls the transcript under the
+                            // surface (Page Up/Down, ctrl+up/down, ctrl+home/end).
+                            _ if self.transcript_engine.v2().is_some() => {
+                                let changed =
+                                    self.route_transcript_v2_input(&event)
+                                        .is_some_and(|damage| {
+                                            damage != super::invalidation::UiInvalidation::None
+                                        });
+                                if changed {
+                                    self.invalidation = self
+                                        .invalidation
+                                        .merge(super::invalidation::UiInvalidation::Structural);
+                                    self.presentation_damage = bmux_tui::damage::Damage::Full;
+                                    self.fast_temporal_presentation = false;
                                 }
                             }
                             action => {
@@ -9074,8 +9144,9 @@ mod tests {
             .unwrap();
         assert_ne!(before, model.committed_visual_text);
 
-        // With the V2 engine selected the body is not the V1 layout: no V1 visual target or
-        // selection row is published, so a right-click there reaches no hidden visual.
+        // With a fresh V2 engine selected the body is not the V1 layout: no V1 visual target or
+        // selection row is published, so a right-click there reaches no hidden visual (V2's
+        // own targets: `v2_shell_alternate_screen_takes_pointer_focus_and_terminal_keys`).
         model.transcript_engine =
             super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
                 bcode_config::TuiEngine::V2,
@@ -9094,6 +9165,314 @@ mod tests {
         assert_eq!(
             model.focused_visual, None,
             "no hidden V1 visual takes the press"
+        );
+        drop(model);
+    }
+
+    /// E1 under V2: the shell plugin's live alternate-screen replay is presented by the V2
+    /// engine, its rows are published as visual targets from the presented frame, a
+    /// right-button press focuses the visual, the focused visual's keys (`shell.terminal.*`)
+    /// reach the adapter, which scrolls its screen, and Escape releases it.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn v2_shell_alternate_screen_takes_pointer_focus_and_terminal_keys() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::{Presenter, Program, RuntimeEvent, TimerId};
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model_with_history(session_id, &[]);
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .unwrap();
+        model.chat.app.set_plugin_host(std::sync::Arc::new(
+            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
+        ));
+        model
+            .chat
+            .app
+            .set_effective_keymap(model.settings.keymap().registry().clone());
+        let payload = serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
+            "live_state_key":"shell-navigation-v2", "columns":80, "rows":24, "streaming":true,
+            "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}});
+        let registry = model
+            .chat
+            .app
+            .plugin_presentation()
+            .unwrap()
+            .registry("bcode.shell")
+            .unwrap();
+        assert!(
+            registry
+                .visual_projection(
+                    "shell-run-request-card",
+                    "bcode.tool.request.shell.run",
+                    &payload,
+                    &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                        24,
+                        bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                        None,
+                    ),
+                )
+                .is_some()
+        );
+        drop(registry);
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "shell-navigation-v2".to_owned(),
+                    model_output: "fallback".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(bcode_session_models::ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "shell-navigation-v2".to_owned(),
+                            producer_plugin_id: "bcode.shell".to_owned(),
+                            schema: "bcode.tool.request.shell.run".to_owned(),
+                            schema_version: 1,
+                            title: None,
+                            tool_call_id: Some("shell-navigation-v2".to_owned()),
+                            metadata: payload,
+                            refs: Vec::new(),
+                        }),
+                    }),
+                    content: Vec::new(),
+                },
+            },
+        };
+        let host = super::super::transcript_v2_host::test_fixtures::attached_with_events(
+            session_id,
+            vec![event],
+            std::time::Instant::now(),
+        );
+        model.transcript_engine =
+            super::super::transcript_v2_host::TranscriptEngineChoice::V2(Box::new(host));
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 24, 40));
+        let mut present = |model: &mut super::BcodeRuntimeModel| {
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            let report = super::bcode_runtime_presenter(&mut terminal)
+                .present(model)
+                .unwrap();
+            let _ = model.presentation_committed(report);
+            let buffer = terminal.retained_buffer().expect("retained buffer");
+            (0..buffer.area().height)
+                .map(|row| buffer.row_symbols(row).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let update = |model: &mut super::BcodeRuntimeModel, event| {
+            Program::update(model, event).expect("update");
+        };
+        // The end-of-update sync routes the plugin visual; two frames settle the geometry the
+        // adapter renders at.
+        update(
+            &mut model,
+            RuntimeEvent::Timer(TimerId::new("bcode.transcript_v2")),
+        );
+        let _ = present(&mut model);
+        update(
+            &mut model,
+            RuntimeEvent::Timer(TimerId::new("bcode.transcript_v2")),
+        );
+        let before = present(&mut model);
+        assert!(!before.contains("fallback"), "{before}");
+        let (target, identity) = model
+            .committed_visual_targets
+            .iter()
+            .find(|(_, identity)| identity.contains(":terminal:"))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "visible shell terminal target: {:?}\n{before}",
+                    model.committed_visual_targets
+                )
+            });
+        assert!(target.height >= 1 && target.right() <= 24);
+        update(
+            &mut model,
+            RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Right),
+                Point::new(target.x, target.y),
+            ))),
+        );
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        update(
+            &mut model,
+            RuntimeEvent::Terminal(Event::Key(bmux_keyboard::KeyStroke {
+                key: bmux_keyboard::KeyCode::Right,
+                modifiers: bmux_keyboard::Modifiers::default(),
+            })),
+        );
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        let after = present(&mut model);
+        assert_ne!(before, after, "the adapter scrolled its terminal screen");
+        update(
+            &mut model,
+            RuntimeEvent::Terminal(Event::Key(bmux_keyboard::KeyStroke {
+                key: bmux_keyboard::KeyCode::Escape,
+                modifiers: bmux_keyboard::Modifiers::default(),
+            })),
+        );
+        assert_eq!(model.focused_visual, None, "Escape releases the visual");
+        drop(model);
+    }
+
+    /// E1 under V2: a running request of a plugin-owned tool renders through the declaring
+    /// plugin's request adapter (as V1 routes `shell.run` to its request card), not the
+    /// canonical fallback, and the adapter renders at the unit's body width so its rows are
+    /// never clipped by the tool chrome.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn v2_running_plugin_tool_request_routes_its_request_adapter_at_the_body_width() {
+        use bmux_tui::geometry::Rect;
+        use bmux_tui_runtime::{Presenter, Program, RuntimeEvent, TimerId};
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model_with_history(session_id, &[]);
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .unwrap();
+        model.chat.app.set_plugin_host(std::sync::Arc::new(
+            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
+        ));
+        model
+            .chat
+            .app
+            .set_effective_keymap(model.settings.keymap().registry().clone());
+        let requested = |sequence, call: &str, producer: Option<&str>| {
+            super::super::transcript_v2_host::test_fixtures::event(
+                session_id,
+                sequence,
+                bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: call.to_owned(),
+                    producer_plugin_id: producer.map(str::to_owned),
+                    tool_name: "shell.run".to_owned(),
+                    arguments_json: serde_json::json!({ "command": "echo running" }).to_string(),
+                    working_directory: None,
+                },
+            )
+        };
+        let host = super::super::transcript_v2_host::test_fixtures::attached_with_events(
+            session_id,
+            vec![
+                requested(1, "call-owned", Some("bcode.shell")),
+                // Another producer's tool of the same name keeps the generic presentation.
+                requested(2, "call-foreign", Some("example.harness")),
+            ],
+            std::time::Instant::now(),
+        );
+        model.transcript_engine =
+            super::super::transcript_v2_host::TranscriptEngineChoice::V2(Box::new(host));
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 40, 30));
+        for _ in 0..2 {
+            Program::update(
+                &mut model,
+                RuntimeEvent::Timer(TimerId::new("bcode.transcript_v2")),
+            )
+            .expect("update");
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            let report = super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .unwrap();
+            let _ = model.presentation_committed(report);
+        }
+        let host = model.transcript_engine.v2().expect("V2 host");
+        let engine = host.engine();
+        let items = &engine.session_view().snapshot().transcript.items;
+        let item = |call: &str| {
+            items
+                .iter()
+                .find(|item| {
+                    matches!(
+                        &item.kind,
+                        bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                            if tool.tool_call_id == call
+                    )
+                })
+                .unwrap_or_else(|| panic!("{call} item"))
+        };
+        let owned = item("call-owned");
+        let visual = engine
+            .render_config()
+            .plugin_visuals
+            .accepted(&owned.id)
+            .expect("the running request routes its plugin request adapter");
+        assert!(
+            visual.adapter.starts_with("bcode.shell:"),
+            "{}",
+            visual.adapter
+        );
+        assert!(
+            engine
+                .render_config()
+                .plugin_visuals
+                .accepted(&item("call-foreign").id)
+                .is_none(),
+            "a foreign producer's tool keeps the generic presentation"
+        );
+        let structure =
+            engine
+                .structure()
+                .unit_presentation(&bcode_tui_transcript::units::UnitKey::Item(
+                    owned.id.clone(),
+                ));
+        let body = bcode_tui_transcript::layout::producers::tool::body_width(
+            owned,
+            structure,
+            &engine.render_config().theme,
+            engine.geometry().width,
+        );
+        let widest = visual
+            .rows
+            .iter()
+            .map(|row| u64::try_from(row.width()).unwrap_or(u64::MAX))
+            .max()
+            .unwrap_or_default();
+        assert!(
+            widest <= body,
+            "adapter rows fit the body ({widest} > {body})"
+        );
+        // Adapters render key hints from the effective keymap: replacing it routes again.
+        let owned_id = owned.id.clone();
+        let revision = visual.revision;
+        model
+            .chat
+            .app
+            .set_effective_keymap(bcode_plugin_sdk::tui::keymap::KeymapRegistry::default());
+        Program::update(
+            &mut model,
+            RuntimeEvent::Timer(TimerId::new("bcode.transcript_v2")),
+        )
+        .expect("update");
+        let rerouted = model
+            .transcript_engine
+            .v2()
+            .expect("V2 host")
+            .engine()
+            .render_config()
+            .plugin_visuals
+            .accepted(&owned_id)
+            .map(|visual| visual.revision);
+        assert!(
+            rerouted.is_some_and(|rerouted| rerouted != revision),
+            "a keymap replacement re-routes the adapter ({rerouted:?})"
         );
         drop(model);
     }

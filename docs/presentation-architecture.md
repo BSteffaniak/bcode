@@ -556,7 +556,8 @@ default = true
   tool" (see Interaction).
 * `cargo run -p xtask -- theme-gallery [--check | --dry-run]` writes the generated gallery,
   [`theme-gallery.md`](theme-gallery.md). It renders the appearance picker's sample transcript
-  through the real row pipeline into a headless 80×96 BMUX buffer under each selected
+  through the transcript engine's unit producers (`bcode_tui_transcript::sample`) into a
+  headless 80×112 BMUX buffer under each selected
   combination: every selectable bundled theme alone (dark variant), plus every bundled profile
   over the default theme and `bcode`. Renders are ANSI-free text, so identical renders are
   printed once with every combination that produces them (at most 64), and swatch tables give

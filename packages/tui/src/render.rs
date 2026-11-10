@@ -33,7 +33,9 @@ pub fn set_structure(snapshot: super::structure::StructureSnapshot) {
 /// with turn facts and groups computed over `items` themselves.
 ///
 /// The active row-building snapshot is restored afterwards, so transcript
-/// layout caches never observe the preview policy.
+/// layout caches never observe the preview policy. Test-only: V1 tests and
+/// benches use it; the appearance picker and gallery render through V2.
+#[cfg(test)]
 pub fn sample_transcript_rows(
     items: &[TranscriptItem],
     width: u16,
@@ -617,6 +619,8 @@ pub struct TuiTheme {
     pub success: Style,
     pub warning: Style,
     pub error: Style,
+    /// The theme's `borders.composer` chrome, which the composer panel frames itself with.
+    pub composer_border: Option<bcode_tui_theme::chrome::BorderStyle>,
 }
 
 impl TuiTheme {
@@ -657,6 +661,7 @@ impl TuiTheme {
             success: theme.success,
             warning: theme.warning,
             error: theme.error,
+            composer_border: theme.unit_chrome.composer_border,
         }
     }
 
@@ -687,6 +692,7 @@ impl TuiTheme {
             success: theme.success,
             warning: theme.warning,
             error: theme.error,
+            composer_border: theme.presented(theme.accent).unit_chrome.composer_border,
         }
     }
 
@@ -716,6 +722,7 @@ impl TuiTheme {
             success: theme.success,
             warning: theme.warning,
             error: theme.error,
+            composer_border: theme.unit_chrome.composer_border,
         }
     }
 }
@@ -895,6 +902,63 @@ pub fn render_prepared_damage(
     layout: FrameLayout,
     intersects: impl Fn(Rect) -> bool,
 ) {
+    let chrome = FrameChrome {
+        transcript_position: TranscriptStatusPosition::of_v1_transcript(app),
+    };
+    render_prepared_damage_with(app, frame, layout, chrome, intersects);
+}
+
+/// What the shell chrome reports about the transcript engine that paints the body. The host
+/// frame path passes it explicitly, so chrome never reads a transcript engine's state itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameChrome {
+    /// Reading position the status row reports (C2).
+    pub transcript_position: TranscriptStatusPosition,
+}
+
+/// Transcript reading position the status row reports (C2): how far the reader is above the
+/// content bottom ("N rows from bottom"), or how many blank tail-space rows are below the latest
+/// content ("N rows below latest"). At most one is non-zero; both are zero while following.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TranscriptStatusPosition {
+    /// Rows between the viewport bottom and the content bottom.
+    pub rows_from_bottom: u64,
+    /// Blank tail-space rows below the latest content row.
+    pub rows_below_latest: u64,
+}
+
+impl TranscriptStatusPosition {
+    /// The position of the V1 transcript viewport.
+    #[must_use]
+    pub fn of_v1_transcript(app: &BmuxApp) -> Self {
+        Self {
+            rows_from_bottom: u64::try_from(app.scroll_offset()).unwrap_or(u64::MAX),
+            rows_below_latest: u64::try_from(app.bottom_overscroll()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The optional status-row label for the position, if any.
+    #[must_use]
+    pub fn label(self) -> Option<String> {
+        if self.rows_from_bottom > 0 {
+            Some(format!("{} rows from bottom", self.rows_from_bottom))
+        } else if self.rows_below_latest > 0 {
+            Some(format!("{} rows below latest", self.rows_below_latest))
+        } else {
+            None
+        }
+    }
+}
+
+/// Render only prepared layout regions selected by terminal-space damage, with the chrome
+/// inputs of the transcript engine that paints the body.
+pub fn render_prepared_damage_with(
+    app: &mut BmuxApp,
+    frame: &mut PaintCx<'_, '_>,
+    layout: FrameLayout,
+    chrome: FrameChrome,
+    intersects: impl Fn(Rect) -> bool,
+) {
     if layout.area.is_empty() {
         app.queue_recovery.settings_visible = false;
         return;
@@ -958,7 +1022,7 @@ pub fn render_prepared_damage(
             " ",
             app.presented_theme().canvas,
         );
-        render_status(app, layout.status, frame, theme);
+        render_status(app, layout.status, frame, theme, chrome.transcript_position);
     }
     if let Some(confirmation) = &app.queue_recovery.confirmation {
         let text = format!(
@@ -5941,7 +6005,13 @@ pub fn pending_label(state: PendingSubmissionState) -> String {
     }
 }
 
-fn render_status(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+fn render_status(
+    app: &BmuxApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    position: TranscriptStatusPosition,
+) {
     if area.is_empty() {
         return;
     }
@@ -5957,7 +6027,7 @@ fn render_status(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: 
         );
         return;
     }
-    let spans = statusline_spans(app, usize::from(area.width), theme);
+    let spans = statusline_spans(app, usize::from(area.width), theme, position);
     frame.write_line(LocalRect::terminal(area), &Line::from_spans(spans));
 }
 
@@ -5997,7 +6067,12 @@ fn queue_status_text(app: &BmuxApp) -> Option<String> {
 
 use bcode_tui_components::chrome::ChromeLine;
 
-fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
+fn statusline_spans(
+    app: &BmuxApp,
+    width: usize,
+    theme: TuiTheme,
+    position: TranscriptStatusPosition,
+) -> Vec<Span> {
     let muted = theme.muted;
     let separator = app.presented_theme().effects.status_separator();
     if let Some(recovery) = app.session_view_snapshot().runtime.queue_recovery() {
@@ -6062,20 +6137,8 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
     if !status_text.is_empty() {
         line = line.optional(status_text, muted, 90, true);
     }
-    if app.scroll_offset() > 0 {
-        line = line.optional(
-            format!("{} rows from bottom", app.scroll_offset()),
-            muted,
-            100,
-            false,
-        );
-    } else if app.bottom_overscroll() > 0 {
-        line = line.optional(
-            format!("{} rows below latest", app.bottom_overscroll()),
-            muted,
-            100,
-            false,
-        );
+    if let Some(label) = position.label() {
+        line = line.optional(label, muted, 100, false);
     }
 
     let key_hints = compact_key_hints(app.key_hints());

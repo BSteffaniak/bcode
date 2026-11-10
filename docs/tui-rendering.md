@@ -366,7 +366,10 @@ window. Bottom-follow clears that local request. Unavailable positions use item 
 
 Positioned shell output supports local horizontal wheel scrolling and right-click focus, then
 Left/Right or Home; Escape releases focus. These events never become invocation input and do
-not resize the PTY. Focused `e` toggles an expanded inline screen window (up to 128 rows);
+not resize the PTY. The V2 transcript routes them from the presented frame's content targets:
+plugin shell screens receive them through the plugin's content events (`shell.terminal.*`
+keys once focused), and canonical shell screens keep a host-local column offset per item,
+eight columns per wheel tick or Left/Right key, clamped to the widest shown line. Focused `e` toggles an expanded inline screen window (up to 128 rows);
 Up/Down and PageUp/PageDown navigate source screen rows. This is an inline expansion, not a
 separate full-screen modal. Normal transcript scrolling exposes the expanded rows.
 

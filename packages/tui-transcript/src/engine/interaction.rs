@@ -197,6 +197,7 @@ impl TranscriptEngine {
     /// effective viewport in the same update.
     pub(super) fn settle_interaction(&mut self, at: Instant) -> EngineUpdate {
         let mut update = EngineUpdate::default();
+        update.invalidated |= self.reconcile_markdown();
         let view = FocusView::new(&self.units, &self.layouts);
         update.invalidated |= self.focus.reconcile(&view);
         if let Some(edge) = self.focus.pending_edge()

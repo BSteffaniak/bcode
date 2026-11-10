@@ -37,6 +37,7 @@
 //! [`SourcePosition::ShellByte`]: crate::layout::SourcePosition::ShellByte
 //! [`SourcePosition::DiffLine`]: crate::layout::SourcePosition::DiffLine
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -67,7 +68,9 @@ use super::group::{
     ActivitySlots, DisclosureRow, ItemStack, marker_header_line, place, placed_width,
     raised_surface, role_style, status_title_role,
 };
-use super::visual::{ContentKeyed, VisualRows};
+use super::visual::{
+    ContentKeyed, ContentTargetKind, UnitTargetRow, VisualCorrespondence, VisualRows,
+};
 use super::{ItemContent, ItemRenderContext, ProducedItem, UnitProducer, UnitView};
 use crate::units::structure::{DisclosureTarget, ResolvedUnitPresentation};
 
@@ -111,6 +114,12 @@ pub struct HeaderData {
     pub timing: Option<String>,
     /// Start of a running call, for the elapsed paint slot.
     pub started_at_ms: Option<u64>,
+    /// Producer title replacing the `label`, `tool`, `status` and `title` fields (plugin
+    /// transcript-block visuals).
+    pub title_override: Option<String>,
+    /// The body draws its own header (plugin full-block visuals): the host header is painted
+    /// only while the unit is not expanded, and the body's first row is the unit's focus target.
+    pub self_drawn: bool,
 }
 
 impl HeaderData {
@@ -182,6 +191,8 @@ pub enum SectionBody {
         rows: Arc<[Line]>,
         /// Producer-namespaced content key (E3).
         key: String,
+        /// Anchors and selection rows of `rows` (E3, C34; empty for named sections).
+        correspondence: Arc<VisualCorrespondence>,
     },
 }
 
@@ -420,7 +431,7 @@ const fn invocation_status(tool: &ToolInvocationView) -> UnitStatus {
 
 /// Static timing phrase: `timed out`, `timeout 10s` while active (or never finished), and
 /// `duration 42ms` once finished. Elapsed time is a paint slot, never laid out (L5).
-fn timing_text(timing: &ToolTimingView, active: bool) -> Option<String> {
+pub(super) fn timing_text(timing: &ToolTimingView, active: bool) -> Option<String> {
     let mut parts = Vec::new();
     if timing.timed_out == Some(true) {
         parts.push("timed out".to_owned());
@@ -587,6 +598,7 @@ fn invocation_anatomy(
             title: None,
             timing: timing_text(&tool.timing, active),
             started_at_ms: tool.timing.started_at_ms.filter(|_| active),
+            ..HeaderData::default()
         },
         summary: None,
         sections,
@@ -757,6 +769,7 @@ fn permission_anatomy(permission: &PermissionView, facts: Option<&UnitFacts>) ->
             title: permission.title.clone(),
             timing: None,
             started_at_ms: None,
+            ..HeaderData::default()
         },
         summary: None,
         sections,
@@ -838,6 +851,7 @@ fn interaction_anatomy(
             title: interaction.title.clone(),
             timing: None,
             started_at_ms: None,
+            ..HeaderData::default()
         },
         summary: None,
         sections,
@@ -993,6 +1007,8 @@ struct Composer<'a> {
     width: u64,
     theme: &'a ResolvedThemeDefinition,
     item: &'a TranscriptViewItemId,
+    /// Columns the unit's shell screen is scrolled by (C39).
+    shell_columns: u64,
 }
 
 impl Composer<'_> {
@@ -1030,6 +1046,8 @@ impl Composer<'_> {
         let meta = self.style("tool.metadata");
         let title = self.style(&status_title_role(header.status, header.is_error));
         let label_style = self.style("tool.label");
+        let title_style = title;
+        let overridden = header.title_override.is_some();
         let timing_visible = presentation.part_visible("timing");
         let fields: Vec<&str> = presentation.header.as_ref().map_or_else(
             || DEFAULT_UNIT_HEADER.to_vec(),
@@ -1053,7 +1071,11 @@ impl Composer<'_> {
                     5,
                 )),
                 "label" => {
-                    if let Some(label) = &header.label {
+                    if let Some(title) = &header.title_override {
+                        segments.push(
+                            HeaderSegment::required(sanitize(title), title_style).truncatable(),
+                        );
+                    } else if let Some(label) = &header.label {
                         segments.push(if header.tool.is_none() {
                             HeaderSegment::required(label.clone(), label_style).truncatable()
                         } else {
@@ -1061,6 +1083,7 @@ impl Composer<'_> {
                         });
                     }
                 }
+                "tool" | "status" | "title" if overridden => {}
                 "tool" => {
                     if let Some(tool) = &header.tool {
                         segments.push(HeaderSegment::required(tool.clone(), title).truncatable());
@@ -1217,7 +1240,11 @@ impl Composer<'_> {
                 self.push(Box::new(VisualRows::new(block)), LABEL_INDENT);
             }
             SectionBody::Diff { text } => self.diff_body(&label, &text, preview),
-            SectionBody::Rows { rows, key } => self.rows_body(&label, &rows, &key, preview),
+            SectionBody::Rows {
+                rows,
+                key,
+                correspondence,
+            } => self.rows_body(&label, &rows, &key, &correspondence, preview),
         }
     }
 
@@ -1236,26 +1263,61 @@ impl Composer<'_> {
         let style = self.style("tool.output");
         let lines = source_lines(text);
         let (ranges, hidden) = preview_ranges(lines.len(), preview);
-        for range in ranges {
-            let base = lines[range.start].0;
-            let source = source_slice(text, &lines[range.clone()]);
-            let rows = lines[range]
+        // A shell screen scrolls horizontally on its own (C39), by at most the columns its
+        // widest shown line overflows the body.
+        let scroll = shell.map(|_| {
+            let body = if self.width > BODY_INDENT {
+                self.width - BODY_INDENT
+            } else {
+                self.width
+            };
+            let widest = ranges
                 .iter()
-                .map(|(_, line)| Line::from_spans(vec![common::span(sanitize(line), style)]))
-                .collect::<Vec<_>>();
-            let block = TextBlock::new(Text::from_lines(rows)).wrap(TextWrap::None);
-            let content: Box<dyn ItemContent> = Box::new(
-                SourceText::new(
-                    block,
-                    TextSource::Shell {
-                        base: u64::try_from(base).unwrap_or(u64::MAX),
-                    },
-                )
-                .with_copy_source(source),
-            );
-            let content = match shell {
-                Some(key) => Box::new(ContentKeyed::new(content, key)),
-                None => content,
+                .flat_map(|range| &lines[range.clone()])
+                .map(|(_, line)| u64::try_from(Line::raw(sanitize(line)).width()).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            let max_columns = widest.saturating_sub(body);
+            (self.shell_columns.min(max_columns), max_columns)
+        });
+        for range in ranges {
+            let content: Box<dyn ItemContent> = match scroll {
+                Some((columns, _)) if columns > 0 => {
+                    let mut stack = ItemStack::new();
+                    for (offset, line) in &lines[range] {
+                        stack.push(scrolled_shell_line(*offset, line, columns, style));
+                    }
+                    Box::new(stack)
+                }
+                _ => {
+                    let base = lines[range.start].0;
+                    let source = source_slice(text, &lines[range.clone()]);
+                    let rows = lines[range]
+                        .iter()
+                        .map(|(_, line)| {
+                            Line::from_spans(vec![common::span(sanitize(line), style)])
+                        })
+                        .collect::<Vec<_>>();
+                    let block = TextBlock::new(Text::from_lines(rows)).wrap(TextWrap::None);
+                    Box::new(
+                        SourceText::new(
+                            block,
+                            TextSource::Shell {
+                                base: u64::try_from(base).unwrap_or(u64::MAX),
+                            },
+                        )
+                        .with_copy_source(source),
+                    )
+                }
+            };
+            let content = match (shell, scroll) {
+                (Some(key), Some((columns, max_columns))) => Box::new(
+                    ContentKeyed::new(content, key).with_target(ContentTargetKind::ShellScreen {
+                        columns,
+                        max_columns,
+                    }),
+                ),
+                _ => content,
             };
             self.push(content, BODY_INDENT);
         }
@@ -1325,14 +1387,124 @@ impl Composer<'_> {
         self.hidden_rows(label, hidden);
     }
 
-    fn rows_body(&mut self, label: &str, rows: &[Line], key: &str, preview: Preview) {
+    fn rows_body(
+        &mut self,
+        label: &str,
+        rows: &[Line],
+        key: &str,
+        correspondence: &Arc<VisualCorrespondence>,
+        preview: Preview,
+    ) {
         let (ranges, hidden) = preview_ranges(rows.len(), preview);
         for range in ranges {
+            let base = range.start;
             let block = TextBlock::new(Text::from_lines(rows[range].to_vec())).wrap(TextWrap::None);
-            self.push(Box::new(VisualRows::new(block).keyed(key)), 0);
+            self.push(
+                Box::new(
+                    VisualRows::new(block)
+                        .keyed(key)
+                        .plugin(Arc::clone(correspondence), base),
+                ),
+                0,
+            );
         }
         self.hidden_rows(label, hidden);
     }
+}
+
+/// One shell output line (starting at output byte `offset`) scrolled by `columns`: the BMUX
+/// cell viewport of the painted line. When the painted viewport is the tail of the line (no
+/// zero-width graphemes were dropped), it stays source-mapped by byte and copies the original
+/// bytes; otherwise it is a rendered row.
+fn scrolled_shell_line(
+    offset: usize,
+    line: &str,
+    columns: u64,
+    style: Style,
+) -> Box<dyn ItemContent> {
+    let painted = sanitize(line);
+    let viewport = Line::from_spans(vec![common::span(painted.clone(), style)])
+        .viewport(usize::try_from(columns).unwrap_or(usize::MAX), usize::MAX);
+    let shown = viewport.plain_text();
+    let skipped = painted.len() - shown.len().min(painted.len());
+    match line.get(skipped..).filter(|_| painted.ends_with(&shown)) {
+        Some(source) => Box::new(
+            SourceText::from_lines(
+                vec![viewport],
+                TextWrap::None,
+                TextSource::Shell {
+                    base: u64::try_from(offset + skipped).unwrap_or(u64::MAX),
+                },
+            )
+            .with_copy_source(source),
+        ),
+        None => Box::new(VisualRows::new(
+            TextBlock::new(Text::from_lines(vec![viewport])).wrap(TextWrap::None),
+        )),
+    }
+}
+
+/// Horizontal frame of one tool unit at a layout width: one definition for [`compose`] and
+/// [`body_width`].
+struct UnitFrame {
+    /// Status container framing the unit.
+    container: TranscriptContainerStyle,
+    /// Width left inside the policy indent.
+    outer: u64,
+    /// Whether the container is plain (unframed).
+    plain: bool,
+    /// Width of the unit's header and section rows: `outer` less the frame insets when the
+    /// container frames the unit.
+    body: u64,
+}
+
+impl UnitFrame {
+    fn of(
+        theme: &ResolvedThemeDefinition,
+        presentation: &ResolvedPresentation,
+        status: Option<UnitStatus>,
+        is_error: bool,
+        width: u64,
+    ) -> Self {
+        let container = tool_container(theme, status, is_error);
+        let outer = placed_width(presentation.indent, width);
+        let insets = common::frame_insets(&container);
+        let plain = matches!(container.recipe.layout, TranscriptContainerLayout::Plain);
+        let framed = !plain && insets.horizontal() < outer;
+        Self {
+            container,
+            outer,
+            plain,
+            body: if framed {
+                outer - insets.horizontal()
+            } else {
+                outer
+            },
+        }
+    }
+}
+
+/// Width in cells of the section rows of `item`'s tool unit laid out at `width`.
+///
+/// It is what the policy indent and, when the status container frames the unit, its frame
+/// insets leave under `structure` and `theme`. [`compose`] lays rows out in exactly this
+/// width, so a plugin visual adapter rendering at it fills the body without being clipped.
+#[must_use]
+pub fn body_width(
+    item: &TranscriptViewItem,
+    structure: &ResolvedUnitPresentation,
+    theme: &ResolvedThemeDefinition,
+    width: u64,
+) -> u64 {
+    let (presentation, facts) = match structure {
+        ResolvedUnitPresentation::Item(structure) => (
+            Cow::Borrowed(&structure.presentation),
+            Some(&structure.facts),
+        ),
+        _ => (Cow::Owned(host_defaults()), None),
+    };
+    let header = tool_anatomy(item, facts).header;
+    UnitFrame::of(theme, &presentation, header.status, header.is_error, width).body
 }
 
 /// Lay out `anatomy` for the unit of `item` under `cx` (structure v2 unit anatomy).
@@ -1353,20 +1525,24 @@ pub fn compose(
         &defaults
     };
     let theme = cx.theme;
-    let container = tool_container(theme, anatomy.header.status, anatomy.header.is_error);
-    let outer = placed_width(presentation.indent, cx.width);
-    let insets = common::frame_insets(&container);
-    let plain = matches!(container.recipe.layout, TranscriptContainerLayout::Plain);
-    let framed = !plain && insets.horizontal() < outer;
+    let UnitFrame {
+        container,
+        outer,
+        plain,
+        body,
+    } = UnitFrame::of(
+        theme,
+        presentation,
+        anatomy.header.status,
+        anatomy.header.is_error,
+        cx.width,
+    );
     let mut composer = Composer {
         stack: ItemStack::new().nested(),
-        width: if framed {
-            outer - insets.horizontal()
-        } else {
-            outer
-        },
+        width: body,
         theme,
         item,
+        shell_columns: cx.shell_columns,
     };
     let disclosure = cx.disclosure.disclosure;
     let target = cx
@@ -1377,6 +1553,14 @@ pub fn compose(
     let collapsible = cx.disclosure.collapsible;
     match disclosure {
         Disclosure::Hidden => composer.hidden_marker(),
+        // A full-block visual draws its own header: its first row is the unit's target.
+        Disclosure::Expanded if anatomy.header.self_drawn => {
+            composer.sections(anatomy.sections, presentation);
+            let stack = std::mem::replace(&mut composer.stack, ItemStack::new().nested());
+            composer
+                .stack
+                .push(Box::new(UnitTargetRow::new(Box::new(stack), target)));
+        }
         Disclosure::Expanded => {
             composer.header(
                 &anatomy.header,

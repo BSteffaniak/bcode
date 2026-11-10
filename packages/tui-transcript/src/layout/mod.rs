@@ -34,4 +34,31 @@ pub enum SourcePosition {
     ShellByte(u64),
     /// Producer-namespaced plugin content key.
     PluginContent(String),
+    /// Position inside a plugin visual's adapter-owned source (E3): a producer-scoped identity
+    /// (`<plugin>:<identity>`, a version 4 source range identity or a version 3 content key)
+    /// and an offset inside it (the range start, or rows below a keyed row). Positions resolve
+    /// only within their own identity, by containment.
+    PluginSource {
+        /// Producer-scoped source identity.
+        identity: String,
+        /// Offset inside the identity.
+        offset: u64,
+    },
+}
+
+impl SourcePosition {
+    /// Whether `self` and `other` index the same source: the same kind and, for plugin
+    /// sources, the same identity.
+    #[must_use]
+    pub fn same_source(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::PluginSource { identity, .. },
+                Self::PluginSource {
+                    identity: other, ..
+                },
+            ) => identity == other,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
 }
