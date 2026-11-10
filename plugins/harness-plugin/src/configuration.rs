@@ -351,7 +351,10 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     if context.plugin_id != crate::PLUGIN_ID || context.request.interface_id != INTERFACE_ID {
         return ServiceResponse::error("invalid_context", "invalid managed configuration context");
     }
-    let request_budget = if context.request.operation == PREPARE_SETUP_OPERATION {
+    let request_budget = if matches!(
+        context.request.operation.as_str(),
+        PREPARE_SETUP_OPERATION | "registrations_resolve" | "registrations_commit"
+    ) {
         MAX_CONFIG_BYTES
     } else {
         MAX_REQUEST_BYTES

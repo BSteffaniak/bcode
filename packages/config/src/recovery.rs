@@ -56,6 +56,7 @@ pub struct ConfigSourceAuthority {
     targets: Vec<PathBuf>,
     roots: Vec<PathBuf>,
     read_only: bool,
+    pool_targets: std::collections::BTreeMap<PathBuf, PathBuf>,
 }
 
 impl ConfigSourceAuthority {
@@ -100,12 +101,37 @@ impl ConfigSourceAuthority {
             targets.push(target);
             roots.push(root);
         }
+        let mut pool_targets = std::collections::BTreeMap::new();
+        let mut remaining = MAX_BYTES;
+        for ((path, required), target) in authority_paths(sources)?.into_iter().zip(&targets) {
+            let logical = if path.is_absolute() {
+                path.clone()
+            } else {
+                sources.cwd.join(path)
+            };
+            let raw = match read_bounded_source(target, &mut remaining) {
+                Ok(raw) => raw,
+                Err(_) if !required && !target.exists() => continue,
+                Err(error) => return Err(error),
+            };
+            let mut layer = toml::from_str(&raw).map_err(|_| ConfigRecoveryError::InvalidSource)?;
+            crate::shared_pools::expand_with_reader(&mut layer, &logical, |pool| {
+                let (target, _) =
+                    pool_target(pool, &sources.cwd, read_only).map_err(pool_source_error)?;
+                let raw =
+                    read_bounded_source(&target, &mut remaining).map_err(pool_source_error)?;
+                pool_targets.insert(pool.to_owned(), target);
+                Ok(raw)
+            })
+            .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+        }
         Ok(Self {
             sources: sources.clone(),
             cwd,
             targets,
             roots,
             read_only,
+            pool_targets,
         })
     }
 
@@ -142,8 +168,12 @@ impl ConfigSourceAuthority {
             }
         }
         if self.read_only {
-            let (replayed, source_presence) =
-                replay_inner(sources, &self.roots, Some(&self.targets))?;
+            let (replayed, source_presence) = replay_inner(
+                sources,
+                &self.roots,
+                Some(&self.targets),
+                Some(&self.pool_targets),
+            )?;
             let execution_digest = execution_fingerprint(config)?;
             if execution_digest != execution_fingerprint(&replayed)? {
                 return Err(ConfigRecoveryError::Changed);
@@ -227,6 +257,48 @@ impl ConfigSourceAuthority {
         }
         Ok(())
     }
+}
+
+// References come from a captured declaring document, not client-supplied paths.
+// Canonicalize the native file-relative reference (including ../) at capture; verification
+// still requires the exact same resolved target before any contents are read.
+fn pool_target(
+    path: &Path,
+    cwd: &Path,
+    read_only: bool,
+) -> Result<(PathBuf, PathBuf), ConfigRecoveryError> {
+    if read_only {
+        let target = path
+            .canonicalize()
+            .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+        authority_target_kind(&target, cwd, true, true)
+    } else {
+        authority_target_kind(path, cwd, true, false)
+    }
+}
+
+fn pool_source_error(_: ConfigRecoveryError) -> crate::ConfigError {
+    crate::ConfigError::Composition {
+        message: "Shared pool source is unavailable or changed".into(),
+    }
+}
+
+fn read_bounded_source(path: &Path, remaining: &mut u64) -> Result<String, ConfigRecoveryError> {
+    let file = File::open(path).map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    if !metadata.is_file() || metadata.len() > *remaining {
+        return Err(ConfigRecoveryError::SourceBounds);
+    }
+    let mut raw = String::new();
+    file.take(*remaining + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    *remaining = remaining
+        .checked_sub(u64::try_from(raw.len()).map_err(|_| ConfigRecoveryError::SourceBounds)?)
+        .ok_or(ConfigRecoveryError::SourceBounds)?;
+    Ok(raw)
 }
 
 fn authority_paths(
@@ -510,13 +582,14 @@ fn replay(
     sources: &ConfigRecoverySources,
     allowed_roots: &[PathBuf],
 ) -> Result<(BcodeConfig, Vec<bool>), ConfigRecoveryError> {
-    replay_inner(sources, allowed_roots, None)
+    replay_inner(sources, allowed_roots, None, None)
 }
 
 fn replay_inner(
     sources: &ConfigRecoverySources,
     allowed_roots: &[PathBuf],
     exact_targets: Option<&[PathBuf]>,
+    pool_targets: Option<&std::collections::BTreeMap<PathBuf, PathBuf>>,
 ) -> Result<(BcodeConfig, Vec<bool>), ConfigRecoveryError> {
     if sources.inline_overrides || !sources.cwd.is_absolute() {
         return Err(ConfigRecoveryError::Unavailable);
@@ -595,7 +668,8 @@ fn replay_inner(
         remaining = remaining
             .checked_sub(length)
             .ok_or(ConfigRecoveryError::SourceBounds)?;
-        let layer = toml::from_str(&raw).map_err(|_| ConfigRecoveryError::InvalidSource)?;
+        let logical = authority_paths(sources)?[index].0;
+        let layer = replay_layer(&raw, logical, sources, &roots, pool_targets, &mut remaining)?;
         crate::merge_toml_value(&mut merged, layer);
         presence.push(true);
     }
@@ -603,6 +677,36 @@ fn replay_inner(
     // non-file input that changed the effective configuration still fails the fingerprint.
     let config = resolve_replayed_config(merged, sources)?;
     Ok((config, presence))
+}
+
+fn replay_layer(
+    raw: &str,
+    logical: &Path,
+    sources: &ConfigRecoverySources,
+    roots: &[PathBuf],
+    pool_targets: Option<&std::collections::BTreeMap<PathBuf, PathBuf>>,
+    remaining: &mut u64,
+) -> Result<toml::Value, ConfigRecoveryError> {
+    let mut layer = toml::from_str(raw).map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    let logical = if logical.is_absolute() {
+        logical.to_owned()
+    } else {
+        sources.cwd.join(logical)
+    };
+    crate::shared_pools::expand_with_reader(&mut layer, &logical, |pool| {
+        let target = if let Some(pinned) = pool_targets {
+            let (target, _) = pool_target(pool, &sources.cwd, true).map_err(pool_source_error)?;
+            if pinned.get(pool) != Some(&target) {
+                return Err(pool_source_error(ConfigRecoveryError::Changed));
+            }
+            target
+        } else {
+            confined(pool, &sources.cwd, roots).map_err(pool_source_error)?
+        };
+        read_bounded_source(&target, remaining).map_err(pool_source_error)
+    })
+    .map_err(|_| ConfigRecoveryError::InvalidSource)?;
+    Ok(layer)
 }
 
 fn resolve_replayed_config(
@@ -827,6 +931,82 @@ mod tests {
             discovered_paths: names.iter().map(|name| directory.join(name)).collect(),
             ..Default::default()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_pool_replay_pins_logical_reference_and_nix_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        let config = dir.path().join("providers/sol.toml");
+        let pool = dir.path().join("pools.toml");
+        let target = store.path().join("preset.toml");
+        let pool_target = store.path().join("pool.toml");
+        std::fs::write(&target, "auth_pool_config='../pools.toml'\n").unwrap();
+        std::fs::write(
+            &pool_target,
+            "schema_version=1\n[auth.pools.accounts]\nprofiles=['one']\n",
+        )
+        .unwrap();
+        symlink(&target, &config).unwrap();
+        symlink(&pool_target, &pool).unwrap();
+        let source = sources(dir.path(), &["providers/sol.toml"]);
+        let effective = crate::load_config_from_paths_with_overrides_and_environment(
+            &source.discovered_paths,
+            &ConfigLoadOverrides::default(),
+            &crate::ConfigEnvironmentSnapshot::new(
+                std::collections::BTreeMap::new(),
+                dir.path().to_owned(),
+            ),
+        )
+        .unwrap();
+        let authority = ConfigSourceAuthority::capture_read_only(&source).unwrap();
+        assert!(authority.verify(&effective, &source).is_ok());
+        std::fs::write(
+            &pool_target,
+            "schema_version=1\n[auth.pools.accounts]\nprofiles=['two']\n",
+        )
+        .unwrap();
+        assert!(authority.verify(&effective, &source).is_err());
+        std::fs::remove_file(&pool).unwrap();
+        let replacement = store.path().join("replacement.toml");
+        std::fs::write(
+            &replacement,
+            "schema_version=1\n[auth.pools.accounts]\nprofiles=['one']\n",
+        )
+        .unwrap();
+        symlink(&replacement, &pool).unwrap();
+        assert!(authority.verify(&effective, &source).is_err());
+        // Durable maintenance replay does not gain the read-only Nix target authority.
+        assert!(replay(&source, &[dir.path().to_owned()]).is_err());
+    }
+
+    #[test]
+    fn shared_pool_recovery_is_bounded_and_preserves_composition() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sol.toml"),
+            "auth_pool_config='pools.toml'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pools.toml"),
+            "schema_version=1\n[auth.pools.accounts]\nprofiles=['one']\n",
+        )
+        .unwrap();
+        let source = sources(dir.path(), &["sol.toml"]);
+        let effective = replay(&source, &[dir.path().to_owned()]).unwrap().0;
+        assert_eq!(effective.auth.pools["accounts"].profiles, vec!["one"]);
+        let authority = ConfigSourceAuthority::capture_read_only(&source).unwrap();
+        assert!(authority.verify(&effective, &source).is_ok());
+        std::fs::write(
+            dir.path().join("pools.toml"),
+            "x".repeat(usize::try_from(MAX_BYTES).unwrap() + 1),
+        )
+        .unwrap();
+        assert!(authority.verify(&effective, &source).is_err());
     }
 
     #[cfg(unix)]

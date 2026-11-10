@@ -8,7 +8,7 @@ BCODE_TEST_NATIVE_LOGIN=1 exercises signed-out native terminal login.
 import os, pathlib, tempfile, subprocess, sys, json, pty, fcntl, termios, struct, select, time, signal, hashlib
 repo=pathlib.Path(__file__).resolve().parents[1]
 binary=pathlib.Path(sys.argv[1]).resolve() if len(sys.argv)>1 else repo/'target/debug/bcode'
-root=pathlib.Path(tempfile.mkdtemp(prefix='bcode-picker-smoke-'))
+root=pathlib.Path(tempfile.mkdtemp(prefix='bcode-picker-smoke-')).resolve()
 native=root/'native';native.mkdir();(native/'scenario').write_text('multi_turn');(native/'application-idle-seconds').write_text('120')
 exe=root/'claude';source=(repo/'packages/bcode/tests/fixtures/harness/claude_native.py').read_text();source=source.replace('session = next(arg.split("=", 1)[1] for arg in sys.argv\n                   if arg.startswith(("--session-id=", "--resume=")))','session = next((arg.split("=", 1)[1] for arg in sys.argv if arg.startswith(("--session-id=", "--resume="))), str(uuid.uuid4()))');exe.write_text('#!'+sys.executable+'\n'+source.split('\n',1)[1]);exe.chmod(0o700)
 login_test=os.environ.get('BCODE_TEST_NATIVE_LOGIN')=='1'
@@ -23,6 +23,12 @@ model_id = "fake-echo"
 [model.prompt_cache]
 mode = "off"
 ''')
+# Mirror file-backed provider presets: relative shared policy beside logical symlinks.
+pool_target=root/'immutable-pools.toml'
+pool_target.write_text('schema_version=1\n[auth.pools]\n')
+pool_target.chmod(0o444)
+(root/'pools.toml').symlink_to(pool_target)
+config.write_text("auth_pool_config='pools.toml'\n"+config.read_text())
 env={k:v for k,v in os.environ.items() if not k.startswith(('BCODE_','ANTHROPIC_','OPENAI_'))}
 env.update(PATH=str(root)+':/usr/bin:/bin',HOME=str(root/'home'),CLAUDE_CONFIG_DIR=str(native),BCODE_NO_SESSION_RESURRECTION='1',BCODE_CONFIG=str(config),XDG_CONFIG_HOME=str(root/'config'),BCODE_NO_ONBOARD='1',TERM='xterm-256color')
 real_config=root/'immutable.toml';config.rename(real_config);real_config.chmod(0o444);config.symlink_to(real_config);original_config=real_config.read_bytes()

@@ -551,3 +551,25 @@ fn unknown_fields_versions_and_oversized_requests_are_rejected() {
         "unsupported_operation"
     );
 }
+
+#[test]
+fn registration_resolution_accepts_configuration_payload_not_small_control_budget() {
+    let payload = json!({"adapter_configurations": {"example.native": {"preserved": "x".repeat(MAX_REQUEST_BYTES + 1)}}});
+    let ctx = context(json!({}), "registrations_resolve", &payload);
+    let response = crate::HarnessPlugin.invoke_service(ctx);
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let resolved: bcode_harness_models::RegistrationResolution =
+        serde_json::from_slice(&response.payload).unwrap();
+    assert_eq!(
+        resolved.configurations["example.native"],
+        payload["adapter_configurations"]["example.native"]
+    );
+    let mut oversized = context(json!({}), "registrations_resolve", &json!({}));
+    oversized.request.payload = vec![b' '; MAX_CONFIG_BYTES + 1];
+    assert!(
+        crate::HarnessPlugin
+            .invoke_service(oversized)
+            .error
+            .is_some()
+    );
+}

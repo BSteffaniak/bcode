@@ -13,6 +13,15 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 
 /// Expand a pool reference relative to its declaring file, before layer composition.
 pub(crate) fn expand(raw: &mut toml::Value, source: &Path) -> Result<(), ConfigError> {
+    expand_with_reader(raw, source, read)
+}
+
+/// Expand using a caller-owned, bounded source reader (for verified recovery).
+pub(crate) fn expand_with_reader(
+    raw: &mut toml::Value,
+    source: &Path,
+    mut read: impl FnMut(&Path) -> Result<String, ConfigError>,
+) -> Result<(), ConfigError> {
     let Some(reference) = raw
         .as_table_mut()
         .and_then(|table| table.remove("auth_pool_config"))
