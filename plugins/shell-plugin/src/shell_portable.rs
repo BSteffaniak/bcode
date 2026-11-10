@@ -1,13 +1,11 @@
 //! Producer-owned semantic command/output presentation; no terminal emulator or host execution.
-use bcode_tui_components::transcript::{
-    tool_visual::{
-        CanonicalPluginVisual,
-        portable::{
-            PortableVisualAdapter, PortableVisualContext, PortableVisualDescriptor,
-            PortableVisualOutput, PortableVisualRegistration,
-        },
+use bcode_tui_components::plugin_visual::{
+    CanonicalPluginVisual,
+    output::VisualRows,
+    portable::{
+        PortableVisualAdapter, PortableVisualContext, PortableVisualDescriptor,
+        PortableVisualOutput, PortableVisualRegistration,
     },
-    transcript_layout::TranscriptLayoutRows,
 };
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use std::collections::BTreeSet;
@@ -230,14 +228,11 @@ pub fn native_projection(
         },
         &CommandContext::from_native(context),
     )?;
-    let TranscriptLayoutRows::Selected {
+    let VisualRows {
         rows,
         anchors,
         selection,
-    } = output.rows
-    else {
-        return None;
-    };
+    } = output.rows;
     Some(bcode_plugin_sdk::tui::PluginTuiVisualProjection {
         rows,
         anchors,
@@ -339,7 +334,7 @@ impl ShellVisual {
         append_status(&mut projection, payload, visual, context, cx, command);
         Some(
             PortableVisualOutput {
-                rows: TranscriptLayoutRows::Selected {
+                rows: VisualRows {
                     rows: projection.rows,
                     anchors: projection.anchors,
                     selection: projection.selection.into_iter().collect(),
@@ -530,27 +525,14 @@ mod tests {
             "version":1, "command":snapshot.command, "text":snapshot.output, "bytes":snapshot.output_bytes, "truncated":false
         }}}]});
         let final_output = ShellVisual.render(&live, &context).unwrap();
-        let TranscriptLayoutRows::Selected {
-            selection: live_sources,
-            ..
-        } = &prepared.rows
-        else {
-            panic!("source-backed live output required");
-        };
-        let TranscriptLayoutRows::Selected {
-            selection: final_sources,
-            ..
-        } = &final_output.rows
-        else {
-            panic!("source-backed final output required");
-        };
+        let live_sources = &prepared.rows.selection;
+        let final_sources = &final_output.rows.selection;
+        assert!(
+            !live_sources.is_empty(),
+            "source-backed live output required"
+        );
         assert_eq!(live_sources, final_sources);
-        let TranscriptLayoutRows::Selected {
-            rows: live_rows, ..
-        } = &prepared.rows
-        else {
-            unreachable!();
-        };
+        let live_rows = &prepared.rows.rows;
         assert!(
             live_rows
                 .iter()
@@ -570,7 +552,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 final_output.rows,
-                TranscriptLayoutRows::Selected {
+                VisualRows {
                     rows: native.rows,
                     anchors: native.anchors,
                     selection: native.selection.into_iter().collect()
@@ -608,9 +590,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let TranscriptLayoutRows::Selected { selection, .. } = output.rows else {
-                panic!("source-backed draft required");
-            };
+            let selection = output.rows.selection;
             assert_eq!(
                 selection
                     .values()
@@ -667,12 +647,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let TranscriptLayoutRows::Selected {
+        let VisualRows {
             rows, selection, ..
-        } = output.rows
-        else {
-            panic!("source projection required");
-        };
+        } = output.rows;
         let command = selection
             .values()
             .filter(|r| r.identity == "shell-command:original")

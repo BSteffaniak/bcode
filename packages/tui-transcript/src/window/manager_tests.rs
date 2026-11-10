@@ -550,6 +550,102 @@ fn w11_live_state_read_short_of_the_tail_stays_detached_and_keeps_paging() {
 }
 
 #[test]
+fn w11_live_discontinuity_during_the_last_newer_page_rehydrates_instead_of_going_live() {
+    let mut history = History::new(300);
+    let (mut window, mut session) = attach_around(&history, 201, 290);
+    let issued = window
+        .request_page(PageDirection::Newer)
+        .expect("newer page");
+    // 301 arrives live and is buffered; the host's feed then skips 302 (a gap) and delivers 303.
+    let buffered = history.push();
+    let _ = window.apply_live(LiveInput::Durable(Box::new(buffered)), &mut session);
+    let _skipped = history.push();
+    assert!(window.interrupt_live_buffer());
+    let after_gap = history.push();
+    let _ = window.apply_live(LiveInput::Durable(Box::new(after_gap)), &mut session);
+    let mut page = history.page(issued.generation, PageDirection::Newer, 289, 300);
+    page.has_more = false;
+    let incorporated = window.apply_page(&page, &mut session).expect("page");
+    // Going live here would append 303 directly after 300 and lose 301 and 302 for good.
+    assert!(!incorporated.mode_changed);
+    assert_eq!(window.summary().mode, WindowMode::Detached);
+    let follow_up = incorporated.follow_up.expect("live-state request");
+    assert_eq!(follow_up.request, WindowRequest::LiveState);
+    let live_state = HistoryWindowResult {
+        generation: follow_up.generation,
+        target: WindowRequest::LiveState,
+        events: history.range(301, history.last()),
+        has_older: false,
+        has_newer: false,
+        first_available_sequence: None,
+        last_available_sequence: None,
+    };
+    window
+        .apply_window(&live_state, &mut session)
+        .expect("live state");
+    assert_eq!(window.summary().mode, WindowMode::Live);
+    let sequences = item_sequences(&session);
+    assert_eq!(&sequences[sequences.len() - 3..], [301, 302, 303]);
+}
+
+#[test]
+fn w11_live_discontinuity_during_a_live_state_read_keeps_the_window_detached() {
+    let mut history = History::new(300);
+    let (mut window, mut session) = attach_around(&history, 201, 290);
+    let issued = window
+        .request_page(PageDirection::Newer)
+        .expect("newer page");
+    for _ in 0..=LIVE_BUFFER_EVENTS {
+        let event = history.push();
+        let _ = window.apply_live(LiveInput::Durable(Box::new(event)), &mut session);
+    }
+    let mut page = history.page(issued.generation, PageDirection::Newer, 289, 300);
+    page.has_more = false;
+    let follow_up = window
+        .apply_page(&page, &mut session)
+        .expect("page")
+        .follow_up
+        .expect("live-state request");
+    // The read was served before the host's feed skipped inputs.
+    let read_last = history.last();
+    let _skipped = history.push();
+    assert!(window.interrupt_live_buffer());
+    let after_gap = history.push();
+    let _ = window.apply_live(LiveInput::Durable(Box::new(after_gap)), &mut session);
+    let live_state = HistoryWindowResult {
+        generation: follow_up.generation,
+        target: WindowRequest::LiveState,
+        events: history.range(301, read_last),
+        has_older: false,
+        has_newer: false,
+        first_available_sequence: None,
+        last_available_sequence: None,
+    };
+    let applied = window
+        .apply_window(&live_state, &mut session)
+        .expect("live state");
+    assert!(!applied.mode_changed);
+    assert_eq!(window.summary().mode, WindowMode::Detached);
+    assert_eq!(window.summary().last_sequence, Some(read_last));
+    let next = window
+        .request_page(PageDirection::Newer)
+        .expect("newer paging continues past the gap");
+    assert_eq!(
+        next.request,
+        PageRequest::Newer {
+            after_sequence: read_last
+        }
+    );
+}
+
+#[test]
+fn live_discontinuity_without_an_in_flight_rehydration_is_a_no_op() {
+    let history = History::new(300);
+    let (mut window, _session) = attach_around(&history, 201, 290);
+    assert!(!window.interrupt_live_buffer());
+}
+
+#[test]
 fn w11_newer_page_with_more_history_discards_the_buffer() {
     let mut history = History::new(400);
     let (mut window, mut session) = attach_around(&history, 101, 200);

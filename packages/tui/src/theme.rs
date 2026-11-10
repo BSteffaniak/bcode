@@ -467,6 +467,19 @@ pub fn resolve_configured_theme(
     config: &bcode_config::TuiConfig,
     project_root: &std::path::Path,
 ) -> PresentedTheme {
+    resolve_configured_theme_with_definition(config, project_root).0
+}
+
+/// Resolve a configured theme together with the declarative definition it was presented from.
+///
+/// The definition is `None` when no configured or fallback theme resolves;
+/// the presented theme then uses the same built-in defaults as
+/// [`resolve_configured_theme`].
+#[must_use]
+pub fn resolve_configured_theme_with_definition(
+    config: &bcode_config::TuiConfig,
+    project_root: &std::path::Path,
+) -> (PresentedTheme, Option<definition::ResolvedThemeDefinition>) {
     let resolved = resolve_definition(
         &config.theme.name,
         &config.theme.effective_overlays(),
@@ -475,7 +488,8 @@ pub fn resolve_configured_theme(
         &config.theme.paths,
     );
     let accent = resolved_accent(resolved.as_ref());
-    resolved_definition_theme(resolved.as_ref(), accent).presented(accent)
+    let presented = resolved_definition_theme(resolved.as_ref(), accent).presented(accent);
+    (presented, resolved)
 }
 
 /// Resolve the target theme from app state.

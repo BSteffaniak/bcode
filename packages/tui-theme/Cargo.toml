@@ -12,14 +12,15 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_presentation_policy_models = { workspace = true }
-bmux_color                       = { workspace = true }
-bmux_tui                         = { workspace = true }
+bmux_color                       = { workspace = true, features = ["serde"] }
+bmux_tui                         = { workspace = true, features = ["serde"] }
 serde                            = { workspace = true, features = ["derive", "std"] }
 thiserror                        = { workspace = true }
 toml                             = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+tempfile   = { workspace = true }
 
 [features]
 default = []

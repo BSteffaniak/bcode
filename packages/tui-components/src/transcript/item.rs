@@ -1015,26 +1015,7 @@ fn terminal_tool_request_item_from_shared(tool: &ToolInvocationView) -> Transcri
 pub fn tool_presentation_contribution(
     tool: &ToolInvocationView,
 ) -> Option<bcode_session_models::ToolContributionEvent> {
-    let presentation = tool.presentation.as_ref()?;
-    Some(bcode_session_models::ToolContributionEvent {
-        invocation_id: tool.tool_call_id.clone(),
-        contribution_id: "primary".to_owned(),
-        sequence: presentation.revision,
-        producer_id: presentation.producer_id.clone(),
-        schema: presentation.schema.clone(),
-        schema_version: presentation.schema_version,
-        operation: bcode_session_models::ToolContributionOperation::Upsert,
-        persistence: match presentation.retention {
-            bcode_tool::ToolPresentationRetention::RetainLatest => {
-                bcode_session_models::ToolContributionPersistence::Durable
-            }
-            bcode_tool::ToolPresentationRetention::ActiveOnly => {
-                bcode_session_models::ToolContributionPersistence::Transient
-            }
-        },
-        artifact: presentation.artifact.clone(),
-        payload: presentation.payload.clone(),
-    })
+    crate::plugin_visual::canonical::presentation_contribution(tool)
 }
 
 fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {

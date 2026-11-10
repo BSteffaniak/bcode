@@ -6,7 +6,9 @@
 //!   producer: anchor keys, source identities and selection identities become
 //!   `<plugin>:<identity>`, the identity [`PluginTuiPresentation::content_event_with_host`] and
 //!   [`PluginTuiPresentation::retain_content_position`] split again. Invalid selection rows
-//!   are dropped.
+//!   are dropped. Selection rows make plugin cells copy their adapter source (C36). Native
+//!   routed visuals carry no images or action regions, so those parts of the accepted visual
+//!   stay empty (statically linked portable adapters supply them in browser hosts).
 //! * Adapters render with the effective frontend keymap ([`VisualKeymapHost`]), so their key
 //!   hints match the keys that reach them.
 //! * Pointer targets ([`TranscriptV2Host::committed_visual_targets`]): the plugin visual rows
@@ -203,6 +205,10 @@ pub fn accepted_visual(routed: RoutedTuiVisual, revision: u64) -> AcceptedPlugin
             .collect(),
         correspondence: Arc::new(correspondence),
         rows: Arc::from(rows),
+        // Native adapters return neither images nor action regions (the routed contract has
+        // none); copy-from-source comes from the selection rows above.
+        images: Arc::default(),
+        actions: Arc::default(),
     }
 }
 

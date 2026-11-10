@@ -89,8 +89,7 @@ presentation = [
     "dep:bmux_tui_components",
     "dep:shuck-parser",
     "dep:shuck-ast",
-    "bcode_tui_components/transcript-engine",
-    "bcode_tui_components/transcript-markdown",
+    "bcode_tui_components/plugin-visual",
 ]
 static-bundled = [
     "native",

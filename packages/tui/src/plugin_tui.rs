@@ -918,7 +918,7 @@ impl PluginTuiPresentation {
     #[must_use]
     pub fn portable_visual_policy(
         &self,
-    ) -> bcode_tui_components::transcript::tool_visual::portable::PortableVisualPolicy {
+    ) -> bcode_tui_components::plugin_visual::portable::PortableVisualPolicy {
         let enabled_plugins = match &self.backend {
             PresentationPluginBackend::Synchronous(host) => host
                 .loaded_plugins()
@@ -929,7 +929,7 @@ impl PluginTuiPresentation {
                 runtime.registry().manifests().keys().cloned().collect()
             }
         };
-        bcode_tui_components::transcript::tool_visual::portable::PortableVisualPolicy {
+        bcode_tui_components::plugin_visual::portable::PortableVisualPolicy {
             enabled_plugins,
             preferred: self.visual_adapter_config.preferred.clone(),
             disabled: self.visual_adapter_config.disabled.clone(),

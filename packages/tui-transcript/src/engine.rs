@@ -502,6 +502,15 @@ impl TranscriptEngine {
         self.content(changes, at)
     }
 
+    /// The host's live input lost continuity (its feed skipped inputs) while the window is
+    /// detached: a `Newer` page or `LiveState` read in flight rehydrates live state instead
+    /// of going live with the inputs buffered since its request (W2, W11). A live window is
+    /// resynchronized by the host with [`Self::attach`] (W10). Returns whether an in-flight
+    /// request was affected.
+    pub fn interrupt_live_buffer(&mut self) -> bool {
+        self.window.interrupt_live_buffer()
+    }
+
     /// Incorporate a page result in one update (W3, N8, N11).
     ///
     /// # Errors
@@ -944,8 +953,34 @@ impl TranscriptEngine {
                     invalidated: focused,
                 }
             }
+            // Resolved and executed by the host (`Self::visual_action`).
+            ItemAction::Visual { .. } => EngineUpdate::default(),
         };
         (update, Some(hit))
+    }
+
+    /// The plugin visual action a hit names (E2), resolved against the visual accepted now:
+    /// `None` for any other hit, or when the unit's accepted visual has another adapter or
+    /// revision (the region was measured from a replaced visual) or no region with that id.
+    #[must_use]
+    pub fn visual_action(
+        &self,
+        hit: &ItemHit,
+    ) -> Option<&bcode_tui_components::plugin_visual::action::VisualAction> {
+        let (
+            UnitKey::Item(item),
+            ItemAction::Visual {
+                adapter,
+                revision,
+                id,
+            },
+        ) = (&hit.unit, &hit.action)
+        else {
+            return None;
+        };
+        self.render
+            .plugin_visuals
+            .resolve_action(item, adapter, *revision, id)
     }
 
     /// Record a presented frame (CK3). Navigation is unchanged.
@@ -1337,6 +1372,8 @@ mod submission;
 mod local_tests;
 #[cfg(test)]
 mod markdown_tests;
+#[cfg(test)]
+mod plugin_visual_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

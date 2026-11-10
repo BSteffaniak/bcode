@@ -114,3 +114,65 @@ fn native_browser_policy_roundtrip_defaults_and_configured_bindings() {
         "unrelated inherited chat ArrowRight must survive override/unbind"
     );
 }
+
+fn assert_theme_roundtrip(label: &str, config: &bcode_config::TuiConfig) -> Value {
+    let encoded = bcode_tui::browser_presentation::export(config, Path::new("."))
+        .expect("native resolved policy must export");
+    let (_, native) =
+        bcode_tui::theme::resolve_configured_theme_with_definition(config, Path::new("."));
+    let native = native.expect("configured theme resolves natively");
+    let parsed = BrowserPolicy::parse(&encoded).expect("real browser parser accepts native policy");
+    let browser = parsed
+        .theme
+        .as_ref()
+        .expect("browser policy carries the resolved theme");
+    assert_eq!(browser, &native, "{label}: resolved theme must survive");
+    for (role, style) in &native.styles {
+        assert_eq!(
+            browser.style(role),
+            Some(*style),
+            "{label}: style role {role}"
+        );
+    }
+    for (role, recipe) in &native.containers {
+        assert_eq!(
+            browser.containers.get(role),
+            Some(recipe),
+            "{label}: container role {role}"
+        );
+    }
+    assert_eq!(browser.chrome, native.chrome, "{label}: chrome");
+    assert_eq!(browser.presentation, native.presentation, "{label}: rules");
+    assert_eq!(
+        browser.fingerprint, native.fingerprint,
+        "{label}: fingerprint"
+    );
+    let policy: Value = serde_json::from_str(&encoded).expect("native policy JSON");
+    assert!(
+        policy["styles"]
+            .as_object()
+            .is_some_and(|styles| !styles.is_empty()),
+        "{label}: flat styles remain exported"
+    );
+    eprintln!(
+        "NATIVE_BROWSER_THEME_ROUNDTRIP {label} roles={} bytes={}",
+        native.styles.len(),
+        encoded.len()
+    );
+    policy
+}
+
+#[test]
+fn native_browser_policy_roundtrips_the_resolved_theme_definition() {
+    let defaults = bcode_config::TuiConfig::default();
+    let default_policy = assert_theme_roundtrip("defaults", &defaults);
+    let mut configured = defaults;
+    configured.theme.name = "nord".into();
+    configured.theme.overlays = vec!["structured".into()];
+    configured.theme.variant = bcode_config::TuiThemeVariant::Light;
+    let configured_policy = assert_theme_roundtrip("nord-structured-light", &configured);
+    assert_ne!(
+        default_policy["revision"], configured_policy["revision"],
+        "a different resolved theme changes the policy revision"
+    );
+}

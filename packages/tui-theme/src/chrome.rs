@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 
 use bmux_tui::style::Color;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Border glyph family.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BorderStyle {
     /// No border.
@@ -33,7 +33,7 @@ pub enum BorderStyle {
 }
 
 /// Focus effect for focused borders.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FocusEffect {
     /// Focus uses the focused border style only.
@@ -46,7 +46,7 @@ pub enum FocusEffect {
 }
 
 /// Icon set.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IconSet {
     /// No icons; text labels only.
@@ -59,7 +59,7 @@ pub enum IconSet {
 }
 
 /// Spacing density.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Density {
     /// No padding; for small terminals.
@@ -72,7 +72,7 @@ pub enum Density {
 }
 
 /// Separator glyph style between status segments.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeparatorStyle {
     /// Middle dot / spaces.
@@ -87,7 +87,7 @@ pub enum SeparatorStyle {
 }
 
 /// Speaker-label treatment in the transcript.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeakerStyle {
     /// Plain text prefix.
@@ -102,7 +102,7 @@ pub enum SpeakerStyle {
 }
 
 /// Surface layering.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SurfaceStyle {
     /// Raised and overlay surfaces share the canvas.
@@ -113,7 +113,9 @@ pub enum SurfaceStyle {
 }
 
 /// Motion level for animated chrome.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Motion {
     /// No animation.
@@ -126,7 +128,7 @@ pub enum Motion {
 }
 
 /// Border style per surface; `None` keeps each component's own default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TuiBorders {
     /// Panels and panes.
     pub panel: Option<BorderStyle>,
@@ -139,7 +141,7 @@ pub struct TuiBorders {
 }
 
 /// Resolved terminal chrome.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct TuiChrome {
     /// Border style per surface.
     pub borders: TuiBorders,

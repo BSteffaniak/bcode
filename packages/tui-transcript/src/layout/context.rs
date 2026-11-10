@@ -184,9 +184,11 @@ impl Default for DiffViewerOptions {
     }
 }
 
-/// One accepted plugin visual (L8, D9): what a plugin adapter produced outside drawing,
-/// accepted for an exact item revision. Acceptance is an item revision; the revision covers
-/// every field.
+/// One accepted plugin visual (L8, D9): what a plugin adapter produced outside drawing.
+///
+/// It is accepted for an exact item revision. Acceptance is an item revision; the revision
+/// covers every field (rows, correspondence, images and actions), so it alone enters the
+/// fingerprint (L3). Hosts bound every field before accepting it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AcceptedPluginVisual {
     /// Adapter identity.
@@ -213,6 +215,13 @@ pub struct AcceptedPluginVisual {
     pub sections: Arc<[crate::layout::producers::visual::VisualSection]>,
     /// Anchors and selection rows of `rows` (E3, C34).
     pub correspondence: Arc<crate::layout::producers::visual::VisualCorrespondence>,
+    /// Images of `rows` in adapter coordinates (`y` is the adapter row; L8), validated by the
+    /// host. Painted from the retained rows that show them, clipped to their cells.
+    pub images: Arc<[bmux_tui::image::ImagePlacement]>,
+    /// Action regions of `rows` in adapter coordinates (E2), validated by the host. Their hits
+    /// are [`crate::layout::geometry::ItemAction::Visual`], resolved by
+    /// [`PluginVisualState::resolve_action`].
+    pub actions: Arc<[bcode_tui_components::plugin_visual::action::VisualActionRegion]>,
 }
 
 impl AcceptedPluginVisual {
@@ -262,6 +271,28 @@ impl PluginVisualState {
     /// Keep only visuals of items `keep` accepts (residency reconciliation).
     pub fn retain(&mut self, keep: impl Fn(&TranscriptViewItemId) -> bool) {
         self.accepted.retain(|id, _| keep(id));
+    }
+
+    /// The action `id` of `item`'s accepted visual, only while that visual is still the one
+    /// from `adapter` accepted at `revision` (E2): a hit measured from a replaced visual
+    /// resolves to nothing.
+    #[must_use]
+    pub fn resolve_action(
+        &self,
+        item: &TranscriptViewItemId,
+        adapter: &str,
+        revision: u64,
+        id: &str,
+    ) -> Option<&bcode_tui_components::plugin_visual::action::VisualAction> {
+        let visual = self.accepted.get(item)?;
+        if visual.adapter != adapter || visual.revision != revision {
+            return None;
+        }
+        visual
+            .actions
+            .iter()
+            .find(|region| region.id == id)
+            .map(|region| &region.action)
     }
 
     /// Fingerprint contribution of a unit: the accepted adapter and revision, if any.

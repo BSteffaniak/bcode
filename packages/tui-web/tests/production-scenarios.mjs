@@ -267,7 +267,7 @@ export async function runProductionScenarios({configuration, wasm, mountInteract
       }, 'canonical turn finished');
       await checkpoint('terminal');
       if (scenario.kind === 'permission-approve' || scenario.kind === 'batch-approve') {
-        const producerAction = regions.find(region => !region.disabled && region.id.startsWith('transcript-action:'));
+        const producerAction = regions.find(region => !region.disabled && region.id.startsWith('bcode-web/transcript-item:') && region.label === 'Producer action');
         assert(producerAction, `filesystem producer supplied no committed local action: ${JSON.stringify(regions)}`);
         const before = await checkpoint('producer-before');
         const sequence = observed.snapshot.latest_sequence;
@@ -278,7 +278,7 @@ export async function runProductionScenarios({configuration, wasm, mountInteract
       }
       if (scenario.kind === 'rich') {
         const canonicalSequence = observed.snapshot.latest_sequence;
-        const disclosure = regions.find(region => !region.disabled && region.id.startsWith('markdown:')
+        const disclosure = regions.find(region => !region.disabled && region.id.startsWith('bcode-web/transcript-item:') && region.label === 'Activate transcript content'
           && (region.text?.includes('Expand detail') || region.label?.includes('Expand detail') || region.description?.includes('details')));
         assert(disclosure, 'rich disclosure missing committed action region');
         const closed = await checkpoint('disclosure-before');
@@ -286,11 +286,9 @@ export async function runProductionScenarios({configuration, wasm, mountInteract
         const opened = await checkpoint('disclosure-after');
         assert(closed.pixel_sha256 !== opened.pixel_sha256, 'local disclosure did not change committed pixels');
         assert((await snapshot()).latest_sequence === canonicalSequence, 'local disclosure mutated canonical session');
-        const copy = regions.find(region => !region.disabled && region.id.startsWith('transcript-copy:'));
-        assert(copy, `rich code-block copy has no committed hit: ${JSON.stringify(regions)}`);
-        await checkpoint('copy', {id:copy.id});
-        await wait(() => copied.some(text => text.includes('let browser = true;')), 'real code-block clipboard action');
-        const link = regions.find(region => !region.disabled && region.id.startsWith('markdown:') && region.id !== disclosure.id);
+        // Code copy is the logical source of a transcript selection (V2, C34); the Rust
+        // surface tests drive that gesture. Producer copy actions are covered above.
+        const link = regions.find(region => !region.disabled && region.id.startsWith('bcode-web/transcript-item:') && region.label === 'Activate transcript content' && region.id !== disclosure.id);
         assert(link, 'rich link has no committed hit');
         await checkpoint('link', {id:link.id});
         await wait(() => navigated.includes('https://example.invalid/browser-acceptance'), 'real link navigation capability');

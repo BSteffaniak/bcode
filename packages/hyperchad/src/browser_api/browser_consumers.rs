@@ -1,15 +1,91 @@
 //! Application-owned browser consumers. No renderer sender or canonical history cache.
-use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+//!
+//! A consumer's attachment also feeds its session's bounded live input ring
+//! ([`super::live::LiveFeed`]); the ring is never a canonical history cache.
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bcode_client::{BcodeClient, ClientError};
 use bcode_session_models::SessionId;
 use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
+use super::live::LiveFeed;
+
 const LEASE: Duration = Duration::from_secs(60);
+/// Concurrent live long-polls of one session (one per mounted tab of it).
+const MAX_SESSION_LIVE_WAITERS: usize = 4;
+/// Concurrent live long-polls across all sessions.
+const MAX_LIVE_WAITERS: usize = MAX_SESSION_LIVE_WAITERS * super::MAX_CACHED_SESSIONS;
+/// Concurrent bounded history reads of one session (the browser's per-mount read limit).
+const MAX_SESSION_HISTORY_READS: usize = 2;
+/// Concurrent bounded history reads across all sessions.
+const MAX_HISTORY_READS: usize = super::MAX_CACHED_SESSIONS;
+
+/// Work admitted concurrently per session and across sessions, without a queue: one session's
+/// tabs cannot take every slot from the others.
+struct Slots {
+    per_session: usize,
+    total: usize,
+    used: Mutex<BTreeMap<SessionId, usize>>,
+}
+
+impl Slots {
+    const fn new(per_session: usize, total: usize) -> Self {
+        Self {
+            per_session,
+            total,
+            used: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn try_acquire(&self, session: SessionId) -> Option<Slot<'_>> {
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = used.values().sum::<usize>();
+        let mine = used.get(&session).copied().unwrap_or_default();
+        if total >= self.total || mine >= self.per_session {
+            return None;
+        }
+        used.insert(session, mine + 1);
+        drop(used);
+        Some(Slot {
+            slots: self,
+            session,
+        })
+    }
+}
+
+/// One admitted unit of work; released when dropped.
+pub(super) struct Slot<'a> {
+    slots: &'a Slots,
+    session: SessionId,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        let mut used = self
+            .slots
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = used.get_mut(&self.session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                used.remove(&self.session);
+            }
+        }
+    }
+}
 
 struct Consumer {
     deadline: watch::Sender<Instant>,
     ready: watch::Receiver<bool>,
+    feed: Arc<LiveFeed>,
     task: JoinHandle<()>,
 }
 
@@ -22,27 +98,56 @@ impl Drop for Consumer {
 }
 
 /// Bounded application attachment owners, independent of renderer publication.
-#[derive(Default)]
 pub struct BrowserConsumers {
     entries: Mutex<BTreeMap<SessionId, Consumer>>,
+    live_waiters: Slots,
+    history_reads: Slots,
+}
+
+impl Default for BrowserConsumers {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            live_waiters: Slots::new(MAX_SESSION_LIVE_WAITERS, MAX_LIVE_WAITERS),
+            history_reads: Slots::new(MAX_SESSION_HISTORY_READS, MAX_HISTORY_READS),
+        }
+    }
 }
 
 impl BrowserConsumers {
     /// Renew one session lease and wait for its compatible attachment.
     ///
+    /// Returns the live input feed of the attachment.
+    ///
     /// # Errors
     /// Returns an error on capacity exhaustion or if the owner ends before attachment.
     /// Callers apply their existing bounded backend request deadline.
-    pub async fn renew(&self, client: &BcodeClient, session: SessionId) -> Result<(), ClientError> {
-        let mut ready = self.admit(client, session, Instant::now(), LEASE)?;
+    pub async fn renew(
+        &self,
+        client: &BcodeClient,
+        session: SessionId,
+    ) -> Result<Arc<LiveFeed>, ClientError> {
+        let (mut ready, feed) = self.admit(client, session, Instant::now(), LEASE)?;
         loop {
             if *ready.borrow_and_update() {
-                return Ok(());
+                return Ok(feed);
             }
             ready.changed().await.map_err(|_| {
                 ClientError::Protocol("browser consumer attachment ended".to_owned())
             })?;
         }
+    }
+
+    /// One live long-poll slot for `session`, or `None` while the session's or all slots are
+    /// in use.
+    pub(super) fn admit_live_waiter(&self, session: SessionId) -> Option<Slot<'_>> {
+        self.live_waiters.try_acquire(session)
+    }
+
+    /// One bounded history read slot for `session`, or `None` while the session's or all
+    /// slots are in use.
+    pub(super) fn admit_history_read(&self, session: SessionId) -> Option<Slot<'_>> {
+        self.history_reads.try_acquire(session)
     }
 
     fn admit(
@@ -51,7 +156,7 @@ impl BrowserConsumers {
         session: SessionId,
         now: Instant,
         lease: Duration,
-    ) -> Result<watch::Receiver<bool>, ClientError> {
+    ) -> Result<(watch::Receiver<bool>, Arc<LiveFeed>), ClientError> {
         let mut entries = self
             .entries
             .lock()
@@ -61,7 +166,7 @@ impl BrowserConsumers {
         });
         if let Some(consumer) = entries.get_mut(&session) {
             consumer.deadline.send_replace(now + lease);
-            return Ok(consumer.ready.clone());
+            return Ok((consumer.ready.clone(), Arc::clone(&consumer.feed)));
         }
         if entries.len() >= super::MAX_CACHED_SESSIONS {
             return Err(ClientError::Protocol(
@@ -70,12 +175,16 @@ impl BrowserConsumers {
         }
         let (deadline, expiry) = watch::channel(now + lease);
         let (status, ready) = watch::channel(false);
+        let feed = Arc::new(LiveFeed::default());
         let client = client.clone();
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                () = lease_ended(expiry) => {},
-                () = drain(client, session, status) => {},
+        let task = tokio::spawn({
+            let feed = Arc::clone(&feed);
+            async move {
+                tokio::select! {
+                    biased;
+                    () = lease_ended(expiry) => {},
+                    () = drain(client, session, status, feed) => {},
+                }
             }
         });
         entries.insert(
@@ -83,11 +192,12 @@ impl BrowserConsumers {
             Consumer {
                 deadline,
                 ready: ready.clone(),
+                feed: Arc::clone(&feed),
                 task,
             },
         );
         drop(entries);
-        Ok(ready)
+        Ok((ready, feed))
     }
 }
 
@@ -102,7 +212,12 @@ async fn lease_ended(mut expiry: watch::Receiver<Instant>) {
     }
 }
 
-async fn drain(client: BcodeClient, session: SessionId, status: watch::Sender<bool>) {
+async fn drain(
+    client: BcodeClient,
+    session: SessionId,
+    status: watch::Sender<bool>,
+    feed: Arc<LiveFeed>,
+) {
     loop {
         status.send_replace(false);
         if let Ok(mut connection) = client.connect("bcode-browser-consumer").await
@@ -114,10 +229,14 @@ async fn drain(client: BcodeClient, session: SessionId, status: watch::Sender<bo
             .await
         {
             // Attachment is complete before readiness. History is immediately
-            // discarded; polling remains the sole observation publisher.
+            // discarded; polling remains the sole snapshot publisher. Each attachment
+            // starts a new live feed epoch: inputs missed while detached are a gap.
             drop(initial);
+            feed.reset();
             status.send_replace(true);
-            while connection.recv_event_without_reconnect().await.is_ok() {}
+            while let Ok(event) = connection.recv_event_without_reconnect().await {
+                feed.observe(session, &event);
+            }
         }
         status.send_replace(false);
         tokio::time::sleep(crate::WATCH_RECONNECT_DELAY).await;
@@ -134,20 +253,70 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn feed_reads_and_waits_are_admitted_within_fixed_limits() {
+        let pool = BrowserConsumers::default();
+        let sessions = (0..super::super::MAX_CACHED_SESSIONS)
+            .map(|_| SessionId::new())
+            .collect::<Vec<_>>();
+        let waiters: Vec<_> = sessions
+            .iter()
+            .flat_map(|session| {
+                (0..MAX_SESSION_LIVE_WAITERS).map(|_| pool.admit_live_waiter(*session).unwrap())
+            })
+            .collect();
+        assert_eq!(waiters.len(), MAX_LIVE_WAITERS);
+        assert!(pool.admit_live_waiter(SessionId::new()).is_none());
+        let reads: Vec<_> = sessions
+            .iter()
+            .map(|session| pool.admit_history_read(*session).unwrap())
+            .collect();
+        assert_eq!(reads.len(), MAX_HISTORY_READS);
+        assert!(pool.admit_history_read(sessions[0]).is_none());
+        drop((waiters, reads));
+        assert!(
+            pool.admit_live_waiter(sessions[0]).is_some()
+                && pool.admit_history_read(sessions[0]).is_some()
+        );
+    }
+
+    #[test]
+    fn one_session_cannot_take_every_feed_slot_from_another() {
+        let pool = BrowserConsumers::default();
+        let (busy, other) = (SessionId::new(), SessionId::new());
+        // One session's tabs attach at once: reads and polls beyond its share are refused.
+        let reads: Vec<_> = (0..MAX_SESSION_HISTORY_READS)
+            .map(|_| pool.admit_history_read(busy).unwrap())
+            .collect();
+        assert!(pool.admit_history_read(busy).is_none());
+        let waiters: Vec<_> = (0..MAX_SESSION_LIVE_WAITERS)
+            .map(|_| pool.admit_live_waiter(busy).unwrap())
+            .collect();
+        assert!(pool.admit_live_waiter(busy).is_none());
+        // Another session still loads and polls.
+        let other_reads: Vec<_> = (0..MAX_SESSION_HISTORY_READS)
+            .map(|_| pool.admit_history_read(other).unwrap())
+            .collect();
+        assert!(pool.admit_live_waiter(other).is_some());
+        drop((reads, waiters, other_reads));
+        assert!(pool.admit_history_read(busy).is_some());
+    }
+
     #[tokio::test]
     async fn bounded_admission_reuses_active_leases_without_eviction() {
         let pool = BrowserConsumers::default();
         let client = client();
         let now = Instant::now();
         let session = SessionId::new();
-        let first = pool.admit(&client, session, now, LEASE).unwrap();
-        let second = pool.admit(&client, session, now, LEASE).unwrap();
+        let (first, first_feed) = pool.admit(&client, session, now, LEASE).unwrap();
+        let (second, second_feed) = pool.admit(&client, session, now, LEASE).unwrap();
         assert!(first.same_channel(&second));
+        assert!(Arc::ptr_eq(&first_feed, &second_feed), "one feed per lease");
         for _ in 1..super::super::MAX_CACHED_SESSIONS {
             pool.admit(&client, SessionId::new(), now, LEASE).unwrap();
         }
         assert!(pool.admit(&client, SessionId::new(), now, LEASE).is_err());
-        assert!(first.same_channel(&pool.admit(&client, session, now, LEASE).unwrap()));
+        assert!(first.same_channel(&pool.admit(&client, session, now, LEASE).unwrap().0));
     }
 
     #[tokio::test]
@@ -156,9 +325,14 @@ mod tests {
         let client = client();
         let now = Instant::now();
         let session = SessionId::new();
-        let mut first = pool.admit(&client, session, now, LEASE).unwrap();
-        let replacement = pool.admit(&client, session, now + LEASE, LEASE).unwrap();
+        let (mut first, first_feed) = pool.admit(&client, session, now, LEASE).unwrap();
+        let (replacement, replacement_feed) =
+            pool.admit(&client, session, now + LEASE, LEASE).unwrap();
         assert!(!first.same_channel(&replacement));
+        assert!(
+            !Arc::ptr_eq(&first_feed, &replacement_feed),
+            "a new lease starts a new feed"
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             while first.changed().await.is_ok() {}
         })
@@ -360,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn failed_attachment_waiter_closes_at_lease_expiry() {
         let pool = BrowserConsumers::default();
-        let mut ready = pool
+        let (mut ready, _feed) = pool
             .admit(
                 &client(),
                 SessionId::new(),

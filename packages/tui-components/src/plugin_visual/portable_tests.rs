@@ -1,4 +1,5 @@
 use super::*;
+use crate::plugin_visual::output::VisualRows;
 use bmux_tui::prelude::Line;
 
 struct Adapter(&'static str, bool);
@@ -10,7 +11,7 @@ impl PortableVisualAdapter for Adapter {
     ) -> Option<PortableVisualOutput> {
         Some(PortableVisualOutput {
             rows: if self.1 {
-                TranscriptLayoutRows::BlankSpan(8193)
+                VisualRows::rendered(vec![Line::raw(""); 8193])
             } else {
                 vec![Line::from(self.0)].into()
             },
@@ -251,4 +252,51 @@ fn zero_width_and_oversized_semantics_do_not_render() {
     let mut input = visual();
     input.payload = serde_json::json!({"text":"x".repeat(256 * 1024 + 1)});
     assert!(registry.prepare(&input, &context()).is_none());
+}
+
+#[test]
+fn out_of_bounds_actions_and_images_reject_the_output() {
+    struct Outside(u8);
+    impl PortableVisualAdapter for Outside {
+        fn render(
+            &self,
+            _: &CanonicalPluginVisual,
+            context: &PortableVisualContext<'_>,
+        ) -> Option<PortableVisualOutput> {
+            let area = bmux_tui::geometry::Rect::new(context.width - 1, 0, 2, 1);
+            let mut output = PortableVisualOutput {
+                rows: vec![Line::from("row")].into(),
+                ..PortableVisualOutput::default()
+            };
+            match self.0 {
+                0 => output
+                    .actions
+                    .push(crate::plugin_visual::action::VisualActionRegion {
+                        id: "copy".into(),
+                        area,
+                        action: VisualAction::Copy("row".into()),
+                    }),
+                _ => output.images.push(bmux_tui::image::ImagePlacement {
+                    key: "image".into(),
+                    payload: bmux_tui::image::ImagePayload::Png {
+                        bytes: vec![1],
+                        width: 1,
+                        height: 1,
+                    },
+                    destination: area,
+                    fit: bmux_tui::image::ImageFit::Contain,
+                    allocation: None,
+                    clip: area,
+                    lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                }),
+            }
+            Some(output)
+        }
+    }
+    for kind in 0..2 {
+        let mut registration = registration("b", 0, true, false);
+        registration.adapter = Box::new(Outside(kind));
+        let registry = PortableVisualRegistry::new(1, policy(), vec![registration]).unwrap();
+        assert!(registry.prepare(&visual(), &context()).is_none());
+    }
 }

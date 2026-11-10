@@ -1,46 +1,79 @@
-//! BMUX rendering/input using retained shared native Markdown components.
+//! BMUX rendering and input of one browser session over the V2 transcript engine.
+//!
+//! * Prepare (outside paint): local rows, the inline interaction reservation, accepted plugin
+//!   visuals and the render configuration ([`crate::transcript::BrowserTranscript`]).
+//! * Paint: one layout of the session chrome (lifecycle summary, transcript region, pinned
+//!   question, composer), the engine frame prepared for the transcript region at the frame
+//!   clock, the latest bar, the selection highlight and the question surface (inline over its
+//!   reserved rows or pinned above the composer).
+//! * Input resolves only against the last committed scene: hit regions registered from the
+//!   committed frame, endpoints of its selection scene, and the engine's committed frame for
+//!   item hits (CK4). Any preparation revokes transcript activation until the next commit.
 use bcode_tui_components::permission::{
     decision::{PermissionDialogOutcome, PermissionDialogResolution, PermissionDialogState},
     permission_modal,
 };
-use bmux_tui::composition::TextBlock;
-use bmux_tui::composition::{Column, Flex, Row, SizeBox};
-use bmux_tui_components::button::{ButtonComponent, ButtonState};
-use bmux_tui_components::modal_frame::{ModalFrameComponent, ModalTheme};
-use std::cell::{Cell, RefCell};
-
-use crate::transcript::{Transcript, TranscriptComponent};
+use bcode_tui_components::plugin_visual::action::VisualAction;
 use bcode_tui_components::{
     composer::ComposerStyle,
-    session_ui::{
-        self, SessionComposerStyle, SessionUi, SessionUiAction, SessionUiEffect, SessionUiIds,
-    },
-    transcript_history::TranscriptHistory,
+    session_ui::{self, SessionComposerStyle, SessionUiIds},
+};
+use bcode_tui_transcript::engine::ItemHit;
+use bcode_tui_transcript::frame::FrameClock;
+use bcode_tui_transcript::layout::geometry::ItemAction;
+use bcode_tui_transcript::markdown::MarkdownActivation;
+use bcode_tui_transcript::navigation::{InputSource, NavIntent, Placement};
+use bcode_tui_transcript::selection::{
+    SELECTION_SCOPE, TranscriptSelection, TranscriptSelectionEndpoint,
+};
+use bcode_tui_transcript::units::UnitKey;
+use bcode_tui_transcript::units::structure::InlineInteraction;
+use bmux_tui::composition::TextBlock;
+use bmux_tui::composition::{Column, Flex, SizeBox};
+use bmux_tui::hit::{HitRegion, HitRole};
+use bmux_tui::paint::LocalRect;
+use bmux_tui::selection::{
+    SelectionAffinity, SelectionGranularity, SelectionScene, SelectionScopeId,
 };
 use bmux_tui::{
     component::{Component, Constraints, LayoutCx, LayoutId},
     damage::Damage,
-    event::{Event, MouseEventKind},
+    event::{Event, MouseButton, MouseEvent, MouseEventKind},
     geometry::{Point, Rect, Size},
     paint::PaintCx,
     presentation::PresentationLimits,
     style::Style,
 };
+use bmux_tui_components::button::{ButtonComponent, ButtonState};
+use bmux_tui_components::modal_frame::{ModalFrameComponent, ModalTheme};
 use bmux_tui_components::text_input::{TextInputControl, TextInputState};
 use bmux_web_renderer::{LocalSurface, input::BrowserInput};
+use std::cell::{Cell, RefCell};
+use web_time::Instant;
 
 use crate::SnapshotState;
+use crate::transcript::BrowserTranscript;
 
-const OLDER: &str = "bcode-web/history-older";
-const NEWER: &str = "bcode-web/history-newer";
+/// Hit id of the latest bar.
 const LATEST: &str = "bcode-web/latest";
+/// Hit id prefix of transcript item regions (`<prefix><index>` into the frame's regions).
+const ITEM_HIT_PREFIX: &str = "bcode-web/transcript-item:";
 const EDITOR: &str = "bcode-web/editor";
+const TRANSCRIPT_REGION: &str = "bcode-web/transcript";
+/// Status notice of a degraded transcript (a history read that cannot load in the browser).
+const HISTORY_UNAVAILABLE: &str =
+    "Transcript history unavailable here: an event exceeds the browser transfer limit";
+const QUESTION_PINNED: &str = "bcode-web/question-pinned";
 const IDS: SessionUiIds<'static> = SessionUiIds {
     root: "bcode-web/root",
     composer: "bcode-web/composer",
     editor: EDITOR,
     composer_size: "bcode-web/composer-size",
 };
+/// Rows one wheel tick scrolls.
+const WHEEL_ROWS: i64 = 3;
+/// Most visual artifact candidates one discovery pass considers.
+const MAX_VISUAL_CANDIDATES: usize = 64;
 
 /// Concrete local surface. This is not a portable application contract.
 pub struct SessionSurface {
@@ -48,13 +81,14 @@ pub struct SessionSurface {
     pub(crate) inner: SurfaceState,
 }
 
+/// Identity a producer artifact page was requested for.
 struct PendingVisualArtifact {
     item_id: String,
+    item_revision: u64,
     reference_key: String,
     offset: u64,
     length: u32,
     observation: u64,
-    preparation: bcode_tui_components::transcript::accepted::VisualPreparation,
     width: u16,
     claim: Option<String>,
 }
@@ -90,17 +124,32 @@ struct VisualArtifactRange {
     finalized: bool,
 }
 
+/// Terminal rectangles of one prepared frame.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Regions {
+    /// The transcript viewport the engine paints.
+    viewport: Option<Rect>,
+    /// The latest bar, while shown.
+    latest_bar: Option<Rect>,
+}
+
+/// A transcript selection gesture in progress: its locked scope and logical anchor.
+struct SelectionDrag {
+    scope: SelectionScopeId,
+    anchor: TranscriptSelectionEndpoint,
+}
+
 pub struct SurfaceState {
     pub(crate) semantic: SnapshotState,
-    ui: SessionUi,
+    composer: TextInputState,
     area: Rect,
-    transcript: Transcript,
-    selection: bmux_tui::selection::SelectionController,
-    height: u16,
-    anchor: Option<(String, usize)>,
+    pub(crate) transcript: BrowserTranscript,
+    regions: Regions,
+    committed_regions: Regions,
+    drag: Option<SelectionDrag>,
     focused: bool,
     focused_hit: Option<String>,
-    navigation_buttons: [Cell<ButtonState>; 3],
+    latest_button: Cell<ButtonState>,
     bindings: crate::bindings::Bindings,
     copy_requested: bool,
     intents: Vec<serde_json::Value>,
@@ -112,7 +161,9 @@ pub struct SurfaceState {
     visual_lease: Option<VisualFetchLease>,
     next_visual_claim: u64,
     visual_cursor: usize,
-    visual_discovery_revision: Option<u64>,
+    visual_discovery: Option<(Option<u64>, u64)>,
+    /// Bumped by every transcript content change (visual discovery fence).
+    content_generation: u64,
     permission_inflight: bool,
     committed_permission: Option<bcode_session_view_models::PermissionView>,
     committed_turn: Option<String>,
@@ -131,6 +182,9 @@ impl SessionSurface {
     /// Rejects invalid session identifiers and excessively large cell grids.
     pub fn new(session: String, width: u16, height: u16) -> Result<Self, &'static str> {
         let area = checked_area(width, height)?;
+        let session_id = session
+            .parse::<bcode_tui_transcript::window::SessionId>()
+            .map_err(|_| "invalid session identity")?;
         Ok(Self {
             local: LocalSurface::new(
                 area,
@@ -142,15 +196,15 @@ impl SessionSurface {
             ),
             inner: SurfaceState {
                 semantic: SnapshotState::new(session)?,
-                ui: SessionUi::new(),
+                composer: TextInputState::new(bmux_text_edit::TextEditBuffer::new()),
                 area,
-                transcript: Transcript::new(),
-                selection: bmux_tui::selection::SelectionController::new(),
-                height: 0,
-                anchor: None,
+                transcript: BrowserTranscript::new(session_id),
+                regions: Regions::default(),
+                committed_regions: Regions::default(),
+                drag: None,
                 focused: true,
                 focused_hit: None,
-                navigation_buttons: std::array::from_fn(|_| Cell::new(ButtonState::new())),
+                latest_button: Cell::new(ButtonState::new()),
                 bindings: crate::bindings::Bindings::new(),
                 copy_requested: false,
                 intents: Vec::new(),
@@ -162,7 +216,8 @@ impl SessionSurface {
                 visual_lease: None,
                 next_visual_claim: 0,
                 visual_cursor: 0,
-                visual_discovery_revision: None,
+                visual_discovery: None,
+                content_generation: 0,
                 permission_inflight: false,
                 committed_permission: None,
                 committed_turn: None,
@@ -176,7 +231,9 @@ impl SessionSurface {
         })
     }
 
-    /// Replace the accepted semantic observation without flattening plugin snapshots.
+    /// Replace the accepted non-transcript observation (the snapshot variant without
+    /// transcript items: permissions, interactions, queue, runtime and lifecycle) and install
+    /// a changed effective presentation policy.
     ///
     /// # Errors
     /// See [`SnapshotState::accept`].
@@ -184,13 +241,26 @@ impl SessionSurface {
         if json.len() > crate::MAX_RESPONSE_BYTES {
             return Err("response too large");
         }
-        let policy = serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|value| value.get("policy").cloned())
+        let value = serde_json::from_str::<serde_json::Value>(json).ok();
+        let policy = value
+            .as_ref()
+            .and_then(|value| value.get("policy"))
             .map(|value| crate::policy::BrowserPolicy::parse(&value.to_string()))
             .transpose()?;
-        if policy.is_none() && self.inner.bindings.effective.policy.is_some() {
-            return Err("effective presentation policy missing");
+        if policy.is_none() {
+            // The backend omits a policy whose revision this surface named
+            // ([`Self::policy_revision`]); anything else must carry the complete policy.
+            let named = value
+                .as_ref()
+                .and_then(|value| value.get("policy_revision"))
+                .and_then(serde_json::Value::as_str);
+            let installed = self.inner.bindings.effective.policy.as_ref();
+            let unchanged = named.is_some_and(|named| {
+                installed.is_some_and(|installed| installed.revision == named)
+            });
+            if !unchanged && (named.is_some() || installed.is_some()) {
+                return Err("effective presentation policy missing");
+            }
         }
         let changed = self.inner.semantic.accept(json)?;
         let policy_changed = policy.as_ref().is_some_and(|policy| {
@@ -202,13 +272,7 @@ impl SessionSurface {
                 .is_none_or(|previous| previous.revision != policy.revision)
         });
         if let Some(policy) = policy.filter(|_| policy_changed) {
-            self.inner
-                .transcript
-                .accepted
-                .set_presentation(policy.transcript_presentation());
-            self.inner
-                .transcript
-                .configure_visuals(&policy.visual_policy)?;
+            self.inner.transcript.set_policy(&policy, Instant::now())?;
             self.inner.bindings.effective.replace(policy);
             self.cancel_pointer();
         }
@@ -251,40 +315,112 @@ impl SessionSurface {
         Ok(changed)
     }
 
-    /// Accept a converging bounded history window and preserve a stable source
-    /// anchor where it overlaps. Disjoint backward/forward windows land at their
-    /// adjacent edge; tail explicitly returns to following.
+    /// Revision of the installed presentation policy, named in snapshot requests so the
+    /// backend omits an unchanged policy; `None` before one is installed.
+    #[must_use]
+    pub fn policy_revision(&self) -> Option<&str> {
+        self.inner
+            .bindings
+            .effective
+            .policy
+            .as_ref()
+            .map(|policy| policy.revision.as_str())
+    }
+
+    /// Body of the next live poll ([`crate::feed::LIVE_ROUTE`]).
     ///
     /// # Errors
-    /// Rejects invalid, stale or non-progressing history observations.
-    pub fn accept_history(&mut self, json: &str, direction: &str) -> Result<bool, &'static str> {
-        self.inner.semantic.validate_history(json, direction)?;
-        let changed = self.accept_snapshot(json)?;
-        if direction == "tail" {
-            self.inner.anchor = None;
-            self.inner
-                .ui
-                .update(SessionUiAction::FollowTail, &mut WindowHistory::default());
-        } else {
-            let top = self
-                .inner
-                .anchor
-                .as_ref()
-                .and_then(|anchor| self.inner.transcript.resolve_anchor(anchor))
-                .unwrap_or_else(|| {
-                    if direction == "older" {
-                        self.inner
-                            .transcript
-                            .rows
-                            .saturating_sub(usize::from(self.inner.height))
-                    } else {
-                        0
-                    }
-                });
-            self.inner.anchor = self.inner.transcript.anchor(top);
-            self.inner.ui.viewport.restore_anchor(top);
-        }
+    /// Returns an error if the request cannot be serialized.
+    pub fn live_request(&self) -> Result<String, &'static str> {
+        self.inner.transcript.live_request()
+    }
+
+    /// Accept one live batch (original response bytes). The first batch attaches the engine.
+    /// Returns whether the transcript changed.
+    ///
+    /// # Errors
+    /// Rejects error envelopes, unknown wire versions, oversized and malformed responses.
+    pub fn accept_live(&mut self, json: &str) -> Result<bool, &'static str> {
+        let changed = self
+            .inner
+            .transcript
+            .accept_live(json.as_bytes(), Instant::now())?;
+        self.transcript_changed(changed);
         Ok(changed)
+    }
+
+    /// Claim the next bounded history read the engine's requests need, as
+    /// `{"claim","route","body"}`; JS transports the opaque body only.
+    ///
+    /// # Errors
+    /// Returns an error if a request cannot be serialized.
+    pub fn next_host_request(&mut self) -> Result<Option<String>, &'static str> {
+        let Some(read) = self.inner.transcript.next_history_read(Instant::now())? else {
+            return Ok(None);
+        };
+        serde_json::to_string(&serde_json::json!({
+            "claim": read.claim.to_string(),
+            "route": crate::feed::HISTORY_PAGE_ROUTE,
+            "body": read.body,
+        }))
+        .map(Some)
+        .map_err(|_| "invalid history claim")
+    }
+
+    /// Answer history read `claim` with the original response bytes (typed error envelopes
+    /// included); true requests a redraw.
+    ///
+    /// # Errors
+    /// Rejects claims that are not in flight.
+    pub fn accept_history_page(&mut self, claim: &str, json: &str) -> Result<bool, &'static str> {
+        let claim = claim.parse::<u64>().map_err(|_| "stale history claim")?;
+        let changed = self.inner.transcript.accept_history_page(
+            claim,
+            Some(json.as_bytes()),
+            Instant::now(),
+        )?;
+        self.transcript_changed(changed);
+        Ok(changed)
+    }
+
+    /// Release history read `claim` after a transport failure; the engine request is
+    /// re-issued with backoff while it is still awaited.
+    pub fn fail_history_page(&mut self, claim: &str) {
+        if let Ok(claim) = claim.parse::<u64>() {
+            let _ = self
+                .inner
+                .transcript
+                .accept_history_page(claim, None, Instant::now());
+        }
+    }
+
+    /// Milliseconds until the transcript needs [`Self::advance`] and a redraw (engine timers,
+    /// paced live text, history retries, visuals beyond one sync's bound); `None` when idle.
+    #[must_use]
+    pub fn next_deadline_ms(&self) -> Option<f64> {
+        let now = Instant::now();
+        if self.inner.transcript.visuals_pending() {
+            return Some(0.0);
+        }
+        self.inner
+            .transcript
+            .next_deadline(now)
+            .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64() * 1000.0)
+    }
+
+    /// Fire due transcript timers. Returns whether a redraw is needed.
+    pub fn advance(&mut self) -> bool {
+        let changed = self.inner.transcript.advance(Instant::now());
+        let changed = changed || self.inner.transcript.visuals_pending();
+        self.transcript_changed(changed);
+        changed
+    }
+
+    fn transcript_changed(&mut self, changed: bool) {
+        if changed {
+            self.inner.content_generation = self.inner.content_generation.wrapping_add(1);
+            self.prepare();
+        }
     }
 
     /// Explicitly reopen the refreshed permission presentation after an ambiguous
@@ -308,7 +444,7 @@ impl SessionSurface {
         self.inner.bindings.effective.cancel_chord();
         self.cancel_pointer();
         if area.is_empty() {
-            self.inner.selection.clear();
+            self.inner.clear_selection();
             self.inner.focused_hit = None;
         }
         self.inner.area = area;
@@ -320,24 +456,21 @@ impl SessionSurface {
     /// Cancel pointer capture (including blur/disposal).
     pub fn cancel_pointer(&mut self) {
         self.local.cancel_pointer();
-        self.inner.selection.set_obscured(
-            true,
-            bmux_tui::selection::SelectionObscurationPolicy::PreserveCompleted,
-        );
-        self.inner.selection.set_obscured(
+        self.inner.drag = None;
+        // A gesture cancelled mid-drag keeps what it selected but stops extending it.
+        let selection = self.inner.transcript.engine().selection().cloned();
+        let update = self.inner.transcript.engine_mut().set_selection(
+            selection.filter(|selection| !selection.is_collapsed()),
             false,
-            bmux_tui::selection::SelectionObscurationPolicy::PreserveCompleted,
         );
+        self.inner.transcript.absorb(update);
         // Reset editor gesture state while retaining real text and source selection.
-        let state = &mut self.inner.ui.composer;
+        let state = &mut self.inner.composer;
         let area = state.content_area();
         let position = Point::new(area.x, area.y);
         TextInputControl::new(&session_ui::composer_policy()).handle_mouse(
             state,
-            bmux_tui::event::MouseEvent::new(
-                MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                position,
-            ),
+            MouseEvent::new(MouseEventKind::Up(MouseButton::Left), position),
         );
     }
 
@@ -359,6 +492,7 @@ impl SessionSurface {
             .normalize(64 * 1024, |x, y| map_point(area, x, y))
             .map_err(|_| "invalid browser input")?;
         let mut submit = false;
+        let mut transcript = false;
         for route in self.local.route_input(input) {
             self.inner.bindings.effective.begin_event();
             if let Event::Focus(focus) = route.event {
@@ -376,115 +510,64 @@ impl SessionSurface {
             if let Some(focus) = &route.focus_changed {
                 self.inner.focused_hit = Some(focus.as_str().to_owned());
             }
-            if self.inner.route_question(&route) {
-                continue;
-            }
-            if route.traversal_consumed {
+            if self.inner.route_question(&route) || route.traversal_consumed {
                 continue;
             }
             if self.inner.permission.is_some() {
                 self.inner.route_permission(&route);
                 continue;
             }
-            let mut history = WindowHistory::from_snapshot(self.inner.semantic.snapshot());
-            if self.inner.route_navigation(&route, &mut history) {
-                continue;
-            }
-            if self.route_transcript_action(&route) {
-                continue;
-            }
             if route.is_activation()
-                && self.inner.committed_generation == Some(self.inner.presentation_generation)
-                && self.inner.committed_revision == self.inner.semantic.revision()
-                && let Some(action) = route.target.as_ref().and_then(|target| {
-                    self.inner
-                        .transcript
-                        .accepted
-                        .activate_local(target.as_str())
-                })
+                && let Some(target) = route
+                    .target
+                    .as_ref()
+                    .map(|target| target.as_str().to_owned())
+                && (target == LATEST || target.starts_with(ITEM_HIT_PREFIX))
             {
-                use bcode_tui_components::transcript::accepted::TranscriptLocalAction;
-                match action {
-                    TranscriptLocalAction::Reprepare => self.prepare(),
-                    TranscriptLocalAction::ScrollTo { row, .. } => {
-                        self.inner.ui.viewport.restore_anchor(row);
-                        self.inner.anchor = self.inner.transcript.anchor(row);
-                    }
-                    TranscriptLocalAction::External(action) => self.inner.transcript_action(action),
-                }
+                self.inner.drag = None;
+                transcript |= self.inner.activate(&target);
                 continue;
             }
-            let action = match route.event {
-                Event::Key(key) => self.inner.route_key(key, &route, &history, &mut submit),
-                Event::Paste(text) => Some(SessionUiAction::Paste(text)),
+            match route.event {
+                Event::Key(key) => {
+                    transcript |= self.inner.route_key(key, &route, &mut submit);
+                }
+                Event::Paste(text) => {
+                    TextInputControl::new(&session_ui::composer_policy())
+                        .handle_paste(&mut self.inner.composer, &text);
+                }
                 Event::Mouse(mouse)
                     if matches!(
                         mouse.kind,
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     ) =>
                 {
-                    Some(if mouse.kind == MouseEventKind::ScrollUp {
-                        SessionUiAction::ScrollUp(3)
+                    let rows = if mouse.kind == MouseEventKind::ScrollUp {
+                        -WHEEL_ROWS
                     } else {
-                        SessionUiAction::ScrollDown(3)
-                    })
+                        WHEEL_ROWS
+                    };
+                    transcript |= self.inner.navigate(NavIntent::ScrollBy {
+                        rows,
+                        source: InputSource::Wheel,
+                    });
                 }
                 Event::Mouse(mouse) if route.targets(&bmux_tui::hit::HitId::new(EDITOR)) => {
                     TextInputControl::new(&session_ui::composer_policy())
-                        .handle_mouse(&mut self.inner.ui.composer, mouse);
-                    None
+                        .handle_mouse(&mut self.inner.composer, mouse);
                 }
                 Event::Mouse(mouse) => {
-                    self.inner
-                        .selection
-                        .handle_mouse(self.local.presentation().selection(), mouse);
-                    None
+                    // Selection is paint-only: it never revokes committed activation.
+                    let scene = self.local.presentation().selection();
+                    let _ = self.inner.pointer(scene, mouse);
                 }
-                _ => None,
-            };
-            if let Some(action) = action {
-                submit |=
-                    self.inner.ui.update(action, &mut history) == SessionUiEffect::SubmitRequested;
-            }
-            if let Some(direction) = history.requested {
-                self.inner
-                    .push_intent(serde_json::json!({"type":"history","direction":direction}));
+                _ => {}
             }
         }
-        self.inner.capture_anchor();
+        if transcript {
+            self.prepare();
+        }
         Ok(submit)
-    }
-
-    fn route_transcript_action(&mut self, route: &bmux_tui::interaction::InteractionRoute) -> bool {
-        if route.is_activation()
-            && self.inner.committed_generation == Some(self.inner.presentation_generation)
-            && self.inner.committed_revision == self.inner.semantic.revision()
-            && let Some(provenance) = route.target.as_ref().and_then(|target| {
-                self.inner
-                    .transcript
-                    .accepted
-                    .action_provenance(target.as_str())
-            })
-        {
-            let theme = self
-                .inner
-                .bindings
-                .effective
-                .policy
-                .as_ref()
-                .map(crate::policy::BrowserPolicy::component_theme);
-            if let Some(action) = self
-                .inner
-                .transcript
-                .translate_action(&provenance, theme.as_ref())
-            {
-                self.inner.transcript_action(action);
-            }
-            // Rejected/stale producer translation never falls back to its
-            // retained payload or an inferred service invocation.
-            return true;
-        }
-        false
     }
 
     /// Drain bounded application intents; no platform authority is exercised here.
@@ -517,9 +600,16 @@ impl SessionSurface {
                 let hit = self.local.presentation().hits().regions().iter()
                     .find(|hit| hit.id.as_str() == region.id && hit.visible);
                 let label = match region.id.as_str() {
-                    OLDER => Some("Load older history"),
-                    NEWER => Some("Load newer history"),
                     LATEST => Some("New messages below; return to latest"),
+                    id if id.starts_with(ITEM_HIT_PREFIX) => id
+                        .strip_prefix(ITEM_HIT_PREFIX)
+                        .and_then(|index| index.parse::<usize>().ok())
+                        .and_then(|index| self.inner.transcript.committed_frame()?.hit_regions.get(index))
+                        .map(|region| match region.hit.action {
+                            ItemAction::ToggleDisclosure(_) => "Expand or collapse",
+                            ItemAction::Activate(_) => "Activate transcript content",
+                            ItemAction::Visual { .. } => "Producer action",
+                        }),
                     EDITOR => Some("Session composer. Ordinary native input queues a follow-up. For exact native steering type /native steer followed by the expected native turn and message. Unresolved submissions retain their exact target and attempt for retry"),
                     id if id.starts_with("bcode-web/permission/") => self.inner.committed_permission
                         .as_ref()
@@ -550,96 +640,67 @@ impl SessionSurface {
         .map_err(|_| "invalid accessibility metadata")
     }
 
-    /// Prepare projections outside the paint callback.
+    /// Prepare the transcript outside the paint callback: local rows, the inline interaction
+    /// reservation, plugin visuals and the render configuration. Revokes transcript
+    /// activation until the next committed frame.
     pub(crate) fn prepare(&mut self) {
-        self.inner.presentation_generation = self.inner.presentation_generation.saturating_add(1);
-        self.inner.committed_generation = None;
-        self.inner.question.prepare(&self.inner.bindings.effective);
-        if let Some(id) = self.inner.question.inline_item.take() {
-            let _ = self.inner.transcript.accepted.remove_visual(&id);
-        }
-        if let Some(snapshot) = self.inner.semantic.snapshot() {
-            self.inner
-                .transcript
-                .prepare_snapshot(snapshot, self.inner.area.width);
-            self.inner.transcript.prepare_visuals(
-                self.inner
-                    .bindings
-                    .effective
-                    .policy
-                    .as_ref()
-                    .map(crate::policy::BrowserPolicy::component_theme)
-                    .as_ref(),
-            );
-            self.inner.transcript.rows = self.inner.transcript.accepted.layout.total_rows();
-            self.inner.question.inline_item = None;
-            let inline = self
-                .inner
-                .bindings
-                .effective
-                .policy
-                .as_ref()
-                .is_none_or(|policy| {
-                    matches!(
-                        policy.interaction.placement,
-                        crate::policy::InteractionPlacement::Transcript
-                    )
-                });
-            if inline {
-                let id = self
-                    .inner
-                    .question
-                    .interaction_id()
-                    .and_then(|interaction_id| {
-                        self.inner
-                            .transcript
-                            .accepted
-                            .document
-                            .iter()
-                            .find_map(|item| {
-                                (item.interaction()?.interaction_id == interaction_id)
-                                    .then(|| item.source_view_item_id().cloned())
-                                    .flatten()
-                            })
-                    });
-                if let Some(id) = id {
-                    let rows = self.inner.question.height(self.inner.area.width);
-                    if let Some(item) = snapshot.transcript.items.iter().find(|item| item.id == id)
-                    {
-                        let _ = self.inner.transcript.accepted.accept_visual(id.clone(),
-                            bcode_tui_components::transcript::accepted::AcceptedVisual {
-                                item_revision: item.revision,
-                                width: self.inner.area.width,
-                                revision: item.revision,
-                                rows: bcode_tui_components::transcript::transcript_layout::TranscriptLayoutRows::BlankSpan(usize::from(rows)),
-                            });
-                        self.inner
-                            .transcript
-                            .prepare_snapshot(snapshot, self.inner.area.width);
-                        self.inner.question.inline_item = Some(id);
-                    }
-                }
-            }
-        }
+        let inner = &mut self.inner;
+        let at = Instant::now();
+        inner.presentation_generation = inner.presentation_generation.saturating_add(1);
+        inner.committed_generation = None;
+        inner.question.prepare(&inner.bindings.effective);
+        let transcript = &mut inner.transcript;
+        transcript.set_pending_submission(inner.semantic.pending_submission());
+        let _ = transcript.sync_local_rows(at);
+        let inline = inner
+            .bindings
+            .effective
+            .policy
+            .as_ref()
+            .is_none_or(|policy| {
+                matches!(
+                    policy.interaction.placement,
+                    crate::policy::InteractionPlacement::Transcript
+                )
+            });
+        let reservation = if inline && !inner.area.is_empty() {
+            let rows = inner.question.height(inner.area.width);
+            inner
+                .question
+                .interaction_id()
+                .filter(|_| rows > 0)
+                .map(|id| InlineInteraction::new(id.to_owned(), u32::from(rows)))
+        } else {
+            None
+        };
+        let update = transcript
+            .engine_mut()
+            .set_inline_interaction(reservation, at);
+        transcript.absorb(update);
+        inner.question.inline_item = transcript
+            .engine()
+            .structure()
+            .inline_interaction_item()
+            .cloned();
+        let _ = inner.sync_region(at);
+        let policy = inner.bindings.effective.policy.as_ref();
+        let theme = policy.map(crate::policy::BrowserPolicy::component_theme);
+        let style = policy.map_or(0, |policy| {
+            bcode_tui_transcript::layout::context::stable_hash(&policy.revision)
+        });
+        let _ = inner.transcript.sync_render(theme.as_ref(), style, at);
     }
 
     fn visual_candidates(&self) -> Result<Vec<VisualCandidate>, &'static str> {
-        let snapshot = self
-            .inner
-            .semantic
-            .snapshot()
-            .ok_or("missing observation")?;
+        let transcript = &self.inner.transcript;
+        let engine = transcript.engine();
         let mut candidates = Vec::new();
         let mut ordinal = 0usize;
-        for item in &snapshot.transcript.items {
-            if candidates.len() >= 64 {
+        for item in &engine.session_view().snapshot().transcript.items {
+            if candidates.len() >= MAX_VISUAL_CANDIDATES {
                 break;
             }
-            if !self
-                .inner
-                .transcript
-                .has_visual(item.id.get(), self.inner.area.width)
-            {
+            if !transcript.visuals.has_visual(engine, item) {
                 continue;
             }
             let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
@@ -653,7 +714,7 @@ impl SessionSurface {
                 continue;
             };
             for reference in &artifact.artifact.refs {
-                if candidates.len() >= 64 {
+                if candidates.len() >= MAX_VISUAL_CANDIDATES {
                     break;
                 }
                 if reference.byte_len == Some(0) {
@@ -675,9 +736,9 @@ impl SessionSurface {
                         .map(|policy| &policy.revision),
                 ))
                 .map_err(|_| "invalid visual identity")?;
-                let Some(budget) = self.inner.transcript.artifact_preview_limit(
-                    item.id.get(),
-                    self.inner.area.width,
+                let Some(budget) = transcript.visuals.artifact_preview_limit(
+                    engine,
+                    item,
                     &reference.key,
                     reference.content_type.as_deref(),
                 ) else {
@@ -698,6 +759,7 @@ impl SessionSurface {
     /// failed/expired work retries at most twice with monotonic backoff.
     ///
     /// # Errors
+    ///
     /// Rejects unavailable observations or artifact request serialization failures.
     pub fn next_visual_artifact(&mut self, now: u64) -> Result<Option<String>, &'static str> {
         if self
@@ -714,10 +776,13 @@ impl SessionSurface {
                 state.retry_at = now.saturating_add(1000);
             }
         }
-        let revision = self.inner.semantic.revision();
-        if revision != self.inner.visual_discovery_revision {
+        let discovery = (
+            self.inner.semantic.revision(),
+            self.inner.content_generation,
+        );
+        if Some(discovery) != self.inner.visual_discovery {
             self.inner.visual_cursor = 0;
-            self.inner.visual_discovery_revision = revision;
+            self.inner.visual_discovery = Some(discovery);
         }
         if !self.inner.visual_fetches.is_empty()
             && self
@@ -853,12 +918,19 @@ impl SessionSurface {
         if length > 64 * 1024 {
             return Err("visual artifact range too large");
         }
-        let request =
-            self.inner
-                .semantic
-                .prepare_artifact(item_id, reference_key, offset, length)?;
+        let transcript = &self.inner.transcript;
+        let item = transcript
+            .item(&bcode_session_view_models::TranscriptViewItemId::new(
+                item_id,
+            ))
+            .ok_or("missing visual item")?;
+        let request = self
+            .inner
+            .semantic
+            .prepare_artifact(item, reference_key, offset, length)?;
         self.inner.pending_visual_artifact = Some(PendingVisualArtifact {
             item_id: item_id.to_owned(),
+            item_revision: item.revision,
             reference_key: reference_key.to_owned(),
             offset,
             length,
@@ -867,15 +939,7 @@ impl SessionSurface {
                 .semantic
                 .revision()
                 .ok_or("missing observation")?,
-            preparation: self
-                .inner
-                .transcript
-                .accepted
-                .visual_preparation(&bcode_session_view_models::TranscriptViewItemId::new(
-                    item_id,
-                ))
-                .ok_or("missing visual item")?,
-            width: self.inner.area.width,
+            width: crate::visuals::body_width(transcript.engine(), item),
             claim: None,
         });
         Ok(request)
@@ -891,17 +955,16 @@ impl SessionSurface {
             .pending_visual_artifact
             .take()
             .ok_or("missing visual artifact request")?;
+        let transcript = &self.inner.transcript;
+        let item = transcript
+            .item(&bcode_session_view_models::TranscriptViewItemId::new(
+                &pending.item_id,
+            ))
+            .ok_or("stale visual artifact")?;
         if json.len() > 512 * 1024
             || self.inner.semantic.revision() != Some(pending.observation)
-            || self
-                .inner
-                .transcript
-                .accepted
-                .visual_preparation(&bcode_session_view_models::TranscriptViewItemId::new(
-                    &pending.item_id,
-                ))
-                .as_ref()
-                != Some(&pending.preparation)
+            || item.revision != pending.item_revision
+            || crate::visuals::body_width(transcript.engine(), item) != pending.width
         {
             return Err("stale visual artifact");
         }
@@ -917,17 +980,6 @@ impl SessionSurface {
         {
             return Err("invalid visual artifact range");
         }
-        let snapshot = self
-            .inner
-            .semantic
-            .snapshot()
-            .ok_or("missing observation")?;
-        let item = snapshot
-            .transcript
-            .items
-            .iter()
-            .find(|item| item.id.get() == pending.item_id)
-            .ok_or("stale visual artifact")?;
         let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } = &item.kind
         else {
             return Err("unsupported visual artifact");
@@ -965,10 +1017,10 @@ impl SessionSurface {
             }
             state.version = Some(version);
         }
-        let accepted = self.inner.transcript.deliver_artifact(
-            &pending.item_id,
-            pending.width,
-            &bcode_tui_components::transcript::tool_visual::portable::PortableArtifactChunk {
+        let accepted = transcript.visuals.deliver_artifact(
+            transcript.engine(),
+            item,
+            &bcode_tui_components::plugin_visual::portable::PortableArtifactChunk {
                 invocation_id: &tool.tool_call_id,
                 artifact_id: &range.artifact_id,
                 reference_key: &range.reference_key,
@@ -989,35 +1041,63 @@ impl SessionSurface {
         Ok(accepted)
     }
 
+    /// Prepare a bounded canonical artifact range of a resident transcript item.
+    ///
+    /// # Errors
+    /// Rejects missing or non-artifact items, foreign references and invalid bounds.
+    pub fn prepare_artifact(
+        &self,
+        item_id: &str,
+        reference_key: &str,
+        offset: u64,
+        length: u32,
+    ) -> Result<String, &'static str> {
+        let item = self
+            .inner
+            .transcript
+            .item(&bcode_session_view_models::TranscriptViewItemId::new(
+                item_id,
+            ))
+            .ok_or("stale artifact")?;
+        self.inner
+            .semantic
+            .prepare_artifact(item, reference_key, offset, length)
+    }
+
     /// Capture current semantic identity before loading one bounded artifact image.
     #[must_use]
     pub fn prepare_image(&mut self, item_id: &str, reference: &str) -> bool {
-        self.inner.pending_image = self.inner.semantic.snapshot().and_then(|snapshot| {
-            self.inner
-                .transcript
-                .prepare_image(snapshot, item_id, reference, self.inner.area.width)
-        });
+        let transcript = &self.inner.transcript;
+        self.inner.pending_image = crate::image::prepare_image(
+            transcript.engine(),
+            &transcript.visuals,
+            item_id,
+            reference,
+        );
         self.inner.pending_image.is_some()
     }
 
     /// Accept decoded RGBA pixels only while every captured input still matches.
     #[must_use]
     pub fn accept_image(&mut self, bytes: Vec<u8>, width: u32, height: u32) -> bool {
-        self.inner.pending_image.take().is_some_and(|pending| {
-            self.inner
-                .transcript
-                .accept_image(&pending, bytes, width, height)
-        })
+        let Some(pending) = self.inner.pending_image.take() else {
+            return false;
+        };
+        let transcript = &mut self.inner.transcript;
+        let accepted = {
+            let (engine, visuals) = transcript.engine_and_visuals();
+            crate::image::accept_image(engine, visuals, &pending, bytes, width, height)
+        };
+        if accepted {
+            self.prepare();
+        }
+        accepted
     }
 
-    /// Copy canonical accepted Markdown source for the current logical selection.
+    /// Copy the logical source of the current transcript selection.
     #[must_use]
     pub fn selected_text(&self) -> Option<String> {
-        let snapshot = self
-            .inner
-            .selection
-            .snapshot(self.local.presentation().selection())?;
-        self.inner.transcript.copy(&snapshot)
+        self.inner.transcript.engine().selected_text()
     }
 
     /// Configure explicit application command overrides (bounded JSON key map).
@@ -1039,7 +1119,7 @@ impl SessionSurface {
     /// Current real BMUX draft source.
     #[must_use]
     pub fn draft(&self) -> &str {
-        self.inner.ui.composer.buffer().text()
+        self.inner.composer.buffer().text()
     }
 
     /// Export bounded caller-owned editor state and exact unresolved submission.
@@ -1053,7 +1133,7 @@ impl SessionSurface {
         }
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "editor": self.inner.ui.composer.snapshot()["buffer"],
+            "editor": self.inner.composer.snapshot()["buffer"],
             "submission": self.inner.semantic.export_recovery()?,
         }))
         .map_err(|_| "invalid surface recovery")
@@ -1092,29 +1172,48 @@ impl SessionSurface {
             .restore_snapshot(&snapshot)
             .map_err(|_| "invalid editor recovery")?;
         self.inner.semantic.restore_recovery(&recovery.submission)?;
-        self.inner.ui.composer = editor;
+        self.inner.composer = editor;
         self.cancel_pointer();
         Ok(())
     }
 
-    /// Validate a durable receipt and clear only its unchanged draft.
+    /// Retain the exact submission of the current draft under `identity` (generated once by
+    /// the platform). While a submission is unresolved, returns its exact original payload.
+    ///
+    /// # Errors
+    /// See [`SnapshotState::prepare_submission`].
+    pub fn prepare_submission(&mut self, identity: String) -> Result<String, &'static str> {
+        let draft = self.draft().to_owned();
+        let body = self.inner.semantic.prepare_submission(identity, draft)?;
+        self.prepare();
+        Ok(body)
+    }
+
+    /// Validate a durable receipt and clear only its unchanged draft. The accepted message
+    /// is revealed once the transcript incorporates it (T2).
     ///
     /// # Errors
     /// See [`SnapshotState::settle_submission`].
     pub fn settle_submission(&mut self, json: &str) -> Result<(), &'static str> {
-        let accepted = self.inner.semantic.settle_submission(json)?;
-        if self.draft() == accepted {
-            self.inner.ui.composer = TextInputState::new(bmux_text_edit::TextEditBuffer::new());
-            self.inner
-                .ui
-                .update(SessionUiAction::FollowTail, &mut WindowHistory::default());
+        let settled = self.inner.semantic.settle_submission(json)?;
+        if self.draft() == settled.draft {
+            self.inner.composer = TextInputState::new(bmux_text_edit::TextEditBuffer::new());
         }
+        let _ = self.inner.transcript.submission_settled(
+            &settled.identity,
+            &settled.text,
+            settled.sequence,
+            Instant::now(),
+        );
+        self.transcript_changed(true);
         Ok(())
     }
 
     pub(crate) fn commit_output(&mut self) {
         self.inner.committed_generation = Some(self.inner.presentation_generation);
         self.inner.committed_revision = self.inner.semantic.revision();
+        self.inner.committed_regions = self.inner.regions;
+        self.inner.transcript.commit();
         if self.inner.committed_turn
             != self
                 .inner
@@ -1147,13 +1246,7 @@ impl SessionSurface {
                 && !self.inner.area.is_empty()
                 && self.inner.permission.is_none(),
         );
-        self.inner.committed_lifecycle_summary = self
-            .inner
-            .semantic
-            .snapshot()
-            .filter(|snapshot| snapshot.execution_lifecycle.session_id.is_some())
-            .map(|snapshot| snapshot.execution_lifecycle.summary())
-            .unwrap_or_default();
+        self.inner.committed_lifecycle_summary = self.inner.lifecycle_summary();
         self.inner.committed_permission = if self
             .local
             .presentation()
@@ -1182,7 +1275,8 @@ impl SessionSurface {
         self.inner.question = checkpoint;
     }
 
-    /// Render to a caller-owned local presentation sink (no network frame decode).
+    /// Prepare and render to a caller-owned local presentation sink (no network frame
+    /// decode), as the browser's Canvas presentation does.
     ///
     /// # Errors
     /// Returns bounded presentation or output errors.
@@ -1191,6 +1285,7 @@ impl SessionSurface {
         output: impl FnOnce(&bmux_tui::presentation::PreparedPresentation) -> Result<(), E>,
     ) -> Result<bool, bmux_tui::presentation::PresentationError<E>> {
         let checkpoint = self.stage_question();
+        self.prepare();
         let inner = &mut self.inner;
         let result = self
             .local
@@ -1222,57 +1317,170 @@ fn map_point(area: Rect, x: f64, y: f64) -> Option<Point> {
     .then(|| Point::new(x.floor() as u16, y.floor() as u16))
 }
 
+/// Whether `scope` is the transcript's selection scope or one of its unit scopes.
+fn is_transcript_scope(scope: &SelectionScopeId) -> bool {
+    scope
+        .as_str()
+        .strip_prefix(SELECTION_SCOPE)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// `rect` (viewport cells) in terminal cells of `viewport`.
+fn terminal_rect(viewport: Rect, x: u64, y: u64, width: u64, height: u64) -> Rect {
+    let cells = |value: u64| u16::try_from(value).unwrap_or(u16::MAX);
+    Rect::new(
+        viewport.x.saturating_add(cells(x)),
+        viewport.y.saturating_add(cells(y)),
+        cells(width),
+        cells(height),
+    )
+}
+
 impl SurfaceState {
-    fn transcript_action(
-        &mut self,
-        action: bcode_tui_components::transcript::actions::TranscriptAction,
-    ) {
-        use bcode_tui_components::transcript::actions::TranscriptAction;
-        match action {
-            TranscriptAction::Open(bcode_markdown_render::MarkdownDestination::Web(url)) => {
+    fn navigate(&mut self, intent: NavIntent) -> bool {
+        let update = self.transcript.engine_mut().intent(intent, Instant::now());
+        self.transcript.absorb(update)
+    }
+
+    /// Activate a committed transcript region: the latest bar jumps to the latest content; an
+    /// item region of the committed frame activates through the engine (X1, E2). Every
+    /// preparation since the last commit revokes activation.
+    fn activate(&mut self, target: &str) -> bool {
+        if self.committed_generation != Some(self.presentation_generation) {
+            return false;
+        }
+        if target == LATEST {
+            return self.navigate(NavIntent::JumpToLatest);
+        }
+        let Some(index) = target
+            .strip_prefix(ITEM_HIT_PREFIX)
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        // The region belongs to the frame the engine committed (CK3, CK4).
+        let Some(frame) = self.transcript.committed_frame() else {
+            return false;
+        };
+        if self.transcript.engine().committed_frame() != Some(frame.id) {
+            return false;
+        }
+        let Some(hit) = frame
+            .hit_regions
+            .get(index)
+            .map(|region| region.hit.clone())
+        else {
+            return false;
+        };
+        let at = Instant::now();
+        match &hit.action {
+            ItemAction::ToggleDisclosure(target) => {
+                let (update, _) = self.transcript.engine_mut().toggle_disclosure(target, at);
+                self.transcript.absorb(update)
+            }
+            ItemAction::Activate(key) => self.activate_markdown(&hit, key, at),
+            ItemAction::Visual { .. } => {
+                // Resolved against the visual accepted now: a replaced adapter or revision
+                // resolves nothing, and nothing falls back to a retained payload.
+                if let Some(action) = self.transcript.engine().visual_action(&hit).cloned() {
+                    self.visual_action(action);
+                }
+                false
+            }
+        }
+    }
+
+    fn activate_markdown(&mut self, hit: &ItemHit, key: &str, at: Instant) -> bool {
+        let Some(target) = self
+            .transcript
+            .engine()
+            .markdown_target_for_action(&hit.unit, key)
+        else {
+            return false;
+        };
+        let engine = self.transcript.engine_mut();
+        let mut changed = engine.focus_markdown(&target);
+        let (update, activation) = engine.activate_markdown(&target, at);
+        changed |= self.transcript.absorb(update);
+        match activation {
+            MarkdownActivation::Details { key, open } => {
+                self.transcript.set_details(key, open);
+                changed = true;
+            }
+            MarkdownActivation::Link(bcode_markdown_render::MarkdownDestination::Web(url)) => {
                 self.push_intent(serde_json::json!({"type":"navigate", "url":url.as_str()}));
             }
-            TranscriptAction::Copy(text) => {
+            MarkdownActivation::Link(bcode_markdown_render::MarkdownDestination::Fragment(
+                fragment,
+            )) => {
+                let (update, _) = self.transcript.engine_mut().navigate_markdown_fragment(
+                    Some(&hit.unit),
+                    &fragment,
+                    at,
+                );
+                changed |= self.transcript.absorb(update);
+            }
+            MarkdownActivation::Link(_) => self.unavailable_destination(),
+            MarkdownActivation::Mermaid { .. }
+            | MarkdownActivation::FootnoteDefinition { .. }
+            | MarkdownActivation::FootnoteReference { .. }
+            | MarkdownActivation::Unavailable => {}
+        }
+        changed
+    }
+
+    fn unavailable_destination(&mut self) {
+        // Local paths never acquire browser host access.
+        self.push_intent(serde_json::json!({"type":"unavailable", "message":"This destination is not available through the browser's narrow navigation port; no host resource was opened."}));
+    }
+
+    fn visual_action(&mut self, action: VisualAction) {
+        match action {
+            VisualAction::Open(bcode_markdown_render::MarkdownDestination::Web(url)) => {
+                self.push_intent(serde_json::json!({"type":"navigate", "url":url.as_str()}));
+            }
+            VisualAction::Copy(text) => {
                 self.push_intent(serde_json::json!({"type":"clipboard", "text":text}));
             }
-            TranscriptAction::Artifact { artifact_id } => {
-                let reference = self.semantic.snapshot().and_then(|snapshot| {
-                    snapshot.transcript.items.iter().find_map(|item| {
-                        let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation {
-                            tool,
-                        } = &item.kind
-                        else {
-                            return None;
-                        };
-                        let Some(bcode_session_view_models::ToolResultView::Artifact { artifact }) =
-                            &tool.result
-                        else {
-                            return None;
-                        };
-                        if artifact.artifact.artifact_id != artifact_id {
-                            return None;
-                        }
-                        Some((
-                            item.id.get().to_owned(),
-                            artifact.artifact.refs.first()?.key.clone(),
-                        ))
-                    })
-                });
-                if let Some((item_id, reference_key)) = reference {
-                    let image = self.semantic.snapshot().is_some_and(|snapshot| snapshot.transcript.items.iter().any(|item| {
-                        item.id.get() == item_id && matches!(&item.kind, bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
-                            if matches!(&tool.result, Some(bcode_session_view_models::ToolResultView::Artifact { artifact })
-                                if artifact.artifact.refs.iter().any(|reference| reference.key == reference_key && reference.content_type.as_deref().is_some_and(|mime| matches!(mime,"image/png"|"image/jpeg"|"image/webp")))))
-                    }));
-                    self.push_intent(serde_json::json!({"type":if image {"image"} else {"artifact"}, "item_id":item_id, "reference_key":reference_key}));
-                }
-            }
+            VisualAction::Artifact { artifact_id } => self.artifact_intent(&artifact_id),
             // Producer translation does not grant arbitrary controller or
             // service authority to this browser boundary.
-            TranscriptAction::Plugin { .. } => self.push_intent(serde_json::json!({"type":"unavailable", "message":"This producer action has no authorized browser capability; no action was sent."})),
-            // Local paths never acquire browser host access. Fragment/disclosure
-            // navigation requires shared semantic target resolution, not guessed rows.
-            TranscriptAction::Open(_) | TranscriptAction::Presentation { .. } => self.push_intent(serde_json::json!({"type":"unavailable", "message":"This destination is not available through the browser's narrow navigation port; no host resource was opened."})),
+            VisualAction::Plugin { .. } => self.push_intent(serde_json::json!({"type":"unavailable", "message":"This producer action has no authorized browser capability; no action was sent."})),
+            VisualAction::Open(_) => self.unavailable_destination(),
+        }
+    }
+
+    fn artifact_intent(&mut self, artifact_id: &str) {
+        let reference =
+            self.transcript
+                .engine()
+                .session_view()
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .find_map(|item| {
+                    let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
+                        &item.kind
+                    else {
+                        return None;
+                    };
+                    let Some(bcode_session_view_models::ToolResultView::Artifact { artifact }) =
+                        &tool.result
+                    else {
+                        return None;
+                    };
+                    if artifact.artifact.artifact_id != artifact_id {
+                        return None;
+                    }
+                    let reference = artifact.artifact.refs.first()?;
+                    let image = reference.content_type.as_deref().is_some_and(|mime| {
+                        matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+                    });
+                    Some((item.id.get().to_owned(), reference.key.clone(), image))
+                });
+        if let Some((item_id, reference_key, image)) = reference {
+            self.push_intent(serde_json::json!({"type":if image {"image"} else {"artifact"}, "item_id":item_id, "reference_key":reference_key}));
         }
     }
 
@@ -1302,10 +1510,116 @@ impl SurfaceState {
         }
     }
 
-    fn capture_anchor(&mut self) {
-        let top = self.ui.viewport.top_row(self.transcript.rows, self.height);
-        self.anchor = self.transcript.anchor(top);
+    // ---- selection ------------------------------------------------------------------------
+
+    fn clear_selection(&mut self) -> bool {
+        self.drag = None;
+        let update = self.transcript.engine_mut().set_selection(None, false);
+        self.transcript.absorb(update)
     }
+
+    /// One pointer event outside hit regions and the editor: left-button gestures select
+    /// transcript text against the committed scene (C34). Returns whether the selection
+    /// changed.
+    fn pointer(&mut self, scene: &SelectionScene, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let mut changed = self.clear_selection();
+                if let Some(drag) = self.selection_anchor(scene, mouse.position) {
+                    let collapsed = TranscriptSelection::collapsed(drag.anchor.clone());
+                    self.drag = Some(drag);
+                    let update = self
+                        .transcript
+                        .engine_mut()
+                        .set_selection(Some(collapsed), true);
+                    changed |= self.transcript.absorb(update);
+                }
+                changed
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.extend_selection(scene, mouse.position, true)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let changed = self.extend_selection(scene, mouse.position, false);
+                self.drag = None;
+                if self
+                    .transcript
+                    .engine()
+                    .selection()
+                    .is_some_and(TranscriptSelection::is_collapsed)
+                {
+                    let update = self.transcript.engine_mut().set_selection(None, false);
+                    self.transcript.absorb(update);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    fn selection_anchor(&self, scene: &SelectionScene, point: Point) -> Option<SelectionDrag> {
+        let scope = scene.initiation_scope(point)?;
+        if !is_transcript_scope(&scope.id) {
+            return None;
+        }
+        let endpoint = scene.endpoint_at_granularity(
+            &scope.id,
+            point,
+            SelectionAffinity::Before,
+            SelectionGranularity::Grapheme,
+        )?;
+        let frame = self.transcript.committed_frame()?;
+        let anchor = self
+            .transcript
+            .engine()
+            .selection_endpoint(frame, &endpoint)?;
+        Some(SelectionDrag {
+            scope: scope.id.clone(),
+            anchor,
+        })
+    }
+
+    fn extend_selection(&mut self, scene: &SelectionScene, point: Point, gesture: bool) -> bool {
+        let Some(drag) = &self.drag else {
+            return false;
+        };
+        let Some(frame) = self.transcript.committed_frame() else {
+            return false;
+        };
+        let engine = self.transcript.engine();
+        let resolve = |affinity| {
+            let endpoint = scene.endpoint_at_granularity(
+                &drag.scope,
+                point,
+                affinity,
+                SelectionGranularity::Grapheme,
+            )?;
+            engine.selection_endpoint(frame, &endpoint)
+        };
+        let focus = resolve(SelectionAffinity::After).and_then(|after| {
+            if engine.compare_selection_endpoints(&after, &drag.anchor)
+                == Some(std::cmp::Ordering::Less)
+            {
+                resolve(SelectionAffinity::Before)
+            } else {
+                Some(after)
+            }
+        });
+        let focus = focus.unwrap_or_else(|| {
+            engine.selection().map_or_else(
+                || drag.anchor.clone(),
+                |selection| selection.focus().clone(),
+            )
+        });
+        let selection = TranscriptSelection::new(drag.anchor.clone(), focus);
+        let update = self
+            .transcript
+            .engine_mut()
+            .set_selection(Some(selection), gesture);
+        self.transcript.absorb(update)
+    }
+
+    // ---- paint ----------------------------------------------------------------------------
 
     fn paint_permission(&self, cx: &mut PaintCx<'_, '_>) -> bool {
         if let Some(dialog) = &self.permission {
@@ -1370,77 +1684,46 @@ impl SurfaceState {
             .map(|role| policy.map_or(text, |policy| policy.style(role)))
     }
 
-    fn paint_selection(&self, cx: &mut PaintCx<'_, '_>) {
-        if let Some(selection) = self.selection.snapshot(cx.selection()) {
-            cx.paint_selection(
-                &selection,
-                Style::new().add_modifier(bmux_tui::style::Modifier::REVERSED),
-            );
-        }
-    }
-
-    fn sync_viewport(
-        ui: &mut SessionUi,
-        transcript: &Transcript,
-        anchor: Option<&(String, usize)>,
-        height: u16,
-        snapshot: Option<&bcode_session_view_models::SessionViewSnapshot>,
-    ) {
-        let anchor = anchor.and_then(|anchor| transcript.resolve_anchor(anchor));
-        ui.viewport.sync_with_anchor(
-            (
-                transcript.rows.saturating_sub(usize::from(height)),
-                0,
-                transcript.rows,
-                height,
-            ),
-            anchor,
-            0,
-            0,
-            &mut WindowHistory::from_snapshot(snapshot),
-        );
-    }
-
+    /// Paint the question surface inline over its reserved rows of the prepared frame, else
+    /// pinned above the composer.
     fn paint_question(
         &mut self,
         layout: &bmux_tui::component::LayoutNode,
-        top: usize,
         question_height: u16,
         pinned_height: u16,
         cx: &mut PaintCx<'_, '_>,
     ) {
-        let inline = self.question.inline_item.as_ref().and_then(|id| {
-            let index = self.transcript.accepted.document.source_index(id)?;
-            self.transcript.accepted.layout.entry_start_row(
-                bcode_tui_components::transcript::transcript_layout::VisibleTranscriptSource::Transcript, index)
-        });
-        let region = if let Some(start) = inline {
-            layout
-                .find_logical_rect(&LayoutId::new("bcode-web/transcript"))
-                .and_then(|rect| {
-                    let end = start.saturating_add(usize::from(question_height));
-                    let visible_start = start.max(top);
-                    let visible_end = end.min(top.saturating_add(usize::from(self.height)));
-                    (visible_start < visible_end).then(|| {
-                        (
-                            u16::try_from(visible_start.saturating_sub(start)).unwrap_or(u16::MAX),
-                            Rect::new(
-                                u16::try_from(rect.x).unwrap_or(0),
-                                u16::try_from(rect.y).unwrap_or(0).saturating_add(
-                                    u16::try_from(visible_start.saturating_sub(top))
-                                        .unwrap_or(u16::MAX),
-                                ),
-                                self.area.width,
-                                u16::try_from(visible_end - visible_start)
-                                    .unwrap_or(0)
-                                    .min(512),
-                            ),
-                        )
-                    })
+        let inline = self.question.inline_item.is_some();
+        let region = if inline {
+            let viewport = self.regions.viewport;
+            let placement = self
+                .transcript
+                .last_frame()
+                .and_then(|frame| self.transcript.engine().inline_interaction_placement(frame));
+            viewport.zip(placement).and_then(|(viewport, placement)| {
+                let height = i64::try_from(placement.height).ok()?;
+                let start = placement.top.max(0);
+                let end = placement
+                    .top
+                    .saturating_add(height)
+                    .min(i64::from(viewport.height));
+                (start < end).then(|| {
+                    (
+                        u16::try_from(start - placement.top).unwrap_or(u16::MAX),
+                        Rect::new(
+                            viewport.x,
+                            viewport
+                                .y
+                                .saturating_add(u16::try_from(start).unwrap_or(u16::MAX)),
+                            viewport.width,
+                            u16::try_from(end - start).unwrap_or(0).min(512),
+                        ),
+                    )
                 })
+            })
         } else {
             layout
-                .find_logical_rect(&LayoutId::new("bcode-web/question-pinned"))
+                .find_logical_rect(&LayoutId::new(QUESTION_PINNED))
                 .map(|rect| {
                     let focused = self.question.focused_rows(self.area.width);
                     let offset = focused
@@ -1477,43 +1760,102 @@ impl SurfaceState {
         (question_height, pinned_height)
     }
 
+    /// The status line above the transcript: the execution lifecycle, and the degraded
+    /// transcript notice while a history read cannot load.
     fn lifecycle_summary(&self) -> String {
-        self.semantic
+        let lifecycle = self
+            .semantic
             .snapshot()
             .filter(|snapshot| snapshot.execution_lifecycle.session_id.is_some())
             .map(|snapshot| snapshot.execution_lifecycle.summary())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !self.transcript.history_unavailable() {
+            return lifecycle;
+        }
+        if lifecycle.is_empty() {
+            HISTORY_UNAVAILABLE.to_owned()
+        } else {
+            format!("{HISTORY_UNAVAILABLE} · {lifecycle}")
+        }
     }
 
-    fn navigation_row<'a>(
-        history: &WindowHistory,
-        show_latest: bool,
-        states: &'a [Cell<ButtonState>; 3],
-    ) -> Row<'a> {
-        let [older, newer, latest] = states;
-        let mut navigation = Row::new();
-        if history.older {
-            navigation = navigation.child(ButtonComponent::new(OLDER, "Older history", older));
-        }
-        if history.newer {
-            navigation = navigation.child(ButtonComponent::new(NEWER, "Newer history", newer));
-        }
-        if show_latest {
-            navigation =
-                navigation.child(ButtonComponent::new(LATEST, "New messages below", latest));
-        }
-        navigation
-    }
-
-    pub(crate) fn paint(&mut self, cx: &mut PaintCx<'_, '_>) {
-        self.question.prepare(&self.bindings.effective);
-        self.question.invalidate_geometry();
-        if self.area.is_empty() || self.paint_permission(cx) {
+    /// Paint the prepared transcript frame into `region`: the engine's viewport (cells,
+    /// selection fragments and highlight, item hit regions from the same snapshot) and the
+    /// latest bar below it.
+    fn paint_transcript(&mut self, region: Rect, cx: &mut PaintCx<'_, '_>) {
+        self.regions = Regions::default();
+        let Some(snapshot) = self.transcript.last_frame() else {
             return;
+        };
+        let height = u16::try_from(snapshot.geometry.height)
+            .unwrap_or(u16::MAX)
+            .min(region.height);
+        let viewport = Rect::new(region.x, region.y, region.width, height);
+        self.regions.viewport = Some(viewport);
+        let selection = self.bindings.effective.policy.as_ref().map_or_else(
+            || Style::new().add_modifier(bmux_tui::style::Modifier::REVERSED),
+            |policy| policy.style("selection"),
+        );
+        let engine = self.transcript.engine();
+        cx.with_child(
+            i32::from(viewport.x),
+            i64::from(viewport.y),
+            LocalRect::new(0, 0, viewport.width, viewport.height),
+            |child| {
+                engine.paint_frame(snapshot, child);
+                engine.paint_selection(snapshot, child, selection);
+                for (index, hit) in snapshot.hit_regions.iter().enumerate() {
+                    let rect = terminal_rect(
+                        Rect::default(),
+                        hit.rect.x,
+                        hit.rect.y,
+                        hit.rect.width,
+                        hit.rect.height,
+                    );
+                    if !rect.is_empty() {
+                        let id = format!("{ITEM_HIT_PREFIX}{index}");
+                        child.push_semantic(bmux_tui::semantic::SemanticRegion::new(
+                            id.clone(),
+                            rect,
+                            "button",
+                        ));
+                        child.push_hit(HitRegion::new(id, rect).role(HitRole::Action).layer(1));
+                    }
+                }
+            },
+        );
+        let bar_row = viewport.bottom();
+        if snapshot.latest_bar.visible && bar_row < region.bottom() {
+            let bar = Rect::new(region.x, bar_row, region.width, 1);
+            self.regions.latest_bar = Some(bar);
+            let button = ButtonComponent::new(
+                LATEST,
+                "New messages below · return to latest",
+                &self.latest_button,
+            );
+            let layout = button.layout(
+                Constraints::tight(Size::new(bar.width, 1)),
+                &mut LayoutCx::new(),
+            );
+            cx.with_child(
+                i32::from(bar.x),
+                i64::from(bar.y),
+                LocalRect::new(0, 0, bar.width, 1),
+                |child| button.paint(&layout, child),
+            );
         }
-        let (question_height, pinned_height) = self.question_extents();
+    }
+
+    /// Lay out the session chrome at the current area and call `f` with it: the composed
+    /// root, its layout and the transcript region. The composer state is lent to the layout
+    /// for the duration of `f`.
+    fn with_chrome<R>(
+        &mut self,
+        pinned_height: u16,
+        f: impl FnOnce(&mut Self, &Column<'_>, &bmux_tui::component::LayoutNode, Rect) -> R,
+    ) -> R {
         let editor = RefCell::new(std::mem::replace(
-            &mut self.ui.composer,
+            &mut self.composer,
             TextInputState::new(bmux_text_edit::TextEditBuffer::new()),
         ));
         let policy = session_ui::composer_policy();
@@ -1522,125 +1864,107 @@ impl SurfaceState {
             .clamp(1, 6)
             .saturating_add(2)
             .min(self.area.height);
-        let [
-            style,
-            surface_style,
-            border_style,
-            selection_style,
-            muted_style,
-        ] = self.presentation_styles();
-        let transcript = &self.transcript;
-        let focused = self.focused;
-        let navigation_states = &self.navigation_buttons;
-        self.sync_navigation_focus();
-        let history = WindowHistory::from_snapshot(self.semantic.snapshot());
-        let show_latest = history.newer || !self.ui.viewport.follows_bottom();
+        let [text, surface, border, selection, muted] = self.presentation_styles();
         let lifecycle_summary = self.lifecycle_summary();
-        let build = |top| {
-            let navigation = Self::navigation_row(&history, show_latest, navigation_states);
-            let transcript_panel = Column::new()
-                .child(
-                    SizeBox::new(TextBlock::new(lifecycle_summary.clone()))
-                        .height(u64::from(!lifecycle_summary.is_empty())),
-                )
-                .child(
-                    SizeBox::new(navigation)
-                        .height(u64::from(history.older || history.newer || show_latest)),
-                )
-                .flex(Flex::new(1, TranscriptComponent { transcript, top }))
-                .child(
-                    SizeBox::new(TextBlock::new(""))
-                        .id("bcode-web/question-pinned")
-                        .height(u64::from(pinned_height)),
-                );
-            session_ui::compose(
-                &IDS,
-                transcript_panel,
-                session_ui::composer(
-                    &IDS,
-                    &editor,
-                    &policy,
-                    SessionComposerStyle {
-                        panel: ComposerStyle {
-                            border: border_style,
-                            surface: surface_style,
-                        },
-                        text: style,
-                        selection: selection_style,
-                        muted: muted_style,
-                    },
-                    focused,
-                ),
-                composer_height,
+        let transcript_panel = Column::new()
+            .child(
+                SizeBox::new(TextBlock::new(lifecycle_summary.clone()))
+                    .height(u64::from(!lifecycle_summary.is_empty())),
             )
-        };
-        let constraints = Constraints::tight(Size::new(self.area.width, self.area.height));
-        let layout = build(0).layout(constraints, &mut LayoutCx::new());
-        self.height = layout
-            .find_logical_rect(&LayoutId::new("bcode-web/transcript"))
-            .and_then(|rect| u16::try_from(rect.height).ok())
-            .unwrap_or(0);
-        Self::sync_viewport(
-            &mut self.ui,
-            &self.transcript,
-            self.anchor.as_ref(),
-            self.height,
-            self.semantic.snapshot(),
+            .flex(Flex::new(
+                1,
+                SizeBox::new(TextBlock::new("")).id(TRANSCRIPT_REGION),
+            ))
+            .child(
+                SizeBox::new(TextBlock::new(""))
+                    .id(QUESTION_PINNED)
+                    .height(u64::from(pinned_height)),
+            );
+        let root = session_ui::compose(
+            &IDS,
+            transcript_panel,
+            session_ui::composer(
+                &IDS,
+                &editor,
+                &policy,
+                SessionComposerStyle {
+                    panel: ComposerStyle { border, surface },
+                    text,
+                    selection,
+                    muted,
+                },
+                self.focused,
+            ),
+            composer_height,
         );
-        let top = self.ui.viewport.top_row(self.transcript.rows, self.height);
-        build(top).paint(&layout, cx);
-        self.paint_question(&layout, top, question_height, pinned_height, cx);
-        self.ui.composer = editor.into_inner();
-        self.paint_selection(cx);
-        self.capture_anchor();
+        let constraints = Constraints::tight(Size::new(self.area.width, self.area.height));
+        let layout = root.layout(constraints, &mut LayoutCx::new());
+        let region = layout
+            .find_logical_rect(&LayoutId::new(TRANSCRIPT_REGION))
+            .map(|rect| {
+                Rect::new(
+                    u16::try_from(rect.x).unwrap_or(0),
+                    u16::try_from(rect.y).unwrap_or(0),
+                    u16::try_from(rect.width).unwrap_or(0),
+                    u16::try_from(rect.height).unwrap_or(0),
+                )
+            })
+            .unwrap_or_default();
+        let result = f(self, &root, &layout, region);
+        drop(root);
+        self.composer = editor.into_inner();
+        result
     }
-}
 
-// Resident bounded window metadata feeds the shared native navigation state machine.
-#[derive(Default)]
-struct WindowHistory {
-    older: bool,
-    newer: bool,
-    requested: Option<&'static str>,
-}
-impl WindowHistory {
-    fn from_snapshot(snapshot: Option<&bcode_session_view_models::SessionViewSnapshot>) -> Self {
-        Self {
-            older: snapshot.is_some_and(|s| s.transcript.has_older_history),
-            newer: snapshot.is_some_and(|s| s.transcript.has_newer_history),
-            requested: None,
+    /// Size the engine's transcript region from the chrome layout (a navigation input applied
+    /// before frames are prepared, outside paint).
+    fn sync_region(&mut self, at: Instant) -> bool {
+        if self.area.is_empty() || self.permission.is_some() {
+            return false;
         }
+        let (_, pinned_height) = self.question_extents();
+        let region = self.with_chrome(pinned_height, |_, _, _, region| region);
+        self.transcript
+            .sync_geometry(region.width, region.height, at)
     }
-}
-impl TranscriptHistory for WindowHistory {
-    fn has_older_history(&self) -> bool {
-        self.older
-    }
-    fn has_newer_history(&self) -> bool {
-        self.newer
-    }
-    fn reveal_request(&self) -> Option<usize> {
-        None
-    }
-    fn newer_reveal_request(&self) -> Option<usize> {
-        None
-    }
-    fn cancel_newer_reveal(&mut self) {}
-    fn cancel_older_reveal(&mut self) {}
-    fn request_load(&mut self, _: usize) {
-        self.requested = Some("older");
-    }
-    fn request_load_newer(&mut self, _: usize) {
-        self.requested = Some("newer");
-    }
-    fn clear_reveal_request(&mut self) {}
-    fn take_ready_pages(&mut self) -> (bool, bool, bool) {
-        (false, false, false)
-    }
-    fn consume_reveal(&mut self, _: bool, _: usize) {}
-}
 
-impl SurfaceState {
+    pub(crate) fn paint(&mut self, cx: &mut PaintCx<'_, '_>) {
+        self.question.prepare(&self.bindings.effective);
+        self.question.invalidate_geometry();
+        self.regions = Regions::default();
+        if self.area.is_empty() || self.paint_permission(cx) {
+            self.transcript.clear_frame();
+            return;
+        }
+        let at = Instant::now();
+        let (question_height, pinned_height) = self.question_extents();
+        self.sync_latest_focus();
+        self.with_chrome(pinned_height, |this, root, layout, region| {
+            root.paint(layout, cx);
+            // The region size is a navigation input applied before the frame is prepared;
+            // `prepare` normally applied it already.
+            let _ = this
+                .transcript
+                .sync_geometry(region.width, region.height, at);
+            if region.is_empty() {
+                this.transcript.clear_frame();
+            } else {
+                let clock = cx.clock().map_or(FrameClock { now: at }, FrameClock::from);
+                let _ = this.transcript.prepare_frame(clock);
+                this.paint_transcript(region, cx);
+            }
+            this.paint_question(layout, question_height, pinned_height, cx);
+        });
+    }
+
+    fn sync_latest_focus(&self) {
+        let mut value = self.latest_button.get();
+        value.set_focused(self.focused && self.focused_hit.as_deref() == Some(LATEST));
+        self.latest_button.set(value);
+    }
+
+    // ---- routed input ---------------------------------------------------------------------
+
     fn route_question(&mut self, route: &bmux_tui::interaction::InteractionRoute) -> bool {
         let interaction_routes = self.question.visible
             || self
@@ -1711,80 +2035,28 @@ impl SurfaceState {
             }
         }
     }
-}
 
-impl SurfaceState {
-    fn sync_navigation_focus(&self) {
-        let [older_state, newer_state, latest_state] = &self.navigation_buttons;
-        for (id, state) in [
-            (OLDER, older_state),
-            (NEWER, newer_state),
-            (LATEST, latest_state),
-        ] {
-            let mut value = state.get();
-            value.set_focused(self.focused && self.focused_hit.as_deref() == Some(id));
-            state.set(value);
-        }
-    }
-}
-
-impl SurfaceState {
-    fn route_navigation(
-        &mut self,
-        route: &bmux_tui::interaction::InteractionRoute,
-        history: &mut WindowHistory,
-    ) -> bool {
-        let activation = route.is_activation();
-        let target = [OLDER, NEWER, LATEST]
-            .into_iter()
-            .find(|id| route.targets(&bmux_tui::hit::HitId::new(*id)));
-        if activation && let Some(target) = target {
-            if target == LATEST {
-                self.ui.update(SessionUiAction::FollowTail, history);
-                if history.newer {
-                    self.push_intent(serde_json::json!({"type":"history","direction":"tail"}));
-                }
-            } else if (target == OLDER && history.older) || (target == NEWER && history.newer) {
-                self.push_intent(serde_json::json!({"type":"history","direction":if target == OLDER { "older" } else { "newer" }}));
-            }
-            return true;
-        }
-
-        false
-    }
-}
-
-impl SurfaceState {
+    /// One key outside modal surfaces. Returns whether the transcript changed.
     fn route_key(
         &mut self,
         key: bmux_keyboard::KeyStroke,
         route: &bmux_tui::interaction::InteractionRoute,
-        history: &WindowHistory,
         submit: &mut bool,
-    ) -> Option<SessionUiAction> {
+    ) -> bool {
         use crate::bindings::Command;
         match self.bindings.command(key) {
             Some(Command::Submit) => {
                 *submit = true;
-                None
+                false
             }
             Some(Command::Newline) => {
                 TextInputControl::new(&session_ui::composer_policy())
-                    .handle_paste(&mut self.ui.composer, "\n");
-                None
+                    .handle_paste(&mut self.composer, "\n");
+                false
             }
-            Some(Command::PageUp) => {
-                Some(SessionUiAction::ScrollUp(usize::from(self.height.max(1))))
-            }
-            Some(Command::PageDown) => {
-                Some(SessionUiAction::ScrollDown(usize::from(self.height.max(1))))
-            }
-            Some(Command::Latest) => {
-                if history.newer {
-                    self.push_intent(serde_json::json!({"type":"history","direction":"tail"}));
-                }
-                Some(SessionUiAction::FollowTail)
-            }
+            Some(Command::PageUp) => self.navigate(NavIntent::PageBy { pages: -1 }),
+            Some(Command::PageDown) => self.navigate(NavIntent::PageBy { pages: 1 }),
+            Some(Command::Latest) => self.navigate(NavIntent::JumpToLatest),
             Some(Command::CancelTurn) => {
                 let turn = self
                     .semantic
@@ -1799,21 +2071,20 @@ impl SurfaceState {
                     self.push_intent(serde_json::json!({"type":"control","action_json":serde_json::json!({"type":"cancel_turn","turn_id":turn}).to_string()}));
                     self.cancel_pending = turn;
                 }
-                None
+                false
             }
             Some(Command::FocusInteraction) => {
-                if let Some(id) = &self.question.inline_item
-                    && let Some(index) = self.transcript.accepted.document.source_index(id)
-                    && let Some(start) = self.transcript.accepted.layout.entry_start_row(bcode_tui_components::transcript::transcript_layout::VisibleTranscriptSource::Transcript, index)
-                {
-                    let focus = self.question.focused_rows(self.area.width);
-                    self.ui.viewport.restore_anchor(start.saturating_add(usize::from(focus.start)));
-                }
-                None
+                let Some(item) = self.question.inline_item.clone() else {
+                    return false;
+                };
+                self.navigate(NavIntent::JumpToItem {
+                    item: UnitKey::Item(item),
+                    placement: Placement::ItemTopAtTop,
+                })
             }
             Some(Command::Copy) => {
                 self.copy_requested = true;
-                None
+                false
             }
             Some(
                 Command::Ignore
@@ -1823,15 +2094,12 @@ impl SurfaceState {
                 | Command::SelectDown
                 | Command::SelectConfirm
                 | Command::SelectCancel,
-            ) => None,
+            ) => false,
             None => {
-                if ![OLDER, NEWER, LATEST]
-                    .into_iter()
-                    .any(|id| route.targets(&bmux_tui::hit::HitId::new(id)))
-                {
-                    self.bindings.edit(&mut self.ui.composer, key);
+                if !route.targets(&bmux_tui::hit::HitId::new(LATEST)) {
+                    self.bindings.edit(&mut self.composer, key);
                 }
-                None
+                false
             }
         }
     }

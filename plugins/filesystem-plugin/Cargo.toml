@@ -69,7 +69,6 @@ presentation = [
     "dep:bmux_tui",
     "dep:bmux_tui_components",
     "dep:devicons",
-    "bcode_tui_components/transcript-engine",
-    "bcode_tui_components/transcript-markdown",
+    "bcode_tui_components/plugin-visual",
 ]
 static-bundled = ["native", "presentation"]

@@ -332,9 +332,10 @@ impl AcceptedTranscript {
                 item_revision: preparation.item_revision,
                 width,
                 revision: self.visual_revision,
-                rows: output.rows,
+                rows: output.rows.into(),
             };
-            if self.accept_prepared_visual(&preparation, accepted, output.images, output.actions) {
+            let actions = output.actions.into_iter().map(Into::into).collect();
+            if self.accept_prepared_visual(&preparation, accepted, output.images, actions) {
                 self.portable_items.insert(id);
             }
         }
@@ -1333,54 +1334,7 @@ pub(super) fn images_supported(
     width: u16,
     rows: usize,
 ) -> bool {
-    use bmux_tui::image::{ImageLifecycle, ImagePayload, ImagePixelFormat};
-    if images.len() > 32 {
-        return false;
-    }
-    let mut keys = BTreeSet::new();
-    let mut bytes = 0usize;
-    images.iter().all(|image| {
-        let (payload, w, h, valid) = match &image.payload {
-            ImagePayload::Png {
-                bytes,
-                width,
-                height,
-            } => (bytes, *width, *height, true),
-            ImagePayload::Pixels {
-                bytes,
-                width,
-                height,
-                format,
-            } => {
-                let channels = match format {
-                    ImagePixelFormat::Rgb8 => 3usize,
-                    ImagePixelFormat::Rgba8 => 4usize,
-                };
-                let expected = usize::try_from(*width)
-                    .ok()
-                    .and_then(|w| usize::try_from(*height).ok().and_then(|h| w.checked_mul(h)))
-                    .and_then(|n| n.checked_mul(channels));
-                (bytes, *width, *height, expected == Some(bytes.len()))
-            }
-        };
-        bytes = bytes.saturating_add(payload.len());
-        valid
-            && w > 0
-            && h > 0
-            && w <= 4096
-            && h <= 4096
-            && !payload.is_empty()
-            && bytes <= 8 * 1024 * 1024
-            && !image.key.as_str().is_empty()
-            && image.key.as_str().len() <= 512
-            && keys.insert(image.key.clone())
-            && image.lifecycle == ImageLifecycle::Frame
-            && image.allocation.is_none()
-            && !image.destination.is_empty()
-            && image.destination.right() <= width
-            && usize::from(image.destination.bottom()) <= rows
-            && image.clip == image.destination
-    })
+    crate::plugin_visual::output::images_supported(images, width, rows)
 }
 
 pub(super) fn visual_supported(bundle: &TranscriptLayoutRows) -> bool {

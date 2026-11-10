@@ -15,6 +15,12 @@ struct ArtifactRequest {
     epoch: SessionId,
     revision: u64,
     item_id: String,
+    /// Canonical artifact identity of the item, for browsers whose transcript engine is fed
+    /// by history pages (the slim snapshot carries no items). The daemon resolves it within
+    /// the session; the launch token already authorizes reading that session's history,
+    /// which names every artifact identity.
+    #[serde(default)]
+    artifact_id: Option<String>,
     reference_key: String,
     offset: u64,
     length: u32,
@@ -35,6 +41,12 @@ impl crate::HyperChadAppState {
             epoch: query.epoch,
             revision: query.revision,
         })?;
+        if let Some(artifact_id) = &query.artifact_id {
+            if artifact_id.is_empty() || artifact_id.len() > 1024 {
+                return Err("invalid_artifact_range");
+            }
+            return Ok(artifact_id.clone());
+        }
         let item = snapshot
             .transcript
             .items
@@ -223,6 +235,60 @@ mod tests {
         };
         let response: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(response["error"], "method_not_allowed");
+    }
+
+    fn query(artifact_id: Option<&str>, epoch: SessionId, revision: u64) -> ArtifactRequest {
+        ArtifactRequest {
+            session_id: SessionId::new(),
+            epoch,
+            revision,
+            item_id: "tool:call".into(),
+            artifact_id: artifact_id.map(ToOwned::to_owned),
+            reference_key: "r".into(),
+            offset: 0,
+            length: 4,
+        }
+    }
+
+    #[test]
+    fn canonical_artifact_identity_is_still_fenced_by_the_observation() {
+        let state =
+            crate::HyperChadAppState::new(bcode_client::BcodeClient::default_endpoint(), "secret");
+        let mut request = query(Some("canonical"), SessionId::new(), 1);
+        let session_id = request.session_id;
+        // No observation of the session yet: stale, whatever identity the browser names.
+        assert_eq!(state.observed_artifact(&request), Err("stale_observation"));
+        let (epoch, revision) = {
+            let mut observations = state.browser_api.try_lock().unwrap();
+            let revision = observations
+                .observe(
+                    session_id,
+                    bcode_session_view_models::SessionViewSnapshot::empty(),
+                )
+                .unwrap();
+            (observations.epoch, revision)
+        };
+        request.epoch = epoch;
+        request.revision = revision;
+        // The slim observation holds no items: the canonical identity is resolved by the
+        // daemon within the session.
+        assert_eq!(
+            state.observed_artifact(&request),
+            Ok("canonical".to_owned())
+        );
+        let mut legacy = query(None, epoch, revision);
+        legacy.session_id = session_id;
+        assert_eq!(state.observed_artifact(&legacy), Err("stale_artifact"));
+        request.artifact_id = Some(String::new());
+        assert_eq!(
+            state.observed_artifact(&request),
+            Err("invalid_artifact_range")
+        );
+        request.artifact_id = Some("x".repeat(1025));
+        assert_eq!(
+            state.observed_artifact(&request),
+            Err("invalid_artifact_range")
+        );
     }
 
     fn range(offset: u64, total: u64, bytes: &[u8]) -> SessionArtifactRange {

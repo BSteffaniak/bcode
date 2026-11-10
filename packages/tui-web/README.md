@@ -52,10 +52,10 @@ an old built artifact establishes that the latest source passes browser E2E.
 
 | Area | Implementation boundary | Required evidence |
 | --- | --- | --- |
-| Composer and transcript | Shared BMUX editor, `TranscriptViewport`, semantic Markdown and retained surface composition | Real WASM editing, rendering, resize, selection/copy and committed hit geometry |
+| Composer and transcript | Shared BMUX editor and the V2 transcript engine (`bcode_tui_transcript`), fed by bounded history pages and live batches (TUI V2 spec section 3.7) | Real WASM editing, rendering, resize, selection/copy and committed hit geometry |
 | Plugin visuals and interaction | Typed plugin-owned presentation and question ports; no browser-side domain replacement | Plugin fixture rendering, focus, validation and authoritative resolution |
 | Images | Browser artifact/image adapter and retained compositor | Real image load, clipping, resize, stale identity rejection and disposal |
-| Policy, history and actions | Typed browser policy/session seams | Applied theme/keymap revisions, paging and action identity enforcement |
+| Policy, history and actions | Typed browser policy (resolved theme, keymap, visual policy), the history-page and live routes, and the snapshot without transcript items | Applied theme/keymap revisions, engine paging and live resume, action identity enforcement |
 | Submission durability | Browser session transport and application receipts | Exact retry identity, durable receipt, restart and stale response rejection |
 | Distribution | Cargo-resolved bridge, exact bindgen ABI, manifest and packaged asset discovery | Fresh build, archived/extracted byte equality, tamper/mixed-protocol rejection, rollback and normal packaged launch |
 

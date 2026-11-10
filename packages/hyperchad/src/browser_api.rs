@@ -1,13 +1,18 @@
 //! Bounded application-semantic JSON routes, independent of the HTML renderer.
 //!
-//! Every successful read is a full replacement, including after reconnect. The epoch and
-//! revision identify observations, not durable stream offsets. Errors are JSON envelopes
-//! (the `HyperChad` content boundary does not expose HTTP status/header control).
+//! Every successful snapshot read is a full replacement, including after reconnect. The epoch
+//! and revision identify observations, not durable stream offsets. The browser transcript
+//! engine reads bounded canonical history pages ([`history_page`]) and polls pushed live input
+//! with an explicit resume contract ([`live`]); `?transcript=omit` slims snapshots to the
+//! non-transcript state it still observes there. Errors are JSON envelopes (the `HyperChad`
+//! content boundary does not expose HTTP status/header control).
 
 mod artifact;
 pub mod browser_consumers;
 mod controls;
 mod history;
+pub mod history_page;
+pub mod live;
 mod permissions;
 
 use std::collections::BTreeMap;
@@ -30,7 +35,17 @@ pub fn with_routes(
     let controls_state = state.clone();
     let artifact_state = state.clone();
     let download_state = state.clone();
+    let history_page_state = state.clone();
+    let live_state = state.clone();
     router
+        .with_route("/api/session-view/history-page", move |request| {
+            let state = history_page_state.clone();
+            async move { state.browser_history_page(request).await }
+        })
+        .with_route("/api/session-view/live", move |request| {
+            let state = live_state.clone();
+            async move { state.browser_live(request).await }
+        })
         .with_route("/api/session-view/artifact/download", move |request| {
             let state = download_state.clone();
             async move { state.browser_artifact_download(request).await }
@@ -75,7 +90,7 @@ pub struct BrowserApiState {
     snapshots: BTreeMap<SessionId, (u64, SessionViewSnapshot)>,
     windows: BTreeMap<SessionId, bcode_session_models::ProjectionWindowRequest>,
     permissions: BTreeMap<SessionId, permissions::PermissionObservation>,
-    policies: BTreeMap<SessionId, serde_json::Value>,
+    policies: BTreeMap<SessionId, std::sync::Arc<serde_json::Value>>,
 }
 
 impl Default for BrowserApiState {
@@ -97,9 +112,21 @@ impl BrowserApiState {
         session_id: SessionId,
         snapshot: SessionViewSnapshot,
         permissions: Option<permissions::PermissionObservation>,
-        policy: Option<serde_json::Value>,
+        policy: Option<std::sync::Arc<serde_json::Value>>,
+        known_policy_revision: Option<&str>,
     ) -> Result<Content, &'static str> {
         let policy_changed = self.policies.get(&session_id) != policy.as_ref();
+        let policy_revision = policy
+            .as_ref()
+            .and_then(|policy| policy.get("revision")?.as_str().map(str::to_owned));
+        // A browser that names the effective revision already installed this policy.
+        let send_policy = policy
+            .as_ref()
+            .filter(|_| {
+                known_policy_revision.is_none()
+                    || known_policy_revision != policy_revision.as_deref()
+            })
+            .map(|policy| policy.as_ref().clone());
         let permissions_changed = permissions
             .as_ref()
             .is_some_and(|next| self.permissions.get(&session_id) != Some(next));
@@ -116,10 +143,11 @@ impl BrowserApiState {
             schema_version: 1,
             epoch: self.epoch,
             revision,
-            policy,
+            policy: send_policy,
+            policy_revision,
             snapshot,
         };
-        let mut writer = BoundedJson(Vec::new());
+        let mut writer = BoundedJson::new();
         serde_json::to_writer(&mut writer, &envelope).map_err(|_| "response_too_large")?;
         self.observe(session_id, envelope.snapshot)
             .ok_or("revision_exhausted")?;
@@ -129,7 +157,7 @@ impl BrowserApiState {
         if let Some((observed_revision, _)) = self.snapshots.get_mut(&session_id) {
             *observed_revision = revision;
         }
-        if let Some(policy) = envelope.policy {
+        if let Some(policy) = policy {
             self.policies.insert(session_id, policy);
         } else {
             self.policies.remove(&session_id);
@@ -138,7 +166,7 @@ impl BrowserApiState {
             self.permissions.insert(session_id, permissions);
         }
         Ok(Content::Raw {
-            data: writer.0.into(),
+            data: writer.bytes.into(),
             content_type: "application/json".to_owned(),
         })
     }
@@ -178,9 +206,13 @@ pub struct BrowserSessionSnapshot {
     pub epoch: SessionId,
     /// Stable within the epoch for an unchanged complete observation.
     pub revision: u64,
-    /// Complete replacement, never a patch or durable resume token.
+    /// Complete replacement, never a patch or durable resume token. Omitted when the request
+    /// named the effective revision (`?policy=<revision>`): the browser already installed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<serde_json::Value>,
+    /// Revision of the effective policy, present whenever a policy is in effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<String>,
     /// Full semantic state.
     pub snapshot: SessionViewSnapshot,
 }
@@ -273,15 +305,39 @@ fn parse_submission(body: &[u8]) -> Result<BrowserSubmitMessage, &'static str> {
     Ok(message)
 }
 
+/// Drop transcript content for a browser whose engine owns the transcript (history pages and
+/// live input). Window bounds, permissions, interactions, queue, model status and lifecycle stay.
+fn omit_transcript_items(snapshot: &mut SessionViewSnapshot) {
+    snapshot.transcript.items.clear();
+    snapshot.text_streams.clear();
+}
+
 /// Bound serialization itself rather than allocating an unbounded intermediate JSON value.
-struct BoundedJson(Vec<u8>);
+struct BoundedJson {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedJson {
+    /// A writer bounded by [`MAX_RESPONSE_BYTES`].
+    const fn new() -> Self {
+        Self::with_limit(MAX_RESPONSE_BYTES)
+    }
+
+    const fn with_limit(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+}
 
 impl std::io::Write for BoundedJson {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.0.len()) {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
             return Err(std::io::Error::other("projection exceeds response limit"));
         }
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -291,12 +347,17 @@ impl std::io::Write for BoundedJson {
 }
 
 fn json_content(value: &impl Serialize) -> Content {
-    let mut writer = BoundedJson(Vec::new());
+    json_content_within(value, MAX_RESPONSE_BYTES)
+}
+
+/// [`json_content`] bounded by `limit` bytes instead of [`MAX_RESPONSE_BYTES`].
+fn json_content_within(value: &impl Serialize, limit: usize) -> Content {
+    let mut writer = BoundedJson::with_limit(limit);
     if serde_json::to_writer(&mut writer, value).is_err() {
         return error("response_too_large");
     }
     Content::Raw {
-        data: writer.0.into(),
+        data: writer.bytes.into(),
         content_type: "application/json".to_owned(),
     }
 }
@@ -341,6 +402,16 @@ impl HyperChadAppState {
         else {
             return error("invalid_session");
         };
+        let omit_transcript = match request.query.get("transcript").map(String::as_str) {
+            None => false,
+            Some("omit") => true,
+            Some(_) => return error("invalid_request"),
+        };
+        let known_policy_revision = request.query.get("policy").map(String::as_str);
+        if known_policy_revision.is_some_and(|revision| revision.is_empty() || revision.len() > 128)
+        {
+            return error("invalid_request");
+        }
         // Serialize observations so concurrent attaches cannot publish older results after newer ones.
         let Ok(mut observations) = self.browser_api.try_lock() else {
             return error("browser_busy");
@@ -366,11 +437,15 @@ impl HyperChadAppState {
         else {
             return error("permission_state_unavailable");
         };
+        if omit_transcript {
+            omit_transcript_items(&mut snapshot);
+        }
         match observations.publish_scoped_observation(
             session_id,
             snapshot,
             Some(permissions),
-            serde_json::from_str(&self.browser_policy).ok(),
+            self.browser_policy.clone(),
+            known_policy_revision,
         ) {
             Ok(content) => content,
             Err(code) => error(code),
@@ -534,6 +609,68 @@ mod tests {
         assert_eq!(state.snapshots.len(), MAX_CACHED_SESSIONS);
         assert!(!state.snapshots.contains_key(&session));
         assert!(state.observe(session, snapshot).unwrap() > first);
+    }
+
+    fn published(content: Content) -> serde_json::Value {
+        let Content::Raw { data, .. } = content else {
+            panic!("expected raw JSON")
+        };
+        serde_json::from_slice(&data).unwrap()
+    }
+
+    #[test]
+    fn an_installed_policy_revision_omits_the_unchanged_policy_from_observations() {
+        let mut state = BrowserApiState::default();
+        let session = SessionId::new();
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.session_id = Some(session);
+        let policy = std::sync::Arc::new(serde_json::json!({
+            "schema_version": 1, "revision": "theme-1", "styles": {}, "bindings": [],
+            "theme": {"large": "x".repeat(64 * 1024)},
+        }));
+        let full = published(
+            state
+                .publish_scoped_observation(
+                    session,
+                    snapshot.clone(),
+                    None,
+                    Some(policy.clone()),
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_eq!(full["policy"], *policy);
+        assert_eq!(full["policy_revision"], "theme-1");
+        // The browser names the revision it installed: the policy is left out, the
+        // observation revision is unchanged and the effective revision is still stated.
+        let slim = published(
+            state
+                .publish_scoped_observation(
+                    session,
+                    snapshot.clone(),
+                    None,
+                    Some(policy.clone()),
+                    Some("theme-1"),
+                )
+                .unwrap(),
+        );
+        assert!(slim.get("policy").is_none());
+        assert_eq!(slim["policy_revision"], "theme-1");
+        assert_eq!(slim["revision"], full["revision"]);
+        assert!(slim.to_string().len() < 16 * 1024);
+        // A stale revision gets the complete policy again.
+        let outdated = published(
+            state
+                .publish_scoped_observation(
+                    session,
+                    snapshot,
+                    None,
+                    Some(policy.clone()),
+                    Some("old"),
+                )
+                .unwrap(),
+        );
+        assert_eq!(outdated["policy"], *policy);
     }
 
     #[test]
@@ -717,6 +854,60 @@ mod tests {
     }
 
     #[test]
+    fn slim_snapshots_keep_non_transcript_state() {
+        let session = SessionId::new();
+        let mut view = bcode_session_view::SessionView::new();
+        view.apply_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id: session,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "transcript".to_owned(),
+            },
+        });
+        let mut snapshot = view.into_snapshot();
+        snapshot.title = Some("kept".to_owned());
+        snapshot.transcript.source_start_sequence = Some(1);
+        snapshot.transcript.has_older_history = true;
+        assert!(!snapshot.transcript.items.is_empty(), "fixture has items");
+        let before = snapshot.clone();
+        omit_transcript_items(&mut snapshot);
+        assert!(snapshot.transcript.items.is_empty() && snapshot.text_streams.is_empty());
+        assert_eq!(snapshot.title, before.title);
+        assert_eq!(
+            (
+                snapshot.transcript.source_start_sequence,
+                snapshot.transcript.has_older_history
+            ),
+            (
+                before.transcript.source_start_sequence,
+                before.transcript.has_older_history
+            )
+        );
+        assert_eq!(snapshot.interactions, before.interactions);
+        assert_eq!(snapshot.runtime, before.runtime);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_unknown_transcript_modes_before_backend_access() {
+        let state = HyperChadAppState::new(bcode_client::BcodeClient::default_endpoint(), "secret");
+        let request = RouteRequest::from_path(
+            &format!(
+                "/api/session-view/{}?token=secret&transcript=full",
+                SessionId::new()
+            ),
+            hyperchad::router::RequestInfo::default(),
+        );
+        let Content::Raw { data, .. } = state.browser_snapshot(request).await else {
+            panic!("expected raw JSON")
+        };
+        let value: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(value["error"], "invalid_request");
+    }
+
+    #[test]
     fn submission_errors_distinguish_rejection_from_ambiguous_receipt_without_details() {
         let rejected = bcode_client::ClientError::Server {
             code: "invalid_turn_admission".to_owned(),
@@ -744,10 +935,10 @@ mod tests {
 
     #[test]
     fn serialization_stops_at_bound_without_partial_response() {
-        let mut writer = BoundedJson(Vec::new());
+        let mut writer = BoundedJson::new();
         assert!(writer.write_all(&vec![b'x'; MAX_RESPONSE_BYTES]).is_ok());
         assert!(writer.write_all(b"x").is_err());
-        assert_eq!(writer.0.len(), MAX_RESPONSE_BYTES);
+        assert_eq!(writer.bytes.len(), MAX_RESPONSE_BYTES);
         let response = json_content(&"x".repeat(MAX_RESPONSE_BYTES));
         let Content::Raw { data, .. } = response else {
             panic!("expected raw JSON")

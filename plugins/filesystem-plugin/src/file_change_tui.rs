@@ -59,7 +59,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         chunk: &bcode_plugin_sdk::tui::PluginTuiArtifactChunk,
     ) -> Result<(), String> {
         self.deliver(
-            &bcode_tui_components::transcript::tool_visual::portable::PortableArtifactChunk {
+            &bcode_tui_components::plugin_visual::portable::PortableArtifactChunk {
                 invocation_id: &chunk.tool_call_id,
                 artifact_id: &chunk.artifact_id,
                 reference_key: &chunk.reference_key,
@@ -109,7 +109,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
 impl FileChangeTuiVisualAdapter {
     pub(super) fn deliver(
         &self,
-        chunk: &bcode_tui_components::transcript::tool_visual::portable::PortableArtifactChunk<'_>,
+        chunk: &bcode_tui_components::plugin_visual::portable::PortableArtifactChunk<'_>,
     ) -> Result<(), String> {
         let key = (
             chunk.invocation_id.to_owned(),
@@ -1018,7 +1018,7 @@ mod tests {
 #[cfg(test)]
 mod preview_identity_tests {
     use super::*;
-    use bcode_tui_components::transcript::tool_visual::portable::{
+    use bcode_tui_components::plugin_visual::portable::{
         PortableArtifactChunk, PortableVisualContext,
     };
 

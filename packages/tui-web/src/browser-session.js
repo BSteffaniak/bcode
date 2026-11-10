@@ -1,6 +1,14 @@
 // Browser platform glue only. Rust/BMUX remains the sole UI/compositor authority.
 class ControlOutcomeError extends Error {}
 
+// One history read answers with at most one 16 MiB canonical event (pages of several events
+// stay within 2 MiB); Rust re-checks the bound (`feed::MAX_HISTORY_RESPONSE_BYTES`).
+const HISTORY_RESPONSE_LIMIT = 16 * 1024 * 1024 + 64 * 1024;
+// Concurrent history reads of one mounted session. Browsers allow about six HTTP/1.1
+// connections per origin; with the live long-poll and the snapshot poll this leaves room for
+// submissions, controls and artifact reads.
+const MAX_HISTORY_READS = 2;
+
 /** Decode only explicitly admitted canonical image bytes; no URL or host access. */
 export async function decodeArtifactImage(bytes, contentType, environment = globalThis) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > 128 * 1024
@@ -270,7 +278,7 @@ function artifactPosition(json) {
 export async function mountBrowserSession({
   wasm, mountInteractiveSurface, container, canvas, sessionId, token,
   backendOrigin, allowedBackendOrigins = [], cellWidth = 9, cellHeight = 18,
-  fetch: fetchImpl = globalThis.fetch, pollMs = 1000, requestTimeoutMs = 15000,
+  fetch: fetchImpl = globalThis.fetch, pollMs = 1000, requestTimeoutMs = 15000, liveTimeoutMs = 30000,
   bindings = {}, recoveryState = {}, signal, capabilities = {}, onError = () => {}, onBackendResult = () => {},
   onState = () => {}, onSemantics = () => {},
 }) {
@@ -280,8 +288,9 @@ export async function mountBrowserSession({
   if (!/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(sessionId) || !token || token.length > 4096) {
     throw new Error('explicit session and launch token required');
   }
-  if (![cellWidth, cellHeight, pollMs, requestTimeoutMs].every(Number.isFinite)
-      || cellWidth < 1 || cellHeight < 1 || requestTimeoutMs < 1 || requestTimeoutMs > 60000) {
+  if (![cellWidth, cellHeight, pollMs, requestTimeoutMs, liveTimeoutMs].every(Number.isFinite)
+      || cellWidth < 1 || cellHeight < 1 || requestTimeoutMs < 1 || requestTimeoutMs > 60000
+      || liveTimeoutMs < 1 || liveTimeoutMs > 120000) {
     throw new Error('invalid browser session limits');
   }
   if (signal?.aborted) throw new Error('session mount aborted');
@@ -294,6 +303,10 @@ export async function mountBrowserSession({
   let columns = 0, rows = 0, lastSize;
   let painted = false, paintGeneration = 0, observationGeneration = 0, geometryGeneration = 0;
   let visualWork = null, visualDiscoveryQueued = false, visualBurst = 0;
+  // Transcript feed: engine history reads in flight (Rust claims them), the deadline timer
+  // and the live long-poll loop.
+  const historyReads = new Set();
+  let historyPumpQueued = false, deadlineTimer, liveBackoff = 0;
   function visualNow() { return BigInt(Math.floor(window.performance.now())); }
   function releaseVisual(work) {
     if (!work || work.settled || rust !== work.rust) return;
@@ -387,6 +400,8 @@ export async function mountBrowserSession({
       try { onSemantics(regions); } catch { /* observer */ }
       publishState();
       scheduleVisualArtifact();
+      scheduleHistoryReads();
+      scheduleDeadline();
     } catch (error) {
       painted = false;
       clearSemantics();
@@ -458,7 +473,9 @@ export async function mountBrowserSession({
     url.searchParams.set('token', token);
     return url;
   }
-  async function request(path, body, responseLimit = 2 * 1024 * 1024) {
+  // `envelopes`: hand typed error envelopes to Rust as the response instead of throwing
+  // (history reads: Rust decides which codes are retried and which degrade the transcript).
+  async function request(path, body, responseLimit = 2 * 1024 * 1024, timeoutMs = requestTimeoutMs, envelopes = false) {
     if (disposed) throw new Error('session disposed');
     if (body !== undefined && new TextEncoder().encode(body).byteLength > 65536) throw new Error('request too large');
     const requestController = new AbortController();
@@ -468,7 +485,7 @@ export async function mountBrowserSession({
     const aborted = new Promise((_, reject) => { rejectAbort = reject; });
     const onAbort = () => rejectAbort(new Error('session request interrupted; outcome may be unknown'));
     requestController.signal.addEventListener('abort', onAbort, { once: true });
-    const deadline = window.setTimeout(abort, requestTimeoutMs);
+    const deadline = window.setTimeout(abort, timeoutMs);
     try {
       return await Promise.race([(async () => {
         const response = await fetchImpl(endpoint(path), {
@@ -483,7 +500,7 @@ export async function mountBrowserSession({
         const json = await readBounded(response, responseLimit, requestController.signal);
         // Inspect only error envelopes; pass original observation/receipt bytes to Rust.
         const envelope = JSON.parse(json);
-        if (envelope.error !== undefined) throw new Error('backend rejected session request');
+        if (envelope.error !== undefined && !envelopes) throw new Error('backend rejected session request');
         return json;
       })(), aborted]);
     } finally {
@@ -517,13 +534,27 @@ export async function mountBrowserSession({
       rust = undefined;
       createRust();
       if (lastSize) resize(lastSize);
-      rust.accept_snapshot(json);
+      // The fresh instance has no policy installed: observe again with the complete policy
+      // unless this observation already carries one.
+      rust.accept_snapshot(JSON.parse(json).policy === undefined && typeof rust.policy_revision === 'function'
+        ? await request(snapshotPath()) : json);
       observationGeneration++;
     }
     if (!disposed) await present();
   }
+  // The policy carries the resolved theme (~160 KB): naming the installed revision lets the
+  // backend omit an unchanged policy from every poll.
+  function snapshotPath() {
+    const path = `/api/session-view/${sessionId}?transcript=omit`;
+    const revision = typeof rust.policy_revision === 'function' ? rust.policy_revision() : undefined;
+    if (revision == null) return path;
+    if (typeof revision !== 'string' || revision.length === 0 || revision.length > 128) throw new Error('invalid policy revision');
+    return `${path}&policy=${encodeURIComponent(revision)}`;
+  }
   async function refresh() {
-    await acceptObservation(await request(`/api/session-view/${sessionId}`));
+    // The engine owns the transcript (history pages and live input); the snapshot carries
+    // only non-transcript state.
+    await acceptObservation(await request(snapshotPath()));
     publishState();
   }
   function notify(type, json) {
@@ -531,15 +562,102 @@ export async function mountBrowserSession({
       try { onBackendResult({ type, json }); } catch { /* observer owns its failures */ }
     }
   }
-  async function loadHistory(direction) {
-    if (!['older', 'newer', 'tail'].includes(direction) || typeof rust.prepare_history !== 'function') throw new Error('history capability unavailable');
-    const body = rust.prepare_history(direction);
-    const json = await request('/api/session-view/history', body);
-    if (disposed) return;
-    if (typeof rust.accept_history !== 'function') throw new Error('history acceptance unavailable');
-    if (rust.accept_history(json, direction) !== false) observationGeneration++;
-    await present();
-    notify('history', json);
+  // Rust claims each bounded history read its engine requests need; JS only transports the
+  // opaque body and returns the original bytes. Reads run outside the serialized queue so
+  // input, resize and live batches are never blocked behind transport; answers are applied
+  // on the queue, and Rust drops claims it superseded.
+  function scheduleHistoryReads() {
+    if (disposed || historyPumpQueued || typeof rust.next_host_request !== 'function') return;
+    historyPumpQueued = true;
+    void enqueue(() => {
+      historyPumpQueued = false;
+      while (!disposed && historyReads.size < MAX_HISTORY_READS) {
+        const json = rust.next_host_request();
+        if (json == null) return;
+        if (typeof json !== 'string' || new TextEncoder().encode(json).byteLength > 128 * 1024) throw new Error('invalid history claim');
+        const read = JSON.parse(json);
+        if (!read || typeof read.claim !== 'string' || read.claim.length === 0 || read.claim.length > 32
+            || read.route !== '/api/session-view/history-page' || typeof read.body !== 'string') throw new Error('invalid history claim');
+        const owner = rust;
+        historyReads.add(read.claim);
+        void request(read.route, read.body, HISTORY_RESPONSE_LIMIT, requestTimeoutMs, true).then(response => enqueue(async () => {
+          if (disposed || rust !== owner) return;
+          let changed = false;
+          // Rust rejects only claims it superseded meanwhile; those are dropped silently.
+          try { changed = rust.accept_history_page(read.claim, response) === true; } catch { return; }
+          if (changed) await present();
+          else scheduleDeadline();
+        }), async () => {
+          // Rust schedules the retry with backoff; the deadline timer wakes for it.
+          if (!disposed && rust === owner) {
+            await enqueue(() => { rust.fail_history_page(read.claim); scheduleDeadline(); }).catch(() => {});
+          }
+        }).catch(() => { /* the queue already reported it */ }).finally(() => {
+          historyReads.delete(read.claim);
+          scheduleHistoryReads();
+        });
+      }
+    }).catch(() => { historyPumpQueued = false; });
+  }
+  // Engine timers (motion frames, paced live text, history retries) drive presentation.
+  function scheduleDeadline() {
+    if (disposed || typeof rust.next_deadline !== 'function') return;
+    window.clearTimeout(deadlineTimer);
+    deadlineTimer = undefined;
+    const wait = rust.next_deadline();
+    if (wait == null) return;
+    if (typeof wait !== 'number' || !Number.isFinite(wait) || wait < 0) throw new Error('invalid transcript deadline');
+    const owner = rust;
+    deadlineTimer = window.setTimeout(() => {
+      deadlineTimer = undefined;
+      void enqueue(async () => {
+        if (disposed || rust !== owner) return;
+        if (rust.advance() === true) await present();
+        else scheduleDeadline();
+        scheduleHistoryReads();
+      }).catch(() => {});
+    }, Math.min(60000, Math.max(0, Math.ceil(wait))));
+  }
+  // Live input long-poll with the Rust-owned resume cursor. A lost response re-polls the
+  // same cursor (exact replay); Rust turns a gap into a tail reload. Failures back off.
+  // A hidden tab holds no long-poll: browsers share about six HTTP/1.1 connections per
+  // origin across every tab of the launch. Resuming polls with the retained cursor; a cursor
+  // the backend no longer retains answers with a gap, which Rust turns into a tail reload.
+  const document = container.ownerDocument;
+  function whenVisible() {
+    if (disposed || document?.visibilityState !== 'hidden' || typeof document.addEventListener !== 'function') return Promise.resolve();
+    return new Promise(resolve => {
+      const finish = () => {
+        document.removeEventListener('visibilitychange', changed);
+        controller.signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const changed = () => { if (document.visibilityState !== 'hidden') finish(); };
+      document.addEventListener('visibilitychange', changed);
+      controller.signal.addEventListener('abort', finish, { once: true });
+    });
+  }
+  async function liveLoop() {
+    while (!disposed && typeof rust?.live_request === 'function') {
+      await whenVisible();
+      if (disposed) return;
+      let owner, body;
+      try {
+        await enqueue(() => { owner = rust; body = rust.live_request(); });
+        if (disposed || typeof body !== 'string') return;
+        const json = await request('/api/session-view/live', body, 2 * 1024 * 1024, liveTimeoutMs);
+        await enqueue(async () => {
+          if (disposed || rust !== owner) return;
+          if (rust.accept_live(json) === true) await present();
+          else scheduleHistoryReads();
+        });
+        liveBackoff = 0;
+      } catch {
+        if (disposed) return;
+        liveBackoff = Math.min(8000, Math.max(250, liveBackoff * 2));
+        await new Promise(resolve => { window.setTimeout(resolve, liveBackoff); });
+      }
+    }
   }
   async function control(actionJson) {
     if (typeof actionJson !== 'string' || new TextEncoder().encode(actionJson).byteLength > 65536
@@ -661,7 +779,6 @@ export async function mountBrowserSession({
           if (typeof intent.message !== 'string' || intent.message.length > 1024) throw new Error('invalid availability message');
           try { onError(intent.message); } catch { /* observer */ }
           break;
-        case 'history': await loadHistory(intent.direction); break;
         case 'producer':
         case 'control':
           if (typeof intent.action_json !== 'string') throw new Error('invalid control intent');
@@ -712,6 +829,7 @@ export async function mountBrowserSession({
     controller.abort();
     signal?.removeEventListener('abort', externalAbort);
     window.clearTimeout(timer);
+    window.clearTimeout(deadlineTimer);
     bridge?.dispose();
     try { capabilities.dispose?.(); } catch { /* platform cleanup cannot retain Rust */ }
     disposal = (async () => {
@@ -802,6 +920,7 @@ export async function mountBrowserSession({
     await enqueue(refresh);
     if (disposed) throw new Error('session mount aborted');
     schedule();
+    void liveLoop();
   } catch (error) {
     try { await dispose(); }
     catch (cleanupError) {
@@ -824,7 +943,6 @@ export async function mountBrowserSession({
       publishState();
     }),
     refresh: () => enqueue(refresh),
-    loadHistory: direction => enqueue(() => loadHistory(direction)),
     control: actionJson => enqueue(() => control(actionJson)),
     dispose,
   };

@@ -3,57 +3,19 @@
 //!
 //! The engine issues [`HostRequest`]s as data. The host turns each into one
 //! [`crate::effects::TuiEffect::LoadTranscriptV2History`] effect carrying a [`HistoryLoad`],
-//! which reads bounded canonical event ranges through the same daemon history API the V1
-//! effects use (`session_history_page`), and delivers a [`HistoryLoaded`] result stamped with
-//! the request's window generation. Turn alignment, generation fencing and incorporation are
-//! the engine's (W3, W4); this module only reads canonical events and validates their shape.
-//!
-//! Every request reads at most [`PageCaps::max_events_scanned`] canonical events
-//! ([`PageCaps::PAGE`] for pages, [`PageCaps::WINDOW`] for windows). The daemon bounds the
-//! payload of one read; item caps are applied by turn alignment in the engine.
-//!
-//! Reads map to the daemon's indexed, non-replaying history reads (session persistence
-//! architecture: normal history paths read bounded pages and never replay the event log):
-//!
-//! * `Tail`: one backward read from the newest event.
-//! * `Head`: one forward read from the session start.
-//! * `Around(sequence)`: one backward read ending at `sequence` and one forward read after it
-//!   (W8: half the window on each side before turn alignment).
-//! * `Older` / `Newer` pages: one read strictly before the first / after the last resident
-//!   sequence (the cursor).
-//! * `LiveState`: one forward read after the resident tail (W11).
-//!
-//! Window results always carry both session bounds (first and last available sequence) for the
-//! presentation-only position estimate (W12, X6). A bound the window read does not reach is
-//! read with one single-event probe at that end of the session (`limit = 1`, still an indexed
-//! bounded read), so a window in the middle of a long session places the scrollbar within the
-//! whole session instead of within the resident rows.
+//! and executes it with the engine crate's bounded history loader
+//! ([`bcode_tui_transcript::window::load_history`], shared with the browser host) over the
+//! daemon history API the V1 effects use (`session_history_page`). The result is delivered as a
+//! [`HistoryLoaded`] stamped with the request's window generation and the host attach epoch.
+//! Reads are bounded and non-replaying; see the loader for the exact reads per request.
 
 use std::future::Future;
 
 use bcode_client::ClientError;
-use bcode_session_models::{
-    SessionEvent, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId,
-};
+use bcode_session_models::{SessionHistoryPage, SessionHistoryQuery, SessionId};
 use bcode_tui_transcript::engine::HostRequest;
-use bcode_tui_transcript::window::{
-    HistoryPageResult, HistoryWindowResult, PageCaps, PageDirection, PageRequest, WindowRequest,
-};
-
-/// Concurrency lane of a history request: requests in one lane supersede each other, requests
-/// in different lanes run concurrently (W5: one page per direction, one replacement).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum HistoryLane {
-    /// `Older` pages.
-    Older,
-    /// `Newer` pages.
-    Newer,
-    /// `Head`, `Tail` and `Around` window replacements.
-    Window,
-    /// `LiveState` rehydration (W11).
-    LiveState,
-}
+pub use bcode_tui_transcript::window::{HistoryLane, HistoryLoaded};
+use bcode_tui_transcript::window::{HistoryLoadError, HistoryLoadRequest};
 
 /// One engine history request to execute for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,33 +36,12 @@ impl HistoryLoad {
     /// Lane the request runs in.
     #[must_use]
     pub const fn lane(&self) -> HistoryLane {
-        match self.request {
-            HostRequest::Page(issued) => match issued.request {
-                PageRequest::Older { .. } => HistoryLane::Older,
-                PageRequest::Newer { .. } => HistoryLane::Newer,
-            },
-            HostRequest::Window(issued) => match issued.request {
-                WindowRequest::LiveState => HistoryLane::LiveState,
-                WindowRequest::Around { .. } | WindowRequest::Head | WindowRequest::Tail => {
-                    HistoryLane::Window
-                }
-            },
-        }
+        HistoryLane::of(&self.request)
     }
 }
 
-/// A loaded history request, ready for the engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HistoryLoaded {
-    /// A page result ([`bcode_tui_transcript::engine::TranscriptEngine::apply_page`]).
-    Page(HistoryPageResult),
-    /// A window result ([`bcode_tui_transcript::engine::TranscriptEngine::apply_window`]).
-    Window(HistoryWindowResult),
-}
-
-/// Execute `load` with `read`: one bounded canonical history read per page (two for
-/// `Around`, one on each side of the target), plus one single-event probe for each session
-/// bound a window read does not reach (module documentation).
+/// Execute `load` with `read` through the shared bounded loader
+/// ([`bcode_tui_transcript::window::load_history`]).
 ///
 /// `read` performs `session_history_page` for `load.session_id` (a daemon client or a managed
 /// session command handle).
@@ -111,224 +52,34 @@ pub enum HistoryLoaded {
 /// * [`ClientError::Protocol`] if a page belongs to another session, contains events of another
 ///   session, is not in strictly ascending sequence order, lies outside the requested range,
 ///   or reports more history without returning any.
-pub async fn load_history<F, Fut>(
-    load: HistoryLoad,
-    mut read: F,
-) -> Result<HistoryLoaded, ClientError>
+pub async fn load_history<F, Fut>(load: HistoryLoad, read: F) -> Result<HistoryLoaded, ClientError>
 where
     F: FnMut(SessionHistoryQuery) -> Fut,
     Fut: Future<Output = Result<SessionHistoryPage, ClientError>>,
 {
-    let mut read = Reader {
-        read: &mut read,
+    let request = HistoryLoadRequest {
         session_id: load.session_id,
+        request: load.request,
+        resident_last: load.resident_last,
     };
-    match load.request {
-        HostRequest::Page(issued) => {
-            let caps = PageCaps::PAGE.max_events_scanned;
-            let (direction, page) = match issued.request {
-                PageRequest::Older { before_sequence } => {
-                    let page = match before_sequence.checked_sub(1) {
-                        Some(last) => read.range(Some(last), caps, Backward).await?,
-                        None => EventRange::default(),
-                    };
-                    (PageDirection::Older, page)
-                }
-                PageRequest::Newer { after_sequence } => {
-                    let first = after_sequence.saturating_add(1);
-                    (
-                        PageDirection::Newer,
-                        read.range(Some(first), caps, Forward).await?,
-                    )
-                }
-            };
-            Ok(HistoryLoaded::Page(HistoryPageResult {
-                generation: issued.generation,
-                direction,
-                events: page.events,
-                has_more: page.has_more,
-                unaligned: false,
-            }))
-        }
-        HostRequest::Window(issued) => {
-            let caps = PageCaps::WINDOW.max_events_scanned;
-            let (events, has_older, has_newer) = match issued.request {
-                WindowRequest::Tail => {
-                    let page = read.range(None, caps, Backward).await?;
-                    (page.events, page.has_more, false)
-                }
-                WindowRequest::Head => {
-                    let page = read.range(None, caps, Forward).await?;
-                    (page.events, false, page.has_more)
-                }
-                WindowRequest::Around { sequence } => {
-                    let half = caps / 2;
-                    let older = read.range(Some(sequence), half, Backward).await?;
-                    let after = Some(sequence.saturating_add(1));
-                    let newer = read.range(after, caps - half, Forward).await?;
-                    let mut events = older.events;
-                    events.extend(newer.events);
-                    (events, older.has_more, newer.has_more)
-                }
-                WindowRequest::LiveState => {
-                    let page = match load.resident_last {
-                        Some(last) => {
-                            read.range(Some(last.saturating_add(1)), caps, Forward)
-                                .await?
-                        }
-                        None => EventRange::default(),
-                    };
-                    return Ok(HistoryLoaded::Window(HistoryWindowResult {
-                        generation: issued.generation,
-                        target: issued.request,
-                        last_available_sequence: (!page.has_more)
-                            .then(|| page.events.last().map(|event| event.sequence))
-                            .flatten(),
-                        events: page.events,
-                        has_older: false,
-                        has_newer: page.has_more,
-                        first_available_sequence: None,
-                    }));
-                }
-            };
-            let first_available_sequence = if has_older {
-                read.edge(Forward).await?
-            } else {
-                events.first().map(|event| event.sequence)
-            };
-            let last_available_sequence = if has_newer {
-                read.edge(Backward).await?
-            } else {
-                events.last().map(|event| event.sequence)
-            };
-            Ok(HistoryLoaded::Window(window_result(
-                issued.generation,
-                issued.request,
-                events,
-                (has_older, has_newer),
-                (first_available_sequence, last_available_sequence),
-            )))
-        }
-    }
-}
-
-use SessionHistoryDirection::{Backward, Forward};
-
-/// Canonical events of one validated read.
-#[derive(Debug, Default)]
-struct EventRange {
-    events: Vec<SessionEvent>,
-    has_more: bool,
-}
-
-/// Bounded canonical reads of one session.
-struct Reader<'a, F> {
-    read: &'a mut F,
-    session_id: SessionId,
-}
-
-impl<F, Fut> Reader<'_, F>
-where
-    F: FnMut(SessionHistoryQuery) -> Fut,
-    Fut: Future<Output = Result<SessionHistoryPage, ClientError>>,
-{
-    /// One bounded canonical read starting at `cursor` (inclusive) in `direction`, validated
-    /// and returned in ascending order.
-    async fn range(
-        &mut self,
-        cursor: Option<u64>,
-        limit: usize,
-        direction: SessionHistoryDirection,
-    ) -> Result<EventRange, ClientError> {
-        let session_id = self.session_id;
-        let page = (self.read)(SessionHistoryQuery {
-            cursor: cursor.map(|sequence| SessionHistoryCursor { sequence }),
-            limit: limit.max(1),
-            direction,
+    bcode_tui_transcript::window::load_history(request, read)
+        .await
+        .map_err(|error| match error {
+            HistoryLoadError::Read(error) => error,
+            inconsistent @ HistoryLoadError::InconsistentPage => {
+                ClientError::Protocol(inconsistent.to_string())
+            }
         })
-        .await?;
-        let in_range = |sequence: u64| {
-            cursor.is_none_or(|cursor| match direction {
-                Forward => sequence >= cursor,
-                Backward => sequence <= cursor,
-            })
-        };
-        if page.session_id != session_id
-            || page
-                .events
-                .iter()
-                .any(|event| event.session_id != session_id || !in_range(event.sequence))
-            || page
-                .events
-                .windows(2)
-                .any(|pair| pair[0].sequence >= pair[1].sequence)
-            || (page.has_more && page.events.is_empty())
-        {
-            return Err(ClientError::Protocol(
-                "inconsistent transcript history page".to_owned(),
-            ));
-        }
-        Ok(EventRange {
-            events: page.events,
-            has_more: page.has_more,
-        })
-    }
-
-    /// The sequence at one end of the session (`Forward`: first, `Backward`: last), read with
-    /// a single-event probe; `None` for an empty session.
-    async fn edge(
-        &mut self,
-        direction: SessionHistoryDirection,
-    ) -> Result<Option<u64>, ClientError> {
-        let probe = self.range(None, 1, direction).await?;
-        Ok(probe.events.first().map(|event| event.sequence))
-    }
-}
-
-/// A window result with its session bounds (W12 hints). A bound is never inside the returned
-/// events: a probe that raced a concurrent append or disagrees with the window is widened to
-/// the window's own edge, since the estimate is presentation only.
-fn window_result(
-    generation: u64,
-    target: WindowRequest,
-    events: Vec<SessionEvent>,
-    (has_older, has_newer): (bool, bool),
-    (first, last): (Option<u64>, Option<u64>),
-) -> HistoryWindowResult {
-    let window_first = events.first().map(|event| event.sequence);
-    let window_last = events.last().map(|event| event.sequence);
-    let first_available_sequence = match (first, window_first) {
-        (Some(first), Some(window)) => Some(first.min(window)),
-        (first, window) => first.or(window),
-    };
-    let last_available_sequence = match (last, window_last) {
-        (Some(last), Some(window)) => Some(last.max(window)),
-        (last, window) => last.or(window),
-    };
-    HistoryWindowResult {
-        generation,
-        target,
-        events,
-        has_older,
-        has_newer,
-        first_available_sequence,
-        last_available_sequence,
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use bcode_client::ClientError;
     use bcode_session_models::{
-        SessionEvent, SessionEventKind, SessionHistoryDirection, SessionHistoryPage,
-        SessionHistoryQuery, SessionId,
+        SessionEvent, SessionEventKind, SessionHistoryPage, SessionHistoryQuery, SessionId,
     };
     use bcode_tui_transcript::engine::HostRequest;
-    use bcode_tui_transcript::window::{
-        IssuedRequest, PageCaps, PageDirection, PageRequest, WindowRequest,
-    };
+    use bcode_tui_transcript::window::{IssuedRequest, PageRequest, WindowRequest};
 
     use super::{HistoryLane, HistoryLoad, HistoryLoaded, load_history};
 
@@ -345,287 +96,61 @@ mod tests {
         }
     }
 
-    /// A daemon double over sequences `first..=last`, recording every query.
-    struct Daemon {
-        session_id: SessionId,
-        first: u64,
-        last: u64,
-        queries: RefCell<Vec<SessionHistoryQuery>>,
-    }
-
-    impl Daemon {
-        fn new(last: u64) -> Self {
-            Self::spanning(1, last)
-        }
-
-        fn spanning(first: u64, last: u64) -> Self {
-            Self {
-                session_id: SessionId::new(),
-                first,
-                last,
-                queries: RefCell::new(Vec::new()),
-            }
-        }
-
-        /// Every query was bounded by the window caps; returns the number of reads.
-        fn bounded_reads(&self) -> usize {
-            let queries = self.queries.borrow();
-            assert!(
-                queries
-                    .iter()
-                    .all(|query| query.limit <= PageCaps::WINDOW.max_events_scanned),
-                "{queries:?}"
-            );
-            queries.len()
-        }
-
-        fn read(&self, query: SessionHistoryQuery) -> SessionHistoryPage {
-            self.queries.borrow_mut().push(query);
-            let all = (self.first..=self.last).collect::<Vec<_>>();
-            let selected: Vec<u64> = match query.direction {
-                SessionHistoryDirection::Forward => all
-                    .into_iter()
-                    .filter(|sequence| {
-                        query
-                            .cursor
-                            .is_none_or(|cursor| *sequence >= cursor.sequence)
-                    })
-                    .collect(),
-                SessionHistoryDirection::Backward => {
-                    let mut selected: Vec<u64> = all
-                        .into_iter()
-                        .rev()
-                        .filter(|sequence| {
-                            query
-                                .cursor
-                                .is_none_or(|cursor| *sequence <= cursor.sequence)
-                        })
-                        .collect();
-                    selected.truncate(query.limit + 1);
-                    selected.reverse();
-                    let has_more = selected.len() > query.limit;
-                    if has_more {
-                        selected.remove(0);
-                    }
-                    return self.page(selected, has_more);
-                }
-            };
-            let has_more = selected.len() > query.limit;
-            self.page(selected.into_iter().take(query.limit).collect(), has_more)
-        }
-
-        fn page(&self, sequences: Vec<u64>, has_more: bool) -> SessionHistoryPage {
-            SessionHistoryPage {
-                session_id: self.session_id,
-                events: sequences
-                    .into_iter()
-                    .map(|sequence| event(self.session_id, sequence))
-                    .collect(),
-                compatibility_issues: Vec::new(),
-                next_cursor: None,
-                has_more,
-            }
-        }
-
-        fn load(&self, request: HostRequest, resident_last: Option<u64>) -> HistoryLoaded {
-            let load = HistoryLoad {
-                session_id: self.session_id,
-                request,
-                resident_last,
-                epoch: 0,
-            };
-            block_on(load_history(load, |query| {
-                std::future::ready(Ok(self.read(query)))
-            }))
-            .expect("history loads")
-        }
-    }
-
-    fn window(request: WindowRequest) -> HostRequest {
-        HostRequest::Window(IssuedRequest {
-            generation: 7,
-            request,
-        })
-    }
-
-    fn page(request: PageRequest) -> HostRequest {
-        HostRequest::Page(IssuedRequest {
-            generation: 7,
-            request,
-        })
-    }
-
-    fn sequences(events: &[SessionEvent]) -> (u64, u64, usize) {
-        (
-            events.first().map_or(0, |event| event.sequence),
-            events.last().map_or(0, |event| event.sequence),
-            events.len(),
-        )
-    }
-
-    #[test]
-    fn tail_window_reads_one_bounded_window_ending_at_the_latest_event() {
-        let daemon = Daemon::new(2_000);
-        let HistoryLoaded::Window(result) = daemon.load(window(WindowRequest::Tail), None) else {
-            panic!("window result");
-        };
-        assert_eq!(result.generation, 7);
-        assert_eq!(result.target, WindowRequest::Tail);
-        assert_eq!(sequences(&result.events), (1_489, 2_000, 512));
-        assert!(result.has_older);
-        assert!(!result.has_newer);
-        assert_eq!(result.last_available_sequence, Some(2_000));
-        assert_eq!(
-            result.first_available_sequence,
-            Some(1),
-            "session start probed"
-        );
-        assert_eq!(
-            daemon.bounded_reads(),
-            2,
-            "one window read and one bound probe"
-        );
-        let probe = daemon.queries.borrow()[1];
-        assert_eq!(
-            (probe.cursor, probe.limit, probe.direction),
-            (None, 1, SessionHistoryDirection::Forward)
-        );
-    }
-
-    #[test]
-    fn window_bounds_are_the_session_bounds_not_the_resident_edges() {
-        let daemon = Daemon::spanning(101, 5_000);
-        let HistoryLoaded::Window(tail) = daemon.load(window(WindowRequest::Tail), None) else {
-            panic!("window result");
-        };
-        assert_eq!(
-            (tail.first_available_sequence, tail.last_available_sequence),
-            (Some(101), Some(5_000))
-        );
-        let HistoryLoaded::Window(head) = daemon.load(window(WindowRequest::Head), None) else {
-            panic!("window result");
-        };
-        assert_eq!(sequences(&head.events), (101, 612, 512));
-        assert_eq!(
-            (head.first_available_sequence, head.last_available_sequence),
-            (Some(101), Some(5_000))
-        );
-        let HistoryLoaded::Window(around) =
-            daemon.load(window(WindowRequest::Around { sequence: 2_500 }), None)
-        else {
-            panic!("window result");
-        };
-        assert_eq!(
-            (
-                around.first_available_sequence,
-                around.last_available_sequence
-            ),
-            (Some(101), Some(5_000))
-        );
-        // Tail: window + start probe; Head: window + end probe; Around: two halves + two
-        // probes. No read scans more than one window.
-        assert_eq!(daemon.bounded_reads(), 2 + 2 + 4);
-    }
-
-    #[test]
-    fn a_window_reaching_both_session_ends_needs_no_probe() {
-        let daemon = Daemon::new(40);
-        let HistoryLoaded::Window(result) = daemon.load(window(WindowRequest::Tail), None) else {
-            panic!("window result");
-        };
-        assert_eq!(
-            (
-                result.first_available_sequence,
-                result.last_available_sequence
-            ),
-            (Some(1), Some(40))
-        );
-        assert_eq!(daemon.bounded_reads(), 1);
-    }
-
-    #[test]
-    fn head_window_starts_at_the_session_start() {
-        let daemon = Daemon::new(2_000);
-        let HistoryLoaded::Window(result) = daemon.load(window(WindowRequest::Head), None) else {
-            panic!("window result");
-        };
-        assert_eq!(sequences(&result.events), (1, 512, 512));
-        assert!(!result.has_older);
-        assert!(result.has_newer);
-        assert_eq!(result.first_available_sequence, Some(1));
-        assert_eq!(
-            result.last_available_sequence,
-            Some(2_000),
-            "session end probed"
-        );
-    }
-
-    #[test]
-    fn around_window_is_centered_on_the_target_sequence() {
-        let daemon = Daemon::new(2_000);
-        let HistoryLoaded::Window(result) =
-            daemon.load(window(WindowRequest::Around { sequence: 1_000 }), None)
-        else {
-            panic!("window result");
-        };
-        assert_eq!(sequences(&result.events), (745, 1_256, 512));
-        assert!(result.events.iter().any(|event| event.sequence == 1_000));
-        assert!(result.has_older && result.has_newer);
-    }
-
-    #[test]
-    fn pages_read_strictly_beyond_the_resident_edges() {
-        let daemon = Daemon::new(2_000);
-        let HistoryLoaded::Page(older) = daemon.load(
-            page(PageRequest::Older {
-                before_sequence: 1_000,
+    fn tail(session_id: SessionId) -> HistoryLoad {
+        HistoryLoad {
+            session_id,
+            request: HostRequest::Window(IssuedRequest {
+                generation: 7,
+                request: WindowRequest::Tail,
             }),
-            None,
-        ) else {
-            panic!("page result");
-        };
-        assert_eq!(older.direction, PageDirection::Older);
-        assert_eq!(sequences(&older.events), (488, 999, 512));
-        assert!(older.has_more);
-        let HistoryLoaded::Page(newer) = daemon.load(
-            page(PageRequest::Newer {
-                after_sequence: 1_800,
-            }),
-            None,
-        ) else {
-            panic!("page result");
-        };
-        assert_eq!(sequences(&newer.events), (1_801, 2_000, 200));
-        assert!(!newer.has_more);
-        let HistoryLoaded::Page(start) =
-            daemon.load(page(PageRequest::Older { before_sequence: 0 }), None)
-        else {
-            panic!("page result");
-        };
-        assert!(start.events.is_empty() && !start.has_more);
+            resident_last: None,
+            epoch: 0,
+        }
     }
 
     #[test]
-    fn live_state_reads_events_after_the_resident_tail() {
-        let daemon = Daemon::new(40);
-        let HistoryLoaded::Window(result) = daemon.load(window(WindowRequest::LiveState), Some(30))
-        else {
+    fn daemon_pages_load_through_the_shared_loader() {
+        let session_id = SessionId::new();
+        let mut queries = Vec::new();
+        let loaded = block_on(load_history(
+            tail(session_id),
+            |query: SessionHistoryQuery| {
+                queries.push(query);
+                std::future::ready(Ok(SessionHistoryPage {
+                    session_id,
+                    events: vec![event(session_id, 1), event(session_id, 2)],
+                    compatibility_issues: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                }))
+            },
+        ))
+        .expect("history loads");
+        let HistoryLoaded::Window(window) = loaded else {
             panic!("window result");
         };
-        assert_eq!(result.target, WindowRequest::LiveState);
-        assert_eq!(sequences(&result.events), (31, 40, 10));
+        assert_eq!((window.generation, window.events.len()), (7, 2));
+        assert_eq!(
+            queries.len(),
+            1,
+            "a window reaching both ends needs no probe"
+        );
     }
 
     #[test]
     fn requests_run_in_their_lane() {
         let lane = |request| {
             HistoryLoad {
-                session_id: SessionId::new(),
                 request,
-                resident_last: None,
-                epoch: 0,
+                ..tail(SessionId::new())
             }
             .lane()
+        };
+        let page = |request| {
+            HostRequest::Page(IssuedRequest {
+                generation: 7,
+                request,
+            })
         };
         assert_eq!(
             lane(page(PageRequest::Older { before_sequence: 9 })),
@@ -635,23 +160,13 @@ mod tests {
             lane(page(PageRequest::Newer { after_sequence: 9 })),
             HistoryLane::Newer
         );
-        assert_eq!(lane(window(WindowRequest::Head)), HistoryLane::Window);
-        assert_eq!(
-            lane(window(WindowRequest::LiveState)),
-            HistoryLane::LiveState
-        );
+        assert_eq!(lane(tail(SessionId::new()).request), HistoryLane::Window);
     }
 
     #[test]
-    fn foreign_or_unordered_pages_are_rejected() {
+    fn inconsistent_pages_and_read_failures_are_client_errors() {
         let session_id = SessionId::new();
-        let load = HistoryLoad {
-            session_id,
-            request: window(WindowRequest::Tail),
-            resident_last: None,
-            epoch: 0,
-        };
-        let foreign = block_on(load_history(load, |_| {
+        let foreign = block_on(load_history(tail(session_id), |_| {
             let other = SessionId::new();
             std::future::ready(Ok(SessionHistoryPage {
                 session_id: other,
@@ -662,16 +177,10 @@ mod tests {
             }))
         }));
         assert!(matches!(foreign, Err(ClientError::Protocol(_))));
-        let unordered = block_on(load_history(load, |_| {
-            std::future::ready(Ok(SessionHistoryPage {
-                session_id,
-                events: vec![event(session_id, 2), event(session_id, 1)],
-                compatibility_issues: Vec::new(),
-                next_cursor: None,
-                has_more: false,
-            }))
+        let failed = block_on(load_history(tail(session_id), |_| {
+            std::future::ready(Err(ClientError::UnexpectedResponse))
         }));
-        assert!(matches!(unordered, Err(ClientError::Protocol(_))));
+        assert!(matches!(failed, Err(ClientError::UnexpectedResponse)));
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

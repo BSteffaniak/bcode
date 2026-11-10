@@ -312,9 +312,12 @@ impl TranscriptV2Host {
 
     /// Continuity was re-established after the event stream was lost: a live window reloads
     /// the tail (W10), which also rehydrates in-flight live state; a detached window loads
-    /// newer history on demand and needs nothing. Returns whether a request was issued.
+    /// newer history on demand, and a `Newer` page or live-state read in flight rehydrates
+    /// instead of going live with inputs buffered across the loss (W11). Returns whether a
+    /// request was issued.
     pub(super) fn resynchronize(&mut self, at: Instant) -> bool {
         if self.engine.window().mode != WindowMode::Live {
+            let _ = self.engine.interrupt_live_buffer();
             return false;
         }
         self.data.held.clear();

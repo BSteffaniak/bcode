@@ -131,6 +131,8 @@ Paths are relative to `packages/tui/src` unless noted. Rule identifiers refer to
 | Engine resolution, V2 host wiring | `bcode_tui` modules `engine_selection` and `transcript_v2_host` | Host owns I/O (client calls for pages), effects and startup. |
 | CLI flag | `bcode_cli` root `Cli` struct | Existing global flags live there. |
 | Engine-neutral scenario suite | `bcode_tui` `cfg(test)` module `transcript_scenarios` (definitions, runner, V1 driver; V2 driver from phase 2). Status manifest: [`tui-v2-scenarios.md`](tui-v2-scenarios.md). | The V1 driver needs crate-internal access, and host-owned scenarios (composer typing, clipboard, configuration reload) need the host. Until phase 4 wires V2 into the host, such scenarios are ignored for V2 with `#[ignore = "V2 pending phase 4: <capability>"]`. |
+| Browser host | `bcode_tui_web` (`transcript`, `history`, `visuals`, `image`, `feed`, `surface`, `wasm`), feed routes in `bcode_hyperchad::browser_api` (`history_page`, `live`) | The browser embeds the engine like the native host and owns its I/O (section 3.7). The wire types are transport only; the payloads are the engine's canonical inputs, so no `_models` crate is involved. |
+| Plugin visual contract | `bcode_tui_components` feature `plugin-visual`, module `plugin_visual` (`canonical` adapter input, `output` rows/images/actions, `action` intents, `portable` static adapter registry) | One BMUX-boundary contract shared by the native and browser hosts and by statically linked producer adapters, independent of either transcript engine. It carries BMUX types, so it is not the `bcode.tui-visual-adapter` ABI (E2) and never reaches portable model contracts. |
 | BMUX patch and Cargo.lock guard | `xtask/src/bmux_lock.rs`, run by `cargo xtask bmux-lock-check` and first by `cargo run -p xtask -- architecture` | Existing repository validation home. |
 
 No `_models` crate is created for V2: no other package needs V2 types without the
@@ -140,7 +142,8 @@ resurrection) lives in `bcode_tui_transcript::navigation`.
 The engine is `Send`; retained items use Send-capable BMUX elements (`SyncElement` and containers over `dyn Component + Send + Sync`, so producer parts can be shared through `Arc`).
 
 `bcode_tui_transcript` dependencies: `bcode_session_view`, `bcode_session_view_models`,
-`bcode_presentation_policy`, `bcode_tui_theme`, `bcode_tui_components` (pure recipes only),
+`bcode_presentation_policy`, `bcode_tui_theme`, `bcode_tui_components` (pure recipes and the
+`plugin-visual` contract only),
 `bmux_tui`, `bmux_tui_components` (features `virtual-list`, `scroll-view`, `disclosure`, and
 others as used), `bmux_tui_runtime` (types only), `bmux_markdown`. It must not depend on
 `bcode_tui`, `bcode_client` or `bcode_ipc` other than through `bcode_session_view` (A5).
@@ -297,7 +300,7 @@ pub struct PaintInputs<'a> { pub clock: FrameClock, pub focus: Option<&'a Focuse
 | L5 | Focus highlight, selection highlight, spinner/elapsed labels, glow phases and boundary-unit state are paint-only: they change paint revision, not layout revision, and are applied by BMUX style overlays, not span splitting. |
 | L6 | Rows, source mappings, focus targets, hit regions and selection fragments come from the same retained layout (B3, B6, B12). Nothing is re-wrapped or re-measured after measurement. |
 | L7 | Markdown: one accepted projection per resident item, consumed by rows, anchors, focus, hits and images; installed only on exact id/revision/options match (D2). See ambiguity 1. |
-| L8 | Asynchronous visuals (Mermaid, images, plugin adapters) reserve explicit placeholder rows; acceptance is an item revision. Plugin adapters run outside drawing (D9). |
+| L8 | Asynchronous visuals (Mermaid, images, plugin adapters) reserve explicit placeholder rows; acceptance is an item revision. Plugin adapters run outside drawing (D9). An accepted plugin visual (`AcceptedPluginVisual`) carries its rows with everything measured with them: anchors and selection rows (`VisualCorrespondence`), adapter-local image placements and action regions. One acceptance revision covers every part and alone enters the fingerprint (L3). Images are placed from the retained rows that show them, clipped to their cells; action regions become `ItemAction::Visual { adapter, revision, id }` hit regions over their visible cells (E2, E3). |
 | L9 | Every resident unit has an exact height at the current width before the update that made it resident returns (rule W3). Width change re-measures resident units; anchors survive via P1/P3. |
 
 How the session's presentation features plug in:
@@ -307,7 +310,7 @@ How the session's presentation features plug in:
 | Structure v2 (groups, sections, visibility floor, disclosure targets) | `units` (group/marker units) + `ItemRenderContext::structure` + `DisclosureState`; disclosure targets are focus targets (BMUX 12). |
 | Themes and profiles | `ItemRenderContext::theme`; theme change = new fingerprint for every unit (full damage, structural). |
 | Chrome (borders via `LineFrame`, speaker, surfaces, separators, density, icons, motion) | Producers wrap content with BMUX `LineFrame` using theme chrome; motion feeds `ScrollMotion` duration (0 under reduce-motion). |
-| Plugin visuals | Accepted rows in `PluginVisualState`, renderer-neutral fallback otherwise (A8, E1–E5). |
+| Plugin visuals | Accepted visuals (rows, correspondence, images, actions) in `PluginVisualState`, renderer-neutral fallback otherwise (A8, E1–E5, E10). |
 
 ### 3.4 Viewport (`viewport`)
 
@@ -347,6 +350,31 @@ assistant segment reveal, overflow handoff); it emits intents into the same redu
 | Inputs | Engine state (read-only), one `FrameClock`, chat-screen rect, composer/status components from the host. |
 | Outputs | `FrameSnapshot`, painted cells and metadata, damage regions. |
 | Invariants | F1–F7 (section 9). |
+
+### 3.7 Browser host (`bcode_tui_web`)
+
+`bcode web` runs the same engine in the browser: `bcode_tui_web` builds for
+`wasm32-unknown-unknown`, paints BMUX cells to a Canvas through `bmux_web_renderer`, and is
+served by `bcode_hyperchad`. The browser host owns what the native host owns (I/O, frames,
+render inputs, the shell chrome) and nothing the engine owns; there is no second transcript
+engine and no browser-side transcript projection.
+
+| Aspect | Contract |
+|---|---|
+| Transcript input | Live: a long poll of `POST /api/session-view/live` with a resume cursor `{epoch, offset}` the WASM side owns. The first poll subscribes (no cursor, `start`); the host attaches only after it, so nothing between subscription and the tail window is lost (durable duplicates are dropped by sequence, A13). `continuous` batches are applied in order; re-polling an older cursor after a lost response replays the same inputs. `gap` (backend reattachment, resync, retention exceeded) reloads the tail of a live window (W10), as native resynchronization does; a gap while a window replacement is in flight drops the held input and reloads the tail if the replacement lands live; a gap while a detached window's last `Newer` page or `LiveState` read is in flight interrupts its live buffer (`TranscriptEngine::interrupt_live_buffer`), so the window rehydrates live state instead of going live across the gap (W11; the native host does the same on resynchronization). Live input is held while a window replacement is in flight (W3). A hidden tab holds no long poll (browsers share about six HTTP/1.1 connections per origin across tabs); it resumes with its cursor when shown. |
+| History requests | Every engine `HostRequest` runs the shared bounded loader (`bcode_tui_transcript::window::load_history`, the native host's implementation) as a suspended job. Each read the loader makes is one claim `{claim, route, body}` the JavaScript host posts verbatim to `POST /api/session-view/history-page` (at most `PageCaps::WINDOW` events) and answers with the original response bytes. One job per lane (`HistoryLane`) supersedes older ones; stale claims are rejected. A failed or inconsistent read leaves the request unanswered and is re-issued with backoff while the engine still awaits it, as natively. Reads are also bounded by bytes: the route cuts a page to the events nearest its cursor that fit 2 MiB less an envelope reserve and reports more history (`has_more`, `next_cursor`), so the loader pages on; the nearest event alone may travel in one response of up to 16 MiB, and a larger one is the typed `history_event_too_large` error, which degrades the transcript with a visible notice instead of retrying. Typed error envelopes reach the WASM side as answers; only transport failures release a claim. At most two reads per mounted session run at once, and the server admits history reads and live polls per session and in total, so one session's tabs cannot starve another's. The server runs no loader and depends on no TUI crate (portable presentation check). |
+| Snapshot for chrome | `GET /api/session-view/{id}?transcript=omit` carries only non-transcript state (permissions, interactions, queue, runtime and model status, lifecycle, window bounds) and the effective presentation policy. The request names the installed policy revision (`&policy=<revision>`); the backend then omits the unchanged policy (it embeds the resolved theme) and states only `policy_revision`. Artifact ranges name the item's canonical artifact identity, because the observed snapshot holds no items. |
+| Render inputs | The exported `ResolvedThemeDefinition` (policy `theme`, the empty default when absent, as natively), the theme's policy layers for structure, browser-owned `<details>` state, and accepted plugin visuals. Plugin visuals come from the statically linked portable adapters (`plugin_visual::portable`) routed outside drawing at the unit's body width and accepted with rows, correspondence, images and action regions (L8, E10); a decoded artifact image is an accepted visual of reserved rows with one placement, fenced by item, item revision and body width. The flat policy styles carry only chrome roles. The policy's `transcript` part carries what the native host applies from the same configuration: reasoning visibility (`[tui.thinking]`, `hidden` hides reasoning units through the structure policy layers), the live-text streaming policy (`[presentation.streaming]`) and reduced motion. |
+| Frames and input | Prepare (outside paint): local rows, the inline interaction reservation (`set_inline_interaction`), visuals and render configuration, and the transcript region size from the chrome layout. Paint: `prepare_frame` at the paint clock, `paint_frame`, `paint_selection`, item hit regions, the latest bar, then the question surface over `inline_interaction_placement` or pinned. Pointer activation resolves only against the committed frame (`committed_frame` matches the frame whose regions were hit) and only while no preparation happened since the commit; selection endpoints resolve against the committed selection scene. `ItemAction::Visual` hits are resolved with `TranscriptEngine::visual_action` and pass the browser's capability policy (navigation, clipboard, artifact viewing; producer controls are unavailable). |
+| Timers | Engine timers, paced live text and history retries are exposed as one deadline; the JavaScript host advances and presents when it fires. |
+| Submissions | The browser's one unresolved submission is a local row (LR1); a verified receipt keeps it until its message is incorporated and then reduces `SubmissionAccepted` for the accepted unit (T2, T27). |
+
+WASM build constraints: the engine and `bcode_session_view` use `web_time::Instant` (a real
+clock on `wasm32-unknown-unknown`, std on native); `bcode_session_view` builds without its
+`client` feature; `bcode_tui_transcript` and `bcode_tui_web` (feature `wasm`) must not resolve
+`bcode_client`, `bcode_plugin_sdk` or `bcode_provider_auth` (xtask architecture profiles).
+`scripts/build-tui-web.sh` builds the release bundle for `wasm32-unknown-unknown` with the
+pinned C toolchain (tree-sitter grammars) and the locked `wasm-bindgen`.
 
 ---
 
@@ -521,7 +549,7 @@ pub enum ScrollTarget { ItemTop(UnitKey), ItemBottom(UnitKey), LatestBottom, Anc
 | W8 | Timeline (`Around`) windows are aligned to whole turns and sized ≤ 512 events total (256 before / 256 after before alignment), so the first newer or older page never triggers eviction. |
 | W9 | Evicting the tail side in `Live` mode switches to `Detached` and discards live-only and streaming items (SD3). Returning uses `Window(Tail)`, the W10 tail request that V2 session attach also uses, which also rehydrates in-flight live state. |
 | W10 | `JumpToSessionStart` and `JumpToLatest` load `Window(Head)` / `Window(Tail)` directly with one request when the target is not resident; they never page through intermediate history. `Head`, `Tail` and `Around` share one window request shape: turn-aligned, ≤ 512 events scanned, ≤ 64 items, ≤ 512 KiB, filled until `viewport_height + prefetch_rows` rows are covered where the session allows (`Around` is centered per W8). V2 session attach uses the same `Tail` request; V1's attach request (12–64 items, 2,048 events scanned) is not reused. |
-| W11 | Transition `Detached → Live` happens when a newer page reports no more history. From the moment a `Newer` request is issued, the engine buffers live transcript events (bounded: 512 events or 512 KiB; overflow marks the buffer overflowed and stops buffering). When the page reports `has_newer = false`, the engine switches to `Live` in the same update and applies buffered events with sequence > the newest resident sequence, plus buffered live-only events, in arrival order. If the buffer overflowed, or a live-only stream was already in flight when the request was issued (W2 newer-activity), it issues `Window(LiveState)` instead: the live-state part of the W10 tail attach, without replacing the durable window; `Boundary(Newer)` shows `loading` until it is incorporated. A `LiveState` read that does not reach the session tail (more events arrived than one bounded read returns) is incorporated like a newer page: the window stays `Detached` with newer history available and newer paging continues, so no gap is left between the read and later live events. A tail-side eviction while a `LiveState` read is in flight cancels the read (its result would continue after the old tail) and newer paging resumes from the new tail. When the page reports more history, the buffer is discarded; its durable events and live-only streams still count as newer activity (W2), so a stream seen then makes the next `Newer` request rehydrate. |
+| W11 | Transition `Detached → Live` happens when a newer page reports no more history. From the moment a `Newer` request is issued, the engine buffers live transcript events (bounded: 512 events or 512 KiB; overflow marks the buffer overflowed and stops buffering). When the page reports `has_newer = false`, the engine switches to `Live` in the same update and applies buffered events with sequence > the newest resident sequence, plus buffered live-only events, in arrival order. If the buffer overflowed, or a live-only stream was already in flight when the request was issued (W2 newer-activity), it issues `Window(LiveState)` instead: the live-state part of the W10 tail attach, without replacing the durable window; `Boundary(Newer)` shows `loading` until it is incorporated. A `LiveState` read that does not reach the session tail (more events arrived than one bounded read returns) is incorporated like a newer page: the window stays `Detached` with newer history available and newer paging continues, so no gap is left between the read and later live events. A tail-side eviction while a `LiveState` read is in flight cancels the read (its result would continue after the old tail) and newer paging resumes from the new tail. When the page reports more history, the buffer is discarded; its durable events and live-only streams still count as newer activity (W2), so a stream seen then makes the next `Newer` request rehydrate. If the host's live input loses continuity while the `Newer` page or `LiveState` read is in flight (`interrupt_live_buffer`), the buffer is treated as overflowed and a `LiveState` read issued before the loss is incorporated like one that does not reach the tail, so the window never goes live across missing events. |
 | W12 | Position estimate (scrollbar, `JumpToFraction`): `rows_before = (first_resident_sequence − first_available_sequence) × r`, `rows_after = (last_available_sequence − last_resident_sequence) × r`, where `r` is the resident rows-per-event average (exponentially smoothed across windows, initial 1.0). Estimates are presentation only and never used for navigation correctness. `JumpToFraction` maps the fraction to a sequence by inverting the estimate and issues `Window(Around)`. |
 | W13 | The `Older`/`Newer` boundary units show availability/loading/exhaustion without height changes (U3). Resident-window bottom is never treated as session tail (C31). |
 
@@ -595,7 +623,15 @@ Host behavior with the V2 engine selected (phase 4):
   everything the adapter returns (render mode, header title and timeout, target, summary,
   named sections, v3 content keys, v4 source ranges, selection rows) bounded and scoped to its
   producer, with V1's per-source fallback title, and the visual producer presents it as V1
-  does. Adapter rows map v4 ranges and v3 keys to
+  does. The accepted visual also carries adapter-local images and action regions (statically
+  linked portable adapters return them; native routed adapters return none, so the native host
+  leaves them empty). Images are BMUX placements registered from the retained block that shows
+  their first adapter row, with the full adapter geometry as allocation and the block's cells
+  as clip, keyed by their unit. Action regions are `ItemAction::Visual { adapter, revision, id }`
+  hit regions over their visible cells; `TranscriptEngine::visual_action` resolves a hit only
+  against the visual accepted now (same adapter and revision), so a hit from a replaced visual
+  resolves to nothing and execution stays with the host's capability policy (E2, E3).
+  Adapter rows map v4 ranges and v3 keys to
   `SourcePosition::PluginSource` (anchors resolve inside their own identity, E3), copy the
   adapter's selection source (C36), and are content targets. The root model publishes the
   presented frame's plugin visual targets, so horizontal wheel input, right-button focus and
@@ -844,7 +880,7 @@ check), **M** manual. Every ID must be checked before phase 7.
 | D6 | Regional damage per F5. | S (BMUX 15b damage observation) |
 | D7 | Spinner/elapsed advance on accepted invalidations. | S |
 | D8 | Latency p99 ≤ 100 ms; RSS ≤ 33,554,432 bytes. | M |
-| D9 | Plugin visual adapter bounds. | U |
+| D9 | Plugin visual adapter bounds: rows and sections (host caps), selection text, images (32, 8 MiB, frame lifetime, inside the rows), action regions (128, 4 MiB, unique ids, inside the rows). | U |
 | D10 | Inline interaction caps. | U |
 | D11 | Presentation memo 256; streaming re-resolves only the streaming unit; grouping incremental. | U |
 | D12 | Manual disclosure overrides bounded, oldest-first, reconciled on residency. | U |
@@ -855,14 +891,15 @@ check), **M** manual. Every ID must be checked before phase 7.
 | ID | Criterion | Verify |
 |---|---|---|
 | E1 | Adapter resolution order: user preferred, manifest priority, producer default, deterministic id; disabled removed; failure advances; canonical fallback last. | U |
-| E2 | `bcode.tui-visual-adapter` ABI carries no BMUX types; TUI keeps layout/chrome/viewport/hits/paint. | G |
-| E3 | Content keys namespaced per producer, cannot authorize; v3 keys, v4 source ranges, older fall back to item level. | U |
+| E2 | `bcode.tui-visual-adapter` ABI carries no BMUX types; TUI keeps layout/chrome/viewport/hits/paint. The statically linked `plugin_visual` contract is a BMUX-boundary API, not that ABI. Plugin visual action hits name only adapter, accepted revision and adapter-local id; the host resolves them at the accepted revision and rejects stale ones. | G, U |
+| E3 | Content keys namespaced per producer, cannot authorize (actions resolve only through E2 hits); v3 keys, v4 source ranges, older fall back to item level. | U |
 | E4 | One primary identity per invocation; updates replace; completion absorbing; retention policies. | U |
 | E5 | Unknown schemas get compact bounded fallbacks, never raw JSON. | U |
 | E6 | Plugin context v3 carries resolved disclosure/sections/properties; plugins don't evaluate rules. | U |
 | E7 | `SessionViewPatch` only at matching base revision, else bounded reset. | U |
 | E8 | Usage, runtime work and notices are not transcript items. | U |
 | E9 | Presentation commit is terminal-local; semantic contracts carry no frame/damage concepts. | G |
+| E10 | Accepted plugin visuals keep source copy over adapter cells (CJK, emoji, combining marks copy their source bytes), place images over the rows that show them (none once hidden), and register action hits only on visible cells after clipping and resize; a hit from a replaced revision or adapter is rejected. | U |
 
 ### X. Decisions and session behaviors
 
@@ -880,6 +917,14 @@ check), **M** manual. Every ID must be checked before phase 7.
 | X10 | V2 declares no thread-locals or mutable statics; no pointer/wall-clock values in cache keys (L2, L3). | G |
 | X11 | `JumpToLatest` from a detached window returns to live with one request (W10). | S |
 | X12 | Prefetch keeps reading continuous: steady wheel scrolling over 5,000 events of history never shows a stall frame at a loaded boundary when page latency ≤ the time to scroll `prefetch_rows`. | S |
+| X13 | Browser host: the engine attaches only after the live subscription; live batches apply in order, replays are duplicates, and a gap reloads the tail of a live window (section 3.7). | U |
+| X14 | Browser host: every engine history request runs the shared loader one bounded history-page read at a time; stale claims are rejected and a failed or inconsistent read is re-issued with backoff while awaited. | U |
+| X15 | Browser host: transcript activation (item hits, the latest bar) resolves only against the committed frame and is revoked by any preparation until the next commit, including after failed output; visual action hits resolve at the accepted revision. | U |
+| X16 | Browser host: a decoded artifact image is admitted only while its item, item revision, body width and accepted visual revision are unchanged, and is dropped when its body width changes. | U |
+| X18 | Browser host: a history read beyond 2 MiB is cut to the events nearest its cursor and reports more history, so a tail of large events loads; an event beyond the single-event bound degrades the transcript visibly without retrying. | U, I |
+| X19 | Browser host: a feed gap while a detached window's last newer page or live-state read is in flight never takes the window live across the gap; the missed events are rehydrated. | U |
+| X20 | Browser host: reasoning visibility, streaming policy and reduced motion follow the exported native configuration; an unchanged policy is omitted from snapshots once its revision is named. | U |
+| X17 | Browser host: `bcode_tui_web` builds for `wasm32-unknown-unknown` (`scripts/build-tui-web.sh`) without `bcode_client`, `bcode_plugin_sdk` or `bcode_provider_auth`. | G |
 
 ### Manual smoke checklist (phase 4 and phase 7 gates)
 

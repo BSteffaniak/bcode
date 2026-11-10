@@ -127,7 +127,8 @@ impl HyperChadAppState {
             query.session_id,
             snapshot,
             Some(permissions),
-            serde_json::from_str(&self.browser_policy).ok(),
+            self.browser_policy.clone(),
+            None,
         ) {
             Ok(content) => content,
             Err(code) => return error(code),

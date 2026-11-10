@@ -1,12 +1,12 @@
 //! Portable BMUX rendering for resolved question artifacts.
-use bcode_tui_components::tool_card::{ToolCardStyle, push_tool_card_detail, tool_card_header};
-use bcode_tui_components::transcript::tool_visual::{
+use bcode_tui_components::plugin_visual::{
     CanonicalPluginVisual,
     portable::{
         PortableVisualAdapter, PortableVisualContext, PortableVisualDescriptor,
         PortableVisualOutput, PortableVisualRegistration,
     },
 };
+use bcode_tui_components::tool_card::{ToolCardStyle, push_tool_card_detail, tool_card_header};
 use bmux_tui::prelude::{Line, Span};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -146,9 +146,8 @@ pub fn question_outcome_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_tui_components::transcript::{
-        tool_visual::portable::{PortableVisualPolicy, PortableVisualRegistry},
-        transcript_layout::TranscriptLayoutRows,
+    use bcode_tui_components::plugin_visual::portable::{
+        PortableVisualPolicy, PortableVisualRegistry,
     };
     use bmux_tui::style::{Color, Style};
 
@@ -199,9 +198,11 @@ mod tests {
             "bcode.question/question-outcome-component"
         );
         let output = registry.resolve(prepared, &visual, context.width).unwrap();
-        let TranscriptLayoutRows::Rendered(rows) = output.rows else {
-            panic!("shared outcome rows");
-        };
+        assert!(
+            output.rows.anchors.is_empty() && output.rows.selection.is_empty(),
+            "shared outcome rows"
+        );
+        let rows = output.rows.rows;
         let outcome = crate::QuestionToolOutcome::deserialize(&visual.payload).unwrap();
         assert_eq!(
             rows,
@@ -211,7 +212,7 @@ mod tests {
         assert_eq!(rows[0].spans[1].style.fg, Some(Color::Green));
         assert_eq!(
             output.actions,
-            [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
+            [] as [bcode_tui_components::plugin_visual::action::VisualActionRegion; 0]
         );
         assert_eq!(output.images, [] as [bmux_tui::image::ImagePlacement; 0]);
     }

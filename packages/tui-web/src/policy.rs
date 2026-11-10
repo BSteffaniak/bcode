@@ -13,6 +13,10 @@ pub struct BrowserPolicy {
     pub schema_version: u16,
     /// Effective theme and keymap fingerprint.
     pub revision: String,
+    /// Fully resolved native theme definition; `None` when no theme resolved
+    /// natively, in which case consumers fall back as the native host does.
+    #[serde(default)]
+    pub theme: Option<bcode_tui_theme::definition::ResolvedThemeDefinition>,
     /// Resolved semantic styles.
     pub styles: BTreeMap<String, BrowserStyle>,
     /// Complete effective scoped bindings, including chords.
@@ -23,6 +27,32 @@ pub struct BrowserPolicy {
     /// Actual loaded producer set and native adapter selection policy.
     #[serde(default)]
     pub visual_policy: BrowserVisualPolicy,
+    /// Transcript presentation resolved from the native configuration.
+    #[serde(default)]
+    pub transcript: BrowserTranscriptPolicy,
+}
+
+/// Transcript presentation the native V2 host applies from the same configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserTranscriptPolicy {
+    /// Reasoning presentation (`[tui.thinking]`); `hidden` hides reasoning units.
+    #[serde(default)]
+    pub reasoning: bcode_session_view_models::ReasoningPresentationPolicy,
+    /// Live-text pacing (`[presentation.streaming]`).
+    #[serde(default)]
+    pub streaming: bcode_session_view_models::StreamingPresentationPolicy,
+    /// Reduced motion (`[tui] reduce_motion`): navigation is instant.
+    #[serde(default)]
+    pub reduce_motion: bool,
+}
+
+impl BrowserTranscriptPolicy {
+    /// Whether reasoning units are shown (the native host's `reasoning_visible`).
+    #[must_use]
+    pub fn reasoning_visible(&self) -> bool {
+        self.reasoning != bcode_session_view_models::ReasoningPresentationPolicy::Hidden
+    }
 }
 
 /// Bounded selection data; registrations remain producer-owned Rust implementations.
@@ -337,35 +367,15 @@ impl BrowserPolicy {
         }
         Ok(policy)
     }
-    pub(crate) fn transcript_presentation(
+    /// The resolved theme definition the transcript engine renders with: the exported native
+    /// definition, else the same empty fallback the native host uses when none resolved.
+    #[must_use]
+    pub(crate) fn resolved_theme(
         &self,
-    ) -> bcode_tui_components::transcript::accepted::TranscriptPresentation {
-        bcode_tui_components::transcript::accepted::TranscriptPresentation {
-            heading: self.style("title"),
-            muted: self.style("muted"),
-            markdown: bcode_markdown_render::MarkdownTheme {
-                text: self.style("markdown.text"),
-                heading: self.style("markdown.heading"),
-                link: self.style("markdown.link"),
-                strong: self.style("markdown.strong"),
-                emphasis: self.style("markdown.emphasis"),
-                strikethrough: self.style("markdown.strikethrough"),
-                inline_code: self.style("markdown.inline_code"),
-                code_block_text: self.style("markdown.code_block_text"),
-                code_block_border: self.style("markdown.code_block_border"),
-                blockquote_bar: self.style("markdown.blockquote_bar"),
-                alert_note: self.style("markdown.alert_note"),
-                alert_tip: self.style("markdown.alert_tip"),
-                alert_important: self.style("markdown.alert_important"),
-                alert_warning: self.style("markdown.alert_warning"),
-                alert_caution: self.style("markdown.alert_caution"),
-                list_marker: self.style("markdown.list_marker"),
-                task_checked: self.style("markdown.task_checked"),
-                task_unchecked: self.style("markdown.task_unchecked"),
-                table_border: self.style("markdown.table_border"),
-                horizontal_rule: self.style("markdown.horizontal_rule"),
-            },
-        }
+    ) -> std::sync::Arc<bcode_tui_theme::definition::ResolvedThemeDefinition> {
+        std::sync::Arc::new(self.theme.clone().unwrap_or_else(|| {
+            bcode_tui_theme::definition::ResolvedThemeDefinition::empty("default", "Default")
+        }))
     }
     pub(crate) fn component_theme(&self) -> bmux_tui_components::theme::ComponentTheme {
         use bmux_tui_components::theme::{
@@ -609,6 +619,26 @@ mod tests {
             bindings.resolve("chat", key("escape")),
             Some(BrowserResolvedBinding::Ignored)
         ));
+    }
+
+    #[test]
+    fn the_exported_theme_renders_the_transcript_and_absence_falls_back_like_native() {
+        let fallback = BrowserPolicy::default().resolved_theme();
+        assert_eq!(fallback.id, "default");
+        let mut definition =
+            bcode_tui_theme::definition::ResolvedThemeDefinition::empty("nord", "Nord");
+        definition.fingerprint = 7;
+        let policy = BrowserPolicy {
+            schema_version: 1,
+            revision: "themed".into(),
+            theme: Some(definition.clone()),
+            ..BrowserPolicy::default()
+        };
+        let parsed = BrowserPolicy::parse(&serde_json::to_string(&policy).unwrap()).unwrap();
+        let theme = parsed.resolved_theme();
+        assert_eq!(theme.id, "nord");
+        assert_eq!(theme.fingerprint, 7);
+        assert_eq!(*theme, definition);
     }
 
     #[test]

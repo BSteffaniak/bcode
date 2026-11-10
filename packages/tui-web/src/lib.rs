@@ -2,17 +2,21 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Concrete browser-local BMUX adapter. No daemon, filesystem or event-log access.
-//! The semantic document is authoritative; the browser retains only full accepted
-//! snapshots and ephemeral editor, navigation and presentation state.
+//! Concrete browser-local BMUX adapter over the V2 transcript engine. No daemon, filesystem
+//! or event-log access: the transcript is fed bounded canonical history pages and pushed live
+//! events, the non-transcript session state arrives as snapshots without transcript items,
+//! and the browser retains only that and ephemeral editor, navigation and presentation state.
 
 mod bindings;
+pub mod feed;
+mod history;
 mod image;
 mod policy;
 mod question;
 mod snapshot;
 mod surface;
 mod transcript;
+mod visuals;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;
 

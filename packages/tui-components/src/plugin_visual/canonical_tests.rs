@@ -1,4 +1,4 @@
-//! Shared native adapter projection regressions.
+//! Canonical adapter projection regressions.
 use super::*;
 
 #[test]

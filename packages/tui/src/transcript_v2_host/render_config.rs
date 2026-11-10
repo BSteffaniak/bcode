@@ -40,7 +40,9 @@ use bcode_presentation_policy::models::{
 use bcode_session_view_models::{
     ToolResultView, TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
 };
-use bcode_tui_components::transcript::tool_visual::{CanonicalPluginVisual, CanonicalToolVisual};
+use bcode_tui_components::plugin_visual::canonical::{
+    CanonicalPluginVisual, CanonicalToolVisual, presentation_contribution,
+};
 use bcode_tui_theme::definition::ResolvedThemeDefinition;
 use bcode_tui_transcript::layout::RenderConfig;
 use bcode_tui_transcript::layout::context::{
@@ -465,7 +467,6 @@ fn plugin_visual<'a>(
     item: &'a TranscriptViewItem,
     presentation: &crate::plugin_tui::PluginTuiPresentation,
 ) -> Option<ItemVisual<'a>> {
-    use bcode_tui_components::transcript::item::tool_presentation_contribution;
     let draft = |draft| {
         ItemVisual::new(
             CanonicalToolVisual::from_draft_view(draft, &serde_json::json!(item.revision)),
@@ -482,7 +483,7 @@ fn plugin_visual<'a>(
             {
                 return Some(draft(pending));
             }
-            if let Some(contribution) = tool_presentation_contribution(tool) {
+            if let Some(contribution) = presentation_contribution(tool) {
                 return Some(ItemVisual::new(
                     CanonicalToolVisual::from_contribution(&contribution),
                     tool.working_directory.as_deref(),

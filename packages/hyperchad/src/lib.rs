@@ -55,7 +55,8 @@ const WATCH_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_mil
 pub struct HyperChadAppState {
     browser_api: Arc<tokio::sync::Mutex<browser_api::BrowserApiState>>,
     browser_consumers: Arc<browser_api::browser_consumers::BrowserConsumers>,
-    browser_policy: String,
+    /// Parsed once at launch; shared by every snapshot response.
+    browser_policy: Option<Arc<serde_json::Value>>,
     browser_origins: Arc<Mutex<browser_origin::BrowserOrigins>>,
     client: BcodeClient,
     access_token: Arc<str>,
@@ -511,7 +512,7 @@ impl HyperChadAppState {
             browser_api: Arc::new(tokio::sync::Mutex::new(
                 browser_api::BrowserApiState::default(),
             )),
-            browser_policy: String::new(),
+            browser_policy: None,
             browser_origins: Arc::new(Mutex::new(browser_origin::BrowserOrigins::default())),
             client,
             access_token: access_token.into(),
@@ -533,12 +534,12 @@ impl HyperChadAppState {
     /// An empty policy leaves browser defaults in effect for standalone hosts.
     /// # Errors
     /// Returns an error for oversized, malformed or unsupported policy envelopes.
-    pub fn with_browser_policy(mut self, policy: String) -> Result<Self, &'static str> {
+    pub fn with_browser_policy(mut self, policy: &str) -> Result<Self, &'static str> {
         if policy.len() > 1024 * 1024 {
             return Err("browser presentation policy exceeds bounds");
         }
         let value: serde_json::Value =
-            serde_json::from_str(&policy).map_err(|_| "invalid browser presentation policy")?;
+            serde_json::from_str(policy).map_err(|_| "invalid browser presentation policy")?;
         if value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -555,7 +556,7 @@ impl HyperChadAppState {
         {
             return Err("unsupported browser presentation policy");
         }
-        self.browser_policy = policy;
+        self.browser_policy = Some(Arc::new(value));
         Ok(self)
     }
 
@@ -5278,9 +5279,9 @@ mod tests {
         })
         .to_string();
         encoded.push_str(&" ".repeat(1024 * 1024 - encoded.len()));
-        assert!(state.clone().with_browser_policy(encoded.clone()).is_ok());
+        assert!(state.clone().with_browser_policy(&encoded).is_ok());
         encoded.push(' ');
-        assert!(state.with_browser_policy(encoded).is_err());
+        assert!(state.with_browser_policy(&encoded).is_err());
     }
 
     #[test]

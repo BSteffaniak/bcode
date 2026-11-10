@@ -103,6 +103,18 @@ pub enum ItemAction {
     /// A producer-defined activation, namespaced by the producer (for example a link or a
     /// copy button).
     Activate(String),
+    /// An action region of an accepted plugin visual (E2). The hit authorizes nothing by
+    /// itself: the host resolves it against the visual accepted now
+    /// ([`crate::layout::context::PluginVisualState::resolve_action`]), which rejects a replaced
+    /// adapter or revision.
+    Visual {
+        /// Adapter identity of the accepted visual.
+        adapter: String,
+        /// Acceptance revision the region was measured with.
+        revision: u64,
+        /// Adapter-local action identity.
+        id: String,
+    },
 }
 
 /// One interactive region of an item, in item-local cells.

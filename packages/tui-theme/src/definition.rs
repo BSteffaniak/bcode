@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bcode_presentation_policy_models::{LayerSource, PresentationSection, RuleLayer};
 use bmux_tui::style::{Color, Modifier, Style};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chrome::{RawChrome, TuiBorders, TuiChrome};
@@ -188,7 +188,7 @@ pub enum ContrastPolicy {
 }
 
 /// Non-fatal problem found while resolving a theme.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemeWarning {
     /// Theme id the warning concerns.
     pub theme: String,
@@ -496,7 +496,7 @@ impl ThemeCatalog {
 }
 
 /// Fully resolved declarative theme data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedThemeDefinition {
     /// Requested base id.
     pub id: String,
@@ -566,7 +566,7 @@ impl ResolvedThemeDefinition {
 }
 
 /// Constrained transcript/container layout recipe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContainerRecipe {
     /// Container layout family.
     pub layout: ContainerLayout,
@@ -581,7 +581,7 @@ pub struct ContainerRecipe {
 }
 
 /// Supported container layout families.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerLayout {
     /// No dedicated container chrome.
@@ -594,7 +594,7 @@ pub enum ContainerLayout {
 }
 
 /// Supported container width behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerWidth {
     /// Paint only content width.
@@ -605,7 +605,7 @@ pub enum ContainerWidth {
 }
 
 /// Supported container border placement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerBorder {
     /// No border.
@@ -1351,8 +1351,8 @@ mod tests {
 
     use super::{
         ContainerBorder, ContainerLayout, ContainerWidth, REQUIRED_CONTAINER_ROLES,
-        REQUIRED_SEMANTIC_STYLE_ROLES, ResolvedThemeVariant, ThemeCatalog, ThemeError,
-        ThemeSelection, parse_theme_definition,
+        REQUIRED_SEMANTIC_STYLE_ROLES, ResolvedThemeDefinition, ResolvedThemeVariant, ThemeCatalog,
+        ThemeError, ThemeSelection, parse_theme_definition,
     };
 
     const BASE: &str = r##"
@@ -1554,6 +1554,118 @@ indicator = "exit-code"
                 );
             }
         }
+    }
+
+    fn json_round_trip(resolved: &ResolvedThemeDefinition) -> ResolvedThemeDefinition {
+        let encoded = serde_json::to_string(resolved).expect("resolved theme serializes");
+        serde_json::from_str(&encoded).expect("resolved theme deserializes")
+    }
+
+    #[test]
+    fn every_bundled_resolution_round_trips_through_json() {
+        let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        let mut adjusted = 0;
+        for variant in [ResolvedThemeVariant::Dark, ResolvedThemeVariant::Light] {
+            for selection in theme_and_profile_selections(&catalog) {
+                let selection = selection.variant(variant);
+                let resolved = catalog.resolve(&selection).expect("bundled theme resolves");
+                adjusted += resolved.contrast_adjustments.len();
+                assert_eq!(
+                    json_round_trip(&resolved),
+                    resolved,
+                    "{} + {:?} ({variant:?})",
+                    selection.base,
+                    selection.overlays
+                );
+            }
+        }
+        assert!(
+            adjusted > 0,
+            "bundled themes must exercise contrast adjustments"
+        );
+    }
+
+    #[test]
+    fn authored_sections_round_trip_through_json() {
+        let source = r##"
+schema_version = 2
+id = "wire"
+extends = ["nord"]
+contrast = "enforce"
+
+[styles."bordr.focussed"]
+fg = "ansi:red"
+
+[styles."tool.failed"]
+fg = 196
+bg = "#220000"
+modifiers = ["bold", "italic", "crossed_out"]
+
+[containers.tool]
+layout = "panel"
+width = "full"
+border = "all"
+padding_x = 2
+padding_y = 1
+
+[extensions."bcode.shell"]
+indicator = "exit-code"
+ratio = 0.375
+limits = [1, 2, 3]
+released = 2024-01-02T03:04:05Z
+nested = { enabled = true, label = "x" }
+
+[chrome.tui]
+borders = { panel = "rounded", dialog = "thick", tool = "left", composer = "double" }
+focus = { effect = "sweep", colors = ["#ff00aa", "#00ffff"] }
+icons = "nerd"
+
+[chrome.web]
+radius = 4
+font = { family = "mono" }
+
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { disclosure = "expanded", detail = "verbose" }
+"##;
+        let mut catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        catalog.insert(parse_theme_definition("wire.toml", source).expect("wire theme parses"));
+        let resolved = catalog
+            .resolve(&ThemeSelection::new("wire").variant(ResolvedThemeVariant::Dark))
+            .expect("wire theme resolves");
+        assert_ne!(resolved.warnings, []);
+        assert_ne!(resolved.contrast_adjustments, []);
+        assert_ne!(resolved.presentation, []);
+        assert!(resolved.renderer_chrome.contains_key("web"));
+        assert!(resolved.extensions.contains_key("bcode.shell"));
+        let decoded = json_round_trip(&resolved);
+        assert_eq!(decoded, resolved);
+        for (role, style) in &resolved.styles {
+            assert_eq!(decoded.style(role), Some(*style), "style role {role}");
+        }
+        for (role, recipe) in &resolved.containers {
+            assert_eq!(
+                decoded.containers.get(role),
+                Some(recipe),
+                "container {role}"
+            );
+        }
+        assert_eq!(decoded.fingerprint, resolved.fingerprint);
+    }
+
+    #[test]
+    fn contrast_adjustments_reject_roles_outside_the_pair_table() {
+        let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        let resolved = catalog
+            .resolve(&ThemeSelection::new("nord").variant(ResolvedThemeVariant::Dark))
+            .expect("nord resolves");
+        let mut encoded = serde_json::to_value(&resolved).expect("serializes");
+        let adjustment = &mut encoded["contrast_adjustments"][0];
+        assert!(adjustment.is_object(), "nord has contrast adjustments");
+        adjustment["role"] = "not.a.pair".into();
+        let error = serde_json::from_value::<ResolvedThemeDefinition>(encoded)
+            .expect_err("unknown pair role is rejected");
+        assert!(error.to_string().contains("not.a.pair"), "{error}");
     }
 
     #[test]

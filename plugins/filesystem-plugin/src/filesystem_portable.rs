@@ -1,13 +1,11 @@
 //! Producer-owned source/diff presentation shared by native and WASM BMUX hosts.
-use bcode_tui_components::transcript::{
-    tool_visual::{
-        CanonicalPluginVisual,
-        portable::{
-            PortableArtifactChunk, PortableVisualAdapter, PortableVisualContext,
-            PortableVisualDescriptor, PortableVisualOutput, PortableVisualRegistration,
-        },
+use bcode_tui_components::plugin_visual::{
+    CanonicalPluginVisual,
+    output::VisualRows,
+    portable::{
+        PortableArtifactChunk, PortableVisualAdapter, PortableVisualContext,
+        PortableVisualDescriptor, PortableVisualOutput, PortableVisualRegistration,
     },
-    transcript_layout::TranscriptLayoutRows,
 };
 use bcode_tui_components::{
     diff_viewer::{DiffViewerLayout, DiffViewerStyle},
@@ -173,7 +171,7 @@ impl PortableVisualAdapter for FilesystemVisual {
             "bcode.filesystem.batch" | "bcode.filesystem.change" | "bcode.filesystem.file_change"
         ) {
             let (rows, anchors) = self.change.project(kind, payload, context);
-            Some(TranscriptLayoutRows::Anchored { rows, anchors })
+            Some(VisualRows::anchored(rows, anchors))
         } else {
             project(kind, payload, context)
         };
@@ -195,7 +193,7 @@ fn attach_change_copy_button(
     visual: &CanonicalPluginVisual,
     context: &PortableVisualContext<'_>,
 ) {
-    use bcode_tui_components::transcript::actions::{TranscriptAction, TranscriptActionRegion};
+    use bcode_tui_components::plugin_visual::action::{VisualAction, VisualActionRegion};
     use bmux_tui::{
         buffer::Buffer,
         component::{Component, Constraints, LayoutCx},
@@ -241,9 +239,11 @@ fn attach_change_copy_button(
     if text.len() > 64 * 1024 {
         return;
     }
-    let TranscriptLayoutRows::Anchored { rows, anchors } = &mut output.rows else {
+    // The toolbar row shifts the adapter rows; only anchor-only projections are shifted.
+    if !output.rows.selection.is_empty() {
         return;
-    };
+    }
+    let VisualRows { rows, anchors, .. } = &mut output.rows;
     let actions = [ActionButton::new("copy-source", label)];
     let state = std::cell::Cell::new(ActionRowState::new());
     let theme = context.theme.copied().unwrap_or_default();
@@ -278,10 +278,10 @@ fn attach_change_copy_button(
     for anchor in anchors {
         anchor.row = anchor.row.saturating_add(1);
     }
-    output.actions.push(TranscriptActionRegion {
+    output.actions.push(VisualActionRegion {
         id: "filesystem.change.copy-source".into(),
         area: hit,
-        action: TranscriptAction::Copy(text.to_owned()),
+        action: VisualAction::Copy(text.to_owned()),
     });
 }
 
@@ -289,7 +289,7 @@ fn project(
     kind: &str,
     payload: &serde_json::Value,
     context: &impl VisualContext,
-) -> Option<TranscriptLayoutRows> {
+) -> Option<VisualRows> {
     use crate::filesystem_tui as fs;
     let (rows, anchors) = match kind {
         "bcode.filesystem.read" | "bcode.filesystem.artifact.read" => {
@@ -309,7 +309,7 @@ fn project(
                     ))
                 })
                 .collect();
-            return Some(TranscriptLayoutRows::Selected {
+            return Some(VisualRows {
                 rows,
                 anchors,
                 selection,
@@ -338,7 +338,7 @@ fn project(
         }
         _ => return None,
     };
-    Some(TranscriptLayoutRows::Anchored { rows, anchors })
+    Some(VisualRows::anchored(rows, anchors))
 }
 
 /// Static producer source/diff registrations.
@@ -403,7 +403,8 @@ pub fn portable_visual_registrations() -> Vec<PortableVisualRegistration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_tui_components::transcript::tool_visual::portable::{
+    use bcode_tui_components::plugin_visual::action::{VisualAction, VisualActionRegion};
+    use bcode_tui_components::plugin_visual::portable::{
         PortableVisualPolicy, PortableVisualRegistry,
     };
     fn visual(schema: &str, payload: serde_json::Value) -> CanonicalPluginVisual {
@@ -444,18 +445,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let TranscriptLayoutRows::Selected {
-            selection: wide, ..
-        } = wide.rows
-        else {
-            panic!("source mappings required");
-        };
-        let TranscriptLayoutRows::Selected {
-            selection: narrow, ..
-        } = narrow.rows
-        else {
-            panic!("source mappings required");
-        };
+        let wide = wide.rows.selection;
+        let narrow = narrow.rows.selection;
         assert!(!wide.is_empty());
         assert!(!narrow.is_empty());
         assert!(
@@ -483,7 +474,6 @@ mod tests {
     }
     #[test]
     fn change_copy_button_uses_semantic_source_and_committed_component_hit_geometry() {
-        use bcode_tui_components::transcript::actions::TranscriptAction;
         let source = "界👩‍💻e\u{301}\n\u{1b}[31mraw\u{1b}[0m\n";
         let input = visual(
             "bcode.filesystem.change",
@@ -497,21 +487,20 @@ mod tests {
                 .render(&input, &context)
                 .unwrap();
             if width == 0 {
-                assert_eq!(
-                    output.actions,
-                    [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
-                );
+                assert_eq!(output.actions, [] as [VisualActionRegion; 0]);
                 continue;
             }
             assert_eq!(output.actions.len(), 1);
             let action = &output.actions[0];
-            assert_eq!(action.action, TranscriptAction::Copy(source.into()));
+            assert_eq!(action.action, VisualAction::Copy(source.into()));
             assert_eq!(action.area.y, 0);
             assert_eq!(action.area.height, 1);
             assert!(action.area.width > 0 && action.area.right() <= width);
-            let TranscriptLayoutRows::Anchored { rows, .. } = output.rows else {
-                panic!("no manufactured selection")
-            };
+            assert!(
+                output.rows.selection.is_empty(),
+                "no manufactured selection"
+            );
+            let rows = output.rows.rows;
             let toolbar = rows[0]
                 .spans
                 .iter()
@@ -533,10 +522,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(
-                output.actions,
-                [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
-            );
+            assert_eq!(output.actions, [] as [VisualActionRegion; 0]);
         }
         let mut streaming = input;
         streaming.streaming = true;
@@ -551,7 +537,7 @@ mod tests {
                 )
                 .unwrap()
                 .actions,
-            [] as [bcode_tui_components::transcript::actions::TranscriptActionRegion; 0]
+            [] as [VisualActionRegion; 0]
         );
         let deleted = visual(
             "bcode.filesystem.change",
@@ -566,13 +552,8 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            output.actions[0].action,
-            TranscriptAction::Copy(source.into())
-        );
-        let TranscriptLayoutRows::Anchored { rows, .. } = output.rows else {
-            panic!("diff rows")
-        };
+        assert_eq!(output.actions[0].action, VisualAction::Copy(source.into()));
+        let rows = output.rows.rows;
         assert!(
             rows[0]
                 .spans
@@ -597,13 +578,11 @@ mod tests {
             .render(&input, &context)
             .unwrap();
         let (rows, anchors) = crate::file_change_tui::file_change_layout(&input.payload, &context);
-        let TranscriptLayoutRows::Anchored {
+        let VisualRows {
             rows: projected,
             anchors: projected_anchors,
-        } = &output.rows
-        else {
-            panic!("diff anchors")
-        };
+            ..
+        } = &output.rows;
         assert_eq!(&projected[1..], rows.as_slice());
         assert_eq!(
             projected_anchors
@@ -618,7 +597,7 @@ mod tests {
         assert_eq!(output.actions.len(), 1);
         assert_eq!(
             output.actions[0].action,
-            bcode_tui_components::transcript::actions::TranscriptAction::Copy("after 🙂\n".into())
+            VisualAction::Copy("after 🙂\n".into())
         );
         let registry = PortableVisualRegistry::new(
             1,
@@ -664,7 +643,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             portable.rows,
-            TranscriptLayoutRows::Selected {
+            VisualRows {
                 rows: native.rows,
                 anchors: native.anchors,
                 selection: native.selection.into_iter().collect()

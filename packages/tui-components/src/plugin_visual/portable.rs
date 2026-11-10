@@ -4,8 +4,9 @@
 //! it in a WASM-compatible implementation module and reuse that module natively.
 //! Registration never implies that a native dynamic adapter can execute in WASM.
 
-use super::CanonicalPluginVisual;
-use crate::transcript::{actions::TranscriptActionRegion, transcript_layout::TranscriptLayoutRows};
+use super::action::VisualAction;
+use super::canonical::CanonicalPluginVisual;
+pub use super::output::PortableVisualOutput;
 use std::collections::BTreeSet;
 
 /// Explicit selection policy captured when constructing one immutable registry.
@@ -48,50 +49,6 @@ pub struct PortableVisualContext<'a> {
     pub width: u16,
     /// Theme resolved at the BMUX boundary, never in portable model contracts.
     pub theme: Option<&'a bmux_tui_components::theme::ComponentTheme>,
-}
-
-/// Complete producer output, accepted atomically with source geometry.
-#[derive(Debug, Clone, Default)]
-pub struct PortableVisualOutput {
-    /// Rows and their original source mappings/anchors, never server-made cells.
-    pub rows: TranscriptLayoutRows,
-    /// Item-local image geometry captured with the rows.
-    pub images: Vec<bmux_tui::image::ImagePlacement>,
-    /// Narrow intents only; registering an adapter does not authorize execution.
-    pub actions: Vec<TranscriptActionRegion>,
-}
-
-impl PortableVisualOutput {
-    /// Attach bounded copy intents from the exact retained source-cell geometry.
-    /// Raster text is never used as copy authority. Unmapped decoration is inert.
-    #[must_use]
-    pub fn with_source_copy_actions(mut self) -> Self {
-        if let TranscriptLayoutRows::Selected { selection, .. } = &self.rows {
-            for (row, source) in selection {
-                let Ok(y) = u16::try_from(*row) else { continue };
-                if !source.is_valid() {
-                    continue;
-                }
-                for (index, cell) in source.cells.iter().enumerate() {
-                    if self.actions.len() >= 1024 {
-                        return self;
-                    }
-                    let start = cell.bytes.start - source.byte_start;
-                    let end = cell.bytes.end - source.byte_start;
-                    let Some(text) = source.text.get(start..end).filter(|text| !text.is_empty())
-                    else {
-                        continue;
-                    };
-                    self.actions.push(TranscriptActionRegion {
-                        id: format!("copy:{row}:{index}"),
-                        area: bmux_tui::geometry::Rect::new(cell.column, y, cell.width, 1),
-                        action: crate::transcript::actions::TranscriptAction::Copy(text.to_owned()),
-                    });
-                }
-            }
-        }
-        self
-    }
 }
 
 /// Narrow verified artifact delivery at the BMUX boundary, not a service call.
@@ -319,19 +276,7 @@ impl PortableVisualRegistry {
             let Some(output) = registration.adapter.render(visual, context) else {
                 continue;
             };
-            if !super::super::accepted::visual_supported(&output.rows)
-                || !super::super::accepted::images_supported(
-                    &output.images,
-                    context.width,
-                    output.rows.len(),
-                )
-                || !crate::transcript::actions::supported(
-                    &output.actions,
-                    context.width,
-                    output.rows.len(),
-                )
-                || crate::transcript::actions::retained_bytes(&output.actions) > 4 * 1024 * 1024
-            {
+            if !output.supported(context.width) {
                 continue;
             }
             return Some(PreparedPortableVisual {
@@ -373,7 +318,7 @@ impl PortableVisualRegistry {
         visual: &CanonicalPluginVisual,
         context: &PortableVisualContext<'_>,
         action_id: &str,
-    ) -> Option<crate::transcript::actions::TranscriptAction> {
+    ) -> Option<VisualAction> {
         if action_id.len() > 1024 {
             return None;
         }
@@ -431,7 +376,7 @@ impl PortableVisualRegistry {
     }
 
     /// Consume only an exact-current completion. Theme/presentation generations
-    /// are additionally guarded by `AcceptedTranscript::accept_prepared_visual`.
+    /// are additionally guarded by the host's own acceptance of the output.
     pub fn resolve(
         &self,
         prepared: PreparedPortableVisual,

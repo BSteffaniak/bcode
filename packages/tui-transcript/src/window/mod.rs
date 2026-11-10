@@ -5,18 +5,28 @@
 //!
 //! * [`manager`]: the [`WindowManager`] (requests, incorporation, live events, eviction).
 //! * [`turns`]: turn alignment of event ranges (W4).
+//! * [`loader`]: the bounded history reads every host executes for [`crate::engine::HostRequest`]s.
 //!
 //! `TranscriptChanges` come from the `SessionView` window operations themselves (spec 3.1); the
 //! phase-4 keyed document diff (SD5) is gone.
 
+pub mod loader;
+#[cfg(test)]
+mod loader_tests;
 pub mod manager;
 #[cfg(test)]
 mod manager_tests;
 pub mod turns;
 
-use bcode_session_models::SessionEvent;
+/// Payload of [`LiveInput::Stream`], re-exported for hosts that transport live inputs.
+pub use bcode_session_models::SessionLiveEvent;
 pub use bmux_tui_components::resident_window::BoundaryStatus;
 pub use bmux_tui_components::resident_window::EdgeRows;
+pub use loader::{
+    HistoryLane, HistoryLoadError, HistoryLoadRequest, HistoryLoaded, SessionEvent,
+    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
+    SessionId, load_history,
+};
 pub use manager::{
     EvictionContext, EvictionOutcome, LiveInput, LiveOutcome, PageIncorporated, StaleResult,
     WindowIncorporated, WindowManager, WindowWork,

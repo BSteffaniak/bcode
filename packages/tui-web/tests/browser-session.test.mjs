@@ -23,7 +23,7 @@ const ID = '00000000-0000-4000-8000-000000000002';
 
 // Host contract double only: native semantic validation and real Canvas/browser
 // behavior require their owning native tests and packaged browser smoke harness.
-async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signal, capabilities = {}, intents = [], visualReferences, acceptVisual } = {}) {
+async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signal, capabilities = {}, intents = [], visualReferences, acceptVisual, feed, document, policyRevision } = {}) {
   const calls = [], errors = [], results = [], accessibility = [], instances = [], bodies = [], states = [], semantics = [];
   let callbacks;
   class BrowserSession {
@@ -113,8 +113,21 @@ async function fixture({ fetch, recoveryState = {}, timeout = 1000, fault, signa
     dispose() { this.check(); calls.push('dispose'); }
     free() { this.check(); this.freed = true; calls.push('free'); }
   }
+  if (feed) {
+    // Transcript feed ABI: Rust claims history reads, owns the live cursor and deadlines.
+    Object.assign(BrowserSession.prototype, {
+      next_host_request() { this.check(); const claim = feed.claims.shift(); return claim === undefined ? null : JSON.stringify(claim); },
+      accept_history_page(claim, json) { this.check(); calls.push(`page:${claim}`); feed.pages.push({ claim, json }); return true; },
+      fail_history_page(claim) { this.check(); calls.push(`page-failed:${claim}`); },
+      live_request() { this.check(); return JSON.stringify({ session_id: SESSION, ...(this.cursor ? { cursor: this.cursor } : {}) }); },
+      accept_live(json) { this.check(); const batch = JSON.parse(json); this.cursor = batch.cursor; calls.push(`live:${batch.continuity}`); return true; },
+      next_deadline() { this.check(); return feed.deadline ?? null; },
+      advance() { this.check(); feed.deadline = null; calls.push('advance'); return true; },
+    });
+  }
   const window = { performance: { now: () => 1234.9 }, location: { origin: 'https://ui.example' }, crypto: { randomUUID: () => ID }, setTimeout, clearTimeout };
-  const canvas = { id: 'canvas' }, container = { ownerDocument: { defaultView: window } };
+  if (policyRevision !== undefined) BrowserSession.prototype.policy_revision = function () { this.check(); return policyRevision; };
+  const canvas = { id: 'canvas' }, container = { ownerDocument: Object.assign(document ?? {}, { defaultView: window }) };
   const mounting = mountBrowserSession({
     wasm: { BrowserSession }, container, canvas, sessionId: SESSION, token: 'private-launch', recoveryState,
     requestTimeoutMs: timeout, pollMs: 60000, signal, capabilities, onError: message => errors.push(message), onBackendResult: result => results.push(result),
@@ -336,20 +349,120 @@ test('chunk work budget bounds streams of empty chunks', async () => {
   await assert.rejects(readBounded(response(Array.from({ length: 32769 }, () => new Uint8Array())), 100), /chunk budget/);
 });
 
-test('history seam passes original u64 request bytes and accepts semantic replacement', async () => {
-  let historyBody;
-  const f = await fixture({ fetch: async (url, options) => {
-    if (url.pathname.endsWith('/history')) { historyBody = options.body; return jsonResponse({ epoch: 'first', revision: 'history-window' }); }
+test('transcript feed transports Rust history claims verbatim and long-polls live input with its cursor', async () => {
+  const claim = (id, cursor) => ({ claim: id, route: '/api/session-view/history-page',
+    body: `{"session_id":"${SESSION}","query":{"cursor":${cursor},"limit":512,"direction":"backward"}}` });
+  const feed = { claims: [claim('1', 'null'), claim('2', '{"sequence":18446744073709551615}'), claim('3', '{"sequence":7}')], pages: [], deadline: null };
+  const historyBodies = [], liveBodies = [], snapshotQueries = [];
+  let liveCalls = 0;
+  const f = await fixture({ feed, fetch: async (url, options) => {
+    if (url.pathname === '/api/session-view/history-page') {
+      historyBodies.push(options.body);
+      const cursor = JSON.parse(options.body).query.cursor;
+      if (cursor === null) return jsonResponse({ schema_version: 1, page: { session_id: SESSION, events: [], has_more: false } });
+      if (cursor.sequence === 7) throw new Error('connection reset');
+      return jsonResponse({ schema_version: 1, error: 'browser_busy' });
+    }
+    if (url.pathname === '/api/session-view/live') {
+      liveBodies.push(options.body);
+      liveCalls++;
+      if (liveCalls === 1) return jsonResponse({ schema_version: 1, continuity: 'start', cursor: { epoch: ID, offset: 0 }, events: [], more: false });
+      if (liveCalls === 2) return jsonResponse({ schema_version: 1, continuity: 'continuous', cursor: { epoch: ID, offset: 2 }, events: [], more: false });
+      // An idle long poll: held open until the session is disposed.
+      return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    }
+    snapshotQueries.push(url.searchParams.get('transcript'));
     return jsonResponse({ epoch: 'first' });
   } });
   const host = await f.mounting;
-  await host.loadHistory('older');
-  assert.match(historyBody, /"revision":18446744073709551615/);
-  assert.equal(JSON.parse(historyBody).direction, 'older');
-  assert.ok(f.calls.includes('history:older'));
-  assert.equal(f.results[0].type, 'history');
-  await assert.rejects(host.loadHistory('arbitrary-path'), /unavailable/);
+  for (let index = 0; index < 50 && (liveCalls < 3 || feed.pages.length < 2 || !f.calls.includes('page-failed:3')); index++) await tick();
+  // The snapshot is the variant without transcript items.
+  assert.deepEqual(snapshotQueries, ['omit']);
+  // Claim bodies are transported verbatim (exact u64 lexemes), answered by claim.
+  assert.ok(historyBodies.includes(claim('1', 'null').body));
+  assert.ok(historyBodies.includes(claim('2', '{"sequence":18446744073709551615}').body));
+  assert.equal(feed.pages[0].claim, '1');
+  assert.equal(JSON.parse(feed.pages[0].json).page.session_id, SESSION);
+  // Typed error envelopes are answers Rust classifies (retry or degrade); only a failed
+  // transport releases the claim. Rust owns every retry.
+  const busy = feed.pages.find(page => page.claim === '2');
+  assert.equal(JSON.parse(busy.json).error, 'browser_busy');
+  assert.ok(!f.calls.includes('page-failed:2'));
+  assert.ok(f.calls.includes('page-failed:3'));
+  // Two reads at most run at once, leaving connections for submissions and controls.
+  assert.ok(historyBodies.length >= 3);
+  // Live: subscribe first, then resume from the cursor Rust took from each batch.
+  assert.deepEqual(JSON.parse(liveBodies[0]), { session_id: SESSION });
+  assert.deepEqual(JSON.parse(liveBodies[1]).cursor, { epoch: ID, offset: 0 });
+  assert.deepEqual(JSON.parse(liveBodies[2]).cursor, { epoch: ID, offset: 2 });
+  assert.deepEqual(f.calls.filter(call => call.startsWith('live:')), ['live:start', 'live:continuous']);
+  const presents = f.calls.filter(call => call === 'present').length;
   await host.dispose();
+  for (let index = 0; index < 5; index++) await tick();
+  assert.equal(f.calls.filter(call => call === 'present').length, presents, 'nothing after disposal');
+});
+
+test('history reads run two at a time, a hidden tab holds no long-poll and snapshots name the installed policy', async () => {
+  const claim = id => ({ claim: id, route: '/api/session-view/history-page',
+    body: `{"session_id":"${SESSION}","query":{"cursor":{"sequence":${id}},"limit":512,"direction":"backward"}}` });
+  const feed = { claims: ['1', '2', '3', '4'].map(claim), pages: [], deadline: null };
+  const listeners = new Set();
+  const document = { visibilityState: 'hidden',
+    addEventListener(type, listener) { assert.equal(type, 'visibilitychange'); listeners.add(listener); },
+    removeEventListener(type, listener) { listeners.delete(listener); } };
+  const pending = [], snapshotUrls = [];
+  let inFlight = 0, peak = 0, liveCalls = 0;
+  const f = await fixture({ feed, document, policyRevision: 'policy-7', fetch: async (url, options) => {
+    if (url.pathname === '/api/session-view/history-page') {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise(resolve => pending.push(resolve));
+      inFlight--;
+      return jsonResponse({ schema_version: 1, page: { session_id: SESSION, events: [], has_more: false } });
+    }
+    if (url.pathname === '/api/session-view/live') {
+      liveCalls++;
+      return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    }
+    snapshotUrls.push(url);
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  for (let index = 0; index < 20; index++) await tick();
+  assert.equal(snapshotUrls[0].searchParams.get('policy'), 'policy-7');
+  assert.equal(snapshotUrls[0].searchParams.get('transcript'), 'omit');
+  assert.equal(liveCalls, 0, 'a hidden tab does not long-poll');
+  assert.equal(inFlight, 2);
+  while (feed.pages.length < 4) {
+    pending.shift()?.();
+    await tick();
+  }
+  assert.equal(peak, 2);
+  document.visibilityState = 'visible';
+  for (const listener of [...listeners]) listener();
+  for (let index = 0; index < 10 && liveCalls === 0; index++) await tick();
+  assert.equal(liveCalls, 1, 'polling resumes when the tab is shown');
+  assert.equal(listeners.size, 0);
+  await host.dispose();
+});
+
+test('engine deadlines drive advance and presentation and stop at disposal', async () => {
+  const feed = { claims: [], pages: [], deadline: 5 };
+  const f = await fixture({ feed, fetch: async (url, options) => {
+    if (url.pathname === '/api/session-view/live') {
+      return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    }
+    return jsonResponse({ epoch: 'first' });
+  } });
+  const host = await f.mounting;
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(f.calls.filter(call => call === 'advance').length, 1);
+  const index = f.calls.indexOf('advance');
+  assert.ok(f.calls.slice(index).includes('present'), 'an advance that changed the transcript presents');
+  feed.deadline = 5;
+  await host.refresh();
+  await host.dispose();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.calls.filter(call => call === 'advance').length, 1, 'no timer survives disposal');
 });
 
 test('typed controls validate response and refresh without automatic retry', async () => {
@@ -393,13 +506,14 @@ test('unrelated control outcome fails closed and still refreshes', async () => {
   await host.dispose();
 });
 
-test('input drains typed Rust history intents and updates bridge from committed metadata', async () => {
+test('input updates bridge from committed metadata and retired history intents fail closed', async () => {
   const intents = [{ type: 'history', direction: 'older' }];
   const paths = [];
   const f = await fixture({ intents, fetch: async (url) => { paths.push(url.pathname); return jsonResponse({ epoch: 'first' }); } });
   const host = await f.mounting;
   f.callbacks.onInput({ type: 'key' }); await host.refresh();
-  assert.equal(paths.filter(path => path.endsWith('/history')).length, 1);
+  assert.equal(paths.filter(path => path.includes('/history')).length, 0, 'the engine pages history itself');
+  assert.ok(f.errors.length > 0);
   assert.equal(f.accessibility.at(-1).label, 'Committed session');
   assert.match(f.accessibility.at(-1).description, /New messages below/);
   await host.dispose();

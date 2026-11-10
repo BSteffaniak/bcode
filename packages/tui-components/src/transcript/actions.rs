@@ -34,6 +34,36 @@ pub struct TranscriptActionRegion {
     pub action: TranscriptAction,
 }
 
+impl From<crate::plugin_visual::action::VisualAction> for TranscriptAction {
+    fn from(action: crate::plugin_visual::action::VisualAction) -> Self {
+        use crate::plugin_visual::action::VisualAction;
+        match action {
+            VisualAction::Open(destination) => Self::Open(destination),
+            VisualAction::Copy(text) => Self::Copy(text),
+            VisualAction::Artifact { artifact_id } => Self::Artifact { artifact_id },
+            VisualAction::Plugin {
+                producer_id,
+                control_id,
+                payload,
+            } => Self::Plugin {
+                producer_id,
+                control_id,
+                payload,
+            },
+        }
+    }
+}
+
+impl From<crate::plugin_visual::action::VisualActionRegion> for TranscriptActionRegion {
+    fn from(region: crate::plugin_visual::action::VisualActionRegion) -> Self {
+        Self {
+            id: region.id,
+            area: region.area,
+            action: region.action.into(),
+        }
+    }
+}
+
 pub(super) fn retained_bytes(regions: &[TranscriptActionRegion]) -> usize {
     regions.iter().fold(0usize, |total, region| {
         let bytes = match &region.action {

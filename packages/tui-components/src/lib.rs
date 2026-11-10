@@ -21,6 +21,8 @@ pub mod diff_viewer;
 pub mod markdown_selection;
 #[cfg(feature = "permission")]
 pub mod permission;
+#[cfg(feature = "plugin-visual")]
+pub mod plugin_visual;
 #[cfg(feature = "session-ui")]
 pub mod session_ui;
 #[cfg(feature = "setup")]

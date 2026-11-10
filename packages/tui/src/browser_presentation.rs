@@ -68,6 +68,7 @@ pub fn export_with_plugins(
             "preferred": visual_policy.preferred,
             "disabled": visual_policy.disabled,
         }),
+        config.presentation.streaming.policy(),
     )
 }
 
@@ -81,6 +82,7 @@ fn export_with_actions(
         project,
         actions,
         json!({"enabled_plugins": [], "preferred": [], "disabled": []}),
+        bcode_session_view_models::StreamingPresentationPolicy::default(),
     )
 }
 
@@ -89,8 +91,10 @@ fn export_with_actions_and_visual_policy(
     project: &Path,
     actions: Vec<bcode_plugin_sdk::tui::keymap::KeymapAction>,
     visual_policy: Value,
+    streaming: bcode_session_view_models::StreamingPresentationPolicy,
 ) -> Result<String, String> {
-    let theme = crate::theme::resolve_configured_theme(config, project);
+    let (theme, definition) =
+        crate::theme::resolve_configured_theme_with_definition(config, project);
     let mut keymap = BmuxKeyMap::try_from_config(config).map_err(|error| error.to_string())?;
     keymap.integrate_contributors(Ok(actions));
     if let Some(error) = keymap.error() {
@@ -146,8 +150,18 @@ fn export_with_actions_and_visual_policy(
         }
     }
     let binding_count = bindings.len();
-    let mut contents = json!({"schema_version":1,"revision":"pending","styles":styles,"bindings":bindings,
-            "interaction":config.interactions,"visual_policy":visual_policy});
+    // The resolved definition drives the browser transcript engine; the flat styles
+    // carry only the chrome roles (composer, permission, question, latest bar).
+    // Transcript presentation the native V2 host applies from the same configuration:
+    // reasoning visibility (structure), live-text pacing and reduced motion.
+    let transcript = json!({
+        "reasoning": reasoning_policy(config.thinking),
+        "streaming": streaming.normalized(),
+        "reduce_motion": config.reduce_motion,
+    });
+    let mut contents = json!({"schema_version":1,"revision":"pending","theme":definition,"styles":styles,
+            "bindings":bindings,"interaction":config.interactions,"visual_policy":visual_policy,
+            "transcript":transcript});
     contents["visual_policy"] = visual_policy;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     serde_json::to_string(&contents)
@@ -173,32 +187,7 @@ fn export_styles(theme: &crate::theme::PresentedTheme) -> BTreeMap<&'static str,
         ("selection", theme.selection),
         ("border", theme.border),
         ("focused", theme.focused),
-        ("title", theme.markdown.heading),
         ("error", theme.error),
-        ("code", theme.markdown.inline_code),
-        ("markdown.text", theme.markdown.text),
-        ("markdown.heading", theme.markdown.heading),
-        ("markdown.link", theme.markdown.link),
-        ("markdown.strong", theme.markdown.strong),
-        ("markdown.emphasis", theme.markdown.emphasis),
-        ("markdown.strikethrough", theme.markdown.strikethrough),
-        ("markdown.inline_code", theme.markdown.inline_code),
-        ("markdown.code_block_text", theme.markdown.code_block_text),
-        (
-            "markdown.code_block_border",
-            theme.markdown.code_block_border,
-        ),
-        ("markdown.blockquote_bar", theme.markdown.blockquote_bar),
-        ("markdown.alert_note", theme.markdown.alert_note),
-        ("markdown.alert_tip", theme.markdown.alert_tip),
-        ("markdown.alert_important", theme.markdown.alert_important),
-        ("markdown.alert_warning", theme.markdown.alert_warning),
-        ("markdown.alert_caution", theme.markdown.alert_caution),
-        ("markdown.list_marker", theme.markdown.list_marker),
-        ("markdown.task_checked", theme.markdown.task_checked),
-        ("markdown.task_unchecked", theme.markdown.task_unchecked),
-        ("markdown.table_border", theme.markdown.table_border),
-        ("markdown.horizontal_rule", theme.markdown.horizontal_rule),
     ] {
         styles.insert(name, style(value));
     }
@@ -446,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_native_markdown_and_component_roles_and_interaction_policy() {
+    fn exports_chrome_roles_the_resolved_theme_and_interaction_policy() {
         let mut config = bcode_config::TuiConfig::default();
         config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
         let theme = crate::theme::resolve_configured_theme(&config, Path::new("."));
@@ -454,15 +443,8 @@ mod tests {
         let result: Value =
             serde_json::from_str(&export(&config, Path::new(".")).unwrap()).unwrap();
         for (role, expected) in [
-            ("markdown.text", theme.markdown.text),
-            ("markdown.heading", theme.markdown.heading),
-            ("markdown.link", theme.markdown.link),
-            ("markdown.code_block_text", theme.markdown.code_block_text),
-            (
-                "markdown.code_block_border",
-                theme.markdown.code_block_border,
-            ),
-            ("markdown.alert_warning", theme.markdown.alert_warning),
+            ("text", theme.text),
+            ("selection", theme.selection),
             ("component.raised", components.surfaces.raised),
             ("component.overlay", components.surfaces.overlay),
             ("component.disabled", components.disabled),
@@ -470,18 +452,9 @@ mod tests {
         ] {
             assert_eq!(result["styles"][role], style(expected), "{role}");
         }
-        assert_eq!(
-            result["styles"]["markdown.heading"],
-            style(theme.markdown.heading)
-        );
-        assert_eq!(
-            result["styles"]["markdown.link"],
-            style(theme.markdown.link)
-        );
-        assert_eq!(
-            result["styles"]["markdown.inline_code"],
-            style(theme.markdown.inline_code)
-        );
+        // Transcript Markdown renders from the resolved theme, not from flat roles.
+        assert!(result["styles"].get("markdown.heading").is_none());
+        assert!(result["theme"].is_object());
         assert_eq!(
             result["interaction"],
             serde_json::to_value(config.interactions).unwrap()
@@ -501,8 +474,14 @@ mod tests {
             "disabled": [],
         });
         let selected: Value = serde_json::from_str(
-            &export_with_actions_and_visual_policy(&config, project, Vec::new(), selection.clone())
-                .unwrap(),
+            &export_with_actions_and_visual_policy(
+                &config,
+                project,
+                Vec::new(),
+                selection.clone(),
+                bcode_session_view_models::StreamingPresentationPolicy::default(),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(selected["visual_policy"], selection);

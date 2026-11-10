@@ -174,6 +174,10 @@ struct LiveBuffer {
     inputs: VecDeque<LiveInput>,
     bytes: usize,
     overflowed: bool,
+    /// The host's live input lost continuity while the request was in flight: inputs between
+    /// the request and now are missing, so neither the buffer nor a live-state read issued
+    /// before the loss may take the window live (W11).
+    discontinuous: bool,
     /// A live-only stream was active when the request was issued (W11).
     stream_active_at_issue: bool,
 }
@@ -326,6 +330,23 @@ impl WindowManager {
     #[must_use]
     pub const fn work(&self) -> WindowWork {
         self.work
+    }
+
+    /// The host's live input lost continuity (its feed skipped inputs, W2, W11). A `Newer`
+    /// page or `LiveState` read in flight can then no longer take the window live with the
+    /// inputs buffered since its request: the buffer is discarded, the page's end rehydrates
+    /// live state instead, and a live-state read in flight is incorporated like a newer page
+    /// (the window stays detached and newer paging continues). A live window is the host's to
+    /// resynchronize (W10). Returns whether an in-flight request was affected.
+    pub fn interrupt_live_buffer(&mut self) -> bool {
+        let Some(buffer) = self.buffer.as_mut() else {
+            return false;
+        };
+        buffer.inputs.clear();
+        buffer.bytes = 0;
+        buffer.overflowed = true;
+        buffer.discontinuous = true;
+        true
     }
 
     /// Drain the item changes of a host-driven `SessionView` change outside the window
@@ -701,9 +722,14 @@ impl WindowManager {
             return Err(StaleResult::NotInFlight);
         }
         self.live_state = None;
-        if result.has_newer {
-            // W11: more events arrived than one bounded read returns, so this read does not
-            // reach the session tail. Going live here would leave a gap between the read and
+        let discontinuous = self
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.discontinuous);
+        if result.has_newer || discontinuous {
+            // W11: more events arrived than one bounded read returns (or the host's live
+            // input lost continuity since the read was issued), so this read does not reach
+            // the session tail. Going live here would leave a gap between the read and
             // later live events; the read is incorporated like a newer page instead, the window
             // stays detached with newer history available, and newer paging continues (the next
             // `Newer` request buffers live events again).

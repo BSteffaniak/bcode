@@ -69,7 +69,8 @@ use super::group::{
     raised_surface, role_style, status_title_role,
 };
 use super::visual::{
-    ContentKeyed, ContentTargetKind, UnitTargetRow, VisualCorrespondence, VisualRows,
+    ContentKeyed, ContentTargetKind, UnitTargetRow, VisualCorrespondence, VisualPlacements,
+    VisualRows,
 };
 use super::{ItemContent, ItemRenderContext, ProducedItem, UnitProducer, UnitView};
 use crate::units::structure::{DisclosureTarget, ResolvedUnitPresentation};
@@ -193,6 +194,8 @@ pub enum SectionBody {
         key: String,
         /// Anchors and selection rows of `rows` (E3, C34; empty for named sections).
         correspondence: Arc<VisualCorrespondence>,
+        /// Images and action regions of `rows` (E2, L8; empty for named sections).
+        placements: Arc<VisualPlacements>,
     },
 }
 
@@ -1244,7 +1247,8 @@ impl Composer<'_> {
                 rows,
                 key,
                 correspondence,
-            } => self.rows_body(&label, &rows, &key, &correspondence, preview),
+                placements,
+            } => self.rows_body(&label, &rows, &key, (&correspondence, &placements), preview),
         }
     }
 
@@ -1392,7 +1396,7 @@ impl Composer<'_> {
         label: &str,
         rows: &[Line],
         key: &str,
-        correspondence: &Arc<VisualCorrespondence>,
+        (correspondence, placements): (&Arc<VisualCorrespondence>, &Arc<VisualPlacements>),
         preview: Preview,
     ) {
         let (ranges, hidden) = preview_ranges(rows.len(), preview);
@@ -1403,7 +1407,8 @@ impl Composer<'_> {
                 Box::new(
                     VisualRows::new(block)
                         .keyed(key)
-                        .plugin(Arc::clone(correspondence), base),
+                        .plugin(Arc::clone(correspondence), base)
+                        .placements(Arc::clone(placements)),
                 ),
                 0,
             );

@@ -40,6 +40,16 @@
 //! * Content targets: rows carrying an identity are [`ContentTargetKind::PluginVisual`]
 //!   targets, so the host routes horizontal wheel input, right-button presses and the focused
 //!   visual's keys to the adapter, as V1 did.
+//! * Images (L8, [`VisualPlacements`]): adapter-local image placements are painted from the
+//!   retained block that shows their first adapter row, with their full adapter geometry as
+//!   allocation and the block's measured cells as clip. A clipped, collapsed or scrolled-out
+//!   block registers nothing; image keys are scoped by the owning unit.
+//! * Actions (E2, E3): adapter-local action regions become hit regions
+//!   ([`ItemAction::Visual`]) over their cells inside the measured block, clipped at the body
+//!   width; fully clipped regions register nothing. A hit names the adapter, the accepted
+//!   revision and the adapter-local action id only: the host resolves it against the visual
+//!   accepted *now* ([`crate::layout::context::PluginVisualState::resolve_action`]), so a hit from a
+//!   replaced revision is rejected, and content keys never authorize an action.
 //!
 //! The canonical shell screen ([`super::tool::SectionBody::Output`] with a shell key) is a
 //! [`ContentTargetKind::ShellScreen`] target that scrolls horizontally on its own (C39): the
@@ -55,11 +65,14 @@ use std::sync::Arc;
 use bcode_session_view_models::{
     ToolTimingView, TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
 };
+use bcode_tui_components::plugin_visual::action::VisualActionRegion;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutNode, LogicalRect,
 };
 use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, EventOutcome};
+use bmux_tui::geometry::Rect;
+use bmux_tui::image::{ImageContribution, ImageKey, ImagePlacement};
 use bmux_tui::paint::PaintCx;
 use bmux_tui::text::Line;
 
@@ -68,9 +81,10 @@ use super::{ItemContent, ItemRenderContext, ProducedItem, UnitProducer, UnitView
 use crate::layout::SourcePosition;
 use crate::layout::context::AcceptedPluginVisual;
 use crate::layout::geometry::{
-    ContentKeyRegion, ItemFocusTarget, ItemGeometry, ItemSelectionFragment, SelectableRun,
-    SelectableRunKind, SelectableText, SourceRow, SourceRows,
+    ContentKeyRegion, ItemAction, ItemFocusTarget, ItemGeometry, ItemHitRegion,
+    ItemSelectionFragment, SelectableRun, SelectableRunKind, SelectableText, SourceRow, SourceRows,
 };
+use crate::units::UnitKey;
 use crate::units::structure::DisclosureTarget;
 
 // ---- accepted visual parts ---------------------------------------------------------------
@@ -209,6 +223,44 @@ impl VisualCorrespondence {
     }
 }
 
+/// Images and action regions of an accepted visual's rows in adapter coordinates (`y` is the
+/// adapter row), with the identity their hits and image keys carry (E2, L8).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VisualPlacements {
+    /// Image key scope of the owning unit.
+    scope: String,
+    adapter: String,
+    revision: u64,
+    images: Arc<[ImagePlacement]>,
+    actions: Arc<[VisualActionRegion]>,
+}
+
+impl VisualPlacements {
+    /// Placements of `visual`, accepted for `item`.
+    #[must_use]
+    pub fn of(item: &TranscriptViewItemId, visual: &AcceptedPluginVisual) -> Self {
+        Self {
+            scope: format!("plugin-visual:{}", UnitKey::Item(item.clone())),
+            adapter: visual.adapter.clone(),
+            revision: visual.revision,
+            images: Arc::clone(&visual.images),
+            actions: Arc::clone(&visual.actions),
+        }
+    }
+
+    /// Whether there is nothing to place.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.actions.is_empty()
+    }
+
+    /// Frame image key of an adapter image key, scoped by the owning unit.
+    #[must_use]
+    pub fn image_key(&self, key: &ImageKey) -> ImageKey {
+        ImageKey::new(format!("{}:{}", self.scope, key.as_str()))
+    }
+}
+
 /// Horizontal column offsets of canonical shell screens, per item (C39). Host-owned view
 /// state; an item's offset is part of its unit's layout fingerprint.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -283,6 +335,7 @@ pub struct ContentTarget {
 #[derive(Debug, Clone)]
 struct PluginRows {
     correspondence: Arc<VisualCorrespondence>,
+    placements: Arc<VisualPlacements>,
     base: usize,
 }
 
@@ -322,8 +375,19 @@ impl VisualRows {
     pub fn plugin(mut self, correspondence: Arc<VisualCorrespondence>, base: usize) -> Self {
         self.plugin = Some(PluginRows {
             correspondence,
+            placements: Arc::default(),
             base,
         });
+        self
+    }
+
+    /// Return plugin rows ([`Self::plugin`]) that also paint the visual's images and register
+    /// its action regions over the cells they show.
+    #[must_use]
+    pub fn placements(mut self, placements: Arc<VisualPlacements>) -> Self {
+        if let Some(plugin) = self.plugin.as_mut() {
+            plugin.placements = placements;
+        }
         self
     }
 }
@@ -335,6 +399,9 @@ impl Component for VisualRows {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.block.paint(layout, cx);
+        if let Some(plugin) = &self.plugin {
+            plugin.paint_images(&self.block, layout, cx);
+        }
     }
 
     fn revision(&self) -> ComponentRevision {
@@ -394,6 +461,86 @@ impl PartBuilder {
 }
 
 impl PluginRows {
+    /// Adapter rows `base..base + rows` this block shows (`rows` measured, at most its lines).
+    fn shown(&self, block: &TextBlock, layout: &LayoutNode) -> Range<usize> {
+        let rows = usize::try_from(layout.size.height)
+            .unwrap_or(usize::MAX)
+            .min(block.text().lines.len());
+        self.base..self.base.saturating_add(rows)
+    }
+
+    /// The measured cells of this block covered by adapter-local `area`, as a block-local
+    /// rectangle; `None` when none are shown (rows outside the block, columns past the body).
+    fn covered(&self, area: Rect, shown: &Range<usize>, width: u64) -> Option<LogicalRect> {
+        let top = usize::from(area.y).max(shown.start);
+        let bottom = usize::from(area.bottom()).min(shown.end);
+        let left = u64::from(area.x);
+        let right = u64::from(area.right()).min(width);
+        (top < bottom && left < right).then(|| {
+            let row = |adapter: usize| u64::try_from(adapter - self.base).unwrap_or(u64::MAX);
+            LogicalRect::new(left, row(top), right - left, row(bottom) - row(top))
+        })
+    }
+
+    /// Paint the images whose first adapter row this block shows (L8): their full adapter
+    /// geometry is the allocation, the block's measured cells the clip.
+    fn paint_images(&self, block: &TextBlock, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let placements = &self.placements;
+        if placements.images.is_empty() {
+            return;
+        }
+        let shown = self.shown(block, layout);
+        let cells = |value: u64| u16::try_from(value).unwrap_or(u16::MAX);
+        let bounds = Rect::new(0, 0, cells(layout.size.width), cells(layout.size.height));
+        for image in placements.images.iter() {
+            let top = usize::from(image.destination.y);
+            if !shown.contains(&top) {
+                continue;
+            }
+            let Ok(y) = u16::try_from(top - self.base) else {
+                continue;
+            };
+            let destination = Rect::new(
+                image.destination.x,
+                y,
+                image.destination.width,
+                image.destination.height,
+            );
+            let clip = destination.intersection(bounds);
+            if clip.is_empty() {
+                continue;
+            }
+            cx.push_image(ImageContribution::Present(ImagePlacement {
+                key: placements.image_key(&image.key),
+                payload: image.payload.clone(),
+                destination,
+                fit: image.fit,
+                allocation: None,
+                clip,
+                lifecycle: image.lifecycle,
+            }));
+        }
+    }
+
+    /// Hit regions of the action regions this block shows (E2).
+    fn hit_regions(&self, shown: &Range<usize>, width: u64) -> Vec<ItemHitRegion> {
+        let placements = &self.placements;
+        placements
+            .actions
+            .iter()
+            .filter_map(|region| {
+                Some(ItemHitRegion {
+                    rect: self.covered(region.area, shown, width)?,
+                    action: ItemAction::Visual {
+                        adapter: placements.adapter.clone(),
+                        revision: placements.revision,
+                        id: region.id.clone(),
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Source map, selectable parts and content targets of the block's measured rows (one per
     /// line: adapter rows are never reflowed), read from the retained layout.
     fn geometry(&self, block: &TextBlock, layout: &LayoutNode, geometry: &mut ItemGeometry) {
@@ -432,6 +579,9 @@ impl PluginRows {
                 .collect();
         }
         geometry.selectable = self.selectable(lines, rows, width);
+        geometry
+            .hit_regions
+            .extend(self.hit_regions(&self.shown(block, layout), width));
     }
 
     /// Selectable parts in row order (see the module documentation).
@@ -669,7 +819,7 @@ fn item_timing(item: &TranscriptViewItem) -> ToolTimingView {
 
 /// The anatomy sections of an accepted visual: its rows as the `visual` section (omitted when
 /// empty and the adapter returned named sections), then the named sections.
-fn visual_sections(visual: &AcceptedPluginVisual) -> Vec<Section> {
+fn visual_sections(item: &TranscriptViewItemId, visual: &AcceptedPluginVisual) -> Vec<Section> {
     let mut sections = Vec::with_capacity(visual.sections.len().saturating_add(1));
     if visual.sections.is_empty() || !visual.rows.is_empty() {
         sections.push(Section {
@@ -679,6 +829,7 @@ fn visual_sections(visual: &AcceptedPluginVisual) -> Vec<Section> {
                 rows: Arc::clone(&visual.rows),
                 key: visual_key(&visual.adapter),
                 correspondence: Arc::clone(&visual.correspondence),
+                placements: Arc::new(VisualPlacements::of(item, visual)),
             },
         });
     }
@@ -697,6 +848,7 @@ fn visual_sections(visual: &AcceptedPluginVisual) -> Vec<Section> {
             rows: Arc::clone(&section.rows),
             key: format!("{}:{}", visual.adapter, section.name),
             correspondence: Arc::default(),
+            placements: Arc::default(),
         },
     }));
     sections
@@ -718,7 +870,9 @@ impl UnitProducer for PluginVisualProducer {
         // The adapter renders the call's arguments and result; the host keeps lifecycle chrome
         // and the failure notice.
         anatomy.sections.retain(|section| section.name == "error");
-        anatomy.sections.splice(0..0, visual_sections(visual));
+        anatomy
+            .sections
+            .splice(0..0, visual_sections(&item.id, visual));
         let header = &mut anatomy.header;
         if visual.target.is_some() {
             header.target.clone_from(&visual.target);

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use bmux_color::Rgb;
 use bmux_tui::style::{Color, Modifier, Style};
+use serde::{Deserialize, Serialize};
 
 use crate::check::{ContrastGroup, SECONDARY_CONTRAST, TEXT_CONTRAST};
 
@@ -218,7 +219,8 @@ pub(crate) fn pair_colors(
 pub(crate) const RATIO_TOLERANCE: f64 = 0.005;
 
 /// Which color of a role resolution changed to meet a contrast pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdjustedChannel {
     /// The role's foreground.
     Foreground,
@@ -227,7 +229,10 @@ pub enum AdjustedChannel {
 }
 
 /// One color raised to meet its contrast pair during resolution.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Role names deserialize only when they name a role of a [`PAIRS`] entry,
+/// since every adjustment originates from that table.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ContrastAdjustment {
     /// Adjusted role.
     pub role: &'static str,
@@ -245,6 +250,63 @@ pub struct ContrastAdjustment {
     pub against: Rgb,
     /// Minimum ratio of the pair.
     pub minimum: f64,
+}
+
+/// The [`PAIRS`] role name equal to `name`: a measured role or a surface it is measured on.
+fn pair_role(name: &str) -> Option<&'static str> {
+    PAIRS.iter().find_map(|pair| {
+        if pair.role == name {
+            return Some(pair.role);
+        }
+        match pair.background {
+            PairBackground::Surface(surface) | PairBackground::OwnWithText(surface)
+                if surface == name =>
+            {
+                Some(surface)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Wire form of [`ContrastAdjustment`] before its role names are matched to [`PAIRS`].
+#[derive(Deserialize)]
+struct OwnedContrastAdjustment {
+    role: String,
+    channel: AdjustedChannel,
+    pair_background: String,
+    before: Rgb,
+    after: Rgb,
+    against: Rgb,
+    minimum: f64,
+}
+
+// Hand-written: a derive would borrow the `&'static str` fields from the input.
+impl<'de> Deserialize<'de> for ContrastAdjustment {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        OwnedContrastAdjustment::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<OwnedContrastAdjustment> for ContrastAdjustment {
+    type Error = String;
+
+    fn try_from(owned: OwnedContrastAdjustment) -> Result<Self, Self::Error> {
+        let known = |name: &str| {
+            pair_role(name).ok_or_else(|| format!("`{name}` is not a contrast pair role"))
+        };
+        Ok(Self {
+            role: known(&owned.role)?,
+            channel: owned.channel,
+            pair_background: known(&owned.pair_background)?,
+            before: owned.before,
+            after: owned.after,
+            against: owned.against,
+            minimum: owned.minimum,
+        })
+    }
 }
 
 impl ContrastAdjustment {

@@ -18,6 +18,23 @@ struct Observation {
     snapshot: SessionViewSnapshot,
     #[serde(default, rename = "policy")]
     policy: Option<serde_json::Value>,
+    /// Revision of the effective policy when the backend omitted an unchanged policy.
+    #[serde(default)]
+    policy_revision: Option<String>,
+}
+
+impl Observation {
+    /// Keep only the policy's identity (its content-hash revision): the policy itself is
+    /// installed by the surface, and observations compare by revision.
+    fn retain_policy_identity(&mut self) {
+        if let Some(revision) = self
+            .policy
+            .take()
+            .and_then(|policy| policy.get("revision")?.as_str().map(str::to_owned))
+        {
+            self.policy_revision = Some(revision);
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,14 +115,6 @@ enum BrowserNavigation {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum BrowserHistoryDirection {
-    Older,
-    Newer,
-    Tail,
-}
-
-#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recovery {
     schema_version: u16,
@@ -118,6 +127,19 @@ struct Recovery {
 struct ActionResponse {
     schema_version: u16,
     outcome: SessionViewActionOutcome,
+}
+
+/// A submission whose durable receipt was verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledSubmission {
+    /// Submission identity.
+    pub identity: String,
+    /// Dispatched text.
+    pub text: String,
+    /// Unmodified editor text the submission was prepared from.
+    pub draft: String,
+    /// Canonical sequence of the accepting event, when the receipt names one.
+    pub sequence: Option<u64>,
 }
 
 /// Accepted semantic snapshot and one unresolved exact submission.
@@ -153,7 +175,8 @@ impl SnapshotState {
         if json.len() > MAX_RESPONSE_BYTES {
             return Err("response too large");
         }
-        let next: Observation = serde_json::from_str(json).map_err(|_| "invalid snapshot")?;
+        let mut next: Observation = serde_json::from_str(json).map_err(|_| "invalid snapshot")?;
+        next.retain_policy_identity();
         if next.schema_version != 1
             || next.snapshot.schema_version != SessionViewSnapshot::SCHEMA_VERSION
             || !uuid(&next.epoch)
@@ -188,7 +211,9 @@ impl SnapshotState {
                 return Err("stale snapshot");
             }
             if next.revision == previous.revision {
-                return if next.snapshot == previous.snapshot && next.policy == previous.policy {
+                return if next.snapshot == previous.snapshot
+                    && next.policy_revision == previous.policy_revision
+                {
                     Ok(false)
                 } else {
                     Err("conflicting snapshot revision")
@@ -199,14 +224,16 @@ impl SnapshotState {
         Ok(true)
     }
 
-    /// Prepare an observation-scoped canonical artifact range; callers name a
-    /// semantic item and reference key, never a filesystem path or storage URI.
+    /// Prepare an observation-scoped canonical artifact range for a resident transcript item.
+    /// Callers name the item and a reference key, never a filesystem path or storage URI; the
+    /// request carries the item's canonical artifact identity, because the transcript the
+    /// browser renders comes from its own engine, not from the observed snapshot.
     ///
     /// # Errors
     /// Rejects foreign references, missing observations and oversized ranges.
     pub fn prepare_artifact(
         &self,
-        item_id: &str,
+        item: &bcode_session_view_models::TranscriptViewItem,
         reference_key: &str,
         offset: u64,
         length: u32,
@@ -215,13 +242,6 @@ impl SnapshotState {
         if length == 0 || length > 128 * 1024 {
             return Err("invalid artifact range");
         }
-        let item = accepted
-            .snapshot
-            .transcript
-            .items
-            .iter()
-            .find(|item| item.id.get() == item_id)
-            .ok_or("stale artifact")?;
         let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } = &item.kind
         else {
             return Err("unsupported artifact");
@@ -241,90 +261,14 @@ impl SnapshotState {
         }
         let json = serde_json::to_string(&serde_json::json!({
             "session_id": self.session, "epoch": accepted.epoch, "revision": accepted.revision,
-            "item_id": item_id, "reference_key": reference_key, "offset": offset, "length": length,
+            "item_id": item.id.get(), "artifact_id": artifact.artifact.artifact_id,
+            "reference_key": reference_key, "offset": offset, "length": length,
         }))
         .map_err(|_| "invalid artifact request")?;
         if json.len() > MAX_REQUEST_BYTES {
             return Err("request too large");
         }
         Ok(json)
-    }
-
-    /// Validate directional convergence before replacing a resident window.
-    ///
-    /// # Errors
-    /// Rejects oversized, malformed, non-progressing or boundary-less windows.
-    pub fn validate_history(&self, json: &str, direction: &str) -> Result<(), &'static str> {
-        self.prepare_history(direction)?;
-        if json.len() > MAX_RESPONSE_BYTES {
-            return Err("response too large");
-        }
-        let next: Observation = serde_json::from_str(json).map_err(|_| "invalid snapshot")?;
-        let previous = &self
-            .accepted
-            .as_ref()
-            .ok_or("missing observation")?
-            .snapshot
-            .transcript;
-        let document = &next.snapshot.transcript;
-        let progressing = match direction {
-            "older" => {
-                previous
-                    .source_start_sequence
-                    .zip(document.source_start_sequence)
-                    .is_some_and(|(old, new)| {
-                        new < old || (new == old && !document.has_older_history)
-                    })
-                    || (document.items.is_empty()
-                        && !document.has_older_history
-                        && document.source_start_sequence.is_none())
-            }
-            "newer" => {
-                previous
-                    .source_end_sequence
-                    .zip(document.source_end_sequence)
-                    .is_some_and(|(old, new)| {
-                        new > old || (new == old && !document.has_newer_history)
-                    })
-                    || (document.items.is_empty()
-                        && !document.has_newer_history
-                        && document.source_end_sequence.is_none())
-            }
-            "tail" => !document.has_newer_history,
-            _ => false,
-        };
-        if !progressing {
-            return Err("history window did not progress");
-        }
-        Ok(())
-    }
-
-    /// Prepare a bounded semantic history replacement from accepted source metadata.
-    /// The host must pass response bytes to `accept`, not merge raw events in JS.
-    ///
-    /// # Errors
-    /// Rejects absent observations, unsupported direction or unavailable boundaries.
-    pub fn prepare_history(&self, direction: &str) -> Result<String, &'static str> {
-        let accepted = self.accepted.as_ref().ok_or("missing observation")?;
-        let direction: BrowserHistoryDirection =
-            serde_json::from_value(serde_json::Value::String(direction.to_owned()))
-                .map_err(|_| "invalid history direction")?;
-        match direction {
-            BrowserHistoryDirection::Older
-                if !accepted.snapshot.transcript.has_older_history
-                    || accepted.snapshot.transcript.source_start_sequence.is_none() =>
-            {
-                return Err("history boundary unavailable");
-            }
-            BrowserHistoryDirection::Newer
-                if !accepted.snapshot.transcript.has_newer_history
-                    || accepted.snapshot.transcript.source_end_sequence.is_none() =>
-            {
-                return Err("history boundary unavailable");
-            }
-            _ => {}
-        }
-        self.browser_request("direction", &direction)
     }
 
     /// Prepare only a narrow browser permission, turn cancellation, or producer-owned interaction input.
@@ -586,6 +530,14 @@ impl SnapshotState {
             .and_then(|pending| serde_json::to_string(pending).ok())
     }
 
+    /// Identity and dispatched text of the unresolved submission, if any.
+    #[must_use]
+    pub fn pending_submission(&self) -> Option<(String, String)> {
+        self.pending
+            .as_ref()
+            .map(|pending| (pending.identity.clone(), pending.text.clone()))
+    }
+
     /// Whether the exact pending operation still needs non-mutating backend preparation.
     #[must_use]
     pub fn needs_preparation(&self) -> bool {
@@ -665,12 +617,12 @@ impl SnapshotState {
     }
 
     /// Validate a durable receipt before releasing the retained retry identity.
-    /// Returns the accepted draft so a host clears only that exact draft.
+    /// Returns the settled submission so a host clears only its exact draft.
     ///
     /// # Errors
     /// Rejects malformed/oversized responses, unsupported schemas, non-durable
     /// outcomes and receipts for a different session or submission.
-    pub fn settle_submission(&mut self, json: &str) -> Result<String, &'static str> {
+    pub fn settle_submission(&mut self, json: &str) -> Result<SettledSubmission, &'static str> {
         if json.len() > MAX_RESPONSE_BYTES {
             return Err("response too large");
         }
@@ -680,7 +632,7 @@ impl SnapshotState {
         if response.schema_version != 1 {
             return Err("unsupported action schema");
         }
-        match response.outcome {
+        let sequence = match response.outcome {
             SessionViewActionOutcome::ManagedSubmissionRecorded { response } => {
                 let retained = pending
                     .managed
@@ -701,21 +653,31 @@ impl SnapshotState {
                 if state == "uncertain" || state == "delivery_attempted" {
                     return Err("native delivery unresolved; exact input retained");
                 }
+                None
             }
             SessionViewActionOutcome::SubmissionAccepted {
                 session_id,
                 receipt,
             } if pending.managed.is_none()
                 && session_id.to_string() == pending.session
-                && receipt.submission_id.0 == pending.identity => {}
+                && receipt.submission_id.0 == pending.identity =>
+            {
+                Some(receipt.accepted_event_sequence)
+            }
             _ => return Err("unmatched submission receipt"),
-        }
-        let text = pending
+        };
+        let draft = pending
             .draft_text
             .clone()
             .unwrap_or_else(|| pending.text.clone());
+        let settled = SettledSubmission {
+            identity: pending.identity.clone(),
+            text: pending.text.clone(),
+            draft,
+            sequence,
+        };
         self.pending = None;
-        Ok(text)
+        Ok(settled)
     }
 }
 
@@ -817,9 +779,28 @@ mod tests {
     fn browser_requests_use_exact_u64_observation_and_narrow_authority() {
         let mut state = SnapshotState::new(SESSION.into()).unwrap();
         state.accept(&observation(u64::MAX)).unwrap();
-        let request = state.prepare_history("tail").unwrap();
-        assert!(request.contains("18446744073709551615"));
-        assert!(state.prepare_history("older").is_err());
+        let item: bcode_session_view_models::TranscriptViewItem = serde_json::from_value(serde_json::json!({
+            "id":"artifact","revision":1,"sequence":null,"timestamp_ms":null,"streaming":false,
+            "kind":{"type":"tool_invocation","tool":{
+                "tool_call_id":"call","producer_plugin_id":"p","tool_name":"t","arguments_json":"{}","working_directory":null,
+                "status":"finished","result_text":null,"is_error":false,"timing":{},
+                "result":{"type":"artifact","artifact":{
+                    "artifact":{"artifact_id":"canonical","producer_plugin_id":"p","schema":"s","schema_version":1,"metadata":{},"refs":[{"key":"bytes","content_type":"text/plain","byte_len":4}]},
+                    "generic_payload":{}
+                }}
+            }}
+        })).unwrap();
+        let request: serde_json::Value =
+            serde_json::from_str(&state.prepare_artifact(&item, "bytes", 0, 4).unwrap()).unwrap();
+        assert_eq!(request["artifact_id"], "canonical");
+        assert!(
+            state
+                .prepare_artifact(&item, "bytes", 0, 4)
+                .unwrap()
+                .contains("18446744073709551615")
+        );
+        assert!(state.prepare_artifact(&item, "foreign", 0, 4).is_err());
+        assert!(state.prepare_artifact(&item, "bytes", 5, 4).is_err());
         assert!(
             state
                 .prepare_control(r#"{"type":"invoke_skill","skill_id":"shell"}"#)
@@ -837,58 +818,6 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn history_windows_require_directional_progress_without_mutating_on_rejection() {
-        let mut snapshot = SessionViewSnapshot::empty();
-        snapshot.session_id = Some(SESSION.parse().unwrap());
-        snapshot.transcript.has_older_history = true;
-        snapshot.transcript.has_newer_history = true;
-        snapshot.transcript.source_start_sequence = Some(100);
-        snapshot.transcript.source_end_sequence = Some(200);
-        let encode = |snapshot: &SessionViewSnapshot, revision| {
-            serde_json::json!({
-                "schema_version":1,"epoch":EPOCH,"revision":revision,"snapshot":snapshot
-            })
-            .to_string()
-        };
-        let mut state = SnapshotState::new(SESSION.into()).unwrap();
-        state.accept(&encode(&snapshot, 1)).unwrap();
-        assert!(
-            state
-                .validate_history(&encode(&snapshot, 2), "older")
-                .is_err()
-        );
-        assert!(
-            state
-                .validate_history(&encode(&snapshot, 2), "newer")
-                .is_err()
-        );
-        snapshot.transcript.source_start_sequence = Some(50);
-        assert!(
-            state
-                .validate_history(&encode(&snapshot, 2), "older")
-                .is_ok()
-        );
-        snapshot.transcript.source_end_sequence = Some(250);
-        assert!(
-            state
-                .validate_history(&encode(&snapshot, 2), "newer")
-                .is_ok()
-        );
-        assert!(
-            state
-                .validate_history(&encode(&snapshot, 2), "tail")
-                .is_err()
-        );
-        snapshot.transcript.has_newer_history = false;
-        assert!(
-            state
-                .validate_history(&encode(&snapshot, 2), "tail")
-                .is_ok()
-        );
-        assert_eq!(state.accepted.as_ref().unwrap().revision, 1);
     }
 
     #[test]
@@ -956,10 +885,9 @@ mod tests {
         assert!(recovered.settle_submission(&wrong.to_string()).is_err());
         let mut accepted = receipt;
         accepted["outcome"]["response"]["kind"]["response"]["state"] = "accepted".into();
-        assert_eq!(
-            recovered.settle_submission(&accepted.to_string()).unwrap(),
-            "native input"
-        );
+        let settled = recovered.settle_submission(&accepted.to_string()).unwrap();
+        assert_eq!(settled.draft, "native input");
+        assert_eq!(settled.sequence, None);
         assert!(recovered.retry_submission().is_none());
     }
 
@@ -1047,10 +975,10 @@ mod tests {
         );
         assert_eq!(state.retry_submission().as_deref(), Some(body.as_str()));
         let receipt = serde_json::json!({"schema_version":1,"outcome":{"type":"submission_accepted","session_id":SESSION,"receipt":{"submission_id":EPOCH,"accepted_event_sequence":1}}});
-        assert_eq!(
-            state.settle_submission(&receipt.to_string()),
-            Ok("draft 🦀".into())
-        );
+        let settled = state.settle_submission(&receipt.to_string()).unwrap();
+        assert_eq!(settled.draft, "draft 🦀");
+        assert_eq!(settled.identity, EPOCH);
+        assert_eq!(settled.sequence, Some(1));
         assert!(state.retry_submission().is_none());
     }
 }

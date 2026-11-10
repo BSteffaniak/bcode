@@ -47,6 +47,7 @@ bcode_tui_components = { workspace = true, features = [
     "composer",
     "diff-viewer",
     "permission",
+    "plugin-visual",
     "session-ui",
     "setup",
     "source-preview",

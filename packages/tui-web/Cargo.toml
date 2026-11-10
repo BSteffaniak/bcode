@@ -21,16 +21,17 @@ bcode_markdown_render = { workspace = true }
 bcode_question_plugin = { workspace = true, default-features = false, features = [
     "presentation",
 ] }
+bcode_session_models      = { workspace = true }
 bcode_session_view_models = { workspace = true }
+bcode_tui_theme           = { workspace = true }
 bcode_tui_transcript      = { workspace = true }
 bcode_shell_plugin = { workspace = true, default-features = false, features = [
     "presentation",
 ] }
 bcode_tui_components = { workspace = true, features = [
     "permission",
+    "plugin-visual",
     "session-ui",
-    "transcript-engine",
-    "transcript-markdown",
 ] }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
@@ -45,6 +46,7 @@ bmux_web_renderer = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["js"] }
+web-time = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen         = { workspace = true, optional = true }

@@ -35,6 +35,8 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[path = "browser_acceptance/backend.rs"]
 mod backend;
+#[path = "browser_acceptance/feed.rs"]
+mod feed;
 #[path = "browser_acceptance/policy_roundtrip.rs"]
 mod policy_roundtrip;
 #[path = "browser_acceptance/scenarios.rs"]
@@ -94,7 +96,7 @@ fn production_actix_child() -> TestResult<()> {
         fixture["token"].as_str().ok_or("token")?,
         root,
     )
-    .with_browser_policy(policy)?;
+    .with_browser_policy(&policy)?;
     let origin_state = state.clone();
     let address_file = PathBuf::from(fixture["address_file"].as_str().ok_or("address_file")?);
     let builder = bcode_hyperchad::init_with_snapshot(

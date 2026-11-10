@@ -68,6 +68,77 @@ impl BrowserSession {
         self.surface()?.accept_snapshot(json).map_err(error)
     }
 
+    /// Revision of the installed presentation policy, named in snapshot requests so an
+    /// unchanged policy is omitted; `None` before one is installed.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn policy_revision(&mut self) -> Result<Option<String>, JsValue> {
+        Ok(self.surface()?.policy_revision().map(str::to_owned))
+    }
+
+    /// Body of the next live poll against the live route, carrying the resume cursor.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn live_request(&mut self) -> Result<String, JsValue> {
+        self.surface()?.live_request().map_err(error)
+    }
+
+    /// Accept the original live batch bytes; true requests a redraw. A gap reloads the tail.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state, error envelopes and malformed or unknown batches.
+    pub fn accept_live(&mut self, json: &str) -> Result<bool, JsValue> {
+        self.surface()?.accept_live(json).map_err(error)
+    }
+
+    /// Claim the next bounded history read the engine needs: `{"claim","route","body"}`.
+    /// JS posts the opaque body to the route and answers with the response bytes.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn next_host_request(&mut self) -> Result<Option<String>, JsValue> {
+        self.surface()?.next_host_request().map_err(error)
+    }
+
+    /// Answer one history claim with the original response bytes, typed error envelopes
+    /// included (Rust retries transient codes and degrades on `history_event_too_large`);
+    /// true requests a redraw.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state and claims that are not in flight.
+    pub fn accept_history_page(&mut self, claim: &str, json: &str) -> Result<bool, JsValue> {
+        self.surface()?
+            .accept_history_page(claim, json)
+            .map_err(error)
+    }
+
+    /// Release one history claim after a transport failure; Rust schedules the retry.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn fail_history_page(&mut self, claim: &str) -> Result<(), JsValue> {
+        self.surface()?.fail_history_page(claim);
+        Ok(())
+    }
+
+    /// Milliseconds until `advance` and a redraw are due; `undefined` when idle.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn next_deadline(&mut self) -> Result<Option<f64>, JsValue> {
+        Ok(self.surface()?.next_deadline_ms())
+    }
+
+    /// Fire due transcript timers; true requests a redraw.
+    ///
+    /// # Errors
+    /// Rejects disposed/busy state.
+    pub fn advance(&mut self) -> Result<bool, JsValue> {
+        Ok(self.surface()?.advance())
+    }
+
     /// Monotonic milliseconds from the platform clock, before the next input.
     ///
     /// # Errors
@@ -178,13 +249,7 @@ impl BrowserSession {
     /// # Errors
     /// Rejects disposed/busy state, invalid identity, empty or oversized drafts.
     pub fn prepare_submission(&mut self, identity: String) -> Result<String, JsValue> {
-        let mut surface = self.surface()?;
-        let draft = surface.draft().to_owned();
-        surface
-            .inner
-            .semantic
-            .prepare_submission(identity, draft)
-            .map_err(error)
+        self.surface()?.prepare_submission(identity).map_err(error)
     }
 
     /// Read the real BMUX editor source for host accessibility and diagnostics.
@@ -243,18 +308,6 @@ impl BrowserSession {
     /// Rejects disposed/busy state, malformed responses or unmatched receipts.
     pub fn settle_submission(&mut self, json: &str) -> Result<(), JsValue> {
         self.surface()?.settle_submission(json).map_err(error)
-    }
-
-    /// Prepare one bounded semantic history request from the accepted snapshot.
-    ///
-    /// # Errors
-    /// Rejects absent snapshots or unsupported directions.
-    pub fn prepare_history(&mut self, direction: &str) -> Result<String, JsValue> {
-        self.surface()?
-            .inner
-            .semantic
-            .prepare_history(direction)
-            .map_err(error)
     }
 
     /// Prepare a canonical artifact image, retaining only an async generation token.
@@ -346,19 +399,7 @@ impl BrowserSession {
         length: u32,
     ) -> Result<String, JsValue> {
         self.surface()?
-            .inner
-            .semantic
             .prepare_artifact(item_id, reference_key, offset, length)
-            .map_err(error)
-    }
-
-    /// Accept a bounded history response with directional convergence checks.
-    ///
-    /// # Errors
-    /// Rejects stale, malformed or non-progressing history windows.
-    pub fn accept_history(&mut self, json: &str, direction: &str) -> Result<bool, JsValue> {
-        self.surface()?
-            .accept_history(json, direction)
             .map_err(error)
     }
 

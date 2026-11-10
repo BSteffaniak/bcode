@@ -4283,7 +4283,7 @@ async fn handle_web_command(
             bcode_tui::browser_presentation::reasoning_policy(config.tui.thinking),
             config.presentation.streaming.policy(),
         )
-        .with_browser_policy(browser_policy)
+        .with_browser_policy(&browser_policy)
         .map_err(|error| CliError::HyperChadRender(error.to_owned()))?
         .with_browser_origins(allowed_browser_origins)
         .map_err(|error| CliError::HyperChadRender(error.to_owned()))?;

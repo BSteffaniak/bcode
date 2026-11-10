@@ -167,8 +167,9 @@ try {
     inputType:'insertText', data:historyDraft, bubbles:true,
   }));
   await wait(() => drawn.join('').includes(historyDraft), 'visible history-navigation draft');
-  await mounted.loadHistory('older');
-  await mounted.loadHistory('tail');
+  // The engine pages history through the history-page route on demand; refreshing the
+  // non-transcript snapshot must leave the draft and the transcript intact.
+  await mounted.refresh();
   drawn.length = 0;
   // An unchanged snapshot correctly skips painting. Force a genuine resize
   // transaction so the retained draft must appear in newly rendered pixels.

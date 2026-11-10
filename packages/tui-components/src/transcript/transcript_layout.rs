@@ -86,6 +86,27 @@ impl From<Vec<Line>> for TranscriptLayoutRows {
     }
 }
 
+impl From<crate::plugin_visual::output::VisualRows> for TranscriptLayoutRows {
+    fn from(visual: crate::plugin_visual::output::VisualRows) -> Self {
+        let crate::plugin_visual::output::VisualRows {
+            rows,
+            anchors,
+            selection,
+        } = visual;
+        if !selection.is_empty() {
+            Self::Selected {
+                rows,
+                anchors,
+                selection,
+            }
+        } else if anchors.is_empty() {
+            Self::Rendered(rows)
+        } else {
+            Self::Anchored { rows, anchors }
+        }
+    }
+}
+
 /// Fingerprint for inputs used to prepare transcript layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLayoutFingerprint(String);
