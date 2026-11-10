@@ -179,7 +179,7 @@ impl BcodeClient {
 impl ClientConnection {
     /// Strict one-request/one-response framing for connections with no subscriptions.
     /// An unsolicited frame is uncertainty, not something to skip or buffer forever.
-    async fn send_lane_request(
+    pub(super) async fn send_lane_request(
         &mut self,
         request: Request,
     ) -> Result<ResponsePayload, ClientError> {

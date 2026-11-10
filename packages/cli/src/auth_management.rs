@@ -1,6 +1,6 @@
 //! Guided account management. Domain decisions and mutations use application operations.
 
-use bcode_client::BcodeClient;
+use bcode_client::{AccountLifecycleClient, BcodeClient};
 use bcode_provider_auth_models::{
     AuthMethodContribution,
     account_lifecycle::{AccountLifecycleAction, AccountLifecycleEffect, AccountLifecycleRequest},
@@ -380,7 +380,7 @@ impl LifecycleFlow {
         Ok(())
     }
 
-    async fn preview(&mut self, client: &BcodeClient) -> Result<(), CliError> {
+    async fn preview(&mut self, client: &AccountLifecycleClient) -> Result<(), CliError> {
         self.plans.clear();
         for index in &self.selected {
             let provider = self.provider();
@@ -424,7 +424,7 @@ impl LifecycleFlow {
     /// Selection and previews only. Execution is deliberately outside this navigation loop.
     async fn navigate(
         &mut self,
-        client: &BcodeClient,
+        client: &AccountLifecycleClient,
         prompts: &mut Terminal,
     ) -> Result<bool, CliError> {
         let mut step = Step::Provider;
@@ -495,9 +495,9 @@ fn present_plan(plan: &AccountLifecyclePlan) {
 /// Returns selection, terminal, application, or incomplete-operation errors. An execution
 /// error may follow partial effects; callers must not automatically replay a plan.
 pub async fn lifecycle(options: LifecycleOptions) -> Result<(), CliError> {
-    let client = BcodeClient::default_endpoint();
     let mut prompts = auth_prompts::terminal();
     options.validate(prompts.interactive)?;
+    let client = BcodeClient::default_endpoint().account_lifecycle().await?;
     let mut flow = LifecycleFlow {
         options,
         catalog: client.account_lifecycle_catalog().await?,
@@ -526,7 +526,7 @@ pub async fn lifecycle(options: LifecycleOptions) -> Result<(), CliError> {
 }
 
 async fn execute_plans(
-    client: &BcodeClient,
+    client: &AccountLifecycleClient,
     plans: &[AccountLifecyclePlan],
 ) -> Result<(), CliError> {
     // Each reviewed account has its own result. Never replay an ambiguous result.

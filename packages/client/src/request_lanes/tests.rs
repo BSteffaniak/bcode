@@ -10,6 +10,7 @@ enum Reply {
     PartialFirst,
     WrongIdFirst,
     EventFirst,
+    AccountLifecycle,
 }
 
 struct Server {
@@ -78,6 +79,7 @@ impl Server {
                                     &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
                                 ).await.unwrap();
                                 handshakes.fetch_add(1, Ordering::SeqCst);
+                                let mut plans = std::collections::BTreeSet::new();
                                 while let Ok(request) = crate::recv_envelope(&mut stream).await {
                                     let index = requests.fetch_add(1, Ordering::SeqCst);
                                     admitted.notify_one();
@@ -92,19 +94,20 @@ impl Server {
                                                     break;
                                                 }
                                             }
-                                            Reply::Pong | Reply::WrongIdFirst | Reply::EventFirst => {}
+                                            Reply::Pong | Reply::WrongIdFirst | Reply::EventFirst | Reply::AccountLifecycle => {}
                                         }
                                     }
                                     let Ok(permit) = replies.acquire().await else { break };
                                     permit.forget();
                                     let id = request.request_id
                                         + u64::from(index == 0 && matches!(reply, Reply::WrongIdFirst));
-                                    let payload = match bcode_ipc::decode_request(&request.payload).unwrap() {
-                                        Request::IngestClientMetrics { .. } => ResponsePayload::ClientMetricsIngested { accepted: 0 },
-                                        _ => ResponsePayload::Pong,
+                                    let response = match bcode_ipc::decode_request(&request.payload).unwrap() {
+                                        request if matches!(reply, Reply::AccountLifecycle) => lifecycle_reply(request, &mut plans),
+                                        Request::IngestClientMetrics { .. } => Response::Ok(ResponsePayload::ClientMetricsIngested { accepted: 0 }),
+                                        _ => Response::Ok(ResponsePayload::Pong),
                                     };
                                     let mut response = bcode_ipc::response_envelope(
-                                        id, &Response::Ok(payload),
+                                        id, &response,
                                     ).unwrap();
                                     if index == 0 && matches!(reply, Reply::EventFirst) {
                                         response.kind = crate::EnvelopeKind::Event;
@@ -143,6 +146,143 @@ impl Server {
         .await
         .unwrap();
     }
+}
+
+fn lifecycle_reply(request: Request, plans: &mut std::collections::BTreeSet<String>) -> Response {
+    use bcode_provider_auth_models::{account_lifecycle::*, application::*};
+    let payload = match request {
+        Request::AccountLifecycleCatalog => ResponsePayload::AccountLifecycleCatalog {
+            catalog: AccountLifecycleCatalog { providers: vec![] },
+        },
+        Request::PreviewAccountLifecycle { request, revoke } => {
+            let plan_id = request.profile.clone();
+            plans.insert(plan_id.clone());
+            ResponsePayload::AccountLifecyclePreview {
+                plan: AccountLifecyclePlan {
+                    plan_id,
+                    local: AccountLifecyclePreview {
+                        request,
+                        owner_plugin_id: "test".into(),
+                        credential_ids: vec![],
+                        runtime_pools: vec![],
+                        retains_declarative_profile: false,
+                    },
+                    revoke,
+                },
+            }
+        }
+        Request::ExecuteAccountLifecycle { plan_id } if plans.remove(&plan_id) => {
+            ResponsePayload::AccountLifecycleExecuted {
+                result: AccountLifecycleExecution {
+                    local: AccountLifecycleOutcome {
+                        credentials: AccountLifecycleEffect::Complete,
+                        runtime: AccountLifecycleEffect::Complete,
+                        operational: AccountLifecycleEffect::Complete,
+                        error: None,
+                    },
+                    revocation: AccountLifecycleRevocation::NotRequested,
+                },
+            }
+        }
+        _ => panic!("unexpected lifecycle request or foreign/consumed plan"),
+    };
+    Response::Ok(payload)
+}
+
+fn lifecycle_request(
+    profile: &str,
+) -> bcode_provider_auth_models::account_lifecycle::AccountLifecycleRequest {
+    use bcode_provider_auth_models::account_lifecycle::*;
+    AccountLifecycleRequest {
+        schema_version: 1,
+        provider_id: "test".into(),
+        profile: profile.into(),
+        action: AccountLifecycleAction::Remove,
+    }
+}
+
+#[tokio::test]
+async fn account_lifecycle_retains_caller_across_review_and_multiple_accounts() {
+    let server = Server::new(Reply::AccountLifecycle);
+    server.replies.add_permits(5);
+    let client = server.client.account_lifecycle().await.unwrap();
+    assert_eq!(
+        client.account_lifecycle_catalog().await.unwrap(),
+        bcode_provider_auth_models::application::AccountLifecycleCatalog { providers: vec![] }
+    );
+    let first = client
+        .preview_account_lifecycle(lifecycle_request("first"), false)
+        .await
+        .unwrap();
+    let second = client
+        .preview_account_lifecycle(lifecycle_request("second"), false)
+        .await
+        .unwrap();
+    // Review is idle time, not a request; neither pooled-lane expiration nor other
+    // callers may replace the connection that owns the reviewed plans.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        client
+            .execute_account_lifecycle(first.plan_id)
+            .await
+            .unwrap()
+            .local
+            .error
+            .is_none()
+    );
+    assert!(
+        client
+            .execute_account_lifecycle(second.plan_id)
+            .await
+            .unwrap()
+            .local
+            .error
+            .is_none()
+    );
+    assert_eq!(server.handshakes.load(Ordering::SeqCst), 1);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn account_lifecycle_transport_failure_does_not_reconnect_or_replay() {
+    let server = Server::new(Reply::CloseFirst);
+    let client = server.client.account_lifecycle().await.unwrap();
+    assert!(
+        client
+            .preview_account_lifecycle(lifecycle_request("first"), false)
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .execute_account_lifecycle("first".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.handshakes.load(Ordering::SeqCst), 1);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn account_lifecycle_cancelled_request_invalidates_conversation() {
+    let server = Server::new(Reply::AccountLifecycle);
+    let client = server.client.account_lifecycle().await.unwrap();
+    {
+        let request = client.preview_account_lifecycle(lifecycle_request("first"), false);
+        tokio::pin!(request);
+        tokio::select! {
+            result = &mut request => panic!("blocked response unexpectedly completed: {result:?}"),
+            () = server.wait_requests(1) => {}
+        }
+    }
+    assert!(
+        client
+            .execute_account_lifecycle("first".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.handshakes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
