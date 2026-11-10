@@ -29,9 +29,15 @@ bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
+    "action-row",
+    "button",
+    "empty-state",
     "key-hint-bar",
     "modal-frame",
+    "selectable-list",
+    "tab-bar",
     "text-input",
+    "tree-view",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }
 crossterm = { workspace = true, features = ["events"] }

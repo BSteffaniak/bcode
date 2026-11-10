@@ -1,7 +1,6 @@
 //! Code review workspace home/picker TUI.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,16 +15,22 @@ use bcode_code_review_models::{
 };
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
 use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_tui::component::{
+    ChildLayout, Component, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
+};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
-use bmux_tui::terminal::Terminal;
+use bmux_tui_components::empty_state::{EmptyStateComponent, EmptyStateStyles};
+use bmux_tui_components::selectable_list::{
+    SelectableList, SelectableListComponent, SelectableListItem, SelectableListOutcome,
+    SelectableListState, SelectableListStyles,
+};
 use tokio::sync::mpsc;
 
-use crate::terminal_events::TuiInput;
-use crate::tui_host_types::{TuiError, helpers};
+use crate::tui_host_types::TuiError;
 
 #[derive(Debug, Clone, Copy)]
 struct ReviewHomeTheme {
@@ -72,9 +77,181 @@ pub enum ReviewHomeOutcome {
     Exit,
 }
 
+/// Caller-owned BMUX state and the exact item snapshot/rectangle last painted.
+#[derive(Debug, Clone)]
+struct HomeList {
+    id: &'static str,
+    items: Vec<SelectableListItem>,
+    state: SelectableListState,
+    painted_area: Option<Rect>,
+    painted_layout: Option<LayoutNode>,
+}
+
+impl HomeList {
+    const fn new(id: &'static str) -> Self {
+        Self {
+            id,
+            items: Vec::new(),
+            state: SelectableListState::new(None),
+            painted_area: None,
+            painted_layout: None,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        items: Vec<SelectableListItem>,
+        area: Rect,
+        selected: Option<usize>,
+        frame: &mut PaintCx<'_, '_>,
+        theme: ReviewHomeTheme,
+    ) {
+        let selection_changed = self.items != items || self.state.selected() != selected;
+        if self.items != items {
+            self.state = SelectableListState::new(selected);
+        } else if self.state.selected() != selected {
+            self.state.set_selected(selected);
+            self.state.set_focused(selected);
+        }
+        self.items = items;
+        self.painted_area = (!area.is_empty()).then_some(area);
+        let list = SelectableList::new(&self.items).styles(home_list_styles(theme));
+        list.clamp_state(area, &mut self.state);
+        let state = std::cell::Cell::new(self.state);
+        let component = SelectableListComponent::new(self.id, &self.items, &state)
+            .styles(home_list_styles(theme))
+            .fallback_style(theme.text);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        // Do not snap back to focus after wheel scrolling; reveal only semantic selection changes.
+        if selection_changed {
+            component.reveal_focus(&layout);
+        }
+        self.state = state.get();
+        frame.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::terminal(Rect::new(0, 0, area.width, area.height)),
+            |child| component.paint(&layout, child),
+        );
+        self.painted_layout = Some(LayoutNode::with_children(
+            LayoutId::new("home-list-root"),
+            LogicalSize::new(u64::from(area.right()), u64::from(area.bottom())),
+            vec![ChildLayout::new(
+                u64::from(area.x),
+                u64::from(area.y),
+                layout,
+            )],
+        ));
+    }
+
+    fn event(&mut self, event: &Event) -> SelectableListOutcome {
+        let Some(area) = self.painted_area else {
+            return SelectableListOutcome::Ignored;
+        };
+        let Some(root) = self.painted_layout.as_ref() else {
+            return SelectableListOutcome::Ignored;
+        };
+        let event = if matches!(event, Event::Mouse(mouse) if !area.contains(mouse.position) && matches!(mouse.kind, bmux_tui::event::MouseEventKind::Up(_)))
+        {
+            &Event::Focus(bmux_tui::event::FocusEvent::Lost)
+        } else {
+            event
+        };
+        let prior_selected = self.state.selected();
+        // BMUX list selection is value-oriented. Home rows are repeatable actions:
+        // releasing the already-selected row must still resume/create it.
+        if matches!(event, Event::Mouse(mouse) if matches!(mouse.kind, bmux_tui::event::MouseEventKind::Up(_)))
+        {
+            self.state.set_selected(None);
+        }
+        let state = std::cell::Cell::new(self.state);
+        let component = SelectableListComponent::new(self.id, &self.items, &state);
+        let mut cx = EventCx::with_clip(root, area);
+        let child = &root.children[0];
+        let outcome = cx.with_child(child, |cx| component.handle_event(event, &child.node, cx));
+        self.state = state.get();
+        if !matches!(outcome, SelectableListOutcome::Selected(_)) {
+            self.state.set_selected(prior_selected);
+        }
+        outcome
+    }
+}
+
+fn home_list_styles(theme: ReviewHomeTheme) -> SelectableListStyles {
+    SelectableListStyles {
+        background: theme.canvas,
+        normal: theme.text,
+        focused: theme.focused,
+        selected: theme.selection,
+        hovered: theme.focused,
+        pressed: theme.selection,
+        disabled: theme.muted,
+        ..SelectableListStyles::default()
+    }
+}
+
+const HOME_PRESETS: [(&str, char, &str); 6] = [
+    ("Unstaged changes", 'u', "Tracked edits not staged yet"),
+    ("Staged changes", 's', "The index, ready to commit"),
+    ("Worktree + staged", 'w', "All tracked local changes"),
+    ("Repository", 'v', "Browse and review repository files"),
+    ("Last commit", 'l', "Review the most recent commit"),
+    (
+        "Custom review…",
+        'n',
+        "Name a workspace, then choose sources in Build",
+    ),
+];
+
+fn home_effective_hints(scope: &str, keys: impl Fn(&str) -> Vec<String>) -> Vec<String> {
+    use bcode_plugin_sdk::tui::keymap::controls::ControlAction;
+    let mut hints = crate::keybindings::effective_hints(scope, &keys);
+    if scope == crate::keybindings::HOME {
+        for control in [
+            ControlAction::FocusNext,
+            ControlAction::FocusPrevious,
+            ControlAction::Cancel,
+        ] {
+            let definition = control.definition(scope);
+            let bindings = keys(&definition.id);
+            if !bindings.is_empty() {
+                hints.push(format!("{} {}", bindings.join("/"), definition.description));
+            }
+        }
+    }
+    hints
+}
+
+fn home_preset_hint(key: char) -> String {
+    let Some(action) = crate::keybindings::actions_for(crate::keybindings::HOME)
+        .into_iter()
+        .find(|action| {
+            action
+                .defaults
+                .iter()
+                .any(|binding| binding == &key.to_string())
+        })
+    else {
+        return String::new();
+    };
+    crate::keybindings::hints()
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|hint| {
+            hint.strip_suffix(&action.description)
+                .map(|keys| format!("  [{}]", keys.trim()))
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct ReviewHomeApp {
+    help: HomeList,
+    presets: HomeList,
+    workspaces: HomeList,
+    preset_focus: bool,
+    preset_selected: usize,
     repo_path: PathBuf,
     workspace_items: Vec<ReviewWorkspaceListItem>,
     selected: usize,
@@ -107,6 +284,11 @@ const fn keymap_scope(app: &ReviewHomeApp) -> &'static str {
 impl ReviewHomeApp {
     const fn new(repo_path: PathBuf, workspace_items: Vec<ReviewWorkspaceListItem>) -> Self {
         Self {
+            help: HomeList::new("review-home-help"),
+            presets: HomeList::new("review-home-presets"),
+            workspaces: HomeList::new("review-home-workspaces"),
+            preset_focus: false,
+            preset_selected: 0,
             repo_path,
             workspace_items,
             selected: 0,
@@ -154,6 +336,7 @@ impl ReviewHomeApp {
             .collect()
     }
 
+    #[cfg(test)]
     fn visible_selection_bounds(&self, height: usize) -> (usize, usize) {
         let visible = self.visible_indices();
         if visible.is_empty() || height == 0 {
@@ -174,6 +357,20 @@ impl ReviewHomeApp {
             .min(self.visible_indices().len().saturating_sub(1));
     }
 
+    /// Keep the current semantic selection when asynchronous work reorders rows.
+    fn reconcile_selection(&mut self, workspace_id: Option<&str>) {
+        if let Some(selected) = workspace_id.and_then(|id| {
+            self.visible_indices().into_iter().position(|index| {
+                self.workspace(index)
+                    .is_some_and(|workspace| workspace.id == id)
+            })
+        }) {
+            self.selected = selected;
+        } else {
+            self.clamp_selection();
+        }
+    }
+
     fn selected_workspace(&self) -> Option<ReviewWorkspace> {
         self.selected_workspace_index()
             .and_then(|index| self.workspace(index).cloned())
@@ -181,8 +378,10 @@ impl ReviewHomeApp {
 
     fn selected_workspace_or_status(&mut self) -> Option<ReviewWorkspace> {
         let Some(workspace) = self.selected_workspace() else {
-            self.status_message =
-                Some("no matching review workspace selected; press n to create one".to_string());
+            self.status_message = Some(
+                "no matching review workspace selected; choose Custom review to create one"
+                    .to_string(),
+            );
             return None;
         };
         Some(workspace)
@@ -224,8 +423,7 @@ impl ReviewHomeApp {
         build_mode: bool,
     ) -> bool {
         if workspace.archived_at_ms.is_some() {
-            self.status_message =
-                Some("review is archived; press R to restore it first".to_string());
+            self.status_message = Some("review is archived; restore it before opening".to_string());
             return true;
         }
         self.open_workspace(workspace, build_mode)
@@ -241,8 +439,10 @@ impl ReviewHomeApp {
             })
             .or_else(|| self.visible_indices().first().copied())
         else {
-            self.status_message =
-                Some("no matching review workspace selected; press n to create one".to_string());
+            self.status_message = Some(
+                "no matching review workspace selected; choose Custom review to create one"
+                    .to_string(),
+            );
             return true;
         };
         let Some(workspace) = self.workspace(index).cloned() else {
@@ -522,7 +722,6 @@ pub struct ReviewHomeSurface {
 #[derive(Debug, Clone)]
 enum ReviewHomeAsyncAction {
     ArchiveSelectedWorkspace {
-        workspace_index: usize,
         workspace_id: String,
     },
     CreatePreset {
@@ -555,7 +754,7 @@ enum ReviewHomeAsyncResult {
 
 #[derive(Debug)]
 struct ArchiveSelectedWorkspaceResult {
-    workspace_index: usize,
+    workspace_id: String,
     archived: bool,
 }
 
@@ -626,12 +825,11 @@ async fn run_home_async_action(
     action: ReviewHomeAsyncAction,
 ) -> ReviewHomeAsyncResult {
     match action {
-        ReviewHomeAsyncAction::ArchiveSelectedWorkspace {
-            workspace_index,
-            workspace_id,
-        } => ReviewHomeAsyncResult::ArchiveSelectedWorkspace(
-            archive_workspace_action(client, repo_path, workspace_index, workspace_id).await,
-        ),
+        ReviewHomeAsyncAction::ArchiveSelectedWorkspace { workspace_id } => {
+            ReviewHomeAsyncResult::ArchiveSelectedWorkspace(
+                archive_workspace_action(client, repo_path, workspace_id).await,
+            )
+        }
         ReviewHomeAsyncAction::CreatePreset {
             title,
             source_kinds,
@@ -687,9 +885,10 @@ fn apply_home_async_result(app: &mut ReviewHomeApp, result: ReviewHomeAsyncResul
         },
         ReviewHomeAsyncResult::ToggleArchived(result) => match result {
             Ok(result) => {
+                let selected_id = app.selected_workspace().map(|workspace| workspace.id);
                 app.include_archived = result.include_archived;
                 app.workspace_items = result.workspaces;
-                app.clamp_selection();
+                app.reconcile_selection(selected_id.as_deref());
                 app.status_message = Some(if app.include_archived {
                     "showing archived reviews".to_string()
                 } else {
@@ -731,16 +930,22 @@ fn apply_archive_selected_workspace_result(
         app.status_message = Some("workspace was not found".to_string());
         return;
     }
-    if result.workspace_index >= app.workspace_items.len() {
+    let Some(index) = app
+        .workspace_items
+        .iter()
+        .position(|item| item.workspace.id == result.workspace_id)
+    else {
         app.status_message = Some("archived workspace".to_string());
         return;
-    }
-    let archived = app.workspace_items.remove(result.workspace_index);
-    app.clamp_selection();
+    };
+    let selected_id = app.selected_workspace().map(|workspace| workspace.id);
+    let archived = app.workspace_items.remove(index);
+    app.reconcile_selection(selected_id.as_deref());
     app.status_message = Some(format!("archived {}", archived.workspace.title));
 }
 
 fn apply_restored_workspace(app: &mut ReviewHomeApp, workspace: ReviewWorkspace) {
+    let selected_id = app.selected_workspace().map(|workspace| workspace.id);
     if let Some(item) = app
         .workspace_items
         .iter_mut()
@@ -748,10 +953,12 @@ fn apply_restored_workspace(app: &mut ReviewHomeApp, workspace: ReviewWorkspace)
     {
         item.workspace = workspace;
     }
+    app.reconcile_selection(selected_id.as_deref());
     app.status_message = Some("restored review workspace".to_string());
 }
 
 fn apply_renamed_workspace(app: &mut ReviewHomeApp, workspace: ReviewWorkspace) {
+    let selected_id = app.selected_workspace().map(|workspace| workspace.id);
     let new_title = workspace.title.clone();
     if let Some(item) = app
         .workspace_items
@@ -760,6 +967,7 @@ fn apply_renamed_workspace(app: &mut ReviewHomeApp, workspace: ReviewWorkspace) 
     {
         item.workspace = workspace;
     }
+    app.reconcile_selection(selected_id.as_deref());
     app.status_message = Some(format!("renamed review to {new_title}"));
 }
 
@@ -773,7 +981,7 @@ impl PluginTuiSurface for ReviewHomeSurface {
     }
 
     fn render(&mut self, _area: Rect, frame: &mut PaintCx<'_, '_>) {
-        render(&self.app, frame, ReviewHomeTheme::resolve(None));
+        render(&mut self.app, frame, ReviewHomeTheme::resolve(None));
     }
 
     fn render_with_theme(
@@ -782,7 +990,7 @@ impl PluginTuiSurface for ReviewHomeSurface {
         frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
-        render(&self.app, frame, ReviewHomeTheme::resolve(theme));
+        render(&mut self.app, frame, ReviewHomeTheme::resolve(theme));
     }
 
     fn render_with_host(
@@ -793,7 +1001,7 @@ impl PluginTuiSurface for ReviewHomeSurface {
         host: &dyn PluginTuiHost,
     ) {
         let scope = keymap_scope(&self.app);
-        crate::keybindings::set_hints(crate::keybindings::effective_hints(scope, |action| {
+        crate::keybindings::set_hints(home_effective_hints(scope, |action| {
             host.keymap_keys(scope, action)
         }));
         self.render_with_theme(area, frame, theme);
@@ -802,7 +1010,12 @@ impl PluginTuiSurface for ReviewHomeSurface {
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let Event::Key(key) = event else {
-            return PluginTuiAction::None;
+            let (redraw, action) = home_pointer_event(&mut self.app, event);
+            let redraw = action.map_or(redraw, |key| {
+                handle_plugin_key_event(&mut self.app, key, &mut self.pending_action)
+            });
+            self.spawn_pending_action(host);
+            return self.action_after_state_update(redraw);
         };
         let scope = keymap_scope(&self.app);
         let Some(key) =
@@ -825,62 +1038,141 @@ impl PluginTuiSurface for ReviewHomeSurface {
     }
 }
 
-/// Run the review home/picker.
-///
-/// # Errors
-///
-/// Returns an error when review workspaces cannot be loaded or terminal I/O fails.
-pub async fn run<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    repo_path: PathBuf,
-) -> Result<ReviewHomeOutcome, TuiError> {
-    let client = BcodeClient::default_endpoint();
-    let mut app = match load_workspaces(&client, repo_path.clone()).await {
-        Ok(workspaces) => ReviewHomeApp::new(repo_path, workspaces),
-        Err(error) => {
-            let mut app = ReviewHomeApp::new(repo_path, Vec::new());
-            app.status_message = Some(format!("failed to load workspaces: {error}"));
-            app
-        }
+fn home_pointer_event(app: &mut ReviewHomeApp, event: &Event) -> (bool, Option<KeyStroke>) {
+    if matches!(event, Event::Resize(_)) {
+        app.help.event(event);
+        app.presets.event(event);
+        app.workspaces.event(event);
+        app.help.painted_area = None;
+        app.presets.painted_area = None;
+        app.workspaces.painted_area = None;
+        return (true, None);
+    }
+    if matches!(event, Event::Focus(_)) {
+        app.help.event(event);
+        app.presets.event(event);
+        app.workspaces.event(event);
+        return (true, None);
+    }
+    if app.help_visible {
+        return (
+            app.help.event(event) != SelectableListOutcome::Ignored,
+            None,
+        );
+    }
+    if app.search_active || app.rename_buffer.is_some() || app.new_review_buffer.is_some() {
+        return (false, None);
+    }
+    let Event::Mouse(mouse) = event else {
+        return (false, None);
     };
-    let keymap = crate::keybindings::load_registry()?;
-    let mut input = TuiInput::start();
-    let mut needs_redraw = true;
-
-    while !app.should_exit {
-        if helpers::resize_from_terminal(terminal)? {
-            needs_redraw = true;
-        }
-        if needs_redraw {
-            let scope = keymap_scope(&app);
-            crate::keybindings::set_hints(crate::keybindings::effective_hints(scope, |action| {
-                keymap
-                    .keys_for_action(scope, action)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
-            }));
-            terminal.draw(|frame| render(&app, frame, ReviewHomeTheme::resolve(None)))?;
-            crate::keybindings::clear_hints();
-            needs_redraw = false;
-        }
-        let Some(event) = input.recv().await? else {
-            continue;
-        };
-        if let Event::Key(key) = event {
-            let scope = keymap_scope(&app);
-            if let Some(key) = crate::keybindings::from_registry(
-                &keymap,
-                scope,
-                key,
-                scope != crate::keybindings::HOME,
-            ) {
-                needs_redraw = handle_key_event(&client, &mut app, key).await;
+    let on_presets = app
+        .presets
+        .painted_area
+        .is_some_and(|area| area.contains(mouse.position));
+    let on_workspaces = app
+        .workspaces
+        .painted_area
+        .is_some_and(|area| area.contains(mouse.position));
+    // A release outside must still clear the component's pressed state.
+    let preset = app.presets.event(event);
+    let workspace = app.workspaces.event(event);
+    if on_presets && matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_)) {
+        app.preset_focus = true;
+    }
+    if on_workspaces && matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_)) {
+        app.preset_focus = false;
+    }
+    match preset {
+        SelectableListOutcome::Focused(index) => app.preset_selected = index,
+        SelectableListOutcome::Selected(index) => {
+            app.preset_selected = index;
+            if let Some((_, key, _)) = HOME_PRESETS.get(index) {
+                return (true, Some(KeyStroke::simple(KeyCode::Char(*key))));
             }
         }
+        _ => {}
     }
+    match workspace {
+        SelectableListOutcome::Focused(index) => app.selected = index,
+        SelectableListOutcome::Selected(index) => {
+            // Resolve against stable painted identity, never a newly filtered positional index.
+            let id = app.workspaces.items.get(index).map(|item| item.id.as_str());
+            if let Some(selected) = app.visible_indices().iter().position(|index| {
+                app.workspace(*index)
+                    .is_some_and(|workspace| Some(workspace.id.as_str()) == id)
+            }) {
+                app.selected = selected;
+                return (true, Some(KeyStroke::simple(KeyCode::Enter)));
+            }
+        }
+        _ => {}
+    }
+    (
+        preset != SelectableListOutcome::Ignored
+            || workspace != SelectableListOutcome::Ignored
+            || on_presets
+            || on_workspaces,
+        None,
+    )
+}
 
-    Ok(app.outcome.unwrap_or(ReviewHomeOutcome::Exit))
+/// Navigation is adapted only after effective keymap resolution.
+fn home_navigation(app: &mut ReviewHomeApp, key: KeyCode) -> Option<KeyCode> {
+    if app.search_active || app.rename_buffer.is_some() || app.new_review_buffer.is_some() {
+        return Some(key);
+    }
+    if app.help_visible {
+        let navigation = match key {
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            key => key,
+        };
+        if matches!(
+            navigation,
+            KeyCode::Down
+                | KeyCode::Up
+                | KeyCode::PageDown
+                | KeyCode::PageUp
+                | KeyCode::Home
+                | KeyCode::End
+        ) {
+            app.help.event(&Event::Key(KeyStroke::simple(navigation)));
+            return None;
+        }
+        if key == KeyCode::Escape {
+            app.help_visible = false;
+            return None;
+        }
+        return (key == KeyCode::Char('?')).then_some(key);
+    }
+    if key == KeyCode::Tab {
+        app.preset_focus = !app.preset_focus;
+        return None;
+    }
+    if app.preset_focus {
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.preset_selected = (app.preset_selected + 1).min(HOME_PRESETS.len() - 1);
+                return None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.preset_selected = app.preset_selected.saturating_sub(1);
+                return None;
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                app.preset_selected = 0;
+                return None;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                app.preset_selected = HOME_PRESETS.len() - 1;
+                return None;
+            }
+            KeyCode::Enter => return Some(KeyCode::Char(HOME_PRESETS[app.preset_selected].1)),
+            _ => {}
+        }
+    }
+    Some(key)
 }
 
 fn handle_plugin_key_event(
@@ -962,6 +1254,9 @@ fn handle_plugin_normal_key(
     key: KeyCode,
     pending_action: &mut Option<ReviewHomeAsyncAction>,
 ) -> bool {
+    let Some(key) = home_navigation(app, key) else {
+        return true;
+    };
     match key {
         KeyCode::Char('/') => app.toggle_search(),
         KeyCode::Char('r') => app.start_rename(),
@@ -1057,7 +1352,6 @@ fn queue_archive_selected_workspace(
         return true;
     };
     *pending_action = Some(ReviewHomeAsyncAction::ArchiveSelectedWorkspace {
-        workspace_index,
         workspace_id: workspace.id.clone(),
     });
     app.status_message = Some(format!("archiving {}...", workspace.title));
@@ -1114,37 +1408,6 @@ fn queue_rename_selected_workspace(
     true
 }
 
-async fn handle_key_event(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-    stroke: KeyStroke,
-) -> bool {
-    if is_review_home_exit_key(stroke) {
-        app.outcome = Some(ReviewHomeOutcome::Exit);
-        app.should_exit = true;
-        return true;
-    }
-    if stroke.modifiers.ctrl
-        || stroke.modifiers.alt
-        || stroke.modifiers.super_key
-        || stroke.modifiers.hyper
-        || stroke.modifiers.meta
-    {
-        return false;
-    }
-    let key = normalized_home_key(stroke);
-    if app.new_review_buffer.is_some() {
-        return handle_new_review_key(client, app, key).await;
-    }
-    if app.rename_buffer.is_some() {
-        return handle_rename_key(client, app, key).await;
-    }
-    if app.search_active {
-        return app.handle_search_key(key);
-    }
-    handle_normal_key(client, app, key).await
-}
-
 fn is_review_home_exit_key(stroke: KeyStroke) -> bool {
     stroke.key == KeyCode::Char('d')
         && stroke.modifiers.ctrl
@@ -1164,138 +1427,6 @@ const fn normalized_home_key(stroke: KeyStroke) -> KeyCode {
         KeyCode::Char(ch) if ch.is_ascii_lowercase() => KeyCode::Char(ch.to_ascii_uppercase()),
         key => key,
     }
-}
-
-async fn handle_new_review_key(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-    key: KeyCode,
-) -> bool {
-    match app.handle_new_review_key(key) {
-        ReviewHomeKeyOutcome::Redraw => true,
-        ReviewHomeKeyOutcome::SubmitNewReview => match submit_new_review(client, app).await {
-            Ok(redraw) => redraw,
-            Err(error) => {
-                app.status_message = Some(format!("failed to create workspace: {error}"));
-                true
-            }
-        },
-        ReviewHomeKeyOutcome::SubmitRename | ReviewHomeKeyOutcome::Ignored => false,
-    }
-}
-
-async fn handle_rename_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
-    match app.handle_rename_key(key) {
-        ReviewHomeKeyOutcome::Redraw => true,
-        ReviewHomeKeyOutcome::SubmitRename => match submit_rename_workspace(client, app).await {
-            Ok(redraw) => redraw,
-            Err(error) => {
-                app.status_message = Some(format!("failed to rename workspace: {error}"));
-                true
-            }
-        },
-        ReviewHomeKeyOutcome::SubmitNewReview | ReviewHomeKeyOutcome::Ignored => false,
-    }
-}
-
-async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
-    match key {
-        KeyCode::Char('/') => app.toggle_search(),
-        KeyCode::Char('r') => app.start_rename(),
-        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Char('d') => {
-            app.details_visible = !app.details_visible;
-            true
-        }
-        KeyCode::Char('D') => app.toggle_draft_filter(),
-        KeyCode::Char('A') => app.toggle_attention_filter(),
-        KeyCode::Char('?') => {
-            app.help_visible = !app.help_visible;
-            true
-        }
-        KeyCode::Enter => app.open_selected(),
-        KeyCode::Char('c') => app.open_most_recent(),
-        KeyCode::Char('o') => app.open_selected_in_review_mode(),
-        KeyCode::Char('b') => app.open_selected_in_build_mode(),
-        KeyCode::Char('x') => match archive_selected_workspace(client, app).await {
-            Ok(archived) => archived,
-            Err(error) => {
-                app.status_message = Some(format!("failed to archive workspace: {error}"));
-                true
-            }
-        },
-        KeyCode::Char('n' | 'e') => app.start_new_review(),
-        KeyCode::Char('u' | 's' | 'w' | 'l' | 'v') => {
-            create_and_open_preset_for_key(client, app, key).await
-        }
-        KeyCode::Char('S') => app.select_next_setup_review(),
-        KeyCode::Char('U') => app.select_previous_setup_review(),
-        KeyCode::Char('F') => app.select_next_draft_review(),
-        KeyCode::Char('B') => app.select_previous_draft_review(),
-        KeyCode::Char('p') => app.select_next_published_review(),
-        KeyCode::Char('P') => app.select_previous_published_review(),
-        KeyCode::Char('M') => app.select_next_attention_review(),
-        KeyCode::Char('N') => app.select_previous_attention_review(),
-        KeyCode::Char('a') => toggle_archived(client, app).await,
-        KeyCode::Char('g') => {
-            app.selected = 0;
-            true
-        }
-        KeyCode::Char('G') => {
-            app.selected = app.visible_indices().len().saturating_sub(1);
-            true
-        }
-        KeyCode::Char('R') => match restore_selected_workspace(client, app).await {
-            Ok(restored) => restored,
-            Err(error) => {
-                app.status_message = Some(format!("failed to restore workspace: {error}"));
-                true
-            }
-        },
-        _ => false,
-    }
-}
-
-async fn create_and_open_preset_for_key(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-    key: KeyCode,
-) -> bool {
-    let KeyCode::Char(ch) = key else {
-        return false;
-    };
-    let Some((title, source_kind)) = (match ch {
-        'u' => Some(("Unstaged changes", ReviewSourceKind::WorkingTreeUnstaged)),
-        's' => Some(("Staged changes", ReviewSourceKind::IndexStaged)),
-        'w' => Some(("Working tree review", ReviewSourceKind::WorkingTreeAndIndex)),
-        'l' => Some(("Last commit review", ReviewSourceKind::LastCommit)),
-        'v' => Some(("Repository browser review", ReviewSourceKind::Repository)),
-        _ => None,
-    }) else {
-        return false;
-    };
-    create_and_open_preset_workspace(client, app, title, vec![source_kind]).await
-}
-
-async fn toggle_archived(client: &BcodeClient, app: &mut ReviewHomeApp) -> bool {
-    app.include_archived = !app.include_archived;
-    match load_workspaces_with_archived(client, app.repo_path.clone(), app.include_archived).await {
-        Ok(workspaces) => {
-            app.workspace_items = workspaces;
-            app.clamp_selection();
-            app.status_message = Some(if app.include_archived {
-                "showing archived reviews".to_string()
-            } else {
-                "hiding archived reviews".to_string()
-            });
-        }
-        Err(error) => {
-            app.include_archived = !app.include_archived;
-            app.status_message = Some(format!("failed to toggle archived reviews: {error}"));
-        }
-    }
-    true
 }
 
 async fn load_workspaces(
@@ -1348,199 +1479,14 @@ async fn load_workspaces_with_archived(
     Ok(items)
 }
 
-async fn create_and_open_preset_workspace(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-    title: &str,
-    source_kinds: Vec<ReviewSourceKind>,
-) -> bool {
-    match create_workspace_with_sources(
-        client,
-        app.repo_path.clone(),
-        title.to_string(),
-        source_kinds,
-    )
-    .await
-    {
-        Ok(workspace) => {
-            app.workspace_items.push(ReviewWorkspaceListItem {
-                workspace: workspace.clone(),
-                thread_count: 0,
-                draft_count: 0,
-                last_publish: None,
-            });
-            sort_workspace_items_recent_first(&mut app.workspace_items);
-            app.open_workspace(workspace, false)
-        }
-        Err(error) => {
-            app.status_message = Some(format!("failed to create workspace: {error}"));
-            true
-        }
-    }
-}
-
-async fn submit_new_review(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-) -> Result<bool, TuiError> {
-    let title = app
-        .new_review_buffer
-        .take()
-        .unwrap_or_else(|| "Untitled review".to_string())
-        .trim()
-        .to_string();
-    let title = if title.is_empty() {
-        "Untitled review".to_string()
-    } else {
-        title
-    };
-    let workspace =
-        create_workspace_with_sources(client, app.repo_path.clone(), title, Vec::new()).await?;
-    app.open_workspace(workspace, true);
-    Ok(true)
-}
-
-async fn submit_rename_workspace(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-) -> Result<bool, TuiError> {
-    let Some(new_title) = app.rename_buffer.take() else {
-        return Ok(false);
-    };
-    let new_title = new_title.trim().to_string();
-    if new_title.is_empty() {
-        app.status_message = Some("review title cannot be empty".to_string());
-        return Ok(true);
-    }
-    let Some(workspace_index) = app.selected_workspace_index() else {
-        app.status_message = Some("no matching review workspace selected".to_string());
-        return Ok(true);
-    };
-    let Some(existing) = app.workspace(workspace_index) else {
-        app.status_message = Some("selected review workspace is unavailable".to_string());
-        return Ok(true);
-    };
-    let mut workspace = existing.clone();
-    workspace.title = new_title.clone();
-    let payload = serde_json::to_vec(&UpdateReviewWorkspaceRequest {
-        repo_path: app.repo_path.clone(),
-        workspace,
-    })
-    .map_err(TuiError::Json)?;
-    let response = client
-        .call_plugin_service(
-            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
-            OP_REVIEW_WORKSPACE_UPDATE.to_string(),
-            payload,
-        )
-        .await?;
-    if let Some(error) = response.error {
-        return Err(TuiError::PluginService {
-            code: error.code,
-            message: error.message,
-        });
-    }
-    let response: UpdateReviewWorkspaceResponse =
-        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    app.workspace_items[workspace_index].workspace = response.workspace;
-    app.status_message = Some(format!("renamed review to {new_title}"));
-    Ok(true)
-}
-
-async fn restore_selected_workspace(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-) -> Result<bool, TuiError> {
-    let Some(workspace_index) = app.selected_workspace_index() else {
-        app.status_message = Some("no matching review workspace selected".to_string());
-        return Ok(true);
-    };
-    let Some(existing) = app.workspace(workspace_index) else {
-        app.status_message = Some("no review workspace selected".to_string());
-        return Ok(true);
-    };
-    if existing.archived_at_ms.is_none() {
-        app.status_message = Some("selected review is not archived".to_string());
-        return Ok(true);
-    }
-    let mut workspace = existing.clone();
-    workspace.archived_at_ms = None;
-    let payload = serde_json::to_vec(&UpdateReviewWorkspaceRequest {
-        repo_path: app.repo_path.clone(),
-        workspace,
-    })
-    .map_err(TuiError::Json)?;
-    let response = client
-        .call_plugin_service(
-            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
-            OP_REVIEW_WORKSPACE_UPDATE.to_string(),
-            payload,
-        )
-        .await?;
-    if let Some(error) = response.error {
-        return Err(TuiError::PluginService {
-            code: error.code,
-            message: error.message,
-        });
-    }
-    let response: UpdateReviewWorkspaceResponse =
-        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    app.workspace_items[workspace_index].workspace = response.workspace;
-    app.status_message = Some("restored review workspace".to_string());
-    Ok(true)
-}
-
-async fn archive_selected_workspace(
-    client: &BcodeClient,
-    app: &mut ReviewHomeApp,
-) -> Result<bool, TuiError> {
-    let Some(workspace_index) = app.selected_workspace_index() else {
-        app.status_message = Some("no matching review workspace selected".to_string());
-        return Ok(true);
-    };
-    let Some(workspace) = app.workspace(workspace_index) else {
-        app.status_message = Some("no review workspace selected".to_string());
-        return Ok(true);
-    };
-    let payload = serde_json::to_vec(&ArchiveReviewWorkspaceRequest {
-        repo_path: app.repo_path.clone(),
-        workspace_id: workspace.id.clone(),
-    })
-    .map_err(TuiError::Json)?;
-    let response = client
-        .call_plugin_service(
-            CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
-            OP_REVIEW_WORKSPACE_ARCHIVE.to_string(),
-            payload,
-        )
-        .await?;
-    if let Some(error) = response.error {
-        return Err(TuiError::PluginService {
-            code: error.code,
-            message: error.message,
-        });
-    }
-    let response: ArchiveReviewWorkspaceResponse =
-        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    if response.archived {
-        let archived = app.workspace_items.remove(workspace_index);
-        app.clamp_selection();
-        app.status_message = Some(format!("archived {}", archived.workspace.title));
-    } else {
-        app.status_message = Some("workspace was not found".to_string());
-    }
-    Ok(true)
-}
-
 async fn archive_workspace_action(
     client: &BcodeClient,
     repo_path: PathBuf,
-    workspace_index: usize,
     workspace_id: String,
 ) -> Result<ArchiveSelectedWorkspaceResult, TuiError> {
     let payload = serde_json::to_vec(&ArchiveReviewWorkspaceRequest {
         repo_path,
-        workspace_id,
+        workspace_id: workspace_id.clone(),
     })
     .map_err(TuiError::Json)?;
     let response = client
@@ -1559,7 +1505,7 @@ async fn archive_workspace_action(
     let response: ArchiveReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     Ok(ArchiveSelectedWorkspaceResult {
-        workspace_index,
+        workspace_id,
         archived: response.archived,
     })
 }
@@ -1631,21 +1577,54 @@ async fn create_workspace_with_sources(
     Ok(response.workspace)
 }
 
-fn render(app: &ReviewHomeApp, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) {
+fn render(app: &mut ReviewHomeApp, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) {
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
+    app.help.painted_area = None;
+    app.presets.painted_area = None;
+    app.workspaces.painted_area = None;
+    if area.is_empty() {
+        return;
+    }
     frame.fill(LocalRect::terminal(area), " ", theme.canvas);
+    if app.help_visible {
+        render_help(app, area, frame, theme);
+        return;
+    }
     render_header(app, area, frame, theme);
+    let body_y = area.height.min(2);
+    let body_height = area.height.saturating_sub(body_y).saturating_sub(2);
+    // Fixed presentation split only; BMUX owns item measurement and scrolling.
+    let preset_height = body_height.min(if body_height >= 10 {
+        7
+    } else {
+        body_height / 2
+    });
+    if preset_height > 0 {
+        let items = HOME_PRESETS
+            .iter()
+            .map(|(label, key, _)| {
+                SelectableListItem::new(
+                    key.to_string(),
+                    format!("{label}{}", home_preset_hint(*key)),
+                )
+            })
+            .collect();
+        app.presets.paint(
+            items,
+            Rect::new(0, body_y, area.width, preset_height),
+            app.preset_focus.then_some(app.preset_selected),
+            frame,
+            theme,
+        );
+    }
     let body = Rect::new(
-        area.x,
-        area.y.saturating_add(2),
+        0,
+        body_y.saturating_add(preset_height),
         area.width,
-        area.height.saturating_sub(4),
+        body_height.saturating_sub(preset_height),
     );
     render_workspaces(app, body, frame, theme);
     render_footer(app, area, frame, theme);
-    if app.help_visible {
-        render_help(area, frame, theme);
-    }
 }
 
 fn render_header(
@@ -1665,10 +1644,7 @@ fn render_header(
     frame.write_line(
         LocalRect::terminal(Rect::new(area.x, area.y.saturating_add(1), area.width, 1)),
         &Line::from_spans(vec![Span::styled(
-            format!(
-                " {filter_label}  {} ",
-                crate::keybindings::hints().unwrap_or_default().join("  ")
-            ),
+            format!(" {filter_label}  ·  Start a review above / resume a workspace below"),
             theme.muted,
         )]),
     );
@@ -1731,7 +1707,7 @@ fn active_filter_label(app: &ReviewHomeApp) -> String {
 }
 
 fn render_workspaces(
-    app: &ReviewHomeApp,
+    app: &mut ReviewHomeApp,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
@@ -1759,41 +1735,40 @@ fn render_empty_review_home(
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
-    let mut lines = vec!["No review workspaces yet.".to_owned(), String::new()];
-    lines.extend(crate::keybindings::hints().unwrap_or_default());
-    for (row, line) in lines.iter().take(usize::from(area.height)).enumerate() {
-        let style = if row == 0 {
-            theme.focused.add_modifier(Modifier::BOLD)
+    if area.is_empty() {
+        return;
+    }
+    let body = [Line::from(if app.workspace_items.is_empty() {
+        "Choose a preset above to start reviewing immediately. Custom review opens Build, where you can combine sources. Saved reviews appear here to resume later."
+    } else {
+        "No workspaces match these filters. Clear search or change the draft/attention filter to see saved reviews."
+    })];
+    let component = EmptyStateComponent::new(
+        "review-home-empty",
+        if app.workspace_items.is_empty() {
+            "Your next review starts here"
         } else {
-            theme.text
-        };
-        frame.write_line(
-            LocalRect::terminal(Rect::new(
-                area.x,
-                area.y
-                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
-                area.width,
-                1,
-            )),
-            &Line::from_spans(vec![Span::styled(format!(" {line}"), style)]),
-        );
-    }
-    if let Some(message) = &app.status_message {
-        let y = area
-            .y
-            .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX))
-            .saturating_add(1);
-        if y < area.bottom() {
-            frame.write_line(
-                LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
-                &Line::from_spans(vec![Span::styled(format!(" {message}"), theme.focused)]),
-            );
-        }
-    }
+            "No matching reviews"
+        },
+    )
+    .body(&body)
+    .styles(EmptyStateStyles {
+        title: theme.focused,
+        body: theme.muted,
+        background: theme.canvas,
+        ..EmptyStateStyles::default()
+    });
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::terminal(Rect::new(0, 0, area.width, area.height)),
+        |child| component.paint(&layout, child),
+    );
 }
 
 fn render_workspace_list(
-    app: &ReviewHomeApp,
+    app: &mut ReviewHomeApp,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
@@ -1804,52 +1779,25 @@ fn render_workspace_list(
         return;
     }
     if visible.is_empty() {
-        frame.write_line(
-            LocalRect::terminal(Rect::new(area.x, area.y, area.width, 1)),
-            &Line::from_spans(vec![Span::styled(
-                if app.draft_filter_active {
-                    " No review workspaces with drafts match the active filters."
-                } else {
-                    " No matching review workspaces."
-                },
-                theme.text,
-            )]),
-        );
+        render_empty_review_home(app, area, frame, theme);
         return;
     }
-    let visible_height = usize::from(area.height);
-    let (first_visible_row, last_visible_row) = app.visible_selection_bounds(visible_height);
-    for (row, workspace_index) in visible
+    let items = visible
         .into_iter()
-        .skip(first_visible_row)
-        .take(last_visible_row.saturating_sub(first_visible_row))
-        .enumerate()
-    {
-        let Some(item) = app.workspace_item(workspace_index) else {
-            continue;
-        };
-        let workspace = &item.workspace;
-        let selected = first_visible_row.saturating_add(row) == app.selected;
-        let style = if selected {
-            theme.selection
-        } else if workspace.archived_at_ms.is_some() {
-            theme.muted
-        } else {
-            theme.text
-        };
-        let status = workspace_health_label(item);
-        let text = format!("{status:8}  {}", workspace_row_text(item));
-        frame.write_line(
-            LocalRect::terminal(Rect::new(
-                area.x,
-                area.y
-                    .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
-                area.width,
-                1,
-            )),
-            &Line::from_spans(vec![Span::styled(text, style)]),
-        );
-    }
+        .filter_map(|index| app.workspace_item(index))
+        .map(|item| {
+            SelectableListItem::new(
+                item.workspace.id.clone(),
+                format!(
+                    "{}  {}",
+                    workspace_health_label(item),
+                    workspace_row_text(item)
+                ),
+            )
+        })
+        .collect();
+    app.workspaces
+        .paint(items, area, Some(app.selected), frame, theme);
 }
 
 fn render_workspace_details(
@@ -2210,48 +2158,54 @@ fn relative_time_label(timestamp_ms: u64) -> String {
     }
 }
 
-fn render_help(area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewHomeTheme) {
-    let lines = crate::keybindings::hints().unwrap_or_default();
-    let width = area.width.min(72);
-    let height = area.height.min(
-        u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2),
+fn render_help(
+    app: &mut ReviewHomeApp,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewHomeTheme,
+) {
+    let mut lines = vec![
+        "Review home — choose a source or resume a saved workspace".to_owned(),
+        "Presets create a review immediately. Custom opens Build to combine sources.".to_owned(),
+        "Resume opens an existing review; setup workspaces open in Build.".to_owned(),
+        "Click to activate. Scroll over a list to browse it.".to_owned(),
+    ];
+    lines.extend(crate::keybindings::hints().unwrap_or_default());
+    let width = area.width.min(84);
+    let popup = Rect::new(area.width.saturating_sub(width) / 2, 0, width, area.height);
+    let items = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| SelectableListItem::new(index.to_string(), line))
+        .collect();
+    app.help.paint(
+        items,
+        popup,
+        Some(app.help.state.focused().unwrap_or(0)),
+        frame,
+        theme,
     );
-    if width < 24 || height < 4 {
-        return;
-    }
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 2);
-    let popup = Rect::new(x, y, width, height);
-    frame.fill(
-        LocalRect::terminal(popup),
-        " ",
-        theme.canvas.patch(theme.text),
-    );
-    for (index, text) in lines.iter().enumerate() {
-        let y = popup
-            .y
-            .saturating_add(1)
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-        if y >= popup.bottom() {
-            break;
-        }
-        frame.write_line(
-            LocalRect::terminal(Rect::new(
-                popup.x.saturating_add(1),
-                y,
-                popup.width.saturating_sub(2),
-                1,
-            )),
-            &Line::from_spans(vec![Span::styled(
-                text.clone(),
-                theme.canvas.patch(theme.text),
-            )]),
-        );
-    }
+}
+
+fn home_footer_hints() -> String {
+    let hints = crate::keybindings::hints().unwrap_or_default();
+    [
+        "Help",
+        "Open review",
+        "Focus next control",
+        "Search",
+        "New review",
+        "Exit",
+    ]
+    .into_iter()
+    .filter_map(|description| {
+        hints
+            .iter()
+            .find(|hint| hint.ends_with(description))
+            .cloned()
+    })
+    .collect::<Vec<_>>()
+    .join("  ")
 }
 
 fn render_footer(
@@ -2260,6 +2214,19 @@ fn render_footer(
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewHomeTheme,
 ) {
+    if area.height >= 2 {
+        let context = app.status_message.clone().unwrap_or_else(|| {
+            if app.preset_focus {
+                HOME_PRESETS[app.preset_selected].2.to_owned()
+            } else {
+                "Resume a saved workspace below, or choose a source preset above.".to_owned()
+            }
+        });
+        frame.write_line(
+            LocalRect::terminal(Rect::new(0, area.height.saturating_sub(2), area.width, 1)),
+            &Line::from_spans(vec![Span::styled(context, theme.muted)]),
+        );
+    }
     let text = app.new_review_buffer.as_ref().map_or_else(
         || {
             app.rename_buffer.as_ref().map_or_else(
@@ -2267,7 +2234,7 @@ fn render_footer(
                     if app.search_active {
                         format!("search: {}", app.search_query)
                     } else {
-                        crate::keybindings::hints().unwrap_or_default().join("  ")
+                        home_footer_hints()
                     }
                 },
                 |title| format!("rename: {title}"),
@@ -2293,6 +2260,355 @@ fn render_footer(
 mod tests {
     use super::*;
     use bcode_code_review_models::ReviewPublishRecord;
+
+    fn paint_home(app: &mut ReviewHomeApp, width: u16, height: u16) {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        render(
+            app,
+            &mut PaintCx::new(&mut frame),
+            ReviewHomeTheme::resolve(None),
+        );
+    }
+
+    fn mouse(kind: bmux_tui::event::MouseEventKind, x: u16, y: u16) -> Event {
+        Event::Mouse(bmux_tui::event::MouseEvent::new(
+            kind,
+            bmux_tui::geometry::Point::new(x, y),
+        ))
+    }
+
+    #[test]
+    fn out_of_order_archive_completions_remove_only_the_requested_ids() {
+        for completion_order in [[0, 1], [1, 0]] {
+            let mut app = ReviewHomeApp::new(
+                PathBuf::from("/repo"),
+                ["first", "second", "survivor"]
+                    .into_iter()
+                    .map(|id| item(workspace(id, vec![], false)))
+                    .collect(),
+            );
+            let mut pending = None;
+            assert!(queue_archive_selected_workspace(&mut app, &mut pending));
+            let Some(ReviewHomeAsyncAction::ArchiveSelectedWorkspace {
+                workspace_id: first_id,
+            }) = pending.take()
+            else {
+                panic!("expected first archive request");
+            };
+            app.selected = 1;
+            assert!(queue_archive_selected_workspace(&mut app, &mut pending));
+            let Some(ReviewHomeAsyncAction::ArchiveSelectedWorkspace {
+                workspace_id: second_id,
+            }) = pending.take()
+            else {
+                panic!("expected second archive request");
+            };
+            let requested_ids = [first_id, second_id];
+            // A reload can replace and reorder the collection while both tasks run.
+            app.workspace_items.reverse();
+            app.selected = 0;
+            for request_index in completion_order {
+                apply_home_async_result(
+                    &mut app,
+                    ReviewHomeAsyncResult::ArchiveSelectedWorkspace(Ok(
+                        ArchiveSelectedWorkspaceResult {
+                            workspace_id: requested_ids[request_index].clone(),
+                            archived: true,
+                        },
+                    )),
+                );
+                assert_eq!(app.selected_workspace().unwrap().id, "survivor");
+                assert!(
+                    !app.workspace_items
+                        .iter()
+                        .any(|item| item.workspace.id == requested_ids[request_index])
+                );
+            }
+            assert_eq!(app.workspace_items.len(), 1);
+            // An absent/duplicate completion must not remove the remaining row.
+            apply_home_async_result(
+                &mut app,
+                ReviewHomeAsyncResult::ArchiveSelectedWorkspace(Ok(
+                    ArchiveSelectedWorkspaceResult {
+                        workspace_id: requested_ids[0].clone(),
+                        archived: true,
+                    },
+                )),
+            );
+            assert_eq!(app.workspace_items.len(), 1);
+            assert_eq!(app.workspace_items[0].workspace.id, "survivor");
+        }
+    }
+
+    #[test]
+    fn restore_and_rename_completions_follow_ids_after_reordering() {
+        let original = workspace("target", vec![], true);
+        let other = workspace("other", vec![], false);
+        let mut app = ReviewHomeApp::new(
+            PathBuf::from("/repo"),
+            vec![item(other.clone()), item(original.clone())],
+        );
+        let mut restored = original;
+        restored.archived_at_ms = None;
+        apply_home_async_result(
+            &mut app,
+            ReviewHomeAsyncResult::RestoreSelectedWorkspace(Ok(restored.clone())),
+        );
+        assert_eq!(app.workspace_items[0].workspace, other);
+        assert_eq!(app.workspace_items[1].workspace, restored);
+        app.workspace_items.reverse();
+        app.selected = 1;
+        let mut renamed = restored;
+        renamed.title = "Renamed target".to_owned();
+        apply_home_async_result(
+            &mut app,
+            ReviewHomeAsyncResult::SubmitRename(Ok(renamed.clone())),
+        );
+        assert_eq!(app.workspace_items[0].workspace, renamed);
+        assert_eq!(app.workspace_items[1].workspace, other);
+        assert_eq!(app.selected_workspace().unwrap().id, "other");
+        app.workspace_items.remove(0);
+        apply_home_async_result(&mut app, ReviewHomeAsyncResult::SubmitRename(Ok(renamed)));
+        assert_eq!(app.workspace_items.len(), 1);
+        assert_eq!(app.workspace_items[0].workspace, other);
+    }
+
+    #[test]
+    fn reload_preserves_selected_workspace_identity_not_row_index() {
+        let first = item(workspace("first", vec![], false));
+        let second = item(workspace("second", vec![], false));
+        let mut app =
+            ReviewHomeApp::new(PathBuf::from("/repo"), vec![first.clone(), second.clone()]);
+        app.selected = 1;
+        apply_home_async_result(
+            &mut app,
+            ReviewHomeAsyncResult::ToggleArchived(Ok(ToggleArchivedResult {
+                include_archived: true,
+                workspaces: vec![second, first.clone()],
+            })),
+        );
+        assert_eq!(app.selected_workspace().unwrap().id, "second");
+        assert_eq!(app.selected, 0);
+        apply_home_async_result(
+            &mut app,
+            ReviewHomeAsyncResult::ToggleArchived(Ok(ToggleArchivedResult {
+                include_archived: false,
+                workspaces: vec![first],
+            })),
+        );
+        assert_eq!(app.selected_workspace().unwrap().id, "first");
+    }
+
+    #[test]
+    fn painted_presets_activate_the_same_async_actions_as_keyboard() {
+        use bmux_tui::event::{MouseButton, MouseEventKind};
+        for (index, (_, key, _)) in HOME_PRESETS.iter().enumerate() {
+            let mut pointer_app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+            paint_home(&mut pointer_app, 90, 24);
+            let area = pointer_app.presets.painted_area.unwrap();
+            let y = area.y + u16::try_from(index).unwrap();
+            assert!(
+                home_pointer_event(
+                    &mut pointer_app,
+                    &mouse(MouseEventKind::Down(MouseButton::Left), 2, y)
+                )
+                .0
+            );
+            let (_, action) = home_pointer_event(
+                &mut pointer_app,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 2, y),
+            );
+            let mut pointer_pending = None;
+            assert!(handle_plugin_key_event(
+                &mut pointer_app,
+                action.unwrap(),
+                &mut pointer_pending
+            ));
+            let mut keyboard_app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+            let mut keyboard_pending = None;
+            assert!(handle_plugin_key_event(
+                &mut keyboard_app,
+                KeyStroke::simple(KeyCode::Char(*key)),
+                &mut keyboard_pending
+            ));
+            assert!(
+                matches!((pointer_pending, keyboard_pending),
+            (Some(ReviewHomeAsyncAction::CreatePreset { title: pointer_title, source_kinds: pointer_sources }), Some(ReviewHomeAsyncAction::CreatePreset { title: keyboard_title, source_kinds: keyboard_sources })) if pointer_title == keyboard_title && pointer_sources == keyboard_sources)
+                    || pointer_app.new_review_buffer.is_some()
+            );
+            assert_eq!(
+                pointer_app.new_review_buffer,
+                keyboard_app.new_review_buffer
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_reaches_custom_without_losing_workspace_selection() {
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+        app.selected = 7;
+        assert_eq!(home_navigation(&mut app, KeyCode::Tab), None);
+        for _ in 0..10 {
+            let _ = home_navigation(&mut app, KeyCode::Down);
+        }
+        assert_eq!(
+            home_navigation(&mut app, KeyCode::Enter),
+            Some(KeyCode::Char('n'))
+        );
+        assert_eq!(app.selected, 7);
+        let _ = home_navigation(&mut app, KeyCode::Tab);
+        assert!(!app.preset_focus);
+    }
+
+    #[test]
+    fn tiny_unicode_home_clears_old_pointer_geometry() {
+        use bmux_tui::event::MouseEventKind;
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+        app.status_message = Some("审查 👩‍💻 e\u{301} ".repeat(100));
+        for width in [0, 1, 2, 8, 80] {
+            for height in [0, 1, 2, 4, 24] {
+                paint_home(&mut app, width, height);
+                for list in [&app.presets, &app.workspaces] {
+                    if let Some(area) = list.painted_area {
+                        assert!(area.right() <= width && area.bottom() <= height);
+                    }
+                }
+            }
+        }
+        paint_home(&mut app, 0, 0);
+        assert_eq!(
+            home_pointer_event(&mut app, &mouse(MouseEventKind::Move, 2, 2)),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_is_retained_and_modal_help_blocks_home_actions() {
+        use bmux_tui::event::{MouseButton, MouseEventKind};
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+        paint_home(&mut app, 50, 12);
+        let area = app.presets.painted_area.unwrap();
+        home_pointer_event(&mut app, &mouse(MouseEventKind::ScrollDown, 2, area.y));
+        let offset = app.presets.state.vertical_scroll();
+        assert!(offset > 0);
+        paint_home(&mut app, 50, 12);
+        assert_eq!(app.presets.state.vertical_scroll(), offset);
+        app.help_visible = true;
+        paint_home(&mut app, 50, 12);
+        assert!(app.presets.painted_area.is_none());
+        assert!(
+            home_pointer_event(
+                &mut app,
+                &mouse(MouseEventKind::Down(MouseButton::Left), 2, 2)
+            )
+            .1
+            .is_none()
+        );
+        assert!(
+            home_pointer_event(
+                &mut app,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 2, 2)
+            )
+            .1
+            .is_none()
+        );
+        assert_eq!(home_navigation(&mut app, KeyCode::Char('u')), None);
+        assert_eq!(home_navigation(&mut app, KeyCode::Escape), None);
+        assert!(!app.help_visible);
+    }
+
+    #[test]
+    fn painted_workspace_click_resumes_selected_unicode_workspace() {
+        use bmux_tui::event::{MouseButton, MouseEventKind};
+        let mut saved = workspace("审查 👩‍💻 e\u{301}", vec![], false);
+        saved.title = "非常长的工作区 👩‍💻 e\u{301} ".repeat(30);
+        let item = ReviewWorkspaceListItem {
+            workspace: saved.clone(),
+            thread_count: 0,
+            draft_count: 0,
+            last_publish: None,
+        };
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![item]);
+        paint_home(&mut app, 80, 24);
+        let area = app.workspaces.painted_area.unwrap();
+        home_pointer_event(
+            &mut app,
+            &mouse(MouseEventKind::Down(MouseButton::Left), area.x + 1, area.y),
+        );
+        let (_, action) = home_pointer_event(
+            &mut app,
+            &mouse(MouseEventKind::Up(MouseButton::Left), area.x + 1, area.y),
+        );
+        assert_eq!(action, Some(KeyStroke::simple(KeyCode::Enter)));
+        let mut pending = None;
+        handle_plugin_key_event(&mut app, action.unwrap(), &mut pending);
+        assert_eq!(
+            app.outcome,
+            Some(ReviewHomeOutcome::OpenWorkspace {
+                workspace: saved,
+                build_mode: true
+            })
+        );
+    }
+
+    #[test]
+    fn effective_preset_hints_do_not_reintroduce_default_shortcuts() {
+        // Effective hint matching uses the declared description, not the default shortcut.
+        let definition = crate::keybindings::actions_for(crate::keybindings::HOME)
+            .into_iter()
+            .find(|action| action.defaults.iter().any(|key| key == "u"))
+            .unwrap();
+        crate::keybindings::set_hints(vec![format!("alt+u {}", definition.description)]);
+        assert_eq!(home_preset_hint('u'), "  [alt+u]");
+        crate::keybindings::set_hints(vec![]);
+        assert_eq!(home_preset_hint('u'), "");
+        crate::keybindings::clear_hints();
+    }
+
+    #[test]
+    fn releasing_outside_a_preset_cancels_activation() {
+        use bmux_tui::event::{MouseButton, MouseEventKind};
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+        paint_home(&mut app, 80, 24);
+        let y = app.presets.painted_area.unwrap().y;
+        home_pointer_event(
+            &mut app,
+            &mouse(MouseEventKind::Down(MouseButton::Left), 2, y),
+        );
+        assert!(
+            home_pointer_event(
+                &mut app,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 2, 23)
+            )
+            .1
+            .is_none()
+        );
+        assert!(
+            home_pointer_event(
+                &mut app,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 2, y)
+            )
+            .1
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resize_invalidates_all_previous_home_hits() {
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), vec![]);
+        paint_home(&mut app, 100, 30);
+        assert!(app.presets.painted_area.is_some());
+        assert!(
+            home_pointer_event(
+                &mut app,
+                &Event::Resize(bmux_tui::geometry::Size::new(1, 1))
+            )
+            .0
+        );
+        assert!(app.presets.painted_area.is_none());
+        assert!(app.workspaces.painted_area.is_none());
+    }
 
     fn workspace(id: &str, sources: Vec<ReviewSource>, archived: bool) -> ReviewWorkspace {
         ReviewWorkspace {
@@ -2380,7 +2696,7 @@ mod tests {
         assert!(!app.should_exit);
         assert_eq!(
             app.status_message.as_deref(),
-            Some("review is archived; press R to restore it first")
+            Some("review is archived; restore it before opening")
         );
     }
 

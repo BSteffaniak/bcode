@@ -1331,9 +1331,9 @@ impl BcodeRuntimeModel {
                     self.fresh_session_settings(),
                 )
                 .expect("plugin surface was present");
-            if result.outcome != bmux_tui::event::EventOutcome::Ignored {
-                return self.apply_root_surface_event_result(result);
-            }
+            // The foreground surface owns input even when it ignores it. Ignored
+            // pointer motion must not select, scroll, or edit the covered chat.
+            return self.apply_root_surface_event_result(result);
         }
         if self.loop_state.has_session_picker() {
             if let Event::Mouse(mouse) = &event
@@ -11973,6 +11973,237 @@ mod tests {
         drop(model);
         assert!(reset);
         assert_eq!(after_reset, initial);
+    }
+
+    #[tokio::test]
+    async fn foreground_plugin_ignored_input_never_reaches_chat_or_requests_damage() {
+        use bmux_tui::event::Event;
+
+        struct IgnoringSurface;
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for IgnoringSurface {
+            fn id(&self) -> &'static str {
+                "ignored-input"
+            }
+            fn title(&self) -> &'static str {
+                "Ignored input"
+            }
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+            ) {
+            }
+            fn handle_event(
+                &mut self,
+                _event: &Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+        }
+        let mut model = root_test_model();
+        model.chat.app.replace_composer_with("underlying draft");
+        model.queue_plugin_surface("test", Box::new(IgnoringSurface));
+        let signal = model.loop_state.root_plugin_surface_invalidation().unwrap();
+        let _ = signal.take();
+        for event in [
+            Event::Key(bmux_keyboard::parse_key_stroke("x").unwrap()),
+            Event::Paste("must not enter chat".into()),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(4, 3),
+            )),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(8, 3),
+            )),
+            Event::Mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(8, 3),
+            )),
+        ] {
+            assert_eq!(
+                model.handle_basic_terminal_event(event),
+                super::super::invalidation::UiInvalidation::None
+            );
+            assert_eq!(model.chat.app.composer().text(), "underlying draft");
+            assert_eq!(
+                model.transcript_selection.phase(),
+                bmux_tui::selection::SelectionGesturePhase::Idle
+            );
+            assert!(!signal.take());
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_plugin_selection_gesture_stays_with_its_owner() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui::selection::{
+            SelectionController, SelectionGesturePhase, SelectionScene, SelectionScope,
+        };
+        struct SelectingSurface {
+            scene: SelectionScene,
+            controller: std::sync::Arc<std::sync::Mutex<SelectionController>>,
+        }
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for SelectingSurface {
+            fn id(&self) -> &'static str {
+                "selection-owner"
+            }
+            fn title(&self) -> &'static str {
+                "Selection owner"
+            }
+            fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {}
+            fn handle_event(
+                &mut self,
+                event: &Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                if let Event::Mouse(mouse) = event {
+                    self.controller
+                        .lock()
+                        .unwrap()
+                        .handle_mouse(&self.scene, *mouse);
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                } else {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+            }
+        }
+        let mut scene = SelectionScene::new();
+        let area = Rect::new(0, 0, 20, 1);
+        scene.push_scope(SelectionScope::new("plugin.selection", area));
+        for fragment in bmux_tui::selection::plain_text_fragments(
+            "plugin.selection",
+            "source",
+            area,
+            0,
+            "selected plugin text",
+            0,
+            1,
+        ) {
+            scene.push_fragment(fragment);
+        }
+        let controller = std::sync::Arc::new(std::sync::Mutex::new(SelectionController::default()));
+        let mut model = root_test_model();
+        model.queue_plugin_surface(
+            "test",
+            Box::new(SelectingSurface {
+                scene,
+                controller: controller.clone(),
+            }),
+        );
+        for (kind, x, phase) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                1,
+                SelectionGesturePhase::Armed,
+            ),
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                7,
+                SelectionGesturePhase::Dragging,
+            ),
+            (
+                MouseEventKind::Up(MouseButton::Left),
+                7,
+                SelectionGesturePhase::Complete,
+            ),
+        ] {
+            assert_eq!(
+                model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
+                    kind,
+                    Point::new(x, 0)
+                ))),
+                super::super::invalidation::UiInvalidation::Structural
+            );
+            assert_eq!(controller.lock().unwrap().phase(), phase);
+            assert_eq!(
+                model.transcript_selection.phase(),
+                SelectionGesturePhase::Idle
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_foreground_plugin_frame_diffs_without_clear_or_full_rewrite() {
+        use bmux_tui::event::Event;
+        use bmux_tui_runtime::Presenter;
+        struct StableSurface;
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for StableSurface {
+            fn id(&self) -> &'static str {
+                "stable-frame"
+            }
+            fn title(&self) -> &'static str {
+                "Stable frame"
+            }
+            fn render(
+                &mut self,
+                area: bmux_tui::geometry::Rect,
+                frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+            ) {
+                frame.set_cell(
+                    i32::from(area.x),
+                    i64::from(area.y),
+                    "S",
+                    bmux_tui::style::Style::new(),
+                );
+                frame.push_selection_scope(bmux_tui::selection::SelectionScope::new(
+                    "test.plugin",
+                    area,
+                ));
+                for fragment in bmux_tui::selection::plain_text_fragments(
+                    "test.plugin",
+                    "source",
+                    area,
+                    0,
+                    "stable plugin text",
+                    0,
+                    1,
+                ) {
+                    frame.push_selection_fragment(fragment);
+                }
+            }
+            fn handle_event(
+                &mut self,
+                _event: &Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            }
+        }
+        let mut model = root_test_model();
+        model.queue_plugin_surface("test", Box::new(StableSurface));
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut bytes,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        assert_ne!(terminal.selection().scopes(), []);
+        let selection = terminal.selection().clone();
+        terminal.writer_mut().clear();
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        drop(model);
+        assert_eq!(report.changed_cells, 0);
+        assert!(!report.full_repaint);
+        assert_eq!(terminal.selection(), &selection);
+        let output = terminal.writer_mut();
+        assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[3J"));
+        assert!(
+            !output.contains(&b'S'),
+            "unchanged cells must not be rewritten"
+        );
+        assert!(
+            output.len() < 128,
+            "only bounded cursor/style/sync controls are expected"
+        );
     }
 
     fn root_test_model() -> super::BcodeRuntimeModel {

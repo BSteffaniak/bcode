@@ -8,7 +8,8 @@
 mod cli;
 
 pub mod async_values;
-pub mod code_review_home;
+pub mod code_review_controls;
+mod code_review_home;
 pub mod code_review_tui;
 pub mod code_review_tui_display;
 pub mod code_review_tui_render;

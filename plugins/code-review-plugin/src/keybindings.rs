@@ -1,10 +1,12 @@
 //! Contributor-owned review action registry and native control adaptation.
 
 use crate::code_review_tui::{ReviewApp, ReviewUxMode};
+#[cfg(test)]
+use bcode_plugin_sdk::tui::keymap::KeymapRegistry;
 use bcode_plugin_sdk::tui::{
     PluginTuiHost,
     keymap::{
-        KeymapAction, KeymapRegistry,
+        KeymapAction,
         controls::{ControlAction, ControlInput},
     },
 };
@@ -120,6 +122,7 @@ pub fn from_host(
     })
 }
 
+#[cfg(test)]
 pub fn from_registry(
     registry: &KeymapRegistry,
     scope: &str,
@@ -132,16 +135,6 @@ pub fn from_registry(
         registry.action_for_key(scope, stroke).map(str::to_owned),
         || ControlInput::from_registry(registry, scope, stroke, &[], text).native_stroke(),
     )
-}
-
-pub fn load_registry() -> Result<KeymapRegistry, crate::tui_host_types::TuiError> {
-    let config =
-        bcode_config::load_config().map_err(|error| std::io::Error::other(error.to_string()))?;
-    bcode_plugin_sdk::tui::keymap::controls::resolve_registry(
-        actions(),
-        config.tui.keybindings.scoped_overrides(),
-    )
-    .map_err(|error| std::io::Error::other(error.to_string()).into())
 }
 
 pub fn effective_hints(scope: &str, keys: impl Fn(&str) -> Vec<String>) -> Vec<String> {

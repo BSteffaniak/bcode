@@ -1,7 +1,7 @@
 //! Full-screen local code review TUI mode.
 
 use bcode_plugin_sdk::path::display_from_current_dir;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,7 @@ use bmux_tui::terminal::Terminal;
 use bmux_tui_components::text_input::{
     EnterBehavior as TextInputEnterBehavior, TextInputOutcome as TextInputKeyOutcome,
 };
+use bmux_tui_components::tree_view::TreeViewItem;
 use serde::{Deserialize, Serialize};
 
 use crate::code_review_tui_render::materialized_file_surface_rows;
@@ -798,11 +799,18 @@ async fn handle_pending_draft_save(
         repo_path.to_path_buf(),
         review_target.clone(),
         Some(review_scope_for_workspace(&app.workspace)),
-        save,
+        save.clone(),
     )
     .await
     {
-        Ok(()) => app.status_message = Some("saved draft comment".to_string()),
+        Ok(draft) => {
+            if !app.reconcile_saved_draft(&save, draft) {
+                app.status_message = Some(
+                    "draft save acknowledged but local reconciliation failed; reopen review before editing"
+                        .to_string(),
+                );
+            }
+        }
         Err(error) => {
             app.status_message = Some(format!("saved locally; draft persistence failed: {error}"));
         }
@@ -2179,7 +2187,7 @@ async fn save_draft(
     target: ReviewOpenTarget,
     scope: Option<ModelReviewScope>,
     save: PendingDraftSave,
-) -> Result<(), TuiError> {
+) -> Result<DraftComment, TuiError> {
     let request = SaveDraftRequest {
         repo_path,
         target: target.clone(),
@@ -2201,8 +2209,9 @@ async fn save_draft(
             message: error.message,
         });
     }
-    let _: SaveDraftResponse = serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
-    Ok(())
+    let response: SaveDraftResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.draft)
 }
 
 async fn delete_draft(
@@ -2210,6 +2219,9 @@ async fn delete_draft(
     repo_path: PathBuf,
     delete: PendingDraftDelete,
 ) -> Result<(), TuiError> {
+    if delete.local_only {
+        return Ok(());
+    }
     let Some(comment_id) = delete.comment.id else {
         return Ok(());
     };
@@ -2513,6 +2525,9 @@ fn handle_event_no_resize(app: &mut ReviewApp, event: &Event) -> bool {
 }
 
 fn handle_event_no_resize_inner(app: &mut ReviewApp, event: &Event) -> bool {
+    if let Some(handled) = route_captured_diff_gesture(app, event) {
+        return handled;
+    }
     if let Event::Key(stroke) = event
         && is_review_exit_key(*stroke)
     {
@@ -2528,8 +2543,19 @@ fn handle_event_no_resize_inner(app: &mut ReviewApp, event: &Event) -> bool {
     if app.publish_state.is_some() {
         return handle_publish_event(app, event);
     }
+    if let Event::Resize(_) | Event::Focus(FocusEvent::Lost) = event {
+        app.controls.lock().expect("review controls lock").suspend();
+    }
     if app.comment_editor.is_some() {
+        if let Some(redraw) = route_review_controls(app, event) {
+            return redraw;
+        }
         return handle_comment_editor_event(app, event);
+    }
+    if !app.help_visible
+        && let Some(redraw) = route_review_controls(app, event)
+    {
+        return redraw;
     }
     match event {
         Event::Resize(_) | Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => {
@@ -2557,6 +2583,64 @@ fn handle_prompt_event(app: &mut ReviewApp, event: &Event) -> bool {
         }
         Event::Mouse(_) | Event::User(_) => false,
     }
+}
+
+// A diff press captures its drag/release until completion, independent of the
+// pane currently under the pointer. In particular, release must not select a
+// tree item or activate a control before the diff owner relinquishes capture.
+fn route_captured_diff_gesture(app: &mut ReviewApp, event: &Event) -> Option<bool> {
+    app.mouse_range_selection_start?;
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.finish_mouse_range_selection();
+                Some(true)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(index) =
+                    app.commentable_diff_line_index_at(mouse.position.x, mouse.position.y)
+                {
+                    app.update_mouse_range_selection(index);
+                }
+                Some(true)
+            }
+            // A fresh press replaces an interrupted pointer gesture; let its
+            // actual target acquire ownership through the ordinary event route.
+            MouseEventKind::Down(_) => {
+                app.finish_mouse_range_selection();
+                None
+            }
+            _ => None,
+        },
+        Event::Resize(_) | Event::Focus(FocusEvent::Lost) => {
+            app.finish_mouse_range_selection();
+            None
+        }
+        _ => None,
+    }
+}
+
+fn route_review_controls(app: &mut ReviewApp, event: &Event) -> Option<bool> {
+    let modal = app.comment_editor.is_some();
+    let routed = {
+        let mut controls = app.controls.lock().expect("review controls lock");
+        if controls.is_modal() != modal {
+            controls.invalidate();
+            return None;
+        }
+        controls.route(event)
+    };
+    routed.map(|(redraw, action)| {
+        if let Some(action) = action {
+            app.controls
+                .lock()
+                .expect("review controls lock")
+                .discard_layout();
+            app.activate_mouse_action(action) || redraw
+        } else {
+            redraw
+        }
+    })
 }
 
 fn handle_prompt_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
@@ -2751,12 +2835,10 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('/') => app.open_file_search_prompt(),
         KeyCode::Char('N') => app.search_previous_match(),
         KeyCode::Enter => {
-            if app.activate_selected_review_target() {
-                true
-            } else if app.sidebar_mode == ReviewSidebarMode::Repository
-                && app.review.is_repository_review()
-            {
+            if app.sidebar_mode == ReviewSidebarMode::Repository && app.sidebar_visible {
                 app.activate_selected_tree_row()
+            } else if app.activate_selected_review_target() {
+                true
             } else {
                 app.jump_to_selected_thread()
             }
@@ -2856,6 +2938,20 @@ const fn normalized_shortcut_key(stroke: KeyStroke) -> KeyCode {
 }
 
 fn handle_mouse(app: &mut ReviewApp, mouse: MouseEvent) -> bool {
+    if app.sidebar_mode == ReviewSidebarMode::Repository
+        && app.sidebar_visible
+        && app.ux_mode != ReviewUxMode::Build
+        && app.file_area_contains(mouse.position.x, mouse.position.y)
+        && !matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        )
+    {
+        return app.handle_navigation_pointer(mouse);
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             if app.file_area_contains(mouse.position.x, mouse.position.y) {
@@ -3574,6 +3670,24 @@ fn find_file_match(
     }
 }
 
+type ReviewNavigationItems = (
+    Vec<bmux_tui_components::tree_view::TreeViewItem>,
+    Vec<ReviewFileTreeRow>,
+);
+
+#[derive(Debug, Clone)]
+struct ReviewNavigationCache {
+    hidden: bool,
+    viewed: BTreeSet<String>,
+    items: Arc<ReviewNavigationItems>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewNavigationVisibility {
+    expansion: Arc<()>,
+    indices: Arc<Vec<usize>>,
+}
+
 /// Sidebar file-tree row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewFileTreeRow {
@@ -3983,7 +4097,8 @@ pub struct ReviewSuggestedComment {
 /// Review draft comment metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDraftComment {
-    /// Persisted comment id, when saved in the plugin database.
+    /// Persisted comment id, or an ephemeral local identity while `persisted` is false.
+    /// Local identities must never be submitted as database comment ids.
     pub id: Option<String>,
     /// Draft body.
     pub body: String,
@@ -4210,6 +4325,8 @@ pub struct PendingDraftSave {
     pub anchor: ReviewCommentAnchor,
     /// Saved body.
     pub body: String,
+    /// Ephemeral optimistic identity; never sent to the persistence service.
+    pub local_id: String,
 }
 
 /// Pending draft comment delete request.
@@ -4221,6 +4338,8 @@ pub struct PendingDraftDelete {
     pub scope: Option<ModelReviewScope>,
     /// Deleted anchor.
     pub anchor: ReviewCommentAnchor,
+    /// Whether this comment has only an ephemeral local identity.
+    pub local_only: bool,
     /// Deleted comment.
     pub comment: ReviewDraftComment,
 }
@@ -5171,7 +5290,7 @@ impl ReviewCommentEditor {
 pub enum ReviewSidebarMode {
     /// Included review workspace sources/sidebar.
     Included,
-    /// Full repository file browser.
+    /// Hierarchical navigation for the current review's files/surfaces.
     Repository,
     /// Review thread list sidebar.
     Threads,
@@ -5638,6 +5757,13 @@ pub struct ReviewApp {
     pub file_scroll: usize,
     /// Top visible repository tree row.
     pub tree_scroll: usize,
+    /// Exact BMUX navigation layout from the last paint pass.
+    pub(crate) navigation_layout: Option<bmux_tui::component::LayoutNode>,
+    pub(crate) navigation_pointer_state: bmux_tui_components::tree_view::TreeViewState,
+    pub(crate) navigation_visible_rows: Vec<ReviewFileTreeRow>,
+    pub(crate) navigation_items: Vec<bmux_tui_components::tree_view::TreeViewItem>,
+    navigation_visible: Arc<RwLock<Option<ReviewNavigationVisibility>>>,
+    navigation_model: Arc<RwLock<Option<ReviewNavigationCache>>>,
     /// Top visible rendered diff row.
     pub diff_scroll: usize,
     /// Selected rendered diff row.
@@ -5699,6 +5825,9 @@ pub struct ReviewApp {
     pub selected_importer: usize,
     /// Draft comment awaiting persistence.
     pub pending_draft_save: Option<PendingDraftSave>,
+    queued_draft_saves: VecDeque<PendingDraftSave>,
+    next_local_draft_id: u64,
+    optimistic_draft_ids: BTreeSet<String>,
     /// Draft comment awaiting deletion.
     pub pending_draft_delete: Option<PendingDraftDelete>,
     /// Draft comment awaiting update.
@@ -5732,7 +5861,8 @@ pub struct ReviewApp {
     /// Last current-file search query.
     pub last_search_query: Option<String>,
     /// Expanded repository sidebar directories.
-    pub expanded_dirs: BTreeSet<PathBuf>,
+    expanded_dirs: BTreeSet<PathBuf>,
+    navigation_expansion: Arc<()>,
     /// Selected repository file-tree row.
     pub selected_tree_row: usize,
     /// Active build-mode row.
@@ -5773,6 +5903,8 @@ pub struct ReviewApp {
     pub session_to_open: Option<SessionId>,
     last_file_area: Option<Rect>,
     last_diff_area: Option<Rect>,
+    /// Retained TUI-local controls and the last accepted interaction layouts.
+    pub controls: Arc<std::sync::Mutex<crate::code_review_controls::ReviewControls>>,
     mouse_regions: Vec<ReviewMouseRegion>,
     syntax_palette: Option<bcode_syntax_render::SyntaxPalette>,
     theme_fingerprint: u64,
@@ -5846,10 +5978,16 @@ impl ReviewApp {
             selected_file: 0,
             file_scroll: 0,
             tree_scroll: 0,
+            navigation_layout: None,
+            navigation_pointer_state: bmux_tui_components::tree_view::TreeViewState::new(None),
+            navigation_visible_rows: Vec::new(),
+            navigation_items: Vec::new(),
+            navigation_model: Arc::new(RwLock::new(None)),
+            navigation_visible: Arc::new(RwLock::new(None)),
             diff_scroll: 0,
             selected_diff_line: 0,
             sidebar_visible: true,
-            sidebar_mode: ReviewSidebarMode::Included,
+            sidebar_mode: ReviewSidebarMode::Repository,
             selected_thread: 0,
             thread_filter: ReviewThreadFilter::All,
             thread_scroll: 0,
@@ -5878,6 +6016,9 @@ impl ReviewApp {
             import_state: None,
             selected_importer: 0,
             pending_draft_save: None,
+            queued_draft_saves: VecDeque::new(),
+            next_local_draft_id: 0,
+            optimistic_draft_ids: BTreeSet::new(),
             pending_draft_delete: None,
             pending_draft_update: None,
             pending_thread_resolve: None,
@@ -5895,6 +6036,7 @@ impl ReviewApp {
             prompt_state: None,
             last_search_query: None,
             expanded_dirs: BTreeSet::new(),
+            navigation_expansion: Arc::new(()),
             selected_tree_row: 0,
             selected_build_row: 0,
             build_scroll: 0,
@@ -5917,12 +6059,15 @@ impl ReviewApp {
             session_to_open: None,
             last_file_area: None,
             last_diff_area: None,
+            controls: Arc::default(),
             mouse_regions: Vec::new(),
             syntax_palette: None,
             theme_fingerprint: 0,
             view_document_cache: Arc::new(RwLock::new(None)),
         };
         app.restore_presentation_state();
+        app.expand_selected_file_dirs();
+        app.sync_tree_row_to_selected_file();
         app
     }
 
@@ -6934,54 +7079,162 @@ impl ReviewApp {
     }
 
     fn review_item_count(&self) -> usize {
-        self.review.files.len().max(self.review.surfaces().len())
+        self.review.files.len().max(self.review.surfaces.len())
     }
 
-    /// Return visible file-tree rows for repository review.
+    /// Return BMUX preorder items and their domain-owned review targets.
+    /// Paths share directory nodes, but leaves retain their source surface identity.
+    #[must_use]
+    pub(crate) fn navigation_items(&self) -> Arc<ReviewNavigationItems> {
+        if let Ok(cache) = self.navigation_model.read()
+            && let Some(cached) = cache.as_ref()
+            && cached.hidden == self.hide_viewed_files
+            && (!cached.hidden || cached.viewed == self.viewed_files)
+        {
+            return Arc::clone(&cached.items);
+        }
+        let items = Arc::new(self.build_navigation_items());
+        if let Ok(mut visible) = self.navigation_visible.write() {
+            *visible = None;
+        }
+        if let Ok(mut cache) = self.navigation_model.write() {
+            *cache = Some(ReviewNavigationCache {
+                hidden: self.hide_viewed_files,
+                viewed: self.viewed_files.clone(),
+                items: Arc::clone(&items),
+            });
+        }
+        items
+    }
+
+    #[must_use]
+    pub(crate) fn navigation_visible_indices(
+        &self,
+        items: &[bmux_tui_components::tree_view::TreeViewItem],
+    ) -> Arc<Vec<usize>> {
+        if let Ok(cache) = self.navigation_visible.read()
+            && let Some(cached) = cache.as_ref()
+            && Arc::ptr_eq(&cached.expansion, &self.navigation_expansion)
+        {
+            return Arc::clone(&cached.indices);
+        }
+        let state = std::cell::RefCell::new(self.navigation_state());
+        let component =
+            bmux_tui_components::tree_view::TreeViewComponent::new("review.files", items, &state);
+        let indices = Arc::new(component.visible_indices());
+        if let Ok(mut cache) = self.navigation_visible.write() {
+            *cache = Some(ReviewNavigationVisibility {
+                expansion: Arc::clone(&self.navigation_expansion),
+                indices: Arc::clone(&indices),
+            });
+        }
+        indices
+    }
+
+    /// Return visible file-tree rows using BMUX expansion semantics.
     #[must_use]
     pub fn file_tree_rows(&self) -> Vec<ReviewFileTreeRow> {
-        let mut rows = Vec::new();
-        self.push_tree_rows(Path::new(""), 0, &mut rows);
-        rows
+        let model = self.navigation_items();
+        let (items, rows) = model.as_ref();
+        self.navigation_visible_indices(items)
+            .iter()
+            .filter_map(|index| rows.get(*index).cloned())
+            .collect()
     }
 
-    fn push_tree_rows(&self, prefix: &Path, depth: usize, rows: &mut Vec<ReviewFileTreeRow>) {
-        let mut dirs = BTreeSet::new();
-        let mut files = Vec::new();
+    fn build_navigation_items(&self) -> ReviewNavigationItems {
+        let surfaces = self.review.surfaces();
+        let mut directories = BTreeSet::new();
+        let mut leaves = BTreeMap::<PathBuf, Vec<usize>>::new();
         for index in 0..self.review_item_count() {
-            let Some(path) = self.review_path_for_index(index) else {
+            let path = self
+                .review
+                .files
+                .get(index)
+                .map(ReviewFile::display_path)
+                .or_else(|| surfaces.get(index).map(|surface| surface.path.as_str()));
+            let Some(path) = path else { continue };
+            if self.hide_viewed_files && self.viewed_files.contains(path) {
                 continue;
-            };
-            let path = Path::new(&path);
-            let rest = if prefix.as_os_str().is_empty() {
-                path
-            } else if let Ok(rest) = path.strip_prefix(prefix) {
-                rest
-            } else {
-                continue;
-            };
-            let mut components = rest.components();
-            let Some(first) = components.next() else {
-                continue;
-            };
-            if components.next().is_some() {
-                dirs.insert(prefix.join(first.as_os_str()));
-            } else {
-                files.push(index);
+            }
+            let path = PathBuf::from(path);
+            for parent in path
+                .ancestors()
+                .skip(1)
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                directories.insert(parent.to_path_buf());
+            }
+            leaves.entry(path).or_default().push(index);
+        }
+        let mut ordered = BTreeMap::new();
+        for directory in directories {
+            let key = directory
+                .components()
+                .map(|part| (0_u8, part.as_os_str().to_os_string()))
+                .collect::<Vec<_>>();
+            let depth = key.len().saturating_sub(1);
+            let label = directory
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            ordered.insert(
+                (key, 0),
+                (
+                    TreeViewItem::new(
+                        format!("directory:{}", directory.display()),
+                        label,
+                        u16::try_from(depth).unwrap_or(u16::MAX),
+                    )
+                    .expandable(true),
+                    ReviewFileTreeRow::Directory {
+                        path: directory,
+                        depth,
+                    },
+                ),
+            );
+        }
+        for (path, indices) in leaves {
+            let mut key = path
+                .components()
+                .map(|part| (0_u8, part.as_os_str().to_os_string()))
+                .collect::<Vec<_>>();
+            if let Some(last) = key.last_mut() {
+                last.0 = 1;
+            }
+            let depth = key.len().saturating_sub(1);
+            for index in indices {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let source = surfaces.get(index);
+                let identity = source.map_or_else(
+                    || format!("file:{index}:{}", path.display()),
+                    |surface| format!("surface:{}:{}", surface.source_id, surface.id),
+                );
+                let label = name.into_owned();
+                ordered.insert(
+                    (key.clone(), index),
+                    (
+                        TreeViewItem::new(
+                            identity,
+                            label,
+                            u16::try_from(depth).unwrap_or(u16::MAX),
+                        ),
+                        ReviewFileTreeRow::File { index, depth },
+                    ),
+                );
             }
         }
-        for dir in dirs {
-            rows.push(ReviewFileTreeRow::Directory {
-                path: dir.clone(),
-                depth,
-            });
-            if self.expanded_dirs.contains(&dir) {
-                self.push_tree_rows(&dir, depth.saturating_add(1), rows);
-            }
+        ordered.into_values().unzip()
+    }
+
+    pub(crate) fn navigation_state(&self) -> bmux_tui_components::tree_view::TreeViewState {
+        let mut state =
+            bmux_tui_components::tree_view::TreeViewState::new(Some(self.selected_tree_row));
+        for path in &self.expanded_dirs {
+            state.set_expanded(&format!("directory:{}", path.display()), true);
         }
-        for index in files {
-            rows.push(ReviewFileTreeRow::File { index, depth });
-        }
+        state
     }
 
     /// Activate the selected repository tree row.
@@ -6991,29 +7244,114 @@ impl ReviewApp {
             Some(ReviewFileTreeRow::Directory { path, .. }) => {
                 self.toggle_file_tree_directory(&path)
             }
-            Some(ReviewFileTreeRow::File { index, .. }) => self.select_file(index),
+            Some(ReviewFileTreeRow::File { index, .. }) => {
+                let changed = self.select_file(index);
+                self.queue_selected_file_load();
+                changed || self.has_pending_file_load()
+            }
             None => false,
         }
     }
 
     /// Activate a repository tree row by absolute rendered tree index.
     pub fn activate_tree_row(&mut self, index: usize) -> bool {
-        self.selected_tree_row = index.min(self.file_tree_rows().len().saturating_sub(1));
+        self.selected_tree_row = index.min(
+            self.navigation_visible_indices(&self.navigation_items().0)
+                .len()
+                .saturating_sub(1),
+        );
         self.activate_selected_tree_row()
+    }
+
+    /// Reconcile semantic expansion without replacing native hover/press/focus state.
+    /// Only the presented directory rows participate in viewport input and painting.
+    pub(crate) fn reconcile_navigation_expansion(
+        &self,
+        state: &mut bmux_tui_components::tree_view::TreeViewState,
+        rows: &[ReviewFileTreeRow],
+    ) {
+        for row in rows {
+            if let ReviewFileTreeRow::Directory { path, .. } = row {
+                state.set_expanded(
+                    &format!("directory:{}", path.display()),
+                    self.expanded_dirs.contains(path),
+                );
+            }
+        }
+    }
+
+    fn invalidate_navigation_visibility(&mut self) {
+        self.navigation_expansion = Arc::new(());
+        if let Ok(mut cache) = self.navigation_visible.write() {
+            *cache = None;
+        }
     }
 
     /// Toggle a directory in the repository sidebar.
     pub fn toggle_file_tree_directory(&mut self, path: &Path) -> bool {
-        if self.expanded_dirs.remove(path) {
-            return true;
+        if !self.expanded_dirs.remove(path) {
+            self.expanded_dirs.insert(path.to_path_buf());
         }
-        self.expanded_dirs.insert(path.to_path_buf());
+        self.invalidate_navigation_visibility();
         true
+    }
+
+    /// Keep keyboard focus visible without undoing independent wheel scrolling.
+    fn reveal_tree_selection(&mut self) {
+        let height = self
+            .last_file_area
+            .map_or(1, |area| usize::from(area.height).max(1));
+        if self.selected_tree_row < self.tree_scroll {
+            self.tree_scroll = self.selected_tree_row;
+        } else if self.selected_tree_row >= self.tree_scroll.saturating_add(height) {
+            self.tree_scroll = self
+                .selected_tree_row
+                .saturating_sub(height.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn handle_navigation_pointer(&mut self, mouse: MouseEvent) -> bool {
+        use bmux_tui::component::EventCx;
+        use bmux_tui_components::tree_view::{TreeViewComponent, TreeViewOutcome};
+        use std::cell::RefCell;
+        let (Some(layout), Some(area)) = (self.navigation_layout.clone(), self.last_file_area)
+        else {
+            return false;
+        };
+        let state = RefCell::new(self.navigation_pointer_state.clone());
+        let component = TreeViewComponent::new("review.files", &self.navigation_items, &state);
+        let mut cx = EventCx::with_clip(&layout, area);
+        let outcome = cx.with_transform(0, 0, i32::from(area.x), i64::from(area.y), area, |cx| {
+            component.handle_event(&Event::Mouse(mouse), &layout, cx)
+        });
+        self.navigation_pointer_state = state.into_inner();
+        match outcome {
+            TreeViewOutcome::Selected { visible, .. } => {
+                // Both keyboard and pointer activation use the same domain action.
+                let Some(target) = self.navigation_visible_rows.get(visible).cloned() else {
+                    return false;
+                };
+                self.selected_tree_row = self.tree_scroll.saturating_add(visible);
+                match target {
+                    ReviewFileTreeRow::Directory { path, .. } => {
+                        self.toggle_file_tree_directory(&path)
+                    }
+                    ReviewFileTreeRow::File { index, .. } => {
+                        let changed = self.select_file(index);
+                        self.queue_selected_file_load();
+                        changed || self.has_pending_file_load()
+                    }
+                }
+            }
+            TreeViewOutcome::Ignored => false,
+            _ => true,
+        }
     }
 
     /// Clear registered mouse hit regions for a new frame.
     pub fn clear_mouse_regions(&mut self) {
         self.mouse_regions.clear();
+        self.navigation_layout = None;
     }
 
     /// Register a mouse hit region.
@@ -7241,13 +7579,25 @@ impl ReviewApp {
     pub fn replace_review(&mut self, review: ReviewSummary) {
         self.save_current_file_viewport();
         let previous_path = self.selected_file_path();
+        let previous_surface = self.selected_surface();
         let workspace = review.workspace();
         self.review = review;
+        self.navigation_model = Arc::new(RwLock::new(None));
+        self.navigation_visible = Arc::new(RwLock::new(None));
         self.workspace = workspace;
         self.sync_review_workspace();
-        self.selected_file = previous_path
-            .as_deref()
-            .and_then(|path| self.review_file_index_for_path(path))
+        self.selected_file = previous_surface
+            .as_ref()
+            .and_then(|previous| {
+                self.review.surfaces().iter().position(|surface| {
+                    surface.source_id == previous.source_id && surface.path == previous.path
+                })
+            })
+            .or_else(|| {
+                previous_path
+                    .as_deref()
+                    .and_then(|path| self.review_file_index_for_path(path))
+            })
             .unwrap_or(self.selected_file)
             .min(self.review_item_count().saturating_sub(1));
         self.selected_build_row = self
@@ -7257,9 +7607,9 @@ impl ReviewApp {
         self.file_scroll = self
             .file_scroll
             .min(self.review.files.len().saturating_sub(1));
-        self.tree_scroll = self
-            .tree_scroll
-            .min(self.file_tree_rows().len().saturating_sub(1));
+        self.expand_selected_file_dirs();
+        self.sync_tree_row_to_selected_file();
+        self.reveal_tree_selection();
         self.restore_current_file_viewport();
         self.queue_selected_file_load();
     }
@@ -7304,10 +7654,7 @@ impl ReviewApp {
         ) && self.sidebar_visible
         {
             self.select_next_thread(rows)
-        } else if self.review.is_repository_review()
-            && self.sidebar_mode == ReviewSidebarMode::Repository
-            && self.sidebar_visible
-        {
+        } else if self.sidebar_mode == ReviewSidebarMode::Repository && self.sidebar_visible {
             self.select_next_tree_row(rows)
         } else {
             self.select_next_view_row(rows)
@@ -7326,10 +7673,7 @@ impl ReviewApp {
         ) && self.sidebar_visible
         {
             self.select_previous_thread(rows)
-        } else if self.review.is_repository_review()
-            && self.sidebar_mode == ReviewSidebarMode::Repository
-            && self.sidebar_visible
-        {
+        } else if self.sidebar_mode == ReviewSidebarMode::Repository && self.sidebar_visible {
             self.select_previous_tree_row(rows)
         } else {
             self.select_previous_view_row(rows)
@@ -8041,50 +8385,105 @@ impl ReviewApp {
         true
     }
 
-    /// Select next repository tree row.
-    pub fn select_next_tree_row(&mut self, rows: usize) -> bool {
-        let max = self.file_tree_rows().len().saturating_sub(1);
-        let next = self.selected_tree_row.saturating_add(rows).min(max);
-        if next == self.selected_tree_row {
-            return false;
-        }
-        self.selected_tree_row = next;
-        true
-    }
-
-    /// Select previous repository tree row.
-    pub const fn select_previous_tree_row(&mut self, rows: usize) -> bool {
-        let next = self.selected_tree_row.saturating_sub(rows);
-        if next == self.selected_tree_row {
-            return false;
-        }
-        self.selected_tree_row = next;
-        true
-    }
-
-    /// Expand selected directory row.
-    pub fn expand_selected_tree_row(&mut self) -> bool {
-        match self.file_tree_rows().get(self.selected_tree_row).cloned() {
-            Some(ReviewFileTreeRow::Directory { path, .. }) => self.expanded_dirs.insert(path),
-            _ => false,
-        }
-    }
-
-    /// Collapse selected directory row or selected file parent.
-    pub fn collapse_selected_tree_row(&mut self) -> bool {
-        match self.file_tree_rows().get(self.selected_tree_row).cloned() {
-            Some(ReviewFileTreeRow::Directory { path, .. }) => self.expanded_dirs.remove(&path),
-            Some(ReviewFileTreeRow::File { index, .. }) => {
-                let Some(path) = self.review_path_for_index(index) else {
-                    return false;
-                };
-                let Some(parent) = Path::new(&path).parent().map(Path::to_path_buf) else {
-                    return false;
-                };
-                self.expanded_dirs.remove(&parent)
+    fn navigate_tree_key(&mut self, key: KeyCode, repeat: usize) -> bool {
+        use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+        use bmux_tui_components::tree_view::{TreeViewComponent, TreeViewOutcome};
+        use std::cell::RefCell;
+        let model = self.navigation_items();
+        let (items, rows) = model.as_ref();
+        let visible = self.navigation_visible_indices(items);
+        let start = self.selected_tree_row.saturating_sub(repeat);
+        let end = self
+            .selected_tree_row
+            .saturating_add(repeat)
+            .saturating_add(1)
+            .min(visible.len());
+        let window = visible
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|source| items[*source].clone())
+            .collect::<Vec<_>>();
+        let mut initial = bmux_tui_components::tree_view::TreeViewState::new(None);
+        let window_rows = visible
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|source| rows[*source].clone())
+            .collect::<Vec<_>>();
+        self.reconcile_navigation_expansion(&mut initial, &window_rows);
+        initial.set_selected_visible(Some(self.selected_tree_row.saturating_sub(start)));
+        initial.set_focused(true);
+        let state = RefCell::new(initial);
+        let component = TreeViewComponent::new("review.files", &window, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 1, 1).size()),
+            &mut LayoutCx::new(),
+        );
+        let mut changed = false;
+        // Work is bounded by the tree, even for an oversized caller-provided movement.
+        for _ in 0..repeat.min(items.len().saturating_add(1)) {
+            let outcome = component.handle_event(
+                &Event::Key(KeyStroke::simple(key)),
+                &layout,
+                &mut EventCx::new(&layout),
+            );
+            if matches!(outcome, TreeViewOutcome::Ignored) {
+                break;
             }
-            None => false,
+            changed = true;
         }
+        let state = state.into_inner();
+        self.selected_tree_row = start.saturating_add(state.selected_visible().unwrap_or(0));
+        let mut expansion_changed = false;
+        for source in visible.iter().skip(start).take(end.saturating_sub(start)) {
+            if let ReviewFileTreeRow::Directory { path, .. } = &rows[*source] {
+                expansion_changed |= if state.is_expanded(&items[*source].id) {
+                    self.expanded_dirs.insert(path.clone())
+                } else {
+                    self.expanded_dirs.remove(path)
+                };
+            }
+        }
+        if expansion_changed {
+            self.invalidate_navigation_visibility();
+        }
+        self.reveal_tree_selection();
+        changed
+    }
+
+    /// Select next tree row without opening its file.
+    pub fn select_next_tree_row(&mut self, rows: usize) -> bool {
+        self.navigate_tree_key(KeyCode::Down, rows)
+    }
+
+    /// Select previous tree row without opening its file.
+    pub fn select_previous_tree_row(&mut self, rows: usize) -> bool {
+        self.navigate_tree_key(KeyCode::Up, rows)
+    }
+
+    /// Expand selected directory using native tree semantics.
+    pub fn expand_selected_tree_row(&mut self) -> bool {
+        self.navigate_tree_key(KeyCode::Right, 1)
+    }
+
+    /// Collapse selected directory or selected file's parent, preserving existing shortcuts.
+    pub fn collapse_selected_tree_row(&mut self) -> bool {
+        let rows = self.file_tree_rows();
+        if let Some(ReviewFileTreeRow::File { index, .. }) = rows.get(self.selected_tree_row) {
+            let Some(path) = self.review_path_for_index(*index) else {
+                return false;
+            };
+            let Some(parent) = Path::new(&path).parent() else {
+                return false;
+            };
+            if let Some(row) = rows.iter().position(
+                |row| matches!(row, ReviewFileTreeRow::Directory { path, .. } if path == parent),
+            ) {
+                self.selected_tree_row = row;
+            }
+        }
+        self.navigate_tree_key(KeyCode::Left, 1)
     }
 
     /// Return open and resolved local review thread counts.
@@ -8953,7 +9352,14 @@ impl ReviewApp {
         self.review
             .files
             .get(index)
-            .is_some_and(|file| self.viewed_files.contains(file.display_path()))
+            .map(ReviewFile::display_path)
+            .or_else(|| {
+                self.review
+                    .surfaces
+                    .get(index)
+                    .map(|surface| surface.path.as_str())
+            })
+            .is_some_and(|path| self.viewed_files.contains(path))
     }
 
     /// Return unviewed file display paths.
@@ -9116,6 +9522,7 @@ impl ReviewApp {
             matches!(row, ReviewFileTreeRow::File { index, .. } if *index == self.selected_file)
         }) {
             self.selected_tree_row = row;
+            self.reveal_tree_selection();
         }
     }
 
@@ -9126,11 +9533,15 @@ impl ReviewApp {
         };
         let path = Path::new(&path);
         let mut prefix = PathBuf::new();
+        let mut expansion_changed = false;
         if let Some(parent) = path.parent() {
             for component in parent.components() {
                 prefix.push(component.as_os_str());
-                self.expanded_dirs.insert(prefix.clone());
+                expansion_changed |= self.expanded_dirs.insert(prefix.clone());
             }
+        }
+        if expansion_changed {
+            self.invalidate_navigation_visibility();
         }
     }
 
@@ -9155,8 +9566,7 @@ impl ReviewApp {
 
     /// Scroll file sidebar down.
     pub fn scroll_files_down(&mut self, rows: usize) -> bool {
-        if self.sidebar_mode == ReviewSidebarMode::Repository && self.review.is_repository_review()
-        {
+        if self.sidebar_mode == ReviewSidebarMode::Repository {
             return self.scroll_tree_down(rows);
         }
         let max = self.review.files.len().saturating_sub(
@@ -9173,8 +9583,7 @@ impl ReviewApp {
 
     /// Scroll file sidebar up.
     pub fn scroll_files_up(&mut self, rows: usize) -> bool {
-        if self.sidebar_mode == ReviewSidebarMode::Repository && self.review.is_repository_review()
-        {
+        if self.sidebar_mode == ReviewSidebarMode::Repository {
             return self.scroll_tree_up(rows);
         }
         let next = self.file_scroll.saturating_sub(rows);
@@ -9187,10 +9596,13 @@ impl ReviewApp {
 
     /// Scroll repository tree sidebar down.
     pub fn scroll_tree_down(&mut self, rows: usize) -> bool {
-        let max = self.file_tree_rows().len().saturating_sub(
-            self.last_file_area
-                .map_or(1, |area| usize::from(area.height).max(1)),
-        );
+        let max = self
+            .navigation_visible_indices(&self.navigation_items().0)
+            .len()
+            .saturating_sub(
+                self.last_file_area
+                    .map_or(1, |area| usize::from(area.height).max(1)),
+            );
         let next = self.tree_scroll.saturating_add(rows).min(max);
         if next == self.tree_scroll {
             return false;
@@ -9532,6 +9944,16 @@ impl ReviewApp {
 
     /// Start a mouse-driven range selection from a rendered diff row.
     pub fn begin_mouse_range_selection(&mut self, index: usize) -> bool {
+        // The diff now owns the left-button gesture. Cancel stale pointer presses
+        // in other panes so its eventual release cannot activate those surfaces.
+        let Ok(controls) = self.controls.lock() else {
+            return false;
+        };
+        controls.suspend();
+        drop(controls);
+        let mut navigation_state = bmux_tui_components::tree_view::TreeViewState::new(None);
+        self.reconcile_navigation_expansion(&mut navigation_state, &self.navigation_visible_rows);
+        self.navigation_pointer_state = navigation_state;
         self.mouse_range_selection_start =
             Some(index.min(self.source_rendered_diff_len().saturating_sub(1)));
         self.mouse_range_selection_dragged = false;
@@ -9583,8 +10005,9 @@ impl ReviewApp {
         if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
             return None;
         }
-        let index = self.tree_scroll + usize::from(y.saturating_sub(area.y));
-        self.file_tree_rows().get(index).cloned()
+        self.navigation_visible_rows
+            .get(usize::from(y.saturating_sub(area.y)))
+            .cloned()
     }
 
     /// Return visible file index under terminal coordinates.
@@ -9974,7 +10397,11 @@ impl ReviewApp {
             self.status_message = Some("no draft comment at selected line".to_string());
             return true;
         };
-        let Some(comment_id) = comment.id.clone() else {
+        let Some(comment_id) = comment
+            .id
+            .clone()
+            .filter(|id| !self.optimistic_draft_ids.contains(id))
+        else {
             self.status_message =
                 Some("draft is not persisted yet; try again after save".to_string());
             return true;
@@ -10018,19 +10445,7 @@ impl ReviewApp {
         match editor.mode {
             ReviewCommentEditorMode::Create => match editor.action {
                 ReviewCommentAction::SaveDraft => {
-                    self.draft_comments.entry(anchor.clone()).or_default().push(
-                        ReviewDraftComment {
-                            id: None,
-                            body: text.clone(),
-                            persisted: false,
-                            created_at_ms: None,
-                            updated_at_ms: None,
-                            session_id: None,
-                            thread_kind: ReviewThreadKind::Note,
-                            severity: ReviewThreadSeverity::Info,
-                        },
-                    );
-                    self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
+                    self.queue_local_draft(anchor, text, None);
                     self.sync_selected_thread_to_anchor();
                     let count = self.draft_comment_count();
                     self.status_message = Some(format!("saved draft comment ({count} total)"));
@@ -10039,19 +10454,7 @@ impl ReviewApp {
                     self.queue_bcode_question(&anchor, text);
                 }
                 ReviewCommentAction::Publish => {
-                    self.draft_comments.entry(anchor.clone()).or_default().push(
-                        ReviewDraftComment {
-                            id: None,
-                            body: text.clone(),
-                            persisted: false,
-                            created_at_ms: None,
-                            updated_at_ms: None,
-                            session_id: None,
-                            thread_kind: ReviewThreadKind::Note,
-                            severity: ReviewThreadSeverity::Info,
-                        },
-                    );
-                    self.pending_draft_save = Some(PendingDraftSave { anchor, body: text });
+                    self.queue_local_draft(anchor, text, None);
                     self.sync_selected_thread_to_anchor();
                     self.publish_readiness_ack = true;
                     self.publish_state = Some(ReviewPublishState::Checklist);
@@ -10078,9 +10481,85 @@ impl ReviewApp {
         true
     }
 
+    fn queue_local_draft(
+        &mut self,
+        anchor: ReviewCommentAnchor,
+        body: String,
+        session_id: Option<String>,
+    ) {
+        self.next_local_draft_id = self
+            .next_local_draft_id
+            .checked_add(1)
+            .expect("local draft identity exhausted");
+        let local_id = format!("local-draft:{}", self.next_local_draft_id);
+        self.optimistic_draft_ids.insert(local_id.clone());
+        self.draft_comments
+            .entry(anchor.clone())
+            .or_default()
+            .push(ReviewDraftComment {
+                id: Some(local_id.clone()),
+                body: body.clone(),
+                persisted: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                session_id,
+                thread_kind: ReviewThreadKind::Note,
+                severity: ReviewThreadSeverity::Info,
+            });
+        let save = PendingDraftSave {
+            anchor,
+            body,
+            local_id,
+        };
+        if self.pending_draft_save.is_none() {
+            self.pending_draft_save = Some(save);
+        } else {
+            self.queued_draft_saves.push_back(save);
+        }
+    }
+
+    // Match the retained request identity, never body text, selection or vector
+    // position. Late completions cannot overwrite a newer comment or resurrect
+    // a deleted one. A body changed since dispatch retains its unsaved state.
+    fn reconcile_saved_draft(&mut self, save: &PendingDraftSave, draft: DraftComment) -> bool {
+        if draft.comment_id.is_empty()
+            || draft.anchor != DraftAnchor::from(save.anchor.clone())
+            || draft.body != save.body
+        {
+            return false;
+        }
+        let Some(comment) = self
+            .draft_comments
+            .get_mut(&save.anchor)
+            .and_then(|comments| {
+                comments.iter_mut().find(|comment| {
+                    !comment.persisted && comment.id.as_deref() == Some(save.local_id.as_str())
+                })
+            })
+        else {
+            return false;
+        };
+        if comment.body != save.body {
+            return false;
+        }
+        self.optimistic_draft_ids.remove(&save.local_id);
+        comment.id = Some(draft.comment_id);
+        comment.persisted = true;
+        comment.created_at_ms = Some(draft.created_at_ms);
+        comment.updated_at_ms = Some(draft.updated_at_ms);
+        // Session links may have advanced while the save was in flight.
+        if comment.session_id.is_none() {
+            comment.session_id = draft.session_id;
+        }
+        self.status_message = Some("saved draft comment".to_string());
+        true
+    }
+
     /// Take the pending draft save request, if present.
-    pub const fn take_pending_draft_save(&mut self) -> Option<PendingDraftSave> {
-        self.pending_draft_save.take()
+    pub fn take_pending_draft_save(&mut self) -> Option<PendingDraftSave> {
+        let save = self.pending_draft_save.take();
+        self.pending_draft_save = self.queued_draft_saves.pop_front();
+        save
     }
 
     /// Take the pending draft delete request, if present.
@@ -10423,20 +10902,8 @@ impl ReviewApp {
         let suggestion_id = suggestion.id.clone();
         suggestion.status = ReviewSuggestionStatus::Accepted;
         self.queue_suggestion_save(anchor.clone(), suggestion_id);
-        self.draft_comments
-            .entry(anchor.clone())
-            .or_default()
-            .push(ReviewDraftComment {
-                id: None,
-                body: body.clone(),
-                persisted: false,
-                created_at_ms: None,
-                updated_at_ms: None,
-                session_id,
-                thread_kind: ReviewThreadKind::Note,
-                severity: ReviewThreadSeverity::Info,
-            });
-        self.pending_draft_save = Some(PendingDraftSave { anchor, body });
+        self.queue_local_draft(anchor, body, session_id);
+
         self.sync_selected_thread_to_anchor();
         self.status_message = Some("accepted suggestion as draft comment".to_string());
         true
@@ -10638,23 +11105,8 @@ impl ReviewApp {
             self.status_message = Some("Bcode answer is already a draft comment".to_string());
             return true;
         }
-        self.draft_comments
-            .entry(anchor.clone())
-            .or_default()
-            .push(ReviewDraftComment {
-                id: None,
-                body: answer.clone(),
-                persisted: false,
-                created_at_ms: None,
-                updated_at_ms: None,
-                session_id,
-                thread_kind: ReviewThreadKind::Note,
-                severity: ReviewThreadSeverity::Info,
-            });
-        self.pending_draft_save = Some(PendingDraftSave {
-            anchor,
-            body: answer,
-        });
+        self.queue_local_draft(anchor, answer, session_id);
+
         self.sync_selected_thread_to_anchor();
         let count = self.draft_comment_count();
         self.status_message = Some(format!("drafted Bcode answer ({count} total)"));
@@ -11989,6 +12441,10 @@ impl ReviewApp {
             target: review_scope_for_workspace(&self.workspace).target().clone(),
             scope: Some(review_scope_for_workspace(&self.workspace)),
             anchor,
+            local_only: comment
+                .id
+                .as_ref()
+                .is_none_or(|id| self.optimistic_draft_ids.contains(id)),
             comment,
         });
         self.status_message = Some(if was_persisted {
@@ -12872,6 +13328,380 @@ fn rendered_rows_for_prompt(file: &ReviewFile) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn saved_draft_identity_enables_edit_without_reopening_review() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .unwrap()
+            .buffer
+            .insert_str("created");
+        assert!(app.save_comment_editor());
+        let save = app.take_pending_draft_save().unwrap();
+        assert!(!app.draft_comments[&save.anchor][0].persisted);
+        assert!(app.open_latest_draft_editor());
+        assert!(
+            app.comment_editor.is_none(),
+            "an ephemeral identity must not be sent as an update id"
+        );
+        let draft = saved_draft_response(&save, "persisted-1");
+        assert!(app.reconcile_saved_draft(&save, draft));
+        let comment = &app.draft_comments[&save.anchor][0];
+        assert_eq!(comment.id.as_deref(), Some("persisted-1"));
+        assert!(comment.persisted);
+        assert_eq!(comment.created_at_ms, Some(10));
+        assert_eq!(comment.updated_at_ms, Some(11));
+        assert!(app.open_latest_draft_editor());
+        let editor = app
+            .comment_editor
+            .as_mut()
+            .expect("editable immediately after acknowledgement");
+        assert_eq!(
+            editor.mode,
+            ReviewCommentEditorMode::Edit {
+                comment_id: "persisted-1".into(),
+                previous_body: "created".into(),
+            }
+        );
+        assert_eq!(editor.buffer.text(), "created");
+        editor.buffer = TextEditBuffer::from_text("created edited");
+        assert!(app.save_comment_editor());
+        let update = app.take_pending_draft_update().unwrap();
+        assert_eq!(update.comment_id, "persisted-1");
+        assert_eq!(update.new_body, "created edited");
+        assert!(
+            !app.reconcile_saved_draft(&save, saved_draft_response(&save, "persisted-1")),
+            "duplicate create acknowledgement cannot overwrite an edit"
+        );
+        assert_eq!(app.draft_comments[&save.anchor][0].body, "created edited");
+        assert!(
+            app.open_latest_draft_editor(),
+            "known database identity remains editable while its body is optimistic"
+        );
+        assert!(app.comment_editor.is_some());
+    }
+
+    fn saved_draft_response(save: &PendingDraftSave, id: &str) -> DraftComment {
+        let response = serde_json::json!({"draft": {
+            "comment_id": id, "thread_id": "thread-1", "anchor": DraftAnchor::from(save.anchor.clone()),
+            "body": save.body, "created_at_ms": 10, "updated_at_ms": 11,
+        }});
+        serde_json::from_value::<SaveDraftResponse>(response)
+            .unwrap()
+            .draft
+    }
+
+    #[test]
+    fn draft_save_completions_match_identity_not_body_order_or_selection() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().unwrap();
+        app.queue_local_draft(anchor.clone(), "identical".into(), Some("linked".into()));
+        app.queue_local_draft(anchor.clone(), "identical".into(), None);
+        let first = app.take_pending_draft_save().unwrap();
+        let second = app.take_pending_draft_save().unwrap();
+        assert_ne!(first.local_id, second.local_id);
+        assert!(app.take_pending_draft_save().is_none());
+        app.selected_diff_line = 0;
+        assert!(app.reconcile_saved_draft(&second, saved_draft_response(&second, "second")));
+        assert_eq!(
+            app.draft_comments[&anchor][0].id.as_deref(),
+            Some(first.local_id.as_str())
+        );
+        assert!(!app.draft_comments[&anchor][0].persisted);
+        assert!(app.reconcile_saved_draft(&first, saved_draft_response(&first, "first")));
+        assert_eq!(app.draft_comments[&anchor][0].id.as_deref(), Some("first"));
+        assert_eq!(app.draft_comments[&anchor][1].id.as_deref(), Some("second"));
+        assert_eq!(
+            app.draft_comments[&anchor][0].session_id.as_deref(),
+            Some("linked")
+        );
+        assert!(!app.reconcile_saved_draft(&second, saved_draft_response(&second, "second")));
+    }
+
+    #[test]
+    fn deleting_optimistic_and_acknowledged_drafts_keeps_service_id_boundary() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().unwrap();
+        app.queue_local_draft(anchor.clone(), "unsaved".into(), None);
+        let save = app.take_pending_draft_save().unwrap();
+        assert!(app.delete_latest_draft_at_selection());
+        let delete = app.take_pending_draft_delete().unwrap();
+        assert!(
+            delete.local_only,
+            "ephemeral ids must never reach delete service"
+        );
+        assert!(!app.reconcile_saved_draft(&save, saved_draft_response(&save, "late")));
+        assert!(!app.draft_comments.contains_key(&anchor));
+
+        app.queue_local_draft(anchor.clone(), "saved".into(), None);
+        let save = app.take_pending_draft_save().unwrap();
+        assert!(app.reconcile_saved_draft(&save, saved_draft_response(&save, "database-id")));
+        app.update_local_draft_body(&anchor, "database-id", "pending edit".into());
+        assert!(!app.draft_comments[&anchor][0].persisted);
+        assert!(app.delete_latest_draft_at_selection());
+        let delete = app.take_pending_draft_delete().unwrap();
+        assert!(
+            !delete.local_only,
+            "dirty body does not erase a known database identity"
+        );
+        assert_eq!(delete.comment.id.as_deref(), Some("database-id"));
+    }
+
+    #[test]
+    fn late_or_mismatched_draft_save_does_not_replace_or_resurrect_comments() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        let anchor = app.selected_comment_anchor().unwrap();
+        app.queue_local_draft(anchor.clone(), "same".into(), None);
+        let deleted = app.take_pending_draft_save().unwrap();
+        app.draft_comments.remove(&anchor);
+        app.queue_local_draft(anchor.clone(), "same".into(), None);
+        let replacement = app.take_pending_draft_save().unwrap();
+        assert!(!app.reconcile_saved_draft(&deleted, saved_draft_response(&deleted, "deleted")));
+        let mut wrong = saved_draft_response(&replacement, "wrong-anchor");
+        wrong.anchor.file_path = "elsewhere.rs".into();
+        assert!(!app.reconcile_saved_draft(&replacement, wrong));
+        let mut wrong = saved_draft_response(&replacement, "wrong-body");
+        wrong.body = "unexpected".into();
+        assert!(!app.reconcile_saved_draft(&replacement, wrong));
+        assert_eq!(app.draft_comments[&anchor].len(), 1);
+        assert_eq!(
+            app.draft_comments[&anchor][0].id.as_deref(),
+            Some(replacement.local_id.as_str())
+        );
+        assert!(!app.draft_comments[&anchor][0].persisted);
+        assert!(app.reconcile_saved_draft(
+            &replacement,
+            saved_draft_response(&replacement, "replacement")
+        ));
+    }
+
+    #[test]
+    fn live_controls_respect_unbound_and_rebound_effective_keys() {
+        use bcode_plugin_sdk::tui::keymap::controls::resolve_registry;
+        use bmux_keyboard::parse_key_stroke;
+        let mut app = sample_app();
+        app.sidebar_mode = ReviewSidebarMode::Included;
+        paint_test_review(&mut app);
+        let scope = crate::keybindings::review_scope(&app);
+        let host = ClipboardTestHost {
+            keymap: resolve_registry(
+                crate::keybindings::actions(),
+                BTreeMap::from([(
+                    scope.into(),
+                    BTreeMap::from([("tab".into(), String::new())]),
+                )]),
+            )
+            .unwrap(),
+            ..ClipboardTestHost::default()
+        };
+        assert!(!handle_effective_event(
+            &mut app,
+            &Event::Key(KeyStroke::simple(KeyCode::Tab)),
+            &host
+        ));
+        assert!(!handle_effective_event(
+            &mut app,
+            &Event::Key(KeyStroke::simple(KeyCode::Right)),
+            &host
+        ));
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Included);
+        let host = ClipboardTestHost {
+            keymap: resolve_registry(
+                crate::keybindings::actions(),
+                BTreeMap::from([(
+                    scope.into(),
+                    BTreeMap::from([
+                        ("ctrl+t".into(), "tui.control.focus_next".into()),
+                        ("ctrl+l".into(), "tui.control.left".into()),
+                        ("ctrl+r".into(), "tui.control.right".into()),
+                    ]),
+                )]),
+            )
+            .unwrap(),
+            ..ClipboardTestHost::default()
+        };
+        assert!(!handle_effective_event(
+            &mut app,
+            &Event::Key(KeyStroke::simple(KeyCode::Tab)),
+            &host
+        ));
+        assert!(handle_effective_event(
+            &mut app,
+            &Event::Key(parse_key_stroke("ctrl+t").unwrap()),
+            &host
+        ));
+        for code in [KeyCode::Left, KeyCode::Right] {
+            assert!(!handle_effective_event(
+                &mut app,
+                &Event::Key(KeyStroke::simple(code)),
+                &host
+            ));
+            assert_eq!(app.sidebar_mode, ReviewSidebarMode::Included);
+        }
+        assert!(handle_effective_event(
+            &mut app,
+            &Event::Key(parse_key_stroke("ctrl+r").unwrap()),
+            &host
+        ));
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Repository);
+        paint_test_review(&mut app);
+        assert!(handle_effective_event(
+            &mut app,
+            &Event::Key(parse_key_stroke("ctrl+l").unwrap()),
+            &host
+        ));
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Included);
+    }
+
+    fn paint_test_review(app: &mut ReviewApp) {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 140, 35));
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        crate::code_review_tui_render::render(app, &mut PaintCx::new(&mut frame), None);
+    }
+
+    #[test]
+    fn captured_diff_release_over_controls_and_tree_finishes_without_activation() {
+        use bmux_tui::geometry::Point;
+        for release in [Point::new(2, 1), Point::new(2, 5)] {
+            let mut app = sample_app();
+            paint_test_review(&mut app);
+            let area = app.diff_area().unwrap();
+            let rows = (area.y..area.bottom())
+                .filter_map(|y| {
+                    app.commentable_diff_line_index_at(area.x, y)
+                        .map(|row| (y, row))
+                })
+                .collect::<Vec<_>>();
+            assert!(rows.len() >= 2);
+            let start = Point::new(area.x, rows[0].0);
+            let end = Point::new(area.x, rows[1].0);
+            // Simulate an interrupted press in the destination pane; acquiring
+            // diff capture must cancel it rather than leave a latent activation.
+            handle_event_no_resize(
+                &mut app,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    release,
+                )),
+            );
+            let sidebar = app.sidebar_mode;
+            handle_event_no_resize(
+                &mut app,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    start,
+                )),
+            );
+            assert_eq!(app.mouse_range_selection_start, Some(rows[0].1));
+            assert!(handle_event_no_resize(
+                &mut app,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    end
+                ))
+            ));
+            let selected = app.selected_diff_line;
+            let tree_row = app.selected_tree_row;
+            if release.y == 5 {
+                assert!(app.file_area_contains(release.x, release.y));
+            }
+            assert!(handle_event_no_resize(
+                &mut app,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    release
+                ))
+            ));
+            assert_eq!(app.selected_diff_line, selected);
+            assert!(handle_event_no_resize(
+                &mut app,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    release
+                ))
+            ));
+            assert_eq!(app.mouse_range_selection_start, None);
+            assert!(!app.mouse_range_selection_dragged);
+            assert_eq!(app.range_selection_start, Some(rows[0].1));
+            assert_eq!(app.selected_diff_line, selected);
+            assert_eq!(app.selected_tree_row, tree_row);
+            assert_eq!(app.sidebar_mode, sidebar);
+            assert!(!app.update_mouse_range_selection(rows[0].1));
+            handle_event_no_resize(
+                &mut app,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    release,
+                )),
+            );
+            assert_eq!(app.sidebar_mode, sidebar);
+            assert_eq!(app.selected_diff_line, selected);
+        }
+    }
+
+    #[test]
+    fn interrupted_diff_capture_relinquishes_on_focus_loss_and_resize() {
+        for event in [
+            Event::Focus(FocusEvent::Lost),
+            Event::Resize(bmux_tui::geometry::Size::new(80, 24)),
+        ] {
+            let mut app = sample_app();
+            paint_test_review(&mut app);
+            app.begin_mouse_range_selection(1);
+            app.update_mouse_range_selection(2);
+            handle_event_no_resize(&mut app, &event);
+            assert_eq!(app.mouse_range_selection_start, None);
+            assert!(!app.mouse_range_selection_dragged);
+            assert_eq!(app.range_selection_start, Some(1));
+        }
+    }
+
+    #[test]
+    fn live_controls_activate_sidebar_and_do_not_intercept_comment_typing() {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::paint::PaintCx;
+        let mut app = sample_app();
+        app.sidebar_mode = ReviewSidebarMode::Included;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 35));
+        let mut frame = Frame::new(&mut buffer);
+        crate::code_review_tui_render::render(&mut app, &mut PaintCx::new(&mut frame), None);
+        assert!(handle_event_no_resize(
+            &mut app,
+            &Event::Key(KeyStroke::simple(KeyCode::Tab))
+        ));
+        assert!(handle_event_no_resize(
+            &mut app,
+            &Event::Key(KeyStroke::simple(KeyCode::Right))
+        ));
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Repository);
+        crate::code_review_tui_render::render(&mut app, &mut PaintCx::new(&mut frame), None);
+        assert!(handle_event_no_resize(
+            &mut app,
+            &Event::Key(KeyStroke::simple(KeyCode::Escape))
+        ));
+        assert!(!app.should_exit);
+        app.open_file_comment_editor();
+        crate::code_review_tui_render::render(&mut app, &mut PaintCx::new(&mut frame), None);
+        assert!(handle_event_no_resize(
+            &mut app,
+            &Event::Paste("unchanged input route".into())
+        ));
+        assert!(
+            app.comment_editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .text()
+                .contains("unchanged input route")
+        );
+    }
 
     #[derive(Default)]
     struct ClipboardTestHost {
@@ -14720,6 +15550,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn navigation_cache_preserves_review_app_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ReviewApp>();
+    }
+
+    #[test]
+    fn navigation_preserves_duplicate_source_identity_on_refresh() {
+        let mut app = build_workspace_app(
+            vec![
+                build_source("one", ReviewSourceKind::Repository, true),
+                build_source("two", ReviewSourceKind::Repository, true),
+            ],
+            vec![
+                build_file_surface("first", "one"),
+                build_file_surface("second", "two"),
+            ],
+            Vec::new(),
+        );
+        let model = app.navigation_items();
+        assert_ne!(model.0[0].id, model.0[1].id);
+        assert!(app.select_file(1));
+        let mut review = app.review.clone();
+        review.surfaces.swap(0, 1);
+        app.replace_review(review);
+        assert_eq!(app.selected_file, 0);
+        assert_eq!(app.selected_surface().unwrap().source_id, "two");
+    }
+
+    #[test]
+    fn navigation_hierarchy_filter_cache_and_keyboard_activation() {
+        let mut review = sample_app().review;
+        review.files.truncate(1);
+        let mut second = review.files[0].clone();
+        second.new_path = Some("界/emoji-👩‍💻-e\u{301}.rs".to_string());
+        review.files.push(second);
+        review.files[0].new_path = Some("界/a.rs".to_string());
+        let mut app = ReviewApp::new(review);
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Repository);
+        assert!(matches!(
+            app.file_tree_rows()[0],
+            ReviewFileTreeRow::Directory { .. }
+        ));
+        let first = app.navigation_items();
+        assert!(Arc::ptr_eq(&first, &app.navigation_items()));
+        app.selected_tree_row = 0;
+        assert!(app.collapse_selected_tree_row());
+        assert_eq!(app.file_tree_rows().len(), 1);
+        assert!(app.expand_selected_tree_row());
+        assert!(app.select_next_tree_row(2));
+        assert_eq!(
+            app.selected_file, 0,
+            "focus must not eagerly load/open a file"
+        );
+        assert!(app.activate_selected_tree_row());
+        assert_eq!(app.selected_file, 1);
+        app.viewed_files.insert("界/a.rs".to_string());
+        app.hide_viewed_files = true;
+        let rows = app.file_tree_rows();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, ReviewFileTreeRow::File { index: 0, .. }))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, ReviewFileTreeRow::File { index: 1, .. }))
+        );
+    }
+
+    #[test]
     fn moving_repository_tree_focus_does_not_open_file() {
         let mut app = build_workspace_app(
             vec![build_source("source-1", ReviewSourceKind::Repository, true)],
@@ -14843,7 +15743,7 @@ pub(crate) mod tests {
             .buffer
             .insert_str("Needs a test");
         assert!(app.save_comment_editor());
-        assert!(app.toggle_sidebar_mode());
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Repository);
         assert!(app.toggle_sidebar_mode());
 
         assert_eq!(app.sidebar_mode, ReviewSidebarMode::Threads);
@@ -15762,12 +16662,28 @@ pub(crate) mod tests {
             comments.last().map(|comment| comment.body.as_str()),
             Some("Use a clearer error message.")
         );
-        assert_eq!(
-            app.take_pending_draft_save()
-                .expect("draft save should be pending")
-                .body,
-            "Use a clearer error message."
-        );
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].body, "Can Bcode check this?");
+        let question_id = comments[0]
+            .id
+            .clone()
+            .expect("optimistic question identity");
+        let answer_id = comments[1].id.clone().expect("optimistic answer identity");
+        assert_ne!(question_id, answer_id);
+        assert!(comments.iter().all(|comment| !comment.persisted));
+
+        // Conversion appends a save; it must not overwrite the earlier comment.
+        let question_save = app
+            .take_pending_draft_save()
+            .expect("original save retained");
+        assert_eq!(question_save.body, "Can Bcode check this?");
+        assert_eq!(question_save.anchor, anchor);
+        assert_eq!(question_save.local_id, question_id);
+        let answer_save = app.take_pending_draft_save().expect("answer save queued");
+        assert_eq!(answer_save.body, "Use a clearer error message.");
+        assert_eq!(answer_save.anchor, anchor);
+        assert_eq!(answer_save.local_id, answer_id);
+        assert!(app.take_pending_draft_save().is_none());
     }
 
     #[test]

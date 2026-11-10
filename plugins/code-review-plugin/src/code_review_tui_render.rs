@@ -16,15 +16,16 @@ use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::{Color, Modifier};
-use bmux_tui::text_width::{display_width, truncate_to_display_width};
+use bmux_tui::text_width::truncate_to_display_width;
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing, ModalTheme,
 };
 
+use crate::code_review_controls::{ControlSurface, ReviewActionGroup};
 use crate::code_review_tui::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewMouseAction, ReviewPromptKind, ReviewPublishState,
-    ReviewSidebarMode, ReviewThreadFilter, add_source_menu_items, advanced_source_menu_items,
-    review_thread_kind_label, review_thread_severity_label, sidebar_width,
+    ReviewSidebarMode, add_source_menu_items, advanced_source_menu_items, review_thread_kind_label,
+    review_thread_severity_label, sidebar_width,
 };
 use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
@@ -34,6 +35,8 @@ use crate::code_review_tui_view::{
     ReviewViewTarget,
 };
 use bcode_code_review_models::ReviewSource;
+use bmux_tui_components::action_row::ActionRowStyles;
+use bmux_tui_components::tab_bar::TabBarStyles;
 
 fn syntax_palette(
     theme: bcode_plugin_sdk::tui::PluginTuiSyntaxTheme,
@@ -81,12 +84,6 @@ impl Default for ReviewTheme {
     }
 }
 
-impl ReviewTheme {
-    const fn control(self, active: bool) -> Style {
-        if active { self.selection } else { self.focused }
-    }
-}
-
 impl From<bcode_plugin_sdk::tui::PluginTuiTheme> for ReviewTheme {
     fn from(theme: bcode_plugin_sdk::tui::PluginTuiTheme) -> Self {
         let component = theme.component_theme();
@@ -121,6 +118,9 @@ const fn fallback_review_diff_theme() -> bcode_plugin_sdk::tui::PluginTuiDiffThe
 }
 
 /// Render one full-screen code review frame.
+///
+/// # Panics
+/// Panics if a prior controls operation poisoned the review controls mutex.
 pub fn render(
     app: &mut ReviewApp,
     frame: &mut PaintCx<'_, '_>,
@@ -128,6 +128,16 @@ pub fn render(
 ) {
     let area = Rect::new(0, 0, frame.area().width, frame.area().height);
     app.clear_mouse_regions();
+    app.controls
+        .lock()
+        .expect("review controls lock")
+        .begin_frame(
+            app.comment_editor.is_some()
+                || app.prompt_state.is_some()
+                || app.import_state.is_some()
+                || app.publish_state.is_some()
+                || app.help_visible,
+        );
     app.comment_input_visible = false;
     if let Some(editor) = &mut app.comment_editor {
         editor
@@ -149,96 +159,60 @@ pub fn render(
     app.confine_mouse_regions(area);
 }
 
-fn render_chrome(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
+fn render_chrome(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     let header = Rect::new(area.x, area.y, area.width, 1);
     render_header(app, header, frame, theme);
+    render_header_actions(
+        app,
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(2).min(2),
+        ),
+        frame,
+        theme,
+    );
 
     let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     render_footer(app, footer, frame, theme);
 }
 
 fn render_header_actions(
-    app: &mut ReviewApp,
+    app: &ReviewApp,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
-    if area.width == 0 {
-        return;
-    }
-    let mut x = area.x;
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Files",
-        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Included),
-        theme.control(app.sidebar_mode == ReviewSidebarMode::Included),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Repo",
-        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Repository),
-        theme.control(app.sidebar_mode == ReviewSidebarMode::Repository),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Threads",
-        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Threads),
-        theme.control(app.sidebar_mode == ReviewSidebarMode::Threads),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "General",
-        ReviewMouseAction::SidebarMode(ReviewSidebarMode::General),
-        theme.control(app.sidebar_mode == ReviewSidebarMode::General),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Summary",
-        ReviewMouseAction::SidebarMode(ReviewSidebarMode::Summary),
-        theme.control(app.sidebar_mode == ReviewSidebarMode::Summary),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Attention",
-        ReviewMouseAction::SidebarMode(ReviewSidebarMode::NeedsAttention),
-        theme.control(app.sidebar_mode == ReviewSidebarMode::NeedsAttention),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "File note",
-        ReviewMouseAction::FileComment,
-        theme.control(false),
-    );
-    let _ = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "+Review note",
-        ReviewMouseAction::NewReviewComment,
-        theme.control(false),
-    );
+    paint_review_controls(app, ControlSurface::Header, area, frame, theme);
+}
+
+fn paint_review_controls(
+    app: &ReviewApp,
+    surface: ControlSurface,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: ReviewTheme,
+) {
+    let styles = ActionRowStyles {
+        normal: theme.focused,
+        focused: theme.selection,
+        hovered: theme.selection,
+        pressed: theme.selection,
+        disabled: theme.muted,
+    };
+    let tabs = TabBarStyles {
+        normal: theme.focused,
+        selected: theme.selection,
+        focused: theme.selection,
+        hovered: theme.selection,
+        pressed: theme.selection,
+        disabled: theme.muted,
+        separator: theme.muted,
+    };
+    let mut controls = app.controls.lock().expect("review controls lock");
+    controls.sync_sidebar(app.sidebar_mode);
+    controls.paint_surface(surface, area, frame, styles, tabs);
 }
 
 fn render_body(
@@ -249,9 +223,9 @@ fn render_body(
 ) -> Rect {
     let body = Rect::new(
         area.x,
-        area.y.saturating_add(1),
+        area.y.saturating_add(3),
         area.width,
-        area.height.saturating_sub(2),
+        area.height.saturating_sub(4),
     );
     let sidebar_width = sidebar_width(app, area.width);
     if sidebar_width == 0 {
@@ -278,13 +252,7 @@ fn render_sidebar(
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
-    render_header_actions(app, area, frame, theme);
-    let content = Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(1),
-    );
+    let content = area;
     match app.sidebar_mode {
         ReviewSidebarMode::Included => render_included(app, content, frame, theme),
         ReviewSidebarMode::Repository => render_files(app, content, frame, theme),
@@ -336,29 +304,7 @@ fn render_overlays(
     }
 }
 
-fn render_header_button(
-    app: &mut ReviewApp,
-    frame: &mut PaintCx<'_, '_>,
-    x: u16,
-    y: u16,
-    label: &'static str,
-    action: ReviewMouseAction,
-    style: Style,
-) -> u16 {
-    let text = format!("[{label}]");
-    let width = u16::try_from(bmux_tui::text_width::display_width(&text).saturating_add(1))
-        .unwrap_or(u16::MAX);
-    let rect = Rect::new(x, y, width.saturating_sub(1), 1);
-    frame.write_line_with_fallback_style(
-        LocalRect::terminal(rect),
-        &Line::from_spans(vec![Span::styled(text, style)]),
-        style,
-    );
-    app.register_mouse_region(rect, action, label);
-    x.saturating_add(width)
-}
-
-fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
+fn render_header(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
     if area.is_empty() {
         return;
     }
@@ -452,92 +398,6 @@ fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
         )]),
         theme.focused,
     );
-    register_header_thread_regions(app, area, &text);
-}
-
-fn register_header_thread_regions(app: &mut ReviewApp, area: Rect, text: &str) {
-    let drafts = app.draft_comment_count();
-    if drafts > 0 {
-        register_header_text_region(
-            app,
-            area,
-            text,
-            &format!("💬 {drafts} draft"),
-            ReviewMouseAction::ShowDraftThreads,
-            "show draft threads",
-        );
-    }
-    let (open_threads, resolved_threads) = app.thread_status_counts();
-    if open_threads == 0 && resolved_threads == 0 {
-        return;
-    }
-    let total_threads = open_threads.saturating_add(resolved_threads);
-    register_header_text_region(
-        app,
-        area,
-        text,
-        &format!("threads {total_threads}"),
-        ReviewMouseAction::ShowAllThreads,
-        "show all threads",
-    );
-    register_header_text_region(
-        app,
-        area,
-        text,
-        &format!("open {open_threads}"),
-        ReviewMouseAction::ShowOpenThreads,
-        "show open threads",
-    );
-    let resolved_label = if app.show_resolved_threads {
-        format!("resolved {resolved_threads}")
-    } else {
-        format!("hidden {resolved_threads}")
-    };
-    register_header_text_region(
-        app,
-        area,
-        text,
-        &resolved_label,
-        ReviewMouseAction::ShowResolvedThreads,
-        "show resolved threads",
-    );
-    register_header_text_region(
-        app,
-        area,
-        text,
-        &format!("filter:{}", app.thread_filter.label()),
-        ReviewMouseAction::CycleThreadFilter,
-        "cycle thread filter",
-    );
-}
-
-fn register_header_text_region(
-    app: &mut ReviewApp,
-    area: Rect,
-    text: &str,
-    needle: &str,
-    action: ReviewMouseAction,
-    label: &'static str,
-) {
-    let visible_text = truncate_to_display_width(text, usize::from(area.width));
-    let Some(byte_index) = visible_text.find(needle) else {
-        return;
-    };
-    let x_offset = u16::try_from(display_width(&visible_text[..byte_index])).unwrap_or(u16::MAX);
-    if x_offset >= area.width {
-        return;
-    }
-    let width = u16::try_from(display_width(needle)).unwrap_or(u16::MAX);
-    app.register_mouse_region(
-        Rect::new(
-            area.x.saturating_add(x_offset),
-            area.y,
-            width.min(area.width.saturating_sub(x_offset)),
-            1,
-        ),
-        action,
-        label,
-    );
 }
 
 fn header_thread_label(app: &ReviewApp) -> String {
@@ -564,7 +424,12 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme
         return;
     }
     let text = app.status_message.as_deref().map_or_else(
-        || crate::keybindings::hints().unwrap_or_default().join("  "),
+        || {
+            format!(
+                "Tab controls · ←/→ select · Enter activate · Esc content  {}",
+                crate::keybindings::hints().unwrap_or_default().join("  ")
+            )
+        },
         str::to_owned,
     );
     frame.write_line(
@@ -707,195 +572,106 @@ const fn diagnostic_severity_label(severity: ReviewSourceDiagnosticSeverity) -> 
 }
 
 fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>, theme: ReviewTheme) {
+    use bmux_tui_components::tree_view::{TreeViewComponent, TreeViewStyles};
+    use std::cell::RefCell;
     if area.is_empty() {
         return;
     }
-    let visible_rows = usize::from(area.height);
-    if app.review.is_repository_review() {
-        render_file_tree(app, area, frame, visible_rows, theme);
-        return;
-    }
-    let visible_files = app.visible_file_indices();
-    let focused_row = visible_files
+    let model = app.navigation_items();
+    let (items, rows) = model.as_ref();
+    let visible = app.navigation_visible_indices(items);
+    app.selected_tree_row = app.selected_tree_row.min(visible.len().saturating_sub(1));
+    app.tree_scroll = app
+        .tree_scroll
+        .min(visible.len().saturating_sub(usize::from(area.height)));
+    // Bound component measurement, labels, painting and native hits to the viewport.
+    // This also avoids imposing terminal u16 geometry on the lifetime/size of a review.
+    let mut viewport_items = Vec::new();
+    let mut viewport_rows = Vec::new();
+    for source in visible
         .iter()
-        .position(|index| *index == app.selected_file)
-        .unwrap_or(0);
-    if focused_row < app.file_scroll {
-        app.file_scroll = focused_row;
-    }
-    if focused_row >= app.file_scroll.saturating_add(visible_rows) {
-        app.file_scroll = focused_row.saturating_sub(visible_rows.saturating_sub(1));
-    }
-    if app.file_scroll >= visible_files.len() {
-        app.file_scroll = visible_files.len().saturating_sub(1);
-    }
-
-    for row in 0..visible_rows {
-        let y = area
-            .y
-            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        let visible_index = app.file_scroll.saturating_add(row);
-        let line_area = Rect::new(area.x, y, area.width, 1);
-        let Some(index) = visible_files.get(visible_index).copied() else {
-            continue;
-        };
-        if let Some(file) = app.review.files.get(index) {
-            let source_label = app.review.file_source_label(index);
-            render_file_row(
-                file,
-                FileRowState {
-                    source_label: source_label.as_deref(),
-                    selected: index == app.selected_file,
-                    viewed: app.file_viewed(index),
-                    draft_comments: app.draft_comment_count_for_file(index),
-                    open_threads: app.open_thread_count_for_file(index),
+        .copied()
+        .skip(app.tree_scroll)
+        .take(usize::from(area.height))
+    {
+        let mut item = items[source].clone();
+        if let crate::code_review_tui::ReviewFileTreeRow::File { index, .. } = rows[source] {
+            let viewed = if app.file_viewed(index) { "✓" } else { "○" };
+            let opened = if index == app.selected_file {
+                "●"
+            } else {
+                " "
+            };
+            let source_label = app
+                .review
+                .surfaces
+                .get(index)
+                .and_then(|surface| {
+                    app.workspace
+                        .sources
+                        .iter()
+                        .find(|source| source.id == surface.source_id)
+                })
+                .map(|source| source.label.as_str());
+            let source = source_label.map_or_else(String::new, |source| format!(" [{source}]"));
+            let drafts = app.draft_comment_count_for_file(index);
+            let threads = app.open_thread_count_for_file(index);
+            let counts = app.review.files.get(index).map_or_else(
+                || {
+                    let mut counts = String::new();
+                    if drafts > 0 {
+                        let _ = write!(counts, " 💬{drafts}");
+                    }
+                    if threads > 0 {
+                        let _ = write!(counts, " ⚠{threads}");
+                    }
+                    counts
                 },
-                line_area,
-                frame,
-                theme,
+                |file| file_row_counts(file, drafts, threads),
             );
-            app.register_mouse_region(
-                line_area,
-                ReviewMouseAction::SelectFile(visible_index),
-                "select file",
-            );
-            app.register_mouse_region(
-                Rect::new(line_area.x, line_area.y, 4.min(line_area.width), 1),
-                ReviewMouseAction::ToggleFileViewed(visible_index),
-                "toggle viewed",
-            );
+            let status = app
+                .review
+                .files
+                .get(index)
+                .map_or("", |file| file.status.label());
+            item.label = format!("{opened}{viewed} {status} {}{source}{counts}", item.label);
         }
+        viewport_items.push(item);
+        viewport_rows.push(rows[source].clone());
     }
-}
-
-fn render_file_tree(
-    app: &mut ReviewApp,
-    area: Rect,
-    frame: &mut PaintCx<'_, '_>,
-    visible_rows: usize,
-    theme: ReviewTheme,
-) {
-    let rows = app.file_tree_rows();
-    let focused_row = app.selected_tree_row.min(rows.len().saturating_sub(1));
-    app.selected_tree_row = focused_row;
-    if focused_row < app.tree_scroll {
-        app.tree_scroll = focused_row;
-    }
-    if focused_row >= app.tree_scroll.saturating_add(visible_rows) {
-        app.tree_scroll = focused_row.saturating_sub(visible_rows.saturating_sub(1));
-    }
-    let opened_path = app.selected_file_path();
-    for row in 0..visible_rows {
-        let y = area
-            .y
-            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        let tree_row_index = app.tree_scroll.saturating_add(row);
-        let line_area = Rect::new(area.x, y, area.width, 1);
-        let Some(tree_row) = rows.get(tree_row_index) else {
-            continue;
-        };
-        match tree_row {
-            crate::code_review_tui::ReviewFileTreeRow::Directory { path, depth } => {
-                let focused = tree_row_index == focused_row;
-                let style = if focused {
-                    theme.selection
-                } else {
-                    theme.focused.patch(theme.overlay)
-                };
-                let expanded = if app.expanded_dirs.contains(path) {
-                    "▾"
-                } else {
-                    "▸"
-                };
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_else(|| path.to_str().unwrap_or_default());
-                let text = format!(" {}{expanded} {name}/", "  ".repeat(*depth));
-                frame.write_line_with_fallback_style(
-                    LocalRect::terminal(line_area),
-                    &Line::from_spans(vec![Span::styled(
-                        truncate_to_display_width(&text, usize::from(area.width)),
-                        style,
-                    )]),
-                    style,
-                );
-                app.register_mouse_region(
-                    line_area,
-                    ReviewMouseAction::ActivateTreeRow(tree_row_index),
-                    "activate tree row",
-                );
-            }
-            crate::code_review_tui::ReviewFileTreeRow::File { index, depth } => {
-                if let Some(path) = app.review_path_for_index(*index) {
-                    render_file_tree_file_row(
-                        &FileTreeFileRow {
-                            path: &path,
-                            focused: tree_row_index == focused_row,
-                            opened: opened_path.as_deref() == Some(path.as_str()),
-                            viewed: app.viewed_files.contains(&path),
-                            draft_comments: app.draft_comment_count_for_file(*index),
-                            depth: *depth,
-                        },
-                        line_area,
-                        frame,
-                        theme,
-                    );
-                    app.register_mouse_region(
-                        line_area,
-                        ReviewMouseAction::ActivateTreeRow(tree_row_index),
-                        "activate tree row",
-                    );
-                }
-            }
-        }
-    }
-}
-
-struct FileTreeFileRow<'a> {
-    path: &'a str,
-    focused: bool,
-    opened: bool,
-    viewed: bool,
-    draft_comments: usize,
-    depth: usize,
-}
-
-fn render_file_tree_file_row(
-    row: &FileTreeFileRow<'_>,
-    area: Rect,
-    frame: &mut PaintCx<'_, '_>,
-    theme: ReviewTheme,
-) {
-    let style = if row.focused {
-        theme.selection
+    let mut tree_state = if app.navigation_items == viewport_items {
+        app.navigation_pointer_state.clone()
     } else {
-        theme.overlay
+        bmux_tui_components::tree_view::TreeViewState::new(None)
     };
-    let path = std::path::Path::new(row.path);
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| path.to_str().unwrap_or_default());
-    let comments = if row.draft_comments == 0 {
-        String::new()
-    } else {
-        format!(" 💬{}", row.draft_comments)
-    };
-    let open_marker = if row.opened { "●" } else { " " };
-    let viewed_marker = if row.viewed { "✓" } else { "○" };
-    let text = format!(
-        " {}{open_marker}{viewed_marker} {name}{comments}",
-        "  ".repeat(row.depth)
+    app.reconcile_navigation_expansion(&mut tree_state, &viewport_rows);
+    tree_state.set_selected_visible(
+        app.selected_tree_row
+            .checked_sub(app.tree_scroll)
+            .filter(|row| *row < viewport_items.len()),
     );
-    frame.write_line_with_fallback_style(
-        LocalRect::terminal(area),
-        &Line::from_spans(vec![Span::styled(
-            truncate_to_display_width(&text, usize::from(area.width)),
-            style,
-        )]),
-        style,
+    let state = RefCell::new(tree_state);
+    let component =
+        TreeViewComponent::new("review.files", &viewport_items, &state).styles(TreeViewStyles {
+            normal: theme.overlay,
+            selected: theme.selection,
+            hovered: theme.focused,
+            pressed: theme.selection,
+            disabled: theme.muted,
+            marker: theme.muted,
+        });
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
     );
+    // Pointer input reuses exactly the component items and resolved layout that painted.
+    app.navigation_pointer_state = state.into_inner();
+    app.navigation_layout = Some(layout);
+    app.navigation_items = viewport_items;
+    app.navigation_visible_rows = viewport_rows;
 }
 
 fn render_review_summary(
@@ -959,7 +735,7 @@ fn render_threads(
     if area.is_empty() {
         return;
     }
-    render_thread_toolbar(app, area, frame);
+    render_thread_toolbar(app, area, frame, theme);
     let threads = app.visible_thread_summaries();
     let detail_height = if threads.is_empty() {
         0
@@ -1139,7 +915,7 @@ fn suggestion_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary
 }
 
 fn render_thread_detail(
-    app: &mut ReviewApp,
+    app: &ReviewApp,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     threads: &[crate::code_review_tui::ReviewThreadSummary],
@@ -1171,30 +947,18 @@ fn render_thread_detail(
             theme.diff.hunk.patch(theme.overlay),
         )]),
     );
-    let actions = [
-        ("Reply", ReviewMouseAction::ReplyThread),
-        (
-            if thread.resolved { "Reopen" } else { "Resolve" },
-            ReviewMouseAction::ToggleThreadResolved,
+    paint_review_controls(
+        app,
+        ControlSurface::Actions(ReviewActionGroup::Thread),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(2),
+            area.width,
+            area.height.saturating_sub(2).min(1),
         ),
-        ("Edit", ReviewMouseAction::EditThread),
-        ("Delete", ReviewMouseAction::DeleteThread),
-        ("Session", ReviewMouseAction::OpenThreadSession),
-        ("Ask", ReviewMouseAction::AskBcode),
-    ];
-    let mut x = area.x;
-    let action_y = area.y.saturating_add(2);
-    for (label, action) in actions {
-        x = render_header_button(
-            app,
-            frame,
-            x,
-            action_y,
-            label,
-            action,
-            ReviewTheme::default().control(false),
-        );
-    }
+        frame,
+        theme,
+    );
     let body = thread.latest_body.lines().next().unwrap_or_default();
     let mut detail_lines = Vec::new();
     if let Some(agent_state) = app.agent_state_for_anchor(&thread.anchor) {
@@ -1241,100 +1005,19 @@ fn render_thread_detail(
     }
 }
 
-fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
-    let mut x = area.x;
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "All",
-        ReviewMouseAction::ThreadFilter(ReviewThreadFilter::All),
-        ReviewTheme::default().control(app.thread_filter == ReviewThreadFilter::All),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Open",
-        ReviewMouseAction::ThreadFilter(ReviewThreadFilter::Open),
-        ReviewTheme::default().control(app.thread_filter == ReviewThreadFilter::Open),
-    );
-    x = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "Resolved",
-        ReviewMouseAction::ThreadFilter(ReviewThreadFilter::Resolved),
-        ReviewTheme::default().control(app.thread_filter == ReviewThreadFilter::Resolved),
-    );
-    let _ = render_header_button(
-        app,
-        frame,
-        x,
-        area.y,
-        "+Review",
-        ReviewMouseAction::NewReviewComment,
-        ReviewTheme::default().control(false),
-    );
-}
-
-#[derive(Clone, Copy)]
-struct FileRowState<'a> {
-    source_label: Option<&'a str>,
-    selected: bool,
-    viewed: bool,
-    draft_comments: usize,
-    open_threads: usize,
-}
-
-fn render_file_row(
-    file: &ReviewFile,
-    state: FileRowState<'_>,
+fn render_thread_toolbar(
+    app: &ReviewApp,
     area: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
-    let FileRowState {
-        source_label,
-        selected,
-        viewed,
-        draft_comments,
-        open_threads,
-    } = state;
-    let style = if selected {
-        theme.selection
-    } else if viewed {
-        theme.muted.patch(theme.overlay)
-    } else {
-        theme.overlay
-    };
-    let status_style = match file.status.label() {
-        "A" => theme.diff.added.patch(style),
-        "D" => theme.diff.removed.patch(style),
-        "R" => theme.diff.hunk.patch(style),
-        _ => theme.focused.patch(style),
-    };
-    let counts = file_row_counts(file, draft_comments, open_threads);
-    let source = source_label.map_or_else(String::new, |label| format!(" [{label}]"));
-    let viewed_marker = if viewed { "✓ " } else { "  " };
-    let path_width = usize::from(area.width)
-        .saturating_sub(counts.len())
-        .saturating_sub(source.len())
-        .saturating_sub(5);
-    let path = truncate_to_display_width(file.display_path(), path_width);
-    let line = Line::from_spans(vec![
-        Span::raw(" "),
-        Span::styled(viewed_marker, style),
-        Span::styled(file.status.label(), status_style),
-        Span::raw(" "),
-        Span::styled(source, theme.muted.patch(style)),
-        Span::styled(path, style),
-        Span::styled(counts, theme.muted.patch(style)),
-    ]);
-    frame.write_line_with_fallback_style(LocalRect::terminal(area), &line, style);
+    paint_review_controls(
+        app,
+        ControlSurface::Actions(ReviewActionGroup::Filters),
+        area,
+        frame,
+        theme,
+    );
 }
 
 fn file_row_counts(file: &ReviewFile, draft_comments: usize, open_threads: usize) -> String {
@@ -3068,67 +2751,35 @@ fn render_comment_editor_header(
 }
 
 fn render_comment_editor_footer(
-    app: &mut ReviewApp,
+    app: &ReviewApp,
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
     frame: &mut PaintCx<'_, '_>,
     theme: ReviewTheme,
 ) {
-    let footer = comment_editor_footer(editor);
-    frame.write_line(
-        LocalRect::terminal(Rect::new(
+    let group = if matches!(
+        editor.mode,
+        crate::code_review_tui::ReviewCommentEditorMode::Create
+    ) {
+        ReviewActionGroup::CreateComment
+    } else {
+        ReviewActionGroup::EditComment
+    };
+    app.controls
+        .lock()
+        .expect("review controls lock")
+        .sync_comment_action(group, editor.action);
+    paint_review_controls(
+        app,
+        ControlSurface::Actions(group),
+        Rect::new(
             popup.x.saturating_add(1),
             popup.bottom().saturating_sub(1),
             popup.width.saturating_sub(2),
-            1,
-        )),
-        &Line::from_spans(vec![Span::styled(
-            truncate_to_display_width(&footer, usize::from(popup.width.saturating_sub(2))),
-            theme.diff.hunk.patch(theme.overlay),
-        )]),
-    );
-    let visible_footer =
-        truncate_to_display_width(&footer, usize::from(popup.width.saturating_sub(2)));
-    let footer_area = Rect::new(
-        popup.x.saturating_add(1),
-        popup.bottom().saturating_sub(1),
-        popup.width.saturating_sub(2),
-        1,
-    );
-    let creating = matches!(
-        editor.mode,
-        crate::code_review_tui::ReviewCommentEditorMode::Create
-    );
-    if creating {
-        for (label, action) in [
-            (
-                "save draft",
-                crate::code_review_tui::ReviewCommentAction::SaveDraft,
-            ),
-            (
-                "ask Bcode",
-                crate::code_review_tui::ReviewCommentAction::AskBcode,
-            ),
-            (
-                "publish",
-                crate::code_review_tui::ReviewCommentAction::Publish,
-            ),
-        ] {
-            register_footer_action(
-                app,
-                &visible_footer,
-                footer_area,
-                label,
-                crate::code_review_tui::ReviewMouseAction::CommentAction(action),
-            );
-        }
-    }
-    register_footer_action(
-        app,
-        &visible_footer,
-        footer_area,
-        "cancel",
-        crate::code_review_tui::ReviewMouseAction::CancelComment,
+            u16::from(popup.height > 0),
+        ),
+        frame,
+        theme,
     );
 }
 
@@ -3146,64 +2797,6 @@ fn comment_editor_y(app: &ReviewApp, area: Rect, height: u16) -> u16 {
         .saturating_add(1);
     let max_y = area.bottom().saturating_sub(height);
     anchor_y.min(max_y).max(area.y)
-}
-
-fn register_footer_action(
-    app: &mut ReviewApp,
-    visible: &str,
-    area: Rect,
-    label: &'static str,
-    action: crate::code_review_tui::ReviewMouseAction,
-) {
-    let Some(offset) = visible.find(label) else {
-        return;
-    };
-    let x = bmux_tui::text_width::display_width(&visible[..offset]);
-    let width = bmux_tui::text_width::display_width(label);
-    app.register_mouse_region(
-        Rect::new(
-            area.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
-            area.y,
-            u16::try_from(width).unwrap_or(u16::MAX),
-            1,
-        ),
-        action,
-        label,
-    );
-}
-
-fn comment_editor_footer(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
-    let actions = if matches!(
-        editor.mode,
-        crate::code_review_tui::ReviewCommentEditorMode::Create
-    ) {
-        [
-            crate::code_review_tui::ReviewCommentAction::SaveDraft,
-            crate::code_review_tui::ReviewCommentAction::AskBcode,
-            crate::code_review_tui::ReviewCommentAction::Publish,
-        ]
-        .into_iter()
-        .map(|action| {
-            let label = match action {
-                crate::code_review_tui::ReviewCommentAction::SaveDraft => "save draft",
-                crate::code_review_tui::ReviewCommentAction::AskBcode => "ask Bcode",
-                crate::code_review_tui::ReviewCommentAction::Publish => "publish",
-            };
-            if action == editor.action {
-                format!("[{label}]")
-            } else {
-                label.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" / ")
-    } else {
-        "save edit".to_owned()
-    };
-    format!(
-        "{actions} / cancel  {}",
-        crate::keybindings::hints().unwrap_or_default().join("  ")
-    )
 }
 
 fn render_comment_editor_body(
@@ -3622,6 +3215,7 @@ struct RenderedRow {
 mod tests {
     use crate::code_review_tui::ReviewFileStatus;
     use bmux_tui::buffer::Buffer;
+    use bmux_tui::text_width::display_width;
 
     use super::*;
 
@@ -3645,23 +3239,298 @@ mod tests {
     }
 
     #[test]
-    fn footer_hits_follow_visible_labels_and_exclude_truncated_actions() {
+    fn navigation_narrow_sidebar_prioritizes_filename_over_source_metadata() {
+        let mut review = crate::code_review_tui::tests::sample_app().review;
+        review.files.truncate(1);
+        review.files[0].new_path = Some("src/scroll_anchor.rs".to_string());
+        let mut workspace = review.workspace();
+        workspace.sources[0].label = "Staged changes".to_string();
+        let source_id = workspace.sources[0].id.clone();
+        let expected_identity = format!("surface:{source_id}:staged-scroll");
+        review.surfaces = vec![bcode_code_review_models::ReviewSurface {
+            id: "staged-scroll".to_string(),
+            source_id,
+            path: "src/scroll_anchor.rs".to_string(),
+            kind: ReviewSurfaceKind::Diff,
+            file: None,
+        }];
+        review.workspace = Some(workspace);
+        let mut app = ReviewApp::new(review);
+        for width in [28, 34, 80] {
+            let area = Rect::new(0, 0, width, 3);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            render_files(
+                &mut app,
+                area,
+                &mut PaintCx::new(&mut frame),
+                ReviewTheme::default(),
+            );
+            let filename_row = buffer.row_symbols(1).unwrap();
+            assert!(
+                filename_row.contains("scroll_anchor.rs"),
+                "filename must remain useful at sidebar width {width}: {filename_row}"
+            );
+            if width == 80 {
+                assert!(filename_row.contains("[Staged changes]"));
+                assert!(
+                    filename_row.find("scroll_anchor.rs").unwrap()
+                        < filename_row.find("[Staged changes]").unwrap()
+                );
+            }
+            assert_eq!(
+                app.selected_file_path().as_deref(),
+                Some("src/scroll_anchor.rs")
+            );
+            assert_eq!(app.navigation_items[1].id, expected_identity);
+        }
+        let text = render_app_text(&mut app, 112, 30);
+        assert!(
+            text.contains("src/scroll_anchor.rs"),
+            "selected path remains available outside the clipped sidebar"
+        );
+    }
+
+    #[test]
+    fn navigation_nested_boundary_expansion_keeps_native_markers_and_scroll_current() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut review = crate::code_review_tui::tests::sample_app().review;
+        let template = review.files[0].clone();
+        review.files = (0..512)
+            .map(|index| {
+                let mut file = template.clone();
+                file.new_path = Some(format!("dir-{index:04}/nested/界-e\u{301}.rs"));
+                file
+            })
+            .collect();
+        let mut app = ReviewApp::new(review);
+        for index in 0..512 {
+            let root = std::path::PathBuf::from(format!("dir-{index:04}"));
+            if index != 0 {
+                app.toggle_file_tree_directory(&root);
+                app.toggle_file_tree_directory(&root.join("nested"));
+            }
+        }
+        let target = std::path::PathBuf::from("dir-0256/nested");
+        let target_row = app
+            .file_tree_rows()
+            .iter()
+            .position(|row| {
+                matches!(row,
+            crate::code_review_tui::ReviewFileTreeRow::Directory { path, .. } if path == &target)
+            })
+            .unwrap();
+        let area = Rect::new(2, 1, 36, 2);
+        app.set_file_area(Some(area));
+        app.tree_scroll = target_row - 1;
+        let paint = |app: &mut ReviewApp| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 6));
+            let mut frame = Frame::new(&mut buffer);
+            render_files(
+                app,
+                area,
+                &mut PaintCx::new(&mut frame),
+                ReviewTheme::default(),
+            );
+            assert!(
+                frame
+                    .hits()
+                    .regions()
+                    .iter()
+                    .all(|hit| hit.area.bottom() <= area.bottom())
+            );
+            buffer.row_symbols(area.y + 1).unwrap()
+        };
+        assert!(paint(&mut app).contains('▾'));
+        let before_items = app.navigation_items.clone();
+        let target_position = Point::new(area.x, area.y + 1);
+        app.handle_navigation_pointer(MouseEvent::new(MouseEventKind::Move, target_position));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_navigation_pointer(MouseEvent::new(kind, target_position));
+        }
+        assert!(paint(&mut app).contains('▸'));
+        assert_eq!(
+            app.navigation_items, before_items,
+            "children changed only below viewport"
+        );
+        assert_eq!(app.tree_scroll, target_row - 1);
+        assert!(
+            !app.navigation_pointer_state
+                .is_expanded("directory:dir-0256/nested")
+        );
+        let cached_model = app.navigation_items();
+        let cached_visible = app.navigation_visible_indices(&cached_model.0);
+        for _ in 0..4 {
+            assert!(paint(&mut app).contains('▸'));
+            assert!(std::sync::Arc::ptr_eq(
+                &cached_visible,
+                &app.navigation_visible_indices(&cached_model.0)
+            ));
+            assert!(
+                app.navigation_pointer_state.expanded_ids().len() <= 2,
+                "viewport state must not contain all expanded directories"
+            );
+        }
+        assert!(app.expand_selected_tree_row());
+        assert!(paint(&mut app).contains('▾'));
+        assert_eq!(app.tree_scroll, target_row - 1);
+        assert!(app.select_next_tree_row(1));
+        assert_eq!(app.tree_scroll, target_row);
+        paint(&mut app);
+        assert!(matches!(
+            app.navigation_visible_rows.last(),
+            Some(crate::code_review_tui::ReviewFileTreeRow::File { index: 256, .. })
+        ));
+        assert!(app.collapse_selected_tree_row());
+        paint(&mut app);
+        assert_eq!(app.selected_tree_row, target_row);
+        assert!(app.navigation_items.len() <= usize::from(area.height));
+    }
+
+    #[test]
+    fn navigation_viewport_beyond_terminal_row_range_remains_bounded() {
+        let mut review = crate::code_review_tui::tests::sample_app().review;
+        review.files.clear();
+        review.surfaces = (0..70_000)
+            .map(|index| bcode_code_review_models::ReviewSurface {
+                id: format!("surface-{index}"),
+                source_id: "source-1".to_string(),
+                path: format!("file-{index:05}.rs"),
+                kind: ReviewSurfaceKind::File,
+                file: None,
+            })
+            .collect();
+        let mut app = ReviewApp::new(review);
+        app.tree_scroll = 68_000;
+        let area = Rect::new(0, 0, 24, 2);
+        app.set_file_area(Some(area));
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render_files(
+            &mut app,
+            area,
+            &mut PaintCx::new(&mut frame),
+            ReviewTheme::default(),
+        );
+        assert_eq!(app.tree_scroll, 68_000);
+        assert_eq!(app.navigation_items.len(), 2);
+        assert_eq!(
+            app.navigation_visible_rows[0],
+            crate::code_review_tui::ReviewFileTreeRow::File {
+                index: 68_000,
+                depth: 0
+            }
+        );
+        assert!(frame.hits().regions().len() <= 3);
+    }
+
+    #[test]
+    fn navigation_tiny_unicode_resize_pointer_and_wheel_are_pane_local() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut review = crate::code_review_tui::tests::sample_app().review;
+        let template = review.files[0].clone();
+        review.files = (0..100)
+            .map(|index| {
+                let mut file = template.clone();
+                file.new_path = Some(format!("界/👩‍💻/e\u{301}-{index:03}.rs"));
+                file
+            })
+            .collect();
+        let mut app = ReviewApp::new(review);
+        app.expand_selected_file_dirs();
+        for width in [0, 1, 2, 3, 9, 40, 2, 40] {
+            let area = Rect::new(1, 1, width, 3);
+            app.set_file_area(Some(area));
+            app.set_diff_area(Rect::new(45, 1, 40, 8));
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 12));
+            let mut frame = Frame::new(&mut buffer);
+            render_files(
+                &mut app,
+                area,
+                &mut PaintCx::new(&mut frame),
+                ReviewTheme::default(),
+            );
+            assert!(frame.hits().regions().iter().all(|hit| hit.area.x >= area.x
+                && hit.area.right() <= area.right()
+                && hit.area.y >= area.y
+                && hit.area.bottom() <= area.bottom()));
+        }
+        let diff_scroll = app.diff_scroll;
+        assert!(app.scroll_files_down(20));
+        let scroll = app.tree_scroll;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 90, 12));
+        let mut frame = Frame::new(&mut buffer);
+        let area = Rect::new(1, 1, 40, 3);
+        render_files(
+            &mut app,
+            area,
+            &mut PaintCx::new(&mut frame),
+            ReviewTheme::default(),
+        );
+        assert_eq!(
+            app.tree_scroll, scroll,
+            "paint must not undo independent wheel scrolling"
+        );
+        assert_eq!(app.diff_scroll, diff_scroll);
+        assert!(app.navigation_items.len() <= 3);
+        let target = app.navigation_visible_rows[0].clone();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_navigation_pointer(MouseEvent::new(kind, Point::new(area.x, area.y)));
+        }
+        if let crate::code_review_tui::ReviewFileTreeRow::File { index, .. } = target {
+            assert_eq!(app.selected_file, index);
+        } else {
+            panic!("scrolled viewport should start with a file");
+        }
+    }
+
+    #[test]
+    fn painted_controls_are_live_and_app_stays_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ReviewApp>();
         let mut app = crate::code_review_tui::tests::sample_app();
-        let action = crate::code_review_tui::ReviewMouseAction::CancelComment;
-        let area = Rect::new(3, 4, 40, 1);
-        register_footer_action(&mut app, "界 help  cancel", area, "cancel", action);
-        assert_eq!(app.mouse_action_at(12, 4), Some(action));
-        assert_eq!(app.mouse_action_at(3, 4), None);
-        app.clear_mouse_regions();
-        register_footer_action(&mut app, "help  can…", area, "cancel", action);
-        assert_eq!(app.mouse_action_at(9, 4), None);
-        app.register_mouse_region(Rect::new(0, 0, 20, 20), action, "cancel");
-        app.confine_mouse_regions(Rect::new(3, 4, 2, 1));
-        assert_eq!(app.mouse_action_at(3, 4), Some(action));
-        assert_eq!(app.mouse_action_at(5, 4), None);
-        assert_eq!(app.mouse_action_at(3, 5), None);
+        app.sidebar_mode = ReviewSidebarMode::Included;
+        render_app_text(&mut app, 140, 40);
+        let routed = app
+            .controls
+            .lock()
+            .expect("controls")
+            .route(&bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab),
+            ));
+        assert_eq!(routed, Some((true, None)));
+        let routed = app
+            .controls
+            .lock()
+            .expect("controls")
+            .route(&bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Right),
+            ));
+        assert_eq!(
+            routed.and_then(|(_, action)| action),
+            Some(ReviewMouseAction::SidebarMode(
+                ReviewSidebarMode::Repository
+            ))
+        );
         render_app_text(&mut app, 0, 0);
-        assert_eq!(app.mouse_action_at(3, 4), None);
+        assert_eq!(
+            app.controls
+                .lock()
+                .expect("controls")
+                .route(&bmux_tui::event::Event::Mouse(
+                    bmux_tui::event::MouseEvent::new(
+                        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                        Point::new(1, 1)
+                    )
+                )),
+            None
+        );
     }
 
     #[test]
@@ -3825,9 +3694,60 @@ mod tests {
         assert!(app.open_comment_editor());
         app.comment_editor.as_mut().expect("composer").action =
             crate::code_review_tui::ReviewCommentAction::AskBcode;
-        let composer = render_app_text(&mut app, 180, 42);
-        assert!(composer.contains("ask Bcode"));
-        assert!(composer.contains("[ask Bcode]"));
+        assert_painted_composer_ask(&mut app);
+    }
+
+    fn assert_painted_composer_ask(app: &mut ReviewApp) {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 42));
+        let mut frame = Frame::new(&mut buffer);
+        render(app, &mut PaintCx::new(&mut frame), None);
+        let ask = frame
+            .hits()
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "review.actions.3.1")
+            .expect("visible Ask Bcode button");
+        assert!(ask.enabled && ask.pointer_events && !ask.area.is_empty());
+        let point = Point::new(ask.area.x, ask.area.y);
+        for kind in [
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            let routed =
+                app.controls
+                    .lock()
+                    .expect("controls")
+                    .route(&bmux_tui::event::Event::Mouse(
+                        bmux_tui::event::MouseEvent::new(kind, point),
+                    ));
+            if matches!(kind, bmux_tui::event::MouseEventKind::Up(_)) {
+                assert_eq!(
+                    routed.and_then(|(_, action)| action),
+                    Some(ReviewMouseAction::CommentAction(
+                        crate::code_review_tui::ReviewCommentAction::AskBcode
+                    ))
+                );
+            }
+        }
+        let composer = (0..buffer.area().height)
+            .filter_map(|row| buffer.row_symbols(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            composer.contains("ask Bcode"),
+            "selected submit action stays explicit in the title"
+        );
+        for label in [
+            "[ Save draft ]",
+            "[ Ask Bcode ]",
+            "[ Publish ]",
+            "[ Cancel ]",
+        ] {
+            assert!(
+                composer.contains(label),
+                "missing usable composer control {label}"
+            );
+        }
     }
 
     #[test]
@@ -3881,7 +3801,7 @@ mod tests {
     }
 
     #[test]
-    fn common_composer_title_and_footer_make_each_submit_action_explicit() {
+    fn common_composer_title_makes_each_submit_action_explicit() {
         let anchor = crate::code_review_tui::ReviewCommentAnchor {
             file_index: 0,
             path: "src/lib.rs".to_string(),
@@ -3914,7 +3834,6 @@ mod tests {
         ] {
             let editor = crate::code_review_tui::ReviewCommentEditor::new(anchor.clone(), action);
             assert!(comment_editor_title(&editor).contains(label));
-            assert!(comment_editor_footer(&editor).contains(&format!("[{label}]")));
         }
     }
 

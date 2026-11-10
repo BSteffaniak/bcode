@@ -1526,7 +1526,10 @@ impl ChatLoopState {
             launch,
             std::sync::Arc::clone(&surface.active_tasks),
         );
-        let Some(active) = surface.surface.as_mut() else {
+        if surface.surface.is_none()
+            || !surface.deferred_input.is_empty()
+            || surface.close_after_drain
+        {
             if let Event::Key(key) = event
                 && (key.key == bmux_keyboard::KeyCode::Escape
                     || (key.key == bmux_keyboard::KeyCode::Char('c') && key.modifiers.ctrl))
@@ -1534,10 +1537,14 @@ impl ChatLoopState {
                 surface.close_after_drain = true;
                 surface.deferred_input.clear();
                 surface.invalidation.request();
-            } else if !surface.close_after_drain && matches!(event, Event::Key(_) | Event::Paste(_))
-            {
+            } else if !surface.close_after_drain {
                 if surface.deferred_input.len() < 32 {
+                    // Mouse press/drag/release and resize are ordered input too.
+                    // Keep later input behind the queued tail even once ownership returns.
                     surface.deferred_input.push_back(event.clone());
+                    if surface.surface.is_some() {
+                        surface.invalidation.request();
+                    }
                 } else {
                     // Fail closed instead of silently losing a reliable input or replaying it.
                     surface.close_after_drain = true;
@@ -1545,17 +1552,25 @@ impl ChatLoopState {
                     surface.invalidation.request();
                 }
             }
-            return Some(bcode_plugin_sdk::tui::PluginTuiEventResult::from_legacy(
-                bcode_plugin_sdk::tui::PluginTuiAction::Redraw,
-            ));
-        };
-        surface.effects_pending = true;
-        surface.invalidation.request();
-        Some(super::plugin_surface_host::compose_surface_input(
-            active.as_mut(),
-            event,
-            &host,
-        ))
+            // Completion of the in-flight drain (or queued-tail replay) wakes
+            // the runtime. Admission itself does not change the visible scene.
+            return Some(bcode_plugin_sdk::tui::PluginTuiEventResult::consumed());
+        }
+        let active = surface
+            .surface
+            .as_mut()
+            .expect("exclusive surface available");
+        let result =
+            super::plugin_surface_host::compose_surface_input(active.as_mut(), event, &host);
+        if result.outcome != bmux_tui::event::EventOutcome::Ignored
+            || !matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None)
+        {
+            // Accepted input may have queued effects, independently of redraw.
+            // Ignored input must not manufacture a drain and its completion frame.
+            surface.effects_pending = true;
+            surface.invalidation.request();
+        }
+        Some(result)
     }
 
     pub fn root_plugin_surface_invalidation(&self) -> Option<bmux_tui_runtime::InvalidationSignal> {
@@ -1607,12 +1622,23 @@ impl ChatLoopState {
             bcode_plugin_sdk::tui::PluginTuiAction::None
         } else if let Some(active) = surface.surface.as_mut() {
             let action = if let Some(event) = surface.deferred_input.pop_front() {
-                surface.effects_pending = true;
-                let action = active.handle_event(&event, &host);
+                let result = super::plugin_surface_host::compose_surface_input(
+                    active.as_mut(),
+                    &event,
+                    &host,
+                );
+                surface.effects_pending |= result.outcome != bmux_tui::event::EventOutcome::Ignored
+                    || !matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None);
                 if !surface.deferred_input.is_empty() {
                     surface.invalidation.request();
                 }
-                action
+                if result.outcome == bmux_tui::event::EventOutcome::Redraw
+                    && matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None)
+                {
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                } else {
+                    result.action
+                }
             } else {
                 active.poll(&host)
             };
@@ -8840,6 +8866,238 @@ mod scheduler_tests {
             _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
         ) -> bcode_plugin_sdk::tui::PluginTuiAction {
             bcode_plugin_sdk::tui::PluginTuiAction::None
+        }
+    }
+
+    struct OrderedSurface {
+        delivered: std::sync::Arc<std::sync::Mutex<Vec<Event>>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for OrderedSurface {
+        fn id(&self) -> &'static str {
+            "ordered-pointer"
+        }
+        fn title(&self) -> &'static str {
+            "Ordered pointer"
+        }
+        fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {}
+        fn handle_event(
+            &mut self,
+            _event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            panic!("focused input must not bypass composition during replay")
+        }
+        fn focused_text_field_event(
+            &mut self,
+            event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiEventResult {
+            use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiEventResult};
+            use bmux_tui::event::{EventOutcome, MouseEventKind};
+
+            self.delivered.lock().unwrap().push(event.clone());
+            PluginTuiEventResult {
+                outcome: if matches!(event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)))
+                {
+                    EventOutcome::Redraw
+                } else {
+                    EventOutcome::Handled
+                },
+                action: PluginTuiAction::None,
+            }
+        }
+        fn drain_effects<'a>(
+            &'a mut self,
+            _host: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bcode_plugin_sdk::tui::PluginTuiAction>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let has_input = !self.delivered.lock().unwrap().is_empty();
+                if has_input && let Some(release) = self.release.take() {
+                    release.await.expect("release pointer drain");
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn root_plugin_click_and_drag_input_survives_exclusive_drain_in_order() {
+        use bmux_tui::event::{EventOutcome, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::Point;
+
+        for drag in [false, true] {
+            let mut state = loop_state();
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+            let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (release, receiver) = tokio::sync::oneshot::channel();
+            state.queue_root_plugin_surface(
+                "test",
+                Box::new(OrderedSurface {
+                    delivered: delivered.clone(),
+                    release: Some(receiver),
+                }),
+            );
+            // Settle opening before delivering the press.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let _ = state.poll_root_plugin_surface(&client, launch.clone());
+                    let surface = state.plugin_surface.as_ref().unwrap();
+                    if !surface.effects_pending && surface.drain_task.is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("opening settles");
+            let pointer = |kind, x| Event::Mouse(MouseEvent::new(kind, Point::new(x, 4)));
+            let mut expected = vec![pointer(MouseEventKind::Down(MouseButton::Left), 10)];
+            state
+                .handle_root_plugin_surface_event(&expected[0], &client, launch.clone())
+                .unwrap();
+            let _ = state.poll_root_plugin_surface(&client, launch.clone());
+            assert!(state.plugin_surface.as_ref().unwrap().surface.is_none());
+            if drag {
+                expected.push(pointer(MouseEventKind::Drag(MouseButton::Left), 12));
+                expected.push(pointer(MouseEventKind::Drag(MouseButton::Left), 14));
+            }
+            expected.push(pointer(
+                MouseEventKind::Up(MouseButton::Left),
+                if drag { 14 } else { 10 },
+            ));
+            for event in &expected[1..] {
+                assert_eq!(
+                    state
+                        .handle_root_plugin_surface_event(event, &client, launch.clone())
+                        .unwrap()
+                        .outcome,
+                    EventOutcome::Handled
+                );
+            }
+            assert_eq!(*delivered.lock().unwrap(), expected[..1]);
+            assert_eq!(
+                state.plugin_surface.as_ref().unwrap().deferred_input.len(),
+                expected.len() - 1,
+                "release/drag must be retained while exclusive drain owns the surface"
+            );
+            release.send(()).unwrap();
+            // Stop precisely when ownership returns, before queued-tail replay.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.plugin_surface.as_ref().unwrap().surface.is_none() {
+                    let _ = state.poll_root_plugin_surface(&client, launch.clone());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("pointer drain settles");
+            expected.push(Event::Paste("after gesture".into()));
+            state
+                .handle_root_plugin_surface_event(expected.last().unwrap(), &client, launch.clone())
+                .unwrap();
+            assert_eq!(
+                *delivered.lock().unwrap(),
+                expected[..1],
+                "new input must not overtake queued release"
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let _ = state.poll_root_plugin_surface(&client, launch.clone());
+                    let surface = state.plugin_surface.as_ref().unwrap();
+                    if surface.deferred_input.is_empty()
+                        && surface.drain_task.is_none()
+                        && !surface.effects_pending
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ordered replay settles");
+            assert_eq!(
+                *delivered.lock().unwrap(),
+                expected,
+                "every gesture event is delivered exactly once in order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ignored_root_plugin_pointer_events_do_not_schedule_presentations_or_drains() {
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        state.queue_root_plugin_surface("test", Box::new(PassiveSurface));
+        let signal = state.root_plugin_surface_invalidation().unwrap();
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        assert!(state.plugin_surface.as_ref().unwrap().surface.is_none());
+        // While exclusive ownership is in the drain, pointer input is
+        // deferred without asking the root for another frame.
+        let busy = state
+            .handle_root_plugin_surface_event(
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::Move,
+                    bmux_tui::geometry::Point::new(3, 2),
+                )),
+                &client,
+                launch.clone(),
+            )
+            .unwrap();
+        assert_eq!(busy.outcome, bmux_tui::event::EventOutcome::Handled);
+        assert!(matches!(
+            busy.action,
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        ));
+        // Settle the opening drain first; only subsequent ignored input is under test.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let _ = state.poll_root_plugin_surface(&client, launch.clone());
+                let surface = state.plugin_surface.as_ref().unwrap();
+                if !surface.effects_pending
+                    && surface.drain_task.is_none()
+                    && surface.deferred_input.is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("opening drain settles");
+        let _ = signal.take();
+        for kind in [
+            bmux_tui::event::MouseEventKind::Move,
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            let event = Event::Mouse(bmux_tui::event::MouseEvent::new(
+                kind,
+                bmux_tui::geometry::Point::new(3, 2),
+            ));
+            let result = state
+                .handle_root_plugin_surface_event(&event, &client, launch.clone())
+                .unwrap();
+            assert_eq!(result.outcome, bmux_tui::event::EventOutcome::Ignored);
+            assert!(!signal.take());
+            assert!(matches!(
+                state.poll_root_plugin_surface(&client, launch.clone()),
+                Some(bcode_plugin_sdk::tui::PluginTuiAction::None)
+            ));
+            let surface = state.plugin_surface.as_ref().unwrap();
+            assert!(!surface.effects_pending);
+            assert!(surface.drain_task.is_none());
+            assert!(surface.surface.is_some());
+            assert!(!signal.take());
         }
     }
 
