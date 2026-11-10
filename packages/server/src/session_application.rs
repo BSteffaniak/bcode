@@ -1343,7 +1343,7 @@ fn configuration_admission_failure(
     error: crate::harness::ManagedHarnessError,
 ) -> SessionApplicationFailure {
     use crate::harness::ManagedHarnessError;
-    tracing::warn!(target: "bcode_server::harness", %error, "session configuration admission failed");
+    tracing::warn!(target: crate::harness::configuration_views::ADMISSION_TARGET, %error, "session configuration admission failed");
     let message = match error {
         ManagedHarnessError::Conflict => {
             "session configuration admission failed: client configuration does not match \

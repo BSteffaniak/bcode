@@ -78,7 +78,7 @@ impl ConfigurationViews {
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.views.get(&digest) {
             if existing.runtime_generation() != view.runtime_generation() {
-                tracing::warn!(target: "bcode_server::harness",
+                tracing::warn!(target: ADMISSION_TARGET, reason = "plugin_runtime_generation_changed",
                     "retained configuration view belongs to another plugin runtime generation");
                 return Err(ManagedHarnessError::Conflict);
             }
@@ -90,7 +90,7 @@ impl ConfigurationViews {
             inner.views.retain(|_, view| !view.is_sole_handle());
         }
         if inner.views.len() >= MAX_VIEWS {
-            tracing::warn!(target: "bcode_server::harness", limit = MAX_VIEWS,
+            tracing::warn!(target: ADMISSION_TARGET, reason = "view_capacity_exhausted", limit = MAX_VIEWS,
                 "configuration view capacity exhausted by views still in use");
             return Err(ManagedHarnessError::Unavailable);
         }
@@ -231,10 +231,11 @@ pub async fn for_client(
     state: &Arc<crate::ServerState>,
     client_id: ClientId,
 ) -> Result<PluginServiceConfigView, ManagedHarnessError> {
-    let view =
-        super::registrations::effective(declarative_for_client(state, client_id).await?).await?;
+    let view = super::registrations::effective(declarative_for_client(state, client_id).await?)
+        .await
+        .map_err(|error| rejected("native_registration_resolution_failed", error))?;
     let encoded = serde_json::to_vec(&view.configuration_values())
-        .map_err(|_| ManagedHarnessError::Invalid)?;
+        .map_err(|_| rejected("service_view_unserializable", ManagedHarnessError::Invalid))?;
     let digest = sha2::Sha256::digest(encoded)
         .iter()
         .fold(String::new(), |mut text, byte| {
@@ -255,7 +256,12 @@ fn verify_startup_sources(
             .config_launch
             .as_ref()
             .and_then(|launch| launch.recovery_sources.as_ref())
-            .ok_or(ManagedHarnessError::Invalid)?;
+            .ok_or_else(|| {
+                rejected(
+                    "client_launch_sources_missing",
+                    ManagedHarnessError::Invalid,
+                )
+            })?;
         authority
             .verify_workspace(supplied, sources)
             .map_err(source_mismatch)?;
@@ -263,14 +269,97 @@ fn verify_startup_sources(
     Ok(())
 }
 
+/// Secret-free diagnostics target for client configuration admission; enabled at warn by
+/// default for background daemons.
+pub const ADMISSION_TARGET: &str = "bcode_server::config_admission";
+
+/// Record which admission check rejected a client configuration. Reasons are fixed
+/// identifiers; configuration contents, paths and values are never logged.
+pub(super) fn rejected(reason: &'static str, error: ManagedHarnessError) -> ManagedHarnessError {
+    tracing::warn!(target: ADMISSION_TARGET, reason, category = %error,
+        "client configuration admission rejected");
+    error
+}
+
 /// Record why supplied configuration was not reproduced from its verified sources.
 /// Recovery errors are secret-free by contract; configuration contents are never logged.
 pub(super) fn source_mismatch(
     error: bcode_config::recovery::ConfigRecoveryError,
 ) -> ManagedHarnessError {
-    tracing::warn!(target: "bcode_server::harness", %error,
+    tracing::warn!(target: ADMISSION_TARGET, reason = "source_verification_failed", %error,
         "client configuration was not reproduced from daemon-verified sources");
     ManagedHarnessError::Conflict
+}
+
+fn same_declarative_config(
+    supplied: &bcode_config::BcodeConfig,
+    startup: &bcode_config::BcodeConfig,
+) -> Result<bool, ManagedHarnessError> {
+    let encode = |config| {
+        serde_json::to_value(config)
+            .map_err(|_| rejected("client_config_unserializable", ManagedHarnessError::Invalid))
+    };
+    Ok(encode(supplied)? == encode(startup)?)
+}
+
+/// Launch provenance records the raw process directory while runtime contexts carry the
+/// canonical one; both name the same directory when they canonicalize equally.
+fn same_directory(launch: &std::path::Path, working: &std::path::Path) -> bool {
+    launch == working
+        || launch.canonicalize().is_ok_and(|launch| {
+            working
+                .canonicalize()
+                .is_ok_and(|working| launch == working)
+        })
+}
+
+/// Verify a configuration that differs from daemon startup against retained sources.
+fn verify_changed_config(
+    context: &bcode_ipc::ClientRuntimeContext,
+    authority: Option<&bcode_config::recovery::ConfigSourceAuthority>,
+    config: &bcode_config::BcodeConfig,
+) -> Result<(), ManagedHarnessError> {
+    let launch = context
+        .config_launch
+        .as_deref()
+        .ok_or_else(|| rejected("client_launch_missing", ManagedHarnessError::Invalid))?;
+    let sources = launch.recovery_sources.as_ref().ok_or_else(|| {
+        rejected(
+            "client_launch_sources_missing",
+            ManagedHarnessError::Invalid,
+        )
+    })?;
+    // Typed context/profile selections are verifiable sources; only untyped inline or
+    // dynamic layers lack a durable source.
+    if sources.inline_overrides {
+        return Err(rejected(
+            "client_inline_overrides_unverifiable",
+            ManagedHarnessError::Invalid,
+        ));
+    }
+    let cwd = context.working_directory.as_deref().ok_or_else(|| {
+        rejected(
+            "client_working_directory_missing",
+            ManagedHarnessError::Invalid,
+        )
+    })?;
+    if !same_directory(&sources.cwd, cwd) {
+        return Err(rejected(
+            "client_launch_directory_mismatch",
+            ManagedHarnessError::Invalid,
+        ));
+    }
+    // Source authority was captured from the daemon's actual startup loader, before setup
+    // edits. Client cwd is correlation, not read authority.
+    authority
+        .ok_or_else(|| {
+            rejected(
+                "daemon_source_authority_unavailable",
+                ManagedHarnessError::Invalid,
+            )
+        })?
+        .verify_workspace(config, sources)
+        .map_err(source_mismatch)
 }
 
 /// Verify declarative launch inputs without incorporating mutable registration state.
@@ -281,7 +370,12 @@ pub async fn declarative_for_client(
     let context = state
         .client_runtime_context(client_id)
         .await
-        .ok_or(ManagedHarnessError::StaleOwner)?;
+        .ok_or_else(|| {
+            rejected(
+                "client_runtime_context_missing",
+                ManagedHarnessError::StaleOwner,
+            )
+        })?;
     let startup = state.startup_config.clone();
     let durable_root = state.state_root.join("plugins");
     tracing::trace!(target: "bcode_server::harness",
@@ -291,15 +385,18 @@ pub async fn declarative_for_client(
         None if context.config_launch.is_none() => return baseline(state),
         Some(encoded) => {
             let supplied = bcode_config::decode_effective_config(encoded)
-                .map_err(|_| ManagedHarnessError::Invalid)?;
-            if serde_json::to_value(&supplied).map_err(|_| ManagedHarnessError::Invalid)?
-                == serde_json::to_value(&startup).map_err(|_| ManagedHarnessError::Invalid)?
-            {
+                .map_err(|_| rejected("client_config_undecodable", ManagedHarnessError::Invalid))?;
+            if same_declarative_config(&supplied, &startup)? {
                 verify_startup_sources(state, &context, &supplied)?;
                 return baseline(state);
             }
         }
-        None => return Err(ManagedHarnessError::Invalid),
+        None => {
+            return Err(rejected(
+                "client_config_missing_with_launch",
+                ManagedHarnessError::Invalid,
+            ));
+        }
     }
     let selection = state.startup_plugin_selection.clone();
     let defaults = state.default_plugin_ids.clone();
@@ -309,57 +406,39 @@ pub async fn declarative_for_client(
         let config = match context.effective_config_toml.as_deref() {
             None if context.config_launch.is_none() => startup,
             Some(encoded) => {
-                let config = bcode_config::decode_effective_config(encoded)
-                    .map_err(|_| ManagedHarnessError::Invalid)?;
+                let config = bcode_config::decode_effective_config(encoded).map_err(|_| {
+                    rejected("client_config_undecodable", ManagedHarnessError::Invalid)
+                })?;
                 // Exact daemon-start configuration needs no client-directed file reads.
                 // Compare the complete declarative value, not an execution-only digest.
-                if serde_json::to_value(&config).map_err(|_| ManagedHarnessError::Invalid)?
-                    != serde_json::to_value(&startup).map_err(|_| ManagedHarnessError::Invalid)?
-                {
-                    let launch = context
-                        .config_launch
-                        .as_deref()
-                        .ok_or(ManagedHarnessError::Invalid)?;
-                    if launch.inline_overrides {
-                        tracing::warn!(target: "bcode_server::harness",
-                            "client configuration differs from daemon startup through inline \
-                            overrides, which have no verifiable source");
-                        return Err(ManagedHarnessError::Invalid);
-                    }
-                    let sources = launch
-                        .recovery_sources
-                        .as_ref()
-                        .ok_or(ManagedHarnessError::Invalid)?;
-                    let cwd = context
-                        .working_directory
-                        .as_deref()
-                        .ok_or(ManagedHarnessError::Invalid)?;
-                    if sources.cwd != cwd {
-                        return Err(ManagedHarnessError::Invalid);
-                    }
-                    // Source authority was captured from the daemon's actual startup loader,
-                    // before setup edits. Client cwd is correlation, not read authority.
-                    authority
-                        .as_ref()
-                        .ok_or(ManagedHarnessError::Invalid)?
-                        .verify_workspace(&config, sources)
-                        .map_err(source_mismatch)?;
+                if !same_declarative_config(&config, &startup)? {
+                    verify_changed_config(&context, authority.as_ref(), &config)?;
                 }
                 config
             }
-            None => return Err(ManagedHarnessError::Invalid),
+            None => {
+                return Err(rejected(
+                    "client_config_missing_with_launch",
+                    ManagedHarnessError::Invalid,
+                ));
+            }
         };
         let requested = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
         if requested.mode != selection.mode
             || requested.enabled != selection.enabled
             || requested.disabled != selection.disabled
         {
-            tracing::warn!(target: "bcode_server::harness",
-                "client plugin selection differs from the daemon's loaded plugins");
-            return Err(ManagedHarnessError::Conflict);
+            return Err(rejected(
+                "client_plugin_selection_differs",
+                ManagedHarnessError::Conflict,
+            ));
         }
-        let digest = bcode_config::recovery::execution_fingerprint(&config)
-            .map_err(|_| ManagedHarnessError::Invalid)?;
+        let digest = bcode_config::recovery::execution_fingerprint(&config).map_err(|_| {
+            rejected(
+                "client_config_unfingerprintable",
+                ManagedHarnessError::Invalid,
+            )
+        })?;
         let mut configs = bcode_plugin_config::resolve_plugin_configs_for_manifests(
             &config,
             manifests.values(),
@@ -534,6 +613,23 @@ mod tests {
         );
         assert!(for_client(&state, client).await.is_err());
         drop(state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_and_canonical_working_directories_correlate_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let other = dir.path().join("other");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        assert!(same_directory(&link, &canonical));
+        assert!(same_directory(&canonical, &canonical));
+        assert!(!same_directory(&other, &canonical));
+        assert!(!same_directory(&dir.path().join("missing"), &canonical));
     }
 
     #[tokio::test]

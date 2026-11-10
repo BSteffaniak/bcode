@@ -4948,7 +4948,7 @@ fn init_tracing() {
             } else {
                 // Background daemons are otherwise silent. Keep lifecycle diagnostics and
                 // secret-safe workflow start failures available without enabling broad logging.
-                "off,bcode_server::idle_shutdown=info,bcode_server::session_stream=info,bcode_tui::session_stream=info,bcode_server::workflow_start=warn,bcode_workflow_store::run_creation=warn".to_string()
+                "off,bcode_server::idle_shutdown=info,bcode_server::session_stream=info,bcode_tui::session_stream=info,bcode_server::workflow_start=warn,bcode_server::config_admission=warn,bcode_workflow_store::run_creation=warn".to_string()
             }
         });
     let (env_filter, invalid_filter) = match tracing_subscriber::EnvFilter::try_new(filter) {

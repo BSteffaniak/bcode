@@ -18,6 +18,16 @@ use crate::{BcodeConfig, ConfigLoadOverrides};
 pub const CONFIG_RECOVERY_VERSION: u32 = 1;
 const MAX_LAYERS: usize = 64;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Presentation and transport sections excluded from the execution fingerprint. Inline
+/// overrides confined to them cannot change what replay must reproduce.
+const EXECUTION_NEUTRAL_TABLES: [&str; 6] = [
+    "tui",
+    "client",
+    "daemon",
+    "onboarding",
+    "observability",
+    "metrics",
+];
 
 /// Complete load-time source provenance, supplied by the initiating client.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,14 +544,7 @@ pub fn execution_fingerprint(config: &BcodeConfig) -> Result<String, ConfigRecov
     let table = value
         .as_object_mut()
         .ok_or(ConfigRecoveryError::InvalidSource)?;
-    for field in [
-        "tui",
-        "client",
-        "daemon",
-        "onboarding",
-        "observability",
-        "metrics",
-    ] {
+    for field in EXECUTION_NEUTRAL_TABLES {
         table.remove(field);
     }
     let bytes = serde_json::to_vec(&value).map_err(|_| ConfigRecoveryError::InvalidSource)?;
@@ -911,7 +914,7 @@ pub fn sources_from_overrides(
                 && let Some(selected) = table.get(field).and_then(toml::Value::as_str)
             {
                 *target = Some(selected.to_owned());
-            } else {
+            } else if !(EXECUTION_NEUTRAL_TABLES.contains(&key.as_str()) && value.is_table()) {
                 sources.inline_overrides = true;
             }
         }
@@ -1652,6 +1655,44 @@ mod tests {
             execution_fingerprint(&config).unwrap(),
             execution_fingerprint(&expected).unwrap()
         );
+    }
+
+    #[test]
+    fn execution_neutral_inline_overrides_remain_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let with_cli = |raw: &str| ConfigLoadOverrides {
+            cli_config_toml: Some(raw.to_owned()),
+            ..Default::default()
+        };
+        let overrides = with_cli("[client]\nrequest_timeout_secs = 600\n");
+        let source = sources_from_overrides(dir.path(), std::slice::from_ref(&path), &overrides);
+        assert!(!source.inline_overrides);
+        let loaded = crate::load_config_from_paths_with_overrides_and_environment(
+            &source.discovered_paths,
+            &overrides,
+            &crate::ConfigEnvironmentSnapshot::new(
+                std::collections::BTreeMap::new(),
+                dir.path().to_owned(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(loaded.client.request_timeout_secs, 600);
+        let replayed = replay(&source, &[dir.path().to_owned()]).unwrap().0;
+        assert_eq!(
+            execution_fingerprint(&replayed).unwrap(),
+            execution_fingerprint(&loaded).unwrap()
+        );
+        for raw in [
+            "[model.retry]\nenabled = false\n",
+            "[client]\nrequest_timeout_secs = 600\n[model.retry]\nenabled = false\n",
+            "client = 1\n",
+        ] {
+            let source =
+                sources_from_overrides(dir.path(), std::slice::from_ref(&path), &with_cli(raw));
+            assert!(source.inline_overrides, "{raw}");
+        }
     }
 
     #[test]

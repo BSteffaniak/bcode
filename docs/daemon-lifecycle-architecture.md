@@ -62,8 +62,14 @@ shared-pool targets, and the plugin selection. Inline overrides that change conf
 have no verifiable source and are rejected.
 
 Admission failures keep the stable `managed_configuration_unavailable` code and name the
-failed check in the message. The daemon log records the secret-free recovery error, never
-configuration contents. Retained configuration views are bounded; views no longer held by
+failed check in the message. Background daemons log each rejection at warn under
+`bcode_server::config_admission` with a fixed reason identifier and the secret-free recovery
+error, never configuration contents. Launch provenance records the raw process directory and
+runtime contexts the canonical one; they correlate when both canonicalize to the same directory.
+Typed context and profile selections are verifiable sources. Inline overrides confined to
+sections excluded from the execution fingerprint (`tui`, `client`, `daemon`, `onboarding`,
+`observability`, `metrics`), such as `--request-timeout-secs`, cannot change what replay must
+reproduce and stay verifiable; any other inline layer is rejected as unverifiable. Retained configuration views are bounded; views no longer held by
 any binding, reservation or in-flight caller are released before capacity is refused.
 
 ## Runtime-work observations
