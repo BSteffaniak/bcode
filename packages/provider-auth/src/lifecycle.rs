@@ -2,17 +2,10 @@
 
 use crate::{AuthProfileResolutionError, ResolvedAuthProfile};
 use bcode_provider_auth_models::AuthMethodContribution;
+use sshenv_vault::app::{AppVaultError, zeroize_vault_values};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use zeroize::{Zeroize as _, Zeroizing};
-
-fn zeroize_vault_values(vault: &mut sshenv_vault::Vault) {
-    for values in vault.profiles.profiles.values_mut() {
-        for value in values.values_mut() {
-            value.zeroize();
-        }
-    }
-}
 
 fn generate_custody_key(
     source: Option<&dyn crate::operations::AuthCustodyKeySource>,
@@ -397,11 +390,7 @@ impl<'a> AuthVaultLifecycle<'a> {
                     )
                 })?;
             let selected = vault.profiles.profiles.remove(self.storage_profile());
-            for values in vault.profiles.profiles.values_mut() {
-                for value in values.values_mut() {
-                    value.zeroize();
-                }
-            }
+            zeroize_vault_values(&mut vault);
             selected.ok_or_else(|| {
                 AuthVaultLifecycleError::ProfileUnavailable(
                     "credential custody profile unavailable".into(),
@@ -1015,7 +1004,7 @@ impl<'a> AuthVaultLifecycle<'a> {
         // Unlike read_guard, establish coordination even for a vault that has never refreshed.
         // Hold it through publication so a concurrent begin/commit cannot restore deleted tokens.
         let _guard = crate::operations::refresh::native::guard(&vault)?;
-        let store = auth_store(&vault);
+        let store = crate::security::auth_vault_store(&vault);
         let Some(mut values) = store
             .get_profile(self.storage_profile())
             .map_err(|error| AuthVaultLifecycleError::ProfileUnavailable(error.to_string()))?
@@ -1093,20 +1082,18 @@ impl<'a> AuthVaultLifecycle<'a> {
         &self,
     ) -> Result<(sshenv_vault::SshenvStore, String), AuthVaultLifecycleError> {
         let vault = self.vault_path();
-        let recipient_key = crate::security::ensure_vault_recipient_key(&vault)
-            .map_err(|error| AuthVaultLifecycleError::VaultUnavailable(error.to_string()))?;
-        let store = auth_store(&vault);
-        if vault.exists() {
-            // Validate existing state before any write. Never archive/reset damaged vaults here.
-            sshenv_vault::load_and_unlock_metadata_with_private_key_paths(
-                &vault,
-                &crate::security::vault_private_key_paths(&vault),
-            )
-            .map_err(|error| AuthVaultLifecycleError::VaultUnavailable(error.to_string()))?;
-        } else {
-            initialize_vault(&vault, &store, &recipient_key)?;
-        }
-        Ok((store, recipient_key))
+        // Validates existing state before any write; never archives/resets damaged vaults.
+        let recipient_key =
+            crate::security::open_or_create_auth_vault(&vault).map_err(|error| match error {
+                AppVaultError::Write(message) => AuthVaultLifecycleError::WriteFailed(message),
+                AppVaultError::Unavailable(message) => {
+                    AuthVaultLifecycleError::VaultUnavailable(message)
+                }
+                identity => AuthVaultLifecycleError::VaultUnavailable(
+                    crate::security::AuthIdentityError::from(identity).to_string(),
+                ),
+            })?;
+        Ok((crate::security::auth_vault_store(&vault), recipient_key))
     }
 
     fn reconcile_device_seal(
@@ -1157,35 +1144,6 @@ fn validate_resolved_owner(
     )
 }
 
-fn auth_store(vault: &Path) -> sshenv_vault::SshenvStore {
-    sshenv_vault::SshenvStore::new(
-        sshenv_vault::SshenvStoreConfig::new(vault.to_path_buf())
-            .with_private_key_paths(crate::security::vault_private_key_paths(vault)),
-    )
-}
-
-fn initialize_vault(
-    vault_path: &Path,
-    store: &sshenv_vault::SshenvStore,
-    recipient_key: &str,
-) -> Result<(), AuthVaultLifecycleError> {
-    store
-        .init(recipient_key)
-        .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
-    let (mut vault, data_key) = store
-        .load_and_unlock()
-        .map_err(|error| AuthVaultLifecycleError::VaultUnavailable(error.to_string()))?;
-    vault
-        .migrate_to_v2(&[recipient_key.to_owned()])
-        .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
-    vault
-        .enable_profile_keys()
-        .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
-    vault
-        .save(vault_path, &data_key)
-        .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     // Native SSH recipient tests run in the default/simulation profiles. The
@@ -1195,6 +1153,7 @@ mod tests {
     #[cfg(not(feature = "custody-simulation"))]
     use bcode_provider_auth_models::AuthCredentialStorage;
     use bcode_provider_auth_models::{AuthSecretField, AuthSecretValidation};
+    use std::path::Path;
 
     fn resolved(vault: &Path) -> ResolvedAuthProfile {
         ResolvedAuthProfile {
@@ -1868,18 +1827,24 @@ mod tests {
         lifecycle
             .upsert(BTreeMap::from([("api_key".into(), "owned".into())]))
             .unwrap();
-        let store = auth_store(&path);
+        let store = crate::security::auth_vault_store(&path);
         let mut values = store.get_profile("exa").unwrap().unwrap();
         values.insert("UNRELATED".into(), "preserved".to_owned().into());
         store.replace_profile("exa", values).unwrap();
         lifecycle.delete().unwrap();
-        let values = auth_store(&path).get_profile("exa").unwrap().unwrap();
+        let values = crate::security::auth_vault_store(&path)
+            .get_profile("exa")
+            .unwrap()
+            .unwrap();
         assert!(!values.contains_key("TEST_PROVIDER_API_KEY"));
         assert_eq!(values["UNRELATED"].as_str(), "preserved");
         assert!(root.path().join("vault.refresh").is_dir());
         lifecycle.delete().unwrap();
         assert_eq!(
-            auth_store(&path).get_profile("exa").unwrap().unwrap(),
+            crate::security::auth_vault_store(&path)
+                .get_profile("exa")
+                .unwrap()
+                .unwrap(),
             values
         );
     }
@@ -2570,7 +2535,7 @@ mod tests {
                 .contains("api_key")
         );
 
-        let store = auth_store(&vault);
+        let store = crate::security::auth_vault_store(&vault);
         let mut raw = store
             .get_profile("exa")
             .expect("read raw")

@@ -3016,7 +3016,6 @@ dependencies = [
 name = "bcode_provider_auth"
 version = "0.0.1-alpha.0"
 dependencies = [
- "base64 0.22.1",
  "bcode_config",
  "bcode_confined_fs",
  "bcode_model",
@@ -3028,7 +3027,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "ssh-key",
  "sshenv_vault",
  "switchy_fs",
  "tempfile",
@@ -13658,8 +13656,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault"
 version = "0.0.1-alpha.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d79e69ea3bd1f11b19178c5cbc7b6ea4ea2cee1eedefdb49ccd97985c1ca42"
+source = "git+https://github.com/BSteffaniak/sshenv?branch=master#630fc7494465af9801c6097724efd29f9cc19b8a"
 dependencies = [
  "aes-siv",
  "age",
@@ -13691,8 +13688,7 @@ dependencies = [
 [[package]]
 name = "sshenv_vault_models"
 version = "0.0.1-alpha.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b4d5201098af5c66e0dee935cc7339e59e800acf7d20b7d1ab885e2bfd492ea"
+source = "git+https://github.com/BSteffaniak/sshenv?branch=master#630fc7494465af9801c6097724efd29f9cc19b8a"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

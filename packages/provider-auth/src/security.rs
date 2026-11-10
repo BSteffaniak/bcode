@@ -1,19 +1,35 @@
+//! Bcode auth vault security policy.
+//!
+//! The vault identity, device-seal reconciliation, and inspection mechanics live upstream in
+//! [`sshenv_vault::app`]. This module binds them to Bcode's managed key name, parses Bcode auth
+//! profile settings, and maps upstream outcomes onto Bcode's stable diagnostics.
+
 use bcode_plugin_sdk::path::display_from_current_dir;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use ssh_key::{Algorithm, LineEnding, PrivateKey, rand_core::OsRng};
-use sshenv_vault::models::{ProfileFactorRequirement, UnlockFactorKindV2, VERSION_V2};
+use sshenv_vault::app::{
+    AppVault, AppVaultConfig, AppVaultError, SecurityAction, SecurityIssue, SecurityReport,
+    profile_device_seal_matches, profile_has_device_seal, zeroize_vault_values,
+};
+use sshenv_vault::models::VERSION_V2;
 
-const BCODE_VAULT_KEY_DIR_SUFFIX: &str = "keys";
-const BCODE_VAULT_PRIVATE_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519";
-const BCODE_VAULT_PUBLIC_KEY_FILE_NAME: &str = "bcode_sshenv_ed25519.pub";
-const BCODE_VAULT_KEY_COMMENT: &str = "bcode sshenv vault key";
+pub use sshenv_vault::app::{
+    AppDeviceSealOptions as AuthDeviceSealOptions, AppDeviceSealPolicy as AuthDeviceSealPolicy,
+};
+
+/// Managed key name: keys live at `<vault>.keys/bcode_sshenv_ed25519{,.pub}`.
+const BCODE_VAULT_KEY_NAME: &str = "bcode";
+
+fn auth_vault(vault_path: &Path) -> AppVault {
+    AppVault::new(AppVaultConfig::new(BCODE_VAULT_KEY_NAME, vault_path))
+}
+
+fn auth_vault_with_options(vault_path: &Path, options: AuthDeviceSealOptions) -> AppVault {
+    AppVault::new(AppVaultConfig::new(BCODE_VAULT_KEY_NAME, vault_path).with_device_seal(options))
+}
 
 /// Error returned when Bcode-managed auth vault identity material cannot be used.
 #[derive(Debug)]
@@ -46,204 +62,83 @@ impl fmt::Display for AuthIdentityError {
 
 impl std::error::Error for AuthIdentityError {}
 
+impl From<AppVaultError> for AuthIdentityError {
+    fn from(error: AppVaultError) -> Self {
+        match error {
+            AppVaultError::IncompleteIdentity {
+                private_key,
+                public_key,
+            } => Self::IncompleteIdentity {
+                private_key,
+                public_key,
+            },
+            other => Self::OperationFailed {
+                message: format!("Bcode auth {other}"),
+            },
+        }
+    }
+}
+
 /// Return the Bcode-managed key directory for an sshenv vault path.
 #[must_use]
 pub fn vault_identity_dir(vault_path: &Path) -> PathBuf {
-    let mut dir = vault_path.as_os_str().to_os_string();
-    dir.push(".");
-    dir.push(BCODE_VAULT_KEY_DIR_SUFFIX);
-    PathBuf::from(dir)
+    auth_vault(vault_path).identity_dir()
 }
 
 /// Return the Bcode-managed private key path for an sshenv vault path.
 #[must_use]
 pub fn vault_private_key_path(vault_path: &Path) -> PathBuf {
-    vault_identity_dir(vault_path).join(BCODE_VAULT_PRIVATE_KEY_FILE_NAME)
+    auth_vault(vault_path).private_key_path()
 }
 
 /// Return the Bcode-managed public key path for an sshenv vault path.
 #[must_use]
 pub fn vault_public_key_path(vault_path: &Path) -> PathBuf {
-    vault_identity_dir(vault_path).join(BCODE_VAULT_PUBLIC_KEY_FILE_NAME)
+    auth_vault(vault_path).public_key_path()
 }
 
 /// Return private-key paths Bcode may use to unlock an auth vault.
 #[must_use]
 pub fn vault_private_key_paths(vault_path: &Path) -> Vec<PathBuf> {
-    vec![vault_private_key_path(vault_path)]
+    auth_vault(vault_path).private_key_paths()
+}
+
+/// Return the sshenv store for an auth vault, unlocking only with the Bcode-managed key.
+#[must_use]
+pub fn auth_vault_store(vault_path: &Path) -> sshenv_vault::SshenvStore {
+    auth_vault(vault_path).store()
 }
 
 /// Read the Bcode-managed auth vault recipient key if the complete keypair exists.
 ///
 /// # Errors
 ///
-/// Returns an error when only part of the managed keypair exists or the public
-/// key cannot be read.
+/// * Only part of the managed keypair exists
+/// * The public key cannot be read
 pub fn read_vault_recipient_key(vault_path: &Path) -> Result<Option<String>, AuthIdentityError> {
-    let private_key = vault_private_key_path(vault_path);
-    let public_key = vault_public_key_path(vault_path);
-    match (private_key.exists(), public_key.exists()) {
-        (true, true) => read_public_key_file(&public_key).map(Some),
-        (false, false) => Ok(None),
-        _ => Err(AuthIdentityError::IncompleteIdentity {
-            private_key,
-            public_key,
-        }),
-    }
+    Ok(auth_vault(vault_path).read_recipient_key()?)
 }
 
 /// Create or reuse the Bcode-managed auth vault recipient key for a vault.
 ///
 /// # Errors
 ///
-/// Returns an error when key generation, filesystem writes, or reading the
-/// resulting public key fails.
+/// * Only part of the managed keypair exists
+/// * Key generation, filesystem writes, or reading the resulting public key fails
 pub fn ensure_vault_recipient_key(vault_path: &Path) -> Result<String, AuthIdentityError> {
-    if let Some(key) = read_vault_recipient_key(vault_path)? {
-        return Ok(key);
-    }
-
-    let identity_dir = vault_identity_dir(vault_path);
-    fs::create_dir_all(&identity_dir).map_err(|error| AuthIdentityError::OperationFailed {
-        message: format!(
-            "failed to create Bcode auth vault key directory {}: {error}",
-            display_from_current_dir(&identity_dir)
-        ),
-    })?;
-    restrict_dir_permissions(&identity_dir)?;
-
-    let private_key_path = vault_private_key_path(vault_path);
-    let public_key_path = vault_public_key_path(vault_path);
-    let mut private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!("failed to generate Bcode auth vault key: {error}"),
-        }
-    })?;
-    private_key.set_comment(BCODE_VAULT_KEY_COMMENT);
-
-    let private_key_text = private_key.to_openssh(LineEnding::LF).map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!("failed to encode Bcode auth vault private key: {error}"),
-        }
-    })?;
-    let public_key_text = private_key.public_key().to_openssh().map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!("failed to encode Bcode auth vault public key: {error}"),
-        }
-    })?;
-
-    write_private_key_file(&private_key_path, private_key_text.as_str())?;
-    write_public_key_file(&public_key_path, &public_key_text)?;
-    read_public_key_file(&public_key_path)
+    Ok(auth_vault(vault_path).ensure_recipient_key()?)
 }
 
-fn read_public_key_file(path: &Path) -> Result<String, AuthIdentityError> {
-    let contents =
-        fs::read_to_string(path).map_err(|error| AuthIdentityError::OperationFailed {
-            message: format!(
-                "failed to read Bcode auth vault public key {}: {error}",
-                display_from_current_dir(path)
-            ),
-        })?;
-    contents
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| AuthIdentityError::OperationFailed {
-            message: format!(
-                "Bcode auth vault public key {} does not contain a public key line",
-                display_from_current_dir(path)
-            ),
-        })
-}
-
-fn write_private_key_file(path: &Path, contents: &str) -> Result<(), AuthIdentityError> {
-    fs::write(path, contents).map_err(|error| AuthIdentityError::OperationFailed {
-        message: format!(
-            "failed to write Bcode auth vault private key {}: {error}",
-            display_from_current_dir(path)
-        ),
-    })?;
-    restrict_private_key_permissions(path)
-}
-
-fn write_public_key_file(path: &Path, contents: &str) -> Result<(), AuthIdentityError> {
-    fs::write(path, format!("{contents}\n")).map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!(
-                "failed to write Bcode auth vault public key {}: {error}",
-                display_from_current_dir(path)
-            ),
-        }
-    })?;
-    restrict_public_key_permissions(path)
-}
-
-#[cfg(unix)]
-fn restrict_dir_permissions(path: &Path) -> Result<(), AuthIdentityError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!(
-                "failed to restrict Bcode auth vault key directory permissions {}: {error}",
-                display_from_current_dir(path)
-            ),
-        }
-    })
-}
-
-#[cfg(not(unix))]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "same fallible interface as Unix permission enforcement"
-)]
-const fn restrict_dir_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_private_key_permissions(path: &Path) -> Result<(), AuthIdentityError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!(
-                "failed to restrict Bcode auth vault private key permissions {}: {error}",
-                display_from_current_dir(path)
-            ),
-        }
-    })
-}
-
-#[cfg(not(unix))]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "same fallible interface as Unix permission enforcement"
-)]
-const fn restrict_private_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_public_key_permissions(path: &Path) -> Result<(), AuthIdentityError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(|error| {
-        AuthIdentityError::OperationFailed {
-            message: format!(
-                "failed to set Bcode auth vault public key permissions {}: {error}",
-                display_from_current_dir(path)
-            ),
-        }
-    })
-}
-
-#[cfg(not(unix))]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "same fallible interface as Unix permission enforcement"
-)]
-const fn restrict_public_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
-    Ok(())
+/// Validate an existing auth vault, or create it with the Bcode-managed identity, sshenv v2,
+/// and per-profile encryption. Damaged vaults are never reset. Returns the recipient key.
+///
+/// # Errors
+///
+/// * Identity errors from [`ensure_vault_recipient_key`]
+/// * An existing vault cannot be unlocked
+/// * A new vault cannot be written
+pub(crate) fn open_or_create_auth_vault(vault_path: &Path) -> Result<String, AppVaultError> {
+    auth_vault(vault_path).open_or_create()
 }
 
 /// Severity for auth vault security diagnostics.
@@ -377,108 +272,83 @@ pub fn inspect_auth_vault_security(
     profile: &str,
     policy: AuthDeviceSealPolicy,
 ) -> AuthSecurityStatus {
-    let mut status = AuthSecurityStatus {
-        vault_path: vault_path.to_path_buf(),
-        profile: profile.to_string(),
-        policy,
-        vault_exists: vault_path.exists(),
-        vault_version: None,
-        profile_keys_enabled: false,
-        profile_exists: false,
-        profile_device_sealed: false,
-        device_seal_backend: None,
-        device_seal_mode: None,
-        device_seal_strict: None,
-        device_seal_keychain_service: None,
-        policy_satisfied: policy != AuthDeviceSealPolicy::Required,
-        diagnostics: Vec::new(),
-    };
-    if !status.vault_exists {
-        status.diagnostics.push(AuthSecurityDiagnostic::warning(
+    let status = auth_vault_with_options(vault_path, AuthDeviceSealOptions::from_policy(policy))
+        .inspect(profile);
+    let diagnostics = status
+        .issues
+        .iter()
+        .map(|issue| security_issue_diagnostic(vault_path, profile, policy, issue))
+        .collect();
+    AuthSecurityStatus {
+        vault_path: status.vault_path,
+        profile: status.profile,
+        policy: status.policy,
+        vault_exists: status.vault_exists,
+        vault_version: status.vault_version,
+        profile_keys_enabled: status.profile_keys_enabled,
+        profile_exists: status.profile_exists,
+        profile_device_sealed: status.profile_device_sealed,
+        device_seal_backend: status.device_seal_backend,
+        device_seal_mode: status.device_seal_mode,
+        device_seal_strict: status.device_seal_strict,
+        device_seal_keychain_service: status.device_seal_keychain_service,
+        policy_satisfied: status.policy_satisfied,
+        diagnostics,
+    }
+}
+
+fn security_issue_diagnostic(
+    vault_path: &Path,
+    profile: &str,
+    policy: AuthDeviceSealPolicy,
+    issue: &SecurityIssue,
+) -> AuthSecurityDiagnostic {
+    match issue {
+        SecurityIssue::VaultMissing => AuthSecurityDiagnostic::warning(
             "auth_vault_missing",
             format!(
                 "Auth vault does not exist: {}",
                 display_from_current_dir(vault_path)
             ),
             "Run `bcode login` for the selected provider.",
-        ));
-        return status;
-    }
-
-    if let Ok(ciphertext) = sshenv_vault::Vault::load_ciphertext(vault_path) {
-        status.vault_version = Some(ciphertext.header.version);
-    }
-
-    let Ok((mut vault, data_key)) = load_auth_vault_metadata(vault_path) else {
-        status.diagnostics.push(AuthSecurityDiagnostic::warning(
+        ),
+        SecurityIssue::UnlockFailed(_) => AuthSecurityDiagnostic::warning(
             "auth_vault_unlock_failed",
             format!(
                 "Auth vault metadata could not be unlocked: {}",
                 display_from_current_dir(vault_path)
             ),
             "Ensure the SSH identity used for this vault is available, then retry.",
-        ));
-        return status;
-    };
-
-    status.vault_version = Some(vault.header.version);
-    status.profile_keys_enabled = vault.profile_keys_enabled();
-    status.profile_exists = vault.profiles.profiles.contains_key(profile)
-        || vault.profiles.profile_entries.contains_key(profile);
-    populate_device_seal_status(&vault, profile, &mut status);
-    let profile_unlockable = if status.profile_exists
-        && vault.profiles.get(profile).is_none()
-        && vault.profiles.profile_entries.contains_key(profile)
-    {
-        match vault.unlock_profile_with_passphrase(profile, &data_key, None) {
-            Ok(()) => true,
-            Err(error) => {
-                status.diagnostics.push(AuthSecurityDiagnostic::warning(
-                    "auth_vault_profile_unlock_failed",
-                    format!("Auth vault profile {profile} could not be unlocked: {error}"),
-                    "Restore this device's seal secret, re-login to reset the auth profile, or remove/rebind the profile seal from a device that can unlock it.",
-                ));
-                false
-            }
-        }
-    } else {
-        true
-    };
-    status.policy_satisfied = match policy {
-        AuthDeviceSealPolicy::Off | AuthDeviceSealPolicy::Preferred => true,
-        AuthDeviceSealPolicy::Required => status.profile_device_sealed && profile_unlockable,
-    };
-
-    if !status.profile_exists {
-        status.diagnostics.push(AuthSecurityDiagnostic::warning(
+        ),
+        SecurityIssue::ProfileUnlockFailed(error) => AuthSecurityDiagnostic::warning(
+            "auth_vault_profile_unlock_failed",
+            format!("Auth vault profile {profile} could not be unlocked: {error}"),
+            "Restore this device's seal secret, re-login to reset the auth profile, or remove/rebind the profile seal from a device that can unlock it.",
+        ),
+        SecurityIssue::ProfileMissing => AuthSecurityDiagnostic::warning(
             "auth_vault_profile_missing",
             format!("Auth vault profile {profile} does not exist."),
             "Run `bcode login` for this auth profile.",
-        ));
-    } else if policy != AuthDeviceSealPolicy::Off && !status.profile_device_sealed {
-        let severity = if policy == AuthDeviceSealPolicy::Required {
-            AuthSecurityDiagnosticSeverity::Error
-        } else {
-            AuthSecurityDiagnosticSeverity::Warning
-        };
-        status.diagnostics.push(AuthSecurityDiagnostic {
-            severity,
+        ),
+        SecurityIssue::DeviceSealMissing => AuthSecurityDiagnostic {
+            severity: if policy == AuthDeviceSealPolicy::Required {
+                AuthSecurityDiagnosticSeverity::Error
+            } else {
+                AuthSecurityDiagnosticSeverity::Warning
+            },
             code: "auth_vault_device_seal_missing".to_string(),
             message: format!("Auth vault profile {profile} is not device-sealed."),
             remediation: Some(
                 "Add settings.recipient_key for the auth profile if migration is needed, then run `bcode auth status` or `bcode login`.".to_string(),
             ),
-        });
-    } else if policy == AuthDeviceSealPolicy::Off && status.profile_device_sealed {
-        status.diagnostics.push(AuthSecurityDiagnostic::info(
+        },
+        SecurityIssue::StrongerThanPolicy => AuthSecurityDiagnostic::info(
             "auth_vault_stronger_than_config",
             format!(
                 "Auth vault profile {profile} is device-sealed even though config sets device_seal=off; stronger vault policy is unchanged."
             ),
-        ));
+        ),
     }
-
-    status
 }
 
 pub(crate) fn read_auth_vault_profile(
@@ -494,7 +364,7 @@ pub(crate) fn read_auth_vault_profile_uncoordinated(
     vault_path: &Path,
     profile: &str,
 ) -> Result<Option<BTreeMap<String, String>>, String> {
-    let (mut vault, data_key) = load_auth_vault_metadata(vault_path).map_err(|error| {
+    let (mut vault, data_key) = auth_vault(vault_path).load_metadata().map_err(|error| {
         format!(
             "failed to unlock auth vault metadata at {}: {error}",
             display_from_current_dir(vault_path)
@@ -506,95 +376,9 @@ pub(crate) fn read_auth_vault_profile_uncoordinated(
             .unlock_profile_with_passphrase(profile, &data_key, None)
             .map_err(|error| format!("failed to unlock auth vault profile {profile}: {error}"))?;
     }
-    Ok(vault.profiles.get(profile).cloned())
-}
-
-fn load_auth_vault_metadata(
-    vault_path: &Path,
-) -> Result<(sshenv_vault::Vault, sshenv_vault::DataKey), String> {
-    let ciphertext = sshenv_vault::Vault::load_ciphertext(vault_path)
-        .map_err(|error| format!("failed to load auth vault: {error}"))?;
-    let fingerprints: HashSet<String> = ciphertext
-        .recipients
-        .iter()
-        .map(|recipient| recipient.fingerprint.clone())
-        .collect();
-    let private_key_paths = vault_private_key_paths(vault_path);
-    let identities = sshenv_vault::identity::load_identities_for_vault_from_paths(
-        &private_key_paths,
-        &fingerprints,
-    )
-    .map_err(|error| format!("failed to load Bcode auth vault SSH identity: {error}"))?;
-    if identities.is_empty() {
-        return Err(
-            "no Bcode-managed auth vault private key matches an auth vault recipient; run `bcode login` to recreate this profile"
-                .to_string(),
-        );
-    }
-    sshenv_vault::Vault::unlock_metadata_with_passphrase(ciphertext, &identities, None)
-        .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))
-}
-
-/// Desired device-seal policy for an sshenv-backed auth profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthDeviceSealPolicy {
-    /// Do not add a device seal automatically.
-    Off,
-    /// Add a device seal when the local host can support it, but continue on failure.
-    Preferred,
-    /// Add a device seal and treat failure as a policy violation.
-    Required,
-}
-
-/// Complete device-seal configuration for an sshenv-backed auth profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthDeviceSealOptions {
-    /// Whether Bcode should reconcile a profile device seal.
-    pub policy: AuthDeviceSealPolicy,
-    /// Concrete sshenv device-seal selection and strictness.
-    pub seal: sshenv_vault::device::DeviceSealOptions,
-}
-
-impl AuthDeviceSealOptions {
-    /// Default Bcode auth-vault device-seal behavior.
-    #[must_use]
-    pub const fn preferred_prompt_free() -> Self {
-        Self {
-            policy: AuthDeviceSealPolicy::Preferred,
-            seal: sshenv_vault::device::DeviceSealOptions {
-                selection: sshenv_vault::device::DeviceSealSelection::Backend(
-                    sshenv_vault::device::DeviceSealBackendSelection::LocalFile,
-                ),
-                strict: false,
-            },
-        }
-    }
-
-    /// Required Bcode auth-vault device-seal behavior.
-    #[must_use]
-    pub const fn required_transparent_device_only() -> Self {
-        Self {
-            policy: AuthDeviceSealPolicy::Required,
-            seal: sshenv_vault::device::DeviceSealOptions {
-                selection: sshenv_vault::device::DeviceSealSelection::Policy(
-                    sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly,
-                ),
-                strict: true,
-            },
-        }
-    }
-
-    /// Build options from the legacy policy-only API.
-    #[must_use]
-    pub const fn from_policy(policy: AuthDeviceSealPolicy) -> Self {
-        match policy {
-            AuthDeviceSealPolicy::Required => Self::required_transparent_device_only(),
-            AuthDeviceSealPolicy::Off | AuthDeviceSealPolicy::Preferred => Self {
-                policy,
-                ..Self::preferred_prompt_free()
-            },
-        }
-    }
+    let values = vault.profiles.get(profile).cloned();
+    zeroize_vault_values(&mut vault);
+    Ok(values)
 }
 
 /// Parse an auth profile's `settings.device_seal` value.
@@ -614,86 +398,20 @@ pub fn device_seal_policy_for_auth_profile(
         })
 }
 
-/// Parse an auth profile's device-seal settings.
+/// Parse an auth profile's device-seal settings (`device_seal`, `device_seal_backend`,
+/// `device_seal_mode`, `device_seal_strict`).
 #[must_use]
 pub fn device_seal_options_for_auth_profile(
     auth_profile: &bcode_config::AuthProfileConfig,
 ) -> AuthDeviceSealOptions {
-    let policy = device_seal_policy_for_auth_profile(auth_profile);
-    let default_options = AuthDeviceSealOptions::from_policy(policy);
-    let selection = auth_profile
-        .settings
-        .get("device_seal_backend")
-        .and_then(|value| parse_device_seal_backend(value))
-        .map_or_else(
-            || {
-                auth_profile
-                    .settings
-                    .get("device_seal_mode")
-                    .and_then(|value| parse_device_seal_policy(value))
-                    .map_or(default_options.seal.selection, |mode| {
-                        sshenv_vault::device::DeviceSealSelection::Policy(mode)
-                    })
-            },
-            sshenv_vault::device::DeviceSealSelection::Backend,
-        );
-    let strict = auth_profile
-        .settings
-        .get("device_seal_strict")
-        .map_or(default_options.seal.strict, |value| {
-            parse_bool_setting(value, default_options.seal.strict)
-        });
-    AuthDeviceSealOptions {
-        policy,
-        seal: sshenv_vault::device::DeviceSealOptions { selection, strict },
-    }
-}
-
-fn parse_device_seal_policy(value: &str) -> Option<sshenv_vault::device::DeviceSealPolicy> {
-    match normalize_setting(value).as_str() {
-        "default" | "legacy" => Some(sshenv_vault::device::DeviceSealPolicy::Default),
-        "transparentdeviceonly" | "transparentlocaldevice" | "devicelocaltransparent" => {
-            Some(sshenv_vault::device::DeviceSealPolicy::TransparentDeviceOnly)
-        }
-        _ => None,
-    }
-}
-
-fn parse_device_seal_backend(
-    value: &str,
-) -> Option<sshenv_vault::device::DeviceSealBackendSelection> {
-    match normalize_setting(value).as_str() {
-        "macoskeychain" => Some(sshenv_vault::device::DeviceSealBackendSelection::MacosKeychain),
-        "macoskeychaindeviceonly" => {
-            Some(sshenv_vault::device::DeviceSealBackendSelection::MacosKeychainDeviceOnly)
-        }
-        "windowsdpapi" | "windowsdpapicurrentuser" => {
-            Some(sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser)
-        }
-        "linuxtpm" | "tpm" => Some(sshenv_vault::device::DeviceSealBackendSelection::LinuxTpm),
-        "linuxsecretservice" | "secretservice" => {
-            Some(sshenv_vault::device::DeviceSealBackendSelection::LinuxSecretService)
-        }
-        "secureenclave" => Some(sshenv_vault::device::DeviceSealBackendSelection::SecureEnclave),
-        "localfile" => Some(sshenv_vault::device::DeviceSealBackendSelection::LocalFile),
-        _ => None,
-    }
-}
-
-fn parse_bool_setting(value: &str, default: bool) -> bool {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" | "strict" => true,
-        "0" | "false" | "no" | "off" | "relaxed" => false,
-        _ => default,
-    }
-}
-
-fn normalize_setting(value: &str) -> String {
-    value
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect()
+    let setting = |key: &str| auth_profile.settings.get(key).map(String::as_str);
+    AuthDeviceSealOptions::from_settings(
+        device_seal_policy_for_auth_profile(auth_profile),
+        None,
+        setting("device_seal_backend"),
+        setting("device_seal_mode"),
+        setting("device_seal_strict"),
+    )
 }
 
 /// Safely reconcile an sshenv auth profile and return structured diagnostics.
@@ -721,48 +439,34 @@ pub fn reconcile_auth_vault_security_report_with_options(
     options: AuthDeviceSealOptions,
     explicit_recipient_key: Option<&str>,
 ) -> AuthSecurityReconcileReport {
-    match reconcile_auth_vault_security_with_options(
+    let diagnostics = match reconcile_auth_vault_security_with_options(
         vault_path,
         profile,
         options,
         explicit_recipient_key,
     ) {
-        Ok(actions) => AuthSecurityReconcileReport {
-            diagnostics: actions
-                .into_iter()
-                .map(|action| AuthSecurityDiagnostic::info("auth_vault_security_refreshed", action))
-                .collect(),
-        },
-        Err(error) => {
-            let severity = if options.policy == AuthDeviceSealPolicy::Required {
-                AuthSecurityDiagnosticSeverity::Error
-            } else {
-                AuthSecurityDiagnosticSeverity::Warning
-            };
-            let diagnostic = match severity {
-                AuthSecurityDiagnosticSeverity::Info => {
-                    AuthSecurityDiagnostic::info("auth_vault_security_refresh_skipped", error)
-                }
-                AuthSecurityDiagnosticSeverity::Warning => AuthSecurityDiagnostic::warning(
-                    "auth_vault_security_refresh_skipped",
-                    format!(
-                        "Auth vault security refresh skipped for profile {profile}; device seal is preferred but not active: {error}"
-                    ),
-                    "Run `bcode login` to recreate credentials with the Bcode-managed per-vault key.",
+        Ok(actions) => actions
+            .into_iter()
+            .map(|action| AuthSecurityDiagnostic::info("auth_vault_security_refreshed", action))
+            .collect(),
+        Err(error) if options.policy == AuthDeviceSealPolicy::Required => {
+            vec![AuthSecurityDiagnostic::error(
+                "auth_vault_security_required_unsatisfied",
+                format!(
+                    "Auth vault security requirement is not satisfied for profile {profile}: {error}"
                 ),
-                AuthSecurityDiagnosticSeverity::Error => AuthSecurityDiagnostic::error(
-                    "auth_vault_security_required_unsatisfied",
-                    format!(
-                        "Auth vault security requirement is not satisfied for profile {profile}: {error}"
-                    ),
-                    "Run `bcode login` to recreate credentials with the Bcode-managed per-vault key.",
-                ),
-            };
-            AuthSecurityReconcileReport {
-                diagnostics: vec![diagnostic],
-            }
+                "Run `bcode login` to recreate credentials with the Bcode-managed per-vault key.",
+            )]
         }
-    }
+        Err(error) => vec![AuthSecurityDiagnostic::warning(
+            "auth_vault_security_refresh_skipped",
+            format!(
+                "Auth vault security refresh skipped for profile {profile}; device seal is preferred but not active: {error}"
+            ),
+            "Run `bcode login` to recreate credentials with the Bcode-managed per-vault key.",
+        )],
+    };
+    AuthSecurityReconcileReport { diagnostics }
 }
 
 /// Safely reconcile an sshenv auth profile with the requested device-seal policy.
@@ -773,8 +477,8 @@ pub fn reconcile_auth_vault_security_report_with_options(
 ///
 /// # Errors
 ///
-/// Returns an error when the requested policy cannot be applied. Callers using
-/// [`AuthDeviceSealPolicy::Preferred`] may convert the error into a warning.
+/// * The requested policy cannot be applied; callers using
+///   [`AuthDeviceSealPolicy::Preferred`] may convert the error into a warning
 pub fn reconcile_auth_vault_security(
     vault_path: &Path,
     profile: &str,
@@ -797,34 +501,26 @@ pub fn reconcile_auth_vault_security(
 ///
 /// # Errors
 ///
-/// Returns an error when the requested policy/options cannot be applied.
+/// * The vault metadata cannot be unlocked
+/// * The requested policy/options cannot be applied or the result cannot be saved
 pub fn reconcile_auth_vault_security_with_options(
     vault_path: &Path,
     profile: &str,
     options: AuthDeviceSealOptions,
     explicit_recipient_key: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    if !vault_path.exists() {
-        return Ok(Vec::new());
+    match auth_vault_with_options(vault_path, options).reconcile(profile, explicit_recipient_key) {
+        Ok(SecurityReport {
+            actions,
+            skipped: None,
+        }) => Ok(action_messages(profile, &actions)),
+        Ok(SecurityReport {
+            skipped: Some(reason),
+            ..
+        })
+        | Err(AppVaultError::DeviceSealRequired { reason, .. }) => Err(reason),
+        Err(error) => Err(error.to_string()),
     }
-
-    let (mut vault, data_key) = load_auth_vault_metadata(vault_path)
-        .map_err(|error| format!("failed to unlock auth vault metadata: {error}"))?;
-
-    let (actions, changed) = prepare_auth_vault_security(
-        &mut vault,
-        &data_key,
-        vault_path,
-        profile,
-        options,
-        explicit_recipient_key,
-    )?;
-    if changed {
-        vault
-            .save(vault_path, &data_key)
-            .map_err(|error| format!("failed to save reconciled auth vault: {error}"))?;
-    }
-    Ok(actions)
 }
 
 /// Prepare security changes on the caller's loaded vault without publishing credentials.
@@ -837,62 +533,34 @@ pub(crate) fn prepare_auth_vault_security(
     options: AuthDeviceSealOptions,
     explicit_recipient_key: Option<&str>,
 ) -> Result<(Vec<String>, bool), String> {
-    let mut actions = Vec::new();
-    if matches!(options.policy, AuthDeviceSealPolicy::Off) {
-        if profile_has_device_seal(vault, profile) {
-            actions.push(format!(
+    let (actions, changed) = auth_vault_with_options(vault_path, options).prepare_security(
+        vault,
+        data_key,
+        profile,
+        explicit_recipient_key,
+    )?;
+    Ok((action_messages(profile, &actions), changed))
+}
+
+fn action_messages(profile: &str, actions: &[SecurityAction]) -> Vec<String> {
+    actions
+        .iter()
+        .map(|action| match action {
+            SecurityAction::MigratedToV2 => "migrated auth vault to sshenv v2".to_string(),
+            SecurityAction::EnabledProfileKeys => {
+                "enabled per-profile auth vault encryption".to_string()
+            }
+            SecurityAction::BoundDeviceSeal => {
+                format!("bound auth profile {profile} to this device")
+            }
+            SecurityAction::ReboundDeviceSeal => {
+                format!("rebound auth profile {profile} to configured device seal")
+            }
+            SecurityAction::KeptStrongerSeal => format!(
                 "auth profile {profile} is device-sealed even though config sets device_seal=off; leaving stronger vault policy unchanged"
-            ));
-        }
-        return Ok((actions, false));
-    }
-
-    if !vault.profiles.profiles.contains_key(profile)
-        && !vault.profiles.profile_entries.contains_key(profile)
-    {
-        return Ok((actions, false));
-    }
-
-    if profile_has_device_seal(vault, profile)
-        && profile_device_seal_matches_options(vault, profile, options.seal)
-    {
-        return Ok((actions, false));
-    }
-
-    if vault.profiles.get(profile).is_none() && vault.profiles.profile_entries.contains_key(profile)
-    {
-        vault
-            .unlock_profile_with_passphrase(profile, data_key, None)
-            .map_err(|error| format!("failed to unlock auth profile {profile}: {error}"))?;
-    }
-
-    if vault.header.version != VERSION_V2 {
-        let recipient_keys = recipient_keys_for_vault(vault_path, vault, explicit_recipient_key)?;
-        vault
-            .migrate_to_v2(&recipient_keys)
-            .map_err(|error| format!("failed to migrate auth vault to v2: {error}"))?;
-        actions.push("migrated auth vault to sshenv v2".to_string());
-    }
-
-    if !vault.profile_keys_enabled() {
-        vault
-            .enable_profile_keys()
-            .map_err(|error| format!("failed to enable auth profile keys: {error}"))?;
-        actions.push("enabled per-profile auth vault encryption".to_string());
-    }
-
-    let rebinding_existing_seal = profile_has_device_seal(vault, profile);
-    vault
-        .require_profile_device_seal_with_options(profile, options.seal)
-        .map_err(|error| {
-            format!("failed to bind auth profile {profile} to this device: {error}")
-        })?;
-    actions.push(if rebinding_existing_seal {
-        format!("rebound auth profile {profile} to configured device seal")
-    } else {
-        format!("bound auth profile {profile} to this device")
-    });
-    Ok((actions, true))
+            ),
+        })
+        .collect()
 }
 
 /// Prepare current-format retained policy without native factor effects or format conversion.
@@ -990,132 +658,13 @@ pub(crate) fn validate_retained_device_policy(
 ) -> Result<(), crate::lifecycle::AuthVaultLifecycleError> {
     if options.policy == AuthDeviceSealPolicy::Off
         || (profile_has_device_seal(vault, profile)
-            && profile_device_seal_matches_options(vault, profile, options.seal))
+            && profile_device_seal_matches(vault, profile, options.seal))
     {
         return Ok(());
     }
     Err(crate::lifecycle::AuthVaultLifecycleError::WriteFailed(
         "retained device policy requires explicit factor provisioning before update".into(),
     ))
-}
-
-fn populate_device_seal_status(
-    vault: &sshenv_vault::Vault,
-    profile: &str,
-    status: &mut AuthSecurityStatus,
-) {
-    status.profile_device_sealed = profile_has_device_seal(vault, profile);
-    if let Some(metadata) = profile_device_seal_metadata(vault, profile) {
-        status.device_seal_backend = metadata.params.get("backend").cloned();
-        status.device_seal_mode = metadata.params.get("policy").cloned();
-        status.device_seal_strict = metadata
-            .params
-            .get("strict")
-            .map(|value| parse_bool_setting(value, true));
-        status.device_seal_keychain_service = metadata.params.get("keychain-service").cloned();
-    }
-}
-
-fn profile_has_device_seal(vault: &sshenv_vault::Vault, profile: &str) -> bool {
-    profile_device_seal_metadata(vault, profile).is_some_and(|_| {
-        vault
-            .profiles
-            .profile_policy(profile)
-            .is_some_and(|policy| {
-                policy
-                    .required_factors
-                    .contains(&ProfileFactorRequirement::DeviceSeal)
-            })
-    })
-}
-
-fn profile_device_seal_matches_options(
-    vault: &sshenv_vault::Vault,
-    profile: &str,
-    options: sshenv_vault::device::DeviceSealOptions,
-) -> bool {
-    profile_device_seal_metadata(vault, profile)
-        .is_some_and(|metadata| sshenv_vault::device::factor_matches_options(metadata, options))
-}
-
-fn profile_device_seal_metadata<'a>(
-    vault: &'a sshenv_vault::Vault,
-    profile: &str,
-) -> Option<&'a sshenv_vault::models::UnlockFactorV2> {
-    vault.profiles.profile_policy(profile).and_then(|policy| {
-        policy
-            .factor_metadata
-            .iter()
-            .find(|factor| factor.kind == UnlockFactorKindV2::DeviceSeal)
-    })
-}
-
-fn recipient_keys_for_vault(
-    vault_path: &Path,
-    vault: &sshenv_vault::Vault,
-    explicit_recipient_key: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let expected: BTreeSet<_> = vault
-        .recipients
-        .iter()
-        .map(|recipient| recipient.fingerprint.clone())
-        .collect();
-    let candidates = recipient_key_candidates(vault_path, explicit_recipient_key);
-    let by_fingerprint: BTreeMap<_, _> = candidates
-        .into_iter()
-        .filter_map(|line| {
-            fingerprint_for_public_key_line(&line).map(|fingerprint| (fingerprint, line))
-        })
-        .collect();
-
-    let mut keys = Vec::new();
-    let mut missing = Vec::new();
-    for fingerprint in expected {
-        if let Some(line) = by_fingerprint.get(&fingerprint) {
-            keys.push(line.clone());
-        } else {
-            missing.push(fingerprint);
-        }
-    }
-    if missing.is_empty() {
-        Ok(keys)
-    } else {
-        Err(format!(
-            "cannot migrate existing auth vault to v2 because recipient public keys were not found for: {}. Run `bcode login` to recreate credentials with the Bcode-managed per-vault key, or pass --recipient-key if this vault intentionally uses a custom key.",
-            missing.join(", ")
-        ))
-    }
-}
-
-fn recipient_key_candidates(
-    vault_path: &Path,
-    explicit_recipient_key: Option<&str>,
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(key) = explicit_recipient_key.and_then(read_public_key_arg) {
-        candidates.push(key);
-    } else if let Ok(Some(key)) = read_vault_recipient_key(vault_path) {
-        candidates.push(key);
-    }
-    candidates
-}
-
-fn read_public_key_arg(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.starts_with("ssh-") {
-        return Some(trimmed.to_string());
-    }
-    fs::read_to_string(trimmed).ok()
-}
-
-fn fingerprint_for_public_key_line(line: &str) -> Option<String> {
-    let body = line.split_whitespace().nth(1)?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .ok()?;
-    let hash = Sha256::digest(decoded);
-    let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash);
-    Some(format!("SHA256:{encoded}"))
 }
 
 #[cfg(test)]
@@ -1144,9 +693,33 @@ mod tests {
 
     #[test]
     fn explicit_windows_dpapi_backend_is_parsed_without_secret_data() {
+        let profile = bcode_config::AuthProfileConfig {
+            settings: BTreeMap::from([(
+                "device_seal_backend".to_string(),
+                "windows-dpapi-current-user".to_string(),
+            )]),
+            ..bcode_config::AuthProfileConfig::default()
+        };
         assert_eq!(
-            parse_device_seal_backend("windows-dpapi-current-user"),
-            Some(sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser)
+            device_seal_options_for_auth_profile(&profile)
+                .seal
+                .selection,
+            sshenv_vault::device::DeviceSealSelection::Backend(
+                sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser
+            )
+        );
+    }
+
+    #[test]
+    fn managed_identity_keeps_bcode_key_file_names() {
+        let vault = Path::new("/state/bcode/auth.vault");
+        assert_eq!(
+            vault_private_key_path(vault),
+            Path::new("/state/bcode/auth.vault.keys/bcode_sshenv_ed25519")
+        );
+        assert_eq!(
+            vault_public_key_path(vault),
+            Path::new("/state/bcode/auth.vault.keys/bcode_sshenv_ed25519.pub")
         );
     }
 }

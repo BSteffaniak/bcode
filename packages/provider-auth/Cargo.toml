@@ -11,7 +11,6 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-base64                     = { workspace = true }
 bcode_config               = { workspace = true }
 bcode_confined_fs          = { workspace = true }
 bcode_model                = { workspace = true }
@@ -22,8 +21,7 @@ hex                        = { workspace = true }
 serde                      = { workspace = true, features = ["derive"] }
 serde_json                 = { workspace = true }
 sha2                       = { workspace = true }
-ssh-key                    = { workspace = true }
-sshenv_vault               = { workspace = true }
+sshenv_vault               = { workspace = true, features = ["app-vault"] }
 switchy_fs                 = { workspace = true, features = ["std"] }
 tempfile                   = { workspace = true }
 thiserror                  = { workspace = true }
