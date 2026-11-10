@@ -5,6 +5,7 @@
 //! Bcode release and repository validation tasks.
 
 mod architecture;
+mod bmux_lock;
 mod theme_gallery;
 mod xray_dev;
 
@@ -59,6 +60,7 @@ impl From<zip::result::ZipError> for XtaskError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandName {
     Architecture,
+    BmuxLockCheck,
     Build,
     Release,
     VerifyRelease,
@@ -100,6 +102,7 @@ impl Options {
         let mut args = env::args().skip(1);
         let command = match args.next().as_deref() {
             Some("architecture") => CommandName::Architecture,
+            Some("bmux-lock-check") => CommandName::BmuxLockCheck,
             Some("build") => CommandName::Build,
             Some("release") => CommandName::Release,
             Some("verify-release") => CommandName::VerifyRelease,
@@ -277,6 +280,7 @@ fn run() -> Result<()> {
     let options = Options::parse()?;
     match options.command {
         CommandName::Architecture => architecture::check(&options.target),
+        CommandName::BmuxLockCheck => bmux_lock::check(),
         CommandName::Build => build(&options),
         CommandName::Release => release(&options),
         CommandName::VerifyRelease => verify_release(&options),
@@ -4014,6 +4018,7 @@ fn print_help() {
         "Bcode release tasks\n\n\
          Usage:\n\
            cargo xtask architecture [--target <triple>]\n\
+           cargo xtask bmux-lock-check\n\
            cargo xtask xray-dev [--demo] [--no-open] [--lifetime-seconds <1..86400>]\n\
            cargo xtask build [--target <triple>] [--features <feature,...>]\n\
            cargo xtask release --target <triple> --version <version> [--features <feature,...>]\n\

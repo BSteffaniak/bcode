@@ -32,3 +32,6 @@ __pycache__/
 .recap/
 
 .claude/
+
+# local BMUX development state (scripts/bmux-dev.sh)
+/.cargo/bmux-dev.*

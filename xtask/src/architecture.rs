@@ -229,8 +229,17 @@ fn forbidden_dependency(owner: &str, dependency: &str) -> bool {
 ///
 /// Returns an error when Cargo resolution fails or a checked boundary is violated.
 pub fn check(target: &str) -> Result<()> {
-    let graph = load(metadata_command(target).arg("--locked"))?;
-    let mut failures = Vec::new();
+    // The BMUX lock check reads the manifest and lockfile directly, so it runs first: a local
+    // override can make `--locked` resolution fail, and its hint must not be lost behind that.
+    let mut failures = crate::bmux_lock::workspace_failures()?;
+    let graph = match load(metadata_command(target).arg("--locked")) {
+        Ok(graph) => graph,
+        Err(error) if failures.is_empty() => return Err(error),
+        Err(error) => {
+            failures.push(error.to_string());
+            return Err(format_error(failures.join("\n")));
+        }
+    };
     check_sql_profiles(&graph, target, &mut failures)?;
     for root in &graph.members {
         let name = &graph.names[root];

@@ -1,5 +1,7 @@
 # TUI rendering configuration
 
+The second transcript engine (V2) is specified in [`tui-v2-architecture.md`](tui-v2-architecture.md); this document describes the current (V1) engine.
+
 ## Optional executable allocator
 
 The normal build uses Rust's system allocator. To opt the `bcode` executable into

@@ -3999,6 +3999,82 @@ fn export_plain_transcript_selection<'a>(
     (!output.is_empty()).then(|| output.join("\n\n"))
 }
 
+/// Test-only seams used by the engine-neutral transcript scenario driver.
+#[cfg(test)]
+impl BcodeRuntimeModel {
+    /// Run the timeline-dialog selection path for `sequence` and request a full redraw, as the
+    /// dialog's update does after a selection.
+    pub(crate) fn timeline_jump_for_test(&mut self, sequence: u64) {
+        let entry = super::timeline_dialog::TimelineEntry::new(sequence, sequence, "scenario");
+        self.apply_root_timeline_jump(&entry);
+        self.request_full_redraw_for_test();
+    }
+
+    /// Request a full structural redraw, as a timer-driven update with visible changes does.
+    pub(crate) fn request_full_redraw_for_test(&mut self) {
+        self.invalidation = self
+            .invalidation
+            .merge(super::invalidation::UiInvalidation::Structural);
+        self.presentation_damage = bmux_tui::damage::Damage::Full;
+        self.fast_temporal_presentation = false;
+    }
+
+    /// Request the paint-level redraw that timer-driven presentation updates (scroll motion,
+    /// glow and streaming frames) request, with full damage because the caller does not track
+    /// which regions those frames touch.
+    pub(crate) fn request_temporal_redraw_for_test(&mut self) {
+        self.invalidation = self
+            .invalidation
+            .merge(super::invalidation::UiInvalidation::Paint);
+        self.presentation_damage = bmux_tui::damage::Damage::Full;
+        self.fast_temporal_presentation = false;
+    }
+
+    /// Reconcile timed invalidations and return the timer the runtime delivers for them.
+    pub(crate) fn invalidations_timer_for_test(&mut self) -> bmux_tui_runtime::TimerId {
+        self.reconcile_temporal_registry();
+        RootTimer::Invalidations.id()
+    }
+
+    /// Frame layout of the last successfully committed presentation.
+    pub(crate) const fn committed_layout_for_test(&self) -> Option<super::render::FrameLayout> {
+        self.committed_layout
+    }
+
+    /// Whether the next presentation has any damage to paint.
+    pub(crate) const fn presentation_redraw_requested_for_test(&self) -> bool {
+        !self.presentation_damage.is_none()
+    }
+
+    /// Whether the damage the next presentation will paint covers the whole surface.
+    pub(crate) fn presentation_damage_is_full_for_test(&self) -> bool {
+        self.presentation_damage.is_full()
+    }
+
+    /// Replace the system clipboard writer used by transcript copying.
+    pub(crate) fn set_transcript_clipboard_for_test(
+        &mut self,
+        copy: fn(&str) -> Result<(), String>,
+    ) {
+        self.transcript_clipboard = copy;
+    }
+
+    /// Wall-clock deadline of the pending post-copy selection clear.
+    pub(crate) const fn selection_clear_at_for_test(&self) -> Option<Instant> {
+        self.selection_clear_at
+    }
+
+    /// Replace the wall-clock deadline of the pending post-copy selection clear.
+    pub(crate) const fn set_selection_clear_at_for_test(&mut self, deadline: Option<Instant>) {
+        self.selection_clear_at = deadline;
+    }
+
+    /// Timer the runtime delivers for the current post-copy selection clear.
+    pub(crate) fn selection_clear_timer_for_test(&self) -> bmux_tui_runtime::TimerId {
+        RootTimer::SelectionClear(self.selection_clear_generation).id()
+    }
+}
+
 /// Export a visible transcript selection through the production selection-export path.
 #[cfg(test)]
 pub fn export_plain_transcript_selection_for_test<'a>(

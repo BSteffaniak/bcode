@@ -37,7 +37,7 @@ Applies to terminal rendering in packages and plugins. Read
 [`docs/tui-rendering.md`](docs/tui-rendering.md) before changing these areas.
 
 - Compose BMUX layout, text, container, and interaction primitives. Do not implement parallel wrapping, clipping, or text-measurement engines.
-- Inspect the public APIs of the locked BMUX revision before adding helpers. If a generic capability is missing, implement it in BMUX rather than duplicating it in Bcode; coordinate dependency updates before relying on new APIs.
+- Inspect the public APIs of the locked BMUX revision before adding helpers. If a generic capability is missing, implement it in BMUX rather than duplicating it in Bcode; coordinate dependency updates before relying on new APIs. Develop against a local BMUX checkout with `scripts/bmux-dev.sh` ([`docs/bmux-development.md`](docs/bmux-development.md)) and turn it off before committing.
 - Bcode owns semantic content, styling, and presentation policy. BMUX owns generic terminal text-layout mechanics. Fixed padding, preview limits, and responsive presentation choices are permitted; duplicated layout mechanics and independently guessed geometry are not.
 - Never use byte length, character count, or formatting field width as terminal-cell measurement for arbitrary text.
 - Derive prefix widths, content constraints, painting, and hit regions from the same layout definitions. Do not maintain duplicate constants or independent measurements for the same geometry.

@@ -30,6 +30,11 @@ dev-only edges, includes build edges, and reports a dependency path for each vio
   lightweight binaries) cannot reach any other Bcode crate, HyperChad, host implementations or
   terminal renderers; typed configuration stays in `bcode_config`.
 * Production/build graphs exclude nonportable `sha2-asm`.
+* Every workspace `bmux_*` patch is a git patch, and `Cargo.lock` resolves every `bmux_*` package
+  from the git source that patch declares, never from a local path override (also
+  `cargo xtask bmux-lock-check`; see [`bmux-development.md`](bmux-development.md)). This check
+  runs first and reads the files directly, so its failures are reported even when `--locked`
+  resolution fails.
 
 Workspace-default resolution checks model/router boundaries. Portable frontend and feature profiles
 use temporary consumer workspaces so unrelated workspace members cannot unify their features.

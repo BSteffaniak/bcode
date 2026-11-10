@@ -4443,6 +4443,20 @@ impl BmuxApp {
         self.tui_config.reduce_motion = reduce_motion;
     }
 
+    /// Shift latest-content activity, its glow animation and its next glow frame `later` into
+    /// the future and then `earlier` into the past, so a caller can replace elapsed wall time with
+    /// its own clock.
+    #[cfg(test)]
+    pub(crate) fn shift_latest_activity_for_test(&mut self, later: Duration, earlier: Duration) {
+        let shift = |at: Instant| {
+            let at = at.checked_add(later).unwrap_or(at);
+            at.checked_sub(earlier).unwrap_or(at)
+        };
+        self.latest_hidden_activity_at = self.latest_hidden_activity_at.map(shift);
+        self.latest_bar_animation_started_at = shift(self.latest_bar_animation_started_at);
+        self.latest_bar_next_frame_at = self.latest_bar_next_frame_at.map(shift);
+    }
+
     /// Duration of the running transcript scroll animation, if any.
     #[cfg(test)]
     pub(crate) fn transcript_scroll_animation_duration_for_test(&self) -> Option<Duration> {
@@ -5536,6 +5550,21 @@ impl BmuxApp {
     #[cfg(test)]
     pub const fn expire_manual_transcript_scroll_for_test(&mut self) {
         self.manual_transcript_scroll_until = None;
+    }
+
+    /// Wall-clock end of the manual-scroll grace window, if one was started.
+    #[cfg(test)]
+    pub(crate) const fn manual_transcript_scroll_until_for_test(&self) -> Option<Instant> {
+        self.manual_transcript_scroll_until
+    }
+
+    /// Replace the wall-clock end of the manual-scroll grace window.
+    #[cfg(test)]
+    pub(crate) const fn set_manual_transcript_scroll_until_for_test(
+        &mut self,
+        until: Option<Instant>,
+    ) {
+        self.manual_transcript_scroll_until = until;
     }
 
     fn manual_transcript_scroll_active(&self) -> bool {
