@@ -1134,12 +1134,7 @@ impl SessionApplication for SessionApplicationHandle<'_> {
                 .reserve_parent(
                     crate::harness::configuration_views::for_client(self.state, self.client_id)
                         .await
-                        .map_err(|_| {
-                            failure(
-                                "managed_configuration_unavailable",
-                                "session configuration admission failed",
-                            )
-                        })?,
+                        .map_err(configuration_admission_failure)?,
                 )
                 .map_err(|_| {
                     failure(
@@ -1340,6 +1335,33 @@ fn failure(code: &str, message: &str) -> SessionApplicationFailure {
         code: code.to_owned(),
         message: message.to_owned(),
     }
+}
+
+/// Keep the stable code while naming which admission check failed; the daemon log carries
+/// the secret-free detail.
+fn configuration_admission_failure(
+    error: crate::harness::ManagedHarnessError,
+) -> SessionApplicationFailure {
+    use crate::harness::ManagedHarnessError;
+    tracing::warn!(target: "bcode_server::harness", %error, "session configuration admission failed");
+    let message = match error {
+        ManagedHarnessError::Conflict => {
+            "session configuration admission failed: client configuration does not match \
+             daemon-verified configuration sources or loaded plugins"
+        }
+        ManagedHarnessError::Invalid => {
+            "session configuration admission failed: client configuration is invalid or has \
+             no verifiable source"
+        }
+        ManagedHarnessError::StaleOwner => {
+            "session configuration admission failed: client context or plugin runtime changed"
+        }
+        ManagedHarnessError::Unavailable => {
+            "session configuration admission failed: configuration service or capacity unavailable"
+        }
+        _ => "session configuration admission failed",
+    };
+    failure("managed_configuration_unavailable", message)
 }
 
 /// Preserve existing semantic error codes while withholding private database/provider details.

@@ -78,11 +78,20 @@ impl ConfigurationViews {
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.views.get(&digest) {
             if existing.runtime_generation() != view.runtime_generation() {
+                tracing::warn!(target: "bcode_server::harness",
+                    "retained configuration view belongs to another plugin runtime generation");
                 return Err(ManagedHarnessError::Conflict);
             }
             return Ok(existing.clone());
         }
         if inner.views.len() >= MAX_VIEWS {
+            // A view only this cache still holds cannot be compared against any binding,
+            // reservation, or in-flight caller, so releasing it changes no identity.
+            inner.views.retain(|_, view| !view.is_sole_handle());
+        }
+        if inner.views.len() >= MAX_VIEWS {
+            tracing::warn!(target: "bcode_server::harness", limit = MAX_VIEWS,
+                "configuration view capacity exhausted by views still in use");
             return Err(ManagedHarnessError::Unavailable);
         }
         inner.views.insert(digest, view.clone());
@@ -249,9 +258,19 @@ fn verify_startup_sources(
             .ok_or(ManagedHarnessError::Invalid)?;
         authority
             .verify_workspace(supplied, sources)
-            .map_err(|_| ManagedHarnessError::Conflict)?;
+            .map_err(source_mismatch)?;
     }
     Ok(())
+}
+
+/// Record why supplied configuration was not reproduced from its verified sources.
+/// Recovery errors are secret-free by contract; configuration contents are never logged.
+pub(super) fn source_mismatch(
+    error: bcode_config::recovery::ConfigRecoveryError,
+) -> ManagedHarnessError {
+    tracing::warn!(target: "bcode_server::harness", %error,
+        "client configuration was not reproduced from daemon-verified sources");
+    ManagedHarnessError::Conflict
 }
 
 /// Verify declarative launch inputs without incorporating mutable registration state.
@@ -302,6 +321,9 @@ pub async fn declarative_for_client(
                         .as_deref()
                         .ok_or(ManagedHarnessError::Invalid)?;
                     if launch.inline_overrides {
+                        tracing::warn!(target: "bcode_server::harness",
+                            "client configuration differs from daemon startup through inline \
+                            overrides, which have no verifiable source");
                         return Err(ManagedHarnessError::Invalid);
                     }
                     let sources = launch
@@ -321,7 +343,7 @@ pub async fn declarative_for_client(
                         .as_ref()
                         .ok_or(ManagedHarnessError::Invalid)?
                         .verify_workspace(&config, sources)
-                        .map_err(|_| ManagedHarnessError::Conflict)?;
+                        .map_err(source_mismatch)?;
                 }
                 config
             }
@@ -332,6 +354,8 @@ pub async fn declarative_for_client(
             || requested.enabled != selection.enabled
             || requested.disabled != selection.disabled
         {
+            tracing::warn!(target: "bcode_server::harness",
+                "client plugin selection differs from the daemon's loaded plugins");
             return Err(ManagedHarnessError::Conflict);
         }
         let digest = bcode_config::recovery::execution_fingerprint(&config)
@@ -510,6 +534,33 @@ mod tests {
         );
         assert!(for_client(&state, client).await.is_err());
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn retained_views_release_capacity_only_when_unused() {
+        let state = Arc::new(crate::tests::test_server_state(
+            crate::SessionManager::default(),
+        ));
+        let views = &state.harness_configuration_views;
+        let view = || state.plugins.service_config_view(BTreeMap::new());
+        let mut held = Vec::new();
+        for index in 0..MAX_VIEWS {
+            held.push(views.retain(format!("held-{index}"), view()).await.unwrap());
+        }
+        assert_eq!(
+            views.retain("extra".into(), view()).await.err(),
+            Some(ManagedHarnessError::Unavailable)
+        );
+        let kept = held.pop().unwrap();
+        drop(held);
+        let extra = views.retain("extra".into(), view()).await.unwrap();
+        // A view still in use keeps its identity rather than being replaced.
+        let again = views
+            .retain(format!("held-{}", MAX_VIEWS - 1), view())
+            .await
+            .unwrap();
+        assert!(again.same_config_view(&kept));
+        drop((extra, again, kept, state));
     }
 
     #[tokio::test]

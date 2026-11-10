@@ -177,8 +177,16 @@ impl ConfigSourceAuthority {
         {
             return Err(ConfigRecoveryError::SourceBounds);
         }
-        for ((path, required), expected) in authority_paths(sources)?.into_iter().zip(&self.targets)
-        {
+        self.verify_targets(config, sources, &self.targets)
+    }
+
+    fn verify_targets(
+        &self,
+        config: &BcodeConfig,
+        sources: &ConfigRecoverySources,
+        targets: &[PathBuf],
+    ) -> Result<ConfigRecoveryReference, ConfigRecoveryError> {
+        for ((path, required), expected) in authority_paths(sources)?.into_iter().zip(targets) {
             let (target, _) =
                 authority_target_kind(path, &self.sources.cwd, required, self.read_only)?;
             if &target != expected {
@@ -189,7 +197,7 @@ impl ConfigSourceAuthority {
             let (replayed, source_presence) = replay_inner(
                 sources,
                 &self.roots,
-                Some(&self.targets),
+                Some(targets),
                 Some(&self.pool_targets),
             )?;
             let execution_digest = execution_fingerprint(config)?;
@@ -206,13 +214,16 @@ impl ConfigSourceAuthority {
             capture_with_sources(config, sources, &self.roots)
         }
     }
+
     /// Verify the same retained sources from another client workspace.
-    /// Only absent workspace-discovery layers may differ; this grants no authority to read
-    /// new files or follow new targets. Explicit sources, selectors and existing layers stay pinned.
+    /// Only workspace-discovery layers may differ. The host derives each substituted layer
+    /// from the client's working directory with the standard discovery rules and reads it
+    /// only when its target stays inside that canonical workspace root; supplied paths never
+    /// select files. Explicit sources, selectors, user layers and shared pools stay pinned.
     ///
     /// # Errors
-    /// Rejects substituted sources, newly present workspace layers, changed targets or contents
-    /// inconsistent with the supplied configuration.
+    /// Rejects substituted non-workspace sources, workspace layers outside the canonical
+    /// workspace root, changed targets, and contents inconsistent with the supplied configuration.
     pub fn verify_workspace(
         &self,
         config: &BcodeConfig,
@@ -233,32 +244,49 @@ impl ConfigSourceAuthority {
                 .discovered_paths
                 .clone_from(&self.sources.discovered_paths);
         } else if sources.discovered_paths != self.sources.discovered_paths {
-            self.verify_absent_workspace_layers(sources)?;
-            normalized
-                .discovered_paths
-                .clone_from(&self.sources.discovered_paths);
+            // Everything except the workspace discovery layers stays pinned to startup.
+            let pinned = ConfigRecoverySources {
+                discovered_paths: sources.discovered_paths.clone(),
+                ..self.sources.read_provenance()
+            };
+            if normalized.read_provenance() != pinned {
+                return Err(ConfigRecoveryError::Changed);
+            }
+            let targets = self.workspace_targets(sources)?;
+            return self
+                .verify_targets(config, &normalized, &targets)
+                .map(|_| ());
         }
         self.verify(config, &normalized).map(|_| ())
     }
 
-    fn verify_absent_workspace_layers(
+    /// Retained targets with each differing discovery layer replaced by its confined
+    /// workspace target, derived by the host rather than taken from the client.
+    fn workspace_targets(
         &self,
         sources: &ConfigRecoverySources,
-    ) -> Result<(), ConfigRecoveryError> {
+    ) -> Result<Vec<PathBuf>, ConfigRecoveryError> {
+        if sources.discovered_paths.len() != self.sources.discovered_paths.len() {
+            return Err(ConfigRecoveryError::Changed);
+        }
         let environment = crate::ConfigEnvironmentSnapshot::new(
             std::collections::BTreeMap::new(),
             sources.cwd.clone(),
         );
         let workspace =
             crate::default_config_paths_from_with_environment(&sources.cwd, &environment);
-        if sources.discovered_paths.len() != self.sources.discovered_paths.len() {
-            return Err(ConfigRecoveryError::Changed);
-        }
-        for (previous, current) in self
+        let root = bcode_config_layers::discover_config_root(&sources.cwd)
+            .unwrap_or_else(|| sources.cwd.clone())
+            .canonicalize()
+            .map_err(|_| ConfigRecoveryError::SourceBounds)?;
+        let offset = usize::from(self.sources.base_config_path.is_some());
+        let mut targets = self.targets.clone();
+        for (index, (previous, current)) in self
             .sources
             .discovered_paths
             .iter()
             .zip(&sources.discovered_paths)
+            .enumerate()
         {
             if previous == current {
                 continue;
@@ -266,14 +294,15 @@ impl ConfigSourceAuthority {
             if !workspace.contains(current) {
                 return Err(ConfigRecoveryError::Changed);
             }
-            for path in [previous, current] {
-                match std::fs::symlink_metadata(path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err(ConfigRecoveryError::Changed),
-                }
+            let (target, _) = authority_target_kind(current, &self.sources.cwd, false, true)?;
+            if !target.starts_with(&root) {
+                return Err(ConfigRecoveryError::SourceBounds);
             }
+            *targets
+                .get_mut(offset + index)
+                .ok_or(ConfigRecoveryError::SourceBounds)? = target;
         }
-        Ok(())
+        Ok(targets)
     }
 }
 
@@ -1217,8 +1246,6 @@ mod tests {
             vec![second.join("bcode.toml"), second.join(".bcode/bcode.toml")];
         assert!(authority.verify_workspace(&effective, &changed).is_ok());
         assert!(authority.verify(&effective, &changed).is_err());
-        std::fs::write(second.join("bcode.toml"), "").unwrap();
-        assert!(authority.verify_workspace(&effective, &changed).is_err());
         changed
             .discovered_paths
             .clone_from(&source.discovered_paths);
@@ -1233,6 +1260,132 @@ mod tests {
             edit_authority
                 .verify_workspace(&effective, &changed)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn read_authority_reads_present_layers_of_another_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir_all(second.join(".bcode")).unwrap();
+        let source = ConfigRecoverySources {
+            cwd: first.clone(),
+            discovered_paths: vec![first.join("bcode.toml"), first.join(".bcode/bcode.toml")],
+            ..Default::default()
+        };
+        std::fs::write(&source.discovered_paths[0], "").unwrap();
+        let authority = ConfigSourceAuthority::capture_read_only(&source).unwrap();
+        let daemon_effective = replay(&source, &[dir.path().to_owned()]).unwrap().0;
+        let client = ConfigRecoverySources {
+            cwd: second.clone(),
+            discovered_paths: vec![second.join("bcode.toml"), second.join(".bcode/bcode.toml")],
+            ..Default::default()
+        };
+        std::fs::write(
+            &client.discovered_paths[1],
+            "[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\n",
+        )
+        .unwrap();
+        let client_effective = replay(&client, &[dir.path().to_owned()]).unwrap().0;
+        assert_ne!(
+            execution_fingerprint(&client_effective).unwrap(),
+            execution_fingerprint(&daemon_effective).unwrap()
+        );
+        assert_eq!(
+            authority.verify_workspace(&client_effective, &client),
+            Ok(())
+        );
+        // Contents are re-read by the host; a config the workspace does not reproduce fails.
+        assert_eq!(
+            authority.verify_workspace(&daemon_effective, &client),
+            Err(ConfigRecoveryError::Changed)
+        );
+        // Only the standard discovery locations of the client workspace may be substituted.
+        let mut arbitrary = client;
+        arbitrary.discovered_paths[1] = second.join("other.toml");
+        std::fs::write(&arbitrary.discovered_paths[1], "").unwrap();
+        assert_eq!(
+            authority.verify_workspace(&daemon_effective, &arbitrary),
+            Err(ConfigRecoveryError::Changed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_authority_rejects_workspace_layers_escaping_their_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("bcode.toml"), "").unwrap();
+        let source = ConfigRecoverySources {
+            cwd: first.clone(),
+            discovered_paths: vec![first.join("bcode.toml"), first.join(".bcode/bcode.toml")],
+            ..Default::default()
+        };
+        std::fs::write(&source.discovered_paths[0], "").unwrap();
+        let authority = ConfigSourceAuthority::capture_read_only(&source).unwrap();
+        let effective = replay(&source, &[dir.path().to_owned()]).unwrap().0;
+        let client = ConfigRecoverySources {
+            cwd: second.clone(),
+            discovered_paths: vec![second.join("bcode.toml"), second.join(".bcode/bcode.toml")],
+            ..Default::default()
+        };
+        std::os::unix::fs::symlink(&outside, second.join(".bcode")).unwrap();
+        assert_eq!(
+            authority.verify_workspace(&effective, &client),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+        std::fs::remove_file(second.join(".bcode")).unwrap();
+        std::os::unix::fs::symlink(outside.join("bcode.toml"), second.join("bcode.toml")).unwrap();
+        assert_eq!(
+            authority.verify_workspace(&effective, &client),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+    }
+
+    #[test]
+    fn read_authority_keeps_explicit_sources_pinned_across_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let base = dir.path().join("base.toml");
+        std::fs::write(&base, "").unwrap();
+        let source = ConfigRecoverySources {
+            cwd: first.clone(),
+            discovered_paths: vec![first.join("bcode.toml"), first.join(".bcode/bcode.toml")],
+            base_config_path: Some(base.clone()),
+            ..Default::default()
+        };
+        let authority = ConfigSourceAuthority::capture_read_only(&source).unwrap();
+        let mut client = ConfigRecoverySources {
+            cwd: second.clone(),
+            discovered_paths: vec![second.join("bcode.toml"), second.join(".bcode/bcode.toml")],
+            base_config_path: Some(base),
+            ..Default::default()
+        };
+        std::fs::write(&client.discovered_paths[0], "").unwrap();
+        let effective = replay(&client, &[dir.path().to_owned()]).unwrap().0;
+        assert_eq!(authority.verify_workspace(&effective, &client), Ok(()));
+        let substituted = second.join("base.toml");
+        std::fs::write(&substituted, "").unwrap();
+        client.base_config_path = Some(substituted);
+        assert_eq!(
+            authority.verify_workspace(&effective, &client),
+            Err(ConfigRecoveryError::Changed)
+        );
+        client.base_config_path = None;
+        client.model_profile = Some("substituted".into());
+        assert_eq!(
+            authority.verify_workspace(&effective, &client),
+            Err(ConfigRecoveryError::Changed)
         );
     }
 

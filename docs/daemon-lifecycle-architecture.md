@@ -44,6 +44,28 @@ project layers, credentials, or profile settings match: worker selection must be
 Multiple layers and inline overrides are explicitly distinguished from file-only reproduction.
 No config contents are copied into orchestration documents or durable prompt snapshots.
 
+## Client configuration admission
+
+One daemon serves clients from any working directory. A client whose effective
+configuration equals the daemon's startup configuration uses the loaded baseline. Otherwise
+the daemon must reproduce the supplied configuration from the source provenance it captured
+at startup, re-reading the files itself and comparing the execution fingerprint.
+
+Only workspace-discovery layers may differ between the client and the daemon's startup. The
+daemon derives the client's workspace layers from the client's working directory with the
+standard discovery rules (`bcode.toml` and `.bcode/bcode.toml` under the nearest `.git`
+root). A substituted layer is read only when its canonical target stays inside that canonical
+workspace root; symlinks leaving the root are rejected. Supplied paths are checked against
+the derived set and never select files. Everything else stays pinned to startup: user
+layers, explicit base/environment/CLI/exclusive files, context and profile selectors,
+shared-pool targets, and the plugin selection. Inline overrides that change configuration
+have no verifiable source and are rejected.
+
+Admission failures keep the stable `managed_configuration_unavailable` code and name the
+failed check in the message. The daemon log records the secret-free recovery error, never
+configuration contents. Retained configuration views are bounded; views no longer held by
+any binding, reservation or in-flight caller are released before capacity is refused.
+
 ## Runtime-work observations
 
 The server's runtime-work registry holds execution cancellation and session ownership.

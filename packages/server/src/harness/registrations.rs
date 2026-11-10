@@ -98,7 +98,7 @@ pub async fn commit(
         .ok_or(ManagedHarnessError::Invalid)?;
     authority
         .verify_workspace(&config, sources)
-        .map_err(|_| ManagedHarnessError::Conflict)?;
+        .map_err(super::configuration_views::source_mismatch)?;
     let view = super::configuration_views::declarative_for_client(state, client).await?;
     let native =
         super::transport::HarnessPluginTransport::with_view(Arc::clone(state), view.clone())
@@ -122,7 +122,7 @@ pub async fn commit(
     // preparation grants authority to substitute a different configuration or installation.
     authority
         .verify_workspace(&config, sources)
-        .map_err(|_| ManagedHarnessError::Conflict)?;
+        .map_err(super::configuration_views::source_mismatch)?;
     let current = super::configuration_views::declarative_for_client(state, client).await?;
     if current.configuration_values() != previous {
         return Err(ManagedHarnessError::Conflict);

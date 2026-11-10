@@ -4397,6 +4397,13 @@ impl PluginServiceConfigView {
         Arc::ptr_eq(&self.identity, &other.identity)
     }
 
+    /// Whether this handle is the only live reference to its view identity, so no other
+    /// holder can observe or compare against it.
+    #[must_use]
+    pub fn is_sole_handle(&self) -> bool {
+        Arc::strong_count(&self.identity) == 1
+    }
+
     /// Return the shared executor runtime identity, not the configuration view identity.
     #[must_use]
     pub fn runtime_generation(&self) -> PluginRuntimeGeneration {
