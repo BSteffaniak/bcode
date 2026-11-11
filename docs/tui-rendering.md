@@ -1,6 +1,6 @@
 # TUI rendering configuration
 
-The second transcript engine (V2) is specified in [`tui-v2-architecture.md`](tui-v2-architecture.md); this document describes the current (V1) engine.
+The terminal transcript engine (`bcode_tui_transcript`, hosted by `bcode_tui::transcript_v2_host`) is specified in [`tui-v2-architecture.md`](tui-v2-architecture.md); that specification is normative for transcript layout, navigation, the latest bar, focus and selection. This document describes configuration and host-side behavior.
 
 ## Optional executable allocator
 
@@ -252,18 +252,19 @@ resume.
 
 ## Semantic transcript boundary
 
-The TUI holds `SessionView` as its sole canonical transcript reducer. Durable and live session events
-are applied to that reducer once, then `SessionViewTerminalAdapter` incrementally adapts the shared
-`TranscriptViewDocument` by stable item ID and revision. Terminal code owns wrapping, Markdown
-projection, plugin adapter instances, row caches, viewport anchors, scrolling, hit testing, and draw
-cadence; it does not infer canonical transcript identity, ordering, lifecycle, fallback, or stream
-integrity from raw events.
+The transcript engine holds its own `SessionView` as the sole canonical transcript reducer. Durable
+and live session events are applied to it once per residency (SD1); its window operations report
+`TranscriptChanges`, which the engine applies to identity-keyed units by stable item ID and
+revision. Terminal code owns wrapping, Markdown projection, plugin adapter instances, layout caches,
+viewport anchors, scrolling, hit testing, and draw cadence; it does not infer canonical transcript
+identity, ordering, lifecycle, fallback, or stream integrity from raw events. The host shell keeps
+a separate bounded `SessionView` of the attached session for shell state (runtime, title, tools,
+plugin status, submission queue) and never presents its transcript.
 
-Ordinary item revisions invalidate only the changed terminal item. Membership or ordering changes
-produce structural damage, and inconsistent source indexes escalate to a full reset. Viewport
-preservation uses shared stable item identity plus the intra-item rendered row. Automatic movement is
-reserved for accepted user submissions and the first visible content of a new assistant segment;
-subsequent semantic updates preserve the current anchor, and manual scrolling detaches following.
+Ordinary item revisions invalidate only the changed unit. Viewport preservation uses stable unit
+identity plus a position inside the unit. Automatic movement is reserved for accepted user
+submissions and the first visible content of a new assistant segment; subsequent semantic updates
+preserve the current anchor, and manual scrolling detaches following.
 
 Incomplete Markdown is renderer-local. Streaming projections visibly preserve accepted source
 content, redact unsafe unfinished destinations, and converge to the normal projection once syntax is
@@ -271,89 +272,73 @@ complete. Semantic text remains unchanged in `SessionView`.
 
 ## Viewport reconciliation
 
-Virtual space below the transcript is an explicit `TailSpace` viewport state, not bottom-follow
-with a mutable growth allowance. It retains a top-origin reading position and derives remaining
-blank rows from the current geometry. New content fills that space regardless of the manual-input
-grace timer; reaching the viewport boundary resumes bottom-follow. Alternating growth and shrinkage
-must not accumulate scroll drift.
+Virtual space below the transcript is an explicit `TailSpace` navigation state, not bottom-follow
+with a mutable growth allowance. It is BMUX overscroll limited to `viewport_height − 1` rows, so at
+least one content row stays visible (VP2). Scrolling down at the bottom enters it and the status row
+shows "N rows below latest" (C2). New content fills that space regardless of the manual-input grace
+timer; reaching the viewport boundary resumes bottom-follow. Alternating growth and shrinkage must
+not accumulate scroll drift.
 
-Latest-content activity compares retained rows only when entries are regenerated; cache hits,
-scrolling and repeated preparations do not generate activity. Timer-only visual refreshes retain
-any pending content damage without adding activity. Successful presentation acknowledges the bounded
-dirty-entry set. Width reflow establishes fresh geometry rather than reporting output activity.
-Changes within the hidden continuation of a visible entry can activate the latest-content bar.
+Rows of the last visible entry that continue below the viewport are not newer content: growth in
+that hidden continuation does not activate the latest-content bar. The bar appears only for a
+distinct newer entry entirely below the viewport, or when the resident window is detached from newer
+history (C18). Width reflow establishes fresh geometry rather than reporting output activity.
 
-Automatic navigation admits nonempty presentation items once by stable identity, retaining only
-resident identities. Reordering, revisions, or removing the tail cannot re-admit older items.
-A new assistant item smoothly reveals its top and holds it while that item grows; a new
-non-assistant item releases the hold into overflow following without moving fitting content.
-Only content extending past the viewport bottom triggers bottom alignment. Manual navigation consumes arrivals without
-scheduling movement. Admissions are checkpointed with navigation so failed presentations do not
-consume them. Stream events do not maintain a second deferred assistant reveal queue.
+Automatic navigation admits nonempty units once by stable identity. Reordering, revisions, or
+removing the tail cannot re-admit older units. A new assistant unit smoothly reveals its top and
+holds it while that unit grows; a new non-assistant unit releases the hold into overflow following
+without moving fitting content. Only content extending past the viewport bottom triggers bottom
+alignment. Manual navigation consumes arrivals without scheduling movement.
 
-Animation targets distinguish item-top, latest-bottom, and unmapped row positions explicitly;
-missing correspondence never implies tail following. Assistant admission uses one
-superseding transition that clears earlier submission requests. At animation completion, the target
-position is applied after layout correspondence so an older reading anchor cannot overwrite it.
-
-Latest-content chrome is measured against the full body using a copy of viewport/history state.
-The bar cannot create its own visibility condition by reducing the viewport. Layout preparation
-then synchronizes the actual viewport once. Stable item anchors are captured before layout
-synchronization as well as before semantic adaptation, covering asynchronous presentation acceptance
-and width changes. Restored row offsets are confined to the surviving item, and manual input clears
-pending correspondence from the preceding navigation intent. Manual input also cancels deferred
-sequence jumps and acceptance reveals belonging to already-pending submissions; a later submission
-retains its own reveal. Source-backed row anchors apply only to their mapped row. Unmapped rows
-retain item-row fallback instead of snapping to preceding source content.
+Latest-bar visibility is a pure function of the units, the measured index, navigation state,
+latest activity and the full transcript-region height, evaluated once at the end of every update
+(F6). It is measured against the full region, so reserving the bar row cannot cause its own
+visibility (C19); frame preparation only copies the stored decision. Restored positions are confined
+to the surviving unit, and manual input cancels deferred sequence jumps and acceptance reveals
+belonging to already-pending submissions; a later submission retains its own reveal (C14, C23,
+C24). Unmapped rows retain unit-row fallback instead of snapping to preceding source content.
 
 History-boundary input first traverses available rows, then retains unfulfilled movement while a
-bounded page is fetched. Page acceptance and navigation consumption are separate: frame preparation
-must not erase a fetch request, and successful page reconciliation consumes movement once through
-the presentation checkpoint. Direction reversal cancels outstanding movement in the other direction.
-Resident-window bottom is not the session tail.
+bounded page is fetched; page requests are issued ahead of the boundary (W5). Direction reversal
+cancels outstanding movement in the other direction. The resident window bottom is not the session
+tail.
 
-Accepted rows retain optional content keys alongside their geometry. Native adapters prepare rows
-and keys together; serialized visual responses support bounded keys in contract version 3 while
-versions 1–2 retain item-level fallback. Invalid keys reject the candidate. Keys are namespaced by
-producer within the owning item and cannot authorize navigation or execution. Filesystem diff bodies,
-shell terminal bodies, and accepted Markdown heading anchors provide correspondence without host
-interpretation of tool payloads. Correspondence is resolved before tail-space exhaustion, so growth
-above a reading position does not consume virtual space.
+Laid-out rows retain optional source positions alongside their geometry. Filesystem diff bodies,
+shell terminal bodies, accepted Markdown source ranges and plugin adapter source ranges provide
+correspondence without host interpretation of tool payloads; positions are namespaced by producer
+within the owning unit and cannot authorize navigation or execution. Correspondence is resolved
+before tail-space exhaustion, so growth above a reading position does not consume virtual space.
 
-The successful terminal presentation callback advances the presented anchor baseline. Unacknowledged
-preparations do not replace it. Manual input and new reveal transitions discard obsolete baselines.
-Animation targets retain item identity and are re-resolved during layout; animation deadlines only
-request a frame rather than independently terminalizing navigation. Missing items fall back to a
-surviving document position, and missing content keys fall back to a clamped item row.
+`NavState` (`bcode_tui_transcript::navigation`) is the sole navigation authority for following,
+holding, reading and tail space (N1); the viewport stores no policy and only resolves positions
+(VP1). Frame preparation and painting never mutate navigation, the resident window or units (CK1),
+so there is no checkpoint or restore: a prepared but unpresented frame has no navigation side
+effect (CK2). A successful presentation records the committed frame, publishes interaction scenes
+and acknowledges latest-bar activity (CK3). Animation targets retain unit identity and are
+re-resolved at every sample; animation deadlines only request a frame (N7). Missing units fall back
+to a surviving document position, and missing source positions fall back to a clamped unit row.
+Activity spinner frames and elapsed labels advance on accepted activity frames rather than
+sampling wall time during drawing; full and partial presentations of the same state therefore
+agree (F7, D7).
 
 Drafts, contributions, and results share the same tool-surface composition function. Filesystem
 write/edit previews and results declare full-block ownership consistently in native adapters and
 manifests, preventing completion from adding a second host header. Other adapters retain explicit
 inline/transcript/full-block composition and generic fallbacks.
 
-The viewport is the sole owner of follow-tail, manual reading, tail-space, and sticky/non-sticky
-reveal policy; the former application `TranscriptScrollMode` has been removed. Candidate preparations
-checkpoint navigation, reveal requests, animation state, and history reveal state. Repeated
-preparations restore the checkpoint, and successful presentation commits it. New semantic events
-restore uncommitted navigation before applying their effects. Manual input supersedes the candidate.
-Animation cadence remains separate from navigation intent. Activity spinner frames and elapsed
-labels advance on accepted activity invalidations rather than sampling wall time during drawing;
-full and partial presentations of the same state therefore agree. Candidate checkpoints capture
-correspondence before layout replacement, and region offsets are clamped before the next region,
-not merely before the end of the containing item.
-
 Detached Markdown anchors retain an exact source byte position from the accepted projection's
 selection provenance. On width changes that position resolves against the new accepted projection,
-so wrapped paragraphs do not rely on the old intra-item row. The retained projection is shared by
-`Arc`; provenance is requested only when capturing or resolving a reading anchor, not for every
-follow-tail update. Missing source geometry falls back to the existing region/item policy.
+so wrapped paragraphs do not rely on the old intra-item row. Each projected row that shows source
+text maps to the first source byte it shows, read from the same projection's selection provenance
+(C24); streaming revisions skip provenance and fall back to unit-row anchors until the unit
+completes.
 
 Filesystem diff correspondence is emitted by the BMUX diff layout pass for both unified and
 side-by-side layouts. Keys identify old/new fragment-relative source lines, including while draft
 line numbers are unknown; completion's absolute file line numbers do not change those keys.
 Chrome, omission rows, and clipped lines do not receive source identity. Two sides may map to the
-same rendered row. Native adapters return rows and correspondence together through `layout`;
-legacy adapters retain the default rows/anchors bridge. Wrapped positions resolve to their owning
+same rendered row. Native adapters return rows and correspondence together through `layout`.
+Wrapped positions resolve to their owning
 source line, not an invented byte-perfect position within the line.
 
 Serialized visual contract version 4 adds optional adapter-owned half-open source ranges.
@@ -366,7 +351,7 @@ window. Bottom-follow clears that local request. Unavailable positions use item 
 
 Positioned shell output supports local horizontal wheel scrolling and right-click focus, then
 Left/Right or Home; Escape releases focus. These events never become invocation input and do
-not resize the PTY. The V2 transcript routes them from the presented frame's content targets:
+not resize the PTY. The transcript routes them from the presented frame's content targets:
 plugin shell screens receive them through the plugin's content events (`shell.terminal.*`
 keys once focused), and canonical shell screens keep a host-local column offset per item,
 eight columns per wheel tick or Left/Right key, clamped to the widest shown line. Focused `e` toggles an expanded inline screen window (up to 128 rows);
@@ -390,25 +375,21 @@ patch is required. MoosicBox keeps Turso allocator-neutral unless its explicit
 
 ## Accepted Markdown projection scheduling
 
-Transcript Markdown has one TUI-owned accepted projection per resident item. Rows, contribution
-geometry, anchors, focus reconciliation, hit testing, and rich-presentation discovery all consume
-that same retained result; consumers must not independently reparse transcript source. During a
-stream, the previous accepted projection remains readable while a dedicated worker prepares the
-latest item revision and complete render-options generation.
+Transcript Markdown has one accepted projection per resident unit. Rows, contribution geometry,
+anchors, focus targets, hit testing, and rich-presentation slots all consume that same retained
+result; consumers must not independently reparse transcript source. The item layout cache keys
+each projection by unit, revision, a fingerprint of every Markdown option and the theme, and
+width, and replaces it only with a projection for the exact new key (L7, D2); units leaving the
+resident window drop theirs, so neither streaming revision count nor resize history grows retained
+state.
 
-The worker mailbox contains at most one active request and one replaceable pending request. New
-revisions, width changes, details state, finalization, or other option changes replace obsolete
-pending work. Completion wakes the chat loop directly. The loop installs a result only when item ID,
-item revision, and every render option still match, then marks only that transcript item dirty.
-Stale results have no layout, focus, rich-presentation, or viewport effect. Renderer panics are
-normalized without source text or private error details; retained content remains visible and a
-later generation retries on the same worker.
-
-Accepted row-count changes use the existing stable item/intra-item viewport anchor. Following and
-manual detachment therefore remain application policies rather than worker behavior. Session switch,
-shutdown, and resident eviction invalidate pending generations. The cache retains only one current
-projection per resident item, so neither streaming revision count nor terminal resize history grows
-retained state.
+Images and Mermaid diagrams reserve fixed placeholder rows (L8). Host-side workers (the bounded
+image loader and the WASM-isolated Mermaid renderer) render the slots of visible units, then up to
+two resident units on each side, outside drawing, with one active and one replaceable pending
+request per kind. A result is installed only when its unit is still resident at the same layout
+revision and the slot has the same contribution id and source key; installation is a revision of
+that unit only. Accepted row-count changes keep the reading position through the unit's source
+anchors.
 
 ## Plugin visual adapters
 
@@ -466,9 +447,10 @@ Bcode session, tool, plugin, provider, or filesystem semantics.
 ## Smooth stream scheduling
 
 Configured live text smoothing remains semantic state in `SessionView`, not terminal rendering logic.
-The TUI contributes the shared presentation deadline to its normal event-loop deadline set, advances
-the view when due, and adapts only changed `SessionView` items through
-`SessionViewTerminalAdapter`. It does not split provider chunks or evaluate interpolation curves.
+The host applies the streaming policy to the transcript engine's `SessionView`, schedules its
+presentation deadline on the transcript timer, advances the view when due, and the engine adapts
+only changed `SessionView` items into transcript units (D13). It does not split provider chunks or
+evaluate interpolation curves.
 
 `[presentation.streaming]` is frontend-independent: `enabled = false`,
 `graphemes_per_second = 0`, or `max_lag_ms = 0` restores immediate chunk presentation. The
@@ -537,15 +519,16 @@ Production telemetry remains the guard against changed-cell or regional-composit
 
 ## Projection and presentation boundedness
 
-Markdown projections are cached by item identity, canonical revision, and complete render options.
-Each resident item keeps the current projection and at most eight variants; resident reconciliation,
-revision replacement, and generation checks prevent stale or incompatible results from being used.
+Each resident unit keeps exactly one accepted Markdown projection, keyed by identity, revision,
+complete render options and width (L7); units leaving the resident window drop theirs.
 
 Bcode owns semantic invalidation and maps stable temporal work to terminal-space damage. Cursor blink
-repaints the composer, activity/spinner cadence repaints the status row, the active latest-content
-animation repaints its one-row bar, and elapsed tool labels or scroll animation repaint the transcript
-viewport. BMUX coalesces those bounded regions and retains cells plus cursor, focus, hit, and image
-metadata outside them. Structural changes, item row-count uncertainty, theme transitions, resize,
+repaints the composer and activity/spinner cadence repaints the status row. Transcript-only changes
+(scrolling, motion frames, focus traversal, disclosure, selection, accepted spinner frames) repaint
+the transcript region alone, and a frame that differs from the committed one only by scroll position
+uses `Damage::Scroll` with terminal scroll-region acceleration (F5). BMUX coalesces those bounded
+regions and retains cells plus cursor, focus, hit, and image metadata outside them. Structural
+changes, theme transitions, resize,
 reset, route changes, onboarding, overlays, and plugin surfaces still use full damage. Animation phase
 is derived from monotonic elapsed time so delayed or coalesced frames catch up rather than slowing;
 the final latest-bar deadline repaints its stable state before scheduling stops. This process-local
@@ -624,9 +607,11 @@ Placement and off-screen focus are renderer-owned and apply on configuration rel
 controller or exchange state. Interaction values and validation remain plugin-owned. Host-configured
 composer edit, selection, newline, and submit bindings are adapted through the terminal plugin host.
 
-Inline interaction rows use the existing indexed transcript layout and viewport. Their complete
-bounded logical extent is retained as a sparse span, while each frame directly renders only the
-visible logical slice. There is no interaction-owned whole-question viewport or full-height scratch
+The transcript engine reserves an inline interaction's complete bounded logical extent in its
+interaction unit, so the transcript scrolls and anchors around it like other content. After each
+frame the host places the surface over the reserved unit's visible rows from the same prepared
+snapshot; a reservation scrolled out of view, clipped away or not current has no placement and
+registers no hit regions (B3, B7). Each frame renders only the visible logical slice. There is no interaction-owned whole-question viewport or full-height scratch
 buffer. The host caps logical extent at 4,096 rows and visible work at 512 rows and 131,072 cells.
 Committed geometry is shared by drawing, cursor projection, hit testing, and mouse translation.
 Pinned mode uses a host-owned viewport keyed by interaction identity and the renderer's focused-row

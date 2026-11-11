@@ -120,8 +120,8 @@ fn configure_tui(
 // ---------------------------------------------------------------------------------------------
 
 /// C2: the status row reports "N rows below latest" in tail space and "N rows from bottom"
-/// while reading, from the V2 engine's presented position, below the transcript as V1 shows
-/// it; the label follows every tick and disappears when following again.
+/// while reading, from the engine's presented position, below the transcript; the label follows
+/// every tick and disappears when following again.
 #[tokio::test]
 async fn c2_status_row_reports_the_v2_reading_position() {
     let mut scenario = attached(ScenarioSession::with_turns(20, 3));
@@ -295,7 +295,7 @@ fn composer_corner(frame: &ScenarioFrame) -> Option<char> {
 }
 
 /// X4: a profile or theme selected after startup reaches the composer frame and the chrome
-/// dialogs and bordered components read, on the V2 path that prepares no V1 transcript layout.
+/// dialogs and bordered components read.
 #[tokio::test]
 async fn x4_theme_changes_after_startup_reach_composer_and_dialog_chrome() {
     let mut scenario = attached(ScenarioSession::with_turns(3, 1));

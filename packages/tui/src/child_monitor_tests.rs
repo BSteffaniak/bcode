@@ -4,7 +4,6 @@ use bcode_session_models::{
     SessionActivity, SessionActivityCoverage, SessionActivityPage, SessionActivityState,
     SessionChildPage,
 };
-use std::fmt::Write as _;
 
 #[test]
 fn monitor_expands_idle_coordinator_and_preserves_transcript() {
@@ -17,7 +16,7 @@ fn monitor_expands_idle_coordinator_and_preserves_transcript() {
     grandchild.parent_id = Some(child.id);
     grandchild.name = Some("running grandchild".to_owned());
     grandchild.explicit_name.clone_from(&grandchild.name);
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     app.apply_monitor_children(
         root,
         &SessionChildPage {
@@ -80,7 +79,7 @@ fn monitor_expands_idle_coordinator_and_preserves_transcript() {
     assert!(app.child_activity_text().contains("degraded"));
     app.move_monitor_selection(true);
     assert_eq!(app.selected_monitor_session(), Some(grandchild.id));
-    assert!(app.transcript().is_empty());
+    assert_eq!(app.session_view_snapshot().transcript.items.len(), 0);
     assert_monitor_resize_preserves_selection(&mut app, grandchild.id);
     drop(app);
 }
@@ -145,12 +144,8 @@ fn canonical_child_relationship_is_projected_once_without_parent_transcript_copy
             spawning: None,
         },
     );
-    let mut app = BmuxApp::new_with_history(
-        Some(child_id),
-        std::slice::from_ref(&relationship),
-        &[],
-        false,
-    );
+    let mut app =
+        BmuxApp::new_with_history(Some(child_id), std::slice::from_ref(&relationship), &[]);
     app.absorb_session_event(&relationship);
     let snapshot = app.session_view_snapshot();
     assert_eq!(snapshot.transcript.items.len(), 1);
@@ -169,71 +164,9 @@ fn canonical_child_relationship_is_projected_once_without_parent_transcript_copy
 }
 
 #[test]
-fn return_navigation_restores_wrapped_source_position_after_resize() {
-    let root = SessionId::new();
-    let child = SessionId::new();
-    let history = vec![event(
-        root,
-        1,
-        SessionEventKind::SystemMessage {
-            text: (0..100).fold(String::new(), |mut text, index| {
-                writeln!(text, "line {index} Unicode 子 👩‍💻 e\u{301}").unwrap();
-                text
-            }),
-        },
-    )];
-    let mut original = BmuxApp::new_with_history(Some(root), &history, &[], false);
-    let area = Rect::new(0, 0, 40, 12);
-    let mut buffer = Buffer::empty(area);
-    let mut frame = Frame::new(&mut buffer);
-    render::render(
-        &mut original,
-        &mut bmux_tui::paint::PaintCx::new(&mut frame),
-    );
-    original.scroll_transcript_to_row_for_test(17);
-    render::render(
-        &mut original,
-        &mut bmux_tui::paint::PaintCx::new(&mut frame),
-    );
-    let before = original.stable_transcript_anchor().unwrap();
-    let before_source = original
-        .stable_transcript_source_position_for_test()
-        .unwrap();
-    let mut visiting = BmuxApp::new_with_history(Some(child), &[], &[], false);
-    visiting.take_cross_session_state_from(&original);
-    drop(original);
-    assert_eq!(visiting.saved_reading_sequence(root), Some(1));
-    let mut returned = BmuxApp::new_with_history(Some(root), &history, &[], false);
-    returned.take_cross_session_state_from(&visiting);
-    drop(visiting);
-    returned.restore_saved_reading_position();
-    render::render(
-        &mut returned,
-        &mut bmux_tui::paint::PaintCx::new(&mut frame),
-    );
-    assert_eq!(returned.stable_transcript_anchor().unwrap().1, before.1);
-    let narrower = Rect::new(0, 0, 24, 12);
-    let mut narrow_buffer = Buffer::empty(narrower);
-    let mut narrow_frame = Frame::new(&mut narrow_buffer);
-    render::render(
-        &mut returned,
-        &mut bmux_tui::paint::PaintCx::new(&mut narrow_frame),
-    );
-    assert_eq!(returned.saved_reading_sequence(root), Some(1));
-    assert_eq!(
-        returned.stable_transcript_anchor().unwrap().1,
-        returned
-            .transcript_row_for_source_position_for_test(before_source.0, before_source.1)
-            .unwrap()
-    );
-    assert!(returned.scroll_offset() > 0);
-    drop(returned);
-}
-
-#[test]
 fn monitor_cache_evicts_and_reload_has_no_total_descendant_limit() {
     let root = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     let mut first = None;
     for _ in 0..6 {
         let children: Vec<_> = (0..64)
@@ -291,7 +224,7 @@ fn monitor_cache_evicts_and_reload_has_no_total_descendant_limit() {
 fn child_activity_refresh_advances_cursor_and_terminal_window_restarts() {
     let root = SessionId::new();
     let later = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     let mut page = SessionActivityPage {
         own: SessionActivity {
             session_id: root,
@@ -328,7 +261,7 @@ fn child_activity_refresh_advances_cursor_and_terminal_window_restarts() {
 #[test]
 fn newer_monitor_request_rejects_stale_even_in_same_session() {
     let root = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     let mut request = super::super::effects::TuiEffect::LoadChildActivity {
         session_id: root,
         after: None,
@@ -351,7 +284,7 @@ fn newer_monitor_request_rejects_stale_even_in_same_session() {
     assert!(!app.accepts_child_result(true, root, first));
     assert!(app.accepts_child_result(true, root, second));
     drop(app);
-    let reconstructed = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let reconstructed = BmuxApp::new_with_history(Some(root), &[], &[]);
     assert!(!reconstructed.accepts_child_result(true, root, second));
     drop(reconstructed);
 }
@@ -373,7 +306,7 @@ fn canonical_parent_intent_is_not_a_card_and_publication_retry_is_one_card() {
             title: Some("子 [safe] 👩‍💻 e\u{301}".to_owned()),
         },
     );
-    let mut app = BmuxApp::new_with_history(Some(parent), &[intent], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(parent), &[intent], &[]);
     assert_eq!(
         app.session_view_snapshot().transcript.items,
         [] as [bcode_session_view_models::TranscriptViewItem; 0]
@@ -415,7 +348,7 @@ fn canonical_parent_intent_is_not_a_card_and_publication_retry_is_one_card() {
 
 #[test]
 fn unrelated_session_has_no_child_strip_until_monitor_requested() {
-    let mut app = BmuxApp::new_with_history(Some(SessionId::new()), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(SessionId::new()), &[], &[]);
     assert_eq!(app.child_activity_text(), "");
     app.toggle_child_panel();
     assert!(app.child_activity_text().contains("unknown"));
@@ -429,7 +362,7 @@ fn successful_activity_refresh_clears_error_and_counts_observed_grandchildren() 
     let root = SessionId::new();
     let coordinator = SessionId::new();
     let grandchild = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     app.apply_child_activity(Err(bcode_client::ClientError::Protocol(
         "offline".to_owned(),
     )));
@@ -498,7 +431,7 @@ fn monitor_refresh_updates_attention_without_retargeting_selection() {
     first.parent_id = Some(root);
     let mut second = session_summary(SessionId::new());
     second.parent_id = Some(root);
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     let mut children = SessionChildPage {
         children: vec![first.clone(), second.clone()],
         next_after: None,
@@ -581,7 +514,7 @@ fn monitor_typed_details_keep_own_counts_separate_from_descendant_activity() {
     let mut coordinator = session_summary(SessionId::new());
     coordinator.parent_id = Some(root);
     let grandchild = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     app.apply_monitor_children(
         root,
         &SessionChildPage {
@@ -746,7 +679,7 @@ fn monitor_painted_panel_preserves_status_color_and_visible_chevron_geometry() {
 fn foreign_child_response_does_not_populate_new_session_monitor() {
     let root = SessionId::new();
     let foreign = SessionId::new();
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     app.apply_monitor_children(
         foreign,
         &SessionChildPage {
@@ -765,7 +698,7 @@ fn monitor_paint_fixture() -> (BmuxApp, bcode_session_models::SessionSummary) {
     let mut child = session_summary(SessionId::new());
     child.parent_id = Some(root);
     child.name = Some("子 👩‍💻 e\u{301}".to_owned());
-    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[]);
     app.apply_monitor_children(
         root,
         &SessionChildPage {

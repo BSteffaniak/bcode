@@ -443,7 +443,7 @@ mod tests {
 
     fn chat(owner: bcode_session_models::SessionId) -> ActiveChat {
         let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
-        let mut app = super::super::app::BmuxApp::new_with_history(Some(owner), &[], &[], false);
+        let mut app = super::super::app::BmuxApp::new_with_history(Some(owner), &[], &[]);
         app.set_managed_execution(owner);
         ActiveChat {
             app,

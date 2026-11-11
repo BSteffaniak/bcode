@@ -1,7 +1,7 @@
 //! Scenario definitions, generic over the engine driver.
 //!
 //! Every scenario asserts the behavior the V2 specification requires
-//! (`docs/tui-v2-architecture.md`), not what V1 happens to do. Scenario names start with the
+//! (`docs/tui-v2-architecture.md`). Scenario names start with the
 //! requirement or bug they cover; `docs/tui-v2-scenarios.md` maps each one to its IDs and records
 //! per-engine status.
 //!

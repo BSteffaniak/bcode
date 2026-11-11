@@ -4,11 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bcode_client::{BcodeClient, ClientError, DaemonAvailability, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
-use bcode_session_models::{
-    ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
-    ProjectionWindowRequest, ProjectionWindowTarget, SessionHistoryCursor, SessionHistoryPage,
-    SessionId, SessionProjectionKind, SessionSummary, WorkId,
-};
+use bcode_session_models::{ProjectionWindowRequest, SessionId, SessionSummary, WorkId};
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
 use bcode_skill_models::SkillId;
@@ -328,15 +324,9 @@ mod activity_watch_lifetime_tests {
     }
 }
 
-const TRANSCRIPT_PAGE_TARGET_ITEMS: usize = 4;
-
 #[cfg(test)]
 #[path = "managed_effect_error_tests.rs"]
 mod managed_effect_error_tests;
-const TRANSCRIPT_PAGE_MAX_ITEMS: usize = 16;
-const TRANSCRIPT_PAGE_TARGET_ROWS: usize = 24;
-const TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED: usize = 512;
-const TRANSCRIPT_PAGE_MAX_BYTES: usize = 512 * 1024;
 
 async fn invoke_plugin_command(
     application: &impl bcode_command::application::CommandApplication,
@@ -379,58 +369,6 @@ async fn invoke_plugin_command(
             ),
         }),
     }
-}
-
-async fn load_transcript_history_page(
-    client: &BcodeClient,
-    session_id: SessionId,
-    cursor: SessionHistoryCursor,
-    width_columns: u16,
-    older: bool,
-) -> Result<
-    (
-        SessionHistoryPage,
-        Vec<bcode_session_models::SubmissionRecord>,
-    ),
-    ClientError,
-> {
-    let (anchor, direction) = if older {
-        (
-            ProjectionWindowAnchor::BeforeSequence(cursor.sequence.saturating_add(1)),
-            ProjectionWindowDirection::Backward,
-        )
-    } else {
-        (
-            ProjectionWindowAnchor::AfterSequence(cursor.sequence.saturating_sub(1)),
-            ProjectionWindowDirection::Forward,
-        )
-    };
-    let page = client
-        .session_projection_history_page(
-            session_id,
-            ProjectionWindowRequest {
-                projection: SessionProjectionKind::Transcript,
-                anchor,
-                direction,
-                target: ProjectionWindowTarget {
-                    min_items: Some(TRANSCRIPT_PAGE_TARGET_ITEMS),
-                    min_estimated_rows: Some(TRANSCRIPT_PAGE_TARGET_ROWS),
-                    min_bytes: None,
-                    width_columns: Some(width_columns.max(1)),
-                },
-                limits: ProjectionWindowLimits {
-                    max_items: TRANSCRIPT_PAGE_MAX_ITEMS,
-                    max_events_scanned: TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED,
-                    max_bytes: TRANSCRIPT_PAGE_MAX_BYTES,
-                },
-            },
-        )
-        .await?;
-    let page = projection_page_as_history_page(session_id, cursor, older, page)?;
-    let records = client
-        .submissions_for_history(session_id, &page.events)
-        .await?;
-    Ok((page, records))
 }
 
 async fn managed_submit_message(
@@ -782,99 +720,6 @@ mod managed_model_filter_tests {
     }
 }
 
-async fn managed_transcript_page(
-    commands: &bcode_client::ManagedSessionCommandHandle,
-    cursor: SessionHistoryCursor,
-    width_columns: u16,
-    older: bool,
-) -> Result<
-    (
-        SessionHistoryPage,
-        Vec<bcode_session_models::SubmissionRecord>,
-    ),
-    ClientError,
-> {
-    let request = ProjectionWindowRequest {
-        projection: SessionProjectionKind::Transcript,
-        anchor: if older {
-            ProjectionWindowAnchor::BeforeSequence(cursor.sequence.saturating_add(1))
-        } else {
-            ProjectionWindowAnchor::AfterSequence(cursor.sequence.saturating_sub(1))
-        },
-        direction: if older {
-            ProjectionWindowDirection::Backward
-        } else {
-            ProjectionWindowDirection::Forward
-        },
-        target: ProjectionWindowTarget {
-            min_items: Some(TRANSCRIPT_PAGE_TARGET_ITEMS),
-            min_estimated_rows: Some(TRANSCRIPT_PAGE_TARGET_ROWS),
-            min_bytes: None,
-            width_columns: Some(width_columns.max(1)),
-        },
-        limits: ProjectionWindowLimits {
-            max_items: TRANSCRIPT_PAGE_MAX_ITEMS,
-            max_events_scanned: TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED,
-            max_bytes: TRANSCRIPT_PAGE_MAX_BYTES,
-        },
-    };
-    let page = commands.session_projection_history_page(request).await?;
-    let page = projection_page_as_history_page(commands.session_id(), cursor, older, page)?;
-    let records = commands.submissions_for_history(&page.events).await?;
-    Ok((page, records))
-}
-
-fn projection_page_as_history_page(
-    session_id: SessionId,
-    cursor: SessionHistoryCursor,
-    older: bool,
-    page: bcode_session_models::ProjectionHistoryPage,
-) -> Result<SessionHistoryPage, ClientError> {
-    let has_more = if older {
-        page.window.has_older
-    } else {
-        page.window.has_newer
-    };
-    let expected_boundary = page.window.source_range.map(|range| {
-        if older {
-            // The request anchors at cursor + 1, so a canonical contiguous
-            // page ends at cursor itself (not cursor - 1).
-            range.end_sequence == cursor.sequence
-        } else {
-            range.start_sequence == cursor.sequence
-        }
-    });
-    if page.session_id != session_id
-        || page.window.projection != SessionProjectionKind::Transcript
-        || page.events.is_empty() && has_more
-        || page.window.source_range.is_some() == page.events.is_empty()
-        || expected_boundary == Some(false)
-        || page.window.source_range.is_some_and(|range| {
-            page.events.first().map(|event| event.sequence) != Some(range.start_sequence)
-                || page.events.last().map(|event| event.sequence) != Some(range.end_sequence)
-                || page
-                    .events
-                    .iter()
-                    .any(|event| event.session_id != session_id)
-                || page
-                    .events
-                    .windows(2)
-                    .any(|pair| pair[0].sequence >= pair[1].sequence)
-        })
-    {
-        return Err(ClientError::Protocol(
-            "inconsistent projection history page boundary".to_owned(),
-        ));
-    }
-    Ok(SessionHistoryPage {
-        session_id,
-        events: page.events,
-        compatibility_issues: Vec::new(),
-        next_cursor: None,
-        has_more,
-    })
-}
-
 /// Submit-message effect request payload.
 #[derive(Debug)]
 pub struct SubmitMessageRequest {
@@ -1026,28 +871,6 @@ pub enum TuiEffect {
     LoadPluginStatus { session_id: SessionId },
     /// Load agent metadata.
     LoadAgentCatalog,
-    /// Load an older history page before the currently displayed timeline.
-    LoadOlderHistory {
-        /// Session to load.
-        session_id: SessionId,
-        /// Pagination cursor.
-        cursor: SessionHistoryCursor,
-        /// Resident window generation at request time.
-        generation: u64,
-        /// Width used for semantic row estimation (not terminal layout).
-        width_columns: u16,
-    },
-    /// Load a newer history page after the currently displayed timeline.
-    LoadNewerHistory {
-        /// Session to load.
-        session_id: SessionId,
-        /// Pagination cursor.
-        cursor: SessionHistoryCursor,
-        /// Resident window generation at request time.
-        generation: u64,
-        /// Width used for semantic row estimation (not terminal layout).
-        width_columns: u16,
-    },
     /// Load the bounded pending-permission snapshot during attach/reconnect.
     ListPermissions,
     /// Save composer draft text for a scope.
@@ -1208,15 +1031,6 @@ pub enum TuiEffect {
     /// Load one bounded canonical milestone page for timeline navigation.
     LoadMilestones {
         request: super::timeline_dialog::MilestonePageRequest,
-    },
-    /// Load a bounded history window around a timeline entry.
-    LoadTimelineJump {
-        /// Active session.
-        session_id: SessionId,
-        /// Resident window generation when the jump was requested.
-        generation: u64,
-        /// Selected event sequence.
-        sequence: u64,
     },
     /// Invoke a plugin-owned command without terminal navigation effects.
     InvokePluginCommand {
@@ -1448,8 +1262,6 @@ pub enum TuiEffectResult {
     SessionOpened {
         /// Session that was opened.
         session_id: SessionId,
-        /// Whether older history exists before the attached window.
-        has_older_history: bool,
         /// Attach result and event-stream task.
         result: Box<Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError>>,
     },
@@ -1539,40 +1351,6 @@ pub enum TuiEffectResult {
     AgentCatalogLoaded {
         /// Agent catalog result.
         agents: Result<AgentCatalog, String>,
-    },
-    /// Older history page load completed.
-    OlderHistoryLoaded {
-        /// Session that was requested.
-        session_id: SessionId,
-        /// Requested boundary cursor.
-        cursor: SessionHistoryCursor,
-        /// Resident window generation at request time.
-        generation: u64,
-        /// History page result.
-        result: Result<
-            (
-                SessionHistoryPage,
-                Vec<bcode_session_models::SubmissionRecord>,
-            ),
-            ClientError,
-        >,
-    },
-    /// Newer history page load completed.
-    NewerHistoryLoaded {
-        /// Session that was requested.
-        session_id: SessionId,
-        /// Requested boundary cursor.
-        cursor: SessionHistoryCursor,
-        /// Resident window generation at request time.
-        generation: u64,
-        /// History page result.
-        result: Result<
-            (
-                SessionHistoryPage,
-                Vec<bcode_session_models::SubmissionRecord>,
-            ),
-            ClientError,
-        >,
     },
     /// Permission poll completed.
     PermissionList {
@@ -1731,25 +1509,6 @@ pub enum TuiEffectResult {
         request: super::timeline_dialog::MilestonePageRequest,
         /// Bounded canonical page.
         result: Result<bcode_session_models::SessionMilestonePage, ClientError>,
-    },
-    /// Bounded timeline jump history loaded.
-    TimelineJumpLoaded {
-        /// Session for which the jump was requested.
-        session_id: SessionId,
-        /// Resident window generation when the jump was requested.
-        generation: u64,
-        /// Selected source sequence.
-        sequence: u64,
-        /// Loaded events and bounded-window flags.
-        result: Result<
-            (
-                Vec<bcode_session_models::SessionEvent>,
-                bool,
-                bool,
-                Vec<bcode_session_models::SubmissionRecord>,
-            ),
-            TuiError,
-        >,
     },
     /// Plugin command invocation completed.
     PluginCommandInvoked {
@@ -1931,9 +1690,6 @@ impl TuiEffectResult {
                 Ok(_) => DaemonObservation::Success,
                 Err(error) => DaemonObservation::Unavailable(error.clone()),
             },
-            Self::OlderHistoryLoaded { result, .. } | Self::NewerHistoryLoaded { result, .. } => {
-                DaemonObservation::from_client_result(result)
-            }
             Self::PermissionList { result } => DaemonObservation::from_client_result(result),
             Self::SaveDraft { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
@@ -1973,7 +1729,6 @@ impl TuiEffectResult {
             | Self::SlashCommandExecuted { .. }
             | Self::ThinkingDialogLoaded { .. }
             | Self::MilestonesLoaded { .. }
-            | Self::TimelineJumpLoaded { .. }
             | Self::PluginCommandInvoked { .. } => DaemonObservation::None,
             Self::RalphAction { result, .. } => DaemonObservation::from_tui_result(result),
             Self::RalphStarted { result } => DaemonObservation::from_tui_result(result),
@@ -2098,8 +1853,6 @@ enum EffectKey {
     SessionModelStatus,
     PluginStatus,
     AgentCatalog,
-    OlderHistory,
-    NewerHistory,
     PermissionList,
     DraftSave,
     SlashPalette,
@@ -2201,28 +1954,6 @@ impl TuiEffect {
                 generation,
                 result: Err(client_error),
             },
-            Self::LoadOlderHistory {
-                session_id,
-                cursor,
-                generation,
-                ..
-            } => TuiEffectResult::OlderHistoryLoaded {
-                session_id,
-                cursor,
-                generation,
-                result: Err(client_error),
-            },
-            Self::LoadNewerHistory {
-                session_id,
-                cursor,
-                generation,
-                ..
-            } => TuiEffectResult::NewerHistoryLoaded {
-                session_id,
-                cursor,
-                generation,
-                result: Err(client_error),
-            },
             Self::SaveDraft { text, .. } => TuiEffectResult::SaveDraft {
                 text,
                 result: Err(client_error),
@@ -2233,7 +1964,6 @@ impl TuiEffect {
             },
             Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
                 session_id,
-                has_older_history: true,
                 result: Box::new(Err(TuiError::Client(client_error))),
             },
             Self::LoadDraftStatus { .. } => TuiEffectResult::DraftStatusLoaded {
@@ -2486,16 +2216,6 @@ impl TuiEffect {
                 request,
                 result: Err(client_error),
             },
-            Self::LoadTimelineJump {
-                session_id,
-                generation,
-                sequence,
-            } => TuiEffectResult::TimelineJumpLoaded {
-                session_id,
-                generation,
-                sequence,
-                result: Err(client_error.into()),
-            },
             Self::InvokePluginCommand { plugin_id, .. } => TuiEffectResult::PluginCommandInvoked {
                 plugin_id,
                 result: Err(client_error.into()),
@@ -2568,8 +2288,6 @@ impl TuiEffect {
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadSessionModelStatus { .. }
             | Self::LoadPluginStatus { .. }
-            | Self::LoadOlderHistory { .. }
-            | Self::LoadNewerHistory { .. }
             | Self::ListPermissions
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
@@ -2598,7 +2316,6 @@ impl TuiEffect {
             | Self::DescribeSkill { .. }
             | Self::LoadThinkingDialog { .. }
             | Self::LoadMilestones { .. }
-            | Self::LoadTimelineJump { .. }
             | Self::LoadTranscriptV2History { .. }
             | Self::LoadManagedModels => EffectDaemonIntent::Background,
         }
@@ -2853,8 +2570,6 @@ impl TuiEffect {
             Self::LoadSessionModelStatus { .. } => EffectKey::SessionModelStatus,
             Self::LoadPluginStatus { .. } => EffectKey::PluginStatus,
             Self::LoadAgentCatalog => EffectKey::AgentCatalog,
-            Self::LoadOlderHistory { .. } => EffectKey::OlderHistory,
-            Self::LoadNewerHistory { .. } => EffectKey::NewerHistory,
             Self::ListPermissions => EffectKey::PermissionList,
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
@@ -2884,7 +2599,7 @@ impl TuiEffect {
             Self::LoadSkillPicker => EffectKey::SkillPicker,
             Self::DescribeSkill { .. } => EffectKey::SkillDescription,
             Self::LoadThinkingDialog { .. } => EffectKey::ThinkingDialog,
-            Self::LoadMilestones { .. } | Self::LoadTimelineJump { .. } => EffectKey::TimelineJump,
+            Self::LoadMilestones { .. } => EffectKey::TimelineJump,
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,
@@ -2952,7 +2667,6 @@ impl TuiEffect {
                 | Self::CancelSearchIndexing { .. }
                 | Self::WaitSearchIndexing { .. }
                 | Self::LoadMilestones { .. }
-                | Self::LoadTimelineJump { .. }
                 | Self::OpenXray { .. }
         )
     }
@@ -3078,34 +2792,6 @@ impl TuiEffect {
                 }
                 .await;
                 TuiEffectResult::CancelTurn { session_id, result }
-            }
-            Self::LoadOlderHistory {
-                session_id: owner,
-                cursor,
-                generation,
-                width_columns,
-            } if owner == session_id => {
-                let result = managed_transcript_page(&commands, cursor, width_columns, true).await;
-                TuiEffectResult::OlderHistoryLoaded {
-                    session_id,
-                    cursor,
-                    generation,
-                    result,
-                }
-            }
-            Self::LoadNewerHistory {
-                session_id: owner,
-                cursor,
-                generation,
-                width_columns,
-            } if owner == session_id => {
-                let result = managed_transcript_page(&commands, cursor, width_columns, false).await;
-                TuiEffectResult::NewerHistoryLoaded {
-                    session_id,
-                    cursor,
-                    generation,
-                    result,
-                }
             }
             Self::ExecuteSlashCommand {
                 message,
@@ -3324,7 +3010,6 @@ impl TuiEffect {
                 }
                 TuiEffectResult::SessionOpened {
                     session_id,
-                    has_older_history: true,
                     result: Box::new(
                         history_flow::attach_session_event_stream_with_window_request(
                             &client,
@@ -3386,42 +3071,6 @@ impl TuiEffect {
                 agents: AgentCatalog::load(&client)
                     .await
                     .map_err(|error| error.to_string()),
-            },
-            Self::LoadOlderHistory {
-                session_id,
-                cursor,
-                generation,
-                width_columns,
-            } => TuiEffectResult::OlderHistoryLoaded {
-                session_id,
-                cursor,
-                generation,
-                result: load_transcript_history_page(
-                    &client,
-                    session_id,
-                    cursor,
-                    width_columns,
-                    true,
-                )
-                .await,
-            },
-            Self::LoadNewerHistory {
-                session_id,
-                cursor,
-                generation,
-                width_columns,
-            } => TuiEffectResult::NewerHistoryLoaded {
-                session_id,
-                cursor,
-                generation,
-                result: load_transcript_history_page(
-                    &client,
-                    session_id,
-                    cursor,
-                    width_columns,
-                    false,
-                )
-                .await,
             },
             Self::ListPermissions => TuiEffectResult::PermissionList {
                 result: client.list_permissions().await,
@@ -3789,19 +3438,6 @@ impl TuiEffect {
                 };
                 TuiEffectResult::ThinkingDialogLoaded { focus, result }
             }
-            Self::LoadTimelineJump {
-                session_id,
-                generation,
-                sequence,
-            } => TuiEffectResult::TimelineJumpLoaded {
-                session_id,
-                generation,
-                sequence,
-                result: super::history_flow::load_timeline_jump_events(
-                    &client, session_id, sequence,
-                )
-                .await,
-            },
             Self::InvokePluginCommand {
                 plugin_id,
                 command_id,
@@ -4970,44 +4606,7 @@ mod projection_paging_tests {
             assert_eq!(owner.requests.lock().unwrap().len(), 1);
         }
     }
-    use bcode_session_models::{
-        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionSourceRange, ProjectionWindow,
-        SessionEvent, SessionEventKind,
-    };
-
-    fn projection_page(
-        session_id: SessionId,
-        start: u64,
-        end: u64,
-        has_more: bool,
-    ) -> bcode_session_models::ProjectionHistoryPage {
-        bcode_session_models::ProjectionHistoryPage {
-            session_id,
-            window: ProjectionWindow {
-                projection: SessionProjectionKind::Transcript,
-                transcript_items: Vec::new(),
-                source_range: Some(ProjectionSourceRange {
-                    start_sequence: start,
-                    end_sequence: end,
-                }),
-                has_older: has_more,
-                has_newer: has_more,
-                scanned_events: usize::try_from(end - start + 1).expect("small test page"),
-            },
-            events: (start..=end)
-                .map(|sequence| SessionEvent {
-                    schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    sequence,
-                    timestamp_ms: sequence,
-                    session_id,
-                    provenance: None,
-                    kind: SessionEventKind::ClientAttached {
-                        client_id: ClientId::new(),
-                    },
-                })
-                .collect(),
-        }
-    }
+    use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId};
 
     fn queue_test_hello(executable_digest: &str) -> bcode_ipc::ResponsePayload {
         bcode_ipc::ResponsePayload::Hello {
@@ -5150,177 +4749,6 @@ mod projection_paging_tests {
         };
         assert_eq!(confirmation, expected);
         assert!(status.oldest.is_none());
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn scheduled_history_effect_fetches_bounded_page_over_ipc() {
-        use bcode_session_models::{ProjectionHistoryPage, ProjectionWindow};
-
-        let session_id = SessionId::new();
-        let socket_dir = tempfile::tempdir().expect("socket directory");
-        let endpoint =
-            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/history.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
-        let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
-            .expect("test executable identity")
-            .1;
-        let responder = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("history client");
-            let mut observed_request = None;
-            loop {
-                let envelope = bcode_ipc::recv_envelope(&mut stream)
-                    .await
-                    .expect("client request");
-                let request = bcode_ipc::decode_request(&envelope.payload).expect("decode request");
-                let response = match request {
-                    bcode_ipc::Request::Hello { .. } => {
-                        bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
-                            protocol_version: bcode_ipc::ProtocolVersion::current(),
-                            client_id: ClientId::new(),
-                            daemon: bcode_ipc::DaemonStatus {
-                                namespace: bcode_ipc::daemon_namespace(),
-                                protocol_version: u32::from(
-                                    bcode_ipc::ProtocolVersion::current().0,
-                                ),
-                                artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                                executable_digest: Some(executable_digest.clone()),
-                                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
-                                storage_writer_epoch: Some(
-                                    bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-                                ),
-                                session_event_schema_version: Some(
-                                    CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                                ),
-                                state_location_id: Some(bcode_ipc::state_location_id()),
-                                ..bcode_ipc::DaemonStatus::default()
-                            },
-                        })
-                    }
-                    bcode_ipc::Request::SessionProjectionHistoryPage {
-                        session_id: requested,
-                        request,
-                    } => {
-                        assert_eq!(requested, session_id);
-                        assert_eq!(request.anchor, ProjectionWindowAnchor::BeforeSequence(11));
-                        assert_eq!(request.direction, ProjectionWindowDirection::Backward);
-                        assert_eq!(request.projection, SessionProjectionKind::Transcript);
-                        assert!(
-                            request.limits.max_events_scanned <= TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED
-                        );
-                        observed_request = Some(request);
-                        bcode_ipc::Response::Ok(
-                            bcode_ipc::ResponsePayload::SessionProjectionHistoryPage {
-                                page: ProjectionHistoryPage {
-                                    session_id,
-                                    window: ProjectionWindow {
-                                        projection: SessionProjectionKind::Transcript,
-                                        transcript_items: Vec::new(),
-                                        source_range: Some(ProjectionSourceRange {
-                                            start_sequence: 7,
-                                            end_sequence: 10,
-                                        }),
-                                        has_older: true,
-                                        has_newer: true,
-                                        scanned_events: 4,
-                                    },
-                                    events: projection_page(session_id, 7, 10, true).events,
-                                },
-                            },
-                        )
-                    }
-                    other => panic!("unexpected history request: {other:?}"),
-                };
-                let reply = bcode_ipc::response_envelope(envelope.request_id, &response)
-                    .expect("encode response");
-                bcode_ipc::send_envelope(&mut stream, &reply)
-                    .await
-                    .expect("send response");
-                if observed_request.is_some() {
-                    break;
-                }
-            }
-            observed_request.expect("projection request")
-        });
-        let effect = TuiEffect::LoadOlderHistory {
-            session_id,
-            cursor: SessionHistoryCursor { sequence: 10 },
-            generation: 42,
-            width_columns: 80,
-        };
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            effect.run(BcodeClient::new(endpoint), sender),
-        )
-        .await
-        .expect("history fetch timeout");
-        let request = responder.await.expect("IPC responder");
-        assert_eq!(request.target.min_items, Some(TRANSCRIPT_PAGE_TARGET_ITEMS));
-        match result {
-            TuiEffectResult::OlderHistoryLoaded {
-                session_id: returned,
-                cursor,
-                generation,
-                result,
-            } => {
-                assert_eq!(returned, session_id);
-                assert_eq!(cursor.sequence, 10);
-                assert_eq!(generation, 42);
-                let (page, _) = result.expect("bounded history page");
-                assert_eq!(page.events.len(), 4);
-                assert_eq!(page.events.first().map(|event| event.sequence), Some(7));
-                assert!(page.has_more);
-            }
-            _ => panic!("unexpected effect result"),
-        }
-    }
-
-    #[test]
-    fn projection_pages_preserve_non_presenting_source_progress_in_both_directions() {
-        let session_id = SessionId::new();
-        let older = projection_page_as_history_page(
-            session_id,
-            SessionHistoryCursor { sequence: 10 },
-            true,
-            projection_page(session_id, 7, 10, true),
-        )
-        .expect("older non-presenting page");
-        assert_eq!(older.events.len(), 4);
-        assert!(older.has_more);
-        let newer = projection_page_as_history_page(
-            session_id,
-            SessionHistoryCursor { sequence: 12 },
-            false,
-            projection_page(session_id, 12, 15, false),
-        )
-        .expect("newer non-presenting page");
-        assert_eq!(newer.events.len(), 4);
-        assert!(!newer.has_more);
-    }
-
-    #[test]
-    fn projection_pages_reject_wrong_boundary_or_stale_session() {
-        let session_id = SessionId::new();
-        let page = projection_page(session_id, 7, 10, true);
-        assert!(
-            projection_page_as_history_page(
-                session_id,
-                SessionHistoryCursor { sequence: 11 },
-                true,
-                page.clone(),
-            )
-            .is_err()
-        );
-        assert!(
-            projection_page_as_history_page(
-                SessionId::new(),
-                SessionHistoryCursor { sequence: 10 },
-                true,
-                page,
-            )
-            .is_err()
-        );
     }
 }
 

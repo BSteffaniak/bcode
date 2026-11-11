@@ -1148,25 +1148,3 @@ pub fn d4_prepend_measures_only_new_units<D: TranscriptScenarioDriver>() {
         format!("the frame after the page did layout work: {frame:?}")
     });
 }
-
-// ---------------------------------------------------------------------------------------------
-// Interactions and inline shell (C37, C39)
-// ---------------------------------------------------------------------------------------------
-
-/// C37: interaction placement (transcript/pinned), off-screen focus retain/suspend, and Ctrl-I
-/// restoring the active interaction into view.
-///
-/// Stub: the driver cannot open plugin interaction surfaces yet.
-pub fn c37_interaction_placement_and_focus_restore<D: TranscriptScenarioDriver>() {
-    let scenario = attach_all::<D>(ScenarioSession::with_turns(2, 1), WIDTH, HEIGHT);
-    scenario.fail("driver: needs plugin interaction surfaces");
-}
-
-/// C39: inline shell expansion (`e`) opens up to 128 rows with local horizontal scroll and
-/// never forwards input to the PTY.
-///
-/// Stub: the driver cannot produce positioned shell captures yet.
-pub fn c39_inline_shell_expansion<D: TranscriptScenarioDriver>() {
-    let scenario = attach_all::<D>(ScenarioSession::with_turns(2, 1), WIDTH, HEIGHT);
-    scenario.fail("driver: needs positioned shell captures");
-}

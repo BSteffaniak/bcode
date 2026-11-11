@@ -1,4 +1,4 @@
-//! Markdown contribution activation for the V2 transcript (V1 visible parity).
+//! Markdown contribution activation for the transcript.
 //!
 //! * Clicking an actionable Markdown contribution (press and release without a drag, BMUX 14)
 //!   focuses and activates it; `tui.markdown.focusNext` / `focusPrevious` (ctrl+tab /
@@ -16,7 +16,7 @@
 //! * Mermaid diagrams toggle a source view painted over the transcript viewport while the
 //!   diagram is visible; it closes when activated again or when the diagram leaves the view.
 //!
-//! Status messages are V1's ([`MarkdownNotice`]), reported through the host shell's status row.
+//! Status messages ([`MarkdownNotice`]) are reported through the host shell's status row.
 //! The focus highlight is reversed video over the focused target's cells, from the prepared
 //! frame's retained geometry (B3, L5).
 
@@ -63,7 +63,7 @@ pub fn resolve_markdown_key(keymap: &BmuxKeyMap, stroke: KeyStroke) -> Option<Ma
     }
 }
 
-/// Status message of one Markdown action (V1's texts).
+/// Status message of one Markdown action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkdownNotice {
     /// Focus moved to a contribution; names the activate, copy and move keys.
@@ -200,7 +200,7 @@ impl TranscriptV2Host {
             .is_some_and(|target| self.activate_markdown_target(&target, at))
     }
 
-    /// Activate a resident Markdown target with V1's policy and messages.
+    /// Activate a resident Markdown target with the host shell's policy and messages.
     fn activate_markdown_target(&mut self, target: &MarkdownTargetId, at: Instant) -> bool {
         let (update, activation) = self.engine.activate_markdown(target, at);
         self.absorb(update);

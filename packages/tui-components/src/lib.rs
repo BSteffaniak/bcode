@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Reusable Bcode TUI components and compatibility adapters.
+//! Reusable Bcode TUI components.
 
 #[cfg(any(feature = "source-viewer", feature = "diff-viewer"))]
 mod source_text;
@@ -17,8 +17,6 @@ pub mod compact;
 pub mod composer;
 #[cfg(feature = "diff-viewer")]
 pub mod diff_viewer;
-#[cfg(feature = "transcript-markdown")]
-pub mod markdown_selection;
 #[cfg(feature = "permission")]
 pub mod permission;
 #[cfg(feature = "plugin-visual")]
@@ -37,9 +35,3 @@ pub mod terminal_viewer;
 pub mod tool_card;
 #[cfg(feature = "transcript")]
 pub mod transcript;
-#[cfg(feature = "transcript")]
-pub mod transcript_history;
-#[cfg(feature = "transcript-markdown")]
-pub mod transcript_markdown;
-#[cfg(feature = "transcript")]
-pub mod transcript_viewport;

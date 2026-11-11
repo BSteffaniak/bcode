@@ -18,9 +18,9 @@ use super::effects::HistoryLoaded;
 use crate::effects::{TuiEffect, TuiEffectResult};
 use crate::history_flow::SessionStreamUpdate;
 
-/// Whether an effect result belongs to the V2 host alone and must not reach the V1 effect
-/// handling: the results of V2 history requests. Every other result is shared host-shell
-/// state and goes to V1 first.
+/// Whether an effect result belongs to the transcript host alone and must not reach the shell's
+/// effect handling: the results of transcript history requests. Every other result is
+/// host-shell state.
 #[must_use]
 pub const fn owns_effect_result(result: &TuiEffectResult) -> bool {
     matches!(result, TuiEffectResult::TranscriptV2HistoryLoaded { .. })
@@ -117,23 +117,6 @@ impl TranscriptV2Host {
         }
     }
 
-    /// Observe a shared (V1-handled) effect result that also affects the V2 transcript.
-    /// Returns whether the transcript changed.
-    ///
-    /// A timeline jump the host shell loaded becomes a V2 `JumpToSequence` intent, which loads
-    /// its own `Around` window (W8, W10); session opening is followed through
-    /// [`Self::sync_session`] at the end of the update.
-    pub fn observe_effect_result(&mut self, result: &TuiEffectResult, at: Instant) -> bool {
-        match result {
-            TuiEffectResult::TimelineJumpLoaded {
-                session_id,
-                sequence,
-                ..
-            } if Some(*session_id) == self.session => self.jump_to_sequence(*sequence, at),
-            _ => false,
-        }
-    }
-
     /// Apply an effect result owned by the V2 host ([`owns_effect_result`]): page and window
     /// results (W3). Results for another session or attach epoch, of another window generation
     /// or no longer in flight are dropped (generation fencing); a failed read leaves its request
@@ -201,7 +184,7 @@ impl TranscriptV2Host {
 
     /// Apply the host shell's streaming-presentation policy (`[tui] streaming`, the streaming
     /// configurator's override or reset) to the engine, which paces live text with it exactly
-    /// as V1's `SessionView` does (D13). An unchanged policy is a no-op; switching to immediate
+    /// as the host shell's `SessionView` does (D13). An unchanged policy is a no-op; switching to immediate
     /// presentation shows pending text in this update.
     pub fn sync_streaming_policy(
         &mut self,
@@ -640,31 +623,5 @@ mod tests {
         host.note_opening_anchor(Some((session, None)));
         host.sync_session(Some(session), at);
         assert_ne!(requested_around(&host), Some(17));
-    }
-
-    #[test]
-    fn a_timeline_jump_loads_the_v2_around_window() {
-        let at = Instant::now();
-        let session = SessionId::new();
-        let (mut host, load) = attached(session, at);
-        assert!(host.apply_effect_result(tail_result(load, conversation(session, 4)), at));
-        let jump = TuiEffectResult::TimelineJumpLoaded {
-            session_id: session,
-            generation: 0,
-            sequence: 9_000,
-            result: Err(crate::TuiError::SessionUnavailable {
-                session_id: session,
-                reason: "V1 window not needed".to_owned(),
-            }),
-        };
-        assert!(!super::owns_effect_result(&jump));
-        assert!(host.observe_effect_result(&jump, at));
-        let effects = host.drain_effects();
-        assert!(matches!(
-            effects.as_slice(),
-            [TuiEffect::LoadTranscriptV2History { load }]
-                if matches!(load.request, HostRequest::Window(issued)
-                    if issued.request == WindowRequest::Around { sequence: 9_000 })
-        ));
     }
 }

@@ -325,19 +325,19 @@ mod tests {
 
     #[test]
     fn timeout_report_is_ephemeral_and_absent_from_canonical_session_view() {
-        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let mut app = BmuxApp::new_with_history(None, &[], &[]);
         let error = bcode_client::ClientError::ConnectTimeout {
             timeout: Duration::from_secs(5),
         };
 
         report_client_issue(&mut app, "send failed", &error);
 
-        assert_eq!(app.transcript().len(), 1);
-        assert!(
-            app.transcript()[0]
-                .text()
-                .contains("daemon did not respond")
-        );
+        let notices = app
+            .ephemeral_notices()
+            .map(|notice| notice.text().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("daemon did not respond"));
         let canonical_empty = app.session_view_snapshot().transcript.items.is_empty();
         drop(app);
         assert!(canonical_empty);
@@ -346,30 +346,25 @@ mod tests {
     #[test]
     fn presentation_note_persistence_failure_reports_without_retrying_persistence() {
         let session_id = bcode_session_models::SessionId::new();
-        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[]);
         let error = bcode_client::ClientError::RequestTimeout {
             timeout: std::time::Duration::from_secs(15),
         };
 
         report_client_issue(&mut app, "presentation note persistence failed", &error);
 
+        // The failure diagnostic is a process-local notice, so it cannot re-enter the daemon
+        // append path.
+        let notices = app
+            .ephemeral_notices()
+            .map(|notice| notice.text().to_owned())
+            .collect::<Vec<_>>();
         assert_eq!(
-            app.transcript().len(),
+            notices.len(),
             1,
             "a failed durable note reports exactly one ephemeral diagnostic"
         );
-        assert!(
-            app.transcript()[0]
-                .text()
-                .contains("presentation note persistence failed")
-        );
-        assert!(
-            matches!(
-                app.transcript_origin_for_test(0),
-                Some(crate::transcript_document::TranscriptPresentationOrigin::Ephemeral { .. })
-            ),
-            "the failure diagnostic is process-local, so it cannot re-enter the daemon append path"
-        );
+        assert!(notices[0].contains("presentation note persistence failed"));
         let canonical_empty = app.session_view_snapshot().transcript.items.is_empty();
         drop(app);
         assert!(

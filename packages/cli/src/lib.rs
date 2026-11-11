@@ -505,7 +505,6 @@ pub async fn run_with_static_bundled(
     command = command.version(build_info().display_version());
     let matches = command.get_matches();
     let arguments_ready = Instant::now();
-    install_tui_engine_selection(&matches)?;
     let _config_override = config_override_from_matches(&matches);
     // Claim the one-shot state location before state resolution, startup reports,
     // plugin preflight, or any daemon operation can populate it.
@@ -5097,35 +5096,6 @@ mod build_version_tests {
     }
 }
 
-/// Fix the transcript engine launch inputs (`--tui-engine` and `BCODE_TUI_ENGINE`) before any
-/// TUI can start.
-///
-/// # Errors
-///
-/// Returns [`CliError::InvalidArguments`] naming the valid values when the environment value
-/// names no engine (EN2).
-fn install_tui_engine_selection(matches: &clap::ArgMatches) -> Result<(), CliError> {
-    bcode_tui::engine_selection::install_launch_selection(
-        matches
-            .get_one::<bcode_config::TuiEngine>("tui_engine")
-            .copied(),
-    )
-    .map_err(|error| CliError::InvalidArguments(error.to_string()))
-}
-
-/// Parser for `--tui-engine`: rejects anything but the engine spellings (EN2).
-fn tui_engine_value_parser() -> impl clap::builder::TypedValueParser<Value = bcode_config::TuiEngine>
-{
-    use clap::builder::TypedValueParser as _;
-
-    clap::builder::PossibleValuesParser::new(
-        bcode_config::TuiEngine::ALL.map(bcode_config::TuiEngine::as_str),
-    )
-    .map(|value| {
-        bcode_config::TuiEngine::parse(&value).expect("possible values are engine spellings")
-    })
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "bcode", version, about = "TUI-first coding agent")]
 struct Cli {
@@ -5171,15 +5141,6 @@ struct Cli {
     /// Force the onboarding/setup-map flow.
     #[arg(long = "onboard", global = true)]
     onboard: bool,
-    /// Terminal UI transcript engine for this process (`v1` or `v2`). Overrides
-    /// `BCODE_TUI_ENGINE` and `[tui] engine`.
-    #[arg(
-        long = "tui-engine",
-        global = true,
-        value_name = "ENGINE",
-        value_parser = tui_engine_value_parser()
-    )]
-    tui_engine: Option<bcode_config::TuiEngine>,
     #[command(flatten)]
     execution_mode: ExecutionModeArgs,
     #[command(subcommand)]
@@ -33231,34 +33192,6 @@ mod client_timeout_cli_tests {
                 .unwrap_err();
             assert!(matches!(error, super::CliError::InvalidArguments(_)));
         }
-    }
-
-    #[test]
-    fn tui_engine_flag_is_global_and_rejects_unknown_engines() {
-        let cli = Cli::try_parse_from(["bcode", "--tui-engine", "v2"]).expect("v2 parses");
-        assert_eq!(cli.tui_engine, Some(bcode_config::TuiEngine::V2));
-        let cli = Cli::try_parse_from(["bcode", "tui", "--tui-engine", "v1"])
-            .expect("global flag parses after a subcommand");
-        assert_eq!(cli.tui_engine, Some(bcode_config::TuiEngine::V1));
-        assert_eq!(
-            Cli::try_parse_from(["bcode"]).expect("no flag").tui_engine,
-            None
-        );
-        let error = Cli::try_parse_from(["bcode", "--tui-engine", "v3"])
-            .expect_err("unknown engine is rejected");
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
-        let command = Cli::command();
-        let argument = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "tui_engine")
-            .expect("tui-engine argument");
-        assert!(argument.is_global_set());
-        let values = argument
-            .get_possible_values()
-            .iter()
-            .map(|value| value.get_name().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(values, ["v1", "v2"]);
     }
 
     #[test]

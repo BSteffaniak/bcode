@@ -14,10 +14,7 @@ use crate::transcript_v2_host::TranscriptV2Host;
 use crate::transcript_v2_host::test_fixtures::{COMPOSER, REGION, attached, paint};
 
 fn keymap() -> BmuxKeyMap {
-    BmuxKeyMap::from_config_for_engine(
-        &bcode_config::TuiConfig::default(),
-        bcode_config::TuiEngine::V2,
-    )
+    BmuxKeyMap::from_config(&bcode_config::TuiConfig::default())
 }
 
 fn press(host: &mut TranscriptV2Host, key: &str, at: Instant) -> TranscriptInputOutcome {

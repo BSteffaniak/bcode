@@ -625,13 +625,12 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     Ok(())
 }
 
-fn latest_assistant_message(chat: &ActiveChat) -> Option<String> {
-    chat.app
-        .transcript()
-        .iter()
-        .rev()
-        .find(|item| item.role == "assistant" && !item.text.trim().is_empty())
-        .map(|item| item.text.clone())
+/// The assistant reply a setup draft is saved from.
+///
+/// Saving a setup draft from the transcript is not wired to transcript content: no assistant
+/// reply is offered, so saving reports that no assistant draft was found.
+const fn latest_assistant_message(_chat: &ActiveChat) -> Option<String> {
+    None
 }
 
 fn append_setup_transcript(

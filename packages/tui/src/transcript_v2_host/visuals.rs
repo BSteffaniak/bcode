@@ -13,7 +13,7 @@
 //!   replaceable pending request. A newer candidate replaces the pending one; the pending
 //!   request starts when the active one completes. An active request whose unit leaves the
 //!   resident window, or whose slot no longer exists, is cancelled.
-//! * Workers are the V1 ones: [`render_mermaid_image`] (WASM-isolated render plus bounded
+//! * Workers are the host's: [`render_mermaid_image`] (WASM-isolated render plus bounded
 //!   rasterization) on a blocking task, and [`MarkdownImageLoader::load_cancellable`] (bounded,
 //!   redirect-validating, decode-limited). The host only shares their handles.
 //! * A completion is installed only on an exact match ([`TranscriptV2Host::complete_markdown_visual`]):
@@ -26,12 +26,12 @@
 //!   is re-projected. Ready images become BMUX image placements that the Markdown body
 //!   registers from its own retained node while painting, so only visible, correctly
 //!   positioned content contributes placements. Failures (and images the terminal or the
-//!   network policy cannot show) become notice rows with the V1 fallback text.
+//!   network policy cannot show) become notice rows with the host's fallback text.
 //! * Accepted visuals of units that left the resident window are dropped.
 //!
 //! Without terminal image support no work starts: Mermaid diagrams keep their highlighted,
-//! source-backed code block and images show the V1 "unsupported" notice. Remote images show
-//! the V1 "network disabled" notice unless `[tui.markdown] network_images` is set.
+//! source-backed code block and images show the "unsupported" notice. Remote images show
+//! the "network disabled" notice unless `[tui.markdown] network_images` is set.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -61,7 +61,7 @@ pub const MAX_CACHED_RESULTS: usize = 32;
 /// Most decoded pixel bytes held by the result cache.
 pub const MAX_CACHED_BYTES: usize = 64 * 1024 * 1024;
 
-/// Handles to the host-side workers (shared with V1; both are reference counted).
+/// Handles to the host-side workers (both are reference counted).
 #[derive(Clone, Default)]
 pub struct VisualWorkers {
     /// Bounded Markdown image loader, when it could be constructed.
@@ -387,7 +387,7 @@ struct Candidate {
     slot: VisualSlot,
 }
 
-/// Notice rows of a failed request (V1 fallback text).
+/// Notice rows of a failed request (the host's fallback text).
 fn failure_notice(request: &VisualSlotRequest, diagnostic: &str) -> Arc<str> {
     match request {
         VisualSlotRequest::Mermaid { source, .. } => {

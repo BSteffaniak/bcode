@@ -7,8 +7,8 @@
 //! engine as BMUX terminal events routed to the transcript list (wheel), as the navigation
 //! intents the host keymap will produce for the default transcript keys, or as clicks hit-tested
 //! against the committed frame's retained item geometry; frames are prepared, painted through
-//! BMUX into a buffer and committed, and observations are read from the painted rows exactly as
-//! for V1 (marker tokens per row).
+//! BMUX into a buffer and committed, and observations are read from the painted rows (marker
+//! tokens per row).
 //!
 //! Units are rendered by the engine's standard producers (structure v2, chrome, Markdown, tools,
 //! groups) with the bundled default theme, the theme's structural layers and its motion level,

@@ -1,8 +1,8 @@
 //! The status row's transcript position label for the V2 transcript (C2).
 //!
 //! The host shell's status row reports how far the reader is from the latest content: "N rows
-//! from bottom" while reading above the content bottom and "N rows below latest" in tail space,
-//! exactly where V1 shows them. With V2 the values come from the last prepared frame: the
+//! from bottom" while reading above the content bottom and "N rows below latest" in tail space.
+//! The values come from the last prepared frame: the
 //! presented viewport offset and the engine's latest-bar decision
 //! ([`LatestBarState::rows_below_latest`](bcode_tui_transcript::latest_bar::LatestBarState)).
 //! The status row is regional chrome outside the transcript region, so a frame whose position

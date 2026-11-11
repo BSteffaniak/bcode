@@ -215,27 +215,3 @@ mod tests {
         assert_eq!(rows, original);
     }
 }
-
-// The complete accepted transcript engine is opt-in; container-only consumers
-// do not acquire semantic/session or plugin presentation dependencies.
-#[cfg(feature = "transcript-engine")]
-pub mod indexed_transcript_layout;
-#[cfg(feature = "transcript-engine")]
-pub mod item;
-#[cfg(feature = "transcript-engine")]
-pub mod transcript_document;
-#[cfg(feature = "transcript-engine")]
-pub mod transcript_layout;
-#[cfg(feature = "transcript-engine")]
-pub mod transcript_markdown_cache;
-
-#[cfg(feature = "transcript-engine")]
-pub mod accepted;
-#[cfg(feature = "transcript-engine")]
-pub mod actions;
-#[cfg(feature = "transcript-engine")]
-pub mod child;
-#[cfg(feature = "transcript-engine")]
-pub mod tool_fallback;
-#[cfg(feature = "transcript-engine")]
-pub mod tool_visual;

@@ -97,7 +97,7 @@ fn routed(rows: usize) -> RoutedTuiVisual {
     }
 }
 
-/// Everything V1 presents is accepted, bounded and scoped to its producer: anchors, source
+/// Everything the adapter presents is accepted, bounded and scoped to its producer: anchors, source
 /// identities and selection identities become `<plugin>:<identity>` (the identity content
 /// events and retained positions are routed by), invalid selection rows are dropped.
 #[test]
@@ -186,10 +186,7 @@ fn shell_host(at: Instant) -> TranscriptV2Host {
 }
 
 fn keymap() -> BmuxKeyMap {
-    BmuxKeyMap::from_config_for_engine(
-        &bcode_config::TuiConfig::default(),
-        bcode_config::TuiEngine::V2,
-    )
+    BmuxKeyMap::from_config(&bcode_config::TuiConfig::default())
 }
 
 fn frame(host: &mut TranscriptV2Host, at: Instant) -> Painted {

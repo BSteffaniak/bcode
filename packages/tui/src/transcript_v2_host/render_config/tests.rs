@@ -122,7 +122,7 @@ fn diff_options_follow_the_effective_diff_viewer_configuration() {
 
 #[test]
 fn render_inputs_are_applied_once_and_follow_changes() {
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let mut app = BmuxApp::new_with_history(None, &[], &[]);
     let mut host = TranscriptV2Host::new();
     let at = Instant::now();
     assert!(host.sync_render_inputs(&mut app, at), "first sync applies");

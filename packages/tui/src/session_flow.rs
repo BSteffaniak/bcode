@@ -295,13 +295,8 @@ pub fn initial_transcript_window_request(
 pub fn start_switch_session(
     chat: &mut ActiveChat,
     next_session_id: SessionId,
-    mut initial_window_request: bcode_session_models::ProjectionWindowRequest,
+    initial_window_request: bcode_session_models::ProjectionWindowRequest,
 ) {
-    let saved = chat.app.saved_reading_sequence(next_session_id);
-    if let Some(sequence) = saved {
-        initial_window_request.anchor =
-            bcode_session_models::ProjectionWindowAnchor::AroundSequence(sequence);
-    }
     start_switch_session_at_sequence(chat, next_session_id, initial_window_request, None);
 }
 
@@ -345,7 +340,7 @@ fn start_switch_session_at_sequence(
     chat.opening_session_progress = None;
     let previous_app = std::mem::replace(
         &mut chat.app,
-        BmuxApp::new_with_history(Some(next_session_id), &[], &[], false),
+        BmuxApp::new_with_history(Some(next_session_id), &[], &[]),
     );
     chat.app.take_cross_session_state_from(&previous_app);
     // Reopening the session that is already attached is an in-process reconstruction, so its
@@ -371,7 +366,6 @@ fn start_switch_session_at_sequence(
 pub fn complete_switch_session(
     chat: &mut ActiveChat,
     session_id: SessionId,
-    has_older_history: bool,
     result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
 ) {
     if chat.opening_session_id() != Some(session_id) {
@@ -393,7 +387,6 @@ pub fn complete_switch_session(
                     Some(session_id),
                     &attached.history,
                     &attached.input_history,
-                    has_older_history,
                 ),
             );
             chat.app.apply_submission_records(&attached.submissions);
@@ -409,17 +402,13 @@ pub fn complete_switch_session(
                 chat.app.replace_composer_with(&draft);
             }
             chat.app.apply_session_summary(&attached.session);
-            if anchor_sequence.is_none() {
-                chat.app.restore_saved_reading_position();
-            }
             chat.app.apply_usage_summary(&attached.usage_summary);
             chat.agents
                 .apply_runtime_selection(&mut chat.app, attached.runtime_selection.clone());
             chat.app
                 .set_status("session writable and attached".to_owned());
             if let Some(sequence) = anchor_sequence {
-                if chat.app.transcript_index_for_sequence(sequence).is_some() {
-                    chat.app.request_transcript_top_anchor_sequence(sequence);
+                if chat.app.has_transcript_sequence(sequence) {
                     chat.app.set_status("jumped to search result".to_owned());
                 } else {
                     chat.app.set_status(format!(
@@ -518,10 +507,7 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     chat.attachment = ChatSessionAttachment::Draft;
     chat.opening_session_progress = None;
     let current_agent_id = chat.app.current_agent_id().to_owned();
-    let previous_app = std::mem::replace(
-        &mut chat.app,
-        BmuxApp::new_with_history(None, &[], &[], false),
-    );
+    let previous_app = std::mem::replace(&mut chat.app, BmuxApp::new_with_history(None, &[], &[]));
     chat.app.take_cross_session_state_from(&previous_app);
     chat.app.clear_pending_reasoning_effort_for_session_change();
     chat.agents

@@ -25,11 +25,14 @@ fn configured_editor_command_wins_over_the_physical_key() {
             SessionKeyBinding::Editor(TextEditCommand::Insert('\n'))
         }
     }
-    let mut ui = crate::session_ui::SessionUi::new();
-    ui.composer.buffer_mut().insert_str("draft");
+    let mut state = TextInputState::new(TextEditBuffer::new());
+    state.buffer_mut().insert_str("draft");
     assert_eq!(
-        ui.update_configured_key(KeyStroke::simple(KeyCode::Enter), &InsertNewline),
+        apply_editor_binding(
+            &mut state,
+            InsertNewline.resolve(KeyStroke::simple(KeyCode::Enter))
+        ),
         Some(TextInputOutcome::Edited)
     );
-    assert_eq!(ui.composer.buffer().text(), "draft\n");
+    assert_eq!(state.buffer().text(), "draft\n");
 }

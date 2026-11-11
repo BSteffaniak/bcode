@@ -8,8 +8,6 @@ use bmux_tui_components::text_input::{TextInputControl, TextInputOutcome};
 
 use super::app::{BmuxApp, KeyActivationOutcome, composer_policy};
 use super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
-const TRANSCRIPT_SCROLL_ROWS: usize = 3;
-const TRANSCRIPT_PAGE_ROWS: usize = 10;
 
 /// Follow-up request produced by handling one key stroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -133,61 +131,6 @@ fn exit_or_clear_composer(app: &mut BmuxApp) -> KeyOutcome {
     }
 }
 
-/// Route `stroke` to transcript focus mode.
-///
-/// The focus-units chat action enters or leaves focus mode, and the
-/// detail-cycle chat action cycles disclosure (every unit, or the focused
-/// target in focus mode). While focus mode is active, keys bound in the
-/// transcript focus scope run their action.
-/// Returns `Some(redraw)` when focus mode consumed the key and `None` when the
-/// key belongs to ordinary handling; inactive focus mode consumes nothing but
-/// its entry action.
-pub fn handle_transcript_focus_key(
-    app: &mut BmuxApp,
-    keymap: &BmuxKeyMap,
-    stroke: KeyStroke,
-) -> Option<bool> {
-    use super::transcript_focus::{FOCUS_SCOPE, FOCUS_UNITS_ACTION, FocusAction};
-    if keymap.action(BmuxScope::Chat.id(), stroke) == Some(FOCUS_UNITS_ACTION) {
-        app.clear_pending_key_activation();
-        return Some(if app.transcript_focus_active() {
-            app.exit_transcript_focus()
-        } else {
-            app.enter_transcript_focus()
-        });
-    }
-    let focus_action = app
-        .transcript_focus_active()
-        .then(|| keymap.action(FOCUS_SCOPE, stroke))
-        .flatten();
-    // The chat-scope detail cycle works in and out of focus mode, unless a
-    // focus-scope binding claims the same key.
-    if focus_action.is_none()
-        && keymap.action(BmuxScope::Chat.id(), stroke)
-            == Some(super::transcript_focus::CYCLE_DETAIL_ACTION)
-    {
-        app.clear_pending_key_activation();
-        return Some(app.cycle_detail());
-    }
-    let action = focus_action.and_then(FocusAction::from_id)?;
-    app.clear_pending_key_activation();
-    Some(app.handle_transcript_focus_action(action))
-}
-
-/// Bulk disclosure; in focus mode it applies to the focused subtree.
-fn tool_disclosure_action(app: &mut BmuxApp, action: BmuxAction) -> KeyOutcome {
-    use bcode_presentation_policy::models::Disclosure;
-    let redraw = match action {
-        BmuxAction::ToolsExpandAll => app.set_all_disclosure(Disclosure::Expanded),
-        BmuxAction::ToolsCollapseAll => app.set_all_disclosure(Disclosure::Collapsed),
-        _ => app.reset_disclosure(),
-    };
-    KeyOutcome {
-        redraw,
-        request: KeyRequest::None,
-    }
-}
-
 pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<KeyOutcome> {
     use bmux_tui_components::text_input::TextInputHistoryAction;
     let outcome = match action? {
@@ -209,39 +152,23 @@ pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Opti
             request: KeyRequest::CycleThinkingEffort,
         },
         BmuxAction::DiffViewerLayoutCycle => diff_viewer_layout_action(app),
+        BmuxAction::InputHistoryPrevious => history_previous(app),
+        BmuxAction::InputHistoryNext => history_next(app),
+        // Transcript keys resolve in the transcript host before chat handling; a key it leaves
+        // unhandled is still consumed here, so it never edits the composer.
         BmuxAction::MarkdownFocusNext
         | BmuxAction::MarkdownFocusPrevious
         | BmuxAction::MarkdownActivate
-        | BmuxAction::MarkdownCopyDestination => markdown_action(app, action?),
-        BmuxAction::InputHistoryPrevious => history_previous(app),
-        BmuxAction::InputHistoryNext => history_next(app),
-        tools @ (BmuxAction::ToolsExpandAll
+        | BmuxAction::MarkdownCopyDestination
+        | BmuxAction::ToolsExpandAll
         | BmuxAction::ToolsCollapseAll
-        | BmuxAction::ToolsResetDisclosure) => tool_disclosure_action(app, tools),
-        BmuxAction::TranscriptPageUp => KeyOutcome {
-            redraw: app.scroll_transcript_up(TRANSCRIPT_PAGE_ROWS),
-            request: KeyRequest::None,
-        },
-        BmuxAction::TranscriptPageDown => KeyOutcome {
-            redraw: app.scroll_transcript_down(TRANSCRIPT_PAGE_ROWS),
-            request: KeyRequest::None,
-        },
-        BmuxAction::TranscriptTop => KeyOutcome {
-            redraw: app.scroll_transcript_up(usize::MAX / 2),
-            request: KeyRequest::None,
-        },
-        BmuxAction::TranscriptBottom => KeyOutcome {
-            redraw: app.scroll_transcript_to_bottom(),
-            request: KeyRequest::None,
-        },
-        BmuxAction::TranscriptLineUp => KeyOutcome {
-            redraw: app.scroll_transcript_up(TRANSCRIPT_SCROLL_ROWS),
-            request: KeyRequest::None,
-        },
-        BmuxAction::TranscriptLineDown => KeyOutcome {
-            redraw: app.scroll_transcript_down(TRANSCRIPT_SCROLL_ROWS),
-            request: KeyRequest::None,
-        },
+        | BmuxAction::ToolsResetDisclosure
+        | BmuxAction::TranscriptPageUp
+        | BmuxAction::TranscriptPageDown
+        | BmuxAction::TranscriptTop
+        | BmuxAction::TranscriptBottom
+        | BmuxAction::TranscriptLineUp
+        | BmuxAction::TranscriptLineDown => KeyOutcome::default(),
         BmuxAction::ClipboardPasteImage
         | BmuxAction::TranscriptCopySelection
         | BmuxAction::TranscriptClearSelection
@@ -292,20 +219,6 @@ fn diff_viewer_layout_action(app: &mut BmuxApp) -> KeyOutcome {
     }
 }
 
-fn markdown_action(app: &mut BmuxApp, action: BmuxAction) -> KeyOutcome {
-    let redraw = match action {
-        BmuxAction::MarkdownFocusNext => app.move_markdown_focus(false),
-        BmuxAction::MarkdownFocusPrevious => app.move_markdown_focus(true),
-        BmuxAction::MarkdownActivate => app.activate_focused_markdown_contribution(),
-        BmuxAction::MarkdownCopyDestination => app.copy_focused_markdown_destination(),
-        _ => false,
-    };
-    KeyOutcome {
-        redraw,
-        request: KeyRequest::None,
-    }
-}
-
 fn history_previous(app: &mut BmuxApp) -> KeyOutcome {
     KeyOutcome {
         redraw: if app.input_history_navigation_active() {
@@ -334,157 +247,5 @@ fn submit(app: &mut BmuxApp, placement: bcode_ipc::PromptPlacement) -> KeyOutcom
     KeyOutcome {
         redraw: true,
         request: KeyRequest::Submit { placement },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use bcode_config::TuiConfig;
-    use bmux_keyboard::parse_key_stroke;
-
-    use super::{BmuxKeyMap, handle_key, handle_transcript_focus_key};
-    use crate::app::disclosure_focus_tests::focus_app;
-    use crate::structure::DisclosureTarget;
-    use crate::transcript_focus::{FOCUS_SCOPE, FocusAction};
-
-    fn key(text: &str) -> bmux_keyboard::KeyStroke {
-        parse_key_stroke(text).expect("test key parses")
-    }
-
-    #[test]
-    fn inactive_focus_mode_leaves_keys_to_the_composer() {
-        let (mut app, _ids) = focus_app(3);
-        let keymap = BmuxKeyMap::from_config(&TuiConfig::default());
-        for text in ["j", "k", "h", "l", "e", "enter", "escape", "up"] {
-            assert_eq!(
-                handle_transcript_focus_key(&mut app, &keymap, key(text)),
-                None,
-                "{text}"
-            );
-        }
-        assert!(!app.transcript_focus_active());
-        assert!(handle_key(&mut app, &keymap, key("j")).redraw);
-        assert!(!app.composer().is_empty());
-    }
-
-    #[test]
-    fn focus_units_enters_and_scope_keys_drive_focus_until_escape() {
-        let (mut app, ids) = focus_app(3);
-        let keymap = BmuxKeyMap::from_config(&TuiConfig::default());
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("alt+u")),
-            Some(true)
-        );
-        assert_eq!(
-            app.focused_disclosure_target(),
-            Some(&DisclosureTarget::Unit(ids[2]))
-        );
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("up")),
-            Some(true)
-        );
-        assert_eq!(
-            app.focused_disclosure_target(),
-            Some(&DisclosureTarget::Section(ids[1], "output".to_owned()))
-        );
-        // Bound but inapplicable keys are consumed without a redraw.
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("l")),
-            Some(false)
-        );
-        // Unbound keys keep their ordinary meaning.
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("x")),
-            None
-        );
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("escape")),
-            Some(true)
-        );
-        assert!(!app.transcript_focus_active());
-        assert!(app.composer().is_empty());
-    }
-
-    #[test]
-    fn cycle_detail_key_cycles_everything_outside_focus_and_the_target_inside() {
-        use bcode_presentation_policy::models::Disclosure;
-        let (mut app, ids) = focus_app(3);
-        let keymap = BmuxKeyMap::from_config(&TuiConfig::default());
-        let shown = |app: &super::BmuxApp, index: usize| {
-            app.target_disclosure(&DisclosureTarget::Unit(ids[index]))
-                .map(|(disclosure, _)| disclosure)
-        };
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("alt+d")),
-            Some(true)
-        );
-        assert!((0..3).all(|index| shown(&app, index) == Some(Disclosure::Collapsed)));
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("alt+u")),
-            Some(true)
-        );
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("d")),
-            Some(true)
-        );
-        assert_eq!(shown(&app, 2), Some(Disclosure::Summary));
-        assert_eq!(shown(&app, 0), Some(Disclosure::Collapsed));
-        // `i` opens the inspector; Escape closes it before leaving focus.
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("i")),
-            Some(true)
-        );
-        assert!(app.inspector_open());
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("escape")),
-            Some(true)
-        );
-        assert!(!app.inspector_open());
-        assert!(app.transcript_focus_active());
-        // Leaving focus with the entry toggle also closes an open inspector,
-        // so no panel outlives the focus scope that routes its keys.
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("i")),
-            Some(true)
-        );
-        assert!(app.inspector_open());
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("alt+u")),
-            Some(true)
-        );
-        assert!(!app.transcript_focus_active());
-        assert!(!app.inspector_open());
-        assert!(app.inspector_state().is_none());
-    }
-
-    #[test]
-    fn remapped_focus_keys_replace_their_defaults() {
-        let (mut app, ids) = focus_app(3);
-        let mut config = TuiConfig::default();
-        config.keybindings.scopes.insert(
-            FOCUS_SCOPE.into(),
-            BTreeMap::from([("p".into(), FocusAction::Previous.id().into())]),
-        );
-        let keymap = BmuxKeyMap::try_from_config(&config).expect("valid keymap");
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("alt+u")),
-            Some(true)
-        );
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("k")),
-            None
-        );
-        assert_eq!(
-            handle_transcript_focus_key(&mut app, &keymap, key("p")),
-            Some(true)
-        );
-        assert_ne!(
-            app.focused_disclosure_target(),
-            Some(&DisclosureTarget::Unit(ids[2]))
-        );
-        app.set_effective_keymap(keymap.registry().clone());
-        assert!(app.transcript_focus_hint().contains(" p previous"));
     }
 }

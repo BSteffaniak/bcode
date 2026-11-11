@@ -1,12 +1,10 @@
 //! Behavior of decorative chrome in the terminal renderer: status separators,
 //! surface layering, and motion.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use bcode_config::TuiDiffViewerConfig;
-use bcode_presentation_policy::models::UnitFacts;
 use bcode_tui_theme::chrome::{
-    BorderStyle, FocusEffect, IconSet, Motion, SeparatorStyle, SurfaceStyle, TuiChrome,
+    FocusEffect, IconSet, Motion, SeparatorStyle, SurfaceStyle, TuiChrome,
 };
 use bmux_tui::style::Color;
 use bmux_tui::text_width::display_width;
@@ -14,7 +12,6 @@ use bmux_tui::text_width::display_width;
 use super::*;
 use crate::app::TemporalDamage;
 use crate::invalidation::InvalidationKey;
-use crate::structure::GroupView;
 use crate::theme::definition::{ThemeCatalog, ThemeSelection};
 
 const ACTIVITY_KEY: &str = "activity-animation";
@@ -44,7 +41,7 @@ fn presented(edit: impl FnOnce(&mut TuiChrome)) -> crate::theme::PresentedTheme 
 }
 
 fn app_with(edit: impl FnOnce(&mut TuiChrome), reduce_motion: bool) -> BmuxApp {
-    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let mut app = BmuxApp::new_with_history(None, &[], &[]);
     app.apply_tui_config(bcode_config::TuiConfig {
         reduce_motion,
         ..bcode_config::TuiConfig::default()
@@ -56,12 +53,6 @@ fn app_with(edit: impl FnOnce(&mut TuiChrome), reduce_motion: bool) -> BmuxApp {
 
 fn text(spans: &[Span]) -> String {
     spans.iter().map(|span| span.content.as_str()).collect()
-}
-
-fn trimmed(rows: &[Line]) -> Vec<String> {
-    rows.iter()
-        .map(|row| row.plain_text().trim_end().to_owned())
-        .collect()
 }
 
 #[test]
@@ -137,150 +128,8 @@ fn flat_surfaces_reproduce_themes_without_surface_chrome() {
     assert_eq!(layered.containers.assistant, flat.containers.assistant);
 }
 
-#[test]
-fn layered_surfaces_keep_tool_geometry_anchors_and_selection() {
-    let previous = semantic_state_theme();
-    let item = crate::transcript::tool_result_item(
-        "call",
-        Some("read"),
-        None,
-        "alpha\n漢字👍e\u{301}\nlonger line of tool output text",
-        false,
-    );
-    for tool_border in [
-        None,
-        Some(BorderStyle::None),
-        Some(BorderStyle::Left),
-        Some(BorderStyle::Rounded),
-    ] {
-        let flat = presented(|chrome| chrome.borders.tool = tool_border);
-        let layered = presented(|chrome| {
-            chrome.borders.tool = tool_border;
-            chrome.surfaces = SurfaceStyle::Layered;
-        });
-        let raised = layered
-            .effects
-            .raised_background(layered.surfaces.raised, layered.canvas)
-            .expect("raised background");
-        for width in [0_u16, 1, 2, 3, 4, 12, 40] {
-            let flat_layout = TranscriptItemLayout::resolve(&flat, &item, width);
-            let layered_layout = TranscriptItemLayout::resolve(&layered, &item, width);
-            assert_eq!(
-                (
-                    flat_layout.outer_width,
-                    flat_layout.content_width,
-                    flat_layout.content_x,
-                    flat_layout.bottom_rows,
-                ),
-                (
-                    layered_layout.outer_width,
-                    layered_layout.content_width,
-                    layered_layout.content_x,
-                    layered_layout.bottom_rows,
-                ),
-                "{tool_border:?} at {width}"
-            );
-            set_plugin_visual_theme(&flat);
-            let (flat_rows, flat_anchors, flat_selection) = transcript_item_layout_from_item(
-                &item,
-                width,
-                None,
-                TuiDiffViewerConfig::default(),
-                None,
-            );
-            set_plugin_visual_theme(&layered);
-            let (rows, anchors, selection) = transcript_item_layout_from_item(
-                &item,
-                width,
-                None,
-                TuiDiffViewerConfig::default(),
-                None,
-            );
-            let context = format!("{tool_border:?} at {width}");
-            assert_eq!(rows.len(), flat_rows.len(), "{context}");
-            assert_eq!(anchors, flat_anchors, "{context}");
-            assert_eq!(selection, flat_selection, "{context}");
-            assert_eq!(trimmed(&rows), trimmed(&flat_rows), "{context}");
-            for row in &rows {
-                assert!(
-                    row.width() <= usize::from(width.max(1)),
-                    "{context}: {row:?}"
-                );
-            }
-            // Frames too narrow to draw degrade to no container, flat or not.
-            assert!(
-                layered_layout.container.is_none()
-                    || rows
-                        .iter()
-                        .flat_map(|row| &row.spans)
-                        .any(|span| span.style.bg == Some(raised)),
-                "{context}: layered rows paint the raised surface"
-            );
-        }
-    }
-    set_plugin_visual_theme(&previous);
-}
-
-fn group_view() -> GroupView {
-    GroupView {
-        id: 7,
-        facts: UnitFacts::default(),
-        presentation: bcode_presentation_policy::host_defaults(),
-        members: vec![7, 8],
-        bridged: Vec::new(),
-        attached: Vec::new(),
-        tools: vec![("読み込み".to_owned(), 1), ("grep👍".to_owned(), 1)],
-        duration_ms: Some(1_200),
-    }
-}
-
-#[test]
-fn layered_group_headers_fill_their_row_without_moving_content_or_anchors() {
-    let previous = semantic_state_theme();
-    let view = group_view();
-    let presentation = bcode_presentation_policy::host_defaults();
-    let flat = presented(|_| {});
-    let layered = presented(|chrome| chrome.surfaces = SurfaceStyle::Layered);
-    let raised = layered
-        .effects
-        .raised_background(layered.surfaces.raised, layered.canvas)
-        .expect("raised background");
-    for width in [0_u16, 1, 2, 5, 9, 30, 80] {
-        let paint = |theme: &crate::theme::PresentedTheme| {
-            set_plugin_visual_theme(theme);
-            let (mut rows, mut anchors) = (Vec::new(), Vec::new());
-            group_header::push_group_header(&mut rows, &mut anchors, &view, &presentation, width);
-            (rows, anchors)
-        };
-        let (flat_rows, flat_anchors) = paint(&flat);
-        let (rows, anchors) = paint(&layered);
-        assert_eq!(anchors, flat_anchors, "width {width}");
-        assert_eq!(trimmed(&rows), trimmed(&flat_rows), "width {width}");
-        let header = rows.last().expect("header row");
-        assert_eq!(
-            header.width(),
-            flat_rows
-                .last()
-                .expect("header")
-                .width()
-                .max(usize::from(width)),
-            "width {width}"
-        );
-        assert!(header.width() <= usize::from(width).max(1), "width {width}");
-        assert!(
-            header
-                .spans
-                .iter()
-                .filter(|span| !span.content.is_empty())
-                .all(|span| span.style.bg == Some(raised)),
-            "width {width}: {header:?}"
-        );
-    }
-    set_plugin_visual_theme(&previous);
-}
-
 fn activity_deadline(app: &BmuxApp, now: Instant) -> Option<Duration> {
-    app.invalidation_requests(now, SystemTime::now())
+    app.invalidation_requests(now)
         .into_iter()
         .find(|request| request.key.as_str() == ACTIVITY_KEY)
         .map(|request| request.at.saturating_duration_since(now))
@@ -342,7 +191,7 @@ fn focus_sweeps_only_with_motion_and_repaint_only_while_active() {
     let mut app = app_with(sweep, false);
     app.set_cancelling();
     let previous = semantic_state_theme();
-    set_plugin_visual_theme(&app.presented_theme());
+    set_chrome_theme(&app.presented_theme());
     // With no gradient-bordered component on screen, only the status line
     // repaints even while the sweep advances.
     begin_focus_frame(0, true);
@@ -363,7 +212,7 @@ fn focus_sweeps_only_with_motion_and_repaint_only_while_active() {
         component_chrome().focus_gradient.expect("gradient").phase,
         0
     );
-    set_plugin_visual_theme(&previous);
+    set_chrome_theme(&previous);
     app.set_idle();
     assert!(tick(&mut app).is_empty(), "idle ticks repaint nothing");
     drop(app);
@@ -397,7 +246,7 @@ fn focus_frames_track_painted_gradients_and_sync_the_phase_for_every_painter() {
     };
     let app = app_with(sweep, false);
     let previous = semantic_state_theme();
-    set_plugin_visual_theme(&app.presented_theme());
+    set_chrome_theme(&app.presented_theme());
 
     // A full frame that paints no bordered component reports nothing.
     begin_focus_frame(7, true);
@@ -418,6 +267,6 @@ fn focus_frames_track_painted_gradients_and_sync_the_phase_for_every_painter() {
     assert!(!focus_gradient_painted());
 
     begin_focus_frame(0, true);
-    set_plugin_visual_theme(&previous);
+    set_chrome_theme(&previous);
     drop(app);
 }

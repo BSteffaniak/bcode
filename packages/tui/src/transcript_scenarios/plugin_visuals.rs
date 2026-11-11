@@ -4,7 +4,7 @@
 //! ([`TranscriptScenarioDriver::load_bundled_plugins`]) and record a file read whose result is
 //! the plugin's artifact, so the plugin's visual adapter presents the tool result instead of
 //! the canonical fallback. They run on the V2 engine in the application (`v2_plugin_visuals` in
-//! `mod.rs`); V1's plugin visual paths are covered by its own tests.
+//! `mod.rs`).
 
 use bcode_session_models::SessionEventKind;
 

@@ -1,7 +1,6 @@
 //! Scenario driver for the V2 transcript engine in the application (TUI V2 phase 4).
 //!
-//! Drives the real [`BcodeRuntimeModel`] with the V2 engine selected
-//! ([`bcode_config::TuiEngine::V2`]) through `Program::update` (terminal input, session stream
+//! Drives the real [`BcodeRuntimeModel`] through `Program::update` (terminal input, session stream
 //! messages, effect completions, timers) and presents through the production root presenter,
 //! then commits through `Program::presentation_committed`. Keys and pointer input therefore
 //! take the application's routing: the keymap, the composer, the transcript focus model and the
@@ -11,8 +10,7 @@
 //! the V2 host's history effects (`LoadTranscriptV2History`) become pending scenario requests,
 //! answered from the scripted session through the host's production history executor (against
 //! a daemon double over the scripted response) and delivered as their effect results; every other
-//! effect, V1 history loads of the hidden host-shell transcript included, is dropped (there is
-//! no daemon). The attach `Tail` window is answered with the setup's resident seed.
+//! effect is dropped (there is no daemon). The attach `Tail` window is answered with the setup's resident seed.
 //!
 //! Time is scenario time: the host clock is scripted ([`TranscriptV2Host::set_scripted_now`]),
 //! so every input, timer and frame the V2 host reduces uses it, and `advance_clock` delivers the
@@ -93,15 +91,11 @@ pub struct V2Driver {
 
 impl V2Driver {
     fn host(&self) -> &TranscriptV2Host {
-        self.model
-            .transcript_v2_for_test()
-            .expect("the V2 scenario driver selects the V2 engine")
+        self.model.transcript_host_for_test()
     }
 
     fn host_mut(&mut self) -> &mut TranscriptV2Host {
-        self.model
-            .transcript_v2_mut_for_test()
-            .expect("the V2 scenario driver selects the V2 engine")
+        self.model.transcript_host_mut_for_test()
     }
 
     fn update(&mut self, event: RuntimeEvent<BcodeRuntimeMessage>) {
@@ -452,13 +446,12 @@ impl TranscriptScenarioDriver for V2Driver {
     const ENGINE: ScenarioEngine = ScenarioEngine::V2;
 
     fn start(setup: &ScenarioSetup) -> Self {
-        let mut model = super::v1::scenario_model(setup, bcode_config::TuiEngine::V2);
+        let mut model = super::model::scenario_model(setup);
         let origin = Instant::now();
         model
-            .transcript_v2_mut_for_test()
-            .expect("V2 engine selected at startup")
+            .transcript_host_mut_for_test()
             .set_scripted_now(origin);
-        super::v1::install_scenario_clipboard(&mut model);
+        super::model::install_scenario_clipboard(&mut model);
         let terminal = bmux_tui::terminal::Terminal::new(
             std::io::sink(),
             Rect::new(0, 0, setup.width, setup.height),
@@ -683,7 +676,7 @@ impl TranscriptScenarioDriver for V2Driver {
                     .apply_configured_structure_rules(presentation.rules);
             }
             ScenarioSetting::ClipboardFails(fails) => {
-                super::v1::set_scenario_clipboard_fails(*fails);
+                super::model::set_scenario_clipboard_fails(*fails);
                 return;
             }
             ScenarioSetting::Selection {
@@ -719,7 +712,7 @@ impl TranscriptScenarioDriver for V2Driver {
     }
 
     fn clipboard_writes(&self) -> Vec<String> {
-        super::v1::scenario_clipboard_writes()
+        super::model::scenario_clipboard_writes()
     }
 
     fn last_repaint(&self) -> Option<RepaintObservation> {

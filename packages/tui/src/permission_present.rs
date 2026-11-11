@@ -2,8 +2,6 @@
 
 use serde_json::Value;
 
-use super::transcript::pretty_jsonish;
-
 /// One labeled permission-detail row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionDetail {
@@ -88,6 +86,32 @@ fn duration_millis(value: &Value) -> Option<u64> {
 fn is_duration_or_timeout_label(label: &str) -> bool {
     let label = label.to_ascii_lowercase();
     label.contains("duration") || label.contains("timeout") || label.ends_with("_ms")
+}
+
+/// Pretty-print JSON arguments for display, falling back to the raw text; both are bounded.
+fn pretty_jsonish(value: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(value).map_or_else(
+        |_| truncate_block(value, 2_000),
+        |json| {
+            serde_json::to_string_pretty(&json).map_or_else(
+                |_| truncate_block(value, 2_000),
+                |pretty| truncate_block(&pretty, 2_000),
+            )
+        },
+    )
+}
+
+/// Truncate a long display block to `max_chars` characters with a truncation marker.
+fn truncate_block(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("\n… truncated");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 #[cfg(test)]

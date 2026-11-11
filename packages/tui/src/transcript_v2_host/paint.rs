@@ -25,7 +25,7 @@ use bmux_tui_components::scrollbar::ScrollbarStyles;
 use super::TranscriptV2Host;
 use crate::render::FrameLayout;
 
-/// Hit id of the V2 latest bar (distinct from the V1 bar, so V1 pointer paths ignore it).
+/// Hit id of the transcript's latest bar.
 pub const LATEST_BAR_HIT: &str = "transcript-v2.latest-bar";
 /// Hit id prefix of V2 transcript interactive regions.
 pub const ITEM_HIT_PREFIX: &str = "transcript-v2.item:";
@@ -87,19 +87,11 @@ pub struct TranscriptPaintStyle<'a> {
     pub glow_window: Duration,
 }
 
-/// The transcript region of a host frame layout: the transcript body plus the row the host
-/// layout reserves for its own latest bar, which the V2 transcript owns (F6).
+/// The transcript region of a host frame layout: the transcript body, including the rows the
+/// transcript uses for its own latest bar (F6).
 #[must_use]
-pub fn transcript_region(layout: FrameLayout) -> Rect {
-    let body = layout.body();
-    layout.latest_bar().map_or(body, |bar| {
-        Rect::new(
-            body.x,
-            body.y,
-            body.width,
-            body.height.saturating_add(bar.height),
-        )
-    })
+pub const fn transcript_region(layout: FrameLayout) -> Rect {
+    layout.body()
 }
 
 impl TranscriptV2Host {

@@ -9,7 +9,7 @@ fn test_chat() -> ActiveChat {
     let session_id = bcode_session_models::SessionId::new();
     let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
     ActiveChat {
-        app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+        app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[]),
         agents: super::super::session_flow::AgentCatalog::default(),
         attachment: super::super::session_flow::ChatSessionAttachment::Attached { session_id },
         event_sender,

@@ -695,11 +695,6 @@ impl ArtifactStreamCoordinator {
     }
 
     #[cfg(test)]
-    pub(crate) async fn next_completion(&mut self) -> Option<ActiveArtifactFetchCompletion> {
-        self.artifact_fetch_receiver.recv().await
-    }
-
-    #[cfg(test)]
     pub(crate) fn completion_capacity(&self) -> usize {
         self.artifact_fetch_receiver.max_capacity()
     }

@@ -14,6 +14,7 @@ pub mod frame;
 pub mod interaction;
 pub mod local_rows;
 pub mod markdown;
+pub mod model;
 pub mod navigation;
 pub mod paging;
 pub mod pipeline;
@@ -21,8 +22,6 @@ pub mod plugin_visuals;
 pub mod scenarios;
 pub mod session;
 pub mod shell;
-pub mod startup;
-pub mod v1;
 pub mod v2;
 pub mod v2_headless;
 
@@ -275,11 +274,11 @@ impl<D: TranscriptScenarioDriver> Scenario<D> {
 /// harness (for example [`navigation`]) instead of [`scenarios`].
 ///
 /// ```ignore
-/// mod v1_engine {
-///     crate::transcript_scenarios::transcript_scenarios! { crate::transcript_scenarios::v1::V1Driver;
+/// mod v2_engine {
+///     crate::transcript_scenarios::transcript_scenarios! { crate::transcript_scenarios::v2::V2Driver;
 ///         page_then_frame_preserves_reader,
-///         #[ignore = "V1 bug BUG-A1: wheel tick before the next frame loses the anchor"]
-///         bug_a1_wheel_between_older_page_and_frame,
+///         #[ignore = "driver: needs presentation failure injection"]
+///         c27_failed_presentation_does_not_commit_navigation,
 ///     }
 /// }
 /// ```
@@ -305,158 +304,8 @@ macro_rules! transcript_scenarios {
 }
 pub(crate) use transcript_scenarios;
 
-/// Scenario instantiation for the V1 engine. Ignored entries fail on V1 (confirmed with
-/// `--ignored`); `docs/tui-v2-scenarios.md` records the observed failure of each.
-mod v1_engine {
-    super::transcript_scenarios! { super::v1::V1Driver;
-        t1_live_append_while_following_shows_latest,
-        t23_live_append_while_reading_keeps_position,
-        c29_older_page_then_frame_preserves_reader,
-        #[ignore = "V1 bug BUG-A1: wheel tick before the next frame maps the anchor to a stale index and leaps a page"]
-        bug_a1_wheel_between_older_page_and_frame,
-        #[ignore = "V1 bug BUG-A2: no prefetch; the view stalls at the boundary while a page loads"]
-        bug_a2_continuous_wheel_moves_without_stall_or_leap,
-        bug_a3_eviction_after_prepend_keeps_visible_content,
-        #[ignore = "V1 bug BUG-A4: the history banner disappears at exhaustion and shifts content by a row"]
-        bug_a4_session_start_does_not_shift_content,
-        #[ignore = "V1 bug BUG-B1: the first newer page after a timeline jump evicts about 500 older events"]
-        bug_b1_timeline_window_first_newer_page_keeps_window,
-        #[ignore = "V1 bug BUG-B2: newer page plus eviction then a wheel tick before the frame flings into blank space"]
-        bug_b2_wheel_between_newer_page_with_eviction_and_frame,
-        #[ignore = "V1 bug BUG-B3: jump-to-latest issues no tail-window request and only scrolls to the bottom of the historical window"]
-        bug_b3_jump_to_latest_after_deep_jump_returns_live,
-        bug_b4_resident_jump_while_detached_lands_and_stays,
-        #[ignore = "V1 deviation C11: an overflowing streaming response bottom-follows instead of holding its top"]
-        c11_streaming_response_reveals_top_and_holds,
-        #[ignore = "V1 deviation C11: no reveal motion runs for an overflowing streaming response (depends on C11)"]
-        c17_reflow_during_reveal_motion_keeps_target,
-        c17_height_change_during_latest_motion_lands_on_latest,
-        #[ignore = "V1 deviation C17: a live item during the jump-to-latest motion keeps a motion running indefinitely"]
-        c17_live_item_during_latest_motion_settles,
-    }
-}
-
-/// V1 instantiation of the kept-behavior navigation scenarios in [`navigation`]. Ignored entries
-/// fail on V1 (confirmed with `--ignored`); `docs/tui-v2-scenarios.md` records each observation.
-mod v1_navigation {
-    super::transcript_scenarios! { super::v1::V1Driver; in navigation;
-        c1_attach_follows_latest_bottom,
-        #[ignore = "V1 deviation C1: wheeling back down to the content bottom stays anchored, so later live content is not followed"]
-        c1_wheel_up_reads_and_wheel_down_resumes_following,
-        c2_wheel_down_at_bottom_enters_tail_space,
-        c2_tail_space_is_bounded_by_the_viewport,
-        c3_tail_space_position_is_stable_across_frames,
-        #[ignore = "V1 deviation C4: after content fills the tail space a motion keeps running and following is never reported (content is correct)"]
-        c4_new_content_fills_tail_space_then_follows,
-        c5_reflow_round_trip_does_not_drift,
-        c6_rows_inserted_above_do_not_consume_tail_space,
-        c7_wheel_up_inside_tail_space_keeps_tail_space,
-        c8_staged_submission_does_not_move_view,
-        #[ignore = "V1 deviation C8: after the staged submission moves to the top, acceptance never reveals the message and a motion keeps running"]
-        c8_accepted_submission_reveals_message_at_top,
-        c8_cleared_local_command_submission_does_not_anchor,
-        #[ignore = "V1 deviation C8: depends on the accepted-submission reveal, which V1 does not perform here"]
-        c9_tool_activity_after_submission_resumes_following,
-        #[ignore = "V1 deviation C11: a new assistant segment below history follows the bottom instead of being revealed at the top"]
-        c10_later_stream_updates_do_not_move_revealed_response,
-        #[ignore = "V1 deviation C11: a new assistant segment below history follows the bottom instead of being revealed at the top"]
-        c11_assistant_hold_survives_completion,
-        #[ignore = "V1 deviation C11: a new assistant segment below history follows the bottom instead of being revealed at the top"]
-        c11_non_assistant_item_releases_hold_into_overflow_follow,
-        c12_revealed_item_is_not_readmitted,
-        #[ignore = "V1 deviation C11: an overflowing streaming response follows the bottom instead of holding its top"]
-        c13_sticky_reveal_hands_off_after_segment_end,
-        c14_manual_scroll_materializes_running_motion,
-        #[ignore = "V1 deviation C14: manual scroll does not cancel a pending non-resident timeline jump; its result replaces the view"]
-        c14_manual_scroll_cancels_pending_jump,
-        c15_grace_suppresses_stream_top_anchor,
-        c16_stream_does_not_anchor_when_scrolled_up,
-        c17_latest_bar_motion_lands_on_latest_bottom,
-        c17_pending_jump_never_falls_back_to_tail,
-        c22_reduced_motion_jump_is_instant,
-        #[ignore = "V1 deviation C22: enabling reduce_motion during a motion lets the motion keep running"]
-        c22_enabling_reduced_motion_mid_motion_settles_at_target,
-        c23_reader_survives_page_and_live_append_before_frame,
-        c24_width_change_keeps_source_line_at_top,
-        c25_structural_insertion_keeps_reading_position,
-        c25_collapse_above_keeps_reading_position,
-        c26_runtime_work_events_do_not_move_final_response,
-        c27_repeated_presentation_is_idempotent,
-        #[ignore = "driver: needs presentation failure injection"]
-        c27_failed_presentation_does_not_commit_navigation,
-        c28_movement_kept_while_page_loads_is_spent_once,
-        c29_direction_reversal_cancels_pending_movement,
-        c30_growth_while_following_is_not_a_prepend,
-        c31_window_bottom_is_not_session_tail,
-        c32_focus_up_puts_target_top_on_top_edge,
-        c32_focus_down_puts_target_bottom_on_bottom_edge,
-        c32_focus_on_visible_target_does_not_scroll,
-        c33_initial_focus_is_last_visible_target,
-        c33_initial_focus_falls_back_to_nearest_target_above,
-        fo4_composer_home_end_do_not_move_transcript,
-        #[ignore = "V1 deviation FO4: Home in transcript focus does not load the session start directly"]
-        fo4_transcript_home_loads_session_start_directly,
-        #[ignore = "V1 deviation FO4: End in transcript focus does not return to the latest bottom"]
-        fo4_transcript_end_returns_to_latest,
-        fo5_page_up_scrolls_from_composer_focus,
-    }
-}
-
-/// V1 instantiation of the kept-behavior interaction scenarios in [`interaction`].
-mod v1_interaction {
-    super::transcript_scenarios! { super::v1::V1Driver; in interaction;
-        c18_latest_bar_ignores_hidden_continuation_of_visible_entry,
-        c18_latest_bar_shows_for_distinct_entry_fully_below,
-        c18_live_entry_below_reader_shows_bar,
-        #[ignore = "V1 deviation C17: jump-to-latest after a live entry keeps a motion running and never resumes following"]
-        c18_jump_to_latest_after_live_entry_follows_and_clears_bar,
-        c19_latest_bar_never_causes_its_own_visibility,
-        c20_scroll_timer_and_reflow_generate_no_activity,
-        #[ignore = "V1 deviation C20/C21: the latest-bar glow never settles, also when time advances through the production timed-invalidation path (root cause not diagnosed)"]
-        c21_latest_bar_glow_settles_still_after_window,
-        c21_reduced_motion_latest_bar_is_still_immediately,
-        #[ignore = "V1 deviation C34: a drag that starts inside a response extends into later transcript items"]
-        c34_drag_inside_response_stays_within_it,
-        c34_drag_from_surrounding_space_spans_items,
-        c34_soft_wrapped_line_selects_without_newlines,
-        c36_code_selection_preserves_indentation_and_blank_lines,
-        c34_selection_survives_scroll,
-        #[ignore = "V1 deviation C34: the selection is invalidated once its rows scroll out of view (BMUX 13)"]
-        c34_selection_survives_scrolling_out_of_view,
-        #[ignore = "V1 deviation C34: copying across a Markdown hard line break glues the two lines together"]
-        c34_hard_line_break_copies_as_line_break,
-        c35_release_copies_and_clears_after_delay,
-        c35_failed_copy_keeps_selection,
-        c35_new_gesture_cancels_pending_clear,
-        c35_click_without_drag_does_not_copy,
-        x1_click_toggles_tool_header_once_per_click,
-        x1_click_toggles_section_label,
-        x1_click_toggles_group_header,
-        x1_drag_from_header_selects_without_toggling,
-        x2_focus_mode_keys_walk_and_toggle_targets,
-        x2_focus_walk_scrolls_targets_into_view,
-        x3_collapsed_group_reveals_failed_member,
-        a16_hidden_units_leave_marker_and_failed_stays_visible,
-        a16_floor_applies_after_manual_toggles,
-        a16_awaiting_decision_stays_expanded_under_rules,
-        c38_streaming_markdown_converges_to_final,
-        #[ignore = "V1 bug D-16: every wheel tick marks full damage"]
-        d6_wheel_scroll_repaints_regionally,
-        #[ignore = "V1 bug D-16: composer input marks full damage"]
-        d6_composer_typing_repaints_regionally,
-        #[ignore = "driver: needs per-frame layout work counters"]
-        d4_scrolling_does_no_layout_work,
-        #[ignore = "driver: needs per-frame layout work counters"]
-        d4_prepend_measures_only_new_units,
-        #[ignore = "driver: needs plugin interaction surfaces"]
-        c37_interaction_placement_and_focus_restore,
-        #[ignore = "driver: needs positioned shell captures"]
-        c39_inline_shell_expansion,
-    }
-}
-
-/// Scenario instantiation for the V2 engine in the application (phase 4): the root model with the
-/// V2 host selected, driven through `update` and the root presenter ([`v2::V2Driver`]).
+/// Scenario instantiation for the V2 engine in the application (phase 4): the root model with its
+/// transcript host, driven through `update` and the root presenter ([`v2::V2Driver`]).
 /// Ignored entries need a later phase's deliverable or a driver capability and fail when run
 /// (confirmed with `--ignored`); `docs/tui-v2-scenarios.md` records each status.
 mod v2_engine {
@@ -503,8 +352,7 @@ mod v2_headless_engine {
 }
 
 /// Resident window and paging scenarios in [`paging`] (phase 5) for the V2 engine in the
-/// application. V1 is not instantiated: the scenarios check V2's window-operation counters and
-/// resident ceiling, which V1 does not report (`docs/tui-v2-scenarios.md`).
+/// application: the scenarios check the window-operation counters and resident ceiling.
 mod v2_paging {
     super::transcript_scenarios! { super::v2::V2Driver; in paging;
         x12_wheel_up_through_long_history_is_continuous,
@@ -589,9 +437,8 @@ mod v2_navigation {
     }
 }
 
-/// V2 instantiation of the kept-behavior interaction scenarios in [`interaction`]. The C37 and
-/// C39 driver stubs are not instantiated: the V2 driver opens interaction surfaces and expands
-/// shell screens, and [`pipeline`] covers both criteria for V2 (`v2_pipeline`).
+/// V2 instantiation of the kept-behavior interaction scenarios in [`interaction`]. [`pipeline`]
+/// covers inline interaction placement (C37) and shell expansion (C39) (`v2_pipeline`).
 mod v2_interaction {
     super::transcript_scenarios! { super::v2::V2Driver; in interaction;
         c18_latest_bar_ignores_hidden_continuation_of_visible_entry,
@@ -631,19 +478,6 @@ mod v2_interaction {
     }
 }
 
-/// V1 instantiation of the process-local row scenarios in [`local_rows`]: V1 draws pending
-/// submissions and notices from the same host-shell state.
-mod v1_local_rows {
-    super::transcript_scenarios! { super::v1::V1Driver; in local_rows;
-        lr1_staged_submission_shows_pending_row,
-        #[ignore = "V1 deviation C8: a staged submission while following moves the view to the transcript top"]
-        lr7_staged_submission_while_following_stays_on_latest_bottom,
-        lr4_rejected_submission_notice_is_visible,
-        lr1_slash_command_output_is_visible,
-        lr4_draft_submission_attaches_and_streams_reply,
-    }
-}
-
 /// V2 instantiation of the process-local row scenarios in [`local_rows`].
 mod v2_local_rows {
     super::transcript_scenarios! { super::v2::V2Driver; in local_rows;
@@ -656,9 +490,8 @@ mod v2_local_rows {
 }
 
 /// Frame pipeline, damage and transcript tooling scenarios in [`pipeline`] (phase 6) for the V2
-/// engine in the application. V1 is not instantiated: the scenarios read the terminal's committed
-/// damage, the host's command routes and inspector, and the V2 inline interaction and shell
-/// tooling (`docs/tui-v2-scenarios.md`).
+/// engine in the application: the scenarios read the terminal's committed damage, the host's
+/// command routes and inspector, and the inline interaction and shell tooling.
 mod v2_pipeline {
     super::transcript_scenarios! { super::v2::V2Driver; in pipeline;
         f1_cells_hits_and_focus_come_from_one_snapshot,
@@ -689,21 +522,8 @@ mod v2_plugin_visuals {
     }
 }
 
-/// Markdown contribution activation scenarios in [`markdown`] (phase 7 parity). The V1-safe
-/// ones (no platform opener or system clipboard) are instantiated for both engines; the V1
-/// entries record what V1 shows in this driver. Link opening and destination copy run on V2
-/// only, whose test opener records destinations.
-mod v1_markdown {
-    super::transcript_scenarios! { super::v1::V1Driver; in markdown;
-        #[ignore = "V1 observation: a click on the details summary does not expand the block in this driver"]
-        md_details_click_toggles_the_block,
-        #[ignore = "V1 observation: the footnote jump reports success but the definition stays out of view"]
-        md_keys_jump_between_footnote_reference_and_definition,
-        #[ignore = "V1 bug: fragment navigation reports success but does not bring the section into view"]
-        md_fragment_link_navigates_to_its_section,
-    }
-}
-
+/// Markdown contribution activation scenarios in [`markdown`] (phase 7 parity). Link opening and
+/// destination copy use the driver's test opener, which records destinations.
 mod v2_markdown {
     super::transcript_scenarios! { super::v2::V2Driver; in markdown;
         md_details_click_toggles_the_block,

@@ -391,7 +391,6 @@ impl BmuxKeyBinding {
 /// Register host-owned dialog actions. Defaults are declarations, never dispatch fallbacks.
 fn register_host_actions(
     registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
-    engine: bcode_config::TuiEngine,
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
     register_control_actions(registry)?;
     register_model_actions(registry)?;
@@ -399,16 +398,13 @@ fn register_host_actions(
     register_streaming_actions(registry)?;
     register_form_editor_actions(registry)?;
     register_onboarding_actions(registry)?;
-    register_transcript_focus_actions(registry)?;
-    if engine == bcode_config::TuiEngine::V2 {
-        super::transcript_v2_host::focus::register_actions(registry)?;
-        register_tool_disclosure_actions(registry)?;
-    }
+    super::transcript_v2_host::focus::register_actions(registry)?;
+    register_tool_disclosure_actions(registry)?;
     Ok(())
 }
 
 /// Register the chat-scope tool-disclosure actions (`tui.tools.*`) without default keys, so a
-/// user binding resolves to them; the V2 transcript runs each as its palette route.
+/// user binding resolves to them; the transcript runs each as its palette route.
 fn register_tool_disclosure_actions(
     registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
@@ -427,43 +423,6 @@ fn register_tool_disclosure_actions(
     Ok(())
 }
 
-/// Register the focus-mode entry action and the remappable focus-mode scope.
-fn register_transcript_focus_actions(
-    registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
-) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
-    use super::transcript_focus::{
-        CYCLE_DETAIL_ACTION, CYCLE_DETAIL_DEFAULT_KEY, FOCUS_SCOPE, FOCUS_UNITS_ACTION,
-        FOCUS_UNITS_DEFAULT_KEY, FocusAction,
-    };
-    use bcode_plugin_sdk::tui::keymap::KeymapAction;
-    registry.register(KeymapAction {
-        id: FOCUS_UNITS_ACTION.into(),
-        scope: BmuxScope::Chat.id().into(),
-        description: "Focus transcript units".into(),
-        defaults: vec![FOCUS_UNITS_DEFAULT_KEY.into()],
-    })?;
-    // Outside focus mode detail cycling applies to every unit and group; in
-    // focus mode the `transcript_focus` binding cycles the focused target.
-    registry.register(KeymapAction {
-        id: CYCLE_DETAIL_ACTION.into(),
-        scope: BmuxScope::Chat.id().into(),
-        description: "Cycle every transcript unit collapsed, summary, expanded".into(),
-        defaults: vec![CYCLE_DETAIL_DEFAULT_KEY.into()],
-    })?;
-    for action in FocusAction::ALL {
-        registry.register(KeymapAction {
-            id: action.id().into(),
-            scope: FOCUS_SCOPE.into(),
-            description: action.description().into(),
-            defaults: action
-                .default_keys()
-                .iter()
-                .map(|key| (*key).to_owned())
-                .collect(),
-        })?;
-    }
-    Ok(())
-}
 fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option<Vec<&'a str>> {
     if scope == "composer_interaction"
         && !matches!(
@@ -1017,17 +976,10 @@ impl BmuxKeyMap {
         }
     }
 
-    /// Build a keymap from TUI config for the default (V1) transcript engine.
+    /// Build a keymap from TUI config.
     #[must_use]
     pub fn from_config(config: &TuiConfig) -> Self {
-        Self::from_config_for_engine(config, bcode_config::TuiEngine::V1)
-    }
-
-    /// Build a keymap from TUI config for the transcript `engine` selected at startup: the
-    /// V2 engine adds its own `transcript_focus` actions (TUI V2 FO4).
-    #[must_use]
-    pub fn from_config_for_engine(config: &TuiConfig, engine: bcode_config::TuiEngine) -> Self {
-        Self::try_from_config_for_engine(config, engine).unwrap_or_else(|error| Self {
+        Self::try_from_config(config).unwrap_or_else(|error| Self {
             registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
             activations: BTreeMap::new(),
             error: Some(error.to_string()),
@@ -1040,18 +992,6 @@ impl BmuxKeyMap {
     /// Returns invalid key configuration or conflicting action registration.
     pub fn try_from_config(
         config: &TuiConfig,
-    ) -> Result<Self, bcode_plugin_sdk::tui::keymap::KeymapError> {
-        Self::try_from_config_for_engine(config, bcode_config::TuiEngine::V1)
-    }
-
-    /// Compile contributor defaults and configuration for the transcript `engine`, without
-    /// silently ignoring invalid keys.
-    ///
-    /// # Errors
-    /// Returns invalid key configuration or conflicting action registration.
-    pub fn try_from_config_for_engine(
-        config: &TuiConfig,
-        engine: bcode_config::TuiEngine,
     ) -> Result<Self, bcode_plugin_sdk::tui::keymap::KeymapError> {
         use bcode_plugin_sdk::tui::keymap::{KeymapAction, KeymapRegistry};
         let mut registry = KeymapRegistry::default();
@@ -1100,7 +1040,7 @@ impl BmuxKeyMap {
             description: BmuxAction::TranscriptClearSelection.description().into(),
             defaults: Vec::new(),
         })?;
-        register_host_actions(&mut registry, engine)?;
+        register_host_actions(&mut registry)?;
         registry.configure(overrides)?;
         Ok(Self {
             error: None,
@@ -1907,7 +1847,9 @@ mod tests {
 
     #[test]
     fn cycle_detail_binds_in_chat_and_focus_scopes_independently() {
-        use crate::transcript_focus::{CYCLE_DETAIL_ACTION, FOCUS_SCOPE, FocusAction};
+        use crate::transcript_v2_host::focus::{
+            CYCLE_DETAIL_ACTION, FOCUS_SCOPE, FocusKeyAction as FocusAction,
+        };
         let keymap = default_keymap();
         assert_eq!(
             keymap.action("chat", parse_key_stroke("alt+d").unwrap()),
@@ -1943,7 +1885,9 @@ mod tests {
 
     #[test]
     fn transcript_focus_bindings_have_defaults_and_remap_in_their_scope() {
-        use crate::transcript_focus::{FOCUS_SCOPE, FOCUS_UNITS_ACTION, FocusAction};
+        use crate::transcript_v2_host::focus::{
+            FOCUS_SCOPE, FOCUS_UNITS_ACTION, FocusKeyAction as FocusAction,
+        };
         let keymap = default_keymap();
         assert_eq!(
             keymap.action("chat", parse_key_stroke("alt+u").unwrap()),

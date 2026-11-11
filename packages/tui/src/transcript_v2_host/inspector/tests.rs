@@ -22,10 +22,7 @@ use crate::transcript_v2_host::input::{TranscriptInputOutcome, TranscriptRouteOu
 use crate::transcript_v2_host::test_fixtures::{COMPOSER, REGION, attached, paint, style};
 
 fn keymap() -> BmuxKeyMap {
-    BmuxKeyMap::from_config_for_engine(
-        &bcode_config::TuiConfig::default(),
-        bcode_config::TuiEngine::V2,
-    )
+    BmuxKeyMap::from_config(&bcode_config::TuiConfig::default())
 }
 
 fn press(host: &mut TranscriptV2Host, key: &str, at: Instant) -> TranscriptInputOutcome {
@@ -327,7 +324,7 @@ fn fo6_user_bound_tool_keys_keep_transcript_focus_and_act_on_the_focused_subtree
         .keybindings
         .chat
         .insert("alt+y".to_owned(), "tui.tools.expandAll".to_owned());
-    let keymap = BmuxKeyMap::from_config_for_engine(&config, bcode_config::TuiEngine::V2);
+    let keymap = BmuxKeyMap::from_config(&config);
     let stroke = parse_key_stroke("alt+y").expect("key");
     assert!(!host.release_focus_for_event(&keymap, &bmux_tui::event::Event::Key(stroke)));
     assert!(host.transcript_focus_active());

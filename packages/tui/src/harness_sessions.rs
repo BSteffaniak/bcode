@@ -45,62 +45,6 @@ mod tests {
     use bmux_tui::text::Line;
 
     #[test]
-    fn canonical_native_tool_is_visible_through_the_normal_terminal_adapter() {
-        use crate::app::BmuxApp;
-        use bcode_harness_models::{
-            HarnessCompleteness, HarnessObservation, HarnessObservationKind,
-        };
-        use bcode_session_models::external_backend::{
-            ExternalBackendEnvelope, ExternalBackendRecord,
-        };
-        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionId};
-        let session_id = SessionId::new();
-        let event = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            session_id,
-            sequence: 1,
-            timestamp_ms: 0,
-            provenance: None,
-            kind: ExternalBackendEnvelope {
-                version: 1,
-                record: ExternalBackendRecord::Observation {
-                    observation: HarnessObservation {
-                        observation_id: "native-tool-observed".into(),
-                        session_id: session_id.to_string(),
-                        generation: 3,
-                        native_correlations: vec![],
-                        completeness: HarnessCompleteness::Partial,
-                        kind: HarnessObservationKind::Tool {
-                            input_json: None,
-                            native_tool_id: "native-tool".into(),
-                            name: "native-shell-visible-marker".into(),
-                            status: "running".into(),
-                        },
-                    },
-                },
-            }
-            .into_event_kind()
-            .unwrap(),
-        };
-        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        app.absorb_session_event(&event);
-        assert_eq!(app.transcript().len(), 1);
-        // An observed native tool is an ordinary generic tool card owned by the observing
-        // harness, never a Bcode tool invocation.
-        assert!(app.transcript().iter().any(|item| matches!(
-            item.kind(),
-            crate::transcript::TranscriptItemKind::ToolRequest {
-                tool_name,
-                tool_call_id,
-                ..
-            } if tool_name == "native-shell-visible-marker"
-                && tool_call_id.starts_with("external:3:")
-        )));
-        assert!(app.session_view_snapshot().tools.is_empty());
-        drop(app);
-    }
-
-    #[test]
     #[allow(clippy::too_many_lines)] // One lifecycle journey: running, coverage loss, then finished.
     fn terminal_reply_keeps_background_and_late_continuation_visible_without_controls() {
         use bcode_harness_models::{
@@ -116,7 +60,7 @@ mod tests {
             submission_id: "submit".into(),
             attempt_id: "attempt".into(),
         };
-        let mut app = crate::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut app = crate::app::BmuxApp::new_with_history(Some(session_id), &[], &[]);
         let terminal = HarnessExecutionEvent::SubmissionTerminal {
             attempt: origin.clone(),
             native_turn_id: None,

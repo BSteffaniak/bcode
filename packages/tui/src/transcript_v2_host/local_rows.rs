@@ -1,12 +1,11 @@
-//! Process-local transcript rows for the V2 engine (spec section 3.3, LR1–LR7).
+//! Process-local transcript rows of the host shell (spec section 3.3, LR1–LR7).
 //!
 //! The host shell owns two kinds of presentation that are not canonical session history:
 //! pending submissions (`PendingSubmissions`: staged, sending and queued messages the session
-//! has not accepted) and process-local notices (ephemeral entries of the shell's presentation
-//! document: errors, slash-command output, plugin activity). V1 draws both from that state; V2
-//! receives them here as plain [`LocalRow`] data at the end of every update, so they flow
-//! through the engine's normal input path and their membership follows the shell state
-//! exactly (staged, sent, queued, accepted, cancelled, cleared, session switches).
+//! has not accepted) and process-local notices (`EphemeralNotices`: errors, slash-command
+//! output, plugin activity). The engine receives them here as plain [`LocalRow`] data at the
+//! end of every update, so they flow through the engine's normal input path and their
+//! membership follows the shell state exactly (staged, sent, queued, accepted, cancelled, cleared, session switches).
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
@@ -18,20 +17,15 @@ use bcode_tui_transcript::units::local::{LocalKey, LocalPlacement, LocalRow};
 
 use super::TranscriptV2Host;
 use crate::app::BmuxApp;
+use crate::ephemeral_notices::EphemeralNotice;
 use crate::pending_submission::{PendingSubmission, PendingSubmissionState};
-use crate::transcript_document::EphemeralEntryView;
 
-/// Notice source of the V1 projection's resident-budget warning. It describes the V1
-/// presentation document, not anything V2 shows, so V2 leaves it out.
-const V1_PROJECTION_NOTICE_SOURCE: &str = "resident-window";
-
-/// Notices V2 shows: every process-local entry except V1's own projection warning.
-fn shown_notices(app: &BmuxApp) -> impl Iterator<Item = EphemeralEntryView<'_>> + '_ {
+/// Notices the transcript shows: every process-local notice of the shell.
+fn shown_notices(app: &BmuxApp) -> impl Iterator<Item = &EphemeralNotice> + '_ {
     app.ephemeral_notices()
-        .filter(|notice| notice.source != V1_PROJECTION_NOTICE_SOURCE)
 }
 
-/// Pending submissions V2 shows: V1 draws nothing for a sent submission.
+/// Pending submissions the transcript shows: nothing is drawn for a sent submission.
 fn shown_pending(app: &BmuxApp) -> impl Iterator<Item = &PendingSubmission> + '_ {
     app.pending_submissions()
         .iter()
@@ -43,18 +37,18 @@ fn shown_pending(app: &BmuxApp) -> impl Iterator<Item = &PendingSubmission> + '_
 fn fingerprint(app: &BmuxApp) -> u64 {
     let mut hasher = DefaultHasher::new();
     for notice in shown_notices(app) {
-        notice.id.hash(&mut hasher);
-        notice.after.hash(&mut hasher);
-        notice.after_sequence.hash(&mut hasher);
-        notice.item.role().hash(&mut hasher);
-        notice.item.text().hash(&mut hasher);
-        std::mem::discriminant(&notice.item.text_format()).hash(&mut hasher);
+        notice.id().hash(&mut hasher);
+        notice.after().hash(&mut hasher);
+        notice.after_sequence().hash(&mut hasher);
+        notice.role().hash(&mut hasher);
+        notice.text().hash(&mut hasher);
+        std::mem::discriminant(&notice.format()).hash(&mut hasher);
     }
     0xff_u8.hash(&mut hasher);
     for pending in shown_pending(app) {
         pending.id().0.hash(&mut hasher);
         pending.text().hash(&mut hasher);
-        crate::render::pending_label(pending.state()).hash(&mut hasher);
+        crate::pending_submission::pending_label(pending.state()).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -91,31 +85,31 @@ pub fn pending_row(pending: &PendingSubmission) -> LocalRow {
         LocalKey::Submission(pending.id().0.clone()),
         LocalPlacement::Tail,
         local_item(TranscriptViewItemKind::UserMessage {
-            // V1 renders pending text as Markdown.
+            // Pending text renders as Markdown.
             message: message(
                 pending.text(),
                 TextFormat::Markdown,
-                Some(crate::render::pending_label(pending.state())),
+                Some(crate::pending_submission::pending_label(pending.state())),
             ),
         }),
     )
 }
 
-/// The notice rows of the shell state, in presentation order at the chronology boundary V1
-/// shows them at.
+/// The notice rows of the shell state, in presentation order at the chronology boundary each
+/// notice was raised at.
 fn notice_rows(app: &BmuxApp) -> impl Iterator<Item = LocalRow> + '_ {
     shown_notices(app).map(|notice| {
-        let role = notice.item.role();
+        let role = notice.role();
         LocalRow::new(
-            LocalKey::Notice(notice.id.get()),
+            LocalKey::Notice(notice.id().get()),
             LocalPlacement::After {
-                item: notice.after.cloned(),
-                sequence: notice.after_sequence,
+                item: notice.after().cloned(),
+                sequence: notice.after_sequence(),
             },
             local_item(TranscriptViewItemKind::SystemMessage {
                 message: message(
-                    notice.item.text(),
-                    notice.item.text_format(),
+                    notice.text(),
+                    notice.format(),
                     (role != "System").then(|| role.to_owned()),
                 ),
             }),

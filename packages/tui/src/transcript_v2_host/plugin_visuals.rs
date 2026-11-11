@@ -1,7 +1,7 @@
 //! Plugin visuals and content input of the V2 transcript (E1–E6, E3, C36, C39).
 //!
-//! * Acceptance ([`accepted_visual`]): a routed adapter visual is accepted with everything V1
-//!   presents (render mode, header title and timeout, operation target, summary, named
+//! * Acceptance ([`accepted_visual`]): a routed adapter visual is accepted with everything the
+//!   adapter returns (render mode, header title and timeout, operation target, summary, named
 //!   sections, v3 content keys and v4 source ranges, selection rows), bounded and scoped to its
 //!   producer: anchor keys, source identities and selection identities become
 //!   `<plugin>:<identity>`, the identity [`PluginTuiPresentation::content_event_with_host`] and
@@ -14,8 +14,7 @@
 //! * Pointer targets ([`TranscriptV2Host::committed_visual_targets`]): the plugin visual rows
 //!   of the presented frame (published only after its output flushed), in terminal cells, with their producer-scoped identity. The root
 //!   model routes horizontal wheel input and right-button presses on them to the adapter, and
-//!   the focused visual's keys through the `visual` scope (Escape releases it), exactly as for
-//!   V1. Targets come from the presented frame's retained geometry: content scrolled away,
+//!   the focused visual's keys through the `visual` scope (Escape releases it). Targets come from the presented frame's retained geometry: content scrolled away,
 //!   resized or changed leaves no target behind.
 //! * Content positions ([`TranscriptV2Host::sync_content_positions`]): while the reader is
 //!   anchored inside plugin content, the adapter is asked to retain that source position

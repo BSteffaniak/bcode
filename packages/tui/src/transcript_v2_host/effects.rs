@@ -5,7 +5,7 @@
 //! [`crate::effects::TuiEffect::LoadTranscriptV2History`] effect carrying a [`HistoryLoad`],
 //! and executes it with the engine crate's bounded history loader
 //! ([`bcode_tui_transcript::window::load_history`], shared with the browser host) over the
-//! daemon history API the V1 effects use (`session_history_page`). The result is delivered as a
+//! daemon history API (`session_history_page`). The result is delivered as a
 //! [`HistoryLoaded`] stamped with the request's window generation and the host attach epoch.
 //! Reads are bounded and non-replaying; see the loader for the exact reads per request.
 

@@ -7,7 +7,6 @@ use super::pending_submission::PendingSubmission;
 pub struct PendingSubmissions {
     items: Vec<PendingSubmission>,
     staged: Option<String>,
-    revision: u64,
 }
 
 impl PendingSubmissions {
@@ -17,17 +16,10 @@ impl PendingSubmissions {
         &self.items
     }
 
-    /// Return revision for layout-affecting pending submission changes.
-    #[must_use]
-    pub const fn revision(&self) -> u64 {
-        self.revision
-    }
-
     /// Stage text as an in-flight submission.
     pub fn stage(&mut self, text: String) {
         self.staged = Some(text.clone());
         self.items.push(PendingSubmission::new(text));
-        self.bump_revision();
     }
 
     /// Take the currently staged submission.
@@ -46,7 +38,6 @@ impl PendingSubmissions {
     pub fn mark_first_queued(&mut self, queue_position: Option<u32>) {
         if let Some(pending) = self.items.first_mut() {
             pending.mark_queued(queue_position);
-            self.bump_revision();
         }
     }
 
@@ -54,41 +45,18 @@ impl PendingSubmissions {
     pub fn mark_first_sent(&mut self) {
         if let Some(pending) = self.items.first_mut() {
             pending.mark_sent();
-            self.bump_revision();
         }
-    }
-
-    /// Supersede positioning from submissions preceding manual navigation.
-    pub fn cancel_reveals(&mut self) {
-        for pending in &mut self.items {
-            pending.cancel_reveal();
-        }
-    }
-
-    /// Whether the first matching submission still owns its acceptance reveal.
-    #[must_use]
-    pub fn reveals_on_acceptance(&self, text: &str) -> bool {
-        self.items
-            .iter()
-            .find(|pending| pending.text() == text)
-            .is_some_and(PendingSubmission::reveals_on_acceptance)
     }
 
     /// Reconcile an authoritative acceptance by identity.
     pub fn remove_id(&mut self, id: &bcode_session_models::SubmissionId) {
         self.items.retain(|item| item.id() != id);
-        self.bump_revision();
     }
 
     /// Remove a pending submission by text.
     pub fn remove(&mut self, text: &str) {
         if let Some(index) = self.items.iter().position(|pending| pending.text() == text) {
             self.items.remove(index);
-            self.bump_revision();
         }
-    }
-
-    const fn bump_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
     }
 }

@@ -1,9 +1,9 @@
 # TUI V2 transcript architecture
 
-This document is the implementation contract for the second terminal transcript engine ("V2").
-Every phase and every change to V2 code implements against it. Rules are numbered; tables are
-normative. Where this document and an older TUI document disagree about V2, this document wins;
-V1 continues to follow [`tui-rendering.md`](tui-rendering.md) until it is deleted.
+This document is the implementation contract for the terminal transcript engine ("V2", the only
+transcript engine since phase 7 removed the first one, "V1"). Every change to the engine and its
+hosts implements against it. Rules are numbered; tables are normative. Where this document and
+an older TUI document disagree about the transcript, this document wins.
 
 Related documents: [`tui-rendering.md`](tui-rendering.md),
 [`renderer-architecture.md`](renderer-architecture.md),
@@ -21,7 +21,7 @@ Contents:
 4. Position and navigation model
 5. Resident window and paging
 6. Focus model
-7. Engine selection
+7. Host integration
 8. BMUX upstream work
 9. Frame pipeline and performance budgets
 10. Acceptance criteria
@@ -43,11 +43,15 @@ frame composition that places the transcript, latest bar, composer and status ro
 
 ### 1.2 Relation to V1
 
+Phase 7 removed the first engine (V1), its transcript state in the host shell and the
+engine-selection seam. Rules S1–S3 governed the transition and are retired; they are kept here
+as history because phase exit criteria cite them.
+
 | Rule | Statement |
 |---|---|
 | S1 | V2 is a separate engine. It does not call V1-private transcript modules in `packages/tui/src` (for example `app.rs`, `chat_loop.rs`, `render.rs`, `transcript_*.rs`, `older_history.rs`, `structure.rs`, `indexed_transcript_layout.rs`). |
 | S2 | V1 stays behaviorally untouched. No V1 bug fixes. The only V1 edits permitted before phase 7 are (a) the engine-selection seam (section 7) and (b) `#[cfg(test)]`-only observation and driving seams used by the scenario suite (for example the `*_for_test` methods on `BcodeRuntimeModel` and `BmuxApp`), which add no production code. Each such edit must leave V1 behavior identical when V1 is selected. |
-| S3 | Both engines remain selectable from phase 4 until phase 7. Phase 7 makes V2 the default, deletes V1 and its seam, and updates documentation and invariants. |
+| S3 | Both engines remain selectable from phase 4 until phase 7. Phase 7 makes V2 the only engine, deletes V1 and its seam, and updates documentation. `INVARIANTS.md` was reviewed in phase 7 and needs no change. |
 | S4 | V2 is not a port. Where V2 needs behavior that V1 implements, it re-derives it from this specification and the acceptance criteria, not from V1 code structure. |
 
 ### 1.3 Shared code
@@ -61,17 +65,18 @@ V2 may use only genuinely generic or semantic layers:
 | Theme | `bcode_tui_theme` | Resolved roles, chrome, motion, density, icons. |
 | Pure content recipes | `bcode_tui_components` | Only producers that are pure functions of explicit inputs (no thread-locals, no application state), such as Markdown projection adapters, tool cards, diff/source viewers, composer recipe. |
 | Terminal mechanics | `bmux_tui`, `bmux_tui_components`, `bmux_tui_runtime`, `bmux_markdown` | Layout, measurement, virtualization, anchoring, scrolling, animation, selection, hits, focus, damage, test harness. |
-| Host shell | `bcode_tui` | Daemon connection, effects/IPC, composer state, overlays/pickers/modals, plugin hosting, configuration. V2 is embedded by the host; it does not own I/O. |
+| Host shell | `bcode_tui` | Daemon connection, effects/IPC, composer state, overlays/pickers/modals, plugin hosting, configuration, the bounded Markdown image loader and WASM Mermaid workers, pending submissions and process-local notices. V2 is embedded by the host; it does not own I/O. |
 
-A V1 module that V2 needs but that relies on thread-locals or V1 application state is not
-shared; V2 implements its own explicit-input equivalent (rule L4). The resulting temporary
-duplication is removed when V1 is deleted in phase 7.
+Producers that need behavior relying on thread-locals or application state use explicit-input
+equivalents (rule L4).
 
 ---
 
 ## 2. Diagnosis summary
 
-Paths are relative to `packages/tui/src` unless noted. Rule identifiers refer to sections 3–6.
+Paths are relative to `packages/tui/src` unless noted and refer to the V1 implementation removed
+in phase 7; the table is kept as the rationale for the rules. Rule identifiers refer to sections
+3–6.
 
 | # | V1 root cause | Evidence | Preventing V2 rule(s) |
 |---|---|---|---|
@@ -123,16 +128,14 @@ Paths are relative to `packages/tui/src` unless noted. Rule identifiers refer to
 
 | Item | Placement | Justification |
 |---|---|---|
-| V2 engine | **New crate** `packages/tui-transcript/` → `bcode_tui_transcript` | A crate boundary mechanically enforces S1 (V2 cannot reach V1 internals of `bcode_tui`), lets the engine be tested headlessly without the host, and survives V1 deletion as the transcript engine. Created in phase 2 when its first code lands. Domain-named. |
+| V2 engine | **New crate** `packages/tui-transcript/` → `bcode_tui_transcript` | A crate boundary keeps the engine independent of its hosts (`bcode_tui`, `bcode_tui_web`) and lets it be tested headlessly. Created in phase 2 when its first code lands. Domain-named. |
 | V2 modules | `window`, `units`, `layout` (with `layout::producers`, `layout::context`), `viewport`, `navigation` (with `navigation::auto`), `focus`, `latest_bar`, `selection`, `frame`, `engine`, `sample` | One module per layer; `engine` is the façade the host calls. `sample` lays a fixed item list out through the standard producers with an explicit `RenderConfig` and `StructureConfig`, without viewport, navigation or boundary rows; the appearance-picker preview and the generated theme gallery render through it. |
-| V2 scenario support | `bcode_tui_transcript` feature `testing` (module `scenario`): deterministic engine fixtures (fixture producers, `LayoutWorkCounters` counted by the item layout cache and read with `TranscriptEngine::take_layout_work`; a scripted history source and BMUX `ProgramHarness` glue are added, together with the `bmux_tui_runtime/testing` dependency, only when a phase needs them). The V2 driver itself is `bcode_tui::transcript_scenarios::v2` (`cfg(test)`); it drives the engine façade directly in phases 2–3 and through `transcript_v2_host` from phase 4. | Keeps one scenario definition set for both engines; the engine crate never depends on `bcode_tui`. |
+| V2 scenario support | `bcode_tui_transcript` feature `testing` (module `scenario`): deterministic engine fixtures (fixture producers, `LayoutWorkCounters` counted by the item layout cache and read with `TranscriptEngine::take_layout_work`; a scripted history source and BMUX `ProgramHarness` glue are added, together with the `bmux_tui_runtime/testing` dependency, only when a phase needs them). The V2 driver itself is `bcode_tui::transcript_scenarios::v2` (`cfg(test)`); it drives the engine façade directly in phases 2–3 and through `transcript_v2_host` from phase 4. | Keeps one scenario definition set for the host and headless drivers; the engine crate never depends on `bcode_tui`. |
 | Incremental window operations | `bcode_session_view` module `window_ops`; change types in `bcode_session_view_models` (`TranscriptChanges`, `TranscriptChange`) | Semantic, renderer-neutral (A1, A4). No terminal data. |
-| Engine enum and config key | `bcode_config`: `TuiEngine` enum, `TuiConfig::engine` | Config crate owns the schema. |
-| Engine resolution, V2 host wiring | `bcode_tui` modules `engine_selection` and `transcript_v2_host` | Host owns I/O (client calls for pages), effects and startup. |
-| CLI flag | `bcode_cli` root `Cli` struct | Existing global flags live there. |
-| Engine-neutral scenario suite | `bcode_tui` `cfg(test)` module `transcript_scenarios` (definitions, runner, V1 driver; V2 driver from phase 2). Status manifest: [`tui-v2-scenarios.md`](tui-v2-scenarios.md). | The V1 driver needs crate-internal access, and host-owned scenarios (composer typing, clipboard, configuration reload) need the host. Until phase 4 wires V2 into the host, such scenarios are ignored for V2 with `#[ignore = "V2 pending phase 4: <capability>"]`. |
+| Host wiring | `bcode_tui` module `transcript_v2_host` | Host owns I/O (client calls for pages), effects and startup. |
+| Transcript scenario suite | `bcode_tui` `cfg(test)` module `transcript_scenarios` (definitions, runner, the host driver `v2` and the headless driver `v2_headless`). Status manifest: [`tui-v2-scenarios.md`](tui-v2-scenarios.md). | Host-owned scenarios (composer typing, clipboard, configuration reload) need the host. |
 | Browser host | `bcode_tui_web` (`transcript`, `history`, `visuals`, `image`, `feed`, `surface`, `wasm`), feed routes in `bcode_hyperchad::browser_api` (`history_page`, `live`) | The browser embeds the engine like the native host and owns its I/O (section 3.7). The wire types are transport only; the payloads are the engine's canonical inputs, so no `_models` crate is involved. |
-| Plugin visual contract | `bcode_tui_components` feature `plugin-visual`, module `plugin_visual` (`canonical` adapter input, `output` rows/images/actions, `action` intents, `portable` static adapter registry) | One BMUX-boundary contract shared by the native and browser hosts and by statically linked producer adapters, independent of either transcript engine. It carries BMUX types, so it is not the `bcode.tui-visual-adapter` ABI (E2) and never reaches portable model contracts. |
+| Plugin visual contract | `bcode_tui_components` feature `plugin-visual`, module `plugin_visual` (`canonical` adapter input, `output` rows/images/actions, `action` intents, `portable` static adapter registry) | One BMUX-boundary contract shared by the native and browser hosts and by statically linked producer adapters, independent of the transcript engine. It carries BMUX types, so it is not the `bcode.tui-visual-adapter` ABI (E2) and never reaches portable model contracts. |
 | BMUX patch and Cargo.lock guard | `xtask/src/bmux_lock.rs`, run by `cargo xtask bmux-lock-check` and first by `cargo run -p xtask -- architecture` | Existing repository validation home. |
 
 No `_models` crate is created for V2: no other package needs V2 types without the
@@ -253,18 +256,16 @@ pub enum UnitKey {
 The host shell owns transcript presentation that is not canonical session history: pending
 submissions (staged, sending and queued messages the session has not accepted) and
 process-local notices (daemon and client errors, slash-command output in a draft, plugin
-activity). V1 draws both from shell state (`PendingSubmissions`, the ephemeral entries of its
-presentation document). The original specification only covered session events, so V2 showed
-neither: a submission left no trace, errors were invisible and draft slash-command output was
-lost. The local-rows rules close that gap (`units::local`, `engine::local`,
-`transcript_v2_host::local_rows`).
+activity). Both come from shell state (`PendingSubmissions` and the shell's process-local
+notices, `bcode_tui::ephemeral_notices`). The local-rows rules present them
+(`units::local`, `engine::local`, `transcript_v2_host::local_rows`).
 
 | Rule | Statement |
 |---|---|
 | LR1 | Local rows are host-owned presentation units. At the end of every update the host passes them to the engine as plain data (`LocalRow { key, placement, item }`, `TranscriptEngine::set_local_rows`); the engine never derives them from its `SessionView` and never writes them into it, so they stay out of every canonical projection. `bcode_tui_transcript` receives only renderer-neutral items (a system message for a notice, a user message for a pending submission) and has no `bcode_tui` dependency. |
-| LR2 | Order matches V1. A notice stands directly after the canonical item that precedes it in the shell's presentation order (before the next canonical item, ending any group run there); when that item is not resident it follows the last resident item at or before its recorded sequence, and without either it precedes every item. A notice whose boundary lies past a detached window follows the newer-history boundary. Pending submissions follow everything, in submission order, after the notices. |
-| LR3 | Identity is stable: `UnitKey::Local(Notice(presentation entry id))` and `UnitKey::Local(Submission(submission id))`; the row's item carries a reserved `local:` id that no session item uses. Equal rows are a no-op; a changed row (for example `sending` → `queued #1`) takes a new layout revision and every other unit keeps its revision (L1). |
-| LR4 | Membership mirrors the shell exactly: rows appear, change and leave when the shell's pending submissions and notices do (staging, sent — which V1 does not draw —, queued, acceptance, cancellation, restore, queue recovery, `/clear`, session switches; the engine reset on a session switch clears and resends them). One exception keeps a submission visible: when the shell forgets a submission because the session recorded it — its submission record arrived (the model composer's submit result carries it, so the shell forgets the submission before any session event; attach hydration does the same), its acceptance or activation event arrived, or its user message arrived — but the engine has not incorporated the canonical item yet (held during a window replacement, such as the attach of a session a draft submission created, or a detached window loading its tail, T27), the host keeps the pending row until the canonical item's sequence (the sequence of the shell session view's `submission:<id>` item, or of the user message) is resident. A submission forgotten for any other reason (cancellation, `/clear`, a session switch) has no recorded item and leaves at once. The host remembers the rows it last showed across engine resets, so a submission forgotten in the update that attaches the session it created is still handed off. The canonical user message then replaces it within one update. Bounds are the shell's: V1 caps neither list, and the host builds rows only when a fingerprint of that state changes. |
+| LR2 | A notice stands directly after the canonical item that was newest when the shell raised it (before the next canonical item, ending any group run there); when that item is not resident it follows the last resident item at or before its recorded sequence, and without either it precedes every item. A notice whose boundary lies past a detached window follows the newer-history boundary. Pending submissions follow everything, in submission order, after the notices. |
+| LR3 | Identity is stable: `UnitKey::Local(Notice(notice id))` and `UnitKey::Local(Submission(submission id))`; the row's item carries a reserved `local:` id that no session item uses. Equal rows are a no-op; a changed row (for example `sending` → `queued #1`) takes a new layout revision and every other unit keeps its revision (L1). |
+| LR4 | Membership mirrors the shell exactly: rows appear, change and leave when the shell's pending submissions and notices do (staging, sent, queued, acceptance, cancellation, restore, queue recovery, `/clear`, session switches; the engine reset on a session switch clears and resends them). One exception keeps a submission visible: when the shell forgets a submission because the session recorded it — its submission record arrived (the model composer's submit result carries it, so the shell forgets the submission before any session event; attach hydration does the same), its acceptance or activation event arrived, or its user message arrived — but the engine has not incorporated the canonical item yet (held during a window replacement, such as the attach of a session a draft submission created, or a detached window loading its tail, T27), the host keeps the pending row until the canonical item's sequence (the sequence of the shell session view's `submission:<id>` item, or of the user message) is resident. A submission forgotten for any other reason (cancellation, `/clear`, a session switch) has no recorded item and leaves at once. The host remembers the rows it last showed across engine resets, so a submission forgotten in the update that attaches the session it created is still handed off. The canonical user message then replaces it within one update. Bounds are the shell's: neither list is capped, and the host builds rows only when a fingerprint of that state changes. |
 | LR5 | Local rows render with the message producers: a notice as a system message titled by its label (`System`, or the shell's own label such as `Activity`); a pending submission as a user message titled `You · <state>` in the `transcript.pending.label` style. They have no disclosure target and are never collapsed by presentation rules. |
 | LR6 | Local rows never trigger automatic navigation and are never admitted (N10); the arrival scan passes over them, so canonical units arriving before a pending row are still arrivals (T2, T3). Acceptance reveals the canonical user message (T2, T27), never the pending row. |
 | LR7 | A local-row change is reduced as content (N11): a following reader stays on the latest bottom and sees a new tail row like any tail content; a reading position does not move; a row below the viewport is latest-bar activity (C18). C8's "staged never moves the view" therefore means no reveal, anchor or jump: while reading, a staged submission moves nothing; while following, the view stays following. |
@@ -570,7 +571,7 @@ Transcript keyboard focus is unit focus: there is one transcript focus mode, ent
 | FO2 | Composer → Transcript: `alt+u` (`tui.transcript.focusUnits`, remappable in the `chat` scope) or the command-palette action. Initial target = last visible target, else nearest above (C33). Pointer input never moves keyboard focus. |
 | FO3 | Transcript → Composer: `Escape` (after closing the inspector, if open), `alt+u` again, a pointer press in the composer, or the command-palette action. Keys bound in the `transcript_focus` scope are consumed by the transcript; any other key or paste returns focus to the composer and is delivered to it. |
 | FO4 | **Home/End (user decision):** composer focused → start/end of the text input, never the transcript. Transcript focused → `JumpToSessionStart` / `JumpToLatest` (window loaded directly, W10); focus moves to the first / last target of the loaded window. |
-| FO5 | Page Up/Page Down scroll the transcript from either focus without changing focus. `ctrl+home` / `ctrl+end` (existing V1 defaults `TranscriptTop` / `TranscriptBottom`, next to `ctrl+up` / `ctrl+down` line scrolling) keep their keys from either focus; in V2 they mean `JumpToSessionStart` / `JumpToLatest` with direct `Head` / `Tail` loads (W10) instead of paging through the resident window. |
+| FO5 | Page Up/Page Down scroll the transcript from either focus without changing focus. `ctrl+home` / `ctrl+end` (`TranscriptTop` / `TranscriptBottom`, next to `ctrl+up` / `ctrl+down` line scrolling) keep their keys from either focus; they mean `JumpToSessionStart` / `JumpToLatest` with direct `Head` / `Tail` loads (W10) instead of paging through the resident window. |
 | FO6 | Transcript focus keys (scope `transcript_focus`, remappable): `j`/`k`/Up/Down, Enter/Space, `l`/`h`, `e`, `d`, `i`, shift+Up/Down, `m`, Home/End (FO4), Escape, as in [`tui-themes.md`](tui-themes.md#focus-mode). Moving focus emits `FocusTarget{target, edge}` (C32). |
 | FO7 | Focus targets are BMUX item focus targets (BMUX 12) derived from the retained item layout (B12); focus highlight is a paint-only overlay (L5). |
 | FO8 | A focus target leaving the resident window moves focus to the nearest surviving target; focus never forces paging. |
@@ -579,51 +580,41 @@ Transcript keyboard focus is unit focus: there is one transcript focus mode, ent
 
 ---
 
-## 7. Engine selection
+## 7. Host integration
 
-| Name | Value |
-|---|---|
-| Environment variable | `BCODE_TUI_ENGINE=v1\|v2` |
-| CLI flag | `--tui-engine <v1\|v2>` (global flag on the root `bcode` command) |
-| Config key | `[tui] engine = "v1" \| "v2"` (`bcode_config::TuiConfig::engine: Option<TuiEngine>`) |
-| Rust enum | `bcode_config::TuiEngine { V1, V2 }` (serde `"v1"`, `"v2"`) |
-| Resolution | `bcode_tui::engine_selection::resolve_tui_engine(cli: Option<TuiEngine>, env: Option<&str>, config: Option<TuiEngine>) -> Result<TuiEngine, EngineSelectionError>` |
+Engine selection (`--tui-engine`, `BCODE_TUI_ENGINE`, `[tui] engine`, `bcode_config::TuiEngine`,
+`bcode_tui::engine_selection`) existed from phase 4 to phase 7 and was removed with V1; rules
+EN1–EN5 are retired. The `--tui-engine` flag is now an unknown argument, a leftover
+`BCODE_TUI_ENGINE` is ignored, and a leftover `[tui] engine` key still parses and is ignored.
+The engine owns its own `SessionView`; the host shell keeps a separate bounded `SessionView` of
+the attached session for shell state (runtime, title, tools, plugin status, submission queue)
+and never presents its transcript.
 
-| Rule | Statement |
-|---|---|
-| EN1 | Precedence: CLI flag > environment variable > config > default. Default is `v1` until phase 7, then `v2`. |
-| EN2 | Invalid CLI values are rejected by argument parsing. An invalid environment value is a startup error naming the valid values; there is no silent fallback. Config values are schema-validated. |
-| EN3 | The engine is chosen once at startup and fixed for the process lifetime. There is no runtime switching (user decision: not worth the complexity); switching engines means restarting with another flag, environment value or config. |
-| EN4 | Each engine owns its own `SessionView` instance and consumes daemon data through the same bounded attach and history paths. Host shell state (composer, overlays, permissions, plugin surfaces, configuration) is engine-independent. |
-| EN5 | Shared code between engines is only the section 1.3 layers and the host shell. The seam in `bcode_tui` is a single dispatch point choosing which engine handles transcript ingest, transcript input and transcript painting. |
+The host (`bcode_tui::transcript_v2_host`, embedded by the root runtime model) integrates the
+engine as follows:
 
-Host behavior with the V2 engine selected (phase 4):
-
-* The keymap is built for the selected engine: the V2-only `transcript_focus` actions
-  (`tui.transcriptFocus.sessionStart` on Home, `tui.transcriptFocus.latest` on End, FO4) are
-  registered only for V2, so the V1 keymap, help and keymap export are unchanged.
-* Command-palette transcript routes reach the V2 host: "Focus transcript units" toggles V2
-  transcript focus like `alt+u`, and the inspector, make-default and bulk disclosure routes
-  run on the V2 transcript (phase 7); a route V2 does not know is left to the host shell and
-  never changes the hidden V1 transcript.
+* The keymap always registers the `transcript_focus` actions, including
+  `tui.transcriptFocus.sessionStart` on Home and `tui.transcriptFocus.latest` on End (FO4).
+* Command-palette transcript routes reach the host: "Focus transcript units" toggles
+  transcript focus like `alt+u`, and the inspector, make-default and bulk disclosure routes run
+  on the transcript.
 * Only this client's accepted submissions move the reader (T2, T27): the host shell decides,
   before it applies a durable user message, whether it accepts one of its own pending
   submissions.
 * A failed V2 history read is re-issued with a doubling backoff (250 ms up to 8 s) while the
-  engine still awaits it, and feeds daemon connectivity like V1 history reads.
+  engine still awaits it, and feeds daemon connectivity.
 * Leaving a session saves its V2 reading position; attaching it again restores it (T21), and
   a session opened at a search hit shows that sequence.
-* The interactive surface sits inline in V2-reserved rows, or in the dock below the V2
-  transcript when pinned (C37); the fast temporal repaint path is V1-only, and the V1
-  transcript body is not rendered.
-* Plugin visuals (phase 7): the host routes the same items V1 routes (live request drafts,
+* The interactive surface sits inline in rows its interaction unit reserves, or in the dock
+  below the transcript when pinned (C37).
+* Plugin visuals (phase 7): the host routes live request drafts,
   plugin-owned invocation presentations, artifact results, requests without a result under
   the declaring plugin's request schema, contributions) at the unit's body width
   (`producers::tool::body_width`, the width the producer lays the rows out in), accepts
   everything the adapter returns (render mode, header title and timeout, target, summary,
   named sections, v3 content keys, v4 source ranges, selection rows) bounded and scoped to its
-  producer, with V1's per-source fallback title, and the visual producer presents it as V1
-  does. The accepted visual also carries adapter-local images and action regions (statically
+  producer, with a per-source fallback title (the artifact title, the tool name of a
+  request), and the visual producer presents it. The accepted visual also carries adapter-local images and action regions (statically
   linked portable adapters return them; native routed adapters return none, so the native host
   leaves them empty). Images are BMUX placements registered from the retained block that shows
   their first adapter row, with the full adapter geometry as allocation and the block's cells
@@ -635,13 +626,13 @@ Host behavior with the V2 engine selected (phase 4):
   `SourcePosition::PluginSource` (anchors resolve inside their own identity, E3), copy the
   adapter's selection source (C36), and are content targets. The root model publishes the
   presented frame's plugin visual targets, so horizontal wheel input, right-button focus and
-  the focused visual's `visual`-scope keys reach `content_event_with_host` exactly as in V1,
+  the focused visual's `visual`-scope keys reach `content_event_with_host`,
   and the reading position's plugin content is retained across reflow. Cells under a host
   overlay (the open inspector, the Mermaid source view) publish no target and reach no shell
   screen (B7). Canonical shell
   screens scroll horizontally on their own (C39): host-owned offsets per item reach the
   engine through the render configuration and re-measure only that unit.
-* Markdown images and Mermaid diagrams (phase 6): the host runs the V1 workers (bounded image
+* Markdown images and Mermaid diagrams (phase 6): the host runs its workers (bounded image
   loader, WASM Mermaid renderer) for the reserved slots of visible units, then up to two
   resident units on each side, outside drawing. Each worker kind has one active and one
   replaceable pending request (D2). A result is installed only when its unit is still resident
@@ -649,8 +640,8 @@ Host behavior with the V2 engine selected (phase 4):
   installation is a unit revision of the owning unit (L8). Ready images are BMUX image
   placements registered by the Markdown body from its own retained node while painting, so
   only visible, correctly positioned content contributes placements; failures and images the
-  terminal or network policy cannot show become notice rows with the V1 fallback text.
-* Markdown activation (phase 7, V1 parity): actionable contributions (links with a safe web,
+  terminal or network policy cannot show become notice rows with the host's fallback text.
+* Markdown activation (phase 7): actionable contributions (links with a safe web,
   local or fragment destination, GitHub issue references, footnote references and
   definitions, `<details>`, Mermaid diagrams) are retained per-unit targets of the Markdown
   projection, with the same rectangles as their hit regions (B3, B12). A click focuses and
@@ -661,13 +652,13 @@ Host behavior with the V2 engine selected (phase 4):
   paint-only highlight (L5), not keyboard focus: the keys work from either focus and keep it
   (FO1). Links open through the host shell's safe activation boundary, `#bcode-session-<id>`
   links switch sessions, `#fragment` links reveal the anchor (the link's unit first),
-  relative local links resolve against the session's working directory (as in V1),
+  relative local links resolve against the session's working directory,
   footnotes jump to their definition and back, `<details>` state is a render input keyed by
   unit and contribution id (a revision of that unit only, L3), and Mermaid diagrams toggle a
   source view over the viewport that occludes the transcript beneath it and closes when the
-  diagram leaves the view. Status messages and copy reporting are V1's.
+  diagram leaves the view. Status messages and copy reporting are the host shell's.
 * Frames (phase 6, F1–F7): the host shell derives only its chrome layout (header, status,
-  composer, dock) and does not prepare or commit the V1 transcript layout. The V2 frame is
+  composer, dock). The V2 frame is
   prepared once per presentation, before drawing, at the presentation clock; painting reads the
   snapshot only. V2 transcript changes (scrolling, motion frames, focus traversal, disclosure,
   selection, accepted spinner frames) repaint the transcript region alone; a frame that differs
@@ -693,8 +684,9 @@ Host behavior with the V2 engine selected (phase 4):
   rows are visited per frame. The copied text is each selected part's source bytes (tool
   output and diffs copy their original text, tabs included, not the sanitized painted text),
   parts of one unit joined by a newline and units by a blank line, copied through the host
-  shell's clipboard path with V1's messages, auto-copy and post-copy clear policy (C35).
-* Host chrome (phase 7, V1 parity): the host shell's streaming-presentation policy (`[tui]
+  shell's clipboard path with the shell's messages and the `[tui.selection]` auto-copy and
+  post-copy clear policy (C35).
+* Host chrome (phase 7): the host shell's streaming-presentation policy (`[tui]
   streaming`, the streaming configurator's override and reset) is applied to the V2 engine's
   own `SessionView` at the end of every update and kept across engine resets; pacing stays in
   `SessionView` and the host only schedules its deadline on the V2 transcript timer (D13). The
@@ -702,7 +694,7 @@ Host behavior with the V2 engine selected (phase 4):
   frame (presented offset, `LatestBarState::rows_below_latest`), passed explicitly to the
   chrome, and a changed position damages the status row with the transcript. Chrome theme
   inputs are kept current from the host frame path (the composer frame reads the frame's
-  theme), not from V1 layout preparation. Transcript scroll keys under an interactive surface
+  theme). Transcript scroll keys under an interactive surface
   and user-bound `tui.tools.*` keys act on V2 (under transcript focus a tools key keeps focus
   and acts on the focused subtree, as the palette command does); docked (`pinned`) surfaces take the dock below
   the V2 transcript and off-screen focus retain/suspend follows the V2 inline geometry (C37).
@@ -792,7 +784,7 @@ check), **M** manual. Every ID must be checked before phase 7.
 |---|---|---|
 | A1 | Shared/session-view/portable layers have no terminal, input, frame, viewport, key, mouse or BMUX dependencies (`bmux_color` only). | G |
 | A2 | The TUI owns terminal layout, viewport, scroll anchoring, hit testing, cursor, input mapping, frame drawing and native plugin surfaces. | M (review); the dependency half is the A1/A6 guard |
-| A3 | Interactive presentation choices persist only to user state; engine switching and focus are not persisted. | U |
+| A3 | Interactive presentation choices persist only to user state; focus is not persisted. | U |
 | A4 | Renderers consume `SessionView` semantics; `SessionView` is the only transcript reducer; events applied once (SD1). | U, S |
 | A5 | V2 holds ephemeral presentation state only; no second event-derived authority. | U; G: `cargo xtask architecture` rejects `bcode_tui_transcript` dependencies on `bcode_tui`, `bcode_client`, `bcode_ipc`, `bcode_session` and `bcode_server`, direct or transitive, except through `bcode_session_view`, whose client-backed actions use `bcode_client` and whose renderer neutrality has its own portable-presentation check (boundary added with the crate in phase 2) |
 | A6 | Portable APIs get no terminal branches or data. | G |
@@ -911,8 +903,8 @@ check), **M** manual. Every ID must be checked before phase 7.
 | X4 | Themes, profiles and chrome (LineFrame borders, speaker, surfaces, separators, motion, density, icons) apply through `ItemRenderContext`. | S, M |
 | X5 | Home/End per FO4 (composer: input start/end; transcript: true session start/latest loaded directly). | S |
 | X6 | Optional scrollbar, off by default, chrome-themeable, positioned within the whole session (W12). | S |
-| X7 | Engine selection by env, CLI and config with EN1 precedence and EN2 errors. | U |
-| X8 | The engine is fixed at startup; no runtime switch path exists (EN3). | U |
+| X7 | Retired in phase 7: engine selection was removed with V1. A leftover `[tui] engine` key still parses and is ignored. | U |
+| X8 | Retired in phase 7: there is one engine, so there is no switch path. | — |
 | X9 | Composer/transcript focus transitions per FO2/FO3/FO10. | S |
 | X10 | V2 declares no thread-locals or mutable statics; no pointer/wall-clock values in cache keys (L2, L3). | G |
 | X11 | `JumpToLatest` from a detached window returns to live with one request (W10). | S |
@@ -928,7 +920,7 @@ check), **M** manual. Every ID must be checked before phase 7.
 
 ### Manual smoke checklist (phase 4 and phase 7 gates)
 
-Run once per engine with a real daemon and a session of at least 5,000 events:
+Run with a real daemon and a session of at least 5,000 events:
 
 1. Attach: the latest bottom is shown and live streaming follows.
 2. Wheel and Page Up into history across several pages: no stall, leap or blank frame.
@@ -937,7 +929,6 @@ Run once per engine with a real daemon and a session of at least 5,000 events:
 5. Submit while following, while reading and while detached: the message is revealed only on acceptance; the answer is held at its top.
 6. Resize narrower and back while reading: the reading position is kept.
 7. Theme and profile switch, reduce-motion toggle, `alt+u` focus mode walk, disclosure clicks, drag selection and copy.
-8. Start once with `--tui-engine v1` and once with `BCODE_TUI_ENGINE=v2`: each engine attaches to the same session.
 
 ### BUG. Regression scenarios
 
@@ -960,7 +951,7 @@ Run once per engine with a real daemon and a session of at least 5,000 events:
 | # | Ambiguity | Resolution | Status |
 |---|---|---|---|
 | 1 | Markdown projection cache: one per item vs current + up to 8 variants. | One accepted projection per resident item is the sole authority for rows, anchors, focus, hits and images (L7). A separate global bounded cache of up to 8 recent width variants may exist only to make resize-back cheap; a variant is used only on exact id/revision/options/width match and then becomes the accepted projection. | Confirmed by user |
-| 2 | Latest bar vs hidden continuation of the visible entry. | Follow the tested behavior: hidden continuation of the visible entry does not activate the bar; only a distinct newer entry fully below or hidden activity does (C18). `tui-rendering.md` is corrected in phase 7. | Confirmed by user |
+| 2 | Latest bar vs hidden continuation of the visible entry. | Follow the tested behavior: hidden continuation of the visible entry does not activate the bar; only a distinct newer entry fully below or hidden activity does (C18). | Confirmed by user |
 | 3 | Scope of the 450 ms grace window. | Grace follows every manual movement intent and suppresses automatic movement only (assistant segment reveal T3, overflow handoff T4). It does not stop content filling tail space (T11), explicit intents, or the reveal of a newly accepted submission (N5). | Confirmed by user |
 | 4 | Theme crate split (renderer-neutral `bcode_theme` described vs `bcode_tui_theme` with BMUX color types in reality). | Keep `bcode_tui_theme` as the TUI theme crate (it may depend on `bmux_tui`); renderer-neutral structure lives in `bcode_presentation_policy_models`. No new theme crate. Documentation is corrected to match. | Confirmed by user |
 | 5 | Navigation hidden in activity code. | Automatic navigation is decided only in `navigation::auto` and enters the reducer as intents (N9); activity code computes latest-bar activity only. | Confirmed by user |
@@ -978,12 +969,14 @@ Additional proposals raised by this specification:
 | 11-P2 | Page Up/Down step | Keep 10 rows (D1) for parity. | Confirmed by user |
 | 11-P3 | Focus bindings | `alt+u` is the single key that moves keyboard focus into the transcript (unit focus); Escape, `alt+u` again, or an unbound key returns to the composer (FO2, FO3). No `alt+t`. `ctrl+home`/`ctrl+end` keep their keys and mean direct session-start/latest loads in V2 (FO5). | Resolved by user |
 | 11-P4 | Detached live handling | Live transcript events are not applied while detached. Return to live uses the bounded tail window (W9, W10), or the buffered catch-up when paging down reaches the tail (W11). Submitting while detached loads the tail window on acceptance (T27). | Confirmed by user |
-| 11-P5 | Runtime engine switching | Dropped (user decision): the engine is chosen at startup only (EN3); each engine owns its `SessionView` (EN4). | Resolved by user |
+| 11-P5 | Runtime engine switching | Dropped (user decision); moot since phase 7 removed V1 and engine selection. | Resolved by user |
 | 11-P6 | Host-owned local rows | Pending submissions and process-local notices are V2 local rows (LR1–LR7, section 3.3). C8 is read as "no automatic navigation": a staged submission while following is shown on the latest bottom (LR7). | Spec correction after user report ("can't send a message" with V2) |
 
 ---
 
 ## 12. Phases
+
+Phases 0–6 refer to the V1 engine, which phase 7 removed.
 
 | Phase | Deliverables | Exit criteria |
 |---|---|---|
@@ -994,7 +987,7 @@ Additional proposals raised by this specification:
 | 4 | V2 wired: engine seam, `engine_selection`, `transcript_v2_host` effects, focus model, latest bar, selection, CLI flag, env var, config key. | X5–X9 pass; both engines selectable side by side; V1 test suite unchanged and passing with `v1`; the section 10 manual smoke checklist passes on both engines; host-owned scenarios are enabled for V2. |
 | 5 | Incremental `SessionView` window operations, prefetch, aligned timeline windows, direct head/tail windows, fast return to live, scrollbar estimates. | SD1–SD7, W1–W13 (with W7a), X11, X12, BUG-B1–B5 pass (BUG-B3 through both `End` in transcript focus and jump-to-latest); no full rebuild on paging (counter). |
 | 6 | Frame cleanup: single snapshot, pure paint, regional damage, split host-side god objects on the V2 path; BMUX 11–14 and 15b. | F1–F7, D4, D6, D7, X1, C34, C35 pass; latency/RSS gate (D8) passes manually. |
-| 7 | V2 default; delete V1 transcript code and the seam; update `tui-rendering.md`, `renderer-architecture.md`, `tui-keybindings.md`, `INVARIANTS.md` (with approval) and remove resolved ambiguities. | Every section 10 ID checked; workspace validation per AGENTS.md passes; no V1 transcript modules remain. |
+| 7 | V2 the only engine; delete V1 transcript code, the old transcript engine of `bcode_tui_components` and the seam (engine selectors included); update `tui-rendering.md`, `renderer-architecture.md`, `tui-keybindings.md` and the other TUI docs; `INVARIANTS.md` reviewed (no change required). Section 11 stays as the decision record the rules and code cite. | Every section 10 ID checked; workspace validation per AGENTS.md passes; no V1 transcript modules remain. |
 
 ---
 

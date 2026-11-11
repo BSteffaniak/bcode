@@ -487,6 +487,7 @@ runs through its last item.
 | `i` | open or close the inspector for the focused target |
 | `shift+Down`, `shift+Up` | scroll the inspector (the mouse wheel over it also scrolls, and its scrollbar can be clicked and dragged) |
 | `m` | make the focused tool unit's disclosure the default for that tool |
+| Home, End | jump to the session start / latest content, loading it directly, and focus its first / last target |
 | Escape | close the inspector, then leave focus mode (`alt+u` also leaves, closing the inspector) |
 
 In focus mode the expand-all, collapse-all, and reset actions affect only the

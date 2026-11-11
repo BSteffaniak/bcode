@@ -9,8 +9,6 @@ from collections import defaultdict
 IDENTITY_FIELDS = {
     "shell_output": ("output_bytes", "chunk_bytes"),
     "shell_replay": ("output_bytes", "chunk_bytes"),
-    "transcript_visual_update": ("transcript_entries",),
-    "renderer_parse_layout": ("format",),
     "telemetry_overhead": ("enabled",),
     "pending_live_fanout": ("workload",),
 }
@@ -21,8 +19,6 @@ TIMING_FIELDS = {
         "average_committed_delta",
     ),
     "shell_replay": ("wall_us",),
-    "transcript_visual_update": ("wall_us", "sync_us"),
-    "renderer_parse_layout": ("parse_layout_us",),
     "telemetry_overhead": ("wall_us",),
     "pending_live_fanout": (
         "wall_us",

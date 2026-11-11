@@ -201,7 +201,7 @@ mod tests {
         let owner = bcode_session_models::SessionId::new();
         let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
         let mut chat = ActiveChat {
-            app: crate::app::BmuxApp::new_with_history(Some(owner), &[], &[], false),
+            app: crate::app::BmuxApp::new_with_history(Some(owner), &[], &[]),
             agents: AgentCatalog::default(),
             attachment: ChatSessionAttachment::Attached { session_id: owner },
             event_sender,
@@ -263,7 +263,7 @@ mod tests {
         let session_id = bcode_session_models::SessionId::new();
         let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
         let mut chat = ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[]),
             agents: AgentCatalog::default(),
             attachment: ChatSessionAttachment::Attached { session_id },
             event_sender,
@@ -328,7 +328,7 @@ mod tests {
                 let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
                 let session_id = attached.then(bcode_session_models::SessionId::new);
                 let mut chat = ActiveChat {
-                    app: BmuxApp::new_with_history(session_id, &[], &[], false),
+                    app: BmuxApp::new_with_history(session_id, &[], &[]),
                     agents: AgentCatalog::default(),
                     attachment: session_id.map_or(ChatSessionAttachment::Draft, |session_id| {
                         ChatSessionAttachment::Attached { session_id }
@@ -362,7 +362,7 @@ mod tests {
         let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
         let session_id = bcode_session_models::SessionId::new();
         let mut chat = super::super::session_flow::ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[]),
             agents: super::super::session_flow::AgentCatalog::default(),
             attachment: super::super::session_flow::ChatSessionAttachment::Opening {
                 session_id,
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn active_plugin_status_does_not_block_ordinary_composer_staging() {
-        let mut app = super::super::app::BmuxApp::new_with_history(None, &[], &[], false);
+        let mut app = super::super::app::BmuxApp::new_with_history(None, &[], &[]);
         app.set_plugin_status(vec![bcode_session_view_models::PluginStatusView {
             plugin_id: "bcode.loop".to_owned(),
             note_id: "loop-active".to_owned(),

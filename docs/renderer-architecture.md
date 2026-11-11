@@ -8,18 +8,16 @@ covered interaction surfaces, composer input, transcript selection, and backgrou
 actions from receiving foreground input. Slash completion deliberately remains non-modal
 and shares the composer. Inactive foreground states remain retained, but do not paint.
 
-Full and temporal frames share `paint_foreground`. Full-screen foregrounds omit chat;
+Frames paint foregrounds through `paint_foreground`. Full-screen foregrounds omit chat;
 partial-screen modals retain a cells-only backdrop prepared through BMUX `PaintCx`.
 Backdrop controls do not contribute cursor, focus, hits, selection, semantic regions, or
 protocol images. The modal owns those contributions even outside its panel. This is a
 conservative modal policy, not geometric hit-through or alpha-layer composition.
 
-Modal frames replace the complete metadata scene while ANSI output remains diffed. Their
-temporal path reuses a terminal-sized backdrop rather than remeasuring/repainting the
-transcript or invoking background plugin components. Structural/background content updates
-refresh preparation; normal rendering restores live background controls on close. Missing
-retained terminal state or incompatible backdrop dimensions forces normal preparation.
-Backdrop storage is bounded by terminal dimensions and is disposable presentation state.
+Modal frames replace the complete metadata scene while ANSI output remains diffed. The
+backdrop is painted from the live background into a terminal-sized cells-only buffer in the
+same frame; normal rendering restores live background controls on close. Backdrop storage is
+bounded by terminal dimensions and is disposable presentation state.
 
 Both draw paths emit protocol image updates through `draw_damage_with_overlay`, before the
 terminal's synchronized-output end and flush. Foreground coverage removes background image
@@ -45,7 +43,7 @@ rows plus render-mode/header hints, but the TUI retains ownership of composition
 chrome, viewport, input, and paint. Adapter failure advances through the ordered candidates before
 the canonical fallback.
 
-Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary into the TUI. Runtime-work label composition and other terminal activity strings live in TUI modules rather than shared session-view models.
+Canonical transcript content reaches the TUI only as `SessionView` documents and window changes consumed by the transcript engine (`bcode_tui_transcript`). Runtime-work label composition and other terminal activity strings live in TUI modules rather than shared session-view models.
 
 ## Smooth live text presentation
 
@@ -108,15 +106,12 @@ The target boundary is active for tool transcript semantics in both established 
 * `packages/session-view` projects bounded history and renderer-relevant live events and executes daemon-backed semantic actions.
 * `packages/hyperchad` consumes this layer as Bcode's HyperChad application host; selected Cargo features choose the concrete HyperChad backend.
 * `packages/hyperchad/ui` owns portable HyperChad presentation built from canonical HyperChad templates, routes, forms, actions, and renderer APIs.
-* `packages/tui` retains a `SessionView` projection and adapts its transcript through one `SessionViewTerminalAdapter`, keyed by stable `TranscriptViewItemId` and revision, into terminal-native rows. `SessionView` is the sole semantic transcript authority: durable and live events are applied there once, while the TUI consumes the resulting document and does not construct assistant, reasoning, tool, permission, compaction, skill, interaction, or system rows from raw events. Usage and runtime-work remain non-transcript runtime state. Assistant and reasoning streams preserve terminal render identity across incremental replacement and durable finalization even when usage state, permission, supplemental, or tool updates are interleaved. Terminal viewport, scroll anchoring, hit testing, wrapping, diff layout, animation, and plugin visual/artifact adapter state remain TUI-owned.
+* `packages/tui-transcript` (the transcript engine, hosted by `packages/tui` and the browser surface `packages/tui-web`) owns the transcript `SessionView` projection and applies its `TranscriptChanges` to units keyed by stable `TranscriptViewItemId` and revision. `SessionView` is the sole semantic transcript authority: durable and live events are applied there once, while the TUI consumes the resulting document and does not construct assistant, reasoning, tool, permission, compaction, skill, interaction, or system rows from raw events. Usage and runtime-work remain non-transcript runtime state. Assistant and reasoning streams preserve terminal render identity across incremental replacement and durable finalization even when usage state, permission, supplemental, or tool updates are interleaved. Terminal viewport, scroll anchoring, hit testing, wrapping, diff layout, animation, and plugin visual/artifact adapter state remain TUI-owned.
 
 The TUI may retain renderer-local interaction and layout state, but shared transcript lifecycle,
 identity, ordering, retention, fallback semantics, and stream integrity come from `SessionView`.
 Terminal-local notices created by TUI commands remain presentation state and are not canonical
 session transcript facts. The TUI must not create a parallel event-derived transcript authority.
-Remaining work is product-parity validation and removal of superseded compatibility interfaces, not
-another transcript reconciliation layer.
-of proven duplicate adapter/projection helpers, not a different semantic contract.
 
 ## Shared renderer contract
 
@@ -135,7 +130,7 @@ Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They 
 
 `packages/session-view` owns generic projection from bounded daemon/session state into `SessionViewSnapshot` and generic execution of daemon-backed `SessionViewAction` values. It must remain domain-focused rather than becoming a miscellaneous application-state crate.
 
-`packages/tui` owns terminal layout, terminal-event mapping, viewport and anchoring behavior, frame rendering, and terminal-specific polish. Terminal-specific plugin surfaces remain TUI-only. Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary; raw event handling may update terminal interaction/status state but cannot create or finalize shared semantic rows.
+`packages/tui-transcript` owns transcript layout, viewport, navigation, focus, the latest bar and selection; `packages/tui` hosts it and owns the shell (composer, overlays, pickers, permissions, plugin surfaces, effects, configuration), terminal-event mapping, frame rendering, and terminal-specific polish. Terminal-specific plugin surfaces remain TUI-only. Canonical transcript content enters only through the transcript engine's `SessionView`; raw event handling may update terminal interaction/status state but cannot create or finalize shared semantic rows.
 
 `packages/hyperchad` owns the HyperChad application host, daemon connection, bounded snapshot hydration, session selection, semantic action mapping, and selected-backend integration. Backend selection flows from consuming package features into `bcode_hyperchad` and then into HyperChad.
 

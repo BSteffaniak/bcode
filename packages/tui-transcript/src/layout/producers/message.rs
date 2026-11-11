@@ -1122,9 +1122,9 @@ impl UnitProducer for SystemMessageProducer {
 /// Process-local rows (LR5), composed like the message kind their item has.
 ///
 /// * A pending submission is a user message titled `You · <state>` in the
-///   `transcript.pending.label` style (V1 `push_pending_submission_rows`).
-/// * A notice is a system message titled by its display label, `System` without one (V1
-///   ephemeral notices keep their own label, such as `Activity`).
+///   `transcript.pending.label` style.
+/// * A notice is a system message titled by its display label, `System` without one (the
+///   host's notices keep their own label, such as `Activity`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LocalRowProducer;
 

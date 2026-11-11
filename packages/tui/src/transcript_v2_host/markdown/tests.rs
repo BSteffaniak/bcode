@@ -1,6 +1,6 @@
 //! V2 Markdown activation in the host: clicks and the `tui.markdown.*` keys open links through
 //! the safe activation boundary, request session switches, navigate fragments, jump between
-//! footnotes, toggle `<details>` and the Mermaid source view, with V1's notices.
+//! footnotes, toggle `<details>` and the Mermaid source view, with the host's notices.
 
 use std::time::{Duration, Instant};
 
@@ -23,10 +23,7 @@ use crate::transcript_v2_host::test_fixtures::{COMPOSER, Painted, REGION, event,
 const GLOW: Duration = Duration::from_millis(0);
 
 fn keymap() -> BmuxKeyMap {
-    BmuxKeyMap::from_config_for_engine(
-        &bcode_config::TuiConfig::default(),
-        bcode_config::TuiEngine::V2,
-    )
+    BmuxKeyMap::from_config(&bcode_config::TuiConfig::default())
 }
 
 /// A host attached to a session with one question and one assistant message per entry of
@@ -243,7 +240,7 @@ fn markdown_keys_without_a_target_are_consumed_without_change() {
         assert_eq!(
             press(&mut host, key, later(at, 1)),
             TranscriptInputOutcome::Consumed,
-            "{key} is the transcript's and never reaches the V1 handler"
+            "{key} is the transcript's and never reaches the chat handler"
         );
     }
     assert_eq!(host.take_markdown_notice(), None);

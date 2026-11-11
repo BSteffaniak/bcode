@@ -39,19 +39,13 @@ pub fn paint_backdrop(
     area: Rect,
     target: &mut PaintCx<'_, '_>,
     paint: impl FnOnce(&mut PaintCx<'_, '_>),
-) -> Buffer {
+) {
     let mut buffer = Buffer::empty(area);
     let mut frame = Frame::new(&mut buffer);
     paint(&mut PaintCx::new(&mut frame));
-    paint_backdrop_buffer(&buffer, target);
-    buffer
-}
-
-/// Reuse a prepared backdrop without invoking background components again.
-pub fn paint_backdrop_buffer(buffer: &Buffer, target: &mut PaintCx<'_, '_>) {
     target.rasterize(LocalRect::terminal(buffer.area()), |x, y| {
-        let point = Point::new(u16::try_from(x).ok()?, u16::try_from(y).ok()?);
-        let cell = buffer.get(point)?;
+        let position = Point::new(u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+        let cell = buffer.get(position)?;
         (!cell.is_wide_continuation()).then(|| (cell.symbol.clone(), cell.style))
     });
 }

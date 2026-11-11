@@ -346,7 +346,7 @@ impl TranscriptV2Host {
             return false;
         }
         let context_base = VisualContextBase::of(app);
-        // Adapters render (key hints) with the effective frontend keymap, as in V1.
+        // Adapters render (key hints) with the effective frontend keymap.
         let keymap_host = super::plugin_visuals::VisualKeymapHost(app.effective_keymap());
         let items = &engine.session_view().snapshot().transcript.items;
         let mut routed = 0;
@@ -430,7 +430,7 @@ impl TranscriptV2Host {
     }
 }
 
-/// The plugin visual one resident item renders through, routed as V1 routes the same item.
+/// The plugin visual one resident item renders through.
 struct ItemVisual<'a> {
     /// Adapter input.
     visual: CanonicalPluginVisual,
@@ -455,7 +455,7 @@ impl<'a> ItemVisual<'a> {
     }
 }
 
-/// The plugin visual `item` renders through, as V1 routes it:
+/// The plugin visual `item` renders through:
 ///
 /// * A live request draft (no presentation or result yet): the draft adapter.
 /// * A plugin-owned invocation presentation: its primary contribution.
@@ -574,9 +574,8 @@ impl VisualContextBase {
 
     /// Route `source`, the visual of `item` under `structure`, through `presentation` and
     /// accept the adapter's result at revision `key`. The adapter renders at the unit's body
-    /// width under `theme` at layout `width` (the width the producer lays its rows out in, as
-    /// V1 rendered adapters at the tool's inner width), in the item's working directory or
-    /// else the session's.
+    /// width under `theme` at layout `width` (the width the producer lays its rows out in, the
+    /// tool's inner width), in the item's working directory or else the session's.
     fn route(
         &self,
         presentation: &crate::plugin_tui::PluginTuiPresentation,

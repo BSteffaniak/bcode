@@ -33,9 +33,6 @@ use super::{
     slash_palette, slash_palette_render, thinking_dialog_render, timeline_dialog_render,
 };
 
-/// Recent Markdown items examined for a missing exact projection on each frame.
-const MARKDOWN_PROJECTION_LOOKBACK: usize = 8;
-
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone)]
 pub struct DraftAutosave {
@@ -394,14 +391,8 @@ pub struct ChatLoopState {
     session_picker_launch_directory: std::path::PathBuf,
     pub(super) interactive_surface_queue: InteractiveSurfaceQueue,
     artifact_stream: Option<ArtifactStreamCoordinator>,
-    markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
-    markdown_presentation: Option<super::markdown_image::MarkdownPresentationRuntime>,
-    markdown_mermaid: Option<super::markdown_mermaid::MarkdownMermaidRuntime>,
-    markdown_image_tasks:
-        Vec<tokio::task::JoinHandle<super::markdown_image::MarkdownImageLoadCompletion>>,
-    markdown_mermaid_tasks:
-        Vec<tokio::task::JoinHandle<super::markdown_mermaid::MarkdownMermaidCompletion>>,
-    modal_backdrop: Option<bmux_tui::buffer::Buffer>,
+    markdown_image_loader: Option<super::markdown_image::MarkdownImageLoader>,
+    mermaid_renderer: Option<bmux_mermaid_render::WasmMermaidRenderer>,
     markdown_image_compositor: bmux_image::tui::TuiImageCompositor,
     markdown_image_capabilities: bmux_image::HostImageCapabilities,
     markdown_image_config: bmux_image::ImageConfig,
@@ -500,13 +491,8 @@ impl ChatLoopState {
             session_picker_launch_directory: std::path::PathBuf::new(),
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             artifact_stream: passive_client.cloned().map(ArtifactStreamCoordinator::new),
-            markdown_projection:
-                super::markdown_projection_coordinator::MarkdownProjectionCoordinator::new(),
-            markdown_presentation: super::markdown_image::MarkdownPresentationRuntime::new().ok(),
-            markdown_mermaid: super::markdown_mermaid::MarkdownMermaidRuntime::packaged().ok(),
-            markdown_image_tasks: Vec::new(),
-            markdown_mermaid_tasks: Vec::new(),
-            modal_backdrop: None,
+            markdown_image_loader: super::markdown_image::MarkdownImageLoader::new().ok(),
+            mermaid_renderer: bmux_mermaid_render::WasmMermaidRenderer::new().ok(),
             markdown_image_compositor: bmux_image::tui::TuiImageCompositor::new(),
             markdown_image_capabilities: bmux_image::host_caps::detect_from_env(),
             markdown_image_config: bmux_image::ImageConfig::default(),
@@ -712,14 +698,6 @@ impl ChatLoopState {
         handle_artifact_completion(chat, self, completion)
     }
 
-    pub fn apply_markdown_projection_completion(
-        &mut self,
-        chat: &mut ActiveChat,
-        completion: super::markdown_projection_coordinator::MarkdownProjectionCompletion,
-    ) -> bool {
-        self.accept_markdown_projection_completion(chat, completion)
-    }
-
     pub fn take_artifact_completion_receiver(
         &mut self,
     ) -> tokio::sync::mpsc::Receiver<ActiveArtifactFetchCompletion> {
@@ -781,14 +759,6 @@ impl ChatLoopState {
             self.managed_effect_access(),
             handle.clone(),
         )
-    }
-
-    pub fn take_markdown_completion_receiver(
-        &self,
-    ) -> tokio::sync::watch::Receiver<
-        Option<super::markdown_projection_coordinator::MarkdownProjectionCompletion>,
-    > {
-        self.markdown_projection.completion_receiver()
     }
 
     pub fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: &DaemonObservation) {
@@ -2195,7 +2165,6 @@ impl ChatLoopState {
         self.viewport_input_connection = std::sync::Arc::default();
         self.viewport_input_retry_at = Instant::now();
         self.request_draft_handoff.clear();
-        self.markdown_projection.invalidate();
         if let Some(stream) = &mut self.artifact_stream {
             stream.retain_session(session_id);
         }
@@ -2259,21 +2228,18 @@ impl ChatLoopState {
 
     pub fn prepare_runtime_work(
         &mut self,
-        chat: &mut ActiveChat,
+        chat: &ActiveChat,
         frame_area: Rect,
     ) -> super::invalidation::UiInvalidation {
         self.prepare_viewport_inputs(chat, frame_area);
         if let Some(stream) = &mut self.artifact_stream {
             stream.start_due_fetches(Instant::now());
         }
-        self.request_latest_markdown_projection(chat, frame_area.width);
         record_artifact_stream_stats(self);
         let changed = chat
             .app
             .plugin_presentation()
-            .is_some_and(crate::plugin_tui::PluginTuiPresentation::poll_dynamic_visuals)
-            | maybe_start_older_history_load(chat, self, frame_area.width)
-            | maybe_start_newer_history_load(chat, self, frame_area.width);
+            .is_some_and(crate::plugin_tui::PluginTuiPresentation::poll_dynamic_visuals);
         if changed {
             super::invalidation::UiInvalidation::Structural
         } else {
@@ -3097,14 +3063,8 @@ impl ChatLoopState {
     #[must_use]
     pub fn markdown_visual_workers(&self) -> super::transcript_v2_host::visuals::VisualWorkers {
         super::transcript_v2_host::visuals::VisualWorkers {
-            images: self
-                .markdown_presentation
-                .as_ref()
-                .map(|runtime| runtime.image_loader.clone()),
-            mermaid: self
-                .markdown_mermaid
-                .as_ref()
-                .map(|runtime| runtime.renderer.clone()),
+            images: self.markdown_image_loader.clone(),
+            mermaid: self.mermaid_renderer.clone(),
         }
     }
 
@@ -3151,145 +3111,8 @@ impl ChatLoopState {
         }
     }
 
-    fn accept_markdown_projection_completion(
-        &mut self,
-        chat: &mut ActiveChat,
-        completion: super::markdown_projection_coordinator::MarkdownProjectionCompletion,
-    ) -> bool {
-        if self.markdown_projection.latest_requested() != Some(&completion.generation) {
-            return false;
-        }
-        let Some((index, item)) = chat
-            .app
-            .transcript()
-            .iter()
-            .enumerate()
-            .find(|(_, item)| item.id().get() == completion.generation.item_id)
-        else {
-            return false;
-        };
-        if item.revision() != completion.generation.item_revision {
-            return false;
-        }
-        let render_duration_ms =
-            u64::try_from(completion.render_duration.as_millis()).unwrap_or(u64::MAX);
-        if let Some(telemetry) = &mut self.telemetry {
-            telemetry.record_histogram("tui.markdown.projection.render_ms", render_duration_ms);
-        }
-        match completion.outcome {
-            super::markdown_projection_coordinator::MarkdownProjectionOutcome::Rendered(result) => {
-                chat.app.transcript_markdown_cache().install(
-                    completion.generation.item_id,
-                    completion.generation.item_revision,
-                    completion.generation.options.clone(),
-                    result,
-                );
-                self.markdown_projection.complete(&completion.generation);
-                if let Some(telemetry) = &mut self.telemetry {
-                    telemetry.add_counter("tui.markdown.projection.accepted_total", 1);
-                }
-                chat.app.mark_transcript_item_dirty(index);
-                true
-            }
-            super::markdown_projection_coordinator::MarkdownProjectionOutcome::Failed(_) => {
-                self.markdown_projection.complete(&completion.generation);
-                if let Some(telemetry) = &mut self.telemetry {
-                    telemetry.add_counter("tui.markdown.projection.failed_total", 1);
-                }
-                false
-            }
-        }
-    }
-
-    fn request_latest_markdown_projection(&mut self, chat: &ActiveChat, width: u16) {
-        // Recent messages without an exact projection come first, newest first: their text is
-        // final once replaced, and a later item (for example live tool activity whose options
-        // change every frame) must not keep a finalized reply painted from its superseded
-        // streaming projection. Otherwise the newest Markdown item of any kind.
-        use super::transcript::{TranscriptItem, TranscriptItemKind};
-        fn missing<'a>(
-            app: &super::app::BmuxApp,
-            item: &'a TranscriptItem,
-            width: u16,
-        ) -> Option<(
-            &'a TranscriptItem,
-            bcode_markdown_render::MarkdownRenderOptions,
-        )> {
-            let options = render::markdown_render_options(app, item, width);
-            (!app
-                .transcript_markdown_cache()
-                .contains(item.id().get(), item.revision(), &options))
-            .then_some((item, options))
-        }
-        let mut recent = chat
-            .app
-            .transcript()
-            .iter()
-            .rev()
-            .filter(|item| item.text_format() == bcode_session_view_models::TextFormat::Markdown)
-            .take(MARKDOWN_PROJECTION_LOOKBACK)
-            .peekable();
-        let newest = recent.peek().copied();
-        let Some((item, options)) = recent
-            .filter(|item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::AssistantMessage
-                        | TranscriptItemKind::ReasoningMessage
-                        | TranscriptItemKind::UserMessage
-                )
-            })
-            .find_map(|item| missing(&chat.app, item, width))
-            .or_else(|| newest.and_then(|item| missing(&chat.app, item, width)))
-        else {
-            return;
-        };
-        if self
-            .markdown_projection
-            .latest_requested()
-            .is_some_and(|generation| {
-                generation.item_id == item.id().get()
-                    && generation.item_revision == item.revision()
-                    && generation.options == options
-            })
-        {
-            return;
-        }
-        if self.markdown_projection.latest_requested().is_some()
-            && let Some(telemetry) = &mut self.telemetry
-        {
-            telemetry.add_counter("tui.markdown.projection.coalesced_total", 1);
-        }
-        if let Some(telemetry) = &mut self.telemetry {
-            telemetry.add_counter("tui.markdown.projection.requested_total", 1);
-        }
-        self.markdown_projection.request(
-            super::markdown_projection_coordinator::MarkdownProjectionRequest {
-                generation: super::markdown_projection_coordinator::MarkdownProjectionGeneration {
-                    item_id: item.id().get(),
-                    item_revision: item.revision(),
-                    options,
-                },
-                source: item.text().to_owned(),
-            },
-        );
-    }
-
-    pub fn abort_all_effects(&mut self) {
+    pub fn abort_all_effects(&self) {
         self.xray_inspectors.shutdown();
-        self.markdown_projection.invalidate();
-        if let Some(markdown) = &mut self.markdown_presentation {
-            markdown.cancel_all();
-        }
-        if let Some(mermaid) = &mut self.markdown_mermaid {
-            mermaid.cancel_all();
-        }
-        for task in self.markdown_image_tasks.drain(..) {
-            task.abort();
-        }
-        for task in self.markdown_mermaid_tasks.drain(..) {
-            task.abort();
-        }
     }
 
     pub fn queue_effect_cancellation(chat: &mut ActiveChat, effect: TuiEffect) {
@@ -3389,8 +3212,6 @@ pub struct TuiRuntimeSettings {
     tui_extensions: Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
     launch_working_directory: std::path::PathBuf,
     launch_options: super::TuiLaunchOptions,
-    /// Transcript engine fixed at startup (EN3); never changed by configuration reloads.
-    transcript_engine: bcode_config::TuiEngine,
 }
 
 impl TuiRuntimeSettings {
@@ -3412,7 +3233,6 @@ impl TuiRuntimeSettings {
             tui_extensions: super::bundled_tui_extensions(),
             launch_working_directory,
             launch_options: super::TuiLaunchOptions::default(),
-            transcript_engine: super::engine_selection::DEFAULT_ENGINE,
         }
     }
 
@@ -3420,24 +3240,6 @@ impl TuiRuntimeSettings {
     pub const fn with_launch_options(mut self, launch_options: super::TuiLaunchOptions) -> Self {
         self.launch_options = launch_options;
         self
-    }
-
-    /// Return the settings with the startup-selected transcript engine (EN3). The keymap is
-    /// rebuilt for that engine, so call this before applying configuration or integrating
-    /// keymap contributors.
-    #[must_use]
-    pub fn with_transcript_engine(mut self, engine: bcode_config::TuiEngine) -> Self {
-        if engine != self.transcript_engine {
-            self.keymap = BmuxKeyMap::from_config_for_engine(&TuiConfig::default(), engine);
-        }
-        self.transcript_engine = engine;
-        self
-    }
-
-    /// Transcript engine selected at startup.
-    #[must_use]
-    pub const fn transcript_engine(&self) -> bcode_config::TuiEngine {
-        self.transcript_engine
     }
 
     /// Return renderer-neutral command completion preferences.
@@ -3462,7 +3264,7 @@ impl TuiRuntimeSettings {
     }
 
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
-        self.keymap = BmuxKeyMap::from_config_for_engine(tui_config, self.transcript_engine);
+        self.keymap = BmuxKeyMap::from_config(tui_config);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
         self.selection_autoscroll = tui_config.mouse.selection_autoscroll;
         self.selection = tui_config.selection;
@@ -3518,66 +3320,6 @@ impl TuiRuntimeSettings {
     pub const fn launch_options(&self) -> super::TuiLaunchOptions {
         self.launch_options
     }
-}
-
-fn maybe_start_older_history_load(
-    chat: &mut ActiveChat,
-    _loop_state: &mut ChatLoopState,
-    width_columns: u16,
-) -> bool {
-    if !chat.app.should_load_older_history() {
-        return false;
-    }
-    let Some(cursor) = chat.app.older_history_cursor() else {
-        return false;
-    };
-    let Some(session_id) = chat.attached_session_id() else {
-        return false;
-    };
-    let generation = chat.app.history_window_generation();
-    let effect = TuiEffect::LoadOlderHistory {
-        session_id,
-        cursor,
-        generation,
-        width_columns,
-    };
-    let started = !chat.pending_effects.contains_effect(&effect);
-    // A replacement window can request the same direction while the old effect
-    // is still running. Replace it; generation/cursor checks fence late results.
-    chat.replace_effect(effect);
-    if started {
-        chat.app.set_loading_older_history(true);
-    }
-    started
-}
-
-fn maybe_start_newer_history_load(
-    chat: &mut ActiveChat,
-    _loop_state: &mut ChatLoopState,
-    width_columns: u16,
-) -> bool {
-    if !chat.app.should_load_newer_history() {
-        return false;
-    }
-    let Some(cursor) = chat.app.newer_history_cursor() else {
-        return false;
-    };
-    let Some(session_id) = chat.attached_session_id() else {
-        return false;
-    };
-    let generation = chat.app.history_window_generation();
-    let effect = TuiEffect::LoadNewerHistory {
-        session_id,
-        cursor,
-        generation,
-        width_columns,
-    };
-    let started = !chat.pending_effects.contains_effect(&effect);
-    chat.replace_effect(effect);
-    if started {
-        chat.app.set_loading_newer_history(true);
-    }
-    started
 }
 
 fn bulk_migration_status_message(
@@ -3657,7 +3399,7 @@ pub fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
-        // Owned by the V2 transcript host; never produced while the V1 engine is selected.
+        // Owned by the transcript host, which applies it before shell effect handling.
         TuiEffectResult::TranscriptV2HistoryLoaded { .. } => {}
         TuiEffectResult::XrayOpened {
             session_id,
@@ -3709,11 +3451,7 @@ pub fn apply_effect_result(
         TuiEffectResult::SessionOpenProgress { snapshot } => {
             apply_session_open_progress(chat, &snapshot);
         }
-        TuiEffectResult::SessionOpened {
-            session_id,
-            has_older_history,
-            result,
-        } => {
+        TuiEffectResult::SessionOpened { session_id, result } => {
             if result.is_ok()
                 && let Some(stream) = &mut loop_state.artifact_stream
             {
@@ -3746,7 +3484,7 @@ pub fn apply_effect_result(
                     }
                 }
             }
-            session_flow::complete_switch_session(chat, session_id, has_older_history, *result);
+            session_flow::complete_switch_session(chat, session_id, *result);
             if chat.attached_session_id() == Some(session_id) {
                 chat.replace_effect(TuiEffect::LoadChildActivity {
                     session_id,
@@ -3939,22 +3677,6 @@ pub fn apply_effect_result(
         }
         TuiEffectResult::AgentCatalogLoaded { agents } => {
             apply_agent_catalog_result(chat, agents);
-        }
-        TuiEffectResult::OlderHistoryLoaded {
-            session_id,
-            cursor,
-            generation,
-            result,
-        } => {
-            apply_older_history_result(chat, loop_state, session_id, cursor, generation, result);
-        }
-        TuiEffectResult::NewerHistoryLoaded {
-            session_id,
-            cursor,
-            generation,
-            result,
-        } => {
-            apply_newer_history_result(chat, loop_state, session_id, cursor, generation, result);
         }
         TuiEffectResult::PermissionList { result } => {
             apply_permission_list_result(chat, loop_state, result);
@@ -4323,37 +4045,6 @@ pub fn apply_effect_result(
                 report_nonfatal_client_error(chat, "Reasoning output settings unavailable", &error);
             }
         },
-        TuiEffectResult::TimelineJumpLoaded {
-            session_id,
-            generation,
-            sequence,
-            result,
-        } => {
-            if chat.viewing_session_id() != Some(session_id)
-                || chat.app.history_window_generation() != generation
-            {
-                return;
-            }
-            match result {
-                Ok((events, has_older, has_newer, submissions)) => {
-                    if !super::history_flow::valid_timeline_window(
-                        session_id, sequence, &events, has_older, has_newer,
-                    ) {
-                        chat.app.set_status(
-                            "Timeline history window inconsistent; retry or inspect session history"
-                                .to_owned(),
-                        );
-                        return;
-                    }
-                    chat.app
-                        .replace_transcript_window(&events, has_older, has_newer, sequence);
-                    chat.app.apply_submission_records(&submissions);
-                    chat.app.request_transcript_top_anchor_sequence(sequence);
-                    chat.app.set_status("jumped to timeline message".to_owned());
-                }
-                Err(error) => report_nonfatal_tui_error(chat, "Timeline jump unavailable", &error),
-            }
-        }
         TuiEffectResult::PluginCommandInvoked { plugin_id, result } => match result {
             Ok(response) => {
                 let (message, effects) = plugin_command_presentation(response);
@@ -4787,110 +4478,6 @@ fn apply_agent_catalog_result(
         Err(error) => {
             chat.app
                 .set_status(format!("Agent metadata unavailable: {error}"));
-        }
-    }
-}
-
-fn hydrate_history_artifacts(
-    chat: &ActiveChat,
-    loop_state: &mut ChatLoopState,
-    events: &[bcode_session_models::SessionEvent],
-) {
-    let presentation = chat.app.plugin_presentation();
-    for event in events {
-        if let Some(stream) = &mut loop_state.artifact_stream {
-            stream.observe_finalized_artifact(
-                event.session_id,
-                event.sequence,
-                &event.kind,
-                |producer, schema, version, key, content_type| {
-                    presentation.is_some_and(|presentation| {
-                        presentation.accepts_artifact_reference(
-                            producer,
-                            schema,
-                            version,
-                            key,
-                            content_type,
-                        )
-                    })
-                },
-            );
-        }
-    }
-}
-
-fn apply_older_history_result(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    session_id: bcode_session_models::SessionId,
-    cursor: bcode_session_models::SessionHistoryCursor,
-    generation: u64,
-    result: Result<
-        (
-            bcode_session_models::SessionHistoryPage,
-            Vec<bcode_session_models::SubmissionRecord>,
-        ),
-        ClientError,
-    >,
-) {
-    if Some(session_id) != chat.viewing_session_id()
-        || !chat.app.accepts_history_page(generation, cursor, true)
-    {
-        return;
-    }
-    match result {
-        Ok((page, submissions)) if chat.app.accepts_history_page_payload(cursor, true, &page) => {
-            hydrate_history_artifacts(chat, loop_state, &page.events);
-            chat.app.prepend_older_history(&page.events, page.has_more);
-            chat.app.apply_submission_records(&submissions);
-        }
-        Ok(_) => {
-            chat.app.set_loading_older_history(false);
-            chat.app.set_status(
-                "Older history page inconsistent; retry or inspect session history".to_owned(),
-            );
-        }
-        Err(error) => {
-            chat.app.set_loading_older_history(false);
-            report_nonfatal_client_error(chat, "Older history unavailable", &error);
-        }
-    }
-}
-
-fn apply_newer_history_result(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    session_id: bcode_session_models::SessionId,
-    cursor: bcode_session_models::SessionHistoryCursor,
-    generation: u64,
-    result: Result<
-        (
-            bcode_session_models::SessionHistoryPage,
-            Vec<bcode_session_models::SubmissionRecord>,
-        ),
-        ClientError,
-    >,
-) {
-    if Some(session_id) != chat.viewing_session_id()
-        || !chat.app.accepts_history_page(generation, cursor, false)
-    {
-        return;
-    }
-    match result {
-        Ok((page, submissions)) if chat.app.accepts_history_page_payload(cursor, false, &page) => {
-            hydrate_history_artifacts(chat, loop_state, &page.events);
-            chat.app.append_newer_history(&page.events, page.has_more);
-            chat.app.apply_submission_records(&submissions);
-        }
-        Ok(_) => {
-            chat.app.set_loading_newer_history(false);
-            chat.app.set_status(
-                "Newer history page inconsistent; retry or inspect session history".to_owned(),
-            );
-        }
-        Err(error) => {
-            chat.app.set_loading_newer_history(false);
-            report_nonfatal_client_error(chat, "Newer history unavailable", &error);
         }
     }
 }
@@ -6190,158 +5777,6 @@ fn record_artifact_stream_stats(loop_state: &mut ChatLoopState) {
     }
 }
 
-fn markdown_destination_cache_source(
-    destination: &bcode_markdown_render::MarkdownDestination,
-) -> String {
-    match destination {
-        bcode_markdown_render::MarkdownDestination::Web(url) => url.as_str().to_owned(),
-        bcode_markdown_render::MarkdownDestination::LocalPath(path) => {
-            path.to_string_lossy().into_owned()
-        }
-        bcode_markdown_render::MarkdownDestination::Fragment(fragment) => format!("#{fragment}"),
-        bcode_markdown_render::MarkdownDestination::UnresolvedRelative(source) => source.clone(),
-        bcode_markdown_render::MarkdownDestination::Inert { reason } => format!("inert:{reason:?}"),
-    }
-}
-
-#[derive(Debug)]
-struct MarkdownFramePresentation {
-    rich: Vec<render::MarkdownRichRegion>,
-    image_removed: Vec<String>,
-    mermaid_removed: Vec<String>,
-}
-
-const fn markdown_image_destination_rect(placeholder: Rect) -> Rect {
-    placeholder
-}
-
-const fn markdown_mermaid_destination_rect(placeholder: Rect) -> Rect {
-    placeholder
-}
-
-fn write_markdown_fallback(
-    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
-    area: Rect,
-    fallback: &str,
-) {
-    if area.is_empty() {
-        return;
-    }
-    let width = usize::from(area.width);
-    let lines = fallback.lines().collect::<Vec<_>>();
-    for row in 0..area.height {
-        let text = lines.get(usize::from(row)).copied().unwrap_or_default();
-        let text = bmux_tui::text_width::truncate_to_display_width(text, width);
-        frame.write_line(
-            bmux_tui::paint::LocalRect::terminal(Rect::new(
-                area.x,
-                area.y.saturating_add(row),
-                area.width,
-                1,
-            )),
-            &bmux_tui::prelude::Line::raw(text),
-        );
-    }
-}
-
-fn image_region_fallback(
-    runtime: &super::markdown_image::MarkdownPresentationRuntime,
-    contribution_id: &str,
-    contribution: &bcode_markdown_render::MarkdownContributionKind,
-) -> Option<String> {
-    let bcode_markdown_render::MarkdownContributionKind::Image {
-        alt,
-        source,
-        linked_destination,
-        ..
-    } = contribution
-    else {
-        return None;
-    };
-    runtime
-        .images
-        .fallback(contribution_id, alt, source, linked_destination.as_ref())
-}
-
-fn reconcile_markdown_presentation(
-    chat: &ActiveChat,
-    loop_state: &mut ChatLoopState,
-    area: Rect,
-) -> MarkdownFramePresentation {
-    let rich = render::transcript_markdown_rich_regions(&chat.app, area);
-    let terminal_supported = loop_state.markdown_image_capabilities.any_supported();
-    let image_inputs = rich
-        .iter()
-        .filter_map(|region| match &region.contribution_kind {
-            bcode_markdown_render::MarkdownContributionKind::Image { source, .. } => {
-                Some(super::markdown_image::MarkdownImagePresentationInput {
-                    contribution_id: region.contribution_id.clone(),
-                    cache_key: super::markdown_image::MarkdownImageCacheKey::new(
-                        &markdown_destination_cache_source(source),
-                        "decoded-rgba8",
-                    ),
-                    destination: source.clone(),
-                    residency: if region.visible_rect.is_some() {
-                        super::markdown_image::MarkdownImageResidency::Visible
-                    } else {
-                        super::markdown_image::MarkdownImageResidency::Hidden
-                    },
-                })
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let mermaid_inputs = if chat.app.tui_config().markdown.mermaid {
-        rich.iter()
-            .filter_map(|region| match &region.contribution_kind {
-                bcode_markdown_render::MarkdownContributionKind::Mermaid {
-                    source,
-                    cache_key,
-                    ..
-                } => Some(super::markdown_mermaid::MarkdownMermaidInput {
-                    contribution_id: region.contribution_id.clone(),
-                    cache_key: cache_key.clone(),
-                    source: source.clone(),
-                    visible: region.visible_rect.is_some(),
-                    prefetch: false,
-                }),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let image_removed =
-        loop_state
-            .markdown_presentation
-            .as_mut()
-            .map_or_else(Vec::new, |runtime| {
-                let (removed, tasks) = runtime.reconcile_and_start(
-                    &image_inputs,
-                    super::markdown_image::MarkdownImagePresentationPolicy {
-                        interactive_resident_frame: true,
-                        network_enabled: chat.app.tui_config().markdown.network_images,
-                        terminal_supported,
-                    },
-                );
-                loop_state.markdown_image_tasks.extend(tasks);
-                removed
-            });
-    let mermaid_removed = loop_state
-        .markdown_mermaid
-        .as_mut()
-        .map_or_else(Vec::new, |runtime| {
-            let (removed, tasks) = runtime.reconcile_and_start(&mermaid_inputs, terminal_supported);
-            loop_state.markdown_mermaid_tasks.extend(tasks);
-            removed
-        });
-    MarkdownFramePresentation {
-        rich,
-        image_removed,
-        mermaid_removed,
-    }
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
@@ -6350,13 +5785,10 @@ pub fn draw_chat_frame<W: Write>(
     schedule_delay: Duration,
     frame_interval: Option<Duration>,
     damage: bmux_tui::damage::Damage,
-    fast_temporal_presentation: bool,
     committed_layout: Option<render::FrameLayout>,
-    transcript_selection: &bmux_tui::selection::SelectionController,
-    mut transcript_v2: Option<&mut super::transcript_v2_host::TranscriptV2Host>,
+    transcript: &mut super::transcript_v2_host::TranscriptV2Host,
 ) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
     // Modal scenes replace all interaction metadata, not just damaged cells.
-    // The temporal path still reuses committed geometry and avoids transcript preparation.
     let damage = if loop_state.modal_foreground() || terminal.retained_buffer().is_none() {
         bmux_tui::damage::Damage::Full
     } else {
@@ -6365,47 +5797,22 @@ pub fn draw_chat_frame<W: Write>(
     // Every painter this frame, including canvas-owning foregrounds that skip
     // the transcript renderer, uses the same focus phase.
     render::begin_focus_frame(chat.app.focus_phase(), damage.is_full());
-    // V1 keeps the chrome theme current while it prepares its transcript layout; V2 prepares no
-    // V1 layout, so the frame path keeps theme and accent changes reaching dialog and component
-    // chrome (the composer reads its theme from the frame's `TuiTheme`).
-    if transcript_v2.is_some() {
-        render::set_plugin_visual_theme(&chat.app.presented_theme());
-    }
+    // The frame path keeps theme and accent changes reaching dialog and component chrome (the
+    // composer reads its theme from the frame's `TuiTheme`).
+    render::set_chrome_theme(&chat.app.presented_theme());
     let frame_started = loop_state
         .telemetry
         .as_ref()
         .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
         .then(Instant::now);
     let prepare_started = frame_started;
-    // The fast temporal path repaints damaged regions from V1 state; with V2 every frame goes
-    // through the engine dispatch below.
-    if fast_temporal_presentation
-        && transcript_v2.is_none()
-        && terminal.retained_buffer().is_some()
-        && (!loop_state.modal_foreground()
-            || loop_state
-                .modal_backdrop
-                .as_ref()
-                .is_some_and(|buffer| buffer.area() == terminal.area()))
-        && let Some(layout) = committed_layout
-    {
-        return draw_temporal_frame(
-            terminal,
-            chat,
-            loop_state,
-            damage,
-            frame_interval,
-            frame_started,
-            layout,
-        );
-    }
     let full_transcript_area = render::transcript_area_for_frame(&chat.app, terminal.area());
     let interaction_rows = loop_state
         .interactive_surface
         .as_mut()
         .map(|surface| surface.preferred_height(full_transcript_area.width).max(1));
-    // With transcript placement the surface is placed over rows its interaction unit reserves:
-    // V1 reserves them in its transcript layout, V2 in its own engine (C37, D10).
+    // With transcript placement the surface is placed over rows its interaction unit reserves
+    // in the transcript engine (C37, D10).
     let pinned = chat.app.tui_config().interactions.placement
         == bcode_config::TuiInteractionPlacement::Pinned;
     let pinned_offset = if pinned {
@@ -6460,69 +5867,31 @@ pub fn draw_chat_frame<W: Write>(
             ))
         })
         .flatten();
-    chat.app.set_active_interaction_layout(
-        active_inline_rows
-            .filter(|_| transcript_v2.is_none())
-            .map(|(interaction_id, rows)| (interaction_id.to_owned(), rows)),
-    );
-    // With V2 the transcript body is the V2 engine's: only the shared chrome layout is derived,
-    // and the V1 transcript layout is not prepared (EN5, phase 6).
-    let prepared = if transcript_v2.is_some() {
-        render::prepare_chrome_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
-    } else {
-        render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
-    };
+    // The transcript body is the engine's: only the shared chrome layout is derived here.
+    let prepared =
+        render::prepare_chrome_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
     let layout = prepared.map(|(layout, _dock)| layout);
     // Layout-dependent transcript state is synced at this frame's clock (the clock the frame is
     // prepared at, F2). A reservation change made here repaints the transcript region in this
     // frame (F5).
-    let transcript_v2_drawn_change =
-        if let (Some(host), Some(layout)) = (transcript_v2.as_deref_mut(), layout) {
-            let now = host
-                .presentation_frame_clock(terminal.presentation_clock())
-                .now;
-            host.sync_geometry(
-                super::transcript_v2_host::paint::transcript_region(layout),
-                now,
-            );
-            host.set_composer_area(layout.composer());
-            host.sync_inline_interaction(active_inline_rows, now)
-        } else {
-            false
-        };
-    let inspector_component_theme = transcript_v2
-        .as_ref()
-        .filter(|host| host.inspector_open())
-        .map(|_| chat.app.presented_theme().component_theme());
-    let transcript_v2_chrome = transcript_v2.is_some().then(|| {
-        (
-            super::transcript_v2_host::focus::jump_to_latest_label(chat.app.effective_keymap()),
-            chat.app.motion_policy().latest_bar_window(),
-            chat.app.presented_theme().canvas,
-        )
+    let transcript_drawn_change = layout.is_some_and(|layout| {
+        let now = transcript
+            .presentation_frame_clock(terminal.presentation_clock())
+            .now;
+        transcript.sync_geometry(
+            super::transcript_v2_host::paint::transcript_region(layout),
+            now,
+        );
+        transcript.set_composer_area(layout.composer());
+        transcript.sync_inline_interaction(active_inline_rows, now)
     });
-    // V1 Markdown images and Mermaid diagrams are placed from the V1 transcript layout, which
-    // the V2 engine replaces in the body (V2 registers its own placements while painting).
-    let rich_presentation = layout.filter(|_| transcript_v2.is_none()).map_or_else(
-        || MarkdownFramePresentation {
-            rich: Vec::new(),
-            image_removed: Vec::new(),
-            mermaid_removed: Vec::new(),
-        },
-        |layout| reconcile_markdown_presentation(chat, loop_state, layout.body),
-    );
-    let inline_placement = (!pinned && transcript_v2.is_none())
-        .then(|| {
-            inline_interaction_surface_placement(
-                &chat.app,
-                layout.map(|layout| layout.body),
-                loop_state
-                    .interactive_surface
-                    .as_ref()
-                    .map(InteractiveSurfaceState::interaction_id),
-            )
-        })
-        .flatten();
+    let inspector_component_theme = transcript
+        .inspector_open()
+        .then(|| chat.app.presented_theme().component_theme());
+    let jump_key =
+        super::transcript_v2_host::focus::jump_to_latest_label(chat.app.effective_keymap());
+    let glow_window = chat.app.motion_policy().latest_bar_window();
+    let canvas = chat.app.presented_theme().canvas;
     let surface_area = if pinned {
         prepared.map_or_else(
             || {
@@ -6536,70 +5905,13 @@ pub fn draw_chat_frame<W: Write>(
             |(_layout, dock)| dock,
         )
     } else {
-        inline_placement.map_or_else(
-            || {
-                Rect::new(
-                    full_transcript_area.x,
-                    full_transcript_area.bottom(),
-                    full_transcript_area.width,
-                    0,
-                )
-            },
-            |placement| placement.destination,
+        Rect::new(
+            full_transcript_area.x,
+            full_transcript_area.bottom(),
+            full_transcript_area.width,
+            0,
         )
     };
-    for stats in chat.app.transcript_layout_mut().drain_sync_stats() {
-        if !loop_state
-            .telemetry
-            .as_ref()
-            .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
-        {
-            continue;
-        }
-        let mut labels = bcode_metrics::MetricLabels::new();
-        labels.insert(
-            "invalidation".to_owned(),
-            stats.invalidation.label().to_owned(),
-        );
-        if let Some(telemetry) = &mut loop_state.telemetry {
-            telemetry.add_counter_with_labels("tui.transcript.sync_total", 1, labels.clone());
-        }
-        if let Some(telemetry) = &mut loop_state.telemetry {
-            telemetry.add_counter_with_labels(
-                "tui.transcript.entries_scanned",
-                u64::try_from(stats.entries_scanned).unwrap_or(u64::MAX),
-                labels.clone(),
-            );
-        }
-        if let Some(telemetry) = &mut loop_state.telemetry {
-            telemetry.add_counter_with_labels(
-                "tui.transcript.signatures_changed",
-                u64::try_from(stats.signatures_changed).unwrap_or(u64::MAX),
-                labels.clone(),
-            );
-        }
-        if let Some(telemetry) = &mut loop_state.telemetry {
-            telemetry.add_counter_with_labels(
-                "tui.transcript.entries_rebuilt",
-                u64::try_from(stats.entries_rebuilt).unwrap_or(u64::MAX),
-                labels.clone(),
-            );
-        }
-        if let Some(telemetry) = &mut loop_state.telemetry {
-            telemetry.add_counter_with_labels(
-                "tui.transcript.rows_regenerated",
-                u64::try_from(stats.rows_regenerated).unwrap_or(u64::MAX),
-                labels.clone(),
-            );
-        }
-        if let Some(telemetry) = &mut loop_state.telemetry {
-            telemetry.record_histogram_with_labels(
-                "tui.transcript.sync_us",
-                stats.duration_micros,
-                labels,
-            );
-        }
-    }
     if let Some(presentation) = chat.app.plugin_presentation() {
         for diagnostic in presentation.drain_diagnostics() {
             if !loop_state
@@ -6651,12 +5963,12 @@ pub fn draw_chat_frame<W: Write>(
     // Regional damage assumes the committed chrome layout; a changed layout (a resized
     // composer or status row) repaints in full (F5).
     let chrome_changed = layout != committed_layout;
-    let damage = match transcript_v2.as_deref() {
-        Some(_) if chrome_changed => bmux_tui::damage::Damage::Full,
-        Some(host) if transcript_v2_drawn_change => {
-            host.with_transcript_damage(damage, terminal.area())
-        }
-        _ => damage,
+    let damage = if chrome_changed {
+        bmux_tui::damage::Damage::Full
+    } else if transcript_drawn_change {
+        transcript.with_transcript_damage(damage, terminal.area())
+    } else {
+        damage
     };
     let regions = damage.retained_regions().to_vec();
     let full_damage = damage.is_full();
@@ -6667,54 +5979,42 @@ pub fn draw_chat_frame<W: Write>(
                 .any(|region| !area.intersection(*region).is_empty())
     };
     let foreground_owns_canvas = loop_state.foreground_owns_canvas();
-    // The V2 transcript style (the canvas, as the V1 body and latest bar use).
-    let transcript_v2_style =
-        transcript_v2_chrome
-            .as_ref()
-            .map(|(jump_key, glow_window, canvas)| {
-                super::transcript_v2_host::paint::TranscriptPaintStyle {
-                    background: *canvas,
-                    text: theme.text,
-                    muted: theme.muted,
-                    info: theme.info,
-                    accent: theme.focused,
-                    focus: theme.selection,
-                    selection: theme.selection,
-                    jump_key,
-                    glow_window: *glow_window,
-                }
-            });
-    // V2 prepares its frame once, before drawing, at the presentation clock (F1, F2); the
-    // prepared frame decides whether transcript damage is a pure scroll (F5, BMUX 11).
-    let damage = match (
-        transcript_v2.as_deref_mut(),
-        layout,
-        transcript_v2_style.as_ref(),
-    ) {
-        (Some(host), Some(layout), Some(style))
+    let transcript_style = super::transcript_v2_host::paint::TranscriptPaintStyle {
+        background: canvas,
+        text: theme.text,
+        muted: theme.muted,
+        info: theme.info,
+        accent: theme.focused,
+        focus: theme.selection,
+        selection: theme.selection,
+        jump_key: &jump_key,
+        glow_window,
+    };
+    // The engine prepares its frame once, before drawing, at the presentation clock (F1, F2);
+    // the prepared frame decides whether transcript damage is a pure scroll (F5, BMUX 11).
+    let damage = match layout {
+        Some(layout)
             if !foreground_owns_canvas
                 && intersects(super::transcript_v2_host::paint::transcript_region(layout)) =>
         {
             let region = super::transcript_v2_host::paint::transcript_region(layout);
-            let clock = host.presentation_frame_clock(terminal.presentation_clock());
-            host.prepare(region, clock, style);
+            let clock = transcript.presentation_frame_clock(terminal.presentation_clock());
+            transcript.prepare(region, clock, &transcript_style);
             terminal
                 .set_scroll_region_acceleration(bmux_tui::terminal::ScrollRegionAcceleration::Auto);
-            host.frame_damage(damage, terminal.area())
+            transcript.frame_damage(damage, terminal.area())
         }
         _ => damage,
     };
-    // The status row reports the V2 reading position of the frame just prepared (C2); a
-    // changed position repaints the status row with the transcript.
-    let (damage, transcript_v2_status_damaged) = match (transcript_v2.as_deref_mut(), layout) {
-        (Some(host), Some(layout)) => {
-            host.with_status_damage(damage, layout.status(), terminal.area())
-        }
-        _ => (damage, false),
+    // The status row reports the reading position of the frame just prepared (C2); a changed
+    // position repaints the status row with the transcript.
+    let (damage, status_damaged) = match layout {
+        Some(layout) => transcript.with_status_damage(damage, layout.status(), terminal.area()),
+        None => (damage, false),
     };
-    let transcript_v2_chrome_inputs = transcript_v2.as_deref().map(|host| render::FrameChrome {
-        transcript_position: host.status_position(),
-    });
+    let chrome_inputs = render::FrameChrome {
+        transcript_position: transcript.status_position(),
+    };
     let geometry = loop_state.interactive_surface.as_ref().map(|_| {
         if pinned {
             InteractiveSurfaceGeometry {
@@ -6722,13 +6022,6 @@ pub fn draw_chat_frame<W: Write>(
                 logical_height: interaction_rows.unwrap_or(surface_area.height),
                 visible_logical_offset: pinned_offset,
                 destination: surface_area,
-            }
-        } else if let Some(placement) = inline_placement {
-            InteractiveSurfaceGeometry {
-                placement: InteractiveSurfacePlacement::Transcript,
-                logical_height: placement.full_area.height,
-                visible_logical_offset: placement.visible_content_offset,
-                destination: placement.destination,
             }
         } else {
             InteractiveSurfaceGeometry {
@@ -6739,8 +6032,8 @@ pub fn draw_chat_frame<W: Write>(
             }
         }
     });
-    // V2 places an inline surface from the frame it paints (D10), so the geometry is final only
-    // after the transcript painted.
+    // An inline surface is placed from the frame the engine paints (D10), so the geometry is
+    // final only after the transcript painted.
     let surface_geometry = std::cell::Cell::new(geometry);
     // Output may fail after emitting image protocol bytes, including at flush.
     // Keep committed residency separate from the candidate and preserve repair debt.
@@ -6755,139 +6048,51 @@ pub fn draw_chat_frame<W: Write>(
             let area = Rect::new(0, 0, frame.area().width, frame.area().height);
             let mut paint_background = |frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
                 if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
-                    // With V2 the transcript body and latest bar are the V2 host's: the V1
-                    // transcript is neither rendered nor reconciled there (EN5).
-                    if let Some(chrome) = transcript_v2_chrome_inputs {
-                        render::render_prepared_damage_with(
-                            &mut chat.app,
-                            frame,
-                            layout,
-                            chrome,
-                            |area| {
-                                (intersects(area)
-                                    || (transcript_v2_status_damaged && area == layout.status()))
-                                    && area != layout.body()
-                                    && Some(area) != layout.latest_bar()
+                    // The transcript body and latest bar are the transcript host's.
+                    render::render_prepared_damage_with(
+                        &mut chat.app,
+                        frame,
+                        layout,
+                        chrome_inputs,
+                        |area| {
+                            (intersects(area) || (status_damaged && area == layout.status()))
+                                && area != layout.body()
+                        },
+                    );
+                    let region = super::transcript_v2_host::paint::transcript_region(layout);
+                    if intersects(region) {
+                        let now = transcript.now();
+                        transcript.paint(region, frame, &transcript_style, now);
+                    }
+                    if let Some(component_theme) = &inspector_component_theme {
+                        transcript.paint_inspector(frame, theme, component_theme);
+                    }
+                    if !pinned && geometry.is_some() {
+                        let placed = transcript.inline_interaction_area().map_or_else(
+                            || InteractiveSurfaceGeometry {
+                                placement: InteractiveSurfacePlacement::Transcript,
+                                logical_height: interaction_rows.unwrap_or(0),
+                                visible_logical_offset: 0,
+                                destination: surface_area,
+                            },
+                            |area| InteractiveSurfaceGeometry {
+                                placement: InteractiveSurfacePlacement::Transcript,
+                                logical_height: area.logical_height,
+                                visible_logical_offset: area.visible_offset,
+                                destination: area.destination,
                             },
                         );
-                    } else {
-                        render::render_prepared_damage(&mut chat.app, frame, layout, |area| {
-                            intersects(area)
-                        });
-                    }
-                    if let (Some(host), Some(style)) =
-                        (transcript_v2.as_deref_mut(), transcript_v2_style.as_ref())
-                    {
-                        let region = super::transcript_v2_host::paint::transcript_region(layout);
-                        if intersects(region) {
-                            let now = host.now();
-                            host.paint(region, frame, style, now);
-                        }
-                        if let Some(component_theme) = &inspector_component_theme {
-                            host.paint_inspector(frame, theme, component_theme);
-                        }
-                        if !pinned && geometry.is_some() {
-                            let placed = host.inline_interaction_area().map_or_else(
-                                || InteractiveSurfaceGeometry {
-                                    placement: InteractiveSurfacePlacement::Transcript,
-                                    logical_height: interaction_rows.unwrap_or(0),
-                                    visible_logical_offset: 0,
-                                    destination: surface_area,
-                                },
-                                |area| InteractiveSurfaceGeometry {
-                                    placement: InteractiveSurfacePlacement::Transcript,
-                                    logical_height: area.logical_height,
-                                    visible_logical_offset: area.visible_offset,
-                                    destination: area.destination,
-                                },
-                            );
-                            surface_geometry.set(Some(placed));
-                        }
-                    } else {
-                        let selection_scene = super::root_program::transcript_selection_scene(
-                            &chat.app,
-                            layout.body(),
-                        );
-                        paint_transcript_overlays(
-                            &chat.app,
-                            layout.body,
-                            frame,
-                            theme,
-                            &selection_scene,
-                            intersects(layout.body),
-                        );
-                    }
-                }
-                for contribution_id in &rich_presentation.image_removed {
-                    super::markdown_image::MarkdownImagePresentationStore::remove_from_frame(
-                        contribution_id,
-                        frame,
-                    );
-                }
-                for contribution_id in &rich_presentation.mermaid_removed {
-                    super::markdown_mermaid::MarkdownMermaidPresentationStore::remove_from_frame(
-                        contribution_id,
-                        frame,
-                    );
-                }
-                if !foreground_owns_canvas
-                    && transcript_v2.is_none()
-                    && layout.is_some_and(|layout| intersects(layout.body))
-                {
-                    for region in &rich_presentation.rich {
-                        let Some(visible_rect) = region.visible_rect else {
-                            continue;
-                        };
-                        match &region.contribution_kind {
-                            bcode_markdown_render::MarkdownContributionKind::Image { .. } => {
-                                if let Some(runtime) = &loop_state.markdown_presentation {
-                                    let destination = markdown_image_destination_rect(visible_rect);
-                                    if !runtime.images.present_ready(
-                                        &region.contribution_id,
-                                        destination,
-                                        layout.map_or(visible_rect, |layout| layout.body),
-                                        frame,
-                                    ) && let Some(fallback) = image_region_fallback(
-                                        runtime,
-                                        &region.contribution_id,
-                                        &region.contribution_kind,
-                                    ) {
-                                        write_markdown_fallback(frame, destination, &fallback);
-                                    }
-                                }
-                            }
-                            bcode_markdown_render::MarkdownContributionKind::Mermaid { .. } => {
-                                if let Some(runtime) = &loop_state.markdown_mermaid {
-                                    if let Some(placement) = runtime.presentations.ready_placement(
-                                        &region.contribution_id,
-                                        markdown_mermaid_destination_rect(visible_rect),
-                                        layout.map_or(visible_rect, |layout| layout.body),
-                                    ) {
-                                        frame.push_image(placement);
-                                    } else if let Some(fallback) =
-                                        runtime.presentations.fallback(&region.contribution_id)
-                                    {
-                                        write_markdown_fallback(frame, visible_rect, &fallback);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                        surface_geometry.set(Some(placed));
                     }
                 }
                 if !foreground_owns_canvas {
                     paint_interactive_surface(loop_state, surface_geometry.get(), frame);
                 }
-                if !modal && let Some(snapshot) = transcript_selection.snapshot(frame.selection()) {
-                    frame.paint_selection(&snapshot, theme.selection);
-                }
             };
             if modal {
-                let backdrop = super::foreground::paint_backdrop(area, frame, paint_background);
-                loop_state.modal_backdrop = Some(backdrop);
+                super::foreground::paint_backdrop(area, frame, paint_background);
             } else {
                 paint_background(frame);
-                loop_state.modal_backdrop = None;
             }
             paint_foreground(chat, loop_state, surface_geometry.get(), frame);
         },
@@ -6935,86 +6140,6 @@ pub fn draw_chat_frame<W: Write>(
         prepare_ms,
     );
     Ok((draw_stats, layout))
-}
-
-/// Paint the focused disclosure target's anchor row with the selection style.
-///
-/// The row comes from the retained layout anchor and the top row the
-/// transcript was painted with, clipped to the transcript `area`; nothing is
-/// painted while the row is scrolled out of view or the body is hidden.
-/// Register the transcript's selection metadata, then paint the focus row
-/// and the inspector over it when `paint_overlays`.
-///
-/// Selection is registered first so the inspector's occlusion removes the
-/// transcript fragments it covers: selection highlights, gesture initiation
-/// and copy then agree with the painted panel and its hit region.
-fn paint_transcript_overlays(
-    app: &super::app::BmuxApp,
-    body: Rect,
-    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
-    theme: render::TuiTheme,
-    selection: &bmux_tui::selection::SelectionScene,
-    paint_overlays: bool,
-) {
-    let panel = paint_overlays
-        .then(|| super::inspector_render::inspector_panel(app, body))
-        .flatten();
-    for scope in selection.scopes() {
-        let mut scope = scope.clone();
-        if let Some(panel) = panel {
-            scope.initiation_area = initiation_beside(scope.initiation_area, panel);
-        }
-        frame.push_selection_scope(scope);
-    }
-    for fragment in selection.fragments() {
-        frame.push_selection_fragment(fragment.clone());
-    }
-    if paint_overlays {
-        paint_transcript_focus(app, body, frame, theme.selection);
-        super::inspector_render::paint_inspector(app, body, frame, theme);
-    }
-}
-
-/// Narrow a selection initiation `area` to the part left of a right-docked
-/// `panel` that spans its rows, so transcript selection can still start
-/// beside the panel. Any other overlap is left for the panel's occlusion,
-/// which disables initiation because a cut-out is not one rectangle.
-const fn initiation_beside(area: Rect, panel: Rect) -> Rect {
-    let overlaps = panel.x < area.x.saturating_add(area.width)
-        && area.x < panel.x.saturating_add(panel.width)
-        && panel.y < area.y.saturating_add(area.height)
-        && area.y < panel.y.saturating_add(panel.height);
-    if overlaps
-        && panel.x > area.x
-        && panel.y <= area.y
-        && panel.y.saturating_add(panel.height) >= area.y.saturating_add(area.height)
-        && panel.x.saturating_add(panel.width) >= area.x.saturating_add(area.width)
-    {
-        Rect::new(area.x, area.y, panel.x - area.x, area.height)
-    } else {
-        area
-    }
-}
-
-fn paint_transcript_focus(
-    app: &super::app::BmuxApp,
-    area: Rect,
-    frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
-    style: bmux_tui::style::Style,
-) {
-    if app.queue_recovery.confirmation.is_some() {
-        return;
-    }
-    let Some(row) = app
-        .focused_disclosure_target()
-        .and_then(|target| app.disclosure_target_row(target))
-    else {
-        return;
-    };
-    let top_row = app.transcript_top_row(area.height);
-    if let Some(rect) = super::transcript_focus::row_rect(area, top_row, row) {
-        frame.restyle(bmux_tui::paint::LocalRect::terminal(rect), style);
-    }
 }
 
 fn paint_launch_dialogs(
@@ -7273,106 +6398,6 @@ fn paint_interactive_surface(
     }
 }
 
-fn draw_temporal_frame<W: Write>(
-    terminal: &mut Terminal<&mut W>,
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    damage: bmux_tui::damage::Damage,
-    frame_interval: Option<Duration>,
-    frame_started: Option<Instant>,
-    layout: render::FrameLayout,
-) -> Result<(bmux_tui::terminal::DrawStats, Option<render::FrameLayout>), TuiError> {
-    let full_damage = damage.is_full();
-    let regions = damage.retained_regions().to_vec();
-    let intersects = |area: Rect| {
-        full_damage
-            || regions
-                .iter()
-                .any(|region| !area.intersection(*region).is_empty())
-    };
-    let draw_started = loop_state
-        .telemetry
-        .as_ref()
-        .is_some_and(super::telemetry::TuiTelemetry::is_enabled)
-        .then(Instant::now);
-    // Output may fail after emitting image protocol bytes, including at flush.
-    // Keep committed residency separate from the candidate and preserve repair debt.
-    let compositor = std::cell::RefCell::new(loop_state.markdown_image_compositor.clone());
-    let capabilities = loop_state.markdown_image_capabilities.clone();
-    let config = loop_state.markdown_image_config.clone();
-    let terminal_area = terminal.area();
-    let draw_result = terminal.draw_damage_with_output_hooks(
-        damage,
-        |frame| {
-            if loop_state.modal_foreground() {
-                if let Some(backdrop) = &loop_state.modal_backdrop {
-                    super::foreground::paint_backdrop_buffer(backdrop, frame);
-                }
-            } else {
-                render::render_prepared_damage(&mut chat.app, frame, layout, intersects);
-                if intersects(layout.body) {
-                    let theme = render::TuiTheme::for_app(&chat.app);
-                    paint_transcript_focus(&chat.app, layout.body, frame, theme.selection);
-                    super::inspector_render::paint_inspector(&chat.app, layout.body, frame, theme);
-                }
-                paint_interactive_surface(
-                    loop_state,
-                    loop_state.interactive_surface_geometry,
-                    frame,
-                );
-            }
-            paint_foreground(
-                chat,
-                loop_state,
-                loop_state.interactive_surface_geometry,
-                frame,
-            );
-        },
-        |writer| compositor.borrow_mut().prepare_output(writer),
-        |writer, scene, delta| {
-            let mut compositor = compositor.borrow_mut();
-            compositor.apply_delta(delta);
-            compositor
-                .render(
-                    writer,
-                    scene,
-                    bmux_image::compositor::PaneRect {
-                        x: terminal_area.x,
-                        y: terminal_area.y,
-                        w: terminal_area.width,
-                        h: terminal_area.height,
-                    },
-                    &capabilities,
-                    &config,
-                )
-                .map_err(std::io::Error::other)
-        },
-    );
-    let compositor = compositor.into_inner();
-    let draw_stats = match draw_result {
-        Ok(stats) => {
-            loop_state.markdown_image_compositor = compositor;
-            stats
-        }
-        Err(error) => {
-            loop_state
-                .markdown_image_compositor
-                .invalidate_after_failed_output(&compositor);
-            return Err(error.into());
-        }
-    };
-    record_frame_telemetry(
-        loop_state,
-        &draw_stats,
-        Duration::ZERO,
-        frame_interval,
-        frame_started,
-        draw_started,
-        0,
-    );
-    Ok((draw_stats, Some(layout)))
-}
-
 fn record_frame_telemetry(
     loop_state: &mut ChatLoopState,
     draw_stats: &bmux_tui::terminal::DrawStats,
@@ -7429,47 +6454,6 @@ fn record_frame_telemetry(
 
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct InlineInteractionPlacement {
-    destination: Rect,
-    full_area: Rect,
-    visible_content_offset: u16,
-}
-
-fn inline_interaction_surface_placement(
-    app: &super::app::BmuxApp,
-    body: Option<Rect>,
-    interaction_id: Option<&str>,
-) -> Option<InlineInteractionPlacement> {
-    let body = body?;
-    let index = app.interaction_transcript_index(interaction_id?)?;
-    let range = app.transcript_item_row_range(index)?;
-    let top = app.transcript_top_row(body.height);
-    let visible_start = range.start.max(top);
-    let visible_end = range.end.min(top.saturating_add(usize::from(body.height)));
-    if visible_start >= visible_end {
-        return None;
-    }
-    Some(InlineInteractionPlacement {
-        destination: Rect::new(
-            body.x,
-            body.y.saturating_add(
-                u16::try_from(visible_start.saturating_sub(top)).unwrap_or(u16::MAX),
-            ),
-            body.width,
-            u16::try_from(visible_end.saturating_sub(visible_start)).unwrap_or(u16::MAX),
-        ),
-        full_area: Rect::new(
-            0,
-            0,
-            body.width,
-            u16::try_from(range.end.saturating_sub(range.start)).unwrap_or(u16::MAX),
-        ),
-        visible_content_offset: u16::try_from(visible_start.saturating_sub(range.start))
-            .unwrap_or(u16::MAX),
-    })
 }
 
 fn interactive_surface_height(surface: &mut InteractiveSurfaceState, viewport: Rect) -> u16 {
@@ -7634,12 +6618,7 @@ fn apply_session_stream_resynchronization(
     loop_state: &mut ChatLoopState,
     attached: &bcode_client::AttachedSessionHistory,
 ) {
-    let has_older = attached
-        .projection_window
-        .as_ref()
-        .is_some_and(|window| window.has_older);
-    chat.app
-        .replace_latest_transcript_window(&attached.history, has_older);
+    chat.app.replace_session_history(&attached.history);
     chat.app.apply_submission_records(&attached.submissions);
     chat.app.apply_session_summary(&attached.session);
     chat.app.apply_usage_summary(&attached.usage_summary);
@@ -8092,7 +7071,7 @@ mod scheduler_tests {
         let session_id = bcode_session_models::SessionId::new();
         let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
         ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[]),
             agents: super::super::session_flow::AgentCatalog::default(),
             attachment: super::super::session_flow::ChatSessionAttachment::Attached { session_id },
             event_sender,
@@ -9403,114 +8382,6 @@ mod scheduler_tests {
 #[cfg(test)]
 #[path = "appearance_picker_flow_tests.rs"]
 mod appearance_picker_flow_tests;
-
-#[cfg(test)]
-mod transcript_overlay_tests {
-    use bmux_tui::buffer::Buffer;
-    use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Point;
-    use bmux_tui::paint::PaintCx;
-    use bmux_tui::selection::{
-        SelectionFragment, SelectionScene, SelectionScope, SelectionScopeId,
-    };
-
-    use super::*;
-    use crate::app::disclosure_focus_tests::focus_app;
-    use crate::inspector_render::{InspectorPlacement, inspector_placement};
-    use crate::transcript_focus::FocusAction;
-
-    /// One selectable fragment per body cell, as transcript text registers
-    /// one per grapheme.
-    fn row_scene(body: Rect) -> SelectionScene {
-        let mut scene = SelectionScene::new();
-        scene.push_scope(SelectionScope::new("bcode.transcript", body));
-        let width = usize::from(body.width);
-        for row in 0..body.height {
-            for column in 0..body.width {
-                let start = usize::from(row) * width + usize::from(column);
-                scene.push_fragment(SelectionFragment::new(
-                    SelectionScopeId::new("bcode.transcript"),
-                    "bcode.test",
-                    Rect::new(body.x + column, body.y + row, 1, 1),
-                    u64::try_from(start).unwrap_or(u64::MAX),
-                    start..start + 1,
-                ));
-            }
-        }
-        scene
-    }
-
-    #[test]
-    fn inspector_removes_the_selection_it_covers_and_keeps_the_rest() {
-        let (mut app, _) = focus_app(3);
-        assert!(app.enter_transcript_focus());
-        assert!(app.handle_transcript_focus_action(FocusAction::Inspect));
-        assert!(app.inspector_open());
-        let theme = render::TuiTheme::for_theme_id("terminal-native");
-        for (width, height) in [(120, 20), (60, 12), (3, 3), (2, 2)] {
-            let body = Rect::new(0, 1, width, height);
-            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height + 2));
-            let mut frame = Frame::new(&mut buffer);
-            let scene = row_scene(body);
-            {
-                let mut cx = PaintCx::new(&mut frame);
-                paint_transcript_overlays(&app, body, &mut cx, theme, &scene, true);
-            }
-            let selection = frame.selection();
-            match inspector_placement(body).map(InspectorPlacement::area) {
-                Some(panel) => {
-                    assert!(
-                        selection
-                            .fragments()
-                            .iter()
-                            .all(|fragment| fragment.area.intersection(panel).is_empty()),
-                        "{width}x{height}"
-                    );
-                    let inside = Point::new(panel.x, panel.y);
-                    assert!(selection.initiation_scope(inside).is_none());
-                    // Beside a right-docked panel, selection still starts.
-                    if matches!(inspector_placement(body), Some(InspectorPlacement::Side(_))) {
-                        let beside = Point::new(body.x, panel.y);
-                        assert!(
-                            selection.initiation_scope(beside).is_some(),
-                            "{width}x{height}"
-                        );
-                    }
-                    let hit = frame
-                        .hits()
-                        .hit_test(inside)
-                        .map(|hit| hit.id().as_str().to_owned());
-                    assert_eq!(
-                        hit.as_deref(),
-                        Some(crate::inspector::INSPECTOR_HIT_ID),
-                        "{width}x{height}"
-                    );
-                }
-                None => assert_eq!(
-                    selection.fragments().len(),
-                    usize::from(width) * usize::from(height),
-                    "{width}x{height}"
-                ),
-            }
-        }
-        // With the inspector closed every row stays selectable.
-        assert!(app.handle_transcript_focus_action(FocusAction::Exit));
-        let body = Rect::new(0, 0, 120, 20);
-        let mut buffer = Buffer::empty(body);
-        let mut frame = Frame::new(&mut buffer);
-        {
-            let mut cx = PaintCx::new(&mut frame);
-            paint_transcript_overlays(&app, body, &mut cx, theme, &row_scene(body), true);
-        }
-        assert_eq!(frame.selection().fragments().len(), 120 * 20);
-        assert!(
-            frame
-                .selection()
-                .initiation_scope(Point::new(119, 5))
-                .is_some()
-        );
-    }
-}
 
 /// Yield the terminal only after foreground work finishes.
 pub fn request_execution_picker(chat: &mut ActiveChat, state: &mut ChatLoopState) {

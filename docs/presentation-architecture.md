@@ -49,15 +49,16 @@ variant = "auto"
   enforcement, gradients, and hex parsing. It has no terminal, frame, or style types. Portable Bcode
   layers may depend on it; it must never depend on `bmux_tui*`, and the resolved dependency check
   enforces that transitively.
-* `bcode_theme` + `bcode_theme_models` (renamed from `bcode_tui_theme`): the renderer-neutral
-  definition format — parsing, inheritance, variants, overlays, discovery, palette expressions, role
-  registry, `[presentation]` and opaque `[chrome.*]` sections. Colors are a portable enum, not
-  `bmux_tui::style::Color`.
+* `bcode_tui_theme`: the theme definition format — parsing, inheritance, variants, overlays,
+  discovery, palette expressions, role registry, `[presentation]` and opaque `[chrome.*]` sections.
+  It may use `bmux_tui` color types; renderer-neutral structure lives in
+  `bcode_presentation_policy_models` (see Deviations).
 * `bcode_presentation_policy` + `bcode_presentation_policy_models`: structural facts, properties,
   rules, layering, compilation, resolution, the visibility floor, and the grouping projection.
   Independent of `bcode_session_view`'s canonical projection; consumes its documents.
-* `bcode_tui`: conversion of resolved paint and chrome to BMUX styles and primitives, per-item
-  disclosure overrides, scroll-anchor preservation, toggle hit regions.
+* `bcode_tui_transcript`: conversion of resolved paint and chrome to BMUX styles and primitives,
+  per-unit disclosure overrides, scroll-anchor preservation, toggle hit regions; `bcode_tui`
+  hosts it.
 * BMUX `tui-components`: generic `Disclosure` component, chrome inputs (border glyph sets, gradient
   borders, density), segmented status bar, icon slots with measured widths.
 
@@ -315,7 +316,8 @@ Every unit is produced as an anatomy, never as finished rows that are trimmed af
   `diff`, `artifact`, `metadata`, `visual` (a plugin-rendered body), `confirmation`, `error`.
   Plugins may add namespaced section names (`bcode.git.files`).
 
-The terminal composer (`bcode_tui`) lays out an anatomy from the resolved presentation:
+The terminal transcript's unit producers (`bcode_tui_transcript`) lay out an anatomy from the
+resolved presentation:
 
 | Disclosure | Output |
 |---|---|
@@ -412,22 +414,21 @@ All properties merge per property (later rules win). `sections` merge per sectio
     each row a disclosure target for that member), revealed members rendered fully;
   * `expanded`: group header, then every member and bridged unit rendered with its own
     presentation, indented.
-* Terminal rendering keeps one layout entry per transcript item: the first member's entry renders
-  the group header plus its own member rendering; other members render their member rendering or
-  zero rows. Each item's layout signature includes its group role (leader with group signature,
-  member with group disclosure, or none), so a group change re-lays out only that group's items.
+* The terminal transcript (`bcode_tui_transcript`) presents a group as its own group-header
+  unit before the first member (and a hidden marker unit for hidden runs); members stay their
+  own units. Structure is resolved per changed unit and enters only that unit's layout
+  fingerprint, so a group change re-lays out only the group's units
+  ([TUI V2 architecture](tui-v2-architecture.md) §3.3, U5 and L3).
 
 ### Interaction
 
-* Disclosure targets: `unit:<item id>`, `group:<first member item id>`, and
-  `section:<item id>:<section name>`. Terminal hit-region ids are `disclosure:<target>`. The
-  legacy form `disclosure:<item id>` remains accepted as `unit:<item id>`.
-* The composer emits one disclosure anchor (`TuiVisualAnchor` with key `disclosure:<target>` and
-  the header or label row) per target. Hit regions are derived from the same retained anchors
-  keyboard focus walks (every `disclosure:` anchor of an entry, host or plugin-namespaced section
-  alike), registered only for visible anchor rows inside their entry, and clipped to the
-  transcript area. An item's layout signature includes every section override recorded for it
-  (one ordered range of the override map), so toggling any section re-lays out only that item.
+* Disclosure targets: a unit (by item id), a group (by its first member's item id), and a named
+  section of a unit (`DisclosureTarget::{Unit, Group, Section}` in `bcode_tui_transcript`).
+* Header and section-label rows of the retained item layout carry their target: the same rows
+  are the keyboard focus targets and the `ItemAction::ToggleDisclosure` hit regions, registered
+  only for visible rows and clipped to the transcript area (L6, B3). A unit's layout fingerprint
+  includes the disclosure state recorded for it, sections included, so toggling a target
+  re-lays out only that unit.
 * Manual overrides are ephemeral, keyed by target, bounded (oldest dropped first), and reconciled
   when items leave the resident window. The visibility floor applies after overrides: a unit
   awaiting a decision cannot be collapsed.
@@ -588,7 +589,7 @@ default = true
 
 1. BMUX: `bmux_color`; `ComponentTheme` v2; component `from_theme`; gradients; color-depth
    quantization; OSC color queries; `Disclosure` component.
-2. Bcode: `bcode_theme` split; seeds, expressions, role registry; `bcode_presentation_policy` with
+2. Bcode: seeds, expressions, role registry; `bcode_presentation_policy` with
    resolution, floor, and grouping projection.
 3. TUI: tool and Markdown disclosure on the shared component; override state; settings migration;
    `explain`.
@@ -629,7 +630,8 @@ the design above, and what remains.
     heading row; `badge` paints a reversed badge, degrading to the heading row when it does not
     fit; `bar` paints a one-cell bar and gap on every row; `gutter` moves the heading into a fixed
     8-cell gutter truncated by display width. One speaker layout
-    (`render::unit_frame::speaker_layout`) feeds both painting and the transcript item layout,
+    (`SpeakerLayout` in `bcode_tui_transcript::layout::producers::message`) feeds both painting
+    and the transcript item layout,
     so Markdown width, hit regions, and selection origins follow the body. `bar` degrades to
     `prefix` below 6 columns and `gutter` below 20;
   * `separators.status` joins status line segments with a glyph measured at a constant three
@@ -750,12 +752,9 @@ the design above, and what remains.
 
 ### Resolution cost
 
-Measured by the ignored release harness `structure::bench` (a synthetic 5,000-item transcript,
-`focus` + `compact` profiles, 11 rules). Every incremental layout sync, including a disclosure
-toggle frame, scans all item signatures. Before the memo that scan took about 11.7 ms, 5.2 ms
-of it resolving presentations; with the memo it takes about 6.2 ms, 2.0 ms of it resolving.
-Fact extraction stays around 0.4 to 0.5 ms. A full 5,000-item relayout takes seconds, and
-resolution is under 0.1% of it; the remaining cost is row building and Markdown rendering.
+Structure resolution runs only for units whose inputs changed and is memoized (bounded at 256
+entries); a disclosure toggle re-resolves and re-lays out only the units it changes. Frame budgets
+and their measurements are in [TUI V2 architecture](tui-v2-architecture.md) §9.2.
 
 ### Not yet done
 

@@ -94,10 +94,17 @@ Common defaults:
 | `Ctrl+C` | Clear |
 | `Ctrl+F` | Open search/command flow |
 | `Page Up` / `Page Down` | Scroll the transcript |
-| `Home` / `End` | Jump to transcript start/end |
+| `Home` / `End` | Move to the start/end of the composer input |
+| `Ctrl+Home` / `Ctrl+End` | Load the session start / latest content directly |
+| `Ctrl+Up` / `Ctrl+Down` | Scroll the transcript one line |
+| `Alt+U` | Focus transcript units (see [focus mode](tui-themes.md#focus-mode)) |
+| `Alt+D` | Cycle every transcript unit collapsed, summary, expanded |
 | `Up` / `Down` | Navigate composer history |
 | `Ctrl+I` | Restore the active transcript interaction into view |
 | `Ctrl+Shift+C` | Copy the current transcript selection |
+
+With transcript focus, `Home`/`End` (`transcript_focus` scope) jump to the session start/latest
+content and focus its first/last unit.
 
 Transcript selection uses logical content rather than framebuffer text. Dragging from inside one
 response constrains the gesture to that response; dragging from transcript-owned surrounding space
@@ -105,7 +112,8 @@ may span multiple items in transcript order. Selection follows scrolling, histor
 responsive reflow. Markdown responses copy canonical source where the rendered projection is
 unambiguous, while unsupported transformed visuals use an explicit rendered-text fallback rather
 than inventing source ranges. Copy success, absence of a selection, and clipboard failures are
-reported in the normal status area.
+reported in the normal status area. Clicking a disclosure header or section label (press and
+release without dragging) toggles it; dragging selects. Neither moves keyboard focus.
 
 By default, releasing the left mouse button after dragging a nonempty transcript selection copies
 it automatically. Successful automatic or keyboard copying keeps the highlight for one second,

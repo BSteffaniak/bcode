@@ -8,15 +8,12 @@ use std::time::{Duration, Instant};
 
 use bmux_tui::event::Event;
 
-const TRANSCRIPT_SELECTION_SCOPE_ID: &str = "bcode.transcript";
-
 use super::TuiError;
 use super::artifact_stream::ActiveArtifactFetchCompletion;
 use super::chat_loop::{ChatLoopState, DraftAutosave, TuiRuntimeSettings};
 use super::effects::TuiEffectResult;
 use super::history_flow;
 use super::invalidation::{InvalidationKey, TemporalRegistry};
-use super::markdown_projection_coordinator::MarkdownProjectionCompletion;
 use super::session_flow::ActiveChat;
 
 /// Typed Bcode event admitted to the root TUI runtime.
@@ -47,8 +44,6 @@ pub enum BcodeRuntimeMessage {
     ComposerSearchCompleted(super::composer_interaction::ComposerCompletion),
     /// Completed artifact fetch for the active presentation generation.
     ArtifactFetchCompleted(Box<ActiveArtifactFetchCompletion>),
-    /// Latest Markdown projection completion.
-    MarkdownProjectionCompleted(Box<Option<MarkdownProjectionCompletion>>),
     /// Plugin surface host invalidation became pending.
     PluginSurfaceInvalidated,
     /// Completed Bcode-owned background effect.
@@ -84,9 +79,6 @@ impl BcodeRuntimeMessage {
     #[allow(dead_code)]
     fn latest_key(&self) -> Option<bmux_tui_runtime::MessageKey> {
         match self {
-            Self::MarkdownProjectionCompleted(_) => Some(bmux_tui_runtime::MessageKey::new(
-                "bcode.markdown_projection",
-            )),
             Self::StreamingConfiguratorDue => Some(bmux_tui_runtime::MessageKey::new(
                 "bcode.streaming_configurator",
             )),
@@ -240,19 +232,14 @@ pub struct BcodeRuntimeModel {
     pub invalidation: super::invalidation::UiInvalidation,
     /// Generic terminal-space damage selected by Bcode for the next presentation.
     presentation_damage: bmux_tui::damage::Damage,
-    /// Whether the next stable temporal presentation can skip full frame preparation.
-    fast_temporal_presentation: bool,
-    /// V2 only: a composer edit since the last presentation repaints the composer region alone
+    /// A composer edit since the last presentation repaints the composer region alone
     /// (F5, D6). Kept until a frame presents it, so later updates cannot drop the region.
     composer_damage: ComposerDamage,
     /// Last successfully committed terminal hit map used for pointer routing.
     pub committed_hits: bmux_tui::hit::HitMap,
     /// Last successfully committed logical content-selection scene.
     pub committed_selection: bmux_tui::selection::SelectionScene,
-    committed_visual_text: Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
     committed_visual_targets: Vec<(bmux_tui::geometry::Rect, String)>,
-    /// Bcode-owned transcript selection gesture state.
-    pub transcript_selection: bmux_tui::selection::SelectionController,
     /// Canonical plain-text export for the current logical selection.
     pub selected_plain_text: Option<String>,
     /// Last successfully committed terminal frame area.
@@ -287,11 +274,8 @@ pub struct BcodeRuntimeModel {
     selection_session: Option<bcode_session_models::SessionId>,
     selection_policy: (bool, bool, u64),
     transcript_clipboard: fn(&str) -> Result<(), String>,
-    /// Source identity of the latest outstanding timeline request within a
-    /// resident-window generation; two jumps need not replace the window between them.
-    pending_timeline_jump: Option<(bcode_session_models::SessionId, u64, u64)>,
-    /// Transcript engine dispatch (TUI V2 spec EN5), selected once at startup (EN3).
-    transcript_engine: super::transcript_v2_host::TranscriptEngineChoice,
+    /// The transcript engine host: ingest, input and painting of the transcript.
+    transcript_host: Box<super::transcript_v2_host::TranscriptV2Host>,
 }
 
 enum RootTimer {
@@ -328,7 +312,7 @@ impl RootTimer {
     }
 }
 
-/// Whether the composer region needs presenting since the last presentation (V2, F5, D6).
+/// Whether the composer region needs presenting since the last presentation (F5, D6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerDamage {
     /// Nothing pending.
@@ -675,7 +659,7 @@ impl BcodeRuntimeModel {
     /// Prepare the root frame's retained selection and temporal damage policy together.
     fn prepare_root_presentation(
         &mut self,
-    ) -> (Option<std::time::Duration>, bmux_tui::damage::Damage, bool) {
+    ) -> (Option<std::time::Duration>, bmux_tui::damage::Damage) {
         self.synchronize_selection_lifecycle();
         let interval = self.settings.bmux_runtime_config().frame_interval;
         self.composer_damage = ComposerDamage::None;
@@ -683,14 +667,9 @@ impl BcodeRuntimeModel {
             &mut self.presentation_damage,
             bmux_tui::damage::Damage::None,
         );
-        let temporal = std::mem::take(&mut self.fast_temporal_presentation)
-            && self
-                .transcript_selection
-                .snapshot(&self.committed_selection)
-                .is_none();
         let launch = self.fresh_session_settings();
         self.loop_state.set_render_launch(launch);
-        (interval, damage, temporal)
+        (interval, damage)
     }
 
     /// Resolve contextual hints without inventing authority when session metadata is absent.
@@ -845,11 +824,8 @@ impl BcodeRuntimeModel {
             settings.selection().clear_after_copy,
             settings.selection().clear_delay_ms,
         );
-        let transcript_engine = super::transcript_v2_host::TranscriptEngineChoice::for_engine(
-            settings.transcript_engine(),
-        );
         Self {
-            transcript_engine,
+            transcript_host: Box::default(),
             selection_clear_at: None,
             selection_clear_generation: 0,
             selection_session,
@@ -875,12 +851,9 @@ impl BcodeRuntimeModel {
             ordered_notes: OrderedPresentationQueue::default(),
             invalidation: super::invalidation::UiInvalidation::Full,
             presentation_damage: bmux_tui::damage::Damage::Full,
-            fast_temporal_presentation: false,
             committed_hits: bmux_tui::hit::HitMap::default(),
             committed_selection: bmux_tui::selection::SelectionScene::new(),
-            committed_visual_text: Vec::new(),
             committed_visual_targets: Vec::new(),
-            transcript_selection: bmux_tui::selection::SelectionController::new(),
             selected_plain_text: None,
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
             focused_input_owner: None,
@@ -903,7 +876,6 @@ impl BcodeRuntimeModel {
             child_watch_picker_generation: None,
             scheduled_deadlines: BTreeMap::new(),
             temporal_registry: TemporalRegistry::default(),
-            pending_timeline_jump: None,
         }
     }
 
@@ -1149,12 +1121,8 @@ impl BcodeRuntimeModel {
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn route_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
         let damage = self.handle_basic_terminal_event(event);
-        // Rendered `#bcode-session-<id>` links of either engine switch sessions.
-        let session_link = self.chat.app.take_session_link_request().or_else(|| {
-            self.transcript_engine
-                .v2_mut()
-                .and_then(super::transcript_v2_host::TranscriptV2Host::take_session_link_request)
-        });
+        // Rendered `#bcode-session-<id>` links switch sessions.
+        let session_link = self.transcript_host.take_session_link_request();
         if let Some(session_id) = session_link {
             super::session_flow::start_switch_session(
                 &mut self.chat,
@@ -1923,19 +1891,8 @@ impl BcodeRuntimeModel {
                 if self.loop_state.modal_foreground() {
                     return super::invalidation::UiInvalidation::None;
                 }
-                if let Some(damage) = self.route_transcript_v2_input(&Event::Key(stroke)) {
+                if let Some(damage) = self.route_transcript_input(&Event::Key(stroke)) {
                     return damage;
-                }
-                if let Some(redraw) = super::input::handle_transcript_focus_key(
-                    &mut self.chat.app,
-                    self.settings.keymap(),
-                    stroke,
-                ) {
-                    return if redraw {
-                        super::invalidation::UiInvalidation::Structural
-                    } else {
-                        super::invalidation::UiInvalidation::None
-                    };
                 }
                 if self
                     .settings
@@ -2002,12 +1959,11 @@ impl BcodeRuntimeModel {
                 }
                 self.loop_state.refresh_slash_palette(&mut self.chat);
                 self.draft_autosave.observe(&self.chat, Instant::now());
-                // With V2, a plain composer edit repaints the composer alone (F5, D6). Requests,
-                // opened menus and palettes stay structural, and an edit that resizes the
-                // composer changes the chrome layout, which repaints fully at draw time.
+                // A plain composer edit repaints the composer alone (F5, D6). Requests, opened
+                // menus and palettes stay structural, and an edit that resizes the composer
+                // changes the chrome layout, which repaints fully at draw time.
                 if outcome.redraw
                     && !submit_menu_open
-                    && self.transcript_engine.v2().is_some()
                     && matches!(outcome.request, super::input::KeyRequest::None)
                     && !slash_palette_before
                     && !self.loop_state.has_slash_palette()
@@ -2141,56 +2097,8 @@ impl BcodeRuntimeModel {
                         super::invalidation::UiInvalidation::None
                     };
                 }
-                if !self.loop_state.modal_foreground()
-                    && matches!(
-                        mouse.kind,
-                        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
-                    )
-                    && let Some(hit) = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse)
-                    && let Some((index, identity)) = hit
-                        .strip_prefix("activity-inspect:")
-                        .and_then(|value| value.split_once(':'))
-                    && let (Ok(index), Ok(identity)) =
-                        (index.parse::<usize>(), identity.parse::<u64>())
-                    && self
-                        .chat
-                        .app
-                        .transcript()
-                        .get(index)
-                        .is_some_and(|item| item.id().get() == identity)
-                    && let Some((plugin_id, surface_kind, options)) =
-                        self.chat.app.activity_inspection(index)
-                {
-                    self.chat
-                        .replace_effect(super::effects::TuiEffect::OpenPluginSurface {
-                            plugin_id,
-                            instance_id: format!("activity-{surface_kind}"),
-                            surface_kind,
-                            options,
-                            working_directory: self
-                                .settings
-                                .launch_working_directory()
-                                .to_path_buf(),
-                            session_id: self.chat.attached_session_id(),
-                        });
-                    return super::invalidation::UiInvalidation::Structural;
-                }
-                // The inspector scrollbar owns presses on it and its drags
-                // ahead of transcript selection.
-                if !self.loop_state.modal_foreground()
-                    && super::mouse_flow::handle_inspector_scrollbar_mouse(
-                        super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse).as_deref(),
-                        &self.chat,
-                        mouse,
-                    )
-                {
-                    return super::invalidation::UiInvalidation::Structural;
-                }
-                if let Some(damage) = self.route_transcript_v2_input(&Event::Mouse(mouse)) {
+                if let Some(damage) = self.route_transcript_input(&Event::Mouse(mouse)) {
                     return damage;
-                }
-                if let Some(selection_damage) = self.handle_transcript_selection_mouse(mouse) {
-                    return selection_damage;
                 }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Streaming)
                     && self.loop_state.handle_streaming_configurator_mouse(
@@ -2243,7 +2151,6 @@ impl BcodeRuntimeModel {
                         hit_id.as_deref(),
                         &mut self.chat,
                         mouse,
-                        self.settings.mouse_scroll_rows(),
                     )
                 };
                 if changed {
@@ -2268,213 +2175,11 @@ impl BcodeRuntimeModel {
         damage
     }
 
-    fn handle_transcript_selection_mouse(
-        &mut self,
-        mouse: bmux_tui::event::MouseEvent,
-    ) -> Option<super::invalidation::UiInvalidation> {
-        if self.loop_state.modal_foreground()
-            || self.loop_state.has_command_palette()
-            || self.loop_state.has_slash_palette()
-            || self
-                .committed_layout
-                .is_none_or(|layout| !layout.body().contains(mouse.position))
-                && self.transcript_selection.phase()
-                    == bmux_tui::selection::SelectionGesturePhase::Idle
-        {
-            return None;
-        }
-        self.synchronize_selection_lifecycle();
-        let had_selection = self
-            .selected_plain_text
-            .as_ref()
-            .is_some_and(|text| !text.is_empty());
-        let outcome = self
-            .transcript_selection
-            .handle_mouse(&self.committed_selection, mouse);
-        match outcome {
-            bmux_tui::selection::SelectionOutcome::Ignored => None,
-            bmux_tui::selection::SelectionOutcome::Click => {
-                self.cancel_selection_clear();
-                self.refresh_selected_plain_text();
-                // Selection armed on the press, so a click on a disclosure
-                // header or Markdown contribution activates on release.
-                let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
-                (super::mouse_flow::is_transcript_click_target(hit_id.as_deref())
-                    && super::mouse_flow::activate_transcript_click(
-                        hit_id.as_deref(),
-                        &mut self.chat,
-                    ))
-                .then_some(super::invalidation::UiInvalidation::Structural)
-            }
-            bmux_tui::selection::SelectionOutcome::Armed => {
-                self.cancel_selection_clear();
-                self.refresh_selected_plain_text();
-                if had_selection {
-                    self.presentation_damage = bmux_tui::damage::Damage::Full;
-                    self.fast_temporal_presentation = false;
-                    Some(super::invalidation::UiInvalidation::Paint)
-                } else {
-                    Some(super::invalidation::UiInvalidation::None)
-                }
-            }
-            bmux_tui::selection::SelectionOutcome::Changed { .. } => {
-                self.refresh_selected_plain_text();
-                let scrolled = self.settings.selection_autoscroll()
-                    && self.committed_layout.is_some_and(|layout| {
-                        scroll_transcript_for_selection_edge(
-                            &mut self.chat.app,
-                            layout.body(),
-                            mouse.position,
-                        )
-                    });
-                self.presentation_damage = bmux_tui::damage::Damage::Full;
-                self.fast_temporal_presentation = false;
-                Some(if scrolled {
-                    super::invalidation::UiInvalidation::Structural
-                } else {
-                    super::invalidation::UiInvalidation::Paint
-                })
-            }
-            bmux_tui::selection::SelectionOutcome::Completed => {
-                self.refresh_selected_plain_text();
-                if self.settings.selection().auto_copy_on_mouse_release {
-                    self.copy_transcript_selection();
-                }
-                self.presentation_damage = bmux_tui::damage::Damage::Full;
-                self.fast_temporal_presentation = false;
-                Some(super::invalidation::UiInvalidation::Paint)
-            }
-            bmux_tui::selection::SelectionOutcome::Cleared
-            | bmux_tui::selection::SelectionOutcome::Invalidated => {
-                self.clear_transcript_selection();
-                self.presentation_damage = bmux_tui::damage::Damage::Full;
-                self.fast_temporal_presentation = false;
-                Some(super::invalidation::UiInvalidation::Paint)
-            }
-        }
-    }
-
-    fn markdown_selection_has_visible_coverage(
-        &self,
-        snapshot: &bmux_tui::selection::SelectionSnapshot,
-    ) -> bool {
-        let Some(layout) = self.committed_layout else {
-            return false;
-        };
-        let fragments = self.committed_selection.fragments();
-        for item in self.chat.app.transcript() {
-            let prefix = format!("bcode.transcript.item.{}.markdown.code.", item.id().get());
-            let has_code_slices = snapshot
-                .slices
-                .iter()
-                .any(|slice| slice.content_id.as_str().starts_with(&prefix));
-            if !has_code_slices {
-                continue;
-            }
-            let Some(projection) = super::render::transcript_markdown_selection_projection(
-                &self.chat.app,
-                item,
-                layout.body().width,
-            ) else {
-                return false;
-            };
-            if !projection.has_selection_source(item.text()) {
-                return false;
-            }
-            let Some(resolved) = resolved_transcript_selection_ranges(item, snapshot) else {
-                return false;
-            };
-            let item_prefix = format!("bcode.transcript.item.{}.markdown", item.id().get());
-            for unit in projection.selection_provenance() {
-                if !matches!(
-                    unit.kind,
-                    bcode_markdown_render::MarkdownSelectionKind::Text
-                        | bcode_markdown_render::MarkdownSelectionKind::Code
-                ) {
-                    continue;
-                }
-                for range in &unit.source_ranges {
-                    if !resolved
-                        .iter()
-                        .any(|selected| selected.start < range.end && range.start < selected.end)
-                    {
-                        continue;
-                    }
-                    let Some(source) = item.text().get(range.clone()) else {
-                        return false;
-                    };
-                    // Source breaks and indentation consumed by layout have no cells.
-                    // Every non-whitespace source unit must have committed, unclipped
-                    // provenance; interval expansion may not restore unavailable text.
-                    if source.chars().all(char::is_whitespace) && unit.rects.is_empty() {
-                        continue;
-                    }
-                    if !fragments.iter().any(|fragment| {
-                        fragment.content_id.as_str().starts_with(&item_prefix)
-                            && fragment.source_range.start <= range.start
-                            && fragment.source_range.end >= range.end
-                            && fragment.revision == item.revision()
-                    }) {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-
     fn refresh_selected_plain_text(&mut self) {
-        // EN5: the V2 engine owns its transcript selection and exports its logical source text.
-        if let Some(host) = self.transcript_engine.v2() {
-            self.selected_plain_text = host.selected_text().filter(|text| !text.is_empty());
-            self.chat
-                .app
-                .set_transcript_selection_pinned(self.selected_plain_text.is_some());
-            return;
-        }
-        if self
-            .transcript_selection
-            .reconcile(&self.committed_selection)
-            == bmux_tui::selection::SelectionOutcome::Invalidated
-        {
-            self.clear_transcript_selection();
-            return;
-        }
+        // The transcript engine owns its selection and exports its logical source text.
         self.selected_plain_text = self
-            .transcript_selection
-            .snapshot(&self.committed_selection)
-            .and_then(|snapshot| {
-                if !self.markdown_selection_has_visible_coverage(&snapshot) {
-                    return None;
-                }
-                let mut parts = Vec::new();
-                let mut start = 0;
-                while start < snapshot.slices.len() {
-                    let visual = snapshot.slices[start]
-                        .content_id
-                        .as_str()
-                        .starts_with("bcode.visual:");
-                    let mut end = start + 1;
-                    while end < snapshot.slices.len()
-                        && snapshot.slices[end]
-                            .content_id
-                            .as_str()
-                            .starts_with("bcode.visual:")
-                            == visual
-                    {
-                        end += 1;
-                    }
-                    let mut group = snapshot.clone();
-                    group.slices = snapshot.slices[start..end].to_vec();
-                    parts.push(if visual {
-                        export_visual_selection(&group, &self.committed_visual_text)?
-                    } else {
-                        export_plain_transcript_selection(self.chat.app.transcript(), &group)?
-                    });
-                    start = end;
-                }
-                (!parts.is_empty()).then(|| parts.join("\n\n"))
-            })
+            .transcript_host
+            .selected_text()
             .filter(|text| !text.is_empty());
         self.chat
             .app
@@ -2498,48 +2203,9 @@ impl BcodeRuntimeModel {
     }
 
     fn apply_root_timeline_jump(&mut self, entry: &super::timeline_dialog::TimelineEntry) {
-        // EN5: with the V2 engine the jump is a V2 navigation intent, resident or not (W8).
-        if let Some(host) = self.transcript_engine.v2_mut() {
-            let now = host.now();
-            let _changed = host.jump_to_sequence(entry.sequence(), now);
-            return;
-        }
-        // A timeline entry can outlive a history prepend/eviction while its
-        // dialog is open. Resolve its stable source sequence against the
-        // current resident window before choosing local or remote navigation.
-        if let Some(index) = self
-            .chat
-            .app
-            .transcript_index_for_sequence(entry.sequence())
-            && self.chat.app.jump_to_transcript_index(index)
-        {
-            // A resident jump supersedes a still-running remote selection too.
-            // Both can target the same session and window generation, so the
-            // generation fence alone cannot reject the older completion.
-            self.pending_timeline_jump = None;
-            self.chat
-                .app
-                .set_status("jumped to timeline message".to_owned());
-            return;
-        }
-        let Some(session_id) = self.chat.attached_session_id() else {
-            self.chat
-                .app
-                .set_status("timeline requires an active session".to_owned());
-            return;
-        };
-        let generation = self.chat.app.history_window_generation();
-        let sequence = entry.sequence();
-        self.pending_timeline_jump = Some((session_id, generation, sequence));
-        self.chat
-            .replace_effect(super::effects::TuiEffect::LoadTimelineJump {
-                session_id,
-                generation,
-                sequence,
-            });
-        self.chat
-            .app
-            .set_status("loading timeline message…".to_owned());
+        // The jump is a navigation intent, resident or not (W8).
+        let now = self.transcript_host.now();
+        let _changed = self.transcript_host.jump_to_sequence(entry.sequence(), now);
     }
 
     fn synchronize_selection_lifecycle(&mut self) {
@@ -2561,13 +2227,10 @@ impl BcodeRuntimeModel {
         }
     }
 
-    /// The clock the post-copy selection clear is scheduled on: the V2 host clock with the V2
-    /// engine (scripted in scenarios), else the wall clock.
+    /// The clock the post-copy selection clear is scheduled on: the transcript host clock
+    /// (scripted in scenarios).
     fn selection_clock_now(&self) -> Instant {
-        self.transcript_engine.v2().map_or_else(
-            Instant::now,
-            super::transcript_v2_host::TranscriptV2Host::now,
-        )
+        self.transcript_host.now()
     }
 
     fn cancel_selection_clear(&mut self) {
@@ -2582,17 +2245,13 @@ impl BcodeRuntimeModel {
 
     fn clear_transcript_selection(&mut self) {
         self.cancel_selection_clear();
-        self.transcript_selection.clear();
-        if let Some(host) = self.transcript_engine.v2_mut() {
-            let _ = host.clear_selection();
-        }
+        let _ = self.transcript_host.clear_selection();
         self.invalidation = self
             .invalidation
             .merge(super::invalidation::UiInvalidation::Paint);
         self.selected_plain_text = None;
         self.chat.app.set_transcript_selection_pinned(false);
         self.presentation_damage = bmux_tui::damage::Damage::Full;
-        self.fast_temporal_presentation = false;
     }
 
     fn clear_transcript_selection_if_due(
@@ -2629,8 +2288,8 @@ impl BcodeRuntimeModel {
         self.report_transcript_copy_result(result);
     }
 
-    /// Copy a V2 Markdown destination (`tui.markdown.copyDestination`) through the transcript
-    /// clipboard path, reporting with V1's messages.
+    /// Copy a Markdown destination (`tui.markdown.copyDestination`) through the transcript
+    /// clipboard path.
     fn copy_markdown_destination(&mut self, text: &str) {
         match (self.transcript_clipboard)(text) {
             Ok(()) => self
@@ -2918,9 +2577,7 @@ impl BcodeRuntimeModel {
                 | "tools.expandAll"
                 | "tools.collapseAll"
                 | "tools.resetDisclosure" => {
-                    if !self.run_transcript_v2_route(&route) {
-                        self.chat.app.run_transcript_tool_route(&route);
-                    }
+                    self.run_transcript_route(&route);
                 }
                 "streaming.configure" => {
                     self.loop_state.open_streaming_configurator(&mut self.chat);
@@ -3071,7 +2728,6 @@ impl BcodeRuntimeModel {
         self.clear_transcript_selection();
         self.selection_session = self.chat.app.session_id();
         self.committed_selection = bmux_tui::selection::SelectionScene::new();
-        self.pending_timeline_jump = None;
         self.loop_state
             .session_changed(self.chat.viewing_session_id());
         self.draft_autosave.reset_for_session_change();
@@ -3082,7 +2738,7 @@ impl BcodeRuntimeModel {
         handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
         let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
-        commands.extend(self.transcript_v2_visual_commands());
+        commands.extend(self.transcript_visual_commands());
         if let Some(command) = self.collect_child_watch_work(handle) {
             commands.push(command);
         }
@@ -3161,11 +2817,8 @@ impl BcodeRuntimeModel {
 
     fn reconcile_temporal_registry(&mut self) {
         let now = Instant::now();
-        self.temporal_registry.reconcile(
-            self.chat
-                .app
-                .invalidation_requests(now, std::time::SystemTime::now()),
-        );
+        self.temporal_registry
+            .reconcile(self.chat.app.invalidation_requests(now));
     }
 
     fn schedule_deadlines(&mut self) {
@@ -3220,12 +2873,13 @@ impl BcodeRuntimeModel {
             (RootTimer::ThemeReload, Some(self.theme_reload_at)),
             (
                 RootTimer::TranscriptV2,
-                self.transcript_engine.v2().and_then(|host| {
-                    match (host.next_deadline(), host.presentation_deadline()) {
-                        (Some(engine), Some(glow)) => Some(engine.min(glow)),
-                        (engine, glow) => engine.or(glow),
-                    }
-                }),
+                match (
+                    self.transcript_host.next_deadline(),
+                    self.transcript_host.presentation_deadline(),
+                ) {
+                    (Some(engine), Some(glow)) => Some(engine.min(glow)),
+                    (engine, glow) => engine.or(glow),
+                },
             ),
         ];
         for (timer, deadline) in deadlines {
@@ -3255,18 +2909,15 @@ impl BcodeRuntimeModel {
             let regions = temporal_damage.iter().filter_map(|damage| match damage {
                 super::app::TemporalDamage::Composer => Some(layout.composer()),
                 super::app::TemporalDamage::Status => Some(layout.status()),
-                super::app::TemporalDamage::LatestBar => layout.latest_bar(),
-                super::app::TemporalDamage::Transcript => Some(layout.body()),
                 super::app::TemporalDamage::Full => None,
             });
             let composer =
                 (self.composer_damage == ComposerDamage::Edited).then(|| layout.composer());
-            // The V2 transcript repaints its own region alone (F5, D6); it stays damaged until
-            // a frame painted it, so later updates cannot drop the region.
+            // The transcript repaints its own region alone (F5, D6); it stays damaged until a
+            // frame painted it, so later updates cannot drop the region.
             let transcript_v2 = self
-                .transcript_engine
-                .v2()
-                .is_some_and(super::transcript_v2_host::TranscriptV2Host::is_invalidated)
+                .transcript_host
+                .is_invalidated()
                 .then(|| super::transcript_v2_host::paint::transcript_region(layout));
             if !temporal_damage.contains(&super::app::TemporalDamage::Full) {
                 let damage = bmux_tui::damage::Damage::regions(
@@ -3398,16 +3049,9 @@ impl BcodeRuntimeModel {
                 }
             }
             "bcode.streaming_presentation" => {
-                // With V2 the hidden V1 view still advances, but the V2 engine paces the
-                // visible transcript on its own timer (`bcode.transcript_v2`).
-                if self.chat.app.advance_streaming_presentation(now)
-                    && self.transcript_engine.v2().is_none()
-                {
-                    return (
-                        super::invalidation::UiInvalidation::Paint,
-                        vec![super::app::TemporalDamage::Transcript],
-                    );
-                }
+                // The host shell's view advances; the transcript engine paces the visible
+                // transcript on its own timer (`bcode.transcript_v2`).
+                let _advanced = self.chat.app.advance_streaming_presentation(now);
                 super::invalidation::UiInvalidation::None
             }
             "bcode.draft_save" => {
@@ -3415,11 +3059,9 @@ impl BcodeRuntimeModel {
                 super::invalidation::UiInvalidation::None
             }
             "bcode.transcript_v2" => {
-                if let Some(host) = self.transcript_engine.v2_mut() {
-                    let now = host.now();
-                    host.advance(now);
-                    let _glow_frame = host.advance_presentation(now);
-                }
+                let now = self.transcript_host.now();
+                self.transcript_host.advance(now);
+                let _glow_frame = self.transcript_host.advance_presentation(now);
                 super::invalidation::UiInvalidation::None
             }
             "bcode.telemetry_flush" => {
@@ -3532,7 +3174,7 @@ fn present_root_frame<W: std::io::Write>(
         terminal.set_color_depth(depth);
         terminal.reset();
     }
-    let (frame_interval, damage, fast_temporal_presentation) = program.prepare_root_presentation();
+    let (frame_interval, damage) = program.prepare_root_presentation();
     let (draw_stats, layout) = super::chat_loop::draw_chat_frame(
         terminal,
         &mut program.chat,
@@ -3540,10 +3182,8 @@ fn present_root_frame<W: std::io::Write>(
         Duration::ZERO,
         frame_interval,
         damage,
-        fast_temporal_presentation,
         program.committed_layout,
-        &program.transcript_selection,
-        program.transcript_engine.v2_mut(),
+        &mut program.transcript_host,
     )?;
     commit_root_presentation(program, terminal, layout);
     Ok(bmux_tui_runtime::PresentReport {
@@ -3561,63 +3201,11 @@ fn commit_root_presentation<W: std::io::Write>(
     program.synchronize_composer_interaction_with_paint(true);
     program.committed_hits = terminal.hits().clone();
     program.committed_selection = terminal.selection().clone();
-    program.committed_visual_text.clear();
-    program.committed_visual_targets.clear();
-    // With V2, plugin visual targets come from the presented V2 frame's retained geometry, and
-    // the reading position's plugin content is retained across reflow (E1, E3). V2 copies
-    // plugin rows through its own selection, so no V1 visual text is published.
-    if let Some(host) = program.transcript_engine.v2_mut() {
-        program.committed_visual_targets = host.committed_visual_targets();
-        if let Some(presentation) = program.chat.app.plugin_presentation() {
-            host.sync_content_positions(presentation);
-        }
-    }
-    // Without V2 they come from the V1 transcript layout.
-    if let Some(layout) = layout.filter(|_| program.transcript_engine.v2().is_none()) {
-        let body = layout.body();
-        for (offset, line) in program
-            .chat
-            .app
-            .transcript_layout()
-            .visible_lines_from_top(
-                program.chat.app.transcript_top_row(body.height),
-                body.height,
-            )
-            .into_iter()
-            .enumerate()
-        {
-            if line.source != super::transcript_layout::VisibleTranscriptSource::Transcript {
-                continue;
-            }
-            if let Some((identity, _)) = program
-                .chat
-                .app
-                .transcript_layout()
-                .content_anchor(line.entry_index, line.row_in_entry)
-            {
-                let area = bmux_tui::geometry::Rect::new(
-                    body.x,
-                    body.y
-                        .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
-                    body.width,
-                    1,
-                )
-                .intersection(body);
-                if !area.is_empty() {
-                    program
-                        .committed_visual_targets
-                        .push((area, identity.to_owned()));
-                }
-            }
-            if let Some(row) = program
-                .chat
-                .app
-                .transcript_layout()
-                .selection_row(line.entry_index, line.row_in_entry)
-            {
-                program.committed_visual_text.push(row.clone());
-            }
-        }
+    // Plugin visual targets come from the presented frame's retained geometry, and the reading
+    // position's plugin content is retained across reflow (E1, E3).
+    program.committed_visual_targets = program.transcript_host.committed_visual_targets();
+    if let Some(presentation) = program.chat.app.plugin_presentation() {
+        program.transcript_host.sync_content_positions(presentation);
     }
     if program.focused_visual.as_ref().is_some_and(|focused| {
         !program
@@ -3626,18 +3214,6 @@ fn commit_root_presentation<W: std::io::Write>(
             .any(|(_, identity)| identity == focused)
     }) {
         program.focused_visual = None;
-    }
-    let reconciliation = program
-        .transcript_selection
-        .reconcile(&program.committed_selection);
-    if reconciliation == bmux_tui::selection::SelectionOutcome::Invalidated {
-        program.clear_transcript_selection();
-        program.presentation_damage = bmux_tui::damage::Damage::Full;
-        program.fast_temporal_presentation = false;
-    } else if program.transcript_selection.phase()
-        != bmux_tui::selection::SelectionGesturePhase::Idle
-    {
-        program.refresh_selected_plain_text();
     }
     program.committed_area = terminal.area();
     if matches!(
@@ -3652,503 +3228,6 @@ fn commit_root_presentation<W: std::io::Write>(
     program.committed_layout = layout;
 }
 
-fn selection_edge_scroll_rows(
-    body: bmux_tui::geometry::Rect,
-    point: bmux_tui::geometry::Point,
-) -> Option<(bool, usize)> {
-    if body.is_empty() {
-        return None;
-    }
-    let (backward, intensity) = if point.y <= body.y {
-        (true, body.y.saturating_sub(point.y).saturating_add(1))
-    } else if point.y >= body.bottom().saturating_sub(1) {
-        (
-            false,
-            point
-                .y
-                .saturating_sub(body.bottom().saturating_sub(1))
-                .saturating_add(1),
-        )
-    } else {
-        return None;
-    };
-    Some((backward, usize::from(intensity.min(body.height.max(1)))))
-}
-
-fn scroll_transcript_for_selection_edge(
-    app: &mut super::app::BmuxApp,
-    body: bmux_tui::geometry::Rect,
-    point: bmux_tui::geometry::Point,
-) -> bool {
-    let Some((backward, rows)) = selection_edge_scroll_rows(body, point) else {
-        return false;
-    };
-    if backward {
-        app.scroll_transcript_up(rows)
-    } else {
-        app.scroll_transcript_down(rows)
-    }
-}
-
-fn ensure_transcript_parent_scope(
-    scene: &mut bmux_tui::selection::SelectionScene,
-    body: bmux_tui::geometry::Rect,
-) {
-    if body.is_empty()
-        || scene
-            .scopes()
-            .iter()
-            .any(|scope| scope.id.as_str() == TRANSCRIPT_SELECTION_SCOPE_ID)
-    {
-        return;
-    }
-    scene.push_scope(bmux_tui::selection::SelectionScope::new(
-        TRANSCRIPT_SELECTION_SCOPE_ID,
-        body,
-    ));
-}
-
-// Shared with the sibling renderer so selection metadata is built inside the frame transaction.
-#[allow(clippy::redundant_pub_crate)]
-pub(super) fn transcript_selection_scene(
-    app: &super::app::BmuxApp,
-    body: bmux_tui::geometry::Rect,
-) -> bmux_tui::selection::SelectionScene {
-    let mut scene = bmux_tui::selection::SelectionScene::new();
-    register_transcript_selection_scene(&mut scene, app, body);
-    scene
-}
-
-#[allow(clippy::too_many_lines)]
-fn register_transcript_selection_scene(
-    scene: &mut bmux_tui::selection::SelectionScene,
-    app: &super::app::BmuxApp,
-    body: bmux_tui::geometry::Rect,
-) {
-    ensure_transcript_parent_scope(scene, body);
-    if body.is_empty() {
-        return;
-    }
-    let top_row = app.transcript_top_row(body.height);
-    let mut source_ranges =
-        std::collections::BTreeMap::<usize, Vec<Option<std::ops::Range<usize>>>>::new();
-    let mut y = body.y;
-    for visible in app
-        .transcript_layout()
-        .visible_lines_from_top(top_row, body.height)
-    {
-        if y >= body.bottom() {
-            break;
-        }
-        let Some(row) = app.transcript_layout().line(visible) else {
-            continue;
-        };
-        if visible.source != super::transcript_layout::VisibleTranscriptSource::Transcript {
-            y = y.saturating_add(1);
-            continue;
-        }
-        let Some(item) = app.transcript().get(visible.entry_index) else {
-            y = y.saturating_add(1);
-            continue;
-        };
-        let scope_id = format!("bcode.transcript.item.{}", item.id().get());
-        if !scene
-            .scopes()
-            .iter()
-            .any(|scope| scope.id.as_str() == scope_id)
-        {
-            let entry_start = app
-                .transcript_layout()
-                .entry_start_row(visible.source, visible.entry_index)
-                .unwrap_or(visible.row_index);
-            let entry_rows = app
-                .transcript_layout()
-                .entry_row_count(visible.source, visible.entry_index)
-                .unwrap_or(1);
-            let visible_start = entry_start.max(top_row);
-            let visible_end = entry_start
-                .saturating_add(entry_rows)
-                .min(top_row.saturating_add(usize::from(body.height)));
-            scene.push_scope(
-                bmux_tui::selection::SelectionScope::new(
-                    scope_id.clone(),
-                    bmux_tui::geometry::Rect::new(
-                        body.x,
-                        body.y.saturating_add(
-                            u16::try_from(visible_start.saturating_sub(top_row))
-                                .unwrap_or(u16::MAX),
-                        ),
-                        body.width,
-                        u16::try_from(visible_end.saturating_sub(visible_start))
-                            .unwrap_or(u16::MAX),
-                    ),
-                )
-                .parent(TRANSCRIPT_SELECTION_SCOPE_ID)
-                .capture(bmux_tui::selection::SelectionCapture::Delegate)
-                .order(u64::try_from(visible.entry_index).unwrap_or(u64::MAX))
-                .revision(item.revision()),
-            );
-        }
-        if let Some(selection) = app
-            .transcript_layout()
-            .selection_row(visible.entry_index, visible.row_in_entry)
-        {
-            for cell in &selection.cells {
-                let x = body.x.saturating_add(cell.column);
-                if x.saturating_add(cell.width) > body.right() {
-                    continue;
-                }
-                scene.push_fragment(
-                    bmux_tui::selection::SelectionFragment::new(
-                        scope_id.clone(),
-                        format!("bcode.visual:{}", selection.identity),
-                        bmux_tui::geometry::Rect::new(x, y, cell.width, 1),
-                        u64::try_from(visible.row_in_entry).unwrap_or(u64::MAX),
-                        cell.bytes.clone(),
-                    )
-                    .revision(selection.revision),
-                );
-            }
-            y = y.saturating_add(1);
-            continue;
-        }
-        let text = row.plain_text();
-        if item.text_format() == bcode_session_view_models::TextFormat::Markdown {
-            let entry_start = app
-                .transcript_layout()
-                .entry_start_row(visible.source, visible.entry_index)
-                .unwrap_or(visible.row_index);
-            let layout = super::render::TranscriptItemLayout::resolve(
-                &app.presented_theme(),
-                item,
-                body.width,
-            );
-            let content_offset = {
-                let entry_rows = app
-                    .transcript_layout()
-                    .entry_row_count(visible.source, visible.entry_index)
-                    .unwrap_or_default();
-                let markdown_rows =
-                    super::render::transcript_markdown_projection_for_layout(app, item, body.width)
-                        .as_ref()
-                        .map_or(0, |projection| projection.lines.len());
-                entry_rows
-                    .saturating_sub(markdown_rows)
-                    .saturating_sub(1)
-                    .saturating_sub(layout.bottom_rows())
-            };
-            let document_row = visible
-                .row_in_entry
-                .checked_sub(content_offset)
-                .and_then(|row| u16::try_from(row).ok());
-            if let Some(document_row) = document_row {
-                let projection =
-                    super::render::transcript_markdown_selection_projection(app, item, body.width);
-                if let Some(projection) = projection {
-                    if !projection.has_selection_source(item.text()) {
-                        y = y.saturating_add(1);
-                        continue;
-                    }
-                    let origin = bmux_tui::geometry::Point::new(
-                        body.x.saturating_add(layout.markdown_x()),
-                        body.y.saturating_add(
-                            u16::try_from(
-                                entry_start
-                                    .saturating_add(content_offset)
-                                    .saturating_sub(top_row),
-                            )
-                            .unwrap_or(u16::MAX),
-                        ),
-                    );
-                    for fragment in super::markdown_selection::markdown_selection_fragments(
-                        &scope_id,
-                        &format!("bcode.transcript.item.{}.markdown", item.id().get()),
-                        &projection,
-                        bmux_tui::geometry::Point::new(origin.x, 0),
-                        u64::try_from(visible.entry_index)
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(1_000_000),
-                        item.revision(),
-                        Some(document_row),
-                    )
-                    .into_iter()
-                    .filter_map(|mut fragment| {
-                        if fragment.area.y != document_row {
-                            return None;
-                        }
-                        fragment.area.y = y;
-                        // A partially clipped unit cannot claim its full source.
-                        (fragment.area.x >= body.x && fragment.area.right() <= body.right())
-                            .then_some(fragment)
-                    }) {
-                        scene.push_fragment(fragment);
-                    }
-                    y = y.saturating_add(1);
-                    continue;
-                }
-            }
-            // Markdown title/chrome and unavailable accepted source have no
-            // canonical plain-row mapping. Never fabricate offset-zero source.
-            y = y.saturating_add(1);
-            continue;
-        }
-        let ranges = source_ranges.entry(visible.entry_index).or_insert_with(|| {
-            transcript_plain_row_source_ranges(
-                item.text.as_str(),
-                app.transcript_layout()
-                    .entry_row_count(visible.source, visible.entry_index)
-                    .unwrap_or(0),
-            )
-        });
-        let source_mapping = ranges
-            .get(visible.row_in_entry)
-            .and_then(Clone::clone)
-            .and_then(|range| {
-                item.text
-                    .get(range.clone())
-                    .map(|source| (source, range.start))
-            })
-            .or_else(|| {
-                let mut offset = 0;
-                item.text().split_inclusive('\n').find_map(|line| {
-                    let source = line.trim_end_matches(['\r', '\n']);
-                    let start = offset;
-                    offset += line.len();
-                    (!source.is_empty() && text.contains(source)).then_some((source, start))
-                })
-            });
-        let Some((source, source_offset)) = source_mapping else {
-            y = y.saturating_add(1);
-            continue;
-        };
-        let prefix = text
-            .find(source)
-            .and_then(|start| text.get(..start))
-            .unwrap_or("");
-        let prefix_width =
-            u16::try_from(bmux_tui::text::Line::raw(prefix).width()).unwrap_or(u16::MAX);
-        for fragment in bmux_tui::selection::plain_text_fragments(
-            scope_id,
-            format!("bcode.transcript.item.{}.plain", item.id().get()),
-            bmux_tui::geometry::Rect::new(
-                body.x.saturating_add(prefix_width),
-                y,
-                body.width.saturating_sub(prefix_width),
-                1,
-            ),
-            u64::try_from(visible.entry_index)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(1_000_000)
-                .saturating_add(u64::try_from(source_offset).unwrap_or(u64::MAX)),
-            source,
-            source_offset,
-            item.revision(),
-        ) {
-            scene.push_fragment(fragment);
-        }
-        y = y.saturating_add(1);
-    }
-}
-
-fn export_visual_selection(
-    snapshot: &bmux_tui::selection::SelectionSnapshot,
-    rows: &[bcode_plugin_sdk::tui::PluginTuiSelectionRow],
-) -> Option<String> {
-    export_visual_slices(&snapshot.slices, rows)
-}
-
-fn export_visual_slices(
-    slices: &[bmux_tui::selection::SelectionSlice],
-    rows: &[bcode_plugin_sdk::tui::PluginTuiSelectionRow],
-) -> Option<String> {
-    let mut output = String::new();
-    let mut previous = None;
-    for slice in slices {
-        let identity = slice.content_id.as_str().strip_prefix("bcode.visual:")?;
-        if previous.is_some_and(|previous| previous != identity) {
-            output.push('\n');
-        }
-        let mut start = slice.source_range.start;
-        for row in rows
-            .iter()
-            .filter(|row| row.identity == identity && row.revision == slice.revision)
-        {
-            let end = row
-                .byte_start
-                .checked_add(row.text.len())?
-                .min(slice.source_range.end);
-            if start >= row.byte_start && start < end {
-                output.push_str(row.text.get(start - row.byte_start..end - row.byte_start)?);
-                start = end;
-            }
-        }
-        if start != slice.source_range.end {
-            return None;
-        }
-        previous = Some(identity);
-    }
-    (!output.is_empty()).then_some(output)
-}
-
-#[test]
-fn visual_copy_joins_soft_rows_and_rejects_stale_source() {
-    use bcode_plugin_sdk::tui::PluginTuiSelectionRow;
-    use bmux_tui::selection::{SelectionContentId, SelectionSlice};
-    let row = |identity: &str, start, text: &str| PluginTuiSelectionRow {
-        identity: identity.to_owned(),
-        byte_start: start,
-        text: text.to_owned(),
-        cells: Vec::new(),
-        revision: 7,
-    };
-    let rows = vec![
-        row("line", 0, "界"),
-        row("line", 3, "e\u{301}"),
-        row("next", 0, "next"),
-    ];
-    let slice = |identity: &str, range| SelectionSlice {
-        content_id: SelectionContentId::new(format!("bcode.visual:{identity}")),
-        source_range: range,
-        revision: 7,
-    };
-    let mut slices = vec![slice("line", 0..6), slice("next", 0..4)];
-    assert_eq!(
-        export_visual_slices(&slices, &rows).as_deref(),
-        Some("界e\u{301}\nnext")
-    );
-    slices[0].revision = 8;
-    assert_eq!(export_visual_slices(&slices, &rows), None);
-}
-
-fn resolved_transcript_selection_ranges(
-    item: &super::transcript::TranscriptItem,
-    snapshot: &bmux_tui::selection::SelectionSnapshot,
-) -> Option<Vec<std::ops::Range<usize>>> {
-    let prefix = format!("bcode.transcript.item.{}.", item.id().get());
-    let endpoints = [&snapshot.anchor, &snapshot.focus];
-    for endpoint in endpoints {
-        if endpoint.content_id.as_str().starts_with(&prefix) && endpoint.revision != item.revision()
-        {
-            return None;
-        }
-    }
-    let blocks = bcode_markdown_render::markdown_code_block_selections(item.text());
-    let mut ranges = Vec::new();
-    for slice in &snapshot.slices {
-        let Some(kind) = slice.content_id.as_str().strip_prefix(&prefix) else {
-            continue;
-        };
-        if slice.revision != item.revision() {
-            return None;
-        }
-        let selected = if kind.starts_with("markdown.code.")
-            && kind.rsplit('.').next() == Some("body")
-        {
-            let offsets = endpoints
-                .into_iter()
-                .filter(|endpoint| endpoint.content_id.as_str().starts_with(&prefix))
-                .map(|endpoint| endpoint.offset)
-                .collect::<Vec<_>>();
-            match offsets.as_slice() {
-                [anchor, focus] => (*anchor).min(*focus)..(*anchor).max(*focus),
-                [offset] => {
-                    if snapshot.anchor.content_id.as_str().starts_with(&prefix) == snapshot.reversed
-                    {
-                        0..*offset
-                    } else {
-                        *offset..item.text().len()
-                    }
-                }
-                [] => 0..item.text().len(),
-                _ => return None,
-            }
-        } else {
-            slice.source_range.clone()
-        };
-        if let Some(suffix) = kind.strip_prefix("markdown.") {
-            ranges.extend(super::markdown_selection::expand_code_selection_range(
-                item.text(),
-                &blocks,
-                suffix,
-                selected,
-            )?);
-        } else if kind == "markdown" || kind == "plain" {
-            item.text().get(selected.clone())?;
-            ranges.push(selected);
-        } else {
-            return None;
-        }
-    }
-    if snapshot.anchor.content_id != snapshot.focus.content_id
-        && endpoints.into_iter().all(|endpoint| {
-            endpoint
-                .content_id
-                .as_str()
-                .starts_with(&format!("{prefix}markdown"))
-        })
-        && endpoints.into_iter().any(|endpoint| {
-            endpoint
-                .content_id
-                .as_str()
-                .starts_with(&format!("{prefix}markdown.code."))
-        })
-    {
-        let interval = snapshot.anchor.offset.min(snapshot.focus.offset)
-            ..snapshot.anchor.offset.max(snapshot.focus.offset);
-        item.text().get(interval.clone())?;
-        ranges.push(interval);
-    }
-    ranges.sort_by_key(|range| (range.start, range.end));
-    let mut disjoint: Vec<std::ops::Range<usize>> = Vec::new();
-    for range in ranges {
-        if let Some(previous) = disjoint.last_mut()
-            && range.start <= previous.end
-        {
-            previous.end = previous.end.max(range.end);
-        } else {
-            disjoint.push(range);
-        }
-    }
-    Some(disjoint)
-}
-
-#[must_use]
-fn export_plain_transcript_selection<'a>(
-    items: impl IntoIterator<Item = &'a super::transcript::TranscriptItem>,
-    snapshot: &bmux_tui::selection::SelectionSnapshot,
-) -> Option<String> {
-    let mut selected = std::collections::BTreeSet::new();
-    for slice in &snapshot.slices {
-        let content = slice.content_id.as_str();
-        let remainder = content.strip_prefix("bcode.transcript.item.")?;
-        let (item_id, kind) = remainder.split_once('.')?;
-        let item_id = item_id.parse::<u64>().ok()?;
-        if kind != "plain" && kind != "markdown" && !kind.starts_with("markdown.code.") {
-            return None;
-        }
-        selected.insert(item_id);
-    }
-    let mut output = Vec::new();
-    for item in items {
-        if !selected.remove(&item.id().get()) {
-            continue;
-        }
-        let disjoint = resolved_transcript_selection_ranges(item, snapshot)?;
-        let mut text = String::new();
-        for range in disjoint {
-            text.push_str(item.text().get(range)?);
-        }
-        if !text.is_empty() {
-            output.push(format_transcript_selection_item(item, &text));
-        }
-    }
-    if !selected.is_empty() {
-        return None;
-    }
-    (!output.is_empty()).then(|| output.join("\n\n"))
-}
-
-/// Test-only seams used by the engine-neutral transcript scenario driver.
 #[cfg(test)]
 impl BcodeRuntimeModel {
     /// Run one command-palette host route as the palette does after a selection.
@@ -4175,39 +3254,6 @@ impl BcodeRuntimeModel {
             .invalidation
             .merge(super::invalidation::UiInvalidation::Structural);
         self.presentation_damage = bmux_tui::damage::Damage::Full;
-        self.fast_temporal_presentation = false;
-    }
-
-    /// Request the paint-level redraw that timer-driven presentation updates (scroll motion,
-    /// glow and streaming frames) request, with full damage because the caller does not track
-    /// which regions those frames touch.
-    pub(crate) fn request_temporal_redraw_for_test(&mut self) {
-        self.invalidation = self
-            .invalidation
-            .merge(super::invalidation::UiInvalidation::Paint);
-        self.presentation_damage = bmux_tui::damage::Damage::Full;
-        self.fast_temporal_presentation = false;
-    }
-
-    /// Reconcile timed invalidations and return the timer the runtime delivers for them.
-    pub(crate) fn invalidations_timer_for_test(&mut self) -> bmux_tui_runtime::TimerId {
-        self.reconcile_temporal_registry();
-        RootTimer::Invalidations.id()
-    }
-
-    /// Frame layout of the last successfully committed presentation.
-    pub(crate) const fn committed_layout_for_test(&self) -> Option<super::render::FrameLayout> {
-        self.committed_layout
-    }
-
-    /// Whether the next presentation has any damage to paint.
-    pub(crate) const fn presentation_redraw_requested_for_test(&self) -> bool {
-        !self.presentation_damage.is_none()
-    }
-
-    /// Whether the damage the next presentation will paint covers the whole surface.
-    pub(crate) fn presentation_damage_is_full_for_test(&self) -> bool {
-        self.presentation_damage.is_full()
     }
 
     /// Replace the system clipboard writer used by transcript copying.
@@ -4223,117 +3269,21 @@ impl BcodeRuntimeModel {
         self.selection_clear_at
     }
 
-    /// Replace the wall-clock deadline of the pending post-copy selection clear.
-    pub(crate) const fn set_selection_clear_at_for_test(&mut self, deadline: Option<Instant>) {
-        self.selection_clear_at = deadline;
-    }
-
     /// Timer the runtime delivers for the current post-copy selection clear.
     pub(crate) fn selection_clear_timer_for_test(&self) -> bmux_tui_runtime::TimerId {
         RootTimer::SelectionClear(self.selection_clear_generation).id()
     }
 }
 
-/// Export a visible transcript selection through the production selection-export path.
-#[cfg(test)]
-pub fn export_plain_transcript_selection_for_test<'a>(
-    items: impl IntoIterator<Item = &'a super::transcript::TranscriptItem>,
-    snapshot: &bmux_tui::selection::SelectionSnapshot,
-) -> Option<String> {
-    export_plain_transcript_selection(items, snapshot)
-}
-
-fn format_transcript_selection_item(
-    item: &super::transcript::TranscriptItem,
-    text: &str,
-) -> String {
-    use super::transcript::TranscriptItemKind;
-
-    let metadata = match item.kind() {
-        TranscriptItemKind::ToolRequest {
-            tool_name,
-            status,
-            active,
-            ..
-        } => Some(format!(
-            "Tool request: {tool_name} [{}]",
-            status.map_or(
-                if *active { "active" } else { "requested" },
-                |status| match status {
-                    bcode_session_view_models::ToolInvocationViewStatus::Requested => "requested",
-                    bcode_session_view_models::ToolInvocationViewStatus::Waiting => "waiting",
-                    bcode_session_view_models::ToolInvocationViewStatus::Running => "running",
-                    bcode_session_view_models::ToolInvocationViewStatus::Finished => "finished",
-                    bcode_session_view_models::ToolInvocationViewStatus::Failed => "failed",
-                    bcode_session_view_models::ToolInvocationViewStatus::Cancelled => "cancelled",
-                }
-            )
-        )),
-        TranscriptItemKind::ToolResult {
-            tool_name,
-            is_error,
-            timing,
-            ..
-        } => Some(format!(
-            "Tool result: {} [{}{}]",
-            tool_name.as_deref().unwrap_or("unknown"),
-            if *is_error { "failed" } else { "finished" },
-            timing
-                .duration_ms
-                .map_or_else(String::new, |duration| format!(", {duration}ms"))
-        )),
-        TranscriptItemKind::ToolRequestDraft { .. } => {
-            Some("Tool request draft [pending; rendered-text fallback]".to_owned())
-        }
-        TranscriptItemKind::ToolContribution { contribution, .. } => Some(format!(
-            "Tool contribution: {} v{} by {} [rendered-text fallback]",
-            contribution.schema, contribution.schema_version, contribution.producer_id
-        )),
-        _ => None,
-    };
-    metadata.map_or_else(
-        || text.to_owned(),
-        |metadata| {
-            item.timestamp_ms().map_or_else(
-                || format!("{metadata}\n{text}"),
-                |timestamp| format!("{metadata} @ {timestamp}ms\n{text}"),
-            )
-        },
-    )
-}
-
-fn transcript_plain_row_source_ranges(
-    source: &str,
-    rendered_rows: usize,
-) -> Vec<Option<std::ops::Range<usize>>> {
-    let source_rows = source
-        .split_inclusive('\n')
-        .scan(0_usize, |offset, line| {
-            let start = *offset;
-            *offset = offset.saturating_add(line.len());
-            let content_len = line.strip_suffix('\n').map_or(line.len(), str::len);
-            Some(start..start.saturating_add(content_len))
-        })
-        .collect::<Vec<_>>();
-    if source_rows.len() != rendered_rows {
-        return vec![None; rendered_rows];
-    }
-    source_rows.into_iter().map(Some).collect()
-}
-
-/// Transcript engine seam (TUI V2 spec section 7, EN5): every method is a no-op with the V1
-/// engine, so the V1 path is unchanged; with V2 it routes to the V2 host.
+/// Transcript routing: ingest, input, painting and commit of the transcript host.
 impl BcodeRuntimeModel {
-    /// Whether the transcript holds keyboard focus in the selected engine.
+    /// Whether the transcript holds keyboard focus.
     fn transcript_focus_active(&self) -> bool {
-        self.transcript_engine.v2().map_or_else(
-            || self.chat.app.transcript_focus_active(),
-            super::transcript_v2_host::TranscriptV2Host::transcript_focus_active,
-        )
+        self.transcript_host.transcript_focus_active()
     }
 
-    /// Route a key or pointer event to the V2 transcript. `None` lets the host shell handle it.
-    fn route_transcript_v2_input(
+    /// Route a key or pointer event to the transcript. `None` lets the host shell handle it.
+    fn route_transcript_input(
         &mut self,
         event: &Event,
     ) -> Option<super::invalidation::UiInvalidation> {
@@ -4341,7 +3291,7 @@ impl BcodeRuntimeModel {
         let modal = self.loop_state.modal_foreground()
             || self.loop_state.has_command_palette()
             || self.loop_state.has_slash_palette();
-        let host = self.transcript_engine.v2_mut()?;
+        let host = &mut self.transcript_host;
         let now = host.now();
         let outcome = match event {
             // User-bound `tui.tools.*` keys run their palette route on V2 (FO6).
@@ -4380,7 +3330,7 @@ impl BcodeRuntimeModel {
             });
         outcome.consumed_redraw().map(|redraw| {
             if copied {
-                // The copy reports through the status row (V1 copy policy).
+                // The copy reports through the status row.
                 super::invalidation::UiInvalidation::Structural
             } else if redraw {
                 Self::transcript_v2_invalidation(damage)
@@ -4403,8 +3353,7 @@ impl BcodeRuntimeModel {
         }
     }
 
-    /// Apply V2 selection gestures to the host shell's copy state, with V1's copy policy
-    /// (C35): a new gesture cancels a pending post-copy clear, the selected text follows the
+    /// Apply transcript selection gestures to the host shell's copy state (C35): a new gesture cancels a pending post-copy clear, the selected text follows the
     /// drag, and a completed drag copies when auto-copy on release is enabled. Returns whether
     /// a copy ran.
     fn apply_transcript_v2_selection_events(
@@ -4426,36 +3375,30 @@ impl BcodeRuntimeModel {
         false
     }
 
-    /// Run a transcript command-palette route on the V2 host. Returns whether V2 handled it
-    /// (always, when V2 is selected); with V1 the route runs on the V1 transcript instead.
-    fn run_transcript_v2_route(&mut self, route: &str) -> bool {
-        let Some(host) = self.transcript_engine.v2_mut() else {
-            return false;
-        };
-        let now = host.now();
-        let _outcome = host.run_transcript_route(route, now);
-        true
+    /// Run a transcript command-palette route on the transcript host.
+    fn run_transcript_route(&mut self, route: &str) {
+        let now = self.transcript_host.now();
+        let _outcome = self.transcript_host.run_transcript_route(route, now);
     }
 
-    /// FO3: with V2 transcript focus, a paste or a key the transcript does not bind returns
+    /// FO3: with transcript focus, a paste or a key the transcript does not bind returns
     /// focus to the composer before shell routing, so the composer receives it.
-    fn release_transcript_v2_focus_for(&mut self, event: &Event) {
+    fn release_transcript_focus_for(&mut self, event: &Event) {
         if self.loop_state.modal_foreground() {
             return;
         }
-        if let Some(host) = self.transcript_engine.v2_mut() {
-            let _released = host.release_focus_for_event(self.settings.keymap(), event);
-        }
+        let _released = self
+            .transcript_host
+            .release_focus_for_event(self.settings.keymap(), event);
     }
 
-    /// Ingest a session stream update into the V2 engine ahead of the shared host-shell path.
-    fn ingest_transcript_v2_stream_update(
+    /// Ingest a session stream update into the transcript engine ahead of the shared
+    /// host-shell path.
+    fn ingest_transcript_stream_update(
         &mut self,
         update: &super::history_flow::SessionStreamUpdate,
     ) -> bool {
-        let Some(host) = self.transcript_engine.v2_mut() else {
-            return false;
-        };
+        let host = &mut self.transcript_host;
         // Decided before the host shell applies the update, which forgets the pending
         // submission it accepts.
         let own_submission = match update {
@@ -4485,30 +3428,20 @@ impl BcodeRuntimeModel {
         host.ingest_stream_update(update, own_submission, now)
     }
 
-    /// Let the V2 host observe a shared effect result before V1 handles it.
-    fn observe_transcript_v2_effect_result(&mut self, result: &TuiEffectResult) {
-        if let Some(host) = self.transcript_engine.v2_mut() {
-            let now = host.now();
-            let _changed = host.observe_effect_result(result, now);
-        }
-    }
-
-    /// Apply an effect result owned by the V2 host.
-    fn apply_transcript_v2_effect_result(
+    /// Apply an effect result owned by the transcript host.
+    fn apply_transcript_effect_result(
         &mut self,
         result: TuiEffectResult,
     ) -> super::invalidation::UiInvalidation {
-        // V2 history reads are daemon reads like V1's: connectivity follows their outcome.
+        // Transcript history reads are daemon reads: connectivity follows their outcome.
         let observation = result.daemon_observation();
         let failed = !matches!(
             observation,
             super::effects::DaemonObservation::None | super::effects::DaemonObservation::Success
         );
         self.loop_state.observe_daemon(&mut self.chat, &observation);
-        let changed = self.transcript_engine.v2_mut().is_some_and(|host| {
-            let now = host.now();
-            host.apply_effect_result(result, now)
-        });
+        let now = self.transcript_host.now();
+        let changed = self.transcript_host.apply_effect_result(result, now);
         if changed || failed {
             super::invalidation::UiInvalidation::Structural
         } else {
@@ -4517,12 +3450,10 @@ impl BcodeRuntimeModel {
     }
 
     /// End of every update: follow the attached session, bring the render and structure
-    /// inputs up to date, start the V2 host's history effects and report whether the V2
+    /// inputs up to date, start the transcript host's history effects and report whether the
     /// transcript needs repainting.
-    fn flush_transcript_v2(&mut self) -> super::invalidation::UiInvalidation {
-        let Some(host) = self.transcript_engine.v2_mut() else {
-            return super::invalidation::UiInvalidation::None;
-        };
+    fn flush_transcript(&mut self) -> super::invalidation::UiInvalidation {
+        let host = &mut self.transcript_host;
         let now = host.now();
         host.note_opening_anchor(
             self.chat
@@ -4534,7 +3465,7 @@ impl BcodeRuntimeModel {
         // The engine's `SessionView` paces live text with the host shell's policy (D13).
         host.sync_streaming_policy(self.chat.app.streaming_presentation_policy(), now);
         let _ = host.sync_render_inputs(&mut self.chat.app, now);
-        // Pending submissions and process-local notices are V2 local rows (LR1–LR7).
+        // Pending submissions and process-local notices are local rows (LR1–LR7).
         host.sync_local_rows(&self.chat.app, now);
         // Transcript tooling reports through the host shell: status notices, and per-tool
         // defaults persisted to user state through the shell's effect (A3).
@@ -4542,7 +3473,7 @@ impl BcodeRuntimeModel {
             let text = notice.text(&self.chat.app);
             self.chat.app.set_status(text);
         });
-        // Markdown activation reports through the status row with V1's messages.
+        // Markdown activation reports through the status row.
         host.set_markdown_activate_label(
             &self.chat.app.shortcut_hint("chat", "tui.markdown.activate"),
         );
@@ -4583,16 +3514,14 @@ impl BcodeRuntimeModel {
         Self::transcript_v2_invalidation(damage)
     }
 
-    /// Runtime commands for the V2 host's started Markdown visual requests: one keyed lane
-    /// per worker kind, so at most one request per lane runs (D2; the host keeps the pending
-    /// one).
-    fn transcript_v2_visual_commands(
+    /// Runtime commands for the transcript host's started Markdown visual requests: one keyed
+    /// lane per worker kind, so at most one request per lane runs (D2; the host keeps the
+    /// pending one).
+    fn transcript_visual_commands(
         &mut self,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
-        let Some(host) = self.transcript_engine.v2_mut() else {
-            return Vec::new();
-        };
-        host.drain_visual_work()
+        self.transcript_host
+            .drain_visual_work()
             .into_iter()
             .map(|work| {
                 bmux_tui_runtime::Command::replace(
@@ -4610,29 +3539,25 @@ impl BcodeRuntimeModel {
             .collect()
     }
 
-    /// The V2 host, when V2 is selected (scenario and test observation seam).
+    /// The transcript host (scenario and test observation seam).
     #[cfg(test)]
-    pub(crate) fn transcript_v2_for_test(
-        &self,
-    ) -> Option<&super::transcript_v2_host::TranscriptV2Host> {
-        self.transcript_engine.v2()
+    pub(crate) fn transcript_host_for_test(&self) -> &super::transcript_v2_host::TranscriptV2Host {
+        &self.transcript_host
     }
 
-    /// The V2 host, mutably, when V2 is selected (scenario clock and observation seam).
+    /// The transcript host, mutably (scenario clock and observation seam).
     #[cfg(test)]
-    pub(crate) fn transcript_v2_mut_for_test(
+    pub(crate) fn transcript_host_mut_for_test(
         &mut self,
-    ) -> Option<&mut super::transcript_v2_host::TranscriptV2Host> {
-        self.transcript_engine.v2_mut()
+    ) -> &mut super::transcript_v2_host::TranscriptV2Host {
+        &mut self.transcript_host
     }
 
-    /// Record the presented V2 frame (CK3) and queue the history requests the commit issued
+    /// Record the presented frame (CK3) and queue the history requests the commit issued
     /// (prefetch after the presented position, W5). Returns whether the transcript needs
     /// another frame and whether history effects were queued.
-    fn commit_transcript_v2_presentation(&mut self) -> (bool, bool) {
-        let Some(host) = self.transcript_engine.v2_mut() else {
-            return (false, false);
-        };
+    fn commit_transcript_presentation(&mut self) -> (bool, bool) {
+        let host = &mut self.transcript_host;
         host.commit();
         // The committed frame decides which Markdown visuals are visible (and prefetched).
         let now = host.now();
@@ -4660,12 +3585,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
     ) -> bmux_tui_runtime::Update<Self::Message> {
         self.invalidation = super::invalidation::UiInvalidation::None;
         self.last_presented_at = Some(Instant::now());
-        // With V2 the V1 transcript layout is neither prepared nor presented (EN5).
-        if self.transcript_engine.v2().is_none() {
-            self.chat.app.commit_transcript_presentation();
-        }
-        let (transcript_v2_redraw, transcript_v2_effects) =
-            self.commit_transcript_v2_presentation();
+        let (transcript_redraw, transcript_effects) = self.commit_transcript_presentation();
         self.loop_state.mark_presentation_committed();
         let deferred = self
             .loop_state
@@ -4674,26 +3594,19 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         let mut update = if deferred {
             self.invalidation = super::invalidation::UiInvalidation::Structural;
             self.presentation_damage = bmux_tui::damage::Damage::Full;
-            self.fast_temporal_presentation = false;
             bmux_tui_runtime::Update::redraw()
-        } else if transcript_v2_redraw {
+        } else if transcript_redraw {
             // Work the commit ran (an accepted Markdown visual, a settled motion) repaints at
             // its own damage scope: the transcript region alone unless it changed more (F5).
-            let invalidation = self
-                .transcript_engine
-                .v2_mut()
-                .map_or(super::invalidation::UiInvalidation::Structural, |host| {
-                    Self::transcript_v2_invalidation(host.take_damage())
-                });
+            let invalidation = Self::transcript_v2_invalidation(self.transcript_host.take_damage());
             self.invalidation = invalidation;
             self.presentation_damage = self.select_presentation_damage(invalidation, &[]);
-            self.fast_temporal_presentation = false;
             bmux_tui_runtime::Update::redraw()
         } else {
             bmux_tui_runtime::Update::none()
         };
-        // Only V2 queues work here; V1 effects keep starting at the end of `update`.
-        if transcript_v2_effects && let Some(handle) = self.runtime_handle.clone() {
+        // Transcript commits queue work here; other effects start at the end of `update`.
+        if transcript_effects && let Some(handle) = self.runtime_handle.clone() {
             for command in self.collect_runtime_work(&handle) {
                 update = update.with_command(command);
             }
@@ -4746,7 +3659,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 let mut session_stream =
                     std::mem::replace(&mut self.chat.event_receiver, replacement_receiver);
                 let mut artifact_completions = self.loop_state.take_artifact_completion_receiver();
-                let mut markdown_completions = self.loop_state.take_markdown_completion_receiver();
                 let session_subscription = bmux_tui_runtime::Subscription::new(
                     bmux_tui_runtime::SubscriptionKey::new("bcode.session_stream"),
                     move |sender| async move {
@@ -4777,31 +3689,10 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         }
                     },
                 );
-                let markdown_subscription = bmux_tui_runtime::Subscription::new(
-                    bmux_tui_runtime::SubscriptionKey::new("bcode.markdown_completions"),
-                    move |sender| async move {
-                        loop {
-                            if markdown_completions.changed().await.is_err() {
-                                break;
-                            }
-                            let completion = markdown_completions.borrow_and_update().clone();
-                            if sender
-                                .send(BcodeRuntimeMessage::MarkdownProjectionCompleted(Box::new(
-                                    completion,
-                                )))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    },
-                );
                 self.schedule_deadlines();
                 let mut update = bmux_tui_runtime::Update::redraw()
                     .with_subscription(session_subscription)
-                    .with_subscription(artifact_subscription)
-                    .with_subscription(markdown_subscription);
+                    .with_subscription(artifact_subscription);
                 for command in self.collect_runtime_work(&handle) {
                     update = update.with_command(command);
                 }
@@ -4845,7 +3736,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 if self.return_from_borrowed_chat(&event) {
                     return Ok(bmux_tui_runtime::Update::redraw());
                 }
-                self.release_transcript_v2_focus_for(&event);
+                self.release_transcript_focus_for(&event);
                 // Transcript focus mode owns keys ahead of inline interactions and completion.
                 let transcript_focus_owns = matches!(event, Event::Key(_))
                     && self.transcript_focus_active()
@@ -4874,47 +3765,28 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                             }
                             super::keymap::BmuxAction::AppExit => self.chat.app.request_exit(),
                             super::keymap::BmuxAction::InteractionFocusActive => {
-                                // EN5: V2 reveals its reserved interaction unit (C37).
+                                // The transcript reveals its reserved interaction unit (C37).
                                 if self.chat.app.tui_config().interactions.placement
                                     == bcode_config::TuiInteractionPlacement::Transcript
-                                    && let Some(host) = self.transcript_engine.v2_mut()
                                 {
-                                    let now = host.now();
-                                    let _changed = host.reveal_inline_interaction(now);
-                                }
-                                if self.chat.app.tui_config().interactions.placement
-                                    == bcode_config::TuiInteractionPlacement::Transcript
-                                    && self.transcript_engine.v2().is_none()
-                                    && let Some(interaction_id) =
-                                        self.loop_state.active_interactive_surface_id()
-                                {
-                                    let _changed = self
-                                        .chat
-                                        .app
-                                        .focus_interaction_in_transcript(interaction_id);
+                                    let now = self.transcript_host.now();
+                                    let _changed =
+                                        self.transcript_host.reveal_inline_interaction(now);
                                 }
                             }
-                            // EN5: the selected engine scrolls the transcript under the
-                            // surface (Page Up/Down, ctrl+up/down, ctrl+home/end).
-                            _ if self.transcript_engine.v2().is_some() => {
+                            // The transcript scrolls under the surface (Page Up/Down,
+                            // ctrl+up/down, ctrl+home/end).
+                            _ => {
                                 let changed =
-                                    self.route_transcript_v2_input(&event)
-                                        .is_some_and(|damage| {
-                                            damage != super::invalidation::UiInvalidation::None
-                                        });
+                                    self.route_transcript_input(&event).is_some_and(|damage| {
+                                        damage != super::invalidation::UiInvalidation::None
+                                    });
                                 if changed {
                                     self.invalidation = self
                                         .invalidation
                                         .merge(super::invalidation::UiInvalidation::Structural);
                                     self.presentation_damage = bmux_tui::damage::Damage::Full;
-                                    self.fast_temporal_presentation = false;
                                 }
-                            }
-                            action => {
-                                let _handled = super::input::handle_chat_action(
-                                    &mut self.chat.app,
-                                    Some(action),
-                                );
                             }
                         }
                         return Ok(bmux_tui_runtime::Update::redraw());
@@ -4926,14 +3798,13 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 | bmux_tui::event::MouseEventKind::ScrollDown
                         )
                     {
-                        // EN5: the selected engine scrolls the transcript under the surface.
-                        let changed = self.route_transcript_v2_input(&event).map_or_else(
+                        // The transcript scrolls under the surface.
+                        let changed = self.route_transcript_input(&event).map_or_else(
                             || {
                                 super::mouse_flow::handle_non_permission_mouse(
                                     None,
                                     &mut self.chat,
                                     mouse,
-                                    self.settings.mouse_scroll_rows(),
                                 )
                             },
                             |damage| damage != super::invalidation::UiInvalidation::None,
@@ -4943,7 +3814,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 .invalidation
                                 .merge(super::invalidation::UiInvalidation::Structural);
                             self.presentation_damage = bmux_tui::damage::Damage::Full;
-                            self.fast_temporal_presentation = false;
                         }
                         return Ok(bmux_tui_runtime::Update::redraw());
                     }
@@ -4961,7 +3831,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         .invalidation
                         .merge(super::invalidation::UiInvalidation::Structural);
                     self.presentation_damage = bmux_tui::damage::Damage::Full;
-                    self.fast_temporal_presentation = false;
                     let command = self.focused_input_command.take();
                     let update = bmux_tui_runtime::Update::redraw();
                     return Ok(command.map_or(update, |command| {
@@ -5006,10 +3875,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                         },
                                     )
                                 });
-                            self.fast_temporal_presentation = geometry.is_some()
-                                && self.committed_layout.is_some()
-                                && !self.presentation_damage.is_full()
-                                && !self.presentation_damage.is_none();
                             return Ok(bmux_tui_runtime::Update::redraw());
                         }
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Relayout => {
@@ -5017,7 +3882,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                                 .invalidation
                                 .merge(super::invalidation::UiInvalidation::Items);
                             self.presentation_damage = bmux_tui::damage::Damage::Full;
-                            self.fast_temporal_presentation = false;
                             return Ok(bmux_tui_runtime::Update::redraw());
                         }
                         super::interactive_surface::InteractiveSurfaceEventOutcome::Resolved(
@@ -5128,7 +3992,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     }
                     _ => {}
                 }
-                let transcript_v2_changed = self.ingest_transcript_v2_stream_update(&update);
+                let transcript_v2_changed = self.ingest_transcript_stream_update(&update);
                 let changed = self
                     .loop_state
                     .apply_session_stream_update(&mut self.chat, *update)
@@ -5285,30 +4149,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     super::invalidation::UiInvalidation::None
                 }
             }
-            bmux_tui_runtime::RuntimeEvent::Message(
-                BcodeRuntimeMessage::MarkdownProjectionCompleted(completion),
-            ) => {
-                if (*completion).is_some_and(|completion| {
-                    self.loop_state
-                        .apply_markdown_projection_completion(&mut self.chat, completion)
-                }) {
-                    super::invalidation::UiInvalidation::Items
-                } else {
-                    super::invalidation::UiInvalidation::None
-                }
-            }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
                 result,
             )) if super::transcript_v2_host::ingest::owns_effect_result(&result) => {
-                self.apply_transcript_v2_effect_result(*result)
+                self.apply_transcript_effect_result(*result)
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::TranscriptV2Visual(
                 completion,
             )) => {
-                let changed = self.transcript_engine.v2_mut().is_some_and(|host| {
-                    let now = host.now();
-                    host.complete_markdown_visual(*completion, now)
-                });
+                let now = self.transcript_host.now();
+                let changed = self
+                    .transcript_host
+                    .complete_markdown_visual(*completion, now);
                 if changed {
                     super::invalidation::UiInvalidation::Structural
                 } else {
@@ -5318,7 +4170,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::EffectCompleted(
                 result,
             )) => {
-                self.observe_transcript_v2_effect_result(&result);
                 let navigation_session = self
                     .loop_state
                     .root_plugin_surface_pending_session_navigation();
@@ -5341,18 +4192,6 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 }
                 let previous_frame_interval = self.settings.bmux_runtime_config().frame_interval;
                 let previous_session_id = self.chat.viewing_session_id();
-                if let TuiEffectResult::TimelineJumpLoaded {
-                    session_id,
-                    generation,
-                    sequence,
-                    ..
-                } = result.as_ref()
-                {
-                    if self.pending_timeline_jump != Some((*session_id, *generation, *sequence)) {
-                        return Ok(bmux_tui_runtime::Update::none());
-                    }
-                    self.pending_timeline_jump = None;
-                }
                 let observation = result.daemon_observation();
                 self.loop_state.observe_daemon(&mut self.chat, &observation);
                 super::chat_loop::apply_effect_result(
@@ -5482,8 +4321,8 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         self.synchronize_composer_interaction();
         self.loop_state.verify_plugin_operations()?;
         self.invalidation = self.invalidation.merge(damage);
-        let transcript_v2_invalidation = self.flush_transcript_v2();
-        self.invalidation = self.invalidation.merge(transcript_v2_invalidation);
+        let transcript_invalidation = self.flush_transcript();
+        self.invalidation = self.invalidation.merge(transcript_invalidation);
         let route_invalidation = self.synchronize_screen();
         self.invalidation = self.invalidation.merge(route_invalidation);
         self.draft_autosave.observe(&self.chat, Instant::now());
@@ -5492,27 +4331,10 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         }
         let housekeeping = self
             .loop_state
-            .prepare_runtime_work(&mut self.chat, self.committed_area);
+            .prepare_runtime_work(&self.chat, self.committed_area);
         self.invalidation = self.invalidation.merge(housekeeping);
         self.presentation_damage =
             self.select_presentation_damage(self.invalidation, &temporal_damage);
-        if self.transcript_selection.phase() != bmux_tui::selection::SelectionGesturePhase::Idle {
-            self.presentation_damage = bmux_tui::damage::Damage::Full;
-        }
-        self.fast_temporal_presentation = self.transcript_selection.phase()
-            == bmux_tui::selection::SelectionGesturePhase::Idle
-            && self.invalidation == super::invalidation::UiInvalidation::Paint
-            && (!temporal_damage.is_empty()
-                || !self
-                    .chat
-                    .app
-                    .composer_submit
-                    .pointer_damage
-                    .borrow()
-                    .is_empty())
-            && !temporal_damage.contains(&super::app::TemporalDamage::Full)
-            && !temporal_damage.contains(&super::app::TemporalDamage::Transcript)
-            && !self.presentation_damage.is_full();
         let mut update = match self.invalidation {
             super::invalidation::UiInvalidation::None => bmux_tui_runtime::Update::none(),
             super::invalidation::UiInvalidation::Full => bmux_tui_runtime::Update::reset(),
@@ -5769,332 +4591,13 @@ mod child_product_tests;
 #[cfg(test)]
 mod tests {
     use super::{BcodeRuntimeAdmissionError, BcodeRuntimeMessage, OrderedPresentationQueue, admit};
-    use crate::app::BmuxApp;
+
     use bcode_command::CommandTextFormat;
     use bcode_session_models::SessionId;
     use std::collections::{BTreeMap, VecDeque};
     use std::convert::Infallible;
 
     fn assert_runtime_message_is_send<T: Send + 'static>() {}
-
-    #[tokio::test]
-    async fn active_selection_forces_full_damage_and_disables_fast_temporal_frames() {
-        let mut model = root_test_model();
-        model.transcript_selection = {
-            let body = bmux_tui::geometry::Rect::new(0, 0, 8, 1);
-            model
-                .committed_selection
-                .push_scope(bmux_tui::selection::SelectionScope::new(
-                    "selection.test",
-                    body,
-                ));
-            for fragment in bmux_tui::selection::plain_text_fragments(
-                "selection.test",
-                "selection.test.content",
-                body,
-                0,
-                "abcdefgh",
-                0,
-                1,
-            ) {
-                model.committed_selection.push_fragment(fragment);
-            }
-            let mut controller = bmux_tui::selection::SelectionController::new();
-            let _ = controller.handle_mouse(
-                &model.committed_selection,
-                bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(0, 0),
-                ),
-            );
-            let _ = controller.handle_mouse(
-                &model.committed_selection,
-                bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(4, 0),
-                ),
-            );
-            controller
-        };
-        model.invalidation = super::super::invalidation::UiInvalidation::Paint;
-        model.fast_temporal_presentation = true;
-        model.presentation_damage = model.select_presentation_damage(model.invalidation, &[]);
-        if model.transcript_selection.phase() != bmux_tui::selection::SelectionGesturePhase::Idle {
-            model.presentation_damage = bmux_tui::damage::Damage::Full;
-            model.fast_temporal_presentation = false;
-        }
-
-        assert!(model.presentation_damage.is_full());
-        assert!(!model.fast_temporal_presentation);
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn runtime_work_starts_existing_older_history_effect_for_selection_reveal() {
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 10,
-            timestamp_ms: 10,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::UserMessage {
-                client_id: bcode_session_models::ClientId::new(),
-                text: "resident tail".to_owned(),
-                admission: bcode_session_models::TurnAdmissionMetadata::default(),
-            },
-        }];
-        let mut model = root_test_model_with_history(session_id, &history);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&history, true);
-        model.chat.app.request_older_history_for_test(2);
-        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
-
-        assert_eq!(
-            model.loop_state.prepare_runtime_work(
-                &mut model.chat,
-                bmux_tui::geometry::Rect::new(0, 0, 40, 12),
-            ),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        assert!(model.chat.pending_effects.contains_effect(
-            &super::super::effects::TuiEffect::LoadOlderHistory {
-                session_id,
-                cursor,
-                generation: model.chat.app.history_window_generation(),
-                width_columns: 40,
-            }
-        ));
-        assert!(model.chat.app.loading_older_history());
-
-        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
-        model
-            .chat
-            .app
-            .replace_transcript_window(&history, false, true, 10);
-        model.chat.app.request_newer_history_for_test(2);
-        let newer_cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
-        assert_eq!(
-            model.loop_state.prepare_runtime_work(
-                &mut model.chat,
-                bmux_tui::geometry::Rect::new(0, 0, 40, 12),
-            ),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        assert!(model.chat.pending_effects.contains_effect(
-            &super::super::effects::TuiEffect::LoadNewerHistory {
-                session_id,
-                cursor: newer_cursor,
-                generation: model.chat.app.history_window_generation(),
-                width_columns: 40,
-            }
-        ));
-        drop(model);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn history_completion_respects_replacement_and_reuses_current_boundary() {
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{
-            SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryPage,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence| SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::AssistantMessage {
-                text: format!("message {sequence}"),
-            },
-        };
-        let history = [event(10)];
-        let mut model = root_test_model_with_history(session_id, &history);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&history, true);
-        model.chat.app.request_older_history_for_test(2);
-        let cursor = model
-            .chat
-            .app
-            .older_history_cursor()
-            .expect("older boundary");
-        let old_generation = model.chat.app.history_window_generation();
-        assert_eq!(
-            model.loop_state.prepare_runtime_work(
-                &mut model.chat,
-                bmux_tui::geometry::Rect::new(0, 0, 40, 12),
-            ),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        assert!(model.chat.pending_effects.contains_effect(
-            &super::super::effects::TuiEffect::LoadOlderHistory {
-                session_id,
-                cursor,
-                generation: old_generation,
-                width_columns: 40,
-            }
-        ));
-        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&history, true);
-        model.chat.app.request_older_history_for_test(2);
-        let new_generation = model.chat.app.history_window_generation();
-        assert_ne!(new_generation, old_generation);
-        assert_eq!(
-            model.loop_state.prepare_runtime_work(
-                &mut model.chat,
-                bmux_tui::geometry::Rect::new(0, 0, 40, 12),
-            ),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        let result = |generation| super::super::effects::TuiEffectResult::OlderHistoryLoaded {
-            session_id,
-            cursor,
-            generation,
-            result: Ok((
-                SessionHistoryPage {
-                    session_id,
-                    events: vec![event(9)],
-                    compatibility_issues: vec![],
-                    next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
-                    has_more: true,
-                },
-                Vec::new(),
-            )),
-        };
-        bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(result(old_generation)),
-            )),
-        )
-        .expect("stale completion");
-        assert!(model.chat.app.loading_older_history());
-        assert_eq!(model.chat.app.older_history_cursor(), Some(cursor));
-        // A late failure from the replaced request must not clear the new
-        // request or steal its retry/navigation state either.
-        bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(super::super::effects::TuiEffectResult::OlderHistoryLoaded {
-                    session_id,
-                    cursor,
-                    generation: old_generation,
-                    result: Err(bcode_client::ClientError::UnexpectedResponse),
-                }),
-            )),
-        )
-        .expect("stale failure completion");
-        assert!(model.chat.app.loading_older_history());
-        assert_eq!(model.chat.app.older_history_cursor(), Some(cursor));
-        let stale = TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([
-            TranscriptFrameStep {
-                label: "replacement frame after stale page",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "stable replacement frame",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(stale[0].observation, stale[1].observation);
-        assert_ne!(
-            stale[0].observation.semantic_items,
-            [] as [(bcode_session_view_models::TranscriptViewItemId, u64); 0]
-        );
-        let stale_items = stale[0].observation.semantic_items.clone();
-        bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(result(new_generation)),
-            )),
-        )
-        .expect("current completion");
-        assert!(!model.chat.app.loading_older_history());
-        assert_eq!(
-            model.chat.app.older_history_cursor(),
-            Some(SessionHistoryCursor { sequence: 8 })
-        );
-        let accepted = TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([
-            TranscriptFrameStep {
-                label: "accepted replacement page",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "accepted replacement page stable",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(accepted[0].observation, accepted[1].observation);
-        assert!(accepted[0].observation.semantic_items.len() > stale_items.len());
-        drop(model);
-    }
-
-    fn milestone_root_key(model: &mut super::BcodeRuntimeModel, key: bmux_keyboard::KeyCode) {
-        let _invalidation = model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
-            bmux_keyboard::KeyStroke::simple(key),
-        ));
-    }
-
-    fn milestone_root_complete(
-        model: &mut super::BcodeRuntimeModel,
-        result: super::super::effects::TuiEffectResult,
-    ) {
-        bmux_tui_runtime::Program::update(
-            model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(result),
-            )),
-        )
-        .expect("milestone root completion");
-    }
-
-    fn milestone_root_open(model: &mut super::BcodeRuntimeModel) {
-        milestone_root_complete(
-            model,
-            super::super::effects::TuiEffectResult::SlashCommandExecuted {
-                message: "/timeline".into(),
-                result: Ok(super::super::slash_commands::SlashCommandOutcome::OpenTimeline),
-            },
-        );
-    }
-
-    fn milestone_root_request(
-        model: &mut super::BcodeRuntimeModel,
-    ) -> Option<super::super::timeline_dialog::MilestonePageRequest> {
-        let (effects, notes) = model.chat.pending_effects.drain_runtime();
-        assert!(notes.is_empty());
-        let mut requests = effects.into_iter().map(|(_, effect)| match effect {
-            super::super::effects::TuiEffect::LoadMilestones { request } => request,
-            _ => panic!("unexpected effect during milestone navigation"),
-        });
-        let request = requests.next();
-        assert!(requests.next().is_none());
-        request
-    }
-
-    fn milestone_root_page(
-        request: super::super::timeline_dialog::MilestonePageRequest,
-        next_after_sequence: Option<u64>,
-    ) -> super::super::effects::TuiEffectResult {
-        super::super::effects::TuiEffectResult::MilestonesLoaded {
-            request,
-            result: Ok(bcode_session_models::SessionMilestonePage {
-                milestones: Vec::new(),
-                next_after_sequence,
-            }),
-        }
-    }
 
     #[tokio::test]
     async fn milestone_root_close_reopen_rejects_stale_success_and_failure() {
@@ -6120,7 +4623,6 @@ mod tests {
         assert_eq!(model.chat.app.status(), status);
         // Loading Enter must neither dismiss the dialog nor schedule a source jump.
         milestone_root_key(&mut model, KeyCode::Enter);
-        assert!(model.pending_timeline_jump.is_none());
         assert!(milestone_root_request(&mut model).is_none());
         milestone_root_complete(&mut model, milestone_root_page(current, Some(42)));
         assert_eq!(model.chat.app.status(), "milestones: more pages available");
@@ -6168,2501 +4670,72 @@ mod tests {
         assert!(milestone_root_request(&mut model).is_none());
         milestone_root_key(&mut model, KeyCode::Char('p'));
         milestone_root_key(&mut model, KeyCode::Enter);
-        // No frame has measured the resident transcript yet, so navigation takes
-        // the bounded history-load route and completes only after acknowledgement.
-        assert_eq!(model.chat.app.status(), "loading timeline message…");
-        let (effects, notes) = model.chat.pending_effects.drain_runtime();
-        assert!(notes.is_empty());
-        assert_eq!(effects.len(), 1);
-        let (_, effect) = effects.into_iter().next().expect("timeline source load");
-        let super::super::effects::TuiEffect::LoadTimelineJump {
-            session_id: requested_session,
-            generation,
-            sequence,
-        } = effect
-        else {
-            panic!("prompt navigation must load its canonical source");
-        };
-        assert_eq!(requested_session, session_id);
-        assert_eq!(sequence, 10);
-        assert_eq!(
-            model.pending_timeline_jump,
-            Some((session_id, generation, sequence))
-        );
-        milestone_root_complete(
-            &mut model,
-            super::super::effects::TuiEffectResult::TimelineJumpLoaded {
-                session_id,
-                generation,
-                sequence,
-                result: Ok((vec![prompt], false, false, Vec::new())),
-            },
-        );
-        assert_eq!(model.chat.app.status(), "jumped to timeline message");
-        assert!(model.pending_timeline_jump.is_none());
+        // The selection jumps the transcript to the prompt's canonical source and closes the
+        // dialog; no further page is requested.
         assert!(milestone_root_request(&mut model).is_none());
         drop(model);
     }
 
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn timeline_completion_cannot_replace_a_newer_window_or_session() {
-        use super::super::effects::TuiEffectResult;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [root_test_history_event(session_id, 10)];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let generation = model.chat.app.history_window_generation();
-        model.pending_timeline_jump = Some((session_id, generation, 9));
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&history, true);
-        let replacement_generation = model.chat.app.history_window_generation();
-        model.pending_timeline_jump = Some((session_id, replacement_generation, 9));
-        let before =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "replacement",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        let complete =
-            |model: &mut super::BcodeRuntimeModel, session_id, generation, sequence, result| {
-                bmux_tui_runtime::Program::update(
-                    model,
-                    bmux_tui_runtime::RuntimeEvent::Message(
-                        super::BcodeRuntimeMessage::EffectCompleted(Box::new(
-                            TuiEffectResult::TimelineJumpLoaded {
-                                session_id,
-                                generation,
-                                sequence,
-                                result,
-                            },
-                        )),
-                    ),
-                )
-                .expect("timeline completion");
-            };
-        complete(
-            &mut model,
-            session_id,
-            generation,
-            9,
-            Ok((
-                vec![root_test_history_event(session_id, 9)],
-                true,
-                true,
-                Vec::new(),
-            )),
-        );
-        complete(
-            &mut model,
-            bcode_session_models::SessionId::new(),
-            replacement_generation,
-            9,
-            Ok((
-                vec![root_test_history_event(session_id, 9)],
-                true,
-                true,
-                Vec::new(),
-            )),
-        );
-        complete(
-            &mut model,
-            session_id,
-            generation,
-            9,
-            Err(super::TuiError::Client(
-                bcode_client::ClientError::UnexpectedResponse,
-            )),
-        );
-        let stale =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "stale completion",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        assert_eq!(stale[0].observation, before[0].observation);
-        for (sequence, events, has_older, has_newer) in [
-            (9, vec![root_test_history_event(session_id, 8)], true, true),
-            (
-                9,
-                vec![root_test_history_event(
-                    bcode_session_models::SessionId::new(),
-                    9,
-                )],
-                true,
-                true,
-            ),
-            (
-                9,
-                vec![
-                    root_test_history_event(session_id, 9),
-                    root_test_history_event(session_id, 9),
-                ],
-                true,
-                true,
-            ),
-            (0, vec![root_test_history_event(session_id, 0)], true, false),
-        ] {
-            model.pending_timeline_jump = Some((session_id, replacement_generation, sequence));
-            complete(
-                &mut model,
-                session_id,
-                replacement_generation,
-                sequence,
-                Ok((events, has_older, has_newer, Vec::new())),
-            );
-        }
-        let rejected = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "invalid current timeline results rejected",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "unchanged replacement",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(rejected[0].observation, rejected[1].observation);
-        assert_eq!(
-            rejected[0].observation.semantic_items,
-            before[0].observation.semantic_items
-        );
-        model.pending_timeline_jump = Some((session_id, replacement_generation, 9));
-        complete(
-            &mut model,
-            session_id,
-            replacement_generation,
-            9,
-            Ok((
-                vec![root_test_history_event(session_id, 9)],
-                true,
-                true,
-                Vec::new(),
-            )),
-        );
-        let accepted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "current completion",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(accepted[0].observation, accepted[1].observation);
-        assert_ne!(
-            accepted[0].observation.semantic_items,
-            before[0].observation.semantic_items
-        );
-        assert!(model.chat.app.transcript_index_for_sequence(9).is_some());
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn timeline_jump_replacement_in_same_window_ignores_prior_completion() {
-        use super::super::effects::TuiEffectResult;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [root_test_history_event(session_id, 10)];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let generation = model.chat.app.history_window_generation();
-        model.pending_timeline_jump = Some((session_id, generation, 9));
-        // A second timeline selection starts before the first request completes;
-        // both still target the same resident generation.
-        model.pending_timeline_jump = Some((session_id, generation, 8));
-        let before =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "before completions",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        for result in [
-            Ok((
-                vec![root_test_history_event(session_id, 9)],
-                true,
-                true,
-                Vec::new(),
-            )),
-            Err(super::TuiError::Client(
-                bcode_client::ClientError::UnexpectedResponse,
-            )),
-        ] {
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
-                        TuiEffectResult::TimelineJumpLoaded {
-                            session_id,
-                            generation,
-                            sequence: 9,
-                            result,
-                        },
-                    )),
-                ),
-            )
-            .expect("superseded completion");
-        }
-        let stale =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "superseded success and failure",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        assert_eq!(before[0].observation, stale[0].observation);
-        assert_eq!(
-            model.pending_timeline_jump,
-            Some((session_id, generation, 8))
-        );
-        bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(TuiEffectResult::TimelineJumpLoaded {
-                    session_id,
-                    generation,
-                    sequence: 8,
-                    result: Ok((
-                        vec![root_test_history_event(session_id, 8)],
-                        true,
-                        true,
-                        Vec::new(),
-                    )),
-                }),
-            )),
-        )
-        .expect("current completion");
-        let accepted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "current timeline jump",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(accepted[0].observation, accepted[1].observation);
-        assert_ne!(
-            accepted[0].observation.semantic_items,
-            before[0].observation.semantic_items
-        );
-        assert!(model.chat.app.transcript_index_for_sequence(8).is_some());
-        assert_eq!(model.pending_timeline_jump, None);
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn timeline_entry_resolves_source_sequence_after_window_replacement() {
-        use super::super::effects::TuiEffect;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let initial = [root_test_history_event(session_id, 10)];
-        let mut model = root_test_model_with_history(session_id, &initial);
-        let _ =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "initial window",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        let stale =
-            super::super::timeline_dialog::TimelineEntry::new(10, 10, "older resident message");
-        let replacement = [root_test_history_event(session_id, 20)];
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&replacement, true);
-        let _ =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "replacement window",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        model.apply_root_timeline_jump(&stale);
-        let generation = model.chat.app.history_window_generation();
-        assert_eq!(
-            model.pending_timeline_jump,
-            Some((session_id, generation, 10))
-        );
-        assert!(
-            model
-                .chat
-                .pending_effects
-                .contains_effect(&TuiEffect::LoadTimelineJump {
-                    session_id,
-                    generation,
-                    sequence: 10,
-                })
-        );
-        let after =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "stale index did not jump to replacement",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        assert_eq!(after[0].observation.semantic_items.len(), 1);
-        assert!(after[0].text.contains("message 20"));
-        assert!(model.chat.app.transcript_index_for_sequence(10).is_none());
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn resident_timeline_jump_supersedes_pending_remote_selection() {
-        use super::super::effects::TuiEffectResult;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [root_test_history_event(session_id, 10)];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let _ =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "layout resident entry",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        let generation = model.chat.app.history_window_generation();
-        model.apply_root_timeline_jump(&super::super::timeline_dialog::TimelineEntry::new(
-            9,
-            9,
-            "remote message",
+    fn milestone_root_key(model: &mut super::BcodeRuntimeModel, key: bmux_keyboard::KeyCode) {
+        let _invalidation = model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(key),
         ));
-        assert_eq!(
-            model.pending_timeline_jump,
-            Some((session_id, generation, 9))
-        );
-        model.apply_root_timeline_jump(&super::super::timeline_dialog::TimelineEntry::new(
-            10,
-            10,
-            "resident message",
-        ));
-        assert_eq!(model.pending_timeline_jump, None);
-        let before =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "resident selection",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        for result in [
-            Ok((
-                vec![root_test_history_event(session_id, 9)],
-                true,
-                true,
-                Vec::new(),
-            )),
-            Err(super::TuiError::Client(
-                bcode_client::ClientError::UnexpectedResponse,
-            )),
-        ] {
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
-                        TuiEffectResult::TimelineJumpLoaded {
-                            session_id,
-                            generation,
-                            sequence: 9,
-                            result,
-                        },
-                    )),
-                ),
-            )
-            .expect("stale remote completion");
-        }
-        let after =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "resident selection after stale completions",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        assert_eq!(before[0].observation, after[0].observation);
-        assert!(model.chat.app.transcript_index_for_sequence(10).is_some());
-        assert!(model.chat.app.transcript_index_for_sequence(9).is_none());
-        drop(model);
     }
 
-    #[tokio::test]
-    async fn newer_completion_cannot_change_a_replaced_centered_window() {
-        use super::super::effects::{TuiEffect, TuiEffectResult};
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{SessionHistoryCursor, SessionHistoryPage};
-
-        let session_id = bcode_session_models::SessionId::new();
-        let initial = [root_test_history_event(session_id, 10)];
-        let replacement = [root_test_history_event(session_id, 20)];
-        let mut model = root_test_model_with_history(session_id, &initial);
-        model
-            .chat
-            .app
-            .replace_transcript_window(&initial, false, true, 10);
-        let cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
-        model.chat.app.request_newer_history_for_test(2);
-        let stale_generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        assert!(
-            model
-                .chat
-                .pending_effects
-                .contains_effect(&TuiEffect::LoadNewerHistory {
-                    session_id,
-                    cursor,
-                    generation: stale_generation,
-                    width_columns: 80,
-                })
-        );
-        model
-            .chat
-            .app
-            .replace_transcript_window(&replacement, false, true, 20);
-        let before =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "replacement",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        for result in [
-            Ok((
-                SessionHistoryPage {
-                    session_id,
-                    events: vec![root_test_history_event(session_id, 11)],
-                    compatibility_issues: vec![],
-                    next_cursor: None,
-                    has_more: false,
-                },
-                Vec::new(),
-            )),
-            Err(bcode_client::ClientError::UnexpectedResponse),
-        ] {
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
-                        TuiEffectResult::NewerHistoryLoaded {
-                            session_id,
-                            cursor,
-                            generation: stale_generation,
-                            result,
-                        },
-                    )),
-                ),
-            )
-            .expect("ignore stale newer completion");
-        }
-        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "stale page ignored",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "stable",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(before[0].observation, after[0].observation);
-        assert_eq!(after[0].observation, after[1].observation);
-        assert_eq!(
-            model.chat.app.newer_history_cursor(),
-            Some(SessionHistoryCursor { sequence: 21 })
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn newer_completion_after_resynchronization_does_not_reopen_the_old_window() {
-        use super::super::effects::{TuiEffect, TuiEffectResult};
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{SessionHistoryPage, SessionSummary, SessionTitleSource};
-
-        let session_id = bcode_session_models::SessionId::new();
-        let initial = [root_test_history_event(session_id, 10)];
-        let mut model = root_test_model_with_history(session_id, &initial);
-        model
-            .chat
-            .app
-            .replace_transcript_window(&initial, false, true, 10);
-        model.chat.app.request_newer_history_for_test(2);
-        let cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        assert!(
-            model
-                .chat
-                .pending_effects
-                .contains_effect(&TuiEffect::LoadNewerHistory {
-                    session_id,
-                    cursor,
-                    generation,
-                    width_columns: 80,
-                })
-        );
-
-        let session = SessionSummary {
-            id: session_id,
-            parent_id: None,
-            name: Some("reconnected".to_owned()),
-            explicit_name: Some("reconnected".to_owned()),
-            derived_title: None,
-            automatic_title: None,
-            automatic_title_source_sequence: None,
-            title_source: SessionTitleSource::Explicit,
-            client_count: 1,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            working_directory: "/tmp/bcode-tui-test".into(),
-            import: None,
-            execution: None,
-            location: None,
-        };
-        let attached = bcode_client::AttachedSessionHistory {
-            session,
-            history: vec![root_test_history_event(session_id, 20)],
-            submissions: vec![],
-            input_history: vec![],
-            usage_summary: bcode_session_models::SessionUsageSummary::default(),
-            import_warnings: vec![],
-            draft: None,
-            runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
-            projection_window: None,
-        };
-        for update in [
-            super::super::history_flow::SessionStreamUpdate::ResyncStarted { session_id },
-            super::super::history_flow::SessionStreamUpdate::Resynchronized {
-                session_id,
-                attached: Box::new(attached),
-            },
-        ] {
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::SessionStream(
-                    Box::new(update),
-                )),
-            )
-            .expect("stream update");
-        }
-        assert_ne!(model.chat.app.history_window_generation(), generation);
-        let before =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "resynchronized",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        for result in [
-            Ok((
-                SessionHistoryPage {
-                    session_id,
-                    events: vec![root_test_history_event(session_id, 11)],
-                    compatibility_issues: vec![],
-                    next_cursor: None,
-                    has_more: false,
-                },
-                Vec::new(),
-            )),
-            Err(bcode_client::ClientError::UnexpectedResponse),
-        ] {
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
-                        TuiEffectResult::NewerHistoryLoaded {
-                            session_id,
-                            cursor,
-                            generation,
-                            result,
-                        },
-                    )),
-                ),
-            )
-            .expect("late newer completion");
-        }
-        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "stale newer page ignored",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "stable",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(before[0].observation, after[0].observation);
-        assert_eq!(after[0].observation, after[1].observation);
-        assert!(model.chat.app.transcript_index_for_sequence(20).is_some());
-        assert!(model.chat.app.transcript_index_for_sequence(11).is_none());
-        drop(model);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn reconnect_replaces_window_and_rejects_old_history_completion() {
-        use super::super::effects::{TuiEffect, TuiEffectResult};
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{
-            SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryPage,
-            SessionSummary, SessionTitleSource,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence| SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::AssistantMessage {
-                text: format!("message {sequence}"),
-            },
-        };
-        let history = [event(10)];
-        let mut model = root_test_model_with_history(session_id, &history);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&history, true);
-        model.chat.app.request_older_history_for_test(2);
-        let cursor = model
-            .chat
-            .app
-            .older_history_cursor()
-            .expect("older boundary");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 40, 12));
-        assert!(
-            model
-                .chat
-                .pending_effects
-                .contains_effect(&TuiEffect::LoadOlderHistory {
-                    session_id,
-                    cursor,
-                    generation,
-                    width_columns: 40,
-                })
-        );
-        let session = SessionSummary {
-            id: session_id,
-            parent_id: None,
-            name: Some("reconnected".to_owned()),
-            explicit_name: Some("reconnected".to_owned()),
-            derived_title: None,
-            automatic_title: None,
-            automatic_title_source_sequence: None,
-            title_source: SessionTitleSource::Explicit,
-            client_count: 1,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            working_directory: "/tmp/bcode-tui-test".into(),
-            import: None,
-            execution: None,
-            location: None,
-        };
-        let attached = bcode_client::AttachedSessionHistory {
-            session,
-            history: vec![event(20)],
-            submissions: vec![],
-            input_history: vec![],
-            usage_summary: bcode_session_models::SessionUsageSummary::default(),
-            import_warnings: vec![],
-            draft: None,
-            runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
-            projection_window: None,
-        };
-        for update in [
-            super::super::history_flow::SessionStreamUpdate::ResyncStarted { session_id },
-            super::super::history_flow::SessionStreamUpdate::Resynchronized {
-                session_id,
-                attached: Box::new(attached),
-            },
-        ] {
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::SessionStream(
-                    Box::new(update),
-                )),
-            )
-            .expect("stream update");
-        }
-        assert_ne!(model.chat.app.history_window_generation(), generation);
-        let before =
-            TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([TranscriptFrameStep {
-                label: "reconnected",
-                input: TranscriptFrameInput::Observe,
-            }]);
+    fn milestone_root_complete(
+        model: &mut super::BcodeRuntimeModel,
+        result: super::super::effects::TuiEffectResult,
+    ) {
         bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(TuiEffectResult::OlderHistoryLoaded {
-                    session_id,
-                    cursor,
-                    generation,
-                    result: Ok((
-                        SessionHistoryPage {
-                            session_id,
-                            events: vec![event(9)],
-                            compatibility_issues: vec![],
-                            next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
-                            has_more: true,
-                        },
-                        Vec::new(),
-                    )),
-                }),
-            )),
-        )
-        .expect("late completion");
-        bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(TuiEffectResult::OlderHistoryLoaded {
-                    session_id,
-                    cursor,
-                    generation,
-                    result: Err(bcode_client::ClientError::UnexpectedResponse),
-                }),
-            )),
-        )
-        .expect("late failure completion");
-        let after = TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([
-            TranscriptFrameStep {
-                label: "late page ignored",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(before[0].observation, after[0].observation);
-        assert_eq!(after[0].observation, after[1].observation);
-        assert!(model.chat.app.transcript_index_for_sequence(20).is_some());
-        assert!(model.chat.app.transcript_index_for_sequence(9).is_none());
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn resumed_boundary_effect_completion_preserves_reader_in_accepted_frame() {
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{SessionEvent, SessionEventKind};
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence| SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind: SessionEventKind::AssistantMessage {
-                text: format!("message {sequence}"),
-            },
-        };
-        let recent = (30..42).map(event).collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &recent);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&recent, true);
-        let initial =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "resume",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        let before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "reach history boundary",
-                input: TranscriptFrameInput::ScrollUp(initial[0].observation.viewport_top + 2),
-            },
-            TranscriptFrameStep {
-                label: "repeat input while loading",
-                input: TranscriptFrameInput::ScrollUp(2),
-            },
-        ]);
-        let reader = &before[1].observation;
-        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
-        let generation = model.chat.app.history_window_generation();
-        assert_eq!(
-            model.loop_state.prepare_runtime_work(
-                &mut model.chat,
-                bmux_tui::geometry::Rect::new(0, 0, 80, 12),
-            ),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        assert!(model.chat.pending_effects.contains_effect(
-            &super::super::effects::TuiEffect::LoadOlderHistory {
-                session_id,
-                cursor,
-                generation,
-                width_columns: 80,
-            }
-        ));
-        complete_older_history_root_test(
-            &mut model,
-            session_id,
-            cursor,
-            generation,
-            (1..30).map(event).collect(),
-        );
-        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "page accepted",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "same page accepted again",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        let loaded = &after[0].observation;
-        let anchor = reader.anchor.as_ref().expect("source anchor before page");
-        let source = reader
-            .terminal_rows
-            .get(reader.viewport_top + anchor.viewport_row_offset)
-            .and_then(|(source, _)| source.as_ref())
-            .expect("source row before page");
-        let previous_row = loaded
-            .terminal_rows
-            .iter()
-            .position(|(id, row)| id.as_ref() == Some(source) && *row == anchor.row_in_item)
-            .expect("reader source row survives page");
-        assert!(previous_row >= loaded.viewport_top);
-        assert!(
-            previous_row - loaded.viewport_top <= 5,
-            "reader moved {} rows; before top {}, after top {}, anchor {:?}",
-            previous_row - loaded.viewport_top,
-            reader.viewport_top,
-            loaded.viewport_top,
-            anchor
-        );
-        assert_eq!(loaded, &after[1].observation);
-        drop(model);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn resumed_boundary_real_ipc_effect_keeps_reader_across_non_presenting_page() {
-        use super::super::effects::TuiEffect;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{
-            ClientId, ProjectionHistoryPage, ProjectionSourceRange, ProjectionWindow, SessionEvent,
-            SessionEventKind,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let event = move |sequence, kind| SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        let recent = (30..42)
-            .map(|sequence| {
-                event(
-                    sequence,
-                    SessionEventKind::UserMessage {
-                        client_id: ClientId::new(),
-                        text: format!("message {sequence}"),
-                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &recent);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&recent, true);
-        let before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "resume",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "load boundary",
-                input: TranscriptFrameInput::ScrollUp(100),
-            },
-            TranscriptFrameStep {
-                label: "repeat while pending",
-                input: TranscriptFrameInput::ScrollUp(2),
-            },
-        ]);
-        let reader = &before[2].observation;
-        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        let effect = TuiEffect::LoadOlderHistory {
-            session_id,
-            cursor,
-            generation,
-            width_columns: 80,
-        };
-        assert!(model.chat.pending_effects.contains_effect(&effect));
-        let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-        assert!(scheduled.into_iter().any(|(_, queued)| matches!(queued, TuiEffect::LoadOlderHistory { session_id: queued_session, cursor: queued_cursor, generation: queued_generation, .. } if queued_session == session_id && queued_cursor == cursor && queued_generation == generation)));
-        let socket_dir = tempfile::tempdir().expect("IPC directory");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("ipc/page.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
-        let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
-            .expect("test executable identity")
-            .1;
-        let responder = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("client");
-            loop {
-                let envelope = bcode_ipc::recv_envelope(&mut stream)
-                    .await
-                    .expect("request");
-                let request = bcode_ipc::decode_request(&envelope.payload).expect("decode");
-                let done = matches!(
-                    request,
-                    bcode_ipc::Request::SessionProjectionHistoryPage { .. }
-                );
-                let response = match request {
-                    bcode_ipc::Request::Hello { .. } => {
-                        bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
-                            protocol_version: bcode_ipc::ProtocolVersion::current(),
-                            client_id: ClientId::new(),
-                            daemon: bcode_ipc::DaemonStatus {
-                                namespace: bcode_ipc::daemon_namespace(),
-                                protocol_version: u32::from(
-                                    bcode_ipc::ProtocolVersion::current().0,
-                                ),
-                                artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                                executable_digest: Some(executable_digest.clone()),
-                                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
-                                storage_writer_epoch: Some(
-                                    bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-                                ),
-                                session_event_schema_version: Some(
-                                    bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                                ),
-                                state_location_id: Some(bcode_ipc::state_location_id()),
-                                ..bcode_ipc::DaemonStatus::default()
-                            },
-                        })
-                    }
-                    bcode_ipc::Request::SessionProjectionHistoryPage {
-                        session_id: requested,
-                        request,
-                    } => {
-                        assert_eq!(requested, session_id);
-                        assert!(request.limits.max_events_scanned <= 512);
-                        bcode_ipc::Response::Ok(
-                            bcode_ipc::ResponsePayload::SessionProjectionHistoryPage {
-                                page: ProjectionHistoryPage {
-                                    session_id,
-                                    window: ProjectionWindow {
-                                        projection:
-                                            bcode_session_models::SessionProjectionKind::Transcript,
-                                        transcript_items: vec![],
-                                        source_range: Some(ProjectionSourceRange {
-                                            start_sequence: 25,
-                                            end_sequence: 29,
-                                        }),
-                                        has_older: true,
-                                        has_newer: true,
-                                        scanned_events: 5,
-                                    },
-                                    events: (25..30)
-                                        .map(|sequence| {
-                                            event(
-                                                sequence,
-                                                SessionEventKind::ClientAttached {
-                                                    client_id: ClientId::new(),
-                                                },
-                                            )
-                                        })
-                                        .collect(),
-                                },
-                            },
-                        )
-                    }
-                    other => panic!("unexpected request: {other:?}"),
-                };
-                let reply = bcode_ipc::response_envelope(envelope.request_id, &response)
-                    .expect("response envelope");
-                bcode_ipc::send_envelope(&mut stream, &reply)
-                    .await
-                    .expect("send response");
-                if done {
-                    break;
-                }
-            }
-        });
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            effect.run_for_test(bcode_client::BcodeClient::new(endpoint)),
-        )
-        .await
-        .expect("effect timeout");
-        responder.await.expect("responder");
-        bmux_tui_runtime::Program::update(
-            &mut model,
+            model,
             bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
                 Box::new(result),
             )),
         )
-        .expect("deliver effect");
-        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "accepted empty semantic page",
-                input: TranscriptFrameInput::Observe,
+        .expect("milestone root completion");
+    }
+
+    fn milestone_root_open(model: &mut super::BcodeRuntimeModel) {
+        milestone_root_complete(
+            model,
+            super::super::effects::TuiEffectResult::SlashCommandExecuted {
+                message: "/timeline".into(),
+                result: Ok(super::super::slash_commands::SlashCommandOutcome::OpenTimeline),
             },
-            TranscriptFrameStep {
-                label: "repeat",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(reader.anchor, after[0].observation.anchor);
-        assert_eq!(reader.viewport_top, after[0].observation.viewport_top);
-        assert_eq!(after[0].observation, after[1].observation);
-        assert_eq!(
-            model
-                .chat
-                .app
-                .older_history_cursor()
-                .map(|cursor| cursor.sequence),
-            Some(24)
         );
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        let (next_scheduled, _) = model.chat.pending_effects.drain_runtime();
-        assert!(next_scheduled.iter().any(|(_, queued)| matches!(queued, TuiEffect::LoadOlderHistory { session_id: queued_session, cursor: queued_cursor, generation: queued_generation, .. } if *queued_session == session_id && queued_cursor.sequence == 24 && *queued_generation == generation)));
-        model.chat.app.scroll_transcript_up(1);
-        assert!(model.chat.app.loading_older_history());
-        let next_page = vec![event(
-            23,
-            SessionEventKind::UserMessage {
-                client_id: ClientId::new(),
-                text: "earlier message".to_owned(),
-                admission: bcode_session_models::TurnAdmissionMetadata::default(),
-            },
-        )];
-        deliver_older_history_root_test(
-            &mut model,
-            session_id,
-            bcode_session_models::SessionHistoryCursor { sequence: 24 },
-            generation,
-            Ok(bcode_session_models::SessionHistoryPage {
-                session_id,
-                events: next_page,
-                compatibility_issues: vec![],
-                next_cursor: None,
-                has_more: false,
+    }
+
+    fn milestone_root_request(
+        model: &mut super::BcodeRuntimeModel,
+    ) -> Option<super::super::timeline_dialog::MilestonePageRequest> {
+        let (effects, notes) = model.chat.pending_effects.drain_runtime();
+        assert!(notes.is_empty());
+        let mut requests = effects.into_iter().filter_map(|(_, effect)| match effect {
+            super::super::effects::TuiEffect::LoadMilestones { request } => Some(request),
+            // The transcript host loads its own windows alongside the dialog.
+            super::super::effects::TuiEffect::LoadTranscriptV2History { .. } => None,
+            _ => panic!("unexpected effect during milestone navigation"),
+        });
+        let request = requests.next();
+        assert!(requests.next().is_none());
+        request
+    }
+
+    fn milestone_root_page(
+        request: super::super::timeline_dialog::MilestonePageRequest,
+        next_after_sequence: Option<u64>,
+    ) -> super::super::effects::TuiEffectResult {
+        super::super::effects::TuiEffectResult::MilestonesLoaded {
+            request,
+            result: Ok(bcode_session_models::SessionMilestonePage {
+                milestones: Vec::new(),
+                next_after_sequence,
             }),
-        );
-        let presenting = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "presenting page",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "presenting page settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(presenting[0].observation, presenting[1].observation);
-        assert_eq!(model.chat.app.older_history_cursor(), None);
-        assert!(
-            presenting[0].observation.semantic_items.len()
-                > after[0].observation.semantic_items.len()
-        );
-        let reader_anchor = reader.anchor.as_ref().expect("reader anchor");
-        let reader_source = reader.terminal_rows
-            [reader.viewport_top + reader_anchor.viewport_row_offset]
-            .0
-            .as_ref()
-            .expect("source-backed reader");
-        let source_row = presenting[0]
-            .observation
-            .terminal_rows
-            .iter()
-            .position(|(id, row)| {
-                id.as_ref() == Some(reader_source) && *row == reader_anchor.row_in_item
-            })
-            .expect("source survives page");
-        let reader_offset = source_row.saturating_sub(presenting[0].observation.viewport_top);
-        assert!(
-            reader_offset > reader_anchor.viewport_row_offset,
-            "presenting page must reveal requested movement: reader_offset={reader_offset}, prior_offset={}, source_row={source_row}, top={}",
-            reader_anchor.viewport_row_offset,
-            presenting[0].observation.viewport_top
-        );
-        assert_eq!(
-            reader_offset - reader_anchor.viewport_row_offset,
-            2,
-            "only the newly navigable rows are revealed, once"
-        );
-        drop(model);
+        }
     }
 
     // Failure-only diagnostics preserve the real admission error that public IPC intentionally
     // normalizes. A successful unregistered DB read alone cannot establish server readability.
-    #[cfg(unix)]
-    async fn persisted_history_failure_diagnostic(
-        root: &std::path::Path,
-        session_id: bcode_session_models::SessionId,
-        cursor: bcode_session_models::SessionHistoryCursor,
-    ) -> String {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let admission = bcode_server::storage_read_admission::RegisteredStorageRead::begin(
-            root.to_path_buf(),
-            session_id,
-        )
-        .await;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let admission_status = match &admission {
-            Ok(_) => "registered".to_owned(),
-            Err(error) => format!("{error:?}"),
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let admission_status = "not applicable";
-        let diagnostic = bcode_session::SessionManager::persistent_lazy(root.to_path_buf());
-        let history = diagnostic
-            .session_history_page(
-                session_id,
-                bcode_session_models::SessionHistoryQuery {
-                    cursor: Some(cursor),
-                    limit: 512,
-                    direction: bcode_session_models::SessionHistoryDirection::Backward,
-                },
-            )
-            .await
-            .map(|page| page.events.len());
-        // This is a failed-test inspection, not a completed tracked product read. Do not mark
-        // the participant clean without recording access; keep its evidence in the fixture root.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        drop(admission);
-        format!("storage admission: {admission_status}; canonical history: {history:?}")
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn persisted_resume_reverses_across_naturally_evicted_newer_history() {
-        use super::super::effects::TuiEffect;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{ClientId, SessionHistoryDirection, SessionHistoryQuery};
-
-        let directory = std::sync::Arc::new(tempfile::tempdir().expect("isolated state"));
-        let state_root = directory.path().join("state");
-        std::fs::create_dir(&state_root).expect("state directory");
-        let locations = bcode_config::resolve_state_location_set_with_environment(
-            &bcode_config::StateConfig::default(),
-            &bcode_config::StateLocationSelection {
-                root: Some(state_root),
-                profile: None,
-            },
-            &bcode_config::ConfigEnvironmentSnapshot::new(
-                BTreeMap::new(),
-                directory.path().to_path_buf(),
-            ),
-        )
-        .expect("resolve isolated state");
-        let sessions_root = locations.primary().sessions_root().to_path_buf();
-        let persisted_sessions_root = sessions_root.clone();
-        let working_directory = directory.path().to_path_buf();
-        let handle = tokio::runtime::Handle::current();
-        let fixture_owner = std::sync::Arc::clone(&directory);
-        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker_cancellation = cancellation.clone();
-        let mut fixture = tokio::task::spawn_blocking(move || {
-            handle.block_on(async move {
-                // The worker retains the directory even if its caller times out or panics.
-                // Cancellation is observed between settled domain writes, never mid-append.
-                let sessions = bcode_session::SessionManager::persistent(sessions_root)
-                    .expect("persistent sessions");
-                let session = sessions
-                    .create_session(None, working_directory)
-                    .await
-                    .expect("session");
-                let ownership = sessions
-                    .acquire_session_ownership(
-                        session.id,
-                        bcode_session::SessionOwnershipKind::RuntimeWork,
-                    )
-                    .await
-                    .expect("fixture write ownership");
-                // Retaining canonical ownership avoids reopening/validating the database for
-                // each of the 1100 writes. All events still use the normal typed append API.
-                let client_id = ClientId::new();
-                for index in 0..1_100 {
-                    if worker_cancellation.load(std::sync::atomic::Ordering::Acquire) {
-                        drop(ownership);
-                        sessions
-                            .release_idle_session_resources(session.id)
-                            .await
-                            .expect("release cancelled fixture ownership");
-                        drop(sessions);
-                        drop(fixture_owner);
-                        return None;
-                    }
-                    sessions
-                        .append_user_message(session.id, client_id, format!("archived {index}"))
-                        .await
-                        .expect("persist user message");
-                }
-                let recent = sessions
-                    .session_history_page(
-                        session.id,
-                        SessionHistoryQuery {
-                            cursor: None,
-                            limit: 12,
-                            direction: SessionHistoryDirection::Backward,
-                        },
-                    )
-                    .await
-                    .expect("recent bounded history")
-                    .events;
-                drop(ownership);
-                sessions
-                    .release_idle_session_resources(session.id)
-                    .await
-                    .expect("release completed fixture ownership");
-                drop(sessions);
-                drop(fixture_owner);
-                Some((session, recent))
-            })
-        });
-        let (session, recent) = if let Ok(result) =
-            // Fixture writes measured up to 139s under shared validation load. This is a
-            // setup deadline, not a traversal or product latency contract.
-            tokio::time::timeout(
-                std::time::Duration::from_mins(5),
-                &mut fixture,
-            )
-            .await
-        {
-            result
-                .expect("fixture worker completed")
-                .expect("fixture not cancelled")
-        } else {
-            cancellation.store(true, std::sync::atomic::Ordering::Release);
-            // Drain the current append and ownership release before reporting timeout.
-            // If settlement stalls, the detached worker still owns the temporary root.
-            let settled =
-                tokio::time::timeout(std::time::Duration::from_secs(10), &mut fixture).await;
-            assert!(
-                settled.is_ok(),
-                "fixture cancellation did not settle; worker retains its isolated root"
-            );
-            panic!(
-                "bounded 1100-event history fixture initialization exceeded 300 seconds after retaining write ownership"
-            );
-        };
-        let mut model = root_test_model_with_history(session.id, &recent);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&recent, true);
-        let resume = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "persisted resume",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "scroll to older boundary",
-                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
-            },
-        ]);
-        assert!(resume[0].observation.semantic_items.len() <= 12);
-        // Keep the private IPC runtime directory separate from the fixture state root.
-        let endpoint =
-            bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc/server.sock"));
-        let shutdown = bcode_agent_runtime::CancellationToken::new();
-        let client =
-            bcode_client::BcodeClient::for_state_location(endpoint.clone(), locations.primary());
-        let server = bcode_server::run_embedded_with_locations_and_shutdown(
-            endpoint,
-            bcode_config::BcodeConfig::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: std::collections::BTreeSet::new(),
-                    disabled: std::collections::BTreeSet::new(),
-                },
-                &[],
-            )
-            .expect("empty plugin host"),
-            bcode_model_catalog::ModelCatalogResolver::embedded(),
-            Vec::new(),
-            shutdown.clone(),
-            Some(locations),
-        );
-        let exercise = async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    if client.verified_server_status().await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("server ready");
-            for _ in 0..72 {
-                if model.chat.app.newer_history_cursor().is_some() {
-                    break;
-                }
-                let before_page = model.chat.app.frame_observation();
-                let prior_anchor = before_page.anchor.as_ref().expect("older source reader");
-                let prior_reader_source = before_page.terminal_rows
-                    [before_page.viewport_top + prior_anchor.viewport_row_offset]
-                    .clone();
-                let cursor = model.chat.app.older_history_cursor().expect("older cursor");
-                let generation = model.chat.app.history_window_generation();
-                model.loop_state.prepare_runtime_work(
-                    &mut model.chat,
-                    bmux_tui::geometry::Rect::new(0, 0, 80, 12),
-                );
-                let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-                let effect = scheduled.into_iter().find_map(|(_, effect)| {
-                    matches!(&effect, TuiEffect::LoadOlderHistory { session_id, cursor: requested, generation: current, .. }
-                        if *session_id == session.id && *requested == cursor && *current == generation)
-                    .then_some(effect)
-                }).expect("scheduled older page");
-                let result = effect.run_for_test(client.clone()).await;
-                if let super::super::effects::TuiEffectResult::OlderHistoryLoaded {
-                    result: page,
-                    ..
-                } = &result
-                {
-                    let (page, _) = match page.as_ref() {
-                        Ok(page) => page,
-                        Err(error) => {
-                            let diagnostic = persisted_history_failure_diagnostic(
-                                &persisted_sessions_root,
-                                session.id,
-                                cursor,
-                            )
-                            .await;
-                            panic!("canonical older page: {error:?}; {diagnostic}");
-                        }
-                    };
-                    assert_ne!(page.events, [] as [bcode_session_models::SessionEvent; 0]);
-                    assert!(page.events.len() <= 512);
-                } else {
-                    panic!("expected older page");
-                }
-                bmux_tui_runtime::Program::update(
-                    &mut model,
-                    bmux_tui_runtime::RuntimeEvent::Message(
-                        super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
-                    ),
-                )
-                .expect("accept older page");
-                let frame = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                    TranscriptFrameStep {
-                        label: "older accepted",
-                        input: TranscriptFrameInput::Observe,
-                    },
-                    TranscriptFrameStep {
-                        label: "older settled",
-                        input: TranscriptFrameInput::Observe,
-                    },
-                    TranscriptFrameStep {
-                        label: "continue upward",
-                        input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
-                    },
-                ]);
-                assert_eq!(frame[0].observation, frame[1].observation);
-                let prior_row = before_page
-                    .terminal_rows
-                    .iter()
-                    .position(|row| row == &prior_reader_source)
-                    .expect("reader source before older page");
-                let accepted_row = frame[0]
-                    .observation
-                    .terminal_rows
-                    .iter()
-                    .position(|row| row == &prior_reader_source)
-                    .expect("reader source after older page");
-                let prior_offset = i128::try_from(prior_row).expect("row fits i128")
-                    - i128::try_from(before_page.viewport_top).expect("top fits i128");
-                let accepted_offset = i128::try_from(accepted_row).expect("row fits i128")
-                    - i128::try_from(frame[0].observation.viewport_top).expect("top fits i128");
-                let requested_movement = accepted_offset - prior_offset;
-                assert!(requested_movement >= 0);
-                let prior_rows = before_page
-                    .terminal_rows
-                    .iter()
-                    .collect::<std::collections::BTreeSet<_>>();
-                // Trimming a distant newer suffix can make net row growth
-                // negative. Count the actual newly navigable source rows
-                // preceding this reader instead of subtracting total extents.
-                let page_rows_above_reader = frame[0]
-                    .observation
-                    .terminal_rows
-                    .iter()
-                    .take(accepted_row)
-                    .filter(|row| row.0.is_some() && !prior_rows.contains(row))
-                    .count();
-                assert!(
-                    requested_movement
-                        <= i128::try_from(page_rows_above_reader).expect("rows fit i128"),
-                    "older page may reveal only newly navigable rows: movement={requested_movement}, new_rows_above_reader={page_rows_above_reader}"
-                );
-            }
-            assert!(model.chat.app.resident_transcript_event_count() <= 1_024);
-            assert!(
-                model.chat.app.newer_history_cursor().is_some(),
-                "natural eviction: resident={}, oldest={:?}, follows={}",
-                model.chat.app.resident_transcript_event_count(),
-                model.chat.app.resident_transcript_oldest_sequence(),
-                model.chat.app.frame_observation().scroll_mode,
-            );
-            let evicted = model
-                .chat
-                .app
-                .newer_history_cursor()
-                .expect("naturally evicted newer suffix");
-            let at_older_boundary = model.chat.app.frame_observation();
-            let anchor = at_older_boundary
-                .anchor
-                .as_ref()
-                .expect("source-backed older reader");
-            let reader_source = at_older_boundary.terminal_rows
-                [at_older_boundary.viewport_top + anchor.viewport_row_offset]
-                .clone();
-            assert!(reader_source.0.is_some());
-            let forward = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "reverse to newer boundary",
-                    input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
-                },
-                TranscriptFrameStep {
-                    label: "boundary settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(forward[0].observation, forward[1].observation);
-            assert!(
-                forward[0]
-                    .observation
-                    .terminal_rows
-                    .contains(&reader_source)
-            );
-            assert!(model.chat.app.should_load_newer_history());
-            // Re-request at the actual resident boundary, not while traversing
-            // rows already present below the older reader.
-            let requested = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "reverse one row to cancel outstanding forward movement",
-                    input: TranscriptFrameInput::ScrollUp(1),
-                },
-                TranscriptFrameStep {
-                    label: "request three rows past newer boundary",
-                    input: TranscriptFrameInput::ScrollDown(3),
-                },
-                TranscriptFrameStep {
-                    label: "forward request settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(requested[1].observation, requested[2].observation);
-            assert!(model.chat.app.should_load_newer_history());
-            assert!(
-                model
-                    .chat
-                    .app
-                    .newer_history_cursor()
-                    .expect("forward cursor")
-                    .sequence
-                    >= evicted.sequence
-            );
-            let mut fetched = 0;
-            while model.chat.app.newer_history_cursor().is_some() {
-                assert!(fetched < 96, "forward pages must make bounded progress");
-                let before_page = model.chat.app.frame_observation();
-                let prior_anchor = before_page.anchor.as_ref().expect("forward source reader");
-                let prior_reader_source = before_page.terminal_rows
-                    [before_page.viewport_top + prior_anchor.viewport_row_offset]
-                    .clone();
-                let cursor = model
-                    .chat
-                    .app
-                    .newer_history_cursor()
-                    .expect("forward cursor");
-                let generation = model.chat.app.history_window_generation();
-                model.loop_state.prepare_runtime_work(
-                    &mut model.chat,
-                    bmux_tui::geometry::Rect::new(0, 0, 80, 12),
-                );
-                let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-                let effect = scheduled.into_iter().find_map(|(_, effect)| {
-                    matches!(&effect, TuiEffect::LoadNewerHistory { session_id, cursor: requested, generation: current, .. }
-                        if *session_id == session.id && *requested == cursor && *current == generation)
-                    .then_some(effect)
-                }).expect("scheduled newer page");
-                let result = effect.run_for_test(client.clone()).await;
-                if let super::super::effects::TuiEffectResult::NewerHistoryLoaded {
-                    result: page,
-                    ..
-                } = &result
-                {
-                    let (page, _) = page.as_ref().expect("canonical newer page");
-                    assert_ne!(page.events, [] as [bcode_session_models::SessionEvent; 0]);
-                    assert!(page.events.len() <= 512);
-                } else {
-                    panic!("expected newer page");
-                }
-                bmux_tui_runtime::Program::update(
-                    &mut model,
-                    bmux_tui_runtime::RuntimeEvent::Message(
-                        super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
-                    ),
-                )
-                .expect("accept newer page");
-                let frame = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                    TranscriptFrameStep {
-                        label: "newer accepted",
-                        input: TranscriptFrameInput::Observe,
-                    },
-                    TranscriptFrameStep {
-                        label: "newer settled",
-                        input: TranscriptFrameInput::Observe,
-                    },
-                    TranscriptFrameStep {
-                        label: "continue forward",
-                        input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
-                    },
-                ]);
-                assert_eq!(frame[0].observation, frame[1].observation);
-                if fetched == 0 {
-                    assert!(frame[0].observation.terminal_rows.contains(&reader_source));
-                    let prior_row = before_page
-                        .terminal_rows
-                        .iter()
-                        .position(|row| row == &prior_reader_source)
-                        .expect("reader before first forward page");
-                    let accepted_row = frame[0]
-                        .observation
-                        .terminal_rows
-                        .iter()
-                        .position(|row| row == &prior_reader_source)
-                        .expect("reader survives first forward page");
-                    // Compare the same source row in signed viewport coordinates:
-                    // it may legitimately move off-screen when the reader asked
-                    // for more rows than fit in the visible viewport.
-                    let prior_offset = i128::try_from(prior_row).expect("row fits i128")
-                        - i128::try_from(before_page.viewport_top).expect("top fits i128");
-                    let accepted_offset = i128::try_from(accepted_row).expect("row fits i128")
-                        - i128::try_from(frame[0].observation.viewport_top).expect("top fits i128");
-                    let displacement = prior_offset - accepted_offset;
-                    let page_rows = frame[0]
-                        .observation
-                        .terminal_rows
-                        .len()
-                        .saturating_sub(before_page.terminal_rows.len());
-                    assert!(
-                        displacement >= 0
-                            && displacement <= i128::try_from(page_rows).expect("rows fit i128"),
-                        "page movement must use only newly navigable rows"
-                    );
-                    assert_eq!(
-                        displacement, 3,
-                        "the first page spends three requested rows exactly once"
-                    );
-                    assert_eq!(frame[0].observation, frame[1].observation);
-                }
-                assert!(model.chat.app.resident_transcript_event_count() <= 1_024);
-                fetched += 1;
-            }
-            let tail = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "return to live tail",
-                    input: TranscriptFrameInput::ScrollToBottom,
-                },
-                TranscriptFrameStep {
-                    label: "tail settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(tail[0].observation, tail[1].observation);
-            assert_eq!(tail[0].observation.scroll_mode, "bottom_follow");
-            shutdown.cancel();
-        };
-        let (server_result, ()) = Box::pin(tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            async { tokio::join!(server, exercise) },
-        ))
-        .await
-        .expect("server and traversal complete");
-        server_result.expect("server shutdown");
-        drop(model);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn persisted_history_page_reaches_scheduled_effect_and_accepted_frame() {
-        use super::super::effects::TuiEffect;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        use bcode_session_models::{ClientId, SessionEventKind};
-
-        let directory = tempfile::tempdir().expect("isolated state");
-        let state_root = directory.path().join("state");
-        std::fs::create_dir(&state_root).expect("state directory");
-        let locations = bcode_config::resolve_state_location_set_with_environment(
-            &bcode_config::StateConfig::default(),
-            &bcode_config::StateLocationSelection {
-                root: Some(state_root),
-                profile: None,
-            },
-            &bcode_config::ConfigEnvironmentSnapshot::new(
-                BTreeMap::new(),
-                directory.path().to_path_buf(),
-            ),
-        )
-        .expect("resolve isolated state");
-        let persisted_sessions_root = locations.primary().sessions_root().to_path_buf();
-        let sessions = bcode_session::SessionManager::persistent(&persisted_sessions_root)
-            .expect("persistent sessions");
-        let session = sessions
-            .create_session(None, directory.path().to_path_buf())
-            .await
-            .expect("session");
-        let client_id = ClientId::new();
-        for index in 0..30 {
-            sessions
-                .append_user_message(session.id, client_id, format!("persisted {index}"))
-                .await
-                .expect("persist user message");
-            if index == 17 {
-                // Exceed one bounded scan so the first fetched page contains no
-                // presenting items; the next page must carry pending movement.
-                for _ in 0..520 {
-                    sessions
-                        .append_event(session.id, SessionEventKind::ClientAttached { client_id })
-                        .await
-                        .expect("persist non-presenting event");
-                }
-            }
-        }
-        let recent = sessions
-            .session_history_page(
-                session.id,
-                bcode_session_models::SessionHistoryQuery {
-                    cursor: None,
-                    limit: 12,
-                    direction: bcode_session_models::SessionHistoryDirection::Backward,
-                },
-            )
-            .await
-            .expect("recent bounded history")
-            .events;
-        // Dropping a manager does not await actor/database teardown. Complete
-        // the writer's ownership handoff before the server opens persisted history.
-        assert!(matches!(
-            sessions
-                .release_session_ownership(session.id)
-                .await
-                .expect("release persisted fixture ownership"),
-            bcode_session::SessionOwnershipRelease::Released
-                | bcode_session::SessionOwnershipRelease::AlreadyUnowned
-        ));
-        drop(sessions);
-
-        let mut model = root_test_model_with_history(session.id, &recent);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&recent, true);
-        let resume =
-            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
-                label: "resume",
-                input: TranscriptFrameInput::Observe,
-            }]);
-        let before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "reach older boundary with two outstanding rows",
-                input: TranscriptFrameInput::ScrollUp(resume[0].observation.viewport_top + 2),
-            },
-            TranscriptFrameStep {
-                label: "repeat upward input during fetch",
-                input: TranscriptFrameInput::ScrollUp(1),
-            },
-        ]);
-        let reader = &before[1].observation;
-        assert_eq!(before[0].observation.viewport_top, reader.viewport_top);
-        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-        let effect = scheduled.into_iter().find_map(|(_, effect)| {
-            matches!(&effect, TuiEffect::LoadOlderHistory { session_id, cursor: expected, generation: current, .. }
-                if *session_id == session.id && *expected == cursor && *current == generation)
-                .then_some(effect)
-        }).expect("scheduled older-history effect");
-
-        // Keep the private IPC runtime directory separate from the fixture state root.
-        let endpoint =
-            bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc/server.sock"));
-        let shutdown = bcode_agent_runtime::CancellationToken::new();
-        let client =
-            bcode_client::BcodeClient::for_state_location(endpoint.clone(), locations.primary());
-        let server = bcode_server::run_embedded_with_locations_and_shutdown(
-            endpoint,
-            bcode_config::BcodeConfig::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: std::collections::BTreeSet::default(),
-                    disabled: std::collections::BTreeSet::default(),
-                },
-                &[],
-            )
-            .expect("empty plugin host"),
-            bcode_model_catalog::ModelCatalogResolver::embedded(),
-            Vec::new(),
-            shutdown.clone(),
-            Some(locations),
-        );
-        let server = Box::pin(server);
-        let exercise = async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    if client.verified_server_status().await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("server ready");
-            let result = effect.run_for_test(client.clone()).await;
-            if let super::super::effects::TuiEffectResult::OlderHistoryLoaded {
-                result: page, ..
-            } = &result
-            {
-                let (page, _) = match page.as_ref() {
-                    Ok(page) => page,
-                    Err(error) => {
-                        // The public IPC error is intentionally normalized. On failure only,
-                        // inspect the same canonical store through bounded domain APIs so the
-                        // fixture reports the underlying load/read cause, not a guessed timeout.
-                        let diagnostic = bcode_session::SessionManager::persistent_lazy(
-                            persisted_sessions_root.clone(),
-                        );
-                        let request = bcode_session_models::ProjectionWindowRequest {
-                            projection: bcode_session_models::SessionProjectionKind::Transcript,
-                            anchor: bcode_session_models::ProjectionWindowAnchor::BeforeSequence(
-                                cursor.sequence.saturating_add(1),
-                            ),
-                            direction: bcode_session_models::ProjectionWindowDirection::Backward,
-                            target: bcode_session_models::ProjectionWindowTarget {
-                                min_items: Some(4),
-                                min_estimated_rows: Some(24),
-                                min_bytes: None,
-                                width_columns: Some(80),
-                            },
-                            limits: bcode_session_models::ProjectionWindowLimits {
-                                max_items: 16,
-                                max_events_scanned: 512,
-                                max_bytes: 512 * 1024,
-                            },
-                        };
-                        let projection = diagnostic
-                            .session_projection_history_page(session.id, request)
-                            .await
-                            .map(|page| (page.events.len(), page.window.scanned_events));
-                        let history = diagnostic
-                            .session_history_page(
-                                session.id,
-                                bcode_session_models::SessionHistoryQuery {
-                                    cursor: Some(cursor),
-                                    limit: 512,
-                                    direction:
-                                        bcode_session_models::SessionHistoryDirection::Backward,
-                                },
-                            )
-                            .await
-                            .map(|page| page.events.len());
-                        let admission_diagnostic = persisted_history_failure_diagnostic(
-                            &persisted_sessions_root,
-                            session.id,
-                            cursor,
-                        )
-                        .await;
-                        panic!(
-                            "persisted first page: {error:?}; canonical projection: {projection:?}; canonical history: {history:?}; {admission_diagnostic}"
-                        );
-                    }
-                };
-                assert!(page.events.len() <= 512);
-                assert!(
-                    page.events.iter().all(|event| matches!(
-                        &event.kind,
-                        SessionEventKind::ClientAttached { .. }
-                    ))
-                );
-                assert!(page.has_more);
-            } else {
-                panic!("expected older-history completion");
-            }
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
-                ),
-            )
-            .expect("accept fetched page");
-            let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "persisted page",
-                    input: TranscriptFrameInput::Observe,
-                },
-                TranscriptFrameStep {
-                    label: "repeat",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(after[0].observation.semantic_items, reader.semantic_items);
-            assert_eq!(after[0].observation.viewport_top, reader.viewport_top);
-            assert_eq!(after[0].observation, after[1].observation);
-            let empty_page_layout = model.chat.app.transcript_layout_mut().drain_sync_stats();
-            assert!(empty_page_layout.iter().all(|stats| stats.entries_scanned
-                <= model.chat.app.resident_transcript_event_count() + 1));
-            model
-                .loop_state
-                .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-            let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-            let next_cursor = model
-                .chat
-                .app
-                .older_history_cursor()
-                .expect("advanced source cursor");
-            assert!(next_cursor.sequence < cursor.sequence);
-            let effect = scheduled.into_iter().find_map(|(_, effect)| {
-                matches!(&effect, TuiEffect::LoadOlderHistory { session_id, cursor: expected, generation: current, .. }
-                    if *session_id == session.id && *expected == next_cursor && *current == generation)
-                    .then_some(effect)
-            }).expect("second scheduled history page");
-            let result = effect.run_for_test(client.clone()).await;
-            if let super::super::effects::TuiEffectResult::OlderHistoryLoaded {
-                result: page, ..
-            } = &result
-            {
-                assert!(page.is_ok(), "second persisted projection effect: {page:?}");
-            } else {
-                panic!("expected older-history completion");
-            }
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
-                ),
-            )
-            .expect("accept presenting page");
-            let presenting = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "persisted presenting page",
-                    input: TranscriptFrameInput::Observe,
-                },
-                TranscriptFrameStep {
-                    label: "presenting page settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert!(presenting[0].observation.semantic_items.len() > reader.semantic_items.len());
-            assert_eq!(presenting[0].observation, presenting[1].observation);
-            let presenting_layout = model.chat.app.transcript_layout_mut().drain_sync_stats();
-            let resident = model.chat.app.resident_transcript_event_count();
-            assert!(
-                presenting_layout
-                    .iter()
-                    .all(|stats| stats.entries_scanned <= resident + 1)
-            );
-            assert!(
-                presenting_layout
-                    .iter()
-                    .map(|stats| stats.rows_regenerated)
-                    .sum::<usize>()
-                    <= presenting[0].observation.terminal_rows.len() * 2
-            );
-            let anchor = reader.anchor.as_ref().expect("reader anchor");
-            let source = &reader.terminal_rows[reader.viewport_top + anchor.viewport_row_offset];
-            let row = presenting[0]
-                .observation
-                .terminal_rows
-                .iter()
-                .position(|candidate| candidate == source)
-                .expect("reader source survives fetched pages");
-            assert!(row >= presenting[0].observation.viewport_top);
-            let offset = row - presenting[0].observation.viewport_top;
-            assert_eq!(
-                offset.saturating_sub(anchor.viewport_row_offset),
-                3,
-                "non-presenting page must not spend three outstanding rows; presenting page reveals them once"
-            );
-            // Two pages do not cross the 1,024-event resident eviction threshold.
-            // Center on a bounded canonical source range to exercise the
-            // independent newer-history request through this persisted server.
-            assert!(model.chat.app.newer_history_cursor().is_none());
-            let centered = (5..=25)
-                .map(|index| root_test_history_event(session.id, index))
-                .collect::<Vec<_>>();
-            model
-                .chat
-                .app
-                .replace_transcript_window(&centered, true, true, 17);
-            let center = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "centered window",
-                    input: TranscriptFrameInput::Observe,
-                },
-                TranscriptFrameStep {
-                    label: "centered settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(center[0].observation, center[1].observation);
-            let newer_cursor = model
-                .chat
-                .app
-                .newer_history_cursor()
-                .expect("newer cursor from centered window");
-            let centered_rows = center[0].observation.terminal_rows.len();
-            let boundary_top = centered_rows.saturating_sub(12);
-            let to_boundary = boundary_top.saturating_sub(center[0].observation.viewport_top);
-            let at_boundary = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "move across centered resident rows",
-                    input: TranscriptFrameInput::ScrollDown(to_boundary),
-                },
-                TranscriptFrameStep {
-                    label: "newer boundary settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(at_boundary[0].observation, at_boundary[1].observation);
-            let before_forward = &at_boundary[1].observation;
-            let previous_anchor = before_forward
-                .anchor
-                .as_ref()
-                .expect("newer-boundary reader");
-            let previous_source = before_forward.terminal_rows
-                [before_forward.viewport_top + previous_anchor.viewport_row_offset]
-                .clone();
-            model.chat.app.request_newer_history_for_test(2);
-            let generation = model.chat.app.history_window_generation();
-            model
-                .loop_state
-                .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-            let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-            let effect = scheduled.into_iter().find_map(|(_, effect)| {
-                matches!(&effect, TuiEffect::LoadNewerHistory { session_id, cursor, generation: current, .. }
-                    if *session_id == session.id && *cursor == newer_cursor && *current == generation)
-                    .then_some(effect)
-            }).expect("scheduled newer history page");
-            let result = effect.run_for_test(client.clone()).await;
-            if let super::super::effects::TuiEffectResult::NewerHistoryLoaded {
-                result: page, ..
-            } = &result
-            {
-                let (page, _) = page.as_ref().expect("persisted newer projection page");
-                assert!(page.events.len() <= 512);
-                assert!(
-                    page.events.iter().all(|event| matches!(
-                        &event.kind,
-                        SessionEventKind::ClientAttached { .. }
-                    ))
-                );
-                assert!(page.has_more);
-            } else {
-                panic!("expected newer-history completion");
-            }
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
-                ),
-            )
-            .expect("accept newer page");
-            let forward = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "persisted newer page",
-                    input: TranscriptFrameInput::Observe,
-                },
-                TranscriptFrameStep {
-                    label: "newer page settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(forward[0].observation, forward[1].observation);
-            assert_eq!(
-                forward[0].observation.semantic_items,
-                center[0].observation.semantic_items
-            );
-            assert_eq!(
-                forward[0].observation.viewport_top,
-                before_forward.viewport_top
-            );
-            assert!(
-                forward[0]
-                    .observation
-                    .terminal_rows
-                    .contains(&previous_source)
-            );
-            let second_newer_before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12)
-                .run([
-                    TranscriptFrameStep {
-                        label: "request newer rows across non-presenting gap",
-                        input: TranscriptFrameInput::ScrollDown(2),
-                    },
-                    TranscriptFrameStep {
-                        label: "newer request settled",
-                        input: TranscriptFrameInput::Observe,
-                    },
-                ]);
-            assert_eq!(
-                second_newer_before[0].observation,
-                second_newer_before[1].observation
-            );
-            assert!(
-                second_newer_before[0].observation.viewport_top
-                    - forward[0].observation.viewport_top
-                    <= 2,
-                "manual movement stays within the two requested rows"
-            );
-            let next_cursor = model
-                .chat
-                .app
-                .newer_history_cursor()
-                .expect("advanced newer cursor");
-            assert!(next_cursor.sequence > newer_cursor.sequence);
-            let newer_reader_at_boundary = forward[0]
-                .observation
-                .anchor
-                .as_ref()
-                .expect("reader at newer edge");
-            let source_after_nonpresenting =
-                &forward[0].observation.terminal_rows[forward[0].observation.viewport_top
-                    + newer_reader_at_boundary.viewport_row_offset];
-            assert_eq!(source_after_nonpresenting, &previous_source);
-            model
-                .loop_state
-                .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-            let (scheduled, _) = model.chat.pending_effects.drain_runtime();
-            let effect = scheduled.into_iter().find_map(|(_, effect)| {
-                matches!(&effect, TuiEffect::LoadNewerHistory { session_id, cursor, generation: current, .. }
-                    if *session_id == session.id && *cursor == next_cursor && *current == generation)
-                    .then_some(effect)
-            }).expect("second scheduled newer page");
-            let result = effect.run_for_test(client.clone()).await;
-            if let super::super::effects::TuiEffectResult::NewerHistoryLoaded {
-                result: page, ..
-            } = &result
-            {
-                assert!(page.is_ok(), "second newer page: {page:?}");
-            } else {
-                panic!("expected second newer completion");
-            }
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
-                ),
-            )
-            .expect("accept presenting newer page");
-            let presenting_newer = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "persisted presenting newer page",
-                    input: TranscriptFrameInput::Observe,
-                },
-                TranscriptFrameStep {
-                    label: "newer page stable",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(
-                presenting_newer[0].observation,
-                presenting_newer[1].observation
-            );
-            assert!(
-                presenting_newer[0].observation.semantic_items.len()
-                    > forward[0].observation.semantic_items.len()
-            );
-            let reader_row = presenting_newer[0]
-                .observation
-                .terminal_rows
-                .iter()
-                .position(|row| row == &previous_source)
-                .expect("centered reader source survives newer pages");
-            let earlier_row = forward[0]
-                .observation
-                .terminal_rows
-                .iter()
-                .position(|row| row == &previous_source)
-                .expect("reader before presenting newer page");
-            let prior_top = second_newer_before[1].observation.viewport_top;
-            let moved_after_page = presenting_newer[0]
-                .observation
-                .viewport_top
-                .saturating_sub(prior_top)
-                .saturating_sub(reader_row.saturating_sub(earlier_row));
-            assert_eq!(
-                moved_after_page, 2,
-                "the page reveals exactly the two outstanding rows once"
-            );
-            let centered_reader = center[0]
-                .observation
-                .anchor
-                .as_ref()
-                .expect("centered source reader");
-            let centered_source = center[0].observation.terminal_rows
-                [center[0].observation.viewport_top + centered_reader.viewport_row_offset]
-                .clone();
-            assert!(
-                presenting_newer[0]
-                    .observation
-                    .terminal_rows
-                    .contains(&centered_source)
-            );
-            let tail = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-                TranscriptFrameStep {
-                    label: "return to live tail",
-                    input: TranscriptFrameInput::ScrollToBottom,
-                },
-                TranscriptFrameStep {
-                    label: "live tail settled",
-                    input: TranscriptFrameInput::Observe,
-                },
-            ]);
-            assert_eq!(tail[0].observation, tail[1].observation);
-            assert_eq!(tail[0].observation.scroll_mode, "bottom_follow");
-            shutdown.cancel();
-        };
-        let (server_result, ()) = Box::pin(tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            async { tokio::join!(server, exercise) },
-        ))
-        .await
-        .expect("server and effect complete");
-        server_result.expect("server shutdown");
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn failed_and_empty_older_pages_do_not_reveal_or_reopen_reading_position() {
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let recent = (30..42)
-            .map(|sequence| root_test_history_event(session_id, sequence))
-            .collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &recent);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&recent, true);
-        let initial = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "resume",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "reach boundary",
-                input: TranscriptFrameInput::ScrollUp(100),
-            },
-        ]);
-        let first = &initial[1].observation;
-        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        deliver_older_history_root_test(
-            &mut model,
-            session_id,
-            cursor,
-            generation,
-            Err(bcode_client::ClientError::UnexpectedResponse),
-        );
-        let failed = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "failure",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "retry",
-                input: TranscriptFrameInput::ScrollUp(2),
-            },
-        ]);
-        assert_eq!(first.terminal_rows, failed[0].observation.terminal_rows);
-        assert_eq!(first.viewport_top, failed[0].observation.viewport_top);
-        assert!(!model.chat.app.loading_older_history());
-        assert!(model.chat.app.older_history_cursor().is_some());
-        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
-        model.chat.app.request_older_history_for_test(1);
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        assert!(
-            model.chat.app.loading_older_history(),
-            "retry must be scheduled"
-        );
-        complete_older_history_root_test(&mut model, session_id, cursor, generation, Vec::new());
-        let exhausted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "exhausted",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "again",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(
-            failed[0].observation.terminal_items,
-            exhausted[0].observation.terminal_items
-        );
-        assert_eq!(
-            failed[0].observation.viewport_top,
-            exhausted[0].observation.viewport_top
-        );
-        assert_eq!(exhausted[0].observation, exhausted[1].observation);
-        assert!(model.chat.app.older_history_cursor().is_none());
-        drop(model);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn failed_and_empty_newer_pages_preserve_reader_and_stop_retrying() {
-        use super::super::effects::TuiEffectResult;
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let centered = (30..42)
-            .map(|sequence| root_test_history_event(session_id, sequence))
-            .collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &centered);
-        model
-            .chat
-            .app
-            .replace_transcript_window(&centered, true, true, 35);
-        let initial = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "centered window",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "reach newer boundary",
-                input: TranscriptFrameInput::ScrollDown(100),
-            },
-        ]);
-        let boundary = &initial[1].observation;
-        let cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        assert!(
-            model
-                .chat
-                .app
-                .accepts_history_page(generation, cursor, false)
-        );
-        let complete = |model: &mut super::BcodeRuntimeModel, result| {
-            bmux_tui_runtime::Program::update(
-                model,
-                bmux_tui_runtime::RuntimeEvent::Message(
-                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
-                        TuiEffectResult::NewerHistoryLoaded {
-                            session_id,
-                            cursor,
-                            generation,
-                            result,
-                        },
-                    )),
-                ),
-            )
-            .expect("newer history effect completion");
-        };
-        complete(
-            &mut model,
-            Err(bcode_client::ClientError::UnexpectedResponse),
-        );
-        let failed = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "newer page failure",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "failure settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(failed[0].observation, failed[1].observation);
-        assert_eq!(failed[0].observation.terminal_rows, boundary.terminal_rows);
-        assert_eq!(failed[0].observation.viewport_top, boundary.viewport_top);
-        assert!(
-            !model
-                .chat
-                .app
-                .accepts_history_page(generation, cursor, false)
-        );
-        assert_eq!(model.chat.app.newer_history_cursor(), Some(cursor));
-
-        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
-        model.chat.app.request_newer_history_for_test(1);
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        assert!(
-            model
-                .chat
-                .app
-                .accepts_history_page(generation, cursor, false),
-            "retry must start"
-        );
-        complete(
-            &mut model,
-            Ok((
-                bcode_session_models::SessionHistoryPage {
-                    session_id,
-                    events: Vec::new(),
-                    compatibility_issues: Vec::new(),
-                    next_cursor: None,
-                    has_more: false,
-                },
-                Vec::new(),
-            )),
-        );
-        let exhausted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "newer history exhausted",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "exhausted settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(exhausted[0].observation, exhausted[1].observation);
-        assert_eq!(
-            exhausted[0].observation.terminal_items,
-            boundary.terminal_items
-        );
-        assert_eq!(exhausted[0].observation.viewport_top, boundary.viewport_top);
-        assert!(model.chat.app.newer_history_cursor().is_none());
-        assert!(
-            !model
-                .chat
-                .app
-                .accepts_history_page(generation, cursor, false)
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn older_history_loading_banner_keeps_source_reader_stable() {
-        use super::super::frame_sequence_harness::{
-            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
-        };
-        let session_id = bcode_session_models::SessionId::new();
-        let recent = (30..54)
-            .map(|sequence| root_test_history_event(session_id, sequence))
-            .collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &recent);
-        model
-            .chat
-            .app
-            .replace_latest_transcript_window(&recent, true);
-        let initial = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "resume",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "near older boundary",
-                input: TranscriptFrameInput::ScrollUp(100),
-            },
-        ]);
-        let before = &initial[1].observation;
-        let anchor = before.anchor.as_ref().expect("source-backed reader");
-        let source = before.terminal_rows[before.viewport_top + anchor.viewport_row_offset].clone();
-        let cursor = model
-            .chat
-            .app
-            .older_history_cursor()
-            .expect("older boundary");
-        let generation = model.chat.app.history_window_generation();
-        model
-            .loop_state
-            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
-        assert!(
-            model
-                .chat
-                .app
-                .accepts_history_page(generation, cursor, true)
-        );
-        let loading = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "loading banner",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "loading banner settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(loading[0].observation, loading[1].observation);
-        let position = loading[0]
-            .observation
-            .terminal_rows
-            .iter()
-            .position(|row| row == &source)
-            .expect("reader retained during loading");
-        assert_eq!(
-            position.saturating_sub(loading[0].observation.viewport_top),
-            anchor.viewport_row_offset
-        );
-        complete_older_history_root_test(&mut model, session_id, cursor, generation, Vec::new());
-        let exhausted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
-            TranscriptFrameStep {
-                label: "banner removed after exhaustion",
-                input: TranscriptFrameInput::Observe,
-            },
-            TranscriptFrameStep {
-                label: "banner removal settled",
-                input: TranscriptFrameInput::Observe,
-            },
-        ]);
-        assert_eq!(exhausted[0].observation, exhausted[1].observation);
-        let position = exhausted[0]
-            .observation
-            .terminal_rows
-            .iter()
-            .position(|row| row == &source)
-            .expect("reader retained after exhaustion");
-        let exhausted_offset = position.saturating_sub(exhausted[0].observation.viewport_top);
-        // Once the banner disappears at the absolute start of history there is
-        // no preceding row with which to preserve its old screen offset.
-        assert_eq!(exhausted[0].observation.viewport_top, 0);
-        assert_eq!(
-            exhausted_offset,
-            anchor.viewport_row_offset.saturating_sub(1)
-        );
-        assert!(model.chat.app.older_history_cursor().is_none());
-        drop(model);
-    }
 
     fn root_test_history_event(
         session_id: bcode_session_models::SessionId,
@@ -8680,49 +4753,6 @@ mod tests {
         }
     }
 
-    fn deliver_older_history_root_test(
-        model: &mut super::BcodeRuntimeModel,
-        session_id: bcode_session_models::SessionId,
-        cursor: bcode_session_models::SessionHistoryCursor,
-        generation: u64,
-        result: Result<bcode_session_models::SessionHistoryPage, bcode_client::ClientError>,
-    ) {
-        bmux_tui_runtime::Program::update(
-            model,
-            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
-                Box::new(super::super::effects::TuiEffectResult::OlderHistoryLoaded {
-                    session_id,
-                    cursor,
-                    generation,
-                    result: result.map(|page| (page, Vec::new())),
-                }),
-            )),
-        )
-        .expect("history effect completion");
-    }
-
-    fn complete_older_history_root_test(
-        model: &mut super::BcodeRuntimeModel,
-        session_id: bcode_session_models::SessionId,
-        cursor: bcode_session_models::SessionHistoryCursor,
-        generation: u64,
-        events: Vec<bcode_session_models::SessionEvent>,
-    ) {
-        deliver_older_history_root_test(
-            model,
-            session_id,
-            cursor,
-            generation,
-            Ok(bcode_session_models::SessionHistoryPage {
-                session_id,
-                events,
-                compatibility_issues: vec![],
-                next_cursor: None,
-                has_more: false,
-            }),
-        );
-    }
-
     #[test]
     fn borrowed_stdout_root_runtime_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
@@ -8738,23 +4768,6 @@ mod tests {
             let (runtime, handle) = super::runtime(&mut terminal, root_test_model());
             super::run(runtime, handle).await
         });
-    }
-
-    struct FailingSelectionOutput {
-        fail: std::rc::Rc<std::cell::Cell<bool>>,
-    }
-
-    impl std::io::Write for FailingSelectionOutput {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.fail.get() {
-                Err(std::io::Error::other("injected presentation failure"))
-            } else {
-                Ok(bytes.len())
-            }
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     struct FlushFailureOutput {
@@ -8778,97 +4791,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_flush_failure_does_not_publish_normal_or_temporal_candidates() {
+    async fn root_flush_failure_does_not_publish_candidates() {
         use bmux_tui_runtime::Presenter;
 
-        for temporal in [false, true] {
-            let mut model = root_test_model();
-            let fail = std::rc::Rc::new(std::cell::Cell::new(false));
-            let mut output = FlushFailureOutput {
-                fail: fail.clone(),
-                bytes: Vec::new(),
-            };
-            let mut terminal = bmux_tui::terminal::Terminal::new(
-                &mut output,
-                bmux_tui::geometry::Rect::new(0, 0, 80, 24),
-            );
+        let mut model = root_test_model();
+        let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut output = FlushFailureOutput {
+            fail: fail.clone(),
+            bytes: Vec::new(),
+        };
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut output,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("initial committed frame");
+        let committed_area = model.committed_area;
+        let committed_body = model
+            .committed_layout
+            .map(super::super::render::FrameLayout::body);
+        let committed_hits = model.committed_hits.clone();
+        let committed_selection = model.committed_selection.clone();
+        let committed_images = terminal.image_scene().clone();
+        model.focused_visual = Some("retain-until-success".to_owned());
+        model.chat.app.replace_composer_with("not delivered");
+        model.presentation_damage = model.select_presentation_damage(
+            super::super::invalidation::UiInvalidation::Paint,
+            &[super::super::app::TemporalDamage::Composer],
+        );
+        fail.set(true);
+        assert!(
             super::bcode_runtime_presenter(&mut terminal)
                 .present(&mut model)
-                .expect("initial committed frame");
-            let committed_area = model.committed_area;
-            let committed_body = model
+                .is_err()
+        );
+        assert_eq!(model.committed_area, committed_area);
+        assert_eq!(
+            model
                 .committed_layout
-                .map(super::super::render::FrameLayout::body);
-            let committed_hits = model.committed_hits.clone();
-            let committed_selection = model.committed_selection.clone();
-            let committed_images = terminal.image_scene().clone();
-            model.focused_visual = Some("retain-until-success".to_owned());
-            model.chat.app.replace_composer_with("not delivered");
-            model.presentation_damage = model.select_presentation_damage(
-                super::super::invalidation::UiInvalidation::Paint,
-                &[super::super::app::TemporalDamage::Composer],
-            );
-            model.fast_temporal_presentation = temporal;
-            fail.set(true);
-            assert!(
-                super::bcode_runtime_presenter(&mut terminal)
-                    .present(&mut model)
-                    .is_err()
-            );
-            assert_eq!(model.committed_area, committed_area);
-            assert_eq!(
-                model
-                    .committed_layout
-                    .map(super::super::render::FrameLayout::body),
-                committed_body
-            );
-            assert_eq!(model.committed_hits, committed_hits);
-            assert_eq!(model.committed_selection, committed_selection);
-            assert_eq!(terminal.image_scene(), &committed_images);
-            assert_eq!(
-                model.focused_visual.as_deref(),
-                Some("retain-until-success")
-            );
-            fail.set(false);
-            model.presentation_damage = bmux_tui::damage::Damage::Full;
-            super::bcode_runtime_presenter(&mut terminal)
-                .present(&mut model)
-                .expect("recovery frame");
-            assert!(model.focused_visual.is_none());
-            drop(model);
-        }
+                .map(super::super::render::FrameLayout::body),
+            committed_body
+        );
+        assert_eq!(model.committed_hits, committed_hits);
+        assert_eq!(model.committed_selection, committed_selection);
+        assert_eq!(terminal.image_scene(), &committed_images);
+        assert_eq!(
+            model.focused_visual.as_deref(),
+            Some("retain-until-success")
+        );
+        fail.set(false);
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("recovery frame");
+        assert!(model.focused_visual.is_none());
+        drop(model);
     }
 
-    #[derive(Default)]
-    struct ImageFailureOutput {
-        bytes: Vec<u8>,
-        fail_upload: bool,
-        fail_flush: bool,
-    }
-
-    impl std::io::Write for ImageFailureOutput {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            // Fail after some upload bytes reached the host, not during cell output.
-            if self.fail_upload && self.bytes.windows(3).any(|part| part == b"a=t") {
-                return Err(std::io::Error::other("injected partial image output"));
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            if self.fail_flush {
-                Err(std::io::Error::other("injected image frame flush"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    // Keep the failure/recovery matrix and its ordered wire assertions in one scenario.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn root_image_normal_and_temporal_failures_repair_before_reupload() {
+    async fn root_image_failures_repair_before_reupload() {
         use bmux_tui::geometry::Rect;
         use bmux_tui::image::{
             ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat,
@@ -8909,265 +4892,731 @@ mod tests {
             }
         }
 
-        for temporal in [false, true] {
-            for partial_output in [false, true] {
-                let mut model = root_test_model();
-                let mut config = model.chat.app.tui_config().clone();
-                config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
-                model.chat.app.apply_tui_config(config);
-                let pixel = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
-                model.loop_state.install_interactive_surface_for_test(
-                    super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
-                        "root-image-fixture",
-                        Box::new(ImageSurface(pixel.clone())),
-                        model.settings.keymap(),
-                    ),
-                );
-                let capabilities = bmux_image::HostImageCapabilities {
-                    kitty_graphics: true,
-                    ..Default::default()
-                };
+        for partial_output in [false, true] {
+            let mut model = root_test_model();
+            let mut config = model.chat.app.tui_config().clone();
+            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+            model.chat.app.apply_tui_config(config);
+            let pixel = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
+            model.loop_state.install_interactive_surface_for_test(
+                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                    "root-image-fixture",
+                    Box::new(ImageSurface(pixel.clone())),
+                    model.settings.keymap(),
+                ),
+            );
+            let capabilities = bmux_image::HostImageCapabilities {
+                kitty_graphics: true,
+                ..Default::default()
+            };
+            model
+                .loop_state
+                .image_presentation_for_test(capabilities.clone());
+            let mut output = ImageFailureOutput::default();
+            let mut terminal =
+                bmux_tui::terminal::Terminal::new(&mut output, Rect::new(0, 0, 80, 24));
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("initial image frame");
+            assert_eq!(terminal.image_scene().placements().len(), 1);
+            assert!(String::from_utf8_lossy(&terminal.writer().bytes).contains("a=t"));
+            let scene = terminal.image_scene().clone();
+            let terminal_hits = terminal.hits().clone();
+            let terminal_selection = terminal.selection().clone();
+            let hits = model.committed_hits.clone();
+            let selection = model.committed_selection.clone();
+            let layout = model
+                .committed_layout
+                .map(super::super::render::FrameLayout::body);
+            pixel.store(2, std::sync::atomic::Ordering::Relaxed);
+            terminal.writer_mut().bytes.clear();
+            terminal.writer_mut().fail_upload = partial_output;
+            terminal.writer_mut().fail_flush = !partial_output;
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            assert!(
+                super::bcode_runtime_presenter(&mut terminal)
+                    .present(&mut model)
+                    .is_err()
+            );
+            assert!(String::from_utf8_lossy(&terminal.writer().bytes).contains("a=t"));
+            assert_eq!(terminal.image_scene(), &scene);
+            assert_eq!(terminal.hits(), &terminal_hits);
+            assert_eq!(terminal.selection(), &terminal_selection);
+            assert_eq!(model.committed_hits, hits);
+            assert_eq!(model.committed_selection, selection);
+            assert_eq!(
                 model
-                    .loop_state
-                    .image_presentation_for_test(capabilities.clone());
-                let mut output = ImageFailureOutput::default();
-                let mut terminal =
-                    bmux_tui::terminal::Terminal::new(&mut output, Rect::new(0, 0, 80, 24));
-                super::bcode_runtime_presenter(&mut terminal)
-                    .present(&mut model)
-                    .expect("initial image frame");
-                assert_eq!(terminal.image_scene().placements().len(), 1);
-                assert!(String::from_utf8_lossy(&terminal.writer().bytes).contains("a=t"));
-                let scene = terminal.image_scene().clone();
-                let terminal_hits = terminal.hits().clone();
-                let terminal_selection = terminal.selection().clone();
-                let hits = model.committed_hits.clone();
-                let selection = model.committed_selection.clone();
-                let layout = model
                     .committed_layout
-                    .map(super::super::render::FrameLayout::body);
-                pixel.store(2, std::sync::atomic::Ordering::Relaxed);
-                terminal.writer_mut().bytes.clear();
-                terminal.writer_mut().fail_upload = partial_output;
-                terminal.writer_mut().fail_flush = !partial_output;
-                model.presentation_damage = bmux_tui::damage::Damage::Full;
-                model.fast_temporal_presentation = temporal;
-                assert!(
-                    super::bcode_runtime_presenter(&mut terminal)
-                        .present(&mut model)
-                        .is_err()
-                );
-                assert!(String::from_utf8_lossy(&terminal.writer().bytes).contains("a=t"));
-                assert_eq!(terminal.image_scene(), &scene);
-                assert_eq!(terminal.hits(), &terminal_hits);
-                assert_eq!(terminal.selection(), &terminal_selection);
-                assert_eq!(model.committed_hits, hits);
-                assert_eq!(model.committed_selection, selection);
-                assert_eq!(
-                    model
-                        .committed_layout
-                        .map(super::super::render::FrameLayout::body),
-                    layout
-                );
+                    .map(super::super::render::FrameLayout::body),
+                layout
+            );
 
-                // Probe a clone: repair debt must survive without consuming the real retry.
-                let mut repair = model
-                    .loop_state
-                    .image_presentation_for_test(capabilities.clone())
-                    .clone();
-                let mut cleanup = Vec::new();
-                repair
-                    .cleanup(&mut cleanup, &capabilities)
-                    .expect("repair cleanup probe");
-                // The committed image plus the candidate-only host ID must both
-                // be repaired; deleting only the old resident is insufficient.
-                assert!(String::from_utf8_lossy(&cleanup).matches("d=I").count() >= 2);
-                terminal.writer_mut().fail_upload = false;
-                terminal.writer_mut().fail_flush = false;
-                terminal.writer_mut().bytes.clear();
-                model.presentation_damage = bmux_tui::damage::Damage::Full;
-                model.fast_temporal_presentation = temporal;
-                super::bcode_runtime_presenter(&mut terminal)
-                    .present(&mut model)
-                    .expect("image recovery frame");
-                let retry = String::from_utf8_lossy(&terminal.writer().bytes);
-                assert!(
-                    retry.find("d=I").expect("uncertain IDs removed")
-                        < retry.find("a=t").expect("image reuploaded")
-                );
-                assert!(retry.contains("a=p"));
-                assert_ne!(terminal.image_scene(), &scene);
-                assert_eq!(terminal.image_scene().placements().len(), 1);
-                terminal.writer_mut().bytes.clear();
-                model.presentation_damage = bmux_tui::damage::Damage::Full;
-                model.fast_temporal_presentation = temporal;
-                super::bcode_runtime_presenter(&mut terminal)
-                    .present(&mut model)
-                    .expect("warm recovered frame");
-                let warm = String::from_utf8_lossy(&terminal.writer().bytes);
-                assert!(!warm.contains("a=t"));
-                assert!(!warm.contains("d=I"));
-                drop(model);
-            }
+            // Probe a clone: repair debt must survive without consuming the real retry.
+            let mut repair = model
+                .loop_state
+                .image_presentation_for_test(capabilities.clone())
+                .clone();
+            let mut cleanup = Vec::new();
+            repair
+                .cleanup(&mut cleanup, &capabilities)
+                .expect("repair cleanup probe");
+            // The committed image plus the candidate-only host ID must both
+            // be repaired; deleting only the old resident is insufficient.
+            assert!(String::from_utf8_lossy(&cleanup).matches("d=I").count() >= 2);
+            terminal.writer_mut().fail_upload = false;
+            terminal.writer_mut().fail_flush = false;
+            terminal.writer_mut().bytes.clear();
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("image recovery frame");
+            let retry = String::from_utf8_lossy(&terminal.writer().bytes);
+            assert!(
+                retry.find("d=I").expect("uncertain IDs removed")
+                    < retry.find("a=t").expect("image reuploaded")
+            );
+            assert!(retry.contains("a=p"));
+            assert_ne!(terminal.image_scene(), &scene);
+            assert_eq!(terminal.image_scene().placements().len(), 1);
+            terminal.writer_mut().bytes.clear();
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("warm recovered frame");
+            let warm = String::from_utf8_lossy(&terminal.writer().bytes);
+            assert!(!warm.contains("a=t"));
+            assert!(!warm.contains("d=I"));
+            drop(model);
         }
     }
 
-    fn assert_visual_selection_matches_container(app: &super::super::app::BmuxApp) {
-        let retained = app.transcript_layout();
-        let mut checked = 0;
-        for visible in retained.visible_lines_from_top(0, u16::MAX) {
-            let Some(source) = retained.selection_row(visible.entry_index, visible.row_in_entry)
-            else {
-                continue;
-            };
-            let Some(cell) = source.cells.first() else {
-                continue;
-            };
-            if source.text.is_empty() {
-                continue;
-            }
-            let painted = retained.line(visible).unwrap().plain_text();
-            let start = painted
-                .find(&source.text)
-                .expect("source appears in painted container");
-            assert_eq!(
-                usize::from(cell.column),
-                bmux_tui::text_width::display_width(&painted[..start])
-            );
-            checked += 1;
+    #[tokio::test]
+    async fn status_partial_presentation_matches_full_production_presenter() {
+        use bmux_tui_runtime::Presenter;
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial_model = root_test_model();
+        let mut full_model = root_test_model();
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+        {
+            super::bcode_runtime_presenter(&mut partial_terminal)
+                .present(&mut partial_model)
+                .expect("initial partial frame");
+            super::bcode_runtime_presenter(&mut full_terminal)
+                .present(&mut full_model)
+                .expect("initial full frame");
         }
-        assert!(checked > 0);
+
+        for model in [&mut partial_model, &mut full_model] {
+            model.chat.app.set_status("timer advanced".to_owned());
+            model.invalidation = super::super::invalidation::UiInvalidation::Paint;
+        }
+        partial_model.presentation_damage = partial_model.select_presentation_damage(
+            super::super::invalidation::UiInvalidation::Paint,
+            &[super::super::app::TemporalDamage::Status],
+        );
+        full_model.presentation_damage = bmux_tui::damage::Damage::Full;
+
+        super::bcode_runtime_presenter(&mut partial_terminal)
+            .present(&mut partial_model)
+            .expect("partial status frame");
+        super::bcode_runtime_presenter(&mut full_terminal)
+            .present(&mut full_model)
+            .expect("full status frame");
+        // Keep teardown (which can join workers) out of the paired frame captures.
+        drop((partial_model, full_model));
+
+        assert_eq!(
+            partial_terminal.retained_buffer(),
+            full_terminal.retained_buffer()
+        );
+        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+        assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
     }
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn shell_navigation_uses_committed_clipped_targets() {
-        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-        use bmux_tui::geometry::{Point, Rect};
-        use bmux_tui_runtime::Presenter;
-        let session_id = bcode_session_models::SessionId::new();
-        let mut model = root_test_model_with_history(session_id, &[]);
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
-        )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .unwrap();
-        model.chat.app.set_plugin_host(std::sync::Arc::new(
-            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
-        ));
-        model.chat.app.absorb_session_event(&bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1, timestamp_ms: 1, session_id, provenance: None,
-            kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                record: bcode_session_models::ToolInvocationResultRecord {
-                    invocation_id: "shell-navigation".to_owned(), model_output: "fallback".to_owned(), is_error: false, presentation: None,
-                    result: Some(bcode_session_models::ToolInvocationResult::Artifact {
-                        artifact: Box::new(bcode_session_models::ToolArtifact {
-                            artifact_id: "shell-navigation".to_owned(), producer_plugin_id: "bcode.shell".to_owned(),
-                            schema: "bcode.tool.request.shell.run".to_owned(), schema_version: 1, title: None,
-                            tool_call_id: Some("shell-navigation".to_owned()),
-                            metadata: serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
-                                "live_state_key":"shell-navigation", "columns":80, "rows":24, "streaming":true,
-                                "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}}),
-                            refs: Vec::new(),
-                        }),
-                    }),
-                    content: Vec::new(),
-                },
-            },
+    async fn modal_foreground_owns_input_and_metadata_across_frames() {
+        use bmux_tui_runtime::{Presenter, Program};
+        let mut model = root_test_model();
+        let surface = question_surface_for_root_test(model.settings.keymap()).await;
+        model
+            .loop_state
+            .install_interactive_surface_for_test(surface);
+        model.chat.app.replace_composer_with("preserved draft");
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("chat");
+        let background_targets: Vec<_> = terminal
+            .hits()
+            .regions()
+            .iter()
+            .map(|hit| hit.id.clone())
+            .collect();
+        model.loop_state.open_command_palette(&mut model.chat);
+        model.synchronize_screen();
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("modal");
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .all(|hit| hit.id.as_str() != "composer")
+        );
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .all(|hit| { !background_targets.contains(&hit.id) })
+        );
+        assert_eq!(
+            terminal
+                .focus()
+                .active_scope()
+                .map(bmux_tui::hit::HitId::as_str),
+            Some("bcode.foreground")
+        );
+        assert!(terminal.hits().regions().iter().all(|hit| {
+            hit.focus_scope
+                .as_ref()
+                .is_none_or(|scope| Some(scope) == terminal.focus().active_scope())
+        }));
+        assert_eq!(terminal.selection().fragments(), []);
+        assert_eq!(terminal.image_scene().placements().len(), 0);
+        let snapshot = terminal.retained_buffer().cloned();
+        let cursor = terminal.cursor();
+        model
+            .update(bmux_tui_runtime::RuntimeEvent::Terminal(
+                bmux_tui::event::Event::Paste("must not reach draft".into()),
+            ))
+            .expect("modal paste");
+        assert_eq!(model.chat.app.composer().text(), "preserved draft");
+        let frozen_work = model
+            .loop_state
+            .active_interactive_surface_work_shape_for_test();
+        for _ in 0..3 {
+            model.presentation_damage = model.select_presentation_damage(
+                super::super::invalidation::UiInvalidation::Paint,
+                &[super::super::app::TemporalDamage::Composer],
+            );
+            super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .expect("modal timer");
+            assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
+            assert_eq!(terminal.cursor(), cursor);
+            assert_eq!(terminal.selection().fragments(), []);
+        }
+        assert_eq!(
+            model
+                .loop_state
+                .active_interactive_surface_work_shape_for_test(),
+            frozen_work
+        );
+        terminal.reset();
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("reset modal");
+        assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
+        assert_eq!(terminal.cursor(), cursor);
+        let escape = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Escape,
+            modifiers: bmux_keyboard::Modifiers::NONE,
         });
         model
-            .chat
-            .app
-            .set_effective_keymap(model.settings.keymap().registry().clone());
-        let registry = model
-            .chat
-            .app
-            .plugin_presentation()
-            .unwrap()
-            .registry("bcode.shell")
-            .unwrap();
-        let seed = registry.visual_projection(
-            "shell-run-request-card",
-            "bcode.tool.request.shell.run",
-            &serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
-                "live_state_key":"shell-navigation", "columns":80, "rows":24, "streaming":true,
-                "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}}),
-            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
-                24,
-                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
-                None,
-            ),
-        );
-        assert!(seed.is_some());
-        drop(registry);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 24, 40));
+            .update(bmux_tui_runtime::RuntimeEvent::Terminal(escape))
+            .expect("close modal");
+        assert!(!model.loop_state.has_command_palette());
+        assert!(model.loop_state.has_interactive_surface());
         super::bcode_runtime_presenter(&mut terminal)
             .present(&mut model)
-            .unwrap();
-        let (target, identity) = model
-            .committed_visual_targets
-            .iter()
-            .find(|(_, identity)| identity.contains(":terminal:"))
-            .cloned()
-            .expect("visible shell terminal target");
-        assert!(target.height == 1 && target.width <= 24);
-        assert_ne!(
-            model.committed_visual_text,
-            [] as [bcode_plugin_sdk::tui::PluginTuiSelectionRow; 0]
-        );
-        let event = Event::Mouse(MouseEvent::new(
-            MouseEventKind::Down(MouseButton::Right),
-            Point::new(target.x, target.y),
-        ));
-        assert_eq!(
-            model.handle_basic_terminal_event(event),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
-        let before = model.committed_visual_text.clone();
-        assert_eq!(
-            model.handle_basic_terminal_event(Event::Key(bmux_keyboard::KeyStroke {
-                key: bmux_keyboard::KeyCode::Right,
-                modifiers: bmux_keyboard::Modifiers::default(),
-            })),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .unwrap();
-        assert_ne!(before, model.committed_visual_text);
-
-        // With a fresh V2 engine selected the body is not the V1 layout: no V1 visual target or
-        // selection row is published, so a right-click there reaches no hidden visual (V2's
-        // own targets: `v2_shell_alternate_screen_takes_pointer_focus_and_terminal_keys`).
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
-                bcode_config::TuiEngine::V2,
-            );
-        model.focused_visual = None;
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .unwrap();
-        assert_eq!(model.committed_visual_targets.len(), 0);
-        assert_eq!(model.committed_visual_text.len(), 0);
-        let _ = model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
-            MouseEventKind::Down(MouseButton::Right),
-            Point::new(target.x, target.y),
-        )));
-        assert_eq!(
-            model.focused_visual, None,
-            "no hidden V1 visual takes the press"
+            .expect("restored chat");
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "composer")
         );
         drop(model);
     }
+
+    #[tokio::test]
+    async fn modal_resize_and_replacement_reconcile_foreground_scene() {
+        use bmux_tui_runtime::Presenter;
+        let mut model = root_test_model();
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut bytes,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        model.loop_state.open_command_palette(&mut model.chat);
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("palette");
+        model.loop_state.open_session_picker(&mut model.chat);
+        assert_eq!(
+            model.loop_state.foreground(),
+            Some(crate::foreground::Foreground::Sessions)
+        );
+        model.synchronize_screen();
+        terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("resized sessions");
+        let partial = terminal.retained_buffer().cloned();
+        let hits = terminal.hits().clone();
+        let semantics = terminal.semantics().clone();
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("reference sessions");
+        assert_eq!(terminal.retained_buffer(), partial.as_ref());
+        assert_eq!(terminal.hits(), &hits);
+        assert_eq!(terminal.semantics(), &semantics);
+        assert!(
+            terminal
+                .hits()
+                .regions()
+                .iter()
+                .all(|hit| hit.id.as_str() != "composer")
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn sessions_cursor_frames_preserve_foreground_composition() {
+        use bmux_tui_runtime::Presenter;
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial = root_test_model();
+        let mut full = root_test_model();
+        for model in [&mut partial, &mut full] {
+            model.loop_state.open_session_picker(&mut model.chat);
+        }
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+        super::bcode_runtime_presenter(&mut partial_terminal)
+            .present(&mut partial)
+            .expect("initial picker");
+        super::bcode_runtime_presenter(&mut full_terminal)
+            .present(&mut full)
+            .expect("initial reference picker");
+        let picker_cursor = partial_terminal.cursor();
+        for tick in 1..=4 {
+            let now = std::time::Instant::now() + std::time::Duration::from_secs(tick);
+            for model in [&mut partial, &mut full] {
+                let key = model
+                    .chat
+                    .app
+                    .invalidation_requests(now)
+                    .into_iter()
+                    .next()
+                    .expect("cursor timer")
+                    .key;
+                model.chat.app.handle_invalidations(&[key], now);
+            }
+            partial.presentation_damage = partial.select_presentation_damage(
+                super::super::invalidation::UiInvalidation::Paint,
+                &[super::super::app::TemporalDamage::Composer],
+            );
+            full.presentation_damage = bmux_tui::damage::Damage::Full;
+            super::bcode_runtime_presenter(&mut partial_terminal)
+                .present(&mut partial)
+                .expect("partial picker");
+            super::bcode_runtime_presenter(&mut full_terminal)
+                .present(&mut full)
+                .expect("full picker");
+            assert_eq!(
+                partial_terminal.retained_buffer(),
+                full_terminal.retained_buffer()
+            );
+            assert_eq!(partial_terminal.cursor(), picker_cursor);
+            assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+            assert_eq!(partial_terminal.semantics(), full_terminal.semantics());
+            assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
+        }
+        drop((partial, full));
+    }
+
+    #[tokio::test]
+    async fn cursor_partial_presentation_matches_full_production_presenter() {
+        use bmux_tui_runtime::Presenter;
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut partial_model = root_test_model();
+        let mut full_model = root_test_model();
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+
+        {
+            let mut presenter = super::bcode_runtime_presenter(&mut partial_terminal);
+            presenter
+                .present(&mut partial_model)
+                .expect("initial partial-side frame presents");
+        }
+        {
+            let mut presenter = super::bcode_runtime_presenter(&mut full_terminal);
+            presenter
+                .present(&mut full_model)
+                .expect("initial full-side frame presents");
+        }
+
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        for model in [&mut partial_model, &mut full_model] {
+            let cursor_key = model
+                .chat
+                .app
+                .invalidation_requests(now)
+                .into_iter()
+                .next()
+                .expect("cursor invalidation is always scheduled")
+                .key;
+            assert_eq!(
+                model.chat.app.handle_invalidations(&[cursor_key], now),
+                super::super::invalidation::UiInvalidation::Paint
+            );
+            model.invalidation = super::super::invalidation::UiInvalidation::Paint;
+        }
+        let temporal_damage = [super::super::app::TemporalDamage::Composer];
+        partial_model.presentation_damage = partial_model.select_presentation_damage(
+            super::super::invalidation::UiInvalidation::Paint,
+            &temporal_damage,
+        );
+        full_model.presentation_damage = bmux_tui::damage::Damage::Full;
+
+        {
+            let mut presenter = super::bcode_runtime_presenter(&mut partial_terminal);
+            presenter
+                .present(&mut partial_model)
+                .expect("cursor partial frame presents");
+        }
+        {
+            let mut presenter = super::bcode_runtime_presenter(&mut full_terminal);
+            presenter
+                .present(&mut full_model)
+                .expect("cursor full frame presents");
+        }
+        drop((partial_model, full_model));
+
+        assert_eq!(
+            partial_terminal.retained_buffer(),
+            full_terminal.retained_buffer()
+        );
+        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+        assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
+        for point in [
+            bmux_tui::geometry::Point::new(0, 0),
+            bmux_tui::geometry::Point::new(2, 22),
+            bmux_tui::geometry::Point::new(79, 23),
+        ] {
+            assert_eq!(
+                partial_terminal
+                    .hits()
+                    .hit_test(point)
+                    .map(|hit| hit.id().as_str().to_owned()),
+                full_terminal
+                    .hits()
+                    .hit_test(point)
+                    .map(|hit| hit.id().as_str().to_owned())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_interaction_redraw_matches_full_presentation() {
+        use bmux_tui::{geometry::Rect, paint::PaintCx, prelude::Line};
+        struct CountingSurface(usize);
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for CountingSurface {
+            fn id(&self) -> &'static str {
+                "counting-test"
+            }
+
+            fn title(&self) -> &'static str {
+                "Counting test"
+            }
+
+            fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+                frame.write_line(
+                    bmux_tui::paint::LocalRect::terminal(area),
+                    &Line::from(self.0.to_string()),
+                );
+            }
+
+            fn handle_event(
+                &mut self,
+                event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                if matches!(event, bmux_tui::event::Event::Key(_)) {
+                    self.0 = self.0.saturating_add(1);
+                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+                } else {
+                    bcode_plugin_sdk::tui::PluginTuiAction::None
+                }
+            }
+        }
+
+        fn model() -> super::BcodeRuntimeModel {
+            let mut chat = root_test_chat();
+            let mut config = chat.app.tui_config().clone();
+            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+            chat.app.apply_tui_config(config);
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let mut loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            loop_state.install_interactive_surface_for_test(
+                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                    "counting-interaction",
+                    Box::new(CountingSurface(0)),
+                    settings.keymap(),
+                ),
+            );
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        }
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut partial = model();
+        let mut full = model();
+        let mut partial_bytes = Vec::new();
+        let mut full_bytes = Vec::new();
+        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
+        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
+        bmux_tui_runtime::Presenter::present(
+            &mut super::bcode_runtime_presenter(&mut partial_terminal),
+            &mut partial,
+        )
+        .expect("initial partial presentation");
+        bmux_tui_runtime::Presenter::present(
+            &mut super::bcode_runtime_presenter(&mut full_terminal),
+            &mut full,
+        )
+        .expect("initial full presentation");
+
+        let event = || {
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            ))
+        };
+        bmux_tui_runtime::Program::update(&mut partial, event()).expect("partial input");
+        bmux_tui_runtime::Program::update(&mut full, event()).expect("full input");
+        full.presentation_damage = bmux_tui::damage::Damage::Full;
+
+        bmux_tui_runtime::Presenter::present(
+            &mut super::bcode_runtime_presenter(&mut partial_terminal),
+            &mut partial,
+        )
+        .expect("partial redraw");
+        bmux_tui_runtime::Presenter::present(
+            &mut super::bcode_runtime_presenter(&mut full_terminal),
+            &mut full,
+        )
+        .expect("full redraw");
+        drop((partial, full));
+
+        assert_eq!(
+            partial_terminal.retained_buffer(),
+            full_terminal.retained_buffer()
+        );
+        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
+        assert_eq!(partial_terminal.hits(), full_terminal.hits());
+    }
+
+    #[tokio::test]
+    async fn stable_question_redraw_is_independent_of_unrelated_transcript_length() {
+        async fn model(history_items: usize) -> super::BcodeRuntimeModel {
+            let session_id = bcode_session_models::SessionId::new();
+            let history = (1..=u64::try_from(history_items).unwrap_or(u64::MAX))
+                .map(|sequence| bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    timestamp_ms: sequence,
+                    session_id,
+                    provenance: None,
+                    kind: bcode_session_models::SessionEventKind::UserMessage {
+                        client_id: bcode_session_models::ClientId::new(),
+                        text: format!("unrelated transcript message {sequence}"),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut model = root_test_model_with_history(session_id, &history);
+            let mut config = model.chat.app.tui_config().clone();
+            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
+            model.chat.app.apply_tui_config(config);
+            let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
+            model.loop_state.install_interactive_surface_for_test(
+                question_surface_with_questions_for_root_test(
+                    &keymap,
+                    serde_json::json!([{
+                        "header": null,
+                        "question": "Choose one",
+                        "options": [
+                            {"label": "One", "value": "one", "description": null},
+                            {"label": "Two", "value": "two", "description": "Second choice"}
+                        ],
+                        "control": "radio",
+                        "selection_mode": "single",
+                        "custom": false,
+                        "custom_mode": "additional",
+                        "required": true
+                    }]),
+                )
+                .await,
+            );
+            model
+        }
+
+        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
+        let mut short = Box::pin(model(0)).await;
+        let mut long = Box::pin(model(1_000)).await;
+        let mut short_bytes = Vec::new();
+        let mut long_bytes = Vec::new();
+        let mut short_terminal = bmux_tui::terminal::Terminal::new(&mut short_bytes, area);
+        let mut long_terminal = bmux_tui::terminal::Terminal::new(&mut long_bytes, area);
+        bmux_tui_runtime::Presenter::present(
+            &mut super::bcode_runtime_presenter(&mut short_terminal),
+            &mut short,
+        )
+        .expect("short initial frame");
+        bmux_tui_runtime::Presenter::present(
+            &mut super::bcode_runtime_presenter(&mut long_terminal),
+            &mut long,
+        )
+        .expect("long initial frame");
+
+        let event = || {
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            ))
+        };
+        bmux_tui_runtime::Program::update(&mut short, event()).expect("short question input");
+        bmux_tui_runtime::Program::update(&mut long, event()).expect("long question input");
+        assert_eq!(short.presentation_damage, long.presentation_damage);
+        drop(short);
+        drop(long);
+    }
+
+    #[tokio::test]
+    async fn stable_interaction_redraw_falls_back_without_committed_geometry() {
+        struct RedrawSurface;
+
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for RedrawSurface {
+            fn id(&self) -> &'static str {
+                "redraw-test"
+            }
+
+            fn title(&self) -> &'static str {
+                "Redraw test"
+            }
+
+            fn render(
+                &mut self,
+                _area: bmux_tui::geometry::Rect,
+                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
+            ) {
+            }
+
+            fn handle_event(
+                &mut self,
+                _event: &bmux_tui::event::Event,
+                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            }
+        }
+
+        let mut model = {
+            let chat = root_test_chat();
+            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
+                std::path::PathBuf::from("."),
+                &[],
+            );
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let passive_client = client
+                .clone()
+                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
+            let mut loop_state =
+                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
+            loop_state.install_interactive_surface_for_test(
+                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
+                    "redraw-interaction",
+                    Box::new(RedrawSurface),
+                    settings.keymap(),
+                ),
+            );
+            super::BcodeRuntimeModel::new(chat, settings, loop_state)
+        };
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
+                bmux_keyboard::KeyStroke {
+                    key: bmux_keyboard::KeyCode::Down,
+                    modifiers: bmux_keyboard::Modifiers::NONE,
+                },
+            )),
+        )
+        .expect("redraw without committed geometry");
+
+        assert!(model.presentation_damage.is_full());
+        drop(model);
+    }
+
+    #[derive(Default)]
+    struct ImageFailureOutput {
+        bytes: Vec<u8>,
+        fail_upload: bool,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for ImageFailureOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // Fail after some upload bytes reached the host, not during cell output.
+            if self.fail_upload && self.bytes.windows(3).any(|part| part == b"a=t") {
+                return Err(std::io::Error::other("injected partial image output"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("injected image frame flush"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    // Keep the failure/recovery matrix and its ordered wire assertions in one scenario.
 
     /// E1 under V2: the shell plugin's live alternate-screen replay is presented by the V2
     /// engine, its rows are published as visual targets from the presented frame, a
@@ -9255,8 +5704,7 @@ mod tests {
             vec![event],
             std::time::Instant::now(),
         );
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::V2(Box::new(host));
+        model.transcript_host = Box::new(host);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 24, 40));
         let mut present = |model: &mut super::BcodeRuntimeModel| {
@@ -9329,7 +5777,7 @@ mod tests {
     }
 
     /// E1 under V2: a running request of a plugin-owned tool renders through the declaring
-    /// plugin's request adapter (as V1 routes `shell.run` to its request card), not the
+    /// plugin's request adapter (`shell.run` routes to its request card), not the
     /// canonical fallback, and the adapter renders at the unit's body width so its rows are
     /// never clipped by the tool chrome.
     #[allow(clippy::too_many_lines)]
@@ -9377,8 +5825,7 @@ mod tests {
             ],
             std::time::Instant::now(),
         );
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::V2(Box::new(host));
+        model.transcript_host = Box::new(host);
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 40, 30));
         for _ in 0..2 {
@@ -9393,7 +5840,7 @@ mod tests {
                 .unwrap();
             let _ = model.presentation_committed(report);
         }
-        let host = model.transcript_engine.v2().expect("V2 host");
+        let host = model.transcript_host_for_test();
         let engine = host.engine();
         let items = &engine.session_view().snapshot().transcript.items;
         let item = |call: &str| {
@@ -9462,9 +5909,7 @@ mod tests {
         )
         .expect("update");
         let rerouted = model
-            .transcript_engine
-            .v2()
-            .expect("V2 host")
+            .transcript_host_for_test()
             .engine()
             .render_config()
             .plugin_visuals
@@ -9474,116 +5919,6 @@ mod tests {
             rerouted.is_some_and(|rerouted| rerouted != revision),
             "a keymap replacement re-routes the adapter ({rerouted:?})"
         );
-        drop(model);
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn visual_selection_text_commits_on_first_frame_and_survives_failed_resize() {
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let mut model = root_test_model_with_history(session_id, &[]);
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
-        )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .unwrap();
-        model.chat.app.set_plugin_host(std::sync::Arc::new(
-            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
-        ));
-        model
-            .chat
-            .app
-            .absorb_session_event(&bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 1,
-                timestamp_ms: 1,
-                session_id,
-                provenance: None,
-                kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                    record: bcode_session_models::ToolInvocationResultRecord {
-                        invocation_id: "source-selection".to_owned(),
-                        model_output: "fallback".to_owned(),
-                        is_error: false,
-                        presentation: None,
-                        result: Some(bcode_session_models::ToolInvocationResult::Artifact {
-                            artifact: Box::new(bcode_session_models::ToolArtifact {
-                                artifact_id: "source-selection".to_owned(),
-                                producer_plugin_id: "bcode.filesystem".to_owned(),
-                                schema: "bcode.filesystem.read".to_owned(),
-                                schema_version: 1,
-                                tool_call_id: Some("source-selection".to_owned()),
-                                title: Some("File contents".to_owned()),
-                                metadata: serde_json::json!({
-                                    "path": "test.rs",
-                                    "contents": "pub fn alpha() {}\npub fn beta() {}",
-                                    "start_line": 1,
-                                }),
-                                refs: Vec::new(),
-                            }),
-                        }),
-                        content: Vec::new(),
-                    },
-                },
-            });
-        assert!(model.chat.app.preview_theme("terminal-native-structured"));
-        let fail = std::rc::Rc::new(std::cell::Cell::new(false));
-        let mut output = FailingSelectionOutput { fail: fail.clone() };
-        let mut terminal = bmux_tui::terminal::Terminal::new(
-            &mut output,
-            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
-        );
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .unwrap();
-        assert_ne!(
-            model.committed_visual_text,
-            [] as [bcode_plugin_sdk::tui::PluginTuiSelectionRow; 0]
-        );
-        assert_visual_selection_matches_container(&model.chat.app);
-        let targets = model.committed_visual_targets.clone();
-        assert_ne!(
-            targets,
-            [] as [(bmux_tui::geometry::Rect, std::string::String); 0]
-        );
-        model.focused_visual = Some("removed-target".to_owned());
-        let before: Vec<_> = model
-            .committed_visual_text
-            .iter()
-            .map(|row| (row.identity.clone(), row.byte_start, row.text.clone()))
-            .collect();
-        fail.set(true);
-        terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 30, 12));
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        assert!(
-            super::bcode_runtime_presenter(&mut terminal)
-                .present(&mut model)
-                .is_err()
-        );
-        let after: Vec<_> = model
-            .committed_visual_text
-            .iter()
-            .map(|row| (row.identity.clone(), row.byte_start, row.text.clone()))
-            .collect();
-        assert_eq!(before, after);
-        assert_eq!(targets, model.committed_visual_targets);
-        assert_eq!(model.focused_visual.as_deref(), Some("removed-target"));
-        fail.set(false);
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .unwrap();
-        assert_ne!(
-            model.committed_visual_text,
-            [] as [bcode_plugin_sdk::tui::PluginTuiSelectionRow; 0]
-        );
-        assert!(model.focused_visual.is_none());
-        assert_ne!(targets, model.committed_visual_targets);
         drop(model);
     }
 
@@ -9600,8 +5935,7 @@ mod tests {
             3,
             std::time::Instant::now(),
         );
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::V2(Box::new(host));
+        model.transcript_host = Box::new(host);
         let key = |model: &mut super::BcodeRuntimeModel, key: &str| {
             bmux_tui_runtime::Program::update(
                 model,
@@ -9612,18 +5946,11 @@ mod tests {
             .expect("update");
         };
         let focused = |model: &super::BcodeRuntimeModel| {
-            model
-                .transcript_v2_for_test()
-                .expect("V2 host")
-                .transcript_focus_active()
+            model.transcript_host_for_test().transcript_focus_active()
         };
 
         key(&mut model, "alt+u");
         assert!(focused(&model), "alt+u enters transcript focus");
-        assert!(
-            !model.chat.app.transcript_focus_active(),
-            "V1 focus untouched"
-        );
         key(&mut model, "k");
         assert!(focused(&model));
         assert_eq!(
@@ -9656,9 +5983,8 @@ mod tests {
         drop(model);
     }
 
-    /// FO2/FO3 through the command palette: with V2 selected, "Focus transcript units"
-    /// toggles V2 transcript focus (never the hidden V1 focus), and transcript routes V2 does
-    /// not implement yet leave the hidden V1 transcript untouched.
+    /// FO2/FO3 through the command palette: "Focus transcript units" toggles transcript focus,
+    /// and every transcript tooling route runs on the transcript host.
     #[tokio::test]
     async fn v2_palette_transcript_routes_reach_the_v2_host_only() {
         let session_id = bcode_session_models::SessionId::new();
@@ -9668,8 +5994,7 @@ mod tests {
             3,
             std::time::Instant::now(),
         );
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::V2(Box::new(host));
+        model.transcript_host = Box::new(host);
         let route = |model: &mut super::BcodeRuntimeModel, route: &str| {
             model.apply_root_command_action(super::super::chat_loop::CommandDispatchRequest {
                 action: bcode_command::CommandAction::Host {
@@ -9679,18 +6004,11 @@ mod tests {
             });
         };
         let focused = |model: &super::BcodeRuntimeModel| {
-            model
-                .transcript_v2_for_test()
-                .expect("V2 host")
-                .transcript_focus_active()
+            model.transcript_host_for_test().transcript_focus_active()
         };
 
         route(&mut model, "transcript.focusUnits");
         assert!(focused(&model), "the palette enters V2 transcript focus");
-        assert!(
-            !model.chat.app.transcript_focus_active(),
-            "V1 focus untouched"
-        );
         bmux_tui_runtime::Program::update(
             &mut model,
             bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
@@ -9712,10 +6030,9 @@ mod tests {
             "the palette action toggles focus off again"
         );
 
-        // Phase 6: every transcript tooling route runs on the V2 host; the hidden V1
-        // transcript (focus, inspector) never changes.
+        // Every transcript tooling route runs on the transcript host.
         route(&mut model, "transcript.inspect");
-        let host = model.transcript_v2_for_test().expect("V2 host");
+        let host = model.transcript_host_for_test();
         assert!(host.inspector_open(), "the palette opens the V2 inspector");
         assert!(host.transcript_focus_active(), "entering focus on the way");
         for route_id in [
@@ -9731,15 +6048,13 @@ mod tests {
                 "{route_id}: {}",
                 model.chat.app.status()
             );
-            assert!(!model.chat.app.transcript_focus_active(), "{route_id}");
-            assert!(!model.chat.app.inspector_open(), "{route_id}");
         }
         drop(model);
     }
 
-    /// With V2 selected and transcript placement configured, the interactive surface is placed
-    /// from the V2 engine's reserved interaction unit, never from the hidden V1 transcript
-    /// layout: without a resident interaction unit it has no visible rows.
+    /// With transcript placement configured, the interactive surface is placed from the
+    /// engine's reserved interaction unit: without a resident interaction unit it has no
+    /// visible rows.
     #[tokio::test]
     async fn v2_places_the_interactive_surface_from_the_v2_transcript() {
         use bmux_tui_runtime::Presenter;
@@ -9773,10 +6088,6 @@ mod tests {
             model.chat.app.tui_config().interactions.placement,
             bcode_config::TuiInteractionPlacement::Transcript
         );
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
-                bcode_config::TuiEngine::V2,
-            );
         model.loop_state.install_interactive_surface_for_test(
             super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
                 "interaction",
@@ -9807,8 +6118,8 @@ mod tests {
         drop(model);
     }
 
-    /// EN5 seam: with the V2 engine selected, the transcript region is painted by the V2 host
-    /// and carries no V1 transcript cells or selection metadata; the shell still paints.
+    /// The transcript region is painted by the transcript host from the windows it loads
+    /// itself, never from the host shell's attach replay; the shell still paints.
     #[tokio::test]
     async fn v2_engine_owns_the_presented_transcript_region() {
         use bmux_tui_runtime::Presenter;
@@ -9822,7 +6133,7 @@ mod tests {
             provenance: None,
             kind: bcode_session_models::SessionEventKind::UserMessage {
                 client_id: bcode_session_models::ClientId::new(),
-                text: "v1 only transcript".to_owned(),
+                text: "host replay only".to_owned(),
                 admission: bcode_session_models::TurnAdmissionMetadata::default(),
             },
         }];
@@ -9846,27 +6157,14 @@ mod tests {
                 .join("\n")
         };
 
-        let mut v1 = root_test_model_with_history(session_id, &history);
-        assert!(
-            v1.transcript_engine.v2().is_none(),
-            "V1 is the default engine"
-        );
-        assert!(screen(&mut v1).contains("v1 only transcript"));
-        assert_ne!(v1.committed_selection.fragments().len(), 0);
-        assert_ne!(v1.chat.app.transcript_layout().total_rows(), 0);
-        drop(v1);
-
         let mut v2 = root_test_model_with_history(session_id, &history);
-        v2.transcript_engine = super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
-            bcode_config::TuiEngine::V2,
-        );
         let painted = screen(&mut v2);
-        assert!(!painted.contains("v1 only transcript"), "{painted}");
+        // The host shell's attach replay is not transcript content: the engine presents only
+        // the windows it loads itself.
+        assert!(!painted.contains("host replay only"), "{painted}");
         assert_eq!(v2.committed_selection.fragments().len(), 0);
-        // The shared chrome layout is derived without preparing the V1 transcript layout.
-        assert_eq!(v2.chat.app.transcript_layout().total_rows(), 0);
         let body = v2.committed_layout.expect("committed layout").body;
-        let host = v2.transcript_v2_for_test().expect("V2 host");
+        let host = v2.transcript_host_for_test();
         let geometry = host.engine().geometry();
         assert_eq!(
             (geometry.width, geometry.height),
@@ -9888,10 +6186,6 @@ mod tests {
         let session_id = bcode_session_models::SessionId::new();
         let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
         let mut model = root_test_model_with_history(session_id, &[]);
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
-                bcode_config::TuiEngine::V2,
-            );
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
         let report = super::bcode_runtime_presenter(&mut terminal)
@@ -9904,8 +6198,7 @@ mod tests {
         // A unit-scoped render change flushed by the commit's visual scheduling.
         assert!(
             model
-                .transcript_v2_mut_for_test()
-                .expect("V2 host")
+                .transcript_host_mut_for_test()
                 .set_markdown_details("transcript:item:x:details:0".to_owned(), true)
         );
         let _update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
@@ -9944,11 +6237,7 @@ mod tests {
         }];
         let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
         let mut model = root_test_model_with_history(session_id, &history);
-        model.transcript_engine =
-            super::super::transcript_v2_host::TranscriptEngineChoice::for_engine(
-                bcode_config::TuiEngine::V2,
-            );
-        let _ = model.flush_transcript_v2();
+        let _ = model.flush_transcript();
         let loads = model.chat.pending_effects.queued_transcript_v2_history();
         let [load] = loads.as_slice() else {
             panic!("one attach request, got {}", loads.len());
@@ -9982,7 +6271,7 @@ mod tests {
             )),
         )
         .expect("V2 history completion");
-        let host = model.transcript_v2_for_test().expect("V2 host");
+        let host = model.transcript_host_for_test();
         assert_eq!(host.engine().window().last_sequence, Some(1));
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
@@ -10002,546 +6291,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(painted.contains("loaded by the v2 window"), "{painted}");
-    }
-
-    #[tokio::test]
-    async fn normal_present_and_mouse_input_path_creates_transcript_selection() {
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::UserMessage {
-                client_id: bcode_session_models::ClientId::new(),
-                text: "normal input path".to_owned(),
-                admission: bcode_session_models::TurnAdmissionMetadata::default(),
-            },
-        }];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("startup frame presents");
-        let fragment = model
-            .committed_selection
-            .fragments()
-            .first()
-            .cloned()
-            .expect("startup transcript fragment");
-
-        assert_eq!(
-            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
-                bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y),
-                ),
-            )),
-            super::super::invalidation::UiInvalidation::None
-        );
-        assert!(matches!(
-            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
-                bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(
-                        fragment.area.x.saturating_add(fragment.area.width),
-                        fragment.area.y,
-                    ),
-                ),
-            )),
-            super::super::invalidation::UiInvalidation::Paint
-                | super::super::invalidation::UiInvalidation::Structural
-        ));
-        assert_eq!(
-            model.handle_basic_terminal_event(bmux_tui::event::Event::Mouse(
-                bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(
-                        fragment.area.x.saturating_add(fragment.area.width),
-                        fragment.area.y,
-                    ),
-                ),
-            )),
-            super::super::invalidation::UiInvalidation::Paint
-        );
-        assert!(model.selected_plain_text.is_some());
-        assert!(
-            model
-                .transcript_selection
-                .snapshot(&model.committed_selection)
-                .is_some()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn clicking_a_tool_header_over_selectable_transcript_toggles_it_once() {
-        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence, kind| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        let history = [
-            event(
-                1,
-                bcode_session_models::SessionEventKind::ToolCallRequested {
-                    tool_call_id: "call-read".to_owned(),
-                    producer_plugin_id: None,
-                    tool_name: "read".to_owned(),
-                    arguments_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
-                    working_directory: None,
-                },
-            ),
-            event(
-                2,
-                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                    record: bcode_session_models::ToolInvocationResultRecord {
-                        invocation_id: "call-read".to_owned(),
-                        model_output: "line one\nline two".to_owned(),
-                        is_error: false,
-                        presentation: None,
-                        result: None,
-                        content: Vec::new(),
-                    },
-                },
-            ),
-        ];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let area = bmux_tui::geometry::Rect::new(0, 0, 60, 16);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("startup frame presents");
-        let region = model
-            .committed_hits
-            .regions()
-            .iter()
-            .find(|region| region.visible && region.id.as_str().starts_with("disclosure:unit:"))
-            .cloned()
-            .expect("tool header disclosure hit region");
-        let target = crate::structure::DisclosureTarget::from_hit_id(region.id.as_str())
-            .expect("disclosure target");
-        let point = bmux_tui::geometry::Point::new(region.area.x, region.area.y);
-        let click = |model: &mut super::BcodeRuntimeModel| {
-            let _press = model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
-                MouseEventKind::Down(MouseButton::Left),
-                point,
-            )));
-            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(
-                MouseEventKind::Up(MouseButton::Left),
-                point,
-            )))
-        };
-
-        assert_eq!(
-            model.chat.app.structure_snapshot().target_override(&target),
-            None
-        );
-        assert_eq!(
-            click(&mut model),
-            super::super::invalidation::UiInvalidation::Structural
-        );
-        let first = model.chat.app.structure_snapshot().target_override(&target);
-        assert!(first.is_some(), "one click toggles the header");
-        assert!(
-            model
-                .selected_plain_text
-                .as_deref()
-                .is_none_or(str::is_empty)
-        );
-
-        let _ = super::bcode_runtime_presenter(&mut terminal).present(&mut model);
-        let _ = click(&mut model);
-        assert_ne!(
-            model.chat.app.structure_snapshot().target_override(&target),
-            first,
-            "a second click toggles back rather than being swallowed"
-        );
-        drop(model);
-    }
-
-    /// History of `calls` finished `bash` calls with three output lines each.
-    fn finished_bash_history(
-        session_id: bcode_session_models::SessionId,
-        calls: u64,
-    ) -> Vec<bcode_session_models::SessionEvent> {
-        let event = |sequence, kind| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind,
-        };
-        (0..calls)
-            .flat_map(|call| {
-                let id = format!("call-{call}");
-                [
-                    event(
-                        call * 2 + 1,
-                        bcode_session_models::SessionEventKind::ToolCallRequested {
-                            tool_call_id: id.clone(),
-                            producer_plugin_id: None,
-                            tool_name: "bash".to_owned(),
-                            arguments_json: r#"{"command":"ls"}"#.to_owned(),
-                            working_directory: None,
-                        },
-                    ),
-                    event(
-                        call * 2 + 2,
-                        bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                            record: bcode_session_models::ToolInvocationResultRecord {
-                                invocation_id: id,
-                                model_output: "one\ntwo\nthree".to_owned(),
-                                is_error: false,
-                                presentation: None,
-                                result: None,
-                                content: Vec::new(),
-                            },
-                        },
-                    ),
-                ]
-            })
-            .collect()
-    }
-
-    /// Focused row, viewport top row, and viewport height.
-    fn focus_view(model: &super::BcodeRuntimeModel) -> (usize, usize, u16) {
-        let height = model.chat.app.transcript_viewport_height_for_test();
-        let top = model.chat.app.transcript_top_row(height);
-        let target = model
-            .chat
-            .app
-            .focused_target_for_test()
-            .expect("focused target");
-        let row = model
-            .chat
-            .app
-            .disclosure_target_row(&target)
-            .expect("focused row");
-        (row, top, height)
-    }
-
-    /// Rows the focused target occupies.
-    fn focused_extent(model: &super::BcodeRuntimeModel) -> std::ops::Range<usize> {
-        let target = model
-            .chat
-            .app
-            .focused_target_for_test()
-            .expect("focused target");
-        crate::transcript_focus::target_extent(&model.chat.app.disclosure_anchors(), &target, None)
-            .expect("focused extent")
-    }
-
-    #[tokio::test]
-    async fn focus_navigation_scrolls_the_presented_transcript_to_the_focused_target() {
-        use bmux_tui::event::Event;
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let history = finished_bash_history(session_id, 12);
-        let mut model = root_test_model_with_history(session_id, &history);
-        let area = bmux_tui::geometry::Rect::new(0, 0, 60, 14);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        let mut present = |model: &mut super::BcodeRuntimeModel| {
-            super::bcode_runtime_presenter(&mut terminal)
-                .present(model)
-                .expect("frame presents");
-        };
-        present(&mut model);
-        let key = |name: &str| Event::Key(bmux_keyboard::parse_key_stroke(name).unwrap());
-        let _ = model.handle_basic_terminal_event(key("alt+u"));
-        assert!(model.chat.app.transcript_focus_active());
-        present(&mut model);
-
-        // Walking up, every drawn frame shows the focused row.
-        let mut moved_view = false;
-        for step in 0..40 {
-            let (_, top_before, _) = focus_view(&model);
-            let _ = model.handle_basic_terminal_event(key("k"));
-            present(&mut model);
-            let (row, top, height) = focus_view(&model);
-            assert!(
-                row >= top && row < top + usize::from(height),
-                "step {step}: focused row {row} outside {top}..{}",
-                top + usize::from(height)
-            );
-            moved_view |= top != top_before;
-        }
-        assert!(moved_view, "walking up the transcript scrolled it");
-        assert_eq!(focus_view(&model).1, 0, "the walk reached the top");
-
-        // Walking back down, a scroll puts the focused unit's last row on the
-        // bottom edge, or its first row on top when it is taller than the view.
-        let mut moved_view = false;
-        for step in 0..40 {
-            let (_, top_before, _) = focus_view(&model);
-            let _ = model.handle_basic_terminal_event(key("j"));
-            // The jump-to-latest bar can appear or disappear on the next
-            // frame and change the transcript height by a row, so the hug is
-            // checked against the height the scroll was computed for.
-            let (_, top, height) = focus_view(&model);
-            present(&mut model);
-            let extent = focused_extent(&model);
-            let (row, drawn_top, drawn_height) = focus_view(&model);
-            assert!(
-                row >= drawn_top && row < drawn_top + usize::from(drawn_height),
-                "step {step}: focused row {row} not drawn"
-            );
-            if top != top_before {
-                moved_view = true;
-                let bottom = top + usize::from(height);
-                assert!(
-                    extent.end == bottom || extent.start == top,
-                    "step {step}: {extent:?} does not hug {top}..{bottom}"
-                );
-            }
-        }
-        assert!(moved_view, "walking down the transcript scrolled it");
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn scrolling_reprojects_selection_highlights_for_still_visible_content() {
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let history = (1..=20)
-            .map(|sequence| bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence,
-                timestamp_ms: sequence,
-                session_id,
-                provenance: None,
-                kind: bcode_session_models::SessionEventKind::UserMessage {
-                    client_id: bcode_session_models::ClientId::new(),
-                    text: format!("message {sequence}"),
-                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                },
-            })
-            .collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &history);
-        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
-        let mut initial_bytes = Vec::new();
-        let mut initial_terminal = bmux_tui::terminal::Terminal::new(&mut initial_bytes, area);
-        super::bcode_runtime_presenter(&mut initial_terminal)
-            .present(&mut model)
-            .expect("initial frame presents");
-        let fragment = model
-            .committed_selection
-            .fragments()
-            .iter()
-            .find(|fragment| {
-                fragment.area.y
-                    == model
-                        .committed_layout
-                        .expect("committed layout")
-                        .body()
-                        .bottom()
-                        .saturating_sub(2)
-            })
-            .cloned()
-            .expect("penultimate visible fragment");
-        let _ = model.transcript_selection.handle_mouse(
-            &model.committed_selection,
-            bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y),
-            ),
-        );
-        let _ = model.transcript_selection.handle_mouse(
-            &model.committed_selection,
-            bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(
-                    fragment.area.x.saturating_add(fragment.area.width),
-                    fragment.area.y,
-                ),
-            ),
-        );
-        let before = model
-            .transcript_selection
-            .snapshot(&model.committed_selection)
-            .expect("selection before scroll");
-        let before_highlights = before.visible_highlights.clone();
-
-        assert!(model.chat.app.scroll_transcript_up(1));
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        let mut scrolled_bytes = Vec::new();
-        let mut scrolled_terminal = bmux_tui::terminal::Terminal::new(&mut scrolled_bytes, area);
-        super::bcode_runtime_presenter(&mut scrolled_terminal)
-            .present(&mut model)
-            .expect("scrolled frame presents");
-        let after = model
-            .transcript_selection
-            .snapshot(&model.committed_selection)
-            .expect("selection survives scroll");
-
-        assert_eq!(after.slices, before.slices);
-        assert_ne!(after.visible_highlights, before_highlights);
-        assert!(after.visible_highlights.iter().all(|highlight| {
-            model
-                .committed_layout
-                .expect("committed layout")
-                .body()
-                .intersection(*highlight)
-                == *highlight
-        }));
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn presenter_paints_selection_highlight_over_real_transcript_content() {
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::UserMessage {
-                client_id: bcode_session_models::ClientId::new(),
-                text: "selectable transcript text".to_owned(),
-                admission: bcode_session_models::TurnAdmissionMetadata::default(),
-            },
-        }];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
-        let mut initial_bytes = Vec::new();
-        let mut initial_terminal = bmux_tui::terminal::Terminal::new(&mut initial_bytes, area);
-        super::bcode_runtime_presenter(&mut initial_terminal)
-            .present(&mut model)
-            .expect("initial frame presents");
-        let fragment = model
-            .committed_selection
-            .fragments()
-            .first()
-            .cloned()
-            .expect("transcript fragment");
-        let _ = model.transcript_selection.handle_mouse(
-            &model.committed_selection,
-            bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y),
-            ),
-        );
-        let _ = model.transcript_selection.handle_mouse(
-            &model.committed_selection,
-            bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(
-                    fragment.area.x.saturating_add(fragment.area.width),
-                    fragment.area.y,
-                ),
-            ),
-        );
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-
-        let mut selected_bytes = Vec::new();
-        let mut selected_terminal = bmux_tui::terminal::Terminal::new(&mut selected_bytes, area);
-        super::bcode_runtime_presenter(&mut selected_terminal)
-            .present(&mut model)
-            .expect("selected frame presents");
-        let selected_cell = selected_terminal
-            .retained_buffer()
-            .and_then(|buffer| {
-                buffer.get(bmux_tui::geometry::Point::new(
-                    fragment.area.x,
-                    fragment.area.y,
-                ))
-            })
-            .expect("selected cell");
-
-        assert_eq!(
-            selected_cell.style.bg,
-            model.chat.app.presented_theme().selection.bg
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn committed_presentation_invalidates_removed_selection_and_unpins_history() {
-        use bmux_tui_runtime::Presenter;
-
-        let mut model = root_test_model();
-        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
-        model.committed_selection.push_scope(
-            bmux_tui::selection::SelectionScope::new(
-                "bcode.transcript.item.removed",
-                bmux_tui::geometry::Rect::new(0, 1, 12, 1),
-            )
-            .parent("bcode.transcript"),
-        );
-        model
-            .committed_selection
-            .push_scope(bmux_tui::selection::SelectionScope::new(
-                "bcode.transcript",
-                bmux_tui::geometry::Rect::new(0, 1, 40, 6),
-            ));
-        for fragment in bmux_tui::selection::plain_text_fragments(
-            "bcode.transcript.item.removed",
-            "bcode.transcript.item.1.plain",
-            bmux_tui::geometry::Rect::new(0, 1, 12, 1),
-            0,
-            "removed",
-            0,
-            1,
-        ) {
-            model.committed_selection.push_fragment(fragment);
-        }
-        let _ = model.transcript_selection.handle_mouse(
-            &model.committed_selection,
-            bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(0, 1),
-            ),
-        );
-        let _ = model.transcript_selection.handle_mouse(
-            &model.committed_selection,
-            bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(6, 1),
-            ),
-        );
-        model.selected_plain_text = Some("removed".to_owned());
-        model.chat.app.set_transcript_selection_pinned(true);
-
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("replacement frame presents");
-
-        assert!(model.selected_plain_text.is_none());
-        assert_eq!(
-            model.transcript_selection.phase(),
-            bmux_tui::selection::SelectionGesturePhase::Idle
-        );
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        assert!(model.presentation_damage.is_full());
-        assert!(!model.fast_temporal_presentation);
-        drop(model);
     }
 
     #[tokio::test]
@@ -10569,481 +6318,6 @@ mod tests {
                 .app
                 .can_trim_resident_transcript_window_for_test()
         );
-    }
-
-    fn selected_test_model(config: &bcode_config::TuiConfig) -> super::BcodeRuntimeModel {
-        let mut model = root_test_model_with_tui_config(config);
-        model
-            .chat
-            .app
-            .push_ephemeral_system_plain("abcdef".to_owned());
-        let item = model
-            .chat
-            .app
-            .transcript()
-            .iter()
-            .next_back()
-            .expect("source item");
-        let item_id = item.id().get();
-        let item_revision = item.revision();
-        model.transcript_clipboard = |text| {
-            assert_eq!(text, "abcdef");
-            Ok(())
-        };
-        let layout = super::super::render::prepare_frame(
-            &mut model.chat.app,
-            bmux_tui::geometry::Rect::new(0, 0, 20, 12),
-        )
-        .expect("layout");
-        let body = layout.body();
-        model.committed_layout = Some(layout);
-        model
-            .committed_selection
-            .push_scope(bmux_tui::selection::SelectionScope::new(
-                "bcode.transcript",
-                body,
-            ));
-        for fragment in bmux_tui::selection::plain_text_fragments(
-            "bcode.transcript",
-            format!("bcode.transcript.item.{item_id}.plain"),
-            bmux_tui::geometry::Rect::new(body.x, body.y + 1, 6, 1),
-            0,
-            "abcdef",
-            0,
-            item_revision,
-        ) {
-            model.committed_selection.push_fragment(fragment);
-        }
-        assert!(model.committed_selection.validate().is_ok());
-        for (kind, x) in [
-            (
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                body.x,
-            ),
-            (
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                body.x + 5,
-            ),
-            (
-                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                body.x + 5,
-            ),
-        ] {
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                kind,
-                bmux_tui::geometry::Point::new(x, body.y + 1),
-            ));
-        }
-        model
-    }
-
-    fn rendered_selection_test_model(
-        terminal: &mut bmux_tui::terminal::Terminal<&mut Vec<u8>>,
-    ) -> (super::BcodeRuntimeModel, bmux_tui::geometry::Point) {
-        use bmux_tui_runtime::Presenter;
-
-        let mut config = bcode_config::TuiConfig::default();
-        config.mouse.selection_autoscroll = false;
-        let mut model = root_test_model_with_tui_config(&config);
-        model
-            .chat
-            .app
-            .push_ephemeral_system_markdown("abcdef".to_owned());
-        let content_id = format!(
-            "bcode.transcript.item.{}.markdown",
-            model
-                .chat
-                .app
-                .transcript()
-                .iter()
-                .next_back()
-                .expect("item")
-                .id()
-                .get()
-        );
-        model.transcript_clipboard = |text| {
-            assert_eq!(text, "abcdef");
-            Ok(())
-        };
-        super::bcode_runtime_presenter(terminal)
-            .present(&mut model)
-            .expect("initial frame");
-        let fragment = model
-            .committed_selection
-            .fragments()
-            .iter()
-            .find(|fragment| {
-                fragment.content_id.as_str() == content_id && fragment.source_range.start == 0
-            })
-            .expect("source fragment");
-        let point = bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y);
-        assert_eq!(
-            terminal
-                .retained_buffer()
-                .expect("frame")
-                .get(point)
-                .expect("cell")
-                .symbol,
-            "a"
-        );
-        assert!(model.committed_selection.validate().is_ok());
-        assert!(model.committed_selection.initiation_scope(point).is_some());
-        (model, point)
-    }
-
-    #[tokio::test]
-    async fn starting_a_click_repaints_old_highlight_and_removes_timer_registry_entry() {
-        use bmux_tui_runtime::Presenter;
-
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(
-            &mut bytes,
-            bmux_tui::geometry::Rect::new(0, 0, 40, 12),
-        );
-        let (mut model, point) = rendered_selection_test_model(&mut terminal);
-        let initial_style = terminal
-            .retained_buffer()
-            .expect("frame")
-            .get(point)
-            .expect("cell")
-            .style;
-        for (kind, position) in [
-            (
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                point,
-            ),
-            (
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(point.x + 5, point.y),
-            ),
-            (
-                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(point.x + 5, point.y),
-            ),
-        ] {
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                kind, position,
-            ));
-        }
-        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("selected frame");
-        assert_ne!(
-            terminal
-                .retained_buffer()
-                .expect("frame")
-                .get(point)
-                .expect("cell")
-                .style,
-            initial_style
-        );
-        let timer = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
-        model
-            .scheduled_deadlines
-            .insert(timer.clone(), model.selection_clear_at.expect("deadline"));
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                point,
-            )),
-            Some(super::super::invalidation::UiInvalidation::Paint)
-        );
-        assert!(!model.scheduled_deadlines.contains_key(&timer));
-        assert!(model.selected_plain_text.is_none());
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("cleared frame");
-        assert_eq!(
-            terminal
-                .retained_buffer()
-                .expect("frame")
-                .get(point)
-                .expect("cell")
-                .style,
-            initial_style
-        );
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                point,
-            )),
-            None
-        );
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn release_copies_source_and_clears_only_when_due() {
-        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
-        assert_eq!(model.chat.app.status(), "transcript selection copied");
-        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
-        assert!(
-            !model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        let deadline = model.selection_clear_at.expect("scheduled clear");
-        assert_eq!(
-            model.clear_transcript_selection_if_due(
-                deadline
-                    .checked_sub(std::time::Duration::from_millis(1))
-                    .expect("earlier instant")
-            ),
-            super::super::invalidation::UiInvalidation::None
-        );
-        assert_eq!(
-            model.clear_transcript_selection_if_due(deadline),
-            super::super::invalidation::UiInvalidation::Paint
-        );
-        assert!(model.selected_plain_text.is_none());
-        assert_eq!(
-            model.transcript_selection.phase(),
-            bmux_tui::selection::SelectionGesturePhase::Idle
-        );
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn manual_copy_obeys_disabled_auto_copy_and_clear_policy() {
-        let mut config = bcode_config::TuiConfig::default();
-        config.selection.auto_copy_on_mouse_release = false;
-        let mut model = selected_test_model(&config);
-        assert!(model.selection_clear_at.is_none());
-        model.copy_transcript_selection();
-        assert!(model.selection_clear_at.is_some());
-        config.selection.clear_after_copy = false;
-        model.settings.apply_tui_config(&config);
-        model.copy_transcript_selection();
-        assert!(model.selection_clear_at.is_none());
-        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
-        config.selection.clear_after_copy = true;
-        config.selection.clear_delay_ms = 0;
-        model.settings.apply_tui_config(&config);
-        model.copy_transcript_selection();
-        assert!(model.selected_plain_text.is_none());
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn release_clear_policy_supports_disabled_and_immediate_clearing() {
-        let mut config = bcode_config::TuiConfig::default();
-        config.selection.clear_after_copy = false;
-        let retained = selected_test_model(&config);
-        assert_eq!(retained.chat.app.status(), "transcript selection copied");
-        assert_eq!(retained.selected_plain_text.as_deref(), Some("abcdef"));
-        assert!(retained.selection_clear_at.is_none());
-        drop(retained);
-        config.selection.clear_after_copy = true;
-        config.selection.clear_delay_ms = 0;
-        let cleared = selected_test_model(&config);
-        assert!(cleared.selected_plain_text.is_none());
-        assert!(cleared.selection_clear_at.is_none());
-        assert!(
-            cleared
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(cleared);
-    }
-
-    #[tokio::test]
-    async fn click_without_drag_does_not_copy() {
-        let mut config = bcode_config::TuiConfig::default();
-        config.selection.auto_copy_on_mouse_release = false;
-        let mut model = selected_test_model(&config);
-        config.selection.auto_copy_on_mouse_release = true;
-        model.settings.apply_tui_config(&config);
-        model.transcript_clipboard = |_| panic!("click must not copy");
-        let body = model.committed_layout.expect("layout").body();
-        let point = bmux_tui::geometry::Point::new(body.x, body.y + 1);
-        model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-            point,
-        ));
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                point,
-            )),
-            None
-        );
-        assert!(model.selection_clear_at.is_none());
-        assert!(model.selected_plain_text.is_none());
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn failed_copy_retains_selection_and_cancels_prior_clear() {
-        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
-        let deadline = model.selection_clear_at.expect("deadline");
-        model.transcript_clipboard = |_| Err("fake failure".to_owned());
-        model.copy_transcript_selection();
-        assert_eq!(model.chat.app.status(), "copy failed: fake failure");
-        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
-        assert!(model.selection_clear_at.is_none());
-        model.clear_transcript_selection_if_due(deadline);
-        assert!(
-            !model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn stale_clear_does_not_erase_new_gesture_or_later_copy() {
-        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
-        let old = model.selection_clear_at.expect("deadline");
-        model.selection_clear_at = Some(old + std::time::Duration::from_secs(1));
-        model.clear_transcript_selection_if_due(old);
-        assert!(model.selected_plain_text.is_some());
-        let body = model.committed_layout.expect("layout").body();
-        model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-            bmux_tui::geometry::Point::new(body.x, body.y + 1),
-        ));
-        assert!(model.selection_clear_at.is_none());
-        model.clear_transcript_selection_if_due(old + std::time::Duration::from_secs(2));
-        assert_eq!(
-            model.transcript_selection.phase(),
-            bmux_tui::selection::SelectionGesturePhase::Armed
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn reload_and_session_change_cancel_selection_deadlines() {
-        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
-        let mut config = bcode_config::TuiConfig::default();
-        config.selection.clear_delay_ms = 25;
-        model.settings.apply_tui_config(&config);
-        model.synchronize_selection_lifecycle();
-        assert!(model.selection_clear_at.is_none());
-        assert!(model.selected_plain_text.is_some());
-        model.copy_transcript_selection();
-        let timer = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
-        model
-            .scheduled_deadlines
-            .insert(timer.clone(), model.selection_clear_at.expect("deadline"));
-        model.chat.app = super::super::app::BmuxApp::new_with_history(
-            Some(bcode_session_models::SessionId::new()),
-            &[],
-            &[],
-            false,
-        );
-        model.synchronize_selection_lifecycle();
-        assert!(!model.scheduled_deadlines.contains_key(&timer));
-        assert!(model.selection_clear_at.is_none());
-        assert!(model.selected_plain_text.is_none());
-        assert_eq!(model.committed_selection.scopes(), []);
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn empty_or_invalidated_selection_never_reaches_clipboard() {
-        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
-        model.transcript_clipboard = |_| panic!("empty selection must not copy");
-        model.committed_selection = bmux_tui::selection::SelectionScene::new();
-        let timer = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
-        model
-            .scheduled_deadlines
-            .insert(timer.clone(), model.selection_clear_at.expect("deadline"));
-        model.copy_transcript_selection();
-        assert!(!model.scheduled_deadlines.contains_key(&timer));
-        assert_eq!(model.chat.app.status(), "no transcript selection");
-        model.clear_transcript_selection();
-        assert!(model.selection_clear_at.is_none());
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        model.copy_transcript_selection();
-        assert!(model.selected_plain_text.is_none());
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn clear_key_routes_without_copying_or_modifying_composer() {
-        let mut config = bcode_config::TuiConfig::default();
-        config.keybindings.chat.insert(
-            "ctrl+shift+x".to_owned(),
-            "tui.transcript.clearSelection".to_owned(),
-        );
-        let mut model = selected_test_model(&config);
-        model.transcript_clipboard = |_| panic!("clear must not copy");
-        let input = model.chat.app.composer().text().to_owned();
-        assert_eq!(
-            model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
-                bmux_keyboard::parse_key_stroke("ctrl+shift+x").expect("key"),
-            )),
-            super::super::invalidation::UiInvalidation::Paint
-        );
-        assert_eq!(model.chat.app.composer().text(), input);
-        assert!(model.selected_plain_text.is_none());
-        assert!(model.selection_clear_at.is_none());
-        assert!(
-            model
-                .chat
-                .app
-                .can_trim_resident_transcript_window_for_test()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn old_timer_identity_cannot_clear_even_after_new_deadline() {
-        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
-        let old = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
-        model.copy_transcript_selection();
-        model.selection_clear_at = Some(std::time::Instant::now());
-        assert_eq!(
-            model.handle_timer(&old).0,
-            super::super::invalidation::UiInvalidation::None
-        );
-        assert!(model.selected_plain_text.is_some());
-        let current = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
-        assert_eq!(
-            model.handle_timer(&current).0,
-            super::super::invalidation::UiInvalidation::Paint
-        );
-        assert!(model.selected_plain_text.is_none());
-        drop(model);
     }
 
     #[tokio::test]
@@ -12294,76 +7568,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn palette_lists_and_dispatches_transcript_disclosure_actions() {
-        use bcode_presentation_policy::models::Disclosure;
-        let palette = crate::command_palette::BmuxCommandPalette::new();
-        let contribution = |id: &str| {
-            (0..)
-                .map_while(|index| palette.contribution_at(index))
-                .find(|contribution| contribution.id == id)
-                .unwrap_or_else(|| panic!("palette lists {id}"))
-        };
-        let mut model = root_test_model();
-        let (app, ids) = crate::app::disclosure_focus_tests::focus_app(2);
-        model.chat.app = app;
-        let dispatch = |model: &mut super::BcodeRuntimeModel, id: &str| {
-            model.apply_root_command_action(
-                super::super::chat_loop::CommandDispatchRequest::from_contribution(contribution(
-                    id,
-                )),
-            );
-        };
-        let unit = |index: usize| crate::structure::DisclosureTarget::Unit(ids[index]);
-        let disclosures = |model: &super::BcodeRuntimeModel| {
-            (0..2)
-                .map(|index| {
-                    model
-                        .chat
-                        .app
-                        .target_disclosure(&unit(index))
-                        .map(|(disclosure, _)| disclosure)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Focus mode toggles through the palette; bulk actions then act on
-        // the focused subtree only.
-        let initial = disclosures(&model);
-        dispatch(&mut model, "transcript.focusUnits");
-        assert!(model.chat.app.transcript_focus_active());
-        // Focus starts on the last unit's `output` section; climb to the unit.
-        assert!(
-            model
-                .chat
-                .app
-                .handle_transcript_focus_action(crate::transcript_focus::FocusAction::Previous)
-        );
-        dispatch(&mut model, "tools.collapseAll");
-        assert_eq!(
-            disclosures(&model),
-            [initial[0], Some(Disclosure::Collapsed)]
-        );
-        dispatch(&mut model, "transcript.focusUnits");
-        assert!(!model.chat.app.transcript_focus_active());
-
-        // Outside focus mode they act on every unit.
-        dispatch(&mut model, "tools.expandAll");
-        assert_eq!(disclosures(&model), [Some(Disclosure::Expanded); 2]);
-        dispatch(&mut model, "tools.collapseAll");
-        assert_eq!(disclosures(&model), [Some(Disclosure::Collapsed); 2]);
-        dispatch(&mut model, "transcript.cycleDetail");
-        let cycled = disclosures(&model);
-        assert_ne!(cycled, [Some(Disclosure::Collapsed); 2]);
-        assert_eq!(cycled[0], cycled[1]);
-        dispatch(&mut model, "tools.resetDisclosure");
-        let reset = model.chat.app.status().contains("reset to defaults");
-        let after_reset = disclosures(&model);
-        drop(model);
-        assert!(reset);
-        assert_eq!(after_reset, initial);
-    }
-
     #[tokio::test]
     async fn foreground_plugin_ignored_input_never_reaches_chat_or_requests_damage() {
         use bmux_tui::event::Event;
@@ -12416,10 +7620,7 @@ mod tests {
                 super::super::invalidation::UiInvalidation::None
             );
             assert_eq!(model.chat.app.composer().text(), "underlying draft");
-            assert_eq!(
-                model.transcript_selection.phase(),
-                bmux_tui::selection::SelectionGesturePhase::Idle
-            );
+            assert_eq!(model.transcript_host.selected_text(), None);
             assert!(!signal.take());
         }
     }
@@ -12507,10 +7708,7 @@ mod tests {
                 super::super::invalidation::UiInvalidation::Structural
             );
             assert_eq!(controller.lock().unwrap().phase(), phase);
-            assert_eq!(
-                model.transcript_selection.phase(),
-                SelectionGesturePhase::Idle
-            );
+            assert_eq!(model.transcript_host.selected_text(), None);
         }
     }
 
@@ -12744,172 +7942,6 @@ mod tests {
         super::BcodeRuntimeModel::new(chat, settings, loop_state)
     }
 
-    #[tokio::test]
-    async fn markdown_click_is_released_to_activation_while_drag_is_consumed() {
-        let mut model = root_test_model();
-        let layout = super::super::render::prepare_frame(
-            &mut model.chat.app,
-            bmux_tui::geometry::Rect::new(0, 0, 20, 8),
-        )
-        .expect("layout");
-        let body = layout.body();
-        model.committed_layout = Some(layout);
-        model
-            .committed_selection
-            .push_scope(bmux_tui::selection::SelectionScope::new(
-                "bcode.transcript",
-                body,
-            ));
-        for fragment in bmux_tui::selection::plain_text_fragments(
-            "bcode.transcript",
-            "link.label",
-            bmux_tui::geometry::Rect::new(body.x, body.y, 8, 1),
-            0,
-            "linktext",
-            0,
-            1,
-        ) {
-            model.committed_selection.push_fragment(fragment);
-        }
-
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(body.x, body.y),
-            )),
-            Some(super::super::invalidation::UiInvalidation::None)
-        );
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(body.x, body.y),
-            )),
-            None
-        );
-
-        let _ = model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-            bmux_tui::geometry::Point::new(body.x, body.y),
-        ));
-        assert!(
-            model
-                .handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(body.x.saturating_add(4), body.y),
-                ))
-                .is_some()
-        );
-        assert!(
-            model
-                .handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                    bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
-                    bmux_tui::geometry::Point::new(body.x.saturating_add(4), body.y),
-                ))
-                .is_some()
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn transcript_selection_arbitrates_drag_before_other_mouse_actions() {
-        let mut model = root_test_model();
-        assert!(model.settings.selection_autoscroll());
-        let layout = super::super::render::prepare_frame(
-            &mut model.chat.app,
-            bmux_tui::geometry::Rect::new(0, 0, 20, 8),
-        )
-        .expect("layout");
-        let body = layout.body();
-        model.committed_layout = Some(layout);
-        model
-            .committed_selection
-            .push_scope(bmux_tui::selection::SelectionScope::new(
-                "bcode.transcript",
-                body,
-            ));
-        model.committed_selection.push_scope(
-            bmux_tui::selection::SelectionScope::new("item", body).parent("bcode.transcript"),
-        );
-        for fragment in bmux_tui::selection::plain_text_fragments(
-            "item",
-            "item.plain",
-            bmux_tui::geometry::Rect::new(0, 1, 6, 1),
-            0,
-            "abcdef",
-            0,
-            1,
-        ) {
-            model.committed_selection.push_fragment(fragment);
-        }
-
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(1, 1),
-            )),
-            Some(super::super::invalidation::UiInvalidation::None)
-        );
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(5, 1),
-            )),
-            Some(super::super::invalidation::UiInvalidation::Structural)
-        );
-        assert_eq!(
-            model.transcript_selection.phase(),
-            bmux_tui::selection::SelectionGesturePhase::Dragging
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn disabled_selection_autoscroll_keeps_viewport_stable() {
-        let mut tui_config = bcode_config::TuiConfig::default();
-        tui_config.mouse.selection_autoscroll = false;
-        let mut model = root_test_model_with_tui_config(&tui_config);
-        let layout = super::super::render::prepare_frame(
-            &mut model.chat.app,
-            bmux_tui::geometry::Rect::new(0, 0, 20, 8),
-        )
-        .expect("layout");
-        let body = layout.body();
-        model.committed_layout = Some(layout);
-        model
-            .committed_selection
-            .push_scope(bmux_tui::selection::SelectionScope::new(
-                "bcode.transcript",
-                body,
-            ));
-        model.committed_selection.push_scope(
-            bmux_tui::selection::SelectionScope::new("item", body).parent("bcode.transcript"),
-        );
-        for fragment in bmux_tui::selection::plain_text_fragments(
-            "item",
-            "item.plain",
-            bmux_tui::geometry::Rect::new(body.x, body.y, body.width, 1),
-            0,
-            "selection",
-            0,
-            1,
-        ) {
-            model.committed_selection.push_fragment(fragment);
-        }
-
-        let _ = model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
-            bmux_tui::geometry::Point::new(body.x, body.y),
-        ));
-        assert_eq!(
-            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
-                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
-                bmux_tui::geometry::Point::new(body.x.saturating_add(4), body.y),
-            )),
-            Some(super::super::invalidation::UiInvalidation::Paint)
-        );
-        drop(model);
-    }
-
     #[test]
     fn response_local_selection_clamps_before_sibling_transcript_items() {
         let mut scene = bmux_tui::selection::SelectionScene::new();
@@ -13029,1148 +8061,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_selection_scene_is_registered_before_highlight_projection() {
-        let mut model = root_test_model();
-        let layout = super::super::render::prepare_frame(
-            &mut model.chat.app,
-            bmux_tui::geometry::Rect::new(0, 0, 20, 8),
-        )
-        .expect("layout");
-
-        let scene = super::transcript_selection_scene(&model.chat.app, layout.body());
-
-        assert!(
-            scene
-                .scopes()
-                .iter()
-                .any(|scope| scope.id.as_str() == "bcode.transcript")
-        );
-        assert!(scene.validate().is_ok());
-    }
-
-    #[test]
-    fn transcript_selection_edge_scroll_intensity_is_bounded() {
-        let body = bmux_tui::geometry::Rect::new(2, 3, 20, 4);
-
-        assert_eq!(
-            super::selection_edge_scroll_rows(body, bmux_tui::geometry::Point::new(3, body.y),),
-            Some((true, 1))
-        );
-        assert_eq!(
-            super::selection_edge_scroll_rows(body, bmux_tui::geometry::Point::new(3, 0)),
-            Some((true, 4))
-        );
-        assert_eq!(
-            super::selection_edge_scroll_rows(
-                body,
-                bmux_tui::geometry::Point::new(3, body.bottom()),
-            ),
-            Some((false, 2))
-        );
-        assert_eq!(
-            super::selection_edge_scroll_rows(
-                body,
-                bmux_tui::geometry::Point::new(3, body.y.saturating_add(1)),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn plain_transcript_selection_exports_canonical_item_order() {
-        let first = super::super::transcript::TranscriptItem::new("You", "first".to_owned());
-        let second =
-            super::super::transcript::TranscriptItem::new("Assistant", "second".to_owned());
-        let first_id = first.id().get();
-        let second_id = second.id().get();
-        let items = [first, second];
-        let snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{second_id}.plain"
-                )),
-                offset: 6,
-                order: 1,
-                affinity: bmux_tui::selection::SelectionAffinity::After,
-                revision: 0,
-            },
-            focus: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{first_id}.plain"
-                )),
-                offset: 0,
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::Before,
-                revision: 0,
-            },
-            reversed: true,
-            slices: vec![
-                bmux_tui::selection::SelectionSlice {
-                    content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                        "bcode.transcript.item.{second_id}.plain"
-                    )),
-                    source_range: 0..6,
-                    revision: 0,
-                },
-                bmux_tui::selection::SelectionSlice {
-                    content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                        "bcode.transcript.item.{first_id}.plain"
-                    )),
-                    source_range: 0..5,
-                    revision: 0,
-                },
-            ],
-            visible_highlights: Vec::new(),
-        };
-
-        assert_eq!(
-            super::export_plain_transcript_selection(items.iter(), &snapshot).as_deref(),
-            Some("first\n\nsecond")
-        );
-    }
-
-    #[test]
-    fn mixed_canonical_and_ephemeral_selection_exports_visible_order() {
-        let session_id = bcode_session_models::SessionId::new();
-        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::AssistantMessage {
-                text: text.to_owned(),
-            },
-        };
-        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(1, "first")], &[], false);
-        app.push_ephemeral_system_plain("local issue".to_owned());
-        app.absorb_session_event(&event(2, "second"));
-        let slices = app
-            .transcript()
-            .iter()
-            .map(|item| bmux_tui::selection::SelectionSlice {
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{}.plain",
-                    item.id().get()
-                )),
-                source_range: 0..item.text().len(),
-                revision: item.revision(),
-            })
-            .collect::<Vec<_>>();
-        let first = &slices[0];
-        let last = &slices[2];
-        let snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: first.content_id.clone(),
-                offset: 0,
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::Before,
-                revision: first.revision,
-            },
-            focus: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: last.content_id.clone(),
-                offset: last.source_range.end,
-                order: 2,
-                affinity: bmux_tui::selection::SelectionAffinity::After,
-                revision: last.revision,
-            },
-            reversed: false,
-            slices,
-            visible_highlights: Vec::new(),
-        };
-
-        assert_eq!(
-            super::export_plain_transcript_selection(app.transcript(), &snapshot).as_deref(),
-            Some("first\n\nlocal issue\n\nsecond")
-        );
-        drop(app);
-    }
-
-    #[test]
-    fn pending_tool_draft_export_is_explicit_and_uses_bounded_fallback() {
-        let draft = bcode_session_view_models::ToolRequestDraftView {
-            output_location: None,
-            turn_id: "turn-1".to_owned(),
-            tool_call_id: "call-1".to_owned(),
-            tool_name: "shell".to_owned(),
-            producer_plugin_id: Some("shell-plugin".to_owned()),
-            schema: "shell.request".to_owned(),
-            schema_version: 1,
-            placement: bcode_session_models::ToolContributionPlacement::Request,
-            generation: 1,
-            revision: 1,
-            argument_bytes: 100,
-            preview_start_offset: 0,
-            preview: "secret preview".to_owned(),
-            truncated: true,
-        };
-        let item = super::super::transcript::TranscriptItem::with_kind(
-            "Tool",
-            "shell request · 100 bytes · truncated".to_owned(),
-            true,
-            super::super::transcript::TranscriptItemKind::ToolRequestDraft {
-                draft: Box::new(draft),
-            },
-        );
-        let item_id = item.id().get();
-        let content_id = format!("bcode.transcript.item.{item_id}.plain");
-        let snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                offset: 0,
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::Before,
-                revision: 0,
-            },
-            focus: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                offset: item.text.len(),
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::After,
-                revision: 0,
-            },
-            reversed: false,
-            slices: vec![bmux_tui::selection::SelectionSlice {
-                content_id: bmux_tui::selection::SelectionContentId::new(content_id),
-                source_range: 0..item.text.len(),
-                revision: 0,
-            }],
-            visible_highlights: Vec::new(),
-        };
-        let exported = super::export_plain_transcript_selection(std::iter::once(&item), &snapshot)
-            .expect("draft export");
-
-        assert!(exported.starts_with("Tool request draft [pending; rendered-text fallback]\n"));
-        assert!(exported.contains("100 bytes · truncated"));
-        assert!(!exported.contains("secret preview"));
-    }
-
-    #[test]
-    fn selected_tool_items_export_canonical_context_and_status() {
-        let request = super::super::transcript::tool_request_item(
-            "call-1",
-            Some("filesystem"),
-            "read_file",
-            r#"{"path":"src/lib.rs"}"#,
-            None,
-        )
-        .with_event_metadata(1, 123);
-        let result = super::super::transcript::tool_result_item(
-            "call-1",
-            Some("read_file"),
-            Some(r#"{"path":"src/lib.rs"}"#),
-            "contents",
-            false,
-        )
-        .with_event_metadata(2, 456);
-        let request_id = request.id().get();
-        let result_id = result.id().get();
-        let snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{request_id}.plain"
-                )),
-                offset: 0,
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::Before,
-                revision: 0,
-            },
-            focus: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{result_id}.plain"
-                )),
-                offset: result.text.len(),
-                order: 1,
-                affinity: bmux_tui::selection::SelectionAffinity::After,
-                revision: 0,
-            },
-            reversed: false,
-            slices: vec![
-                bmux_tui::selection::SelectionSlice {
-                    content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                        "bcode.transcript.item.{result_id}.plain"
-                    )),
-                    source_range: 0..result.text.len(),
-                    revision: 0,
-                },
-                bmux_tui::selection::SelectionSlice {
-                    content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                        "bcode.transcript.item.{request_id}.plain"
-                    )),
-                    source_range: 0..request.text.len(),
-                    revision: 0,
-                },
-            ],
-            visible_highlights: Vec::new(),
-        };
-        let exported = super::export_plain_transcript_selection([&request, &result], &snapshot)
-            .expect("tool export");
-
-        assert!(exported.starts_with("Tool request: read_file [requested] @ 123ms"));
-        assert!(exported.contains("src/lib.rs"));
-        assert!(exported.contains("Tool result: read_file [finished] @ 456ms\ncontents"));
-    }
-
-    #[test]
-    fn markdown_plain_ranges_export_exact_delimiters_and_link_destination() {
-        let source = "**strong** [label](https://example.com)";
-        let item = super::super::transcript::TranscriptItem::with_format(
-            "Assistant",
-            source.to_owned(),
-            bcode_session_view_models::TextFormat::Markdown,
-        );
-        let item_id = item.id().get();
-        let export = |range: std::ops::Range<usize>| {
-            let content_id = format!("bcode.transcript.item.{item_id}.markdown");
-            let snapshot = bmux_tui::selection::SelectionSnapshot {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                anchor: bmux_tui::selection::SelectionEndpoint {
-                    scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                    content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                    offset: range.start,
-                    order: 0,
-                    affinity: bmux_tui::selection::SelectionAffinity::Before,
-                    revision: 0,
-                },
-                focus: bmux_tui::selection::SelectionEndpoint {
-                    scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                    content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                    offset: range.end,
-                    order: 0,
-                    affinity: bmux_tui::selection::SelectionAffinity::After,
-                    revision: 0,
-                },
-                reversed: false,
-                slices: vec![bmux_tui::selection::SelectionSlice {
-                    content_id: bmux_tui::selection::SelectionContentId::new(content_id),
-                    source_range: range,
-                    revision: 0,
-                }],
-                visible_highlights: Vec::new(),
-            };
-            super::export_plain_transcript_selection(std::iter::once(&item), &snapshot)
-        };
-
-        assert_eq!(export(0..10).as_deref(), Some("**strong**"));
-        assert_eq!(export(2..8).as_deref(), Some("strong"));
-        assert_eq!(export(12..17).as_deref(), Some("label"));
-        assert_eq!(export(19..38).as_deref(), Some("https://example.com"));
-    }
-
-    fn dispatch_selection_gesture(
-        model: &mut super::BcodeRuntimeModel,
-        start: bmux_tui::geometry::Point,
-        end: bmux_tui::geometry::Point,
-    ) {
-        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-        for (kind, point) in [
-            (MouseEventKind::Down(MouseButton::Left), start),
-            (MouseEventKind::Drag(MouseButton::Left), end),
-            (MouseEventKind::Up(MouseButton::Left), end),
-        ] {
-            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
-        }
-    }
-
-    fn production_code_gesture(
-        source: &str,
-        width: u16,
-        selected: std::ops::Range<usize>,
-        reverse: bool,
-    ) -> String {
-        use bmux_tui::{
-            event::{Event, MouseButton, MouseEvent, MouseEventKind},
-            geometry::{Point, Rect},
-        };
-        use bmux_tui_runtime::Presenter;
-
-        let session_id = bcode_session_models::SessionId::new();
-        let history = [bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 1,
-            timestamp_ms: 1,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::AssistantMessage {
-                text: source.to_owned(),
-            },
-        }];
-        let mut model = root_test_model_with_history(session_id, &history);
-        let area = Rect::new(0, 0, width, 40);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("production presentation");
-        let fragments = model.committed_selection.fragments();
-        let first = fragments
-            .iter()
-            .find(|fragment| {
-                fragment.source_range.start == selected.start
-                    && (fragment.content_id.as_str().rsplit('.').next() == Some("body")
-                        || fragment.content_id.as_str().rsplit('.').next() == Some("header")
-                        || fragment.content_id.as_str().rsplit('.').next() == Some("footer"))
-            })
-            .expect("visible first source unit");
-        let last = fragments
-            .iter()
-            .find(|fragment| {
-                fragment.source_range.end == selected.end
-                    && (fragment.content_id.as_str().rsplit('.').next() == Some("body")
-                        || fragment.content_id.as_str().rsplit('.').next() == Some("footer")
-                        || fragment.content_id.as_str().rsplit('.').next() == Some("header"))
-            })
-            .expect("visible last source unit");
-        let body_only = first.content_id.as_str().rsplit('.').next() == Some("body")
-            && last.content_id.as_str().rsplit('.').next() == Some("body");
-        let start = Point::new(first.area.x, first.area.y);
-        let end = Point::new(last.area.right().saturating_sub(1), last.area.y);
-        let reverse_start = fragments
-            .iter()
-            .find(|fragment| fragment.source_range.start == selected.end)
-            .map(|fragment| Point::new(fragment.area.x, fragment.area.y));
-        assert!(
-            fragments
-                .iter()
-                .any(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("header"))
-        );
-        assert!(
-            fragments
-                .iter()
-                .any(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("footer"))
-        );
-        assert!(
-            !fragments
-                .iter()
-                .any(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("whole"))
-        );
-        let (start, end) = if reverse {
-            (
-                reverse_start.expect("reverse gesture requires a visible exclusive end boundary"),
-                start,
-            )
-        } else {
-            (start, end)
-        };
-        for (kind, point) in [
-            (MouseEventKind::Down(MouseButton::Left), start),
-            (MouseEventKind::Drag(MouseButton::Left), end),
-            (MouseEventKind::Up(MouseButton::Left), end),
-        ] {
-            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
-        }
-        let snapshot = model
-            .transcript_selection
-            .snapshot(&model.committed_selection)
-            .expect("complete-scene gesture");
-        assert!(
-            !body_only
-                || snapshot.anchor.content_id != snapshot.focus.content_id
-                || snapshot
-                    .slices
-                    .iter()
-                    .all(|slice| slice.content_id.as_str().rsplit('.').next() == Some("body")),
-            "body gesture selected chrome: {snapshot:?}"
-        );
-        model.selected_plain_text.take().expect("production export")
-    }
-
-    #[tokio::test]
-    async fn production_previous_markdown_projection_is_not_selectable() {
-        use bmux_tui::geometry::{Point, Rect};
-        use bmux_tui_runtime::Presenter;
-        let session_id = bcode_session_models::SessionId::new();
-        let mut model = root_test_model_with_history(session_id, &[]);
-        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
-            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence,
-            timestamp_ms: sequence,
-            session_id,
-            provenance: None,
-            kind: bcode_session_models::SessionEventKind::AssistantDelta {
-                text: text.to_owned(),
-            },
-        };
-        model
-            .chat
-            .app
-            .absorb_session_event(&event(1, "```text\nold body\n"));
-        let area = Rect::new(0, 0, 70, 40);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("accepted streaming frame");
-        let old_fragments = model.committed_selection.fragments().to_vec();
-        let item = model
-            .chat
-            .app
-            .transcript()
-            .iter()
-            .next_back()
-            .expect("stream");
-        let id = item.id().get();
-        let width = model.committed_layout.expect("layout").body().width;
-        let previous = super::super::render::transcript_markdown_selection_projection(
-            &model.chat.app,
-            item,
-            width,
-        )
-        .expect("accepted projection");
-        let previous_revision = item.revision();
-        model.chat.app.absorb_session_event(&event(2, "new tail"));
-        let item = model
-            .chat
-            .app
-            .transcript()
-            .iter()
-            .next_back()
-            .expect("new stream revision");
-        assert_eq!(id, item.id().get());
-        let options = super::super::render::markdown_render_options(&model.chat.app, item, width);
-        // Match the current render options while preserving the previous source
-        // revision, so the fixture exercises previous-compatible presentation
-        // rather than a legitimate synchronous new-option projection.
-        model.chat.app.transcript_markdown_cache().install(
-            id,
-            previous_revision,
-            options,
-            std::sync::Arc::clone(&previous),
-        );
-        let frame_options =
-            super::super::render::markdown_render_options(&model.chat.app, item, area.width);
-        model.chat.app.transcript_markdown_cache().install(
-            id,
-            previous_revision,
-            frame_options,
-            previous,
-        );
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        assert!(
-            super::super::render::transcript_markdown_selection_projection(
-                &model.chat.app,
-                item,
-                width
-            )
-            .is_none()
-        );
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("previous compatible frame");
-        assert!(
-            model
-                .committed_selection
-                .fragments()
-                .iter()
-                .all(|fragment| {
-                    !fragment
-                        .content_id
-                        .as_str()
-                        .starts_with(&format!("bcode.transcript.item.{id}."))
-                })
-        );
-        for fragment in old_fragments {
-            dispatch_selection_gesture(
-                &mut model,
-                Point::new(fragment.area.x, fragment.area.y),
-                Point::new(fragment.area.right(), fragment.area.y),
-            );
-            assert!(model.selected_plain_text.is_none());
-        }
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn production_clipped_code_unicode_fails_closed() {
-        use bmux_tui::geometry::{Point, Rect};
-        use bmux_tui_runtime::Presenter;
-        let mut model = root_test_model_with_history(bcode_session_models::SessionId::new(), &[]);
-        model
-            .chat
-            .app
-            .push_ephemeral_system_markdown("```\na界b\n```\n".to_owned());
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 7, 30));
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("narrow frame");
-        let fragments = model.committed_selection.fragments();
-        let first = fragments
-            .iter()
-            .find(|fragment| {
-                fragment.content_id.as_str().rsplit('.').next() == Some("body")
-                    && fragment.source_range == (4..5)
-            })
-            .cloned()
-            .expect("narrow first ASCII source unit");
-        let last = fragments
-            .iter()
-            .find(|fragment| {
-                fragment.content_id.as_str().rsplit('.').next() == Some("body")
-                    && fragment.source_range == (8..9)
-            })
-            .cloned()
-            .expect("narrow last ASCII source unit");
-        {
-            dispatch_selection_gesture(
-                &mut model,
-                Point::new(first.area.x, first.area.y),
-                Point::new(last.area.right(), last.area.y),
-            );
-            let wide_visible = model
-                .committed_selection
-                .fragments()
-                .iter()
-                .any(|fragment| {
-                    fragment.content_id.as_str().rsplit('.').next() == Some("body")
-                        && fragment.source_range == (5..8)
-                });
-            if wide_visible {
-                assert_eq!(model.selected_plain_text.as_deref(), Some("a界b"));
-            } else {
-                assert!(
-                    model.selected_plain_text.is_none(),
-                    "clipped interior source must not be restored"
-                );
-            }
-        }
-        let fragment = model
-            .committed_selection
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("header"))
-            .cloned()
-            .expect("narrow fence geometry");
-        let footer = model
-            .committed_selection
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("footer"))
-            .cloned()
-            .expect("narrow footer geometry");
-        model.clear_transcript_selection();
-        dispatch_selection_gesture(
-            &mut model,
-            Point::new(fragment.area.x, fragment.area.y),
-            Point::new(footer.area.x, footer.area.y),
-        );
-        let wide_visible = model
-            .committed_selection
-            .fragments()
-            .iter()
-            .any(|fragment| {
-                fragment.content_id.as_str().rsplit('.').next() == Some("body")
-                    && fragment.source_range == (5..8)
-            });
-        if wide_visible {
-            assert_eq!(
-                model.selected_plain_text.as_deref(),
-                Some("```\na界b\n```\n")
-            );
-        } else {
-            assert!(
-                model.selected_plain_text.is_none(),
-                "fence traversal may not restore clipped code"
-            );
-        }
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn production_mixed_plain_markdown_gesture_preserves_item_order() {
-        use bmux_tui::{
-            event::{Event, MouseButton, MouseEvent, MouseEventKind},
-            geometry::{Point, Rect},
-        };
-        use bmux_tui_runtime::Presenter;
-        for reverse in [false, true] {
-            let mut model =
-                root_test_model_with_history(bcode_session_models::SessionId::new(), &[]);
-            model
-                .chat
-                .app
-                .push_ephemeral_system_plain("plain-before".to_owned());
-            model
-                .chat
-                .app
-                .push_ephemeral_system_markdown("```\ncode-middle\n```\n".to_owned());
-            model
-                .chat
-                .app
-                .push_ephemeral_system_plain("plain-after!".to_owned());
-            let mut bytes = Vec::new();
-            let mut terminal =
-                bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 70, 40));
-            super::bcode_runtime_presenter(&mut terminal)
-                .present(&mut model)
-                .expect("mixed frame");
-            let items = model.chat.app.transcript().iter().collect::<Vec<_>>();
-            let first_id = format!("bcode.transcript.item.{}.plain", items[0].id().get());
-            let last_id = format!("bcode.transcript.item.{}.plain", items[2].id().get());
-            let fragments = model.committed_selection.fragments();
-            let first = fragments
-                .iter()
-                .find(|fragment| {
-                    fragment.content_id.as_str() == first_id && fragment.source_range.start == 0
-                })
-                .expect("first plain source");
-            let last = fragments
-                .iter()
-                .find(|fragment| {
-                    fragment.content_id.as_str() == last_id
-                        && fragment.source_range.end == "plain-after".len()
-                })
-                .expect("last plain source");
-            let start = Point::new(first.area.x, first.area.y);
-            let end = Point::new(last.area.x, last.area.y);
-            let reverse_start = Point::new(last.area.right(), last.area.y);
-            let (start, end) = if reverse {
-                (reverse_start, start)
-            } else {
-                (start, end)
-            };
-            for (kind, point) in [
-                (MouseEventKind::Down(MouseButton::Left), start),
-                (MouseEventKind::Drag(MouseButton::Left), end),
-                (MouseEventKind::Up(MouseButton::Left), end),
-            ] {
-                model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
-            }
-            assert_eq!(
-                model.selected_plain_text.as_deref(),
-                Some("plain-before\n\n```\ncode-middle\n```\n\n\nplain-after")
-            );
-            drop(model);
-        }
-    }
-
-    #[tokio::test]
-    async fn production_body_prose_body_selection_checks_each_source_interval() {
-        let source = "```\nfirst\n```\n\nprose between\n\n```\nsecond!\n```\n";
-        let start = source.find("first").expect("first body");
-        let end = source.find("second!").expect("second body") + "second".len();
-        for reverse in [false, true] {
-            assert_eq!(
-                production_code_gesture(source, 70, start..end, reverse),
-                &source[start..end]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn production_mermaid_does_not_steal_following_code_fences() {
-        let source = "```mermaid\ngraph LR; A-->B\n```\n\n```rust\nlet value = 1;\n```\n";
-        let header = source.find("```rust").expect("ordinary header");
-        let body = source.find("let value").expect("ordinary body");
-        let footer = source.rfind("```").expect("ordinary footer");
-        assert_eq!(
-            production_code_gesture(source, 70, header..body, false),
-            "```rust\n"
-        );
-        assert_eq!(
-            production_code_gesture(source, 70, footer..source.len(), false),
-            "```\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn production_code_drag_preserves_source_intervals() {
-        for newline in ["\n", "\r\n"] {
-            let body = format!("first 界e\u{301}{newline}  {newline}\tsecond{newline}third");
-            let source = format!("```text{newline}{body}!{newline}```{newline}\nfollowing prose");
-            let start = source.find("first").expect("body start");
-            for reverse in [false, true] {
-                assert_eq!(
-                    production_code_gesture(&source, 70, 0..start + body.len(), reverse),
-                    &source[..start + body.len()]
-                );
-                let footer_end = source
-                    .find("following prose")
-                    .expect("prose")
-                    .saturating_sub(1);
-                if !reverse {
-                    assert_eq!(
-                        production_code_gesture(&source, 70, start + 2..footer_end, reverse),
-                        &source[start + 2..footer_end]
-                    );
-                }
-                assert_eq!(
-                    production_code_gesture(&source, 70, start..start + body.len(), reverse),
-                    body
-                );
-                assert_eq!(
-                    production_code_gesture(&source, 70, start + 2..start + body.len(), reverse),
-                    &body[2..]
-                );
-            }
-        }
-        let body = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let source = format!("```text\n{body}!\n```\n");
-        for reverse in [false, true] {
-            assert_eq!(
-                production_code_gesture(&source, 24, 8..8 + body.len(), reverse),
-                body
-            );
-        }
-    }
-
-    #[test]
-    fn production_export_rejects_stale_or_unresolved_source() {
-        let item = crate::transcript::TranscriptItem::with_format(
-            "Assistant",
-            "```\nbody\n```\n".to_owned(),
-            bcode_session_view_models::TextFormat::Markdown,
-        );
-        let id = format!(
-            "bcode.transcript.item.{}.markdown.code.0.body",
-            item.id().get()
-        );
-        let endpoint = |offset| bmux_tui::selection::SelectionEndpoint {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            content_id: bmux_tui::selection::SelectionContentId::new(&id),
-            offset,
-            order: u64::try_from(offset).expect("offset"),
-            affinity: bmux_tui::selection::SelectionAffinity::Before,
-            revision: item.revision(),
-        };
-        let mut snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: endpoint(4),
-            focus: endpoint(8),
-            reversed: false,
-            slices: vec![bmux_tui::selection::SelectionSlice {
-                content_id: bmux_tui::selection::SelectionContentId::new(&id),
-                source_range: 4..8,
-                revision: item.revision(),
-            }],
-            visible_highlights: Vec::new(),
-        };
-        assert_eq!(
-            super::export_plain_transcript_selection([&item], &snapshot).as_deref(),
-            Some("body")
-        );
-        assert!(super::export_plain_transcript_selection(std::iter::empty(), &snapshot).is_none());
-        snapshot.slices[0].revision += 1;
-        assert!(super::export_plain_transcript_selection([&item], &snapshot).is_none());
-    }
-
-    #[test]
-    fn markdown_code_body_selection_exports_exact_canonical_bytes() {
-        let source = "```rust\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n```\r\n";
-        let item = super::super::transcript::TranscriptItem::with_format(
-            "Assistant",
-            source.to_owned(),
-            bcode_session_view_models::TextFormat::Markdown,
-        );
-        let item_id = item.id().get();
-        let snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{item_id}.markdown.code.0.body"
-                )),
-                offset: 0,
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::Before,
-                revision: 0,
-            },
-            focus: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{item_id}.markdown.code.0.body"
-                )),
-                offset: source.len(),
-                order: 1,
-                affinity: bmux_tui::selection::SelectionAffinity::After,
-                revision: 0,
-            },
-            reversed: false,
-            slices: vec![bmux_tui::selection::SelectionSlice {
-                content_id: bmux_tui::selection::SelectionContentId::new(format!(
-                    "bcode.transcript.item.{item_id}.markdown.code.0.body"
-                )),
-                source_range: 0..source.len(),
-                revision: 0,
-            }],
-            visible_highlights: Vec::new(),
-        };
-
-        assert_eq!(
-            super::export_plain_transcript_selection(std::iter::once(&item), &snapshot).as_deref(),
-            Some("fn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n")
-        );
-    }
-
-    #[test]
-    fn transcript_export_preserves_indented_and_incomplete_code_source() {
-        for (source, expected) in [
-            ("    first\n\tsecond\n\nnext", "    first\n\tsecond\n\n"),
-            ("```\npartial", "partial"),
-        ] {
-            let item = super::super::transcript::TranscriptItem::with_format(
-                "Assistant",
-                source.to_owned(),
-                bcode_session_view_models::TextFormat::Markdown,
-            );
-            let item_id = item.id().get();
-            let content_id = format!("bcode.transcript.item.{item_id}.markdown.code.0.body");
-            let snapshot = bmux_tui::selection::SelectionSnapshot {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                anchor: bmux_tui::selection::SelectionEndpoint {
-                    scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                    content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                    offset: 0,
-                    order: 0,
-                    affinity: bmux_tui::selection::SelectionAffinity::Before,
-                    revision: 0,
-                },
-                focus: bmux_tui::selection::SelectionEndpoint {
-                    scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                    content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                    offset: source.len(),
-                    order: 0,
-                    affinity: bmux_tui::selection::SelectionAffinity::After,
-                    revision: 0,
-                },
-                reversed: false,
-                slices: vec![bmux_tui::selection::SelectionSlice {
-                    content_id: bmux_tui::selection::SelectionContentId::new(content_id),
-                    source_range: 0..source.len(),
-                    revision: 0,
-                }],
-                visible_highlights: Vec::new(),
-            };
-            assert_eq!(
-                super::export_plain_transcript_selection(std::iter::once(&item), &snapshot)
-                    .as_deref(),
-                Some(expected)
-            );
-        }
-    }
-
-    #[test]
-    fn markdown_code_whole_selection_exports_original_fences_and_language() {
-        let source = "```rust\nfn main() {}\n```\n";
-        let item = super::super::transcript::TranscriptItem::with_format(
-            "Assistant",
-            source.to_owned(),
-            bcode_session_view_models::TextFormat::Markdown,
-        );
-        let item_id = item.id().get();
-        let content_id = format!("bcode.transcript.item.{item_id}.markdown.code.0.whole");
-        let snapshot = bmux_tui::selection::SelectionSnapshot {
-            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-            anchor: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                offset: 0,
-                order: 0,
-                affinity: bmux_tui::selection::SelectionAffinity::Before,
-                revision: 0,
-            },
-            focus: bmux_tui::selection::SelectionEndpoint {
-                scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
-                content_id: bmux_tui::selection::SelectionContentId::new(content_id.clone()),
-                offset: source.len(),
-                order: 1,
-                affinity: bmux_tui::selection::SelectionAffinity::After,
-                revision: 0,
-            },
-            reversed: false,
-            slices: vec![bmux_tui::selection::SelectionSlice {
-                content_id: bmux_tui::selection::SelectionContentId::new(content_id),
-                source_range: 0..source.len(),
-                revision: 0,
-            }],
-            visible_highlights: Vec::new(),
-        };
-
-        assert_eq!(
-            super::export_plain_transcript_selection(std::iter::once(&item), &snapshot).as_deref(),
-            Some(source)
-        );
-    }
-
-    #[test]
-    fn plain_transcript_rows_map_to_item_local_utf8_offsets_only_when_exact() {
-        assert_eq!(
-            super::transcript_plain_row_source_ranges("a界\nsecond", 2),
-            vec![Some(0..4), Some(5..11)]
-        );
-        assert_eq!(
-            super::transcript_plain_row_source_ranges("wrapped source", 2),
-            vec![None, None]
-        );
-    }
-
-    #[test]
-    fn transcript_parent_scope_uses_committed_body_geometry() {
-        let body = bmux_tui::geometry::Rect::new(3, 4, 20, 8);
-        let mut scene = bmux_tui::selection::SelectionScene::new();
-
-        super::ensure_transcript_parent_scope(&mut scene, body);
-        super::ensure_transcript_parent_scope(&mut scene, body);
-
-        assert_eq!(scene.scopes().len(), 1);
-        assert_eq!(scene.scopes()[0].id.as_str(), "bcode.transcript");
-        assert_eq!(scene.scopes()[0].area, body);
-        assert_eq!(scene.scopes()[0].initiation_area, body);
-    }
-
-    #[tokio::test]
     async fn root_model_starts_with_empty_committed_selection_state() {
         let model = root_test_model();
 
         assert_eq!(model.committed_selection.scopes(), []);
         assert_eq!(model.committed_selection.fragments(), []);
-        assert_eq!(
-            model.transcript_selection.phase(),
-            bmux_tui::selection::SelectionGesturePhase::Idle
-        );
         drop(model);
-    }
-
-    fn root_filesystem_plugin_host() -> bcode_plugin::PluginHost {
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
-        )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
-            &bcode_plugin::PluginSelection::all_enabled(),
-        )
-        .expect("static filesystem plugin manifest should parse");
-        bcode_plugin::PluginHost::load_static_plugins(&selected)
-            .expect("static filesystem plugin should load")
-    }
-
-    #[derive(Debug)]
-    struct RecordedRootFrame {
-        text: String,
-        invocation_primary_items: usize,
-        invocation_item_ids: Vec<bcode_session_view_models::TranscriptViewItemId>,
-    }
-
-    struct RecordingRootPresenter {
-        frames: Vec<RecordedRootFrame>,
-    }
-
-    impl RecordingRootPresenter {
-        const fn new() -> Self {
-            Self { frames: Vec::new() }
-        }
-    }
-
-    impl bmux_tui_runtime::Presenter<super::BcodeRuntimeModel> for RecordingRootPresenter {
-        type Error = super::TuiError;
-
-        fn reset(&mut self, _reason: bmux_tui_runtime::ResetReason) {}
-
-        fn present(
-            &mut self,
-            program: &mut super::BcodeRuntimeModel,
-        ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
-            let area = bmux_tui::geometry::Rect::new(0, 0, 100, 40);
-            let mut bytes = Vec::new();
-            let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-            program.presentation_damage = bmux_tui::damage::Damage::Full;
-            let report = bmux_tui_runtime::Presenter::present(
-                &mut super::bcode_runtime_presenter(&mut terminal),
-                program,
-            )?;
-            let text = terminal
-                .retained_buffer()
-                .map_or_else(String::new, |buffer| {
-                    (0..buffer.area().height)
-                        .filter_map(|row| buffer.row_symbols(row))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                });
-            let invocation_item_ids = program
-                .chat
-                .app
-                .session_view_snapshot()
-                .transcript
-                .items
-                .iter()
-                .filter(|item| {
-                    matches!(
-                        item.kind,
-                        bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft { .. }
-                            | bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { .. }
-                    )
-                })
-                .map(|item| item.id.clone())
-                .collect::<Vec<_>>();
-            let invocation_primary_items = invocation_item_ids.len();
-            self.frames.push(RecordedRootFrame {
-                text,
-                invocation_primary_items,
-                invocation_item_ids,
-            });
-            Ok(report)
-        }
-    }
-
-    #[tokio::test]
-    async fn status_partial_presentation_matches_full_production_presenter() {
-        use bmux_tui_runtime::Presenter;
-
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut partial_model = root_test_model();
-        let mut full_model = root_test_model();
-        let mut partial_bytes = Vec::new();
-        let mut full_bytes = Vec::new();
-        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
-        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
-        {
-            super::bcode_runtime_presenter(&mut partial_terminal)
-                .present(&mut partial_model)
-                .expect("initial partial frame");
-            super::bcode_runtime_presenter(&mut full_terminal)
-                .present(&mut full_model)
-                .expect("initial full frame");
-        }
-
-        for model in [&mut partial_model, &mut full_model] {
-            model.chat.app.set_status("timer advanced".to_owned());
-            model.invalidation = super::super::invalidation::UiInvalidation::Paint;
-        }
-        partial_model.presentation_damage = partial_model.select_presentation_damage(
-            super::super::invalidation::UiInvalidation::Paint,
-            &[super::super::app::TemporalDamage::Status],
-        );
-        partial_model.fast_temporal_presentation = true;
-        full_model.presentation_damage = bmux_tui::damage::Damage::Full;
-
-        super::bcode_runtime_presenter(&mut partial_terminal)
-            .present(&mut partial_model)
-            .expect("partial status frame");
-        super::bcode_runtime_presenter(&mut full_terminal)
-            .present(&mut full_model)
-            .expect("full status frame");
-        // Keep teardown (which can join workers) out of the paired frame captures.
-        drop((partial_model, full_model));
-
-        assert_eq!(
-            partial_terminal.retained_buffer(),
-            full_terminal.retained_buffer()
-        );
-        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
-        assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
     }
 
     // Keep stationary modal transitions and their failed-flush authority checks together.
@@ -14306,364 +8202,6 @@ mod tests {
     }
 
     // Keep modal open, temporal reuse, reset, and close assertions in one lifecycle scenario.
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn modal_foreground_owns_input_and_metadata_across_frames() {
-        use bmux_tui_runtime::{Presenter, Program};
-        let mut model = root_test_model();
-        let surface = question_surface_for_root_test(model.settings.keymap()).await;
-        model
-            .loop_state
-            .install_interactive_surface_for_test(surface);
-        model.chat.app.replace_composer_with("preserved draft");
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("chat");
-        let background_targets: Vec<_> = terminal
-            .hits()
-            .regions()
-            .iter()
-            .map(|hit| hit.id.clone())
-            .collect();
-        model.loop_state.open_command_palette(&mut model.chat);
-        model.synchronize_screen();
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("modal");
-        assert!(
-            terminal
-                .hits()
-                .regions()
-                .iter()
-                .all(|hit| hit.id.as_str() != "composer")
-        );
-        assert!(
-            terminal
-                .hits()
-                .regions()
-                .iter()
-                .all(|hit| { !background_targets.contains(&hit.id) })
-        );
-        assert_eq!(
-            terminal
-                .focus()
-                .active_scope()
-                .map(bmux_tui::hit::HitId::as_str),
-            Some("bcode.foreground")
-        );
-        assert!(terminal.hits().regions().iter().all(|hit| {
-            hit.focus_scope
-                .as_ref()
-                .is_none_or(|scope| Some(scope) == terminal.focus().active_scope())
-        }));
-        assert_eq!(terminal.selection().fragments(), []);
-        assert_eq!(terminal.image_scene().placements().len(), 0);
-        let snapshot = terminal.retained_buffer().cloned();
-        let cursor = terminal.cursor();
-        model
-            .update(bmux_tui_runtime::RuntimeEvent::Terminal(
-                bmux_tui::event::Event::Paste("must not reach draft".into()),
-            ))
-            .expect("modal paste");
-        assert_eq!(model.chat.app.composer().text(), "preserved draft");
-        let frozen_work = model
-            .loop_state
-            .active_interactive_surface_work_shape_for_test();
-        for _ in 0..3 {
-            model.presentation_damage = model.select_presentation_damage(
-                super::super::invalidation::UiInvalidation::Paint,
-                &[super::super::app::TemporalDamage::Composer],
-            );
-            model.fast_temporal_presentation = true;
-            super::bcode_runtime_presenter(&mut terminal)
-                .present(&mut model)
-                .expect("modal timer");
-            assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
-            assert_eq!(terminal.cursor(), cursor);
-            assert_eq!(terminal.selection().fragments(), []);
-        }
-        assert_eq!(
-            model
-                .loop_state
-                .active_interactive_surface_work_shape_for_test(),
-            frozen_work
-        );
-        terminal.reset();
-        model.fast_temporal_presentation = true;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("reset modal");
-        assert_eq!(terminal.retained_buffer(), snapshot.as_ref());
-        assert_eq!(terminal.cursor(), cursor);
-        let escape = bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
-            key: bmux_keyboard::KeyCode::Escape,
-            modifiers: bmux_keyboard::Modifiers::NONE,
-        });
-        model
-            .update(bmux_tui_runtime::RuntimeEvent::Terminal(escape))
-            .expect("close modal");
-        assert!(!model.loop_state.has_command_palette());
-        assert!(model.loop_state.has_interactive_surface());
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("restored chat");
-        assert!(
-            terminal
-                .hits()
-                .regions()
-                .iter()
-                .any(|hit| hit.id.as_str() == "composer")
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn modal_resize_and_replacement_reconcile_foreground_scene() {
-        use bmux_tui_runtime::Presenter;
-        let mut model = root_test_model();
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(
-            &mut bytes,
-            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
-        );
-        model.loop_state.open_command_palette(&mut model.chat);
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("palette");
-        model.loop_state.open_session_picker(&mut model.chat);
-        assert_eq!(
-            model.loop_state.foreground(),
-            Some(crate::foreground::Foreground::Sessions)
-        );
-        model.synchronize_screen();
-        terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 100, 30));
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        model.fast_temporal_presentation = true;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("resized sessions");
-        let partial = terminal.retained_buffer().cloned();
-        let hits = terminal.hits().clone();
-        let semantics = terminal.semantics().clone();
-        model.presentation_damage = bmux_tui::damage::Damage::Full;
-        model.fast_temporal_presentation = false;
-        super::bcode_runtime_presenter(&mut terminal)
-            .present(&mut model)
-            .expect("reference sessions");
-        assert_eq!(terminal.retained_buffer(), partial.as_ref());
-        assert_eq!(terminal.hits(), &hits);
-        assert_eq!(terminal.semantics(), &semantics);
-        assert!(
-            terminal
-                .hits()
-                .regions()
-                .iter()
-                .all(|hit| hit.id.as_str() != "composer")
-        );
-        drop(model);
-    }
-
-    #[tokio::test]
-    async fn sessions_cursor_frames_preserve_foreground_composition() {
-        use bmux_tui_runtime::Presenter;
-
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut partial = root_test_model();
-        let mut full = root_test_model();
-        for model in [&mut partial, &mut full] {
-            model.loop_state.open_session_picker(&mut model.chat);
-        }
-        let mut partial_bytes = Vec::new();
-        let mut full_bytes = Vec::new();
-        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
-        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
-        super::bcode_runtime_presenter(&mut partial_terminal)
-            .present(&mut partial)
-            .expect("initial picker");
-        super::bcode_runtime_presenter(&mut full_terminal)
-            .present(&mut full)
-            .expect("initial reference picker");
-        let picker_cursor = partial_terminal.cursor();
-        for tick in 1..=4 {
-            let now = std::time::Instant::now() + std::time::Duration::from_secs(tick);
-            for model in [&mut partial, &mut full] {
-                let key = model
-                    .chat
-                    .app
-                    .invalidation_requests(now, std::time::SystemTime::now())
-                    .into_iter()
-                    .next()
-                    .expect("cursor timer")
-                    .key;
-                model.chat.app.handle_invalidations(&[key], now);
-            }
-            partial.presentation_damage = partial.select_presentation_damage(
-                super::super::invalidation::UiInvalidation::Paint,
-                &[super::super::app::TemporalDamage::Composer],
-            );
-            partial.fast_temporal_presentation = true;
-            full.presentation_damage = bmux_tui::damage::Damage::Full;
-            super::bcode_runtime_presenter(&mut partial_terminal)
-                .present(&mut partial)
-                .expect("partial picker");
-            super::bcode_runtime_presenter(&mut full_terminal)
-                .present(&mut full)
-                .expect("full picker");
-            assert_eq!(
-                partial_terminal.retained_buffer(),
-                full_terminal.retained_buffer()
-            );
-            assert_eq!(partial_terminal.cursor(), picker_cursor);
-            assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
-            assert_eq!(partial_terminal.semantics(), full_terminal.semantics());
-            assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
-        }
-        drop((partial, full));
-    }
-
-    #[tokio::test]
-    async fn cursor_partial_presentation_matches_full_production_presenter() {
-        use bmux_tui_runtime::Presenter;
-
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut partial_model = root_test_model();
-        let mut full_model = root_test_model();
-        let mut partial_bytes = Vec::new();
-        let mut full_bytes = Vec::new();
-        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
-        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
-
-        {
-            let mut presenter = super::bcode_runtime_presenter(&mut partial_terminal);
-            presenter
-                .present(&mut partial_model)
-                .expect("initial partial-side frame presents");
-        }
-        {
-            let mut presenter = super::bcode_runtime_presenter(&mut full_terminal);
-            presenter
-                .present(&mut full_model)
-                .expect("initial full-side frame presents");
-        }
-
-        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        for model in [&mut partial_model, &mut full_model] {
-            let cursor_key = model
-                .chat
-                .app
-                .invalidation_requests(now, std::time::SystemTime::now())
-                .into_iter()
-                .next()
-                .expect("cursor invalidation is always scheduled")
-                .key;
-            assert_eq!(
-                model.chat.app.handle_invalidations(&[cursor_key], now),
-                super::super::invalidation::UiInvalidation::Paint
-            );
-            model.invalidation = super::super::invalidation::UiInvalidation::Paint;
-        }
-        let temporal_damage = [super::super::app::TemporalDamage::Composer];
-        partial_model.presentation_damage = partial_model.select_presentation_damage(
-            super::super::invalidation::UiInvalidation::Paint,
-            &temporal_damage,
-        );
-        partial_model.fast_temporal_presentation = true;
-        full_model.presentation_damage = bmux_tui::damage::Damage::Full;
-
-        {
-            let mut presenter = super::bcode_runtime_presenter(&mut partial_terminal);
-            presenter
-                .present(&mut partial_model)
-                .expect("cursor partial frame presents");
-        }
-        {
-            let mut presenter = super::bcode_runtime_presenter(&mut full_terminal);
-            presenter
-                .present(&mut full_model)
-                .expect("cursor full frame presents");
-        }
-        drop((partial_model, full_model));
-
-        assert_eq!(
-            partial_terminal.retained_buffer(),
-            full_terminal.retained_buffer()
-        );
-        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
-        assert_eq!(partial_terminal.image_scene(), full_terminal.image_scene());
-        for point in [
-            bmux_tui::geometry::Point::new(0, 0),
-            bmux_tui::geometry::Point::new(2, 22),
-            bmux_tui::geometry::Point::new(79, 23),
-        ] {
-            assert_eq!(
-                partial_terminal
-                    .hits()
-                    .hit_test(point)
-                    .map(|hit| hit.id().as_str().to_owned()),
-                full_terminal
-                    .hits()
-                    .hit_test(point)
-                    .map(|hit| hit.id().as_str().to_owned())
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn presentation_damage_localizes_stable_temporal_regions() {
-        use bmux_tui_runtime::Presenter;
-
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut model = root_test_model();
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        {
-            let mut presenter = super::bcode_runtime_presenter(&mut terminal);
-            presenter
-                .present(&mut model)
-                .expect("initial frame presents");
-        }
-
-        for temporal_damage in [
-            super::super::app::TemporalDamage::Composer,
-            super::super::app::TemporalDamage::Status,
-            super::super::app::TemporalDamage::Transcript,
-        ] {
-            assert!(matches!(
-                model.select_presentation_damage(
-                    super::super::invalidation::UiInvalidation::Paint,
-                    &[temporal_damage],
-                ),
-                bmux_tui::damage::Damage::Regions(_)
-            ));
-        }
-        assert!(
-            model
-                .select_presentation_damage(
-                    super::super::invalidation::UiInvalidation::Paint,
-                    &[super::super::app::TemporalDamage::Full],
-                )
-                .is_full()
-        );
-        for invalidation in [
-            super::super::invalidation::UiInvalidation::Items,
-            super::super::invalidation::UiInvalidation::Structural,
-            super::super::invalidation::UiInvalidation::Full,
-        ] {
-            assert!(
-                model
-                    .select_presentation_damage(
-                        invalidation,
-                        &[super::super::app::TemporalDamage::Status],
-                    )
-                    .is_full()
-            );
-        }
-        drop(model);
-    }
 
     #[test]
     fn ordered_note_queue_releases_one_per_session_until_typed_completion() {
@@ -14696,7 +8234,7 @@ mod tests {
     ) -> super::super::session_flow::ActiveChat {
         let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
         super::super::session_flow::ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(None, &[], input_history, false),
+            app: super::super::app::BmuxApp::new_with_history(None, &[], input_history),
             agents: super::super::session_flow::AgentCatalog::default(),
             attachment: super::super::session_flow::ChatSessionAttachment::Draft,
             event_sender,
@@ -14713,12 +8251,7 @@ mod tests {
     ) -> super::super::session_flow::ActiveChat {
         let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
         super::super::session_flow::ActiveChat {
-            app: super::super::app::BmuxApp::new_with_history(
-                Some(session_id),
-                history,
-                &[],
-                false,
-            ),
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), history, &[]),
             agents: super::super::session_flow::AgentCatalog::default(),
             attachment: super::super::session_flow::ChatSessionAttachment::Attached { session_id },
             event_sender,
@@ -15513,198 +9046,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stable_interaction_redraw_matches_full_presentation() {
-        use bmux_tui::{geometry::Rect, paint::PaintCx, prelude::Line};
-        struct CountingSurface(usize);
-
-        impl bcode_plugin_sdk::tui::PluginTuiSurface for CountingSurface {
-            fn id(&self) -> &'static str {
-                "counting-test"
-            }
-
-            fn title(&self) -> &'static str {
-                "Counting test"
-            }
-
-            fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
-                frame.write_line(
-                    bmux_tui::paint::LocalRect::terminal(area),
-                    &Line::from(self.0.to_string()),
-                );
-            }
-
-            fn handle_event(
-                &mut self,
-                event: &bmux_tui::event::Event,
-                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
-                if matches!(event, bmux_tui::event::Event::Key(_)) {
-                    self.0 = self.0.saturating_add(1);
-                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-                } else {
-                    bcode_plugin_sdk::tui::PluginTuiAction::None
-                }
-            }
-        }
-
-        fn model() -> super::BcodeRuntimeModel {
-            let mut chat = root_test_chat();
-            let mut config = chat.app.tui_config().clone();
-            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
-            chat.app.apply_tui_config(config);
-            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-                std::path::PathBuf::from("."),
-                &[],
-            );
-            let client = bcode_client::BcodeClient::default_endpoint();
-            let passive_client = client
-                .clone()
-                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-            let mut loop_state =
-                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-            loop_state.install_interactive_surface_for_test(
-                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
-                    "counting-interaction",
-                    Box::new(CountingSurface(0)),
-                    settings.keymap(),
-                ),
-            );
-            super::BcodeRuntimeModel::new(chat, settings, loop_state)
-        }
-
-        let area = Rect::new(0, 0, 80, 24);
-        let mut partial = model();
-        let mut full = model();
-        let mut partial_bytes = Vec::new();
-        let mut full_bytes = Vec::new();
-        let mut partial_terminal = bmux_tui::terminal::Terminal::new(&mut partial_bytes, area);
-        let mut full_terminal = bmux_tui::terminal::Terminal::new(&mut full_bytes, area);
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut partial_terminal),
-            &mut partial,
-        )
-        .expect("initial partial presentation");
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut full_terminal),
-            &mut full,
-        )
-        .expect("initial full presentation");
-
-        let event = || {
-            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
-                bmux_keyboard::KeyStroke {
-                    key: bmux_keyboard::KeyCode::Down,
-                    modifiers: bmux_keyboard::Modifiers::NONE,
-                },
-            ))
-        };
-        bmux_tui_runtime::Program::update(&mut partial, event()).expect("partial input");
-        bmux_tui_runtime::Program::update(&mut full, event()).expect("full input");
-        assert!(partial.fast_temporal_presentation);
-        full.presentation_damage = bmux_tui::damage::Damage::Full;
-        full.fast_temporal_presentation = false;
-
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut partial_terminal),
-            &mut partial,
-        )
-        .expect("partial redraw");
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut full_terminal),
-            &mut full,
-        )
-        .expect("full redraw");
-        drop((partial, full));
-
-        assert_eq!(
-            partial_terminal.retained_buffer(),
-            full_terminal.retained_buffer()
-        );
-        assert_eq!(partial_terminal.cursor(), full_terminal.cursor());
-        assert_eq!(partial_terminal.hits(), full_terminal.hits());
-    }
-
-    #[tokio::test]
-    async fn stable_question_redraw_is_independent_of_unrelated_transcript_length() {
-        async fn model(history_items: usize) -> super::BcodeRuntimeModel {
-            let session_id = bcode_session_models::SessionId::new();
-            let history = (1..=u64::try_from(history_items).unwrap_or(u64::MAX))
-                .map(|sequence| bcode_session_models::SessionEvent {
-                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    sequence,
-                    timestamp_ms: sequence,
-                    session_id,
-                    provenance: None,
-                    kind: bcode_session_models::SessionEventKind::UserMessage {
-                        client_id: bcode_session_models::ClientId::new(),
-                        text: format!("unrelated transcript message {sequence}"),
-                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                    },
-                })
-                .collect::<Vec<_>>();
-            let mut model = root_test_model_with_history(session_id, &history);
-            let mut config = model.chat.app.tui_config().clone();
-            config.interactions.placement = bcode_config::TuiInteractionPlacement::Pinned;
-            model.chat.app.apply_tui_config(config);
-            let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
-            model.loop_state.install_interactive_surface_for_test(
-                question_surface_with_questions_for_root_test(
-                    &keymap,
-                    serde_json::json!([{
-                        "header": null,
-                        "question": "Choose one",
-                        "options": [
-                            {"label": "One", "value": "one", "description": null},
-                            {"label": "Two", "value": "two", "description": "Second choice"}
-                        ],
-                        "control": "radio",
-                        "selection_mode": "single",
-                        "custom": false,
-                        "custom_mode": "additional",
-                        "required": true
-                    }]),
-                )
-                .await,
-            );
-            model
-        }
-
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut short = Box::pin(model(0)).await;
-        let mut long = Box::pin(model(1_000)).await;
-        let mut short_bytes = Vec::new();
-        let mut long_bytes = Vec::new();
-        let mut short_terminal = bmux_tui::terminal::Terminal::new(&mut short_bytes, area);
-        let mut long_terminal = bmux_tui::terminal::Terminal::new(&mut long_bytes, area);
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut short_terminal),
-            &mut short,
-        )
-        .expect("short initial frame");
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut long_terminal),
-            &mut long,
-        )
-        .expect("long initial frame");
-
-        let event = || {
-            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
-                bmux_keyboard::KeyStroke {
-                    key: bmux_keyboard::KeyCode::Down,
-                    modifiers: bmux_keyboard::Modifiers::NONE,
-                },
-            ))
-        };
-        bmux_tui_runtime::Program::update(&mut short, event()).expect("short question input");
-        bmux_tui_runtime::Program::update(&mut long, event()).expect("long question input");
-        assert!(short.fast_temporal_presentation);
-        assert!(long.fast_temporal_presentation);
-        assert_eq!(short.presentation_damage, long.presentation_damage);
-        drop(short);
-        drop(long);
-    }
-
-    #[tokio::test]
     #[ignore = "manual already-built question interaction committed-presentation latency probe"]
     #[allow(clippy::too_many_lines)] // The emitted artifact keeps timing and work-shape attribution together.
     async fn question_interaction_to_committed_presentation_latency_report() {
@@ -15818,216 +9159,6 @@ mod tests {
                 <= LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0
         );
         assert_eq!(full_repaints, 0);
-    }
-
-    #[tokio::test]
-    #[ignore = "manual inline-question transcript-scroll committed-presentation probe"]
-    #[allow(clippy::too_many_lines)] // The probe keeps fixture setup and per-frame attribution together.
-    async fn inline_question_transcript_scroll_performance_report() {
-        const SAMPLES: usize = 30;
-        const LOCKED_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(17);
-        let session_id = bcode_session_models::SessionId::new();
-        let history = (1..=1_000)
-            .map(|sequence| bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence,
-                timestamp_ms: sequence,
-                session_id,
-                provenance: None,
-                kind: bcode_session_models::SessionEventKind::UserMessage {
-                    client_id: bcode_session_models::ClientId::new(),
-                    text: format!("scroll fixture transcript message {sequence}"),
-                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                },
-            })
-            .collect::<Vec<_>>();
-        let mut model = root_test_model_with_history(session_id, &history);
-        let mut config = model.chat.app.tui_config().clone();
-        config.interactions.placement = bcode_config::TuiInteractionPlacement::Transcript;
-        model.chat.app.apply_tui_config(config);
-        let questions = (0..20)
-            .map(|index| {
-                serde_json::json!({
-                    "header": format!("Question {index}"),
-                    "question": format!(
-                        "Choose an answer for a deliberately long question number {index} while scrolling"
-                    ),
-                    "options": [
-                        {"label": "One long answer", "value": "one", "description": "A deliberately long option description that wraps in the inline viewport"},
-                        {"label": "Two long answer", "value": "two", "description": "Another deliberately long option description that wraps in the inline viewport"}
-                    ],
-                    "control": "radio",
-                    "selection_mode": "single",
-                    "custom": false,
-                    "custom_mode": "additional",
-                    "required": true
-                })
-            })
-            .collect::<Vec<_>>();
-        let question_snapshot = serde_json::json!({ "questions": questions });
-        model.chat.app.set_pending_interactions(vec![
-            bcode_session_view_models::InteractionViewSummary {
-                interaction_id: "question-root-test".to_owned(),
-                producer_id: Some("bcode.question".to_owned()),
-                exchange_schema: Some("bcode.question.request".to_owned()),
-                exchange_schema_version: Some(1),
-                kind: "bcode.question".to_owned(),
-                tool_call_id: Some("call-question-scroll".to_owned()),
-                title: Some("Question".to_owned()),
-                required: true,
-                snapshot: Some(question_snapshot.clone()),
-                state: bcode_session_view_models::InteractionViewState::Pending,
-                status_detail: None,
-                resolved: false,
-                resolution: None,
-            },
-        ]);
-        let keymap = super::super::keymap::BmuxKeyMap::from_config(model.chat.app.tui_config());
-        model.loop_state.install_interactive_surface_for_test(
-            question_surface_with_questions_for_root_test(
-                &keymap,
-                question_snapshot["questions"].clone(),
-            )
-            .await,
-        );
-        let area = bmux_tui::geometry::Rect::new(0, 0, 80, 24);
-        let mut bytes = Vec::new();
-        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
-        bmux_tui_runtime::Presenter::present(
-            &mut super::bcode_runtime_presenter(&mut terminal),
-            &mut model,
-        )
-        .expect("initial inline question scroll frame");
-
-        let initial_geometry = model.loop_state.active_interactive_surface_geometry();
-        let surface_work_shape = model
-            .loop_state
-            .active_interactive_surface_work_shape_for_test();
-        let mut total_samples = Vec::with_capacity(SAMPLES);
-        let mut draw_samples = Vec::with_capacity(SAMPLES);
-        let mut changed_cells = Vec::with_capacity(SAMPLES);
-        let mut scroll_offsets = Vec::with_capacity(SAMPLES);
-        let mut fast_path_frames = 0_usize;
-        let mut full_repaints = 0_usize;
-        for index in 0..SAMPLES {
-            let started = std::time::Instant::now();
-            let mouse = bmux_tui::event::MouseEvent::new(
-                if index.is_multiple_of(2) {
-                    bmux_tui::event::MouseEventKind::ScrollUp
-                } else {
-                    bmux_tui::event::MouseEventKind::ScrollDown
-                },
-                bmux_tui::geometry::Point::new(2, 2),
-            );
-            bmux_tui_runtime::Program::update(
-                &mut model,
-                bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Mouse(mouse)),
-            )
-            .expect("inline question scroll input");
-            fast_path_frames =
-                fast_path_frames.saturating_add(usize::from(model.fast_temporal_presentation));
-            scroll_offsets.push(model.chat.app.scroll_offset());
-            let draw_started = std::time::Instant::now();
-            let report = bmux_tui_runtime::Presenter::present(
-                &mut super::bcode_runtime_presenter(&mut terminal),
-                &mut model,
-            )
-            .expect("inline question scroll presentation");
-            total_samples.push(started.elapsed());
-            draw_samples.push(draw_started.elapsed());
-            changed_cells.push(report.changed_cells);
-            full_repaints = full_repaints.saturating_add(usize::from(report.full_repaint));
-        }
-        drop(model);
-        let total = latency_summary(&total_samples);
-        let draw = latency_summary(&draw_samples);
-        let within_budget = total["p99_ms"].as_f64().expect("numeric p99")
-            <= LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0;
-        println!(
-            "{}",
-            serde_json::json!({
-                "kind": "bcode_inline_question_transcript_scroll_performance",
-                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-                "sample_count": SAMPLES,
-                "resident_transcript_events": history.len(),
-                "initial_surface_geometry": format!("{initial_geometry:?}"),
-                "surface_work_shape": surface_work_shape,
-                "locked_p99_budget_ms": LOCKED_FRAME_BUDGET.as_secs_f64() * 1_000.0,
-                "total_latency": total,
-                "draw_latency": draw,
-                "changed_cells": changed_cells,
-                "scroll_offsets": scroll_offsets,
-                "full_repaints": full_repaints,
-                "fast_path_frames": fast_path_frames,
-                "within_budget": within_budget
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn stable_interaction_redraw_falls_back_without_committed_geometry() {
-        struct RedrawSurface;
-
-        impl bcode_plugin_sdk::tui::PluginTuiSurface for RedrawSurface {
-            fn id(&self) -> &'static str {
-                "redraw-test"
-            }
-
-            fn title(&self) -> &'static str {
-                "Redraw test"
-            }
-
-            fn render(
-                &mut self,
-                _area: bmux_tui::geometry::Rect,
-                _frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
-            ) {
-            }
-
-            fn handle_event(
-                &mut self,
-                _event: &bmux_tui::event::Event,
-                _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
-            ) -> bcode_plugin_sdk::tui::PluginTuiAction {
-                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-            }
-        }
-
-        let mut model = {
-            let chat = root_test_chat();
-            let settings = super::super::chat_loop::TuiRuntimeSettings::bootstrap(
-                std::path::PathBuf::from("."),
-                &[],
-            );
-            let client = bcode_client::BcodeClient::default_endpoint();
-            let passive_client = client
-                .clone()
-                .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-            let mut loop_state =
-                super::super::chat_loop::ChatLoopState::new(&client, &passive_client, false);
-            loop_state.install_interactive_surface_for_test(
-                super::super::interactive_surface::InteractiveSurfaceState::from_surface_for_test(
-                    "redraw-interaction",
-                    Box::new(RedrawSurface),
-                    settings.keymap(),
-                ),
-            );
-            super::BcodeRuntimeModel::new(chat, settings, loop_state)
-        };
-        bmux_tui_runtime::Program::update(
-            &mut model,
-            bmux_tui_runtime::RuntimeEvent::Terminal(bmux_tui::event::Event::Key(
-                bmux_keyboard::KeyStroke {
-                    key: bmux_keyboard::KeyCode::Down,
-                    modifiers: bmux_keyboard::Modifiers::NONE,
-                },
-            )),
-        )
-        .expect("redraw without committed geometry");
-
-        assert!(model.presentation_damage.is_full());
-        assert!(!model.fast_temporal_presentation);
-        drop(model);
     }
 
     #[tokio::test]
@@ -16430,408 +9561,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn managed_runtime_commits_progressive_filesystem_write_frames_without_external_wakeup() {
-        let session_id = bcode_session_models::SessionId::new();
-        let (runtime, handle) = {
-            let mut model = root_test_model();
-            model.chat.mark_attached(session_id);
-            model.chat.app =
-                super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-            model
-                .chat
-                .app
-                .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
-            let config = bmux_tui_runtime::RuntimeConfig {
-                frame_interval: None,
-                ..bmux_tui_runtime::RuntimeConfig::default()
-            };
-            bmux_tui_runtime::Runtime::new(model, RecordingRootPresenter::new(), config)
-        };
-        let draft = |revision, text: &str| {
-            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
-                bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
-                    session_id,
-                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
-                        event: bcode_session_models::ToolRequestDraftEvent {
-                            output_position: None,
-                            turn_id: "turn-live".to_owned(),
-                            tool_call_id: "call-write".to_owned(),
-                            tool_name: "filesystem.write".to_owned(),
-                            producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                            schema: "bcode.filesystem.request-draft.write".to_owned(),
-                            schema_version: 1,
-                            placement: bcode_session_models::ToolContributionPlacement::Request,
-                            generation: 1,
-                            revision,
-                            operation:
-                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                                    start_offset: 0,
-                                    text: text.to_owned(),
-                                },
-                            argument_bytes: text.len(),
-                            truncated: false,
-                        },
-                    },
-                }),
-            ))
-        };
-        let durable = |sequence, kind| {
-            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
-                bcode_ipc::Event::Session(bcode_session_models::SessionEvent {
-                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    sequence,
-                    timestamp_ms: sequence,
-                    session_id,
-                    provenance: None,
-                    kind,
-                }),
-            ))
-        };
-        for update in [
-            draft(1, r#"{"path":"src/lib.rs","contents":"first"}"#),
-            draft(2, r#"{"path":"src/lib.rs","contents":"first second"}"#),
-            durable(
-                1,
-                bcode_session_models::SessionEventKind::ToolCallRequested {
-                    tool_call_id: "call-write".to_owned(),
-                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                    tool_name: "filesystem.write".to_owned(),
-                    arguments_json: r#"{"path":"src/lib.rs","contents":"first second"}"#.to_owned(),
-                    working_directory: None,
-                },
-            ),
-            durable(
-                2,
-                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                    record: bcode_session_models::ToolInvocationResultRecord {
-                        invocation_id: "call-write".to_owned(),
-                        model_output: "wrote 12 bytes".to_owned(),
-                        is_error: false,
-                        presentation: None,
-                        result: None,
-                        content: Vec::new(),
-                    },
-                },
-            ),
-        ] {
-            assert!(
-                handle
-                    .try_send(super::BcodeRuntimeMessage::SessionStream(Box::new(update)))
-                    .is_ok(),
-                "session update fits"
-            );
-        }
-        let runtime_task = tokio::spawn(runtime.run());
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while handle.stats().frames_presented < 4 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("both draft and canonical handoff frames commit without external wakeup");
-        assert_eq!(handle.stats().frames_presented, 4);
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(
-            handle.stats().frames_presented,
-            4,
-            "runtime remains idle after the handoff queue drains"
-        );
-        handle
-            .try_send_terminal(bmux_tui::event::Event::Key(
-                bmux_keyboard::KeyStroke::with_modifiers(
-                    bmux_keyboard::KeyCode::Char('d'),
-                    bmux_keyboard::Modifiers {
-                        ctrl: true,
-                        ..bmux_keyboard::Modifiers::NONE
-                    },
-                ),
-            ))
-            .expect("exit input fits");
-
-        let output = tokio::time::timeout(std::time::Duration::from_secs(2), runtime_task)
-            .await
-            .expect("managed runtime exits")
-            .expect("runtime task joins")
-            .unwrap_or_else(|_| panic!("managed runtime succeeds"));
-        let first = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| frame.text.contains("first") && !frame.text.contains("first second"))
-            .expect("first draft committed");
-        let second = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| frame.text.contains("first second"))
-            .expect("second draft committed");
-        let result = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| frame.text.contains("wrote 12 bytes"))
-            .expect("canonical result committed");
-        assert!(
-            first < second && second < result,
-            "frames: {:?}",
-            output.presenter.frames
-        );
-        assert_eq!(
-            output.presenter.frames[result]
-                .text
-                .matches("wrote 12 bytes")
-                .count(),
-            1
-        );
-        assert!(!output.presenter.frames[result].text.contains("assembling"));
-        assert!(
-            output
-                .presenter
-                .frames
-                .iter()
-                .all(|frame| frame.invocation_primary_items <= 1),
-            "more than one primary invocation item was rendered"
-        );
-        let invocation_ids = output
-            .presenter
-            .frames
-            .iter()
-            .flat_map(|frame| frame.invocation_item_ids.iter())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            invocation_ids.len(),
-            1,
-            "invocation identity changed across frames"
-        );
-        assert_eq!(output.stats.frames_presented, 5);
-        drop(output);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn managed_runtime_commits_progressive_filesystem_edit_frames_without_external_wakeup() {
-        let session_id = bcode_session_models::SessionId::new();
-        let (runtime, handle) = {
-            let mut model = root_test_model();
-            model.chat.mark_attached(session_id);
-            model.chat.app =
-                super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-            model
-                .chat
-                .app
-                .set_plugin_host(std::sync::Arc::new(root_filesystem_plugin_host()));
-            bmux_tui_runtime::Runtime::new(
-                model,
-                RecordingRootPresenter::new(),
-                bmux_tui_runtime::RuntimeConfig {
-                    frame_interval: None,
-                    ..bmux_tui_runtime::RuntimeConfig::default()
-                },
-            )
-        };
-        let draft = |revision, operation, argument_bytes| {
-            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
-                bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
-                    session_id,
-                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
-                        event: bcode_session_models::ToolRequestDraftEvent {
-                            output_position: None,
-                            turn_id: "turn-edit".to_owned(),
-                            tool_call_id: "call-edit".to_owned(),
-                            tool_name: "filesystem.edit".to_owned(),
-                            producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                            schema: "bcode.filesystem.request-draft.edit".to_owned(),
-                            schema_version: 1,
-                            placement: bcode_session_models::ToolContributionPlacement::Request,
-                            generation: 1,
-                            revision,
-                            operation,
-                            argument_bytes,
-                            truncated: false,
-                        },
-                    },
-                }),
-            ))
-        };
-        let durable = |sequence, kind| {
-            super::super::history_flow::SessionStreamUpdate::Event(Box::new(
-                bcode_ipc::Event::Session(bcode_session_models::SessionEvent {
-                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    sequence,
-                    timestamp_ms: sequence,
-                    session_id,
-                    provenance: None,
-                    kind,
-                }),
-            ))
-        };
-        let fragments = [
-            r#"{"path":"src/lib.rs","#,
-            r#""old_text":"before""#,
-            r#", "new_text":"aft"#,
-            r#"er two"}"#,
-        ];
-        let mut offset: usize = 0;
-        let mut revision: u64 = 1;
-        let mut updates = Vec::new();
-        updates.push(draft(
-            revision,
-            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                start_offset: 0,
-                text: String::new(),
-            },
-            0,
-        ));
-        for fragment in fragments {
-            revision = revision.saturating_add(1);
-            offset = offset.saturating_add(fragment.len());
-            updates.push(draft(
-                revision,
-                bcode_session_models::ToolRequestDraftOperation::Append {
-                    offset: offset.saturating_sub(fragment.len()),
-                    text: fragment.to_owned(),
-                },
-                offset,
-            ));
-        }
-        updates.extend([
-            durable(
-                1,
-                bcode_session_models::SessionEventKind::ToolCallRequested {
-                    tool_call_id: "call-edit".to_owned(),
-                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
-                    tool_name: "filesystem.edit".to_owned(),
-                    arguments_json:
-                        r#"{"path":"src/lib.rs","old_text":"before","new_text":"after two"}"#
-                            .to_owned(),
-                    working_directory: None,
-                },
-            ),
-            durable(
-                2,
-                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
-                    record: bcode_session_models::ToolInvocationResultRecord {
-                        invocation_id: "call-edit".to_owned(),
-                        model_output: "edited src/lib.rs".to_owned(),
-                        is_error: false,
-                        presentation: None,
-                        result: None,
-                        content: Vec::new(),
-                    },
-                },
-            ),
-        ]);
-        for update in updates {
-            assert!(
-                handle
-                    .try_send(super::BcodeRuntimeMessage::SessionStream(Box::new(update)))
-                    .is_ok(),
-                "session update fits"
-            );
-        }
-        let runtime_task = tokio::spawn(runtime.run());
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while handle.stats().frames_presented < 7 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fragmented edit drafts and canonical handoff commit without external wakeup");
-        assert_eq!(handle.stats().frames_presented, 7);
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(
-            handle.stats().frames_presented,
-            7,
-            "runtime remains idle after the edit handoff queue drains"
-        );
-        handle
-            .try_send_terminal(bmux_tui::event::Event::Key(
-                bmux_keyboard::KeyStroke::with_modifiers(
-                    bmux_keyboard::KeyCode::Char('d'),
-                    bmux_keyboard::Modifiers {
-                        ctrl: true,
-                        ..bmux_keyboard::Modifiers::NONE
-                    },
-                ),
-            ))
-            .expect("exit input fits");
-        let output = tokio::time::timeout(std::time::Duration::from_secs(2), runtime_task)
-            .await
-            .expect("managed runtime exits")
-            .expect("runtime task joins")
-            .unwrap_or_else(|_| panic!("managed runtime succeeds"));
-        let original = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| {
-                frame.text.contains("receiving original text")
-                    && frame.text.contains("before")
-                    && !frame.text.contains("new_text")
-            })
-            .expect("original edit text committed before replacement starts");
-        let partial = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| frame.text.contains("aft") && !frame.text.contains("after two"))
-            .expect("partial replacement committed");
-        let complete = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| frame.text.contains("after two"))
-            .expect("complete replacement committed");
-        let result = output
-            .presenter
-            .frames
-            .iter()
-            .position(|frame| frame.text.contains("edited src/lib.rs"))
-            .expect("canonical edit result committed");
-        assert!(
-            original < partial && partial < complete && complete < result,
-            "frames: {:?}",
-            output.presenter.frames
-        );
-        assert_eq!(
-            output.presenter.frames[result]
-                .text
-                .matches("edited src/lib.rs")
-                .count(),
-            1
-        );
-        assert!(!output.presenter.frames[result].text.contains("assembling"));
-        assert!(
-            output
-                .presenter
-                .frames
-                .iter()
-                .all(|frame| frame.invocation_primary_items <= 1),
-            "more than one primary invocation item was rendered"
-        );
-        let invocation_ids = output
-            .presenter
-            .frames
-            .iter()
-            .flat_map(|frame| frame.invocation_item_ids.iter())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            invocation_ids.len(),
-            1,
-            "invocation identity changed across frames"
-        );
-        assert_eq!(output.stats.frames_presented, 8);
-        drop(output);
-    }
-
-    #[tokio::test]
     async fn root_request_draft_handoff_waits_for_committed_paint() {
         let session_id = bcode_session_models::SessionId::new();
         let mut model = root_test_model();
         model.chat.mark_attached(session_id);
-        model.chat.app =
-            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        model.chat.app = super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[]);
         let draft = |revision, text: &str| {
             super::super::history_flow::SessionStreamUpdate::Event(Box::new(
                 bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {

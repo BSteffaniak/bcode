@@ -70,28 +70,6 @@ impl InputHistory {
         });
     }
 
-    /// Prepend older committed user messages in chronological order.
-    pub fn prepend_committed(
-        &mut self,
-        messages: impl IntoIterator<Item = SessionInputHistoryEntry>,
-    ) {
-        let messages = messages
-            .into_iter()
-            .filter(|entry| !entry.text.trim().is_empty() && self.sequences.insert(entry.sequence))
-            .collect::<Vec<_>>();
-        if messages.is_empty() {
-            return;
-        }
-        let added = messages.len();
-        self.entries.splice(0..0, messages);
-        if let Some(index) = &mut self.index {
-            *index = index.saturating_add(added);
-        }
-        if let Some(browse_len) = &mut self.browse_len {
-            *browse_len = browse_len.saturating_add(added);
-        }
-    }
-
     /// Return previous history entry and store draft when starting navigation.
     pub fn previous(&mut self, current_draft: &str) -> InputHistoryOutcome {
         if self.entries.is_empty() {

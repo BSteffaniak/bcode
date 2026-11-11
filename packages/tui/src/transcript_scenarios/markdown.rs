@@ -2,9 +2,8 @@
 //! the `tui.markdown.*` keys with footnote jumps, `#fragment` navigation, link opening and
 //! destination copy, all observed in committed frames (status row included).
 //!
-//! Scenarios that reach the platform opener or the system clipboard run on V2 only: the V2
-//! host's opener records destinations in test builds and the V2 driver observes clipboard
-//! writes, while the V1 path would open real destinations.
+//! Scenarios that reach the platform opener or the system clipboard rely on the host's opener,
+//! which records destinations in test builds, and on the driver's scripted clipboard.
 
 use std::time::Duration;
 
@@ -88,8 +87,8 @@ fn expect_hidden<D: TranscriptScenarioDriver>(scenario: &Scenario<D>, needle: &s
     });
 }
 
-/// Clicking a `<details>` summary expands the block, clicking it again collapses it, with
-/// V1's status messages.
+/// Clicking a `<details>` summary expands the block, clicking it again collapses it, with the
+/// host's status messages.
 pub fn md_details_click_toggles_the_block<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_all::<D>(
         session(&[
@@ -152,7 +151,8 @@ pub fn md_fragment_link_navigates_to_its_section<D: TranscriptScenarioDriver>() 
 }
 
 /// Clicking a web link opens it through the safe activation boundary, and the copy key copies
-/// the focused link's destination through the transcript clipboard path, with V1's messages.
+/// the focused link's destination through the transcript clipboard path, with the host's
+/// messages.
 pub fn md_link_opens_and_its_destination_copies<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_all::<D>(
         session(&["read [WEBLINK](https://example.com/docs) now".to_owned()]),

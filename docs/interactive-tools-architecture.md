@@ -86,11 +86,12 @@ types.
 The TUI owns interaction placement, clipping, hit testing, mouse-coordinate translation, cursor
 adaptation, and terminal painting. The same plugin controller and surface can be presented:
 
-* inline at the semantic interaction transcript item, using the indexed transcript as the only
-  scrolling authority; or
+* inline at the semantic interaction transcript item, using the transcript engine's navigation as
+  the only scrolling authority; or
 * pinned above the composer as an overlay that does not alter transcript layout.
 
-Inline surfaces reserve their complete bounded logical extent in the indexed transcript. The host
+Inline surfaces reserve their complete bounded logical extent in the transcript engine's
+interaction unit. The host
 retains that extent as a sparse span and asks the plugin to draw only the visible slice; there is no
 question-level viewport or full-height scratch allocation. Committed TUI geometry records placement,
 logical extent, visible logical offset, and destination for drawing, cursor projection, hit testing,

@@ -1,16 +1,12 @@
-//! V2 transcript host wiring (TUI V2 specification sections 3.0, 7 and 12, phase 4).
+//! Transcript host wiring (TUI V2 specification sections 3.0, 7 and 12).
 //!
-//! [`TranscriptEngineChoice`] is the single dispatch point between the two transcript engines
-//! (EN5). It is selected once at startup from the process engine (EN1, EN3) and stored on the
-//! root runtime model. With [`TranscriptEngineChoice::V1`] every seam is a no-op and the
-//! existing V1 code path runs unchanged; with [`TranscriptEngineChoice::V2`] the seams route
-//! transcript ingest, transcript input and transcript painting to [`TranscriptV2Host`], which
-//! owns the `bcode_tui_transcript` engine plus the host state it needs (attached session,
-//! outstanding history requests, last prepared frame).
+//! The root runtime model routes transcript ingest, transcript input and transcript painting
+//! to [`TranscriptV2Host`], which owns the `bcode_tui_transcript` engine plus the host state it
+//! needs (attached session, outstanding history requests, last prepared frame).
 //!
 //! The host shell (composer, overlays, permissions, plugin surfaces, configuration) stays
-//! engine-independent (EN4). In phase 4 the V1 application model still receives session
-//! events, because it owns that shell state; the V2 engine keeps its own `SessionView`.
+//! separate from the engine (EN4). The application model receives session events for that
+//! shell state; the engine keeps its own `SessionView`.
 //!
 //! Method ownership:
 //!
@@ -32,7 +28,7 @@
 //! * [`local_rows`]: pending submissions and process-local notices of the host shell as
 //!   engine local rows (LR1–LR7).
 //! * [`markdown`]: Markdown contribution focus and activation (links, session links,
-//!   footnotes, fragments, `<details>`, the Mermaid source view; V1 visible parity).
+//!   footnotes, fragments, `<details>`, the Mermaid source view).
 //! * [`visuals`]: Markdown images and Mermaid diagrams rendered by the host-side workers and
 //!   accepted into the render configuration (phase 6, L8, D2).
 //! * [`paint`]: viewport geometry, frame preparation, painting, commit, the latest bar and the
@@ -69,7 +65,6 @@ pub mod test_fixtures;
 #[cfg(test)]
 mod scrollbar_tests;
 
-use bcode_config::TuiEngine;
 use bcode_session_models::SessionId;
 use bcode_tui_transcript::engine::{HostRequest, TranscriptEngine};
 use bcode_tui_transcript::focus::ChatFocus;
@@ -77,45 +72,6 @@ use bcode_tui_transcript::frame::FrameSnapshot;
 use bcode_tui_transcript::latest_bar::LatestBarState;
 use bcode_tui_transcript::navigation::MotionConfig;
 use bcode_tui_transcript::viewport::ViewportGeometry;
-
-/// Which engine handles transcript ingest, input and painting (EN5). Fixed for the process
-/// lifetime (EN3).
-#[derive(Debug, Default)]
-pub enum TranscriptEngineChoice {
-    /// The V1 transcript pipeline in `BmuxApp`; every seam is a no-op.
-    #[default]
-    V1,
-    /// The V2 engine behind [`TranscriptV2Host`].
-    V2(Box<TranscriptV2Host>),
-}
-
-impl TranscriptEngineChoice {
-    /// Build the choice for `engine`.
-    #[must_use]
-    pub fn for_engine(engine: TuiEngine) -> Self {
-        match engine {
-            TuiEngine::V1 => Self::V1,
-            TuiEngine::V2 => Self::V2(Box::default()),
-        }
-    }
-
-    /// The V2 host, when V2 is selected.
-    #[must_use]
-    pub fn v2(&self) -> Option<&TranscriptV2Host> {
-        match self {
-            Self::V1 => None,
-            Self::V2(host) => Some(host),
-        }
-    }
-
-    /// The V2 host, mutably, when V2 is selected.
-    pub fn v2_mut(&mut self) -> Option<&mut TranscriptV2Host> {
-        match self {
-            Self::V1 => None,
-            Self::V2(host) => Some(host),
-        }
-    }
-}
 
 /// Host side of the V2 transcript engine: the engine façade plus the host state that the
 /// engine deliberately does not own (I/O, session attachment, effect bookkeeping, frames).
@@ -320,18 +276,7 @@ impl TranscriptV2Host {
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscriptEngineChoice, TranscriptV2Host};
-    use bcode_config::TuiEngine;
-
-    #[test]
-    fn choice_follows_the_selected_engine() {
-        let v1 = TranscriptEngineChoice::for_engine(TuiEngine::V1);
-        assert!(v1.v2().is_none());
-        let mut v2 = TranscriptEngineChoice::for_engine(TuiEngine::V2);
-        assert!(v2.v2().is_some());
-        assert!(v2.v2_mut().is_some());
-        assert!(TranscriptEngineChoice::default().v2().is_none());
-    }
+    use super::TranscriptV2Host;
 
     #[test]
     fn new_host_is_detached_composer_focused_and_needs_a_frame() {

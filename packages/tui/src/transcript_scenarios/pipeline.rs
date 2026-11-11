@@ -11,7 +11,7 @@
 //! Like the other suites, every scenario observes committed frames plus the driver's semantic
 //! facts (damage, layout work, selection, clipboard). They are instantiated for the V2 engine in
 //! the application only (`v2_pipeline` in `mod.rs`): they need the host's chrome, focus model,
-//! command routes and the terminal's committed damage, which V1 does not report in this form.
+//! command routes and the terminal's committed damage.
 
 use std::time::Duration;
 

@@ -1,12 +1,11 @@
 //! Structure inspector and transcript tooling for the V2 engine (spec section 6, FO6).
 //!
-//! The inspector explains how the focused disclosure target resolved, with the content the
-//! V1 inspector shows: facts, every resolved property with the rule and layer that set it,
-//! visibility-floor adjustments, the manual override and grouping notes. The explanation comes
-//! from the V2 engine's own structure resolution ([`TranscriptEngine::inspect_focused`]);
-//! presentation helpers that only format policy types (`fact_rows`, `property_rows`,
-//! placement and the bordered panel) are shared with the V1 inspector, so both engines paint
-//! the same panel. Nothing here reads or changes V1 transcript state.
+//! The inspector explains how the focused disclosure target resolved: facts, every resolved
+//! property with the rule and layer that set it, visibility-floor adjustments, the manual
+//! override and grouping notes. The explanation comes from the engine's own structure
+//! resolution ([`TranscriptEngine::inspect_focused`]); presentation helpers that only format
+//! policy types (`fact_rows`, `property_rows`, placement and the bordered panel) live in the
+//! host's `inspector` and `inspector_render` modules, shared with `bcode theme explain`.
 //!
 //! The inspector paints over the transcript viewport (a side panel on wide viewports, an inset
 //! modal on narrow ones) after the transcript, and registers its hit region above transcript
@@ -15,7 +14,7 @@
 //!
 //! Tooling actions that need the host shell report through [`ToolNotice`]s (status text) and
 //! queued per-tool default rules, which the root model drains after every update: the rules
-//! persist to user state through the same effect V1 uses (A3).
+//! persist to user state through the host shell's persistence effect (A3).
 //!
 //! [`TranscriptEngine::inspect_focused`]: bcode_tui_transcript::engine::TranscriptEngine::inspect_focused
 
@@ -451,7 +450,7 @@ pub fn inspection_properties(inspection: &Inspection) -> Vec<InspectedProperty> 
     properties
 }
 
-/// Inspector content rows for `report` (the rows the V1 inspector shows), or a placeholder
+/// Inspector content rows for `report`, or a placeholder
 /// when nothing structural is focused. Rows are semantic lines; wrapping is BMUX's.
 #[must_use]
 pub fn report_lines(report: Option<&Inspection>, theme: TuiTheme) -> Vec<Line> {

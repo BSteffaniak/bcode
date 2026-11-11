@@ -234,7 +234,7 @@ impl TranscriptV2Host {
 
     /// Run a transcript command-palette route (`transcript.focusUnits`,
     /// `transcript.cycleDetail`, `transcript.inspect`, `transcript.makeDefault`, `tools.*`).
-    /// Each runs the same handler as its key, as in V1: "Focus transcript units" enters or
+    /// Each runs the same handler as its key: "Focus transcript units" enters or
     /// leaves transcript focus exactly like `alt+u` (FO2, FO3); "Inspect" enters focus if
     /// needed and opens the inspector; detail cycling and the bulk disclosure actions apply
     /// to the focused subtree with transcript focus and to every unit otherwise (FO6).

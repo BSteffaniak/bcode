@@ -3,8 +3,7 @@
 //! Keys resolve through the shared host keymap: the chat scope binds transcript focus entry
 //! (`tui.transcript.focusUnits`, `alt+u`) and the transcript scroll keys (Page Up/Down,
 //! `ctrl+up`/`ctrl+down`, `ctrl+home`/`ctrl+end`), and the remappable `transcript_focus` scope
-//! binds the focus keys. The action identities are the keymap contract shared by both engines;
-//! the V2 meaning of each action is defined here and in [`super::input`].
+//! binds the focus keys. The meaning of each action is defined here and in [`super::input`].
 
 use bmux_keyboard::KeyStroke;
 
@@ -14,8 +13,13 @@ use crate::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
 pub const FOCUS_SCOPE: &str = "transcript_focus";
 /// Chat-scope action that enters (or leaves) transcript focus (FO2, FO3).
 pub const FOCUS_UNITS_ACTION: &str = "tui.transcript.focusUnits";
-/// Chat-scope action that cycles detail outside transcript focus.
+/// Default binding of [`FOCUS_UNITS_ACTION`].
+pub const FOCUS_UNITS_DEFAULT_KEY: &str = "alt+u";
+/// Action that cycles disclosure collapsed → summary → expanded: the focused target in
+/// transcript focus, every unit and group otherwise.
 pub const CYCLE_DETAIL_ACTION: &str = "tui.transcript.cycleDetail";
+/// Chat-scope default binding of [`CYCLE_DETAIL_ACTION`] (outside transcript focus).
+pub const CYCLE_DETAIL_DEFAULT_KEY: &str = "alt+d";
 
 /// An action of the [`FOCUS_SCOPE`] scope (FO6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -90,6 +94,48 @@ impl FocusKeyAction {
         }
     }
 
+    /// User-facing description, independent of the binding.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Next => "Focus next disclosure target",
+            Self::Previous => "Focus previous disclosure target",
+            Self::Toggle => "Toggle focused target",
+            Self::Expand => "Expand focused target one level",
+            Self::Collapse => "Collapse focused target one level or focus its parent",
+            Self::ExpandAll => "Expand everything under the focused target",
+            Self::CycleDetail => "Cycle focused target collapsed, summary, expanded",
+            Self::Inspect => "Inspect how the focused target's presentation resolved",
+            Self::InspectorScrollDown => "Scroll the inspector down",
+            Self::InspectorScrollUp => "Scroll the inspector up",
+            Self::MakeDefault => "Make the focused tool's disclosure its default",
+            Self::Exit => "Close the inspector, or leave transcript focus",
+            Self::SessionStart => "Jump to the session start",
+            Self::Latest => "Jump to the latest content",
+        }
+    }
+
+    /// Default bindings.
+    #[must_use]
+    pub const fn default_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Next => &["j", "down"],
+            Self::Previous => &["k", "up"],
+            Self::Toggle => &["enter", "space"],
+            Self::Expand => &["l", "right"],
+            Self::Collapse => &["h", "left"],
+            Self::ExpandAll => &["e"],
+            Self::CycleDetail => &["d"],
+            Self::Inspect => &["i"],
+            Self::InspectorScrollDown => &["shift+down", "ctrl+e"],
+            Self::InspectorScrollUp => &["shift+up", "ctrl+y"],
+            Self::MakeDefault => &["m"],
+            Self::Exit => &["escape"],
+            Self::SessionStart => &["home"],
+            Self::Latest => &["end"],
+        }
+    }
+
     /// Parse a registry identity.
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
@@ -102,23 +148,40 @@ pub const SESSION_START_ACTION: &str = "tui.transcriptFocus.sessionStart";
 /// `transcript_focus` action: jump to the latest content (FO4, default End).
 pub const LATEST_ACTION: &str = "tui.transcriptFocus.latest";
 
-/// Register the `transcript_focus` actions only the V2 engine has: Home/End jump to the
-/// session start / latest content (FO4). The keymap of the V1 engine never contains them.
+/// Register the chat-scope transcript focus entry and detail cycling actions and every
+/// `transcript_focus` action (FO2–FO6), including Home/End to the session start / latest
+/// content (FO4).
 ///
 /// # Errors
 /// Returns a conflicting registration (a contributor default already bound to the key).
 pub fn register_actions(
     registry: &mut bcode_plugin_sdk::tui::keymap::KeymapRegistry,
 ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
-    for (id, description, key) in [
-        (SESSION_START_ACTION, "Jump to the session start", "home"),
-        (LATEST_ACTION, "Jump to the latest content", "end"),
-    ] {
-        registry.register(bcode_plugin_sdk::tui::keymap::KeymapAction {
-            id: id.into(),
+    use bcode_plugin_sdk::tui::keymap::KeymapAction;
+    registry.register(KeymapAction {
+        id: FOCUS_UNITS_ACTION.into(),
+        scope: BmuxScope::Chat.id().into(),
+        description: "Focus transcript units".into(),
+        defaults: vec![FOCUS_UNITS_DEFAULT_KEY.into()],
+    })?;
+    // Outside transcript focus detail cycling applies to every unit and group; in transcript
+    // focus the `transcript_focus` binding cycles the focused target.
+    registry.register(KeymapAction {
+        id: CYCLE_DETAIL_ACTION.into(),
+        scope: BmuxScope::Chat.id().into(),
+        description: "Cycle every transcript unit collapsed, summary, expanded".into(),
+        defaults: vec![CYCLE_DETAIL_DEFAULT_KEY.into()],
+    })?;
+    for action in FocusKeyAction::ALL {
+        registry.register(KeymapAction {
+            id: action.id().into(),
             scope: FOCUS_SCOPE.into(),
-            description: description.into(),
-            defaults: vec![key.into()],
+            description: action.description().into(),
+            defaults: action
+                .default_keys()
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect(),
         })?;
     }
     Ok(())
@@ -145,7 +208,7 @@ pub const LINE_SCROLL_ROWS: i64 = 3;
 pub enum TranscriptKey {
     /// `alt+u`: enter transcript focus, or leave it (FO2, FO3).
     ToggleFocus,
-    /// Chat-scope detail cycling (V1 cycles every unit; V2 consumes it, see [`super::input`]).
+    /// Chat-scope detail cycling of every unit (see [`super::input`]).
     CycleDetailAll,
     /// A transcript scroll key (FO5).
     Scroll(ScrollKey),
@@ -241,10 +304,7 @@ mod tests {
     use crate::keymap::BmuxKeyMap;
 
     fn keymap() -> BmuxKeyMap {
-        BmuxKeyMap::from_config_for_engine(
-            &bcode_config::TuiConfig::default(),
-            bcode_config::TuiEngine::V2,
-        )
+        BmuxKeyMap::from_config(&bcode_config::TuiConfig::default())
     }
 
     fn key(input: &str) -> bmux_keyboard::KeyStroke {
@@ -305,8 +365,7 @@ mod tests {
         assert_eq!(resolve_key(&keymap, key("a"), true), None);
     }
 
-    /// The `transcript_focus` scope is the keymap contract both engines share: every action
-    /// registered there (including any the V1 engine adds) has a V2 meaning.
+    /// Every action registered in the `transcript_focus` scope has a transcript meaning.
     #[test]
     fn every_registered_focus_scope_action_has_a_v2_meaning() {
         let keymap = keymap();
@@ -321,22 +380,22 @@ mod tests {
     }
 
     #[test]
-    fn only_the_v2_keymap_binds_the_v2_focus_actions() {
-        let v1 = BmuxKeyMap::from_config(&bcode_config::TuiConfig::default());
-        for action in [FocusKeyAction::SessionStart, FocusKeyAction::Latest] {
-            assert!(
-                v1.registry()
-                    .keys_for_action(FOCUS_SCOPE, action.id())
-                    .is_empty(),
-                "{action:?} is not a V1 action"
-            );
-        }
-        assert!(!v1.help_markdown().contains("Jump to the session start"));
-        assert_eq!(v1.action(FOCUS_SCOPE, key("home")), None);
-        assert_eq!(v1.action(FOCUS_SCOPE, key("end")), None);
-        let v2 = keymap();
-        assert!(v2.help_markdown().contains("Jump to the session start"));
-        assert!(v2.help_markdown().contains("Jump to the latest content"));
+    fn the_keymap_binds_the_session_start_and_latest_focus_actions() {
+        let keymap = keymap();
+        assert_eq!(
+            keymap.action(FOCUS_SCOPE, key("home")),
+            Some(FocusKeyAction::SessionStart.id())
+        );
+        assert_eq!(
+            keymap.action(FOCUS_SCOPE, key("end")),
+            Some(FocusKeyAction::Latest.id())
+        );
+        assert!(keymap.help_markdown().contains("Jump to the session start"));
+        assert!(
+            keymap
+                .help_markdown()
+                .contains("Jump to the latest content")
+        );
     }
 
     #[test]

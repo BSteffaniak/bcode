@@ -1,6 +1,6 @@
 //! Process-local transcript rows (spec section 3.3, LR1–LR7): pending submissions and
-//! process-local notices of the host shell are visible in committed frames, in V1's order,
-//! and leave when the shell forgets them.
+//! process-local notices of the host shell are visible in committed frames, in presentation
+//! order, and leave when the shell forgets them.
 //!
 //! Observations are committed frames only: rows are found by their visible text (the pending
 //! heading `You · sending`, the submitted prompt, notice text) and by scenario markers.
@@ -18,7 +18,7 @@ const HEIGHT: u16 = 24;
 const SETTLE: Duration = Duration::from_secs(2);
 /// Distinctive composer text, observable in frames without marker tokens.
 const PROMPT: &str = "zqx local prompt";
-/// Heading of a staged submission (V1 `You · sending`).
+/// Heading of a staged submission.
 const SENDING: &str = "You · sending";
 /// Server error code of the rejected submission the user reported.
 const REJECTION: &str = "managed_configuration_unavailable";
@@ -144,8 +144,7 @@ pub fn lr7_staged_submission_while_following_stays_on_latest_bottom<D: Transcrip
 }
 
 /// LR4: a rejected submission reports the daemon's error as a visible System notice, before
-/// the retained pending row (V1 order: notices at their chronology boundary, pending rows
-/// last).
+/// the retained pending row (notices at their chronology boundary, pending rows last).
 pub fn lr4_rejected_submission_notice_is_visible<D: TranscriptScenarioDriver>() {
     let mut scenario = short::<D>();
     submit(&mut scenario);

@@ -26,8 +26,6 @@ run_probe() {
     printf '%s\n' '{"schema_version":1,"kind":"live_shell_tui_performance_baseline"}'
     run_probe bcode_shell_plugin tests::live_shell_output_chunk_baseline_report
     run_probe bcode_shell_plugin shell_run_tui::tests::incremental_replay_work_baseline_report --features static-bundled
-    run_probe bcode_tui plugin_tui::tests::targeted_visual_update_transcript_baseline_report
-    run_probe bcode_tui render::markdown_and_json_layout_work_per_revision_baseline_report
     run_probe bcode_tui telemetry::tests::telemetry_enabled_disabled_overhead_baseline_report
     run_probe bcode_server tests::transient_streaming_fixed_workload_baseline_report
 } >"${output}"
@@ -42,10 +40,6 @@ with open(path, encoding="utf-8") as source:
 
 shell = [record for record in records if record.get("domain") == "shell_output"]
 replay = [record for record in records if record.get("domain") == "shell_replay"]
-transcript = [
-    record for record in records if record.get("domain") == "transcript_visual_update"
-]
-frames = [record for record in records if record.get("domain") == "renderer_parse_layout"]
 telemetry = [record for record in records if record.get("domain") == "telemetry_overhead"]
 publisher = [
     record for record in records if record.get("domain") == "pending_live_fanout"
@@ -66,10 +60,6 @@ if len(replay) != 9 or any(
     for record in replay
 ):
     raise SystemExit("shell replay-work matrix is incomplete or amplified")
-if len(transcript) != 3:
-    raise SystemExit(f"expected 3 transcript matrix cases, found {len(transcript)}")
-if len(frames) != 2 or {record["format"] for record in frames} != {"markdown", "json"}:
-    raise SystemExit("renderer parse/layout baseline is incomplete")
 if {record["enabled"] for record in telemetry} != {False, True}:
     raise SystemExit("telemetry enabled/disabled control is incomplete")
 if len(publisher) != 5 or any(
@@ -83,9 +73,5 @@ if {record["output_bytes"] for record in shell} != expected_volumes:
     raise SystemExit("shell output-volume matrix is incomplete")
 if {record["chunk_bytes"] for record in shell} != expected_chunks:
     raise SystemExit("shell chunk-size matrix is incomplete")
-if {record["transcript_entries"] for record in transcript} != {10, 500, 2000}:
-    raise SystemExit("transcript-size matrix is incomplete")
-if any(record["entries_rebuilt"] != 1 for record in transcript):
-    raise SystemExit("targeted visual baseline rebuilt unrelated transcript entries")
 print(path)
 PY

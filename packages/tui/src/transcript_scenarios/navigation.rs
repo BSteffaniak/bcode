@@ -1,6 +1,6 @@
 //! Kept-behavior navigation scenarios, generic over the engine driver.
 //!
-//! These scenarios pin the navigation behavior V2 must keep from V1 (spec section 10, rows
+//! These scenarios pin the kept navigation behavior (spec section 10, rows
 //! C1–C17, C22–C33, and the focus model's Home/End rules FO4/FO5). Each one asserts what the
 //! specification requires, observed through committed frames: marker rows, content shift, the
 //! latest bar, following state, motion and focus. Names start with the requirement they cover;
@@ -452,7 +452,7 @@ pub fn c2_tail_space_is_bounded_by_the_viewport<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_everything::<D>(ScenarioSession::with_turns(20, 3), WIDTH);
     let tick = scenario.wheel_rows();
     // Wheel until the view stops moving, so the check does not depend on how many ticks an
-    // engine needs to reach the bound (V1's wheel handling is timing sensitive under load).
+    // engine needs to reach the bound.
     let mut bounded = enter_tail_space(&mut scenario, 40);
     for _ in 0..8 {
         let next = enter_tail_space(&mut scenario, 10);

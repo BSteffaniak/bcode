@@ -5,6 +5,11 @@ The fixed-workload probe was captured with
 migration. Raw local artifacts are `target/tui-runtime-before.jsonl` and
 `target/tui-runtime-after.jsonl`; both contain the same 30-case matrix plus the schema record.
 
+The comparison below is a record of that migration. The targeted transcript-update and renderer
+parse/layout probes measured the retired transcript engine and were removed with it, so the
+capture script now records a 25-case matrix (shell output, shell replay, telemetry overhead and
+pending live fan-out) plus the schema record.
+
 These are deterministic work-shape probes, not an interactive latency or process-RSS benchmark.
 Timing values are local debug-build observations and should be interpreted as regression signals,
 not release targets.

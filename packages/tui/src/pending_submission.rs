@@ -5,7 +5,6 @@
 pub struct PendingSubmission {
     id: bcode_session_models::SubmissionId,
     text: String,
-    reveal_on_acceptance: bool,
     state: PendingSubmissionState,
 }
 
@@ -18,7 +17,6 @@ impl PendingSubmission {
                 bcode_session_models::SessionId::new().to_string(),
             ),
             text,
-            reveal_on_acceptance: true,
             state: PendingSubmissionState::Sending,
         }
     }
@@ -27,17 +25,6 @@ impl PendingSubmission {
     #[must_use]
     pub const fn id(&self) -> &bcode_session_models::SubmissionId {
         &self.id
-    }
-
-    /// Supersede the positioning associated with this submission, but retain its data.
-    pub const fn cancel_reveal(&mut self) {
-        self.reveal_on_acceptance = false;
-    }
-
-    /// Whether acceptance still owns a pending navigation intent.
-    #[must_use]
-    pub const fn reveals_on_acceptance(&self) -> bool {
-        self.reveal_on_acceptance
     }
 
     /// Mark the submission as queued.
@@ -75,4 +62,17 @@ pub enum PendingSubmissionState {
         /// Server-reported queue position.
         queue_position: Option<u32>,
     },
+}
+
+/// Status label of a pending submission (`sending`, `sent`, `queued #N`).
+#[must_use]
+pub fn pending_label(state: PendingSubmissionState) -> String {
+    match state {
+        PendingSubmissionState::Sending => "sending".to_owned(),
+        PendingSubmissionState::Sent => "sent".to_owned(),
+        PendingSubmissionState::Queued { queue_position } => queue_position.map_or_else(
+            || "queued".to_owned(),
+            |position| format!("queued #{position}"),
+        ),
+    }
 }

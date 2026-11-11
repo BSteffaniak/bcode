@@ -105,8 +105,8 @@ pub fn markdown_document_id(unit: &UnitKey) -> String {
 /// excluded from the fingerprint shared by every unit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarkdownOptions {
-    /// `<details>` blocks opened by the user, by content key (L2: replaces V1's thread-local
-    /// open state). Keys start with the owning unit's [`markdown_document_id`] and `:`; a
+    /// `<details>` blocks opened by the user, by content key (L2: an explicit input, never a
+    /// thread-local). Keys start with the owning unit's [`markdown_document_id`] and `:`; a
     /// toggle re-measures only that unit.
     pub details_open: BTreeMap<String, bool>,
     /// Whether Mermaid diagrams render as visuals (placeholders reserve rows until accepted).

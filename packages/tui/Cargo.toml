@@ -50,12 +50,8 @@ bcode_tui_components = { workspace = true, features = [
     "plugin-visual",
     "session-ui",
     "setup",
-    "source-preview",
     "source-viewer",
-    "terminal-viewer",
     "transcript",
-    "transcript-engine",
-    "transcript-markdown",
 ] }
 bcode_tui_theme = { workspace = true }
 bcode_tui_transcript = { workspace = true }
@@ -102,27 +98,22 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-unicode-segmentation = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 webbrowser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-bcode_agent_runtime     = { workspace = true }
 bcode_daemon_lifecycle  = { workspace = true }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
 bcode_hello_plugin      = { workspace = true }
 bcode_model_catalog     = { workspace = true }
 bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }
-bcode_server            = { workspace = true }
-bcode_session           = { workspace = true }
 bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
 bcode_tui_transcript    = { workspace = true, features = ["testing"] }
 bcode_vim_edit_plugin   = { workspace = true, features = ["static-bundled"] }
 bmux_terminal_protocol  = { workspace = true }
-insta                   = { workspace = true }
 tempfile                = { workspace = true }
 
 [features]

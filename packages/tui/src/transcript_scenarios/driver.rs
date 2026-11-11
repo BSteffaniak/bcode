@@ -1,6 +1,6 @@
 //! Engine-neutral transcript scenario driver contract.
 //!
-//! A driver adapts one transcript engine (V1 today, V2 later) to the semantic operations and
+//! A driver adapts the transcript engine (in the application or headless) to the semantic operations and
 //! observations used by the scenario suite. Nothing here names engine internals: inputs are user
 //! inputs, session events, history results and navigation intents; observations come from the
 //! committed frame (what the user sees) plus a few semantic engine facts that a frame cannot
@@ -16,10 +16,8 @@ use super::session::ScenarioSession;
 /// Identity of the engine a driver adapts, used in failure messages and the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScenarioEngine {
-    /// The current transcript engine in `bcode_tui`.
-    V1,
-    /// The rewritten transcript engine (`bcode_tui_transcript`) in the application: the root
-    /// model with the V2 host selected.
+    /// The transcript engine (`bcode_tui_transcript`) in the application: the root model with
+    /// its transcript host.
     V2,
     /// The V2 engine façade driven headlessly, without the host (engine-level checks).
     V2Headless,
