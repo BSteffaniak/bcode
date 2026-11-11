@@ -10,11 +10,13 @@
 //!   the client.
 //! * [`viewed`] matches identity-pinned viewed marks.
 //! * [`publish`] plans which pull request each thread publishes to and builds bundle threads.
+//! * [`scope`] derives the scope a workspace's annotations are stored under.
 //! * [`tui`] is the review surface over the document (phase 3).
 
 pub mod document;
 pub mod provider;
 pub mod publish;
+pub mod scope;
 pub mod service;
 #[cfg(test)]
 pub mod testing;

@@ -26,8 +26,7 @@ use std::path::{Path, PathBuf};
 /// Surface option carrying the JSON [`Entry`].
 pub const ENTRY_OPTION: &str = "entry";
 
-/// Id of workspaces that are not saved (yet).
-pub const TRANSIENT_WORKSPACE_ID: &str = "transient-review-workspace";
+pub use crate::v2::scope::TRANSIENT_WORKSPACE_ID;
 
 /// What the V2 app opens first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

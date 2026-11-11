@@ -80,6 +80,8 @@ impl PluginTuiSurfaceFactory for ReviewSurfaceV2Factory {
             let repo_path = request
                 .repo_path
                 .ok_or("code review surface requires repo_path")?;
+            // Hosts pass the working directory; unsaved reviews are scoped by the repository.
+            let repo_path = crate::v2::scope::working_tree_root(&repo_path);
             let entry = entry::Entry::from_options(&request.options)?;
             let app = ReviewAppV2::new(
                 Arc::new(backend::DaemonBackend::new()),

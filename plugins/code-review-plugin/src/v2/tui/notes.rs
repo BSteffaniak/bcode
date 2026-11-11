@@ -57,8 +57,10 @@ pub struct NoteScope {
 }
 
 impl NoteScope {
-    /// The scope of `workspace` (as the first review interface derived it): the workspace id with the first included source's
-    /// target (the repository when it has none expressible as a target).
+    /// The scope of `workspace`: its annotation scope id ([`crate::v2::scope`]: the workspace id,
+    /// or a per-target id for a transient review) with the first included source's target (the
+    /// repository when it has none expressible as a target), as the first review interface
+    /// derived it for durable workspaces.
     #[must_use]
     pub fn for_workspace(workspace: &ReviewWorkspace) -> Self {
         let target = workspace
@@ -72,7 +74,7 @@ impl NoteScope {
             repo_path: workspace.repo_root.clone(),
             target: target.clone(),
             scope: Some(ReviewScope::Workspace {
-                workspace_id: workspace.id.clone(),
+                workspace_id: crate::v2::scope::annotation_workspace_id(workspace),
                 target,
             }),
         }
@@ -893,7 +895,7 @@ pub async fn load(backend: SharedBackend, scope: NoteScope) -> Result<LoadedNote
     // External imports and publish records belong to durable workspaces.
     let (mut external, mut published) = (Vec::new(), Vec::new());
     if let Some(ReviewScope::Workspace { workspace_id, .. }) = &scope.scope
-        && workspace_id != super::entry::TRANSIENT_WORKSPACE_ID
+        && !crate::v2::scope::is_transient_scope_id(workspace_id)
     {
         let imports: Result<ListExternalReviewImportsResponse, _> = call_json(
             backend,

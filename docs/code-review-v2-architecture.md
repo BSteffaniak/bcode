@@ -1253,13 +1253,41 @@ environment variable is ignored. `publish-github` is unchanged.
   transient scope and then saved in the new one, and saved back when that fails
   (`review.suggestion.delete` is additive for this).
 * **Transient persistence (decision, phase 6 part 2).** A transient review is not listed on
-  home and keeps no presentation state; its annotations live in the shared transient scope
-  (`transient-review-workspace` plus the first source's target), as V1's direct reviews did, so
-  reopening the same target shows them again. Leaving a transient review that has drafts, AI
+  home and keeps no presentation state; its annotations live in a per-target transient scope,
+  so reopening the same target shows them again and transient reviews of other targets do not.
+  Leaving a transient review that has drafts, AI
   questions, or suggestions offers saving once: the first exit shows "this review is not saved:
   ctrl+s saves it with its comments; exit again to leave without saving" (any other key
   cancels the offer), and saving makes it a durable review on home. Without annotations, exit
   leaves at once.
+* **Transient annotation scope.** `src/v2/scope.rs` owns the scope id every annotation request
+  carries (`ReviewScope::Workspace { workspace_id, .. }`, stored under the review key
+  `review-workspace-{workspace_id}`): drafts, threads (resolution, classification, linked
+  sessions), AI exchanges, and suggestions all use it, from the client (`NoteScope::for_workspace`)
+  and from the service when it derives a workspace's key itself (`review.bundle.get` and the
+  publish preview and submit operations), and the V2 publish flow's bundle `review_id`.
+  * A durable workspace's scope id is its own id, so durable keys are unchanged.
+  * A transient workspace's scope id is `transient-review-workspace-{fingerprint}`: the first
+    32 hex digits of a SHA-256 over the repository root and each source's kind (its JSON
+    encoding, in order). Source ids, labels, titles, and the included flag are not part of it, so
+    a target opened from the CLI, a home suggestion, or the wizard shares one scope; the
+    repository is part of it because the default state database is shared by every repository.
+  * The repository root is the working tree root: hosts pass the working directory, so the
+    surface factory resolves it to the nearest ancestor with a `.git` entry
+    (`working_tree_root`) before the app opens. A review started from a subdirectory shares the
+    scope of one started at the root.
+  * The scope's fallback `target` (the first included source's target) is unchanged; the
+    service still uses it for provider operations, not for the key.
+  * Saving moves the annotations from the fingerprinted scope into the new workspace's scope, as
+    above.
+  * Before this change every transient review used the bare id `transient-review-workspace`
+    (the scope's target was ignored by the key), so annotations from any unsaved review showed in
+    every other unsaved review, across repositories in the shared database. Annotations written
+    under that shared key are left in place and not migrated: they cannot be attributed to a
+    target (each row records only the first source's legacy target, which is the repository for
+    pull-request, stack, file, multi-commit, and current-branch reviews). No review shows them
+    any more; `is_transient_scope_id` still recognizes the bare id so it is never treated as a
+    durable workspace.
 * **Reviewed revisions.** Each source's resolved commit sides (`reviewed_revisions`, the first
   part of a multi-part source) are recorded when the pass is marked complete or published (7.4)
   and saved with the workspace; home compares them with the current heads (7.2).
@@ -1420,6 +1448,20 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
   `presentation_state_json` column stay so the migration history is unchanged, but since phase 7
   nothing reads or writes the column and the model no longer has the field; older clients' JSON
   that still carries `presentation_state` decodes (the field is ignored).
+* Transient annotation keys (7.5): transient reviews are keyed per target
+  (`review-workspace-transient-review-workspace-{fingerprint}`); durable keys
+  (`review-workspace-{id}`) are unchanged. Rows under the former shared key
+  `review-workspace-transient-review-workspace` stay in the database unmigrated and are no
+  longer shown; no schema change is involved.
+* Target-keyed drafts of early workspaces: workspaces written before drafts were scoped to
+  workspaces kept their drafts under the target key (`review-{sha256(repo, target)}` of the first
+  included source; the service's `workspace_legacy_review_key`). The first review interface
+  stopped reading that key for workspaces once drafts were scoped, and V2 matches it: the review
+  route lists only the workspace key. Home's draft and thread counts still fall back to the
+  target key when the workspace key has no drafts, so such a workspace can show a count on home
+  that its review does not list. The rows are not adopted into the workspace key: the target key
+  is shared by every workspace whose first source has the same target (and by target-scoped
+  requests for that target), so adopting them would assign one review's drafts to another.
 
 ## 10. Phases
 

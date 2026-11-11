@@ -1095,7 +1095,10 @@ async fn build_bundle(
         title = format!("{title} · {}", planned.label);
     }
     ReviewBundle {
-        review_id: format!("review-workspace-{}", context.workspace.id),
+        review_id: format!(
+            "review-workspace-{}",
+            crate::v2::scope::annotation_workspace_id(&context.workspace)
+        ),
         title,
         repo_root: context.repo_path.clone(),
         target,

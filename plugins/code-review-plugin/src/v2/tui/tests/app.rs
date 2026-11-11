@@ -667,6 +667,98 @@ fn saving_a_transient_review_makes_it_durable_with_its_drafts() {
     assert!(!screen.contains("1 drafts"), "{}", screen.text());
 }
 
+/// Unsaved reviews keep their comments per target (spec 7.5): another target's unsaved review
+/// does not show them, reopening the same target does, and saving moves them out of it.
+#[test]
+fn unsaved_reviews_keep_their_comments_per_target() {
+    let fixture = fixture();
+    let backend = Arc::new(LocalBackend::default());
+    let last_commit = || Entry::Sources {
+        title: None,
+        sources: vec![ReviewSourceKind::LastCommit],
+    };
+    let branch = || Entry::Sources {
+        title: None,
+        sources: vec![ReviewSourceKind::BranchCompare {
+            base_branch: BASE_BRANCH.to_owned(),
+            head_branch: HEAD_BRANCH.to_owned(),
+            merge_base: true,
+        }],
+    };
+    let comment = |scenario: &mut Scenario<ReviewAppV2>, body: &str| {
+        scenario.key("shift+c");
+        scenario.paste(body);
+        scenario.key("ctrl+s");
+        settled(scenario)
+    };
+    let (mut scenario, _) = open(&fixture, &backend, last_commit(), 140, 40);
+    let screen = comment(&mut scenario, "about the last commit");
+    assert!(
+        screen.contains("about the last commit"),
+        "{}",
+        screen.text()
+    );
+
+    // Another target's unsaved review starts without it.
+    let (mut scenario, screen) = open(&fixture, &backend, branch(), 140, 40);
+    assert!(scenario.surface().review().unwrap().is_transient());
+    assert!(
+        !screen.contains("about the last commit"),
+        "{}",
+        screen.text()
+    );
+    let screen = comment(&mut scenario, "about the branch");
+    assert!(screen.contains("about the branch"), "{}", screen.text());
+
+    // Reopening each target shows its own comments only.
+    let (_, screen) = open(&fixture, &backend, last_commit(), 140, 40);
+    assert!(
+        screen.contains("about the last commit"),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.contains("about the branch"), "{}", screen.text());
+    let (_, screen) = open(&fixture, &backend, branch(), 140, 40);
+    assert!(screen.contains("about the branch"), "{}", screen.text());
+    assert!(
+        !screen.contains("about the last commit"),
+        "{}",
+        screen.text()
+    );
+
+    // Saving the last-commit review moves its comment into the saved review and out of the
+    // unsaved scope; the branch review's comment stays where it was.
+    let (mut scenario, _) = open(&fixture, &backend, last_commit(), 140, 40);
+    scenario.key("ctrl+s");
+    settled(&mut scenario);
+    let saved = scenario
+        .surface()
+        .review()
+        .unwrap()
+        .workspace()
+        .unwrap()
+        .id
+        .clone();
+    assert_ne!(saved, TRANSIENT_WORKSPACE_ID);
+    let resume = Entry::Resume {
+        workspace_id: Some(saved),
+    };
+    let (_, screen) = open(&fixture, &backend, resume, 140, 40);
+    assert!(
+        screen.contains("about the last commit"),
+        "{}",
+        screen.text()
+    );
+    let (_, screen) = open(&fixture, &backend, last_commit(), 140, 40);
+    assert!(
+        !screen.contains("about the last commit"),
+        "{}",
+        screen.text()
+    );
+    let (_, screen) = open(&fixture, &backend, branch(), 140, 40);
+    assert!(screen.contains("about the branch"), "{}", screen.text());
+}
+
 #[test]
 fn home_clicks_start_suggestions_and_open_reviews_where_painted() {
     let fixture = fixture();

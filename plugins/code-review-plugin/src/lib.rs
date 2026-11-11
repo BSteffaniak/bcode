@@ -1138,7 +1138,7 @@ fn review_bundle_for_request(
         |workspace| Ok(workspace_review_key(workspace)),
     )?;
     let scope = workspace.as_ref().map(|workspace| ReviewScope::Workspace {
-        workspace_id: workspace.id.clone(),
+        workspace_id: v2::scope::annotation_workspace_id(workspace),
         target: request.target.clone(),
     });
     let excluded_thread_anchors = request.excluded_thread_anchors;
@@ -4556,8 +4556,13 @@ fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {
     format!("workspace-{}", hex::encode(hasher.finalize()))
 }
 
+/// Review key of a workspace's annotations: `review-workspace-` plus its annotation scope id
+/// (its id when durable; a per-target id when transient, spec 7.5).
 fn workspace_review_key(workspace: &ReviewWorkspace) -> String {
-    format!("review-workspace-{}", workspace.id)
+    format!(
+        "review-workspace-{}",
+        v2::scope::annotation_workspace_id(workspace)
+    )
 }
 
 fn review_key_for_scope(
