@@ -309,6 +309,11 @@ Profile state (macOS `sample` over the 5k-file scroll, unstripped release build)
   target (142–165 ms across runs): its two renders take 11–15 ms, and the rest is the in-process
   service calls (git, JSON) for the first files' hunks.
 
+#### V2 screen on large terminals (phase 8)
+
+Measured at 200×60, 300×90, and 400×120 with `v2_screen_benchmark_sizes`, and in the real app
+under the chat host; the tables and their attribution are in 13.2.
+
 ## 3. Layered architecture
 
 ```
@@ -1525,6 +1530,30 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
      override is removed. Overrides for the development-only `code-review-v2…` scopes are not
      aliased: they need renaming to the scopes above (they also show as unresolved). No alias
      mechanism was added to the generic keymap registry for this.
+8. **Measure the large-terminal frame.** Attribute frame time on a large terminal between the
+   host root loop, the review surface, and terminal diff/flush; add a large-terminal benchmark
+   case (13.2).
+
+   **Implementation (phase 8).** Measured (13.2): the review surface paints a 400×120 scroll
+   frame in 1.5–2.5 ms; the chat-root host adds about 6 ms per frame, 4–5 ms per key, an idle
+   redraw loop, and one-event-per-cycle input that closes the review past 32 queued events.
+9. **Standalone app.** `packages/code-review-ui` and the `bcode-review` binary with their own
+   runtime loop, direct data calls, and `bcode_tui_theme` theme loading; the UI written against
+   a `ReviewHost` trait; the host's theme mapping and session live stream made public; V2 names
+   flattened; the review PTY smoke cases rewritten for the app (13.3).
+10. **Visual system.** Semantic surface, text, and accent tiers derived from bcode theme roles;
+    rounded panels, pill chips and buttons, selection bar, spinners, collapsible and resizable
+    rails; generic pieces upstream in BMUX (13.4).
+11. **Inline AI live feed.** AI cards follow the linked session live in place: thinking, tool
+    lines, streaming answer, follow-up composer, stop, inline permission prompts, attention
+    marks (13.5).
+12. **Review assistant.** A docked assistant with chips, feed, and composer; review tools as
+    daemon plugin tools governed by bcode permission rules; tool writes reflected live (13.6).
+13. **Embedded-session model (Bcode-wide).** Specified and signed off before implementation:
+    the daemon as the single session runtime, client-hosted tools, session origin metadata, and a
+    sanctioned daemon start for consumer apps (13.7).
+14. **Close.** Re-measure, parity, documentation, and tmux smoke at narrow, normal, and large
+    sizes (13.8).
 
 ## 11. Acceptance criteria
 
@@ -1568,6 +1597,300 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
 * Whole-stack mode ships with comment attribution and publishing as described in 7.3.
 * BMUX components are used wherever they fit; generic gaps are added upstream without Bcode
   semantics; review-specific behavior stays in the code review plugin.
+
+## 13. Next: standalone app, visual system, inline AI, review assistant, embedded sessions
+
+Phases 8–14 (section 10) follow V2 becoming the only review UI. They move the review out of the
+chat host into its own app, give it a deliberate visual system, make AI work visible where it
+happens, add a review assistant whose writes are governed by bcode permissions, and define how
+any app embeds real bcode sessions.
+
+### 13.1 Current state that motivates the plan
+
+* **The review runs inside the chat program.** `bcode review` opens the `code-review` plugin
+  surface through `run_prepared_plugin_surface` (`packages/tui/src/runtime.rs`). Its
+  `prepare_plugin_surface_model` calls `initialize_tui_with_presentation`, which builds the chat
+  state, the bcode client, and settings, and then the surface runs under `root_program::run`, the
+  chat root loop. Every review frame therefore passes through the chat program's loop and its
+  per-frame work, although the review uses none of the chat UI. The review's own frame path is
+  measured (2.1: 0.87–1.56 ms p95 at 200×60 in an optimized build); the host loop and terminal
+  diff/flush are not, and on a large full-screen terminal the review is visibly sluggish.
+* **Data goes through a JSON service hop in-process.** The UI reaches the data layer through
+  `ReviewBackend` (`src/v2/tui/backend.rs`) and `call_json`: every request and response is
+  encoded to JSON and dispatched as a plugin service operation, even though the UI and the
+  service are the same crate in the same process.
+* **Theme and live sessions are host-private.** The theme arrives as `PluginTuiTheme` from the
+  host; the mapping from a resolved bcode theme definition to `ComponentTheme` (and the markdown
+  and syntax palettes) is `resolved_definition_theme` in `packages/tui/src/theme.rs`, which is
+  `pub(crate)`. Linked AI sessions are followed through the host's `stream_plugin_session_view`
+  (`packages/tui/src/plugin_surface_host.rs`), a private function. A program outside
+  `packages/tui` cannot reuse either.
+* **A standalone precedent exists.** `bcode-git` is `packages/git-ui` (`bcode_git_ui`) with
+  `packages/git-ui/cli` (`bcode_git_ui_cli`, binary `bcode-git`); the git plugin's
+  `plugins/git-plugin/src/cli.rs` runs the same `bcode_git_ui::run` as the bundled `bcode git`
+  subcommand. It runs its own `bmux_tui_runtime` loop and loads themes itself through
+  `bcode_tui_theme::discovery` (`default_theme_roots`, `discover_themes`), with unset fields
+  falling back to `[tui.theme]` in `bcode.toml` (`packages/git-ui/src/config.rs`).
+* **AI cards show only the final answer.** `AgentState::from_snapshot` (`src/v2/tui/agent.rs`)
+  reduces a linked session's `SessionViewSnapshot` to a phase and the last completed assistant
+  message. The snapshot already carries what a live view needs: transcript items (user,
+  reasoning, tool invocation, permission, assistant), text streams, pending `permissions`,
+  `thinking` state, and runtime cost and token totals.
+* **Consumer apps cannot start the daemon.** `BcodeClient::for_daemon` (the explicit,
+  verified-target constructor for independent consumers) never launches a daemon: it requires
+  one already running. Only the default client auto-starts (`DaemonAvailability::AutoStart`).
+  There is no way for a client to register tools on its connection, and sessions carry no
+  record of which app created them.
+
+### 13.2 Phase 8: measure the large-terminal frame
+
+Measure before changing anything. Attribute each frame's time at narrow (80×24), normal
+(200×60), and large (a full-screen large monitor, at least 400×110) sizes between:
+
+* the host root loop (event dispatch, chat-program work, invalidation) outside the surface;
+* the review surface (layout, row building, paint);
+* terminal diff and flush (changed cells, bytes written, write time).
+
+Add a large-terminal case to `v2_screen_benchmark` (today 200×60) and record the numbers in 2.1
+alongside the existing tables. The results decide which costs phase 9 removes by leaving the
+chat loop, which belong to the review surface, and which are generic terminal costs to fix in
+BMUX. Criterion B's steady scroll target (≤ 2 ms p95) applies at the large size too.
+
+**Implementation (phase 8).** Measured; no product code changed. The review surface is cheap
+on a large terminal; the sluggishness comes from the chat-root host and its input pipeline, plus
+the bytes written for every frame.
+
+* **Benchmark.** `v2_screen_benchmark_sizes` (`src/v2/tui/tests/benchmark.rs`, ignored; run
+  with `cargo test --release -p bcode_code_review_plugin v2_screen_benchmark_sizes --
+  --ignored --nocapture --test-threads 1`) runs 200×60, 300×90, and 400×120 in both layouts
+  (`BCODE_BENCH_SIZES` chooses others) and reports paint, encode, and input time plus bytes per
+  frame, presenting into an in-memory BMUX terminal with the themed host colors. The narrow
+  80×24 size was not measured in this phase.
+* **Real app.** `bcode review` against the exported 5k-file fixture, built with the
+  `debug-release` profile (`codegen-units=16`, `debug=line-tables-only`), run in tmux under
+  `script(1)` with isolated state; CPU attributed with macOS `sample`, causes confirmed with
+  lldb line breakpoints. tmux plus `script` is two pty layers, so terminal-write blocking is
+  probably overstated compared with a fast native terminal.
+
+Review surface alone (optimized benchmark; averages; side-by-side unless noted):
+
+| Measurement | 200×60 | 300×90 | 400×120 |
+| --- | --- | --- | --- |
+| 5k-file scroll: paint / encode | 0.64 / 0.15 ms | 0.95 / 0.26 ms | 1.51 / 0.44 ms |
+| 5k-file scroll: paint p95 | 1.31 ms | 1.63 ms | 2.39 ms |
+| 5k-file scroll: bytes per frame (avg / max) | 21 / 54 KB | 36 / 90 KB | 54 / 129 KB |
+| 5k-file scroll, unified: paint / encode / bytes | 0.58 / 0.13 ms / 16 KB | 1.05 / 0.29 ms / 27 KB | 1.59 / 0.42 ms / 42 KB |
+| 40k-line file scroll: paint / encode / bytes | 0.53 / 0.14 ms / 24 KB | 1.56 / 0.40 ms / 49 KB | 1.63 / 0.55 ms / 76 KB |
+| Held PageDown: paint / encode / bytes | 0.91 / 0.18 ms / 24 KB | 1.99 / 0.35 ms / 43 KB | 2.51 / 0.52 ms / 69 KB |
+| Held `j`: paint / encode / bytes | 0.43 / 0.12 ms / 18 KB | 1.91 / 0.35 ms / 27 KB | 1.36 / 0.36 ms / 32 KB |
+| 10 queued `j` per frame: paint / encode | 0.69 / 0.15 ms | 1.38 / 0.36 ms | 1.78 / 0.54 ms |
+| Full redraw: paint / encode / bytes | 3.3 / 0.21 ms / 67 KB | 3.5 / 0.39 ms / 111 KB | 3.8 / 0.52 ms / 159 KB |
+| Input handling per event | ≤ 0.006 ms | ≤ 0.006 ms | ≤ 0.005 ms |
+| First content frame after the index | 114–189 ms | 121–123 ms | 111–120 ms |
+
+Paint grows roughly with the cell count. Isolated maximums of about 30 ms happen when jumping
+into the 40k-line file. Criterion B's steady scroll target is met at 200×60 and missed narrowly
+at 400×120 (2.39–2.47 ms p95 scrolling the 5k-file review, 2.7–2.9 ms p95 under held PageDown).
+
+Real app (ms per presented frame from `sample`; held PageDown at 40 Hz):
+
+| Component | 200×50 | 400×120 |
+| --- | --- | --- |
+| Whole frame (`present_root_frame`) | 9.1 | 14.3 |
+| Review surface `render_with_host` | 2.5 | 5.1 (2.7 of it row measurement in `layout_list`) |
+| Host backdrop copy + extra full buffer | 0.6 + 0.2 | 1.8 + 0.8 |
+| Keymap copy before each frame (`prepare_root_presentation`) | 2.2 | 1.3 |
+| Other chat-frame work (chrome, transcript sync) | about 2.1 | about 2.5 |
+| BMUX diff + ANSI encode | 0.16 | 0.9 |
+| stdout write (blocking) | 1.4 | 1.9 (15 per frame while wheel scrolling) |
+| Event handling per key (`update`) | 5.2 (3.3 of it the keymap copy) | 3.9 (2.6 of it the keymap copy) |
+| Idle frames with nothing changing | 48/s at 2.9 ms each | 34/s at 6.9 ms each |
+| Main thread busy holding PageDown | 47% | 54% (96% wheel scrolling at 30 Hz) |
+| Content frames/s: PageDown 40 Hz / `j` 60 Hz / wheel 30 Hz | 27 / 40 / not measured | 26 / 36 / 16 |
+| Frames per input event | 0.66–0.70 | 0.57–0.67 (2.7 per isolated wheel notch) |
+| Catch-up after releasing a held key | up to 1443 ms (PageDown) | 116–577 ms (PageDown), about 16 ms (`j`) |
+| Bytes per content frame: PageDown / `j` | 9.6 / 13 KB | 45–64 / 28 KB |
+
+Excluding the surface render, encode, and write, the host adds about 5 ms per frame at 200×50
+and 6.4 ms at 400×120, plus 4–5 ms of handling per key and a continuous idle frame loop. The
+surface is 2.5–5 ms of a 14 ms frame.
+
+Attribution (`packages/tui` paths are the chat host; line numbers at this phase's revision):
+
+* **Idle redraw loop (host).** `root_program.rs` requests a redraw after every committed frame
+  while the hidden chat transcript is invalidated (`presentation_committed`), and the flag is
+  cleared only when the transcript paints (`transcript_v2_host/paint.rs`), which it never does
+  while a plugin owns the screen (`chat_loop.rs`, `!foreground_owns_canvas`). lldb on an idle
+  400×120 review: 26 of 30 redraw requests came from that branch, the rest from timers.
+* **Keymap copied per frame, event, and poll (host).** `fresh_session_settings`
+  (`root_program.rs`) copies the whole `KeymapRegistry` (`plugin_surface_host.rs`) from
+  `prepare_root_presentation`, every poll, and input routing: 19–32% of busy main-thread time,
+  including dropping the copies on worker threads.
+* **One input event per cycle, and closing on overflow (host).** Input that arrives while the
+  surface is out for `drain_effects` is queued and replayed one event per poll and drain
+  (`chat_loop.rs`); frames are skipped meanwhile (`root_plugin_paint_pending`). Past 32 queued
+  events the host sets `close_after_drain`: a burst of 100 `j` closes `bcode review` every time
+  (60 does not). This is a correctness bug as well as the cause of the catch-up lag.
+* **Backdrop copy (host).** For the plugin screen, `paint_backdrop` (`chat_loop.rs`,
+  `foreground.rs`) allocates a second full-size buffer every frame and copies it back cell by
+  cell: about 2.6 ms per frame at 400×120 and 17.5% of each idle frame.
+* **Full damage for every plugin input (host and BMUX).** `root_program.rs` sets
+  `Damage::Full` for plugin input, so BMUX's scroll-region shortcut never applies; it also needs
+  a full-width region (`scroll_plan`), which the file panel prevents.
+* **Blocking terminal write (BMUX).** `packages/tui/src/terminal.rs` in BMUX writes and flushes
+  stdout on the UI thread: 1.4–1.9 ms per frame under held PageDown and about 15 ms per frame
+  (27% of busy time) wheel scrolling at 400×120 under tmux.
+* **Row measurement (surface and BMUX).** `layout_list` (`surface.rs`) with
+  `VirtualSourceList::layout_pinned`, `ItemView::layout`, `RowContext::build`, and
+  `layout_diff_row`: about 2.7 of the 5.1 ms surface render per PageDown frame at 400×120.
+* **Syntax highlighting (surface).** `schedule_syntax` (`surface.rs`) highlights whole old and
+  new blobs on the blocking pool; paging through the 5k-file review kept one core busy for the
+  whole run, and each completion triggers another poll, drain, and frame.
+* **Wheel animation (surface).** The 90 ms scroll animation makes about 2.7 frames per wheel
+  notch, each paying the full host overhead.
+
+Consequences for later phases:
+
+* Removed by phase 9, provided the app runs its own loop and does not reuse the root
+  plugin-surface host: the idle redraw loop, the keymap copies (the app holds its keymap by
+  reference), the one-event-per-cycle input replay and its close-on-overflow (the app handles
+  events directly, replays all queued input before a drain, coalesces repeated motion keys, and
+  does not take the surface out when no effects are pending), and the backdrop copy. If the chat
+  host keeps embedding plugin surfaces, the same fixes apply there; the close-on-overflow is a
+  bug to fix regardless.
+* Needed regardless of phase 9:
+  * BMUX: move terminal output off the UI thread on macOS (as `LinuxTerminalOutput` does on
+    Linux) and drop superseded frames under backpressure; support scroll regions that are not
+    full width where the terminal allows it (left/right margins).
+  * App and surface: report scroll damage for the list area instead of full damage; cache row
+    measurements per row key and width (about 1–2.5 ms per PageDown frame at 400×120); bound
+    syntax highlighting to visible windows, cancel jobs for files scrolled past, and batch
+    completions into one redraw.
+  * Keep the 90 ms wheel animation and re-check it once the host costs are gone; shorten it on
+    large terminals or merge wheel input into the running animation if it still saturates.
+
+### 13.3 Phase 9: standalone app
+
+* **Crates.** `packages/code-review-ui` (the review UI, moved from `src/v2/tui/`) and
+  `packages/code-review-ui/cli` with a `bcode-review` binary, mirroring `bcode-git`. The data
+  layer the UI calls (service operations, document) becomes callable as Rust from the UI crate,
+  in `packages/code-review` (the implementation crate beside the existing
+  `packages/code-review/models`); the code review plugin keeps its service interface, CLI
+  registration, and (phase 12) tools as adapters over the same functions, so other consumers
+  (agents, other plugins) are unaffected.
+* **Own loop, direct calls.** The app runs its own `bmux_tui_runtime` loop and calls the data
+  layer directly (no JSON encoding, no service dispatch). It uses the same state database and
+  code paths as the service, so the app and the daemon plugin agree on every record.
+* **Theme.** Loaded like `bcode-git`: `bcode_tui_theme` discovery and `[tui.theme]` from the
+  bcode configuration.
+* **Entry points.** `bcode review` remains a bundled subcommand and runs the app in-process the
+  way `bcode git` runs `bcode-git`; `bcode-review` takes the same subcommands (7.5).
+* **`ReviewHost`.** The UI is written against a small host trait with four parts:
+  * terminal: size, input events, and frame submission (the loop);
+  * theme: the `ComponentTheme`, diff styles, icon policy, and change notifications;
+  * sessions: create, send, follow a session's live view, open a session in Bcode;
+  * clipboard.
+
+  The app provides the standalone implementation. Embedding the review in the chat TUI later is
+  another implementation of the same trait over the plugin surface host, with no change to the
+  UI. Chat embedding is not maintained in phase 9; the boundary is what keeps it cheap.
+* **Shared functions.** The host's theme mapping (`resolved_definition_theme`) moves to
+  `bcode_tui_theme` as a public function, and the live session view stream
+  (`stream_plugin_session_view`) becomes a public function of `bcode_session_view` /
+  `bcode_client`. The chat host calls the public versions, so there is one implementation of
+  each.
+* **Names.** Internal V2 names are flattened: `src/v2/` modules move to the crate root,
+  `ReviewAppV2` becomes `ReviewApp`, `ReviewSurfaceV2` becomes `ReviewSurface`, and similar.
+  Persisted and configured spellings (`presentation_v2_json`, the `presentation_v2` JSON field,
+  the `review_v2` configuration table) keep their names or gain a read alias; only Rust names
+  change.
+* **Smoke.** The 11 cases in `scripts/smoke-continuous-tui-pty.py` that open `bcode review`
+  (`completion-review` and the ten `review-*` cases) are rewritten for the app.
+
+### 13.4 Phase 10: visual system
+
+The design learns from bdata (`packages/tui-components/src/theme.rs`, `draw.rs`, and
+`packages/app/src/view` in that repository): a small set of semantic tiers, panels, and pills
+used consistently.
+
+* **Semantic tiers.** Surfaces `canvas`, `surface`, `surface_alt`, `overlay`; text `text`,
+  `strong`, `muted`, `dim`; accents `accent`, `accent_alt`, `on_accent`. Each tier is derived from
+  bcode theme roles (`surface.raised`, `surface.overlay`, `control.focused`, the theme accent, and
+  so on) with fallbacks through `ComponentTheme::derive`, so every bcode theme, including ones
+  that define few roles, produces a complete review theme.
+* **Warning means "needs you".** Warning color is reserved for things that need the reviewer
+  (a pending permission, an unsaved review with comments, a failed AI request). Status roles stop
+  using it: modified files use warning today (6.3) and move to an accent or neutral role.
+* **Components.** Rounded panels whose border and title take the accent when focused, with a
+  right-aligned title for status; layered surfaces (canvas, panel, overlay); a header of pill
+  chips; real button pills for actions such as publish; a `▌` selection bar on the selected row;
+  spinners next to the thing that is busy (a loading file, a running AI card) rather than one
+  global indicator; collapsible rails with drag-resize and a zoom that gives one pane the whole
+  screen.
+* **Placement.** Generic pieces (rounded titled panels with right titles, pills, rail collapse and
+  resize) go upstream into BMUX without review semantics (1.3); review-specific composition stays
+  in the review UI.
+
+### 13.5 Phase 11: inline AI live feed
+
+Asking an AI question keeps the reviewer where they are: the card at the anchor follows the
+linked session live, from the session's `SessionViewSnapshot` stream (13.3) instead of
+`AgentState::from_snapshot`'s last answer.
+
+* **Card contents.** The question (marked `▍`); reasoning collapsed as `▸ thinking · N words`;
+  tool lines with `◌` running, `✓` done, `✗` failed, showing the last few and `+K earlier`; the
+  answer as streaming markdown; a footer with a spinner, elapsed time, and tokens and cost.
+* **In place.** A follow-up composer inside the card, stop (cancels the running turn), and inline
+  permission prompts (Allow, Always, Deny) answered without leaving the review.
+* **More.** "Show all" opens the full session transcript in a panel inside the review; `o` still
+  opens the session in Bcode.
+* **Attention.** When an off-screen card needs the reviewer (a permission prompt, a failure, a
+  finished answer), a toast appears and the scrollbar marks the card's position.
+* **Bounds.** Cards keep a bounded window of transcript items and reuse the identity-keyed layout
+  cache (6.4); streaming updates relayout only the card that changed.
+
+### 13.6 Phase 12: review assistant
+
+* **Dock.** `ctrl+k` opens a docked assistant rail in the bdata style: chips for model, effort,
+  agent, and permission mode; the session feed (rendered like 13.5); a composer; the rail
+  collapses like other rails (13.4).
+* **Review tools.** Review operations are exposed to agents as daemon plugin tools of the code
+  review plugin, so any bcode session (the assistant, an AI card's session, or a chat session)
+  can use them:
+  * read: review summary, sources, pull request and stack metadata, file and hunk context,
+    threads, CI status;
+  * write: draft a comment, reply, resolve, mark viewed, suggest a change;
+  * external: publish the review, post a pull request comment.
+* **Permissions.** Each tool declares a policy operation (`ToolPolicyOperation`), so bcode
+  permission rules (ask, allow, deny, remembered decisions) govern them like any other tool.
+  External tools are high-risk and ask by default.
+* **Live reflection.** The app reflects tool writes as they happen (a drafted comment appears at
+  its anchor, a resolve updates the thread), through the same annotation store and refresh path
+  as the reviewer's own edits.
+
+### 13.7 Phase 13: embedded-session model (Bcode-wide)
+
+This phase changes Bcode beyond the review and needs its own specification and sign-off before
+implementation. The goal: bdata and any other consumer, embedded or not, create real bcode
+sessions that are visible and resumable everywhere.
+
+* **One runtime.** The daemon is the single session runtime. "Embedded" means an in-process
+  client of the daemon, not a second runtime.
+* **Client-hosted tools.** An app registers typed tools on its connection; the daemon routes
+  calls for them back to that connection. When the app is not connected, a call fails with a
+  clear tool error and the session history stays intact.
+* **Session origin.** Sessions record their origin (app and app context) for listing and
+  filtering.
+* **Sanctioned daemon start.** Consumer apps get a supported way to start the daemon (today the
+  explicit constructor, `BcodeClient::for_daemon`, only attaches to a running one).
+* **SDK mode.** The in-process SDK mode remains for stateless use and app-owned persistence.
+* bdata's migration to this model is follow-up work in that repository.
+
+### 13.8 Phase 14: close
+
+Re-measure (13.2's sizes and the 2.1 benchmarks), close parity (Appendix B) for everything the
+move touched, update this document and `docs/code-review-plugin-extension-points.md`, and run
+the tmux smoke at narrow, normal, and large sizes.
 
 ## Appendix A. V1 behavior inventory
 

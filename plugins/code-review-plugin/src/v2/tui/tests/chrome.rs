@@ -26,12 +26,12 @@ fn fixture() -> GitFixture {
     GitFixture::generate(FixtureSpec::small())
 }
 
-const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
+pub(super) const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
 }
 
 /// A host theme whose roles all have distinct colors; `accent` varies it.
-fn host_theme(accent: Rgb) -> PluginTuiTheme {
+pub(super) fn host_theme(accent: Rgb) -> PluginTuiTheme {
     let component = ComponentTheme::derive(ComponentThemeSeed {
         background: rgb(16, 18, 24),
         foreground: rgb(220, 222, 230),

@@ -618,6 +618,25 @@ impl<S: PluginTuiSurface> Scenario<S> {
         })
     }
 
+    /// Paint one frame at the terminal's size into a prepared presentation with full damage, as
+    /// the host does for a plugin surface, without encoding it. Pass the result to
+    /// [`bmux_tui::terminal::Terminal::draw_prepared_with_output_hooks`] to diff-encode it
+    /// against the terminal's retained frame.
+    pub fn prepare<W: std::io::Write>(
+        &mut self,
+        terminal: &bmux_tui::terminal::Terminal<W>,
+    ) -> Option<bmux_tui::presentation::PreparedPresentation> {
+        let area = terminal.area();
+        self.size = Size::new(area.width, area.height);
+        self.surface.prepare_keymap(&self.host);
+        let surface = &mut self.surface;
+        let host = &self.host;
+        let theme = self.theme.as_ref();
+        terminal.prepare_frame(bmux_tui::damage::Damage::Full, |cx| {
+            surface.render_with_host(area, cx, theme, host);
+        })
+    }
+
     /// Settle async work, then render one frame.
     pub fn frame(&mut self) -> Screen {
         self.settle();
