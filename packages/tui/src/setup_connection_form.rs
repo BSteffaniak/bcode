@@ -68,9 +68,7 @@ impl ConnectionForm {
             Err(message) => (Vec::new(), message),
         };
         Self {
-            keymap: super::keymap::BmuxKeyMap::from_registry(
-                bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
-            ),
+            keymap: super::keymap::BmuxKeyMap::from_registry(std::sync::Arc::default()),
             presentation: Presentation::Guided,
             providers,
             picker: Some(false),

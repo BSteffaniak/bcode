@@ -77,7 +77,7 @@ struct BcodePluginTuiHost {
 
 #[derive(Debug, Clone, Default)]
 pub struct FreshSessionSettings {
-    pub keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    pub keymap: Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry>,
     pub working_directory: std::path::PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,

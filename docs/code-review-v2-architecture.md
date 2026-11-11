@@ -1769,6 +1769,37 @@ Consequences for later phases:
   * Keep the 90 ms wheel animation and re-check it once the host costs are gone; shorten it on
     large terminals or merge wheel input into the running animation if it still saturates.
 
+**Chat-host fixes (after phase 8).** The generic host costs are fixed in the chat host itself,
+since they affect every plugin surface:
+
+* A foreground that owns the canvas hides the transcript, so pending transcript work neither
+  requests frames after a commit nor turns other updates into redraws; the transcript stays
+  invalidated and repaints in the frame that closes the foreground. Composer-cursor and status
+  animation under a plugin surface advance without presenting.
+* `BmuxKeyMap`, the app's effective keymap, and `FreshSessionSettings` share the
+  `KeymapRegistry` through an `Arc`; nothing copies it per frame, event, or poll.
+* `PluginTuiSurface::has_pending_effects` (default true) lets a surface say it has no
+  `drain_effects` work; the host then never lends it out. Input queued during a drain is
+  replayed in one poll, stopping only at an action the root must apply; queued pointer motion
+  and resizes coalesce; the queue is bounded (4096, newer input dropped and logged) and never
+  closes the surface. Esc / Ctrl-C request a close only while an operation holds the surface.
+* No backdrop is painted (or allocated) under a canvas-owning foreground.
+* Plugin input keeps whole-surface damage: surfaces report no damage, BMUX diffs cells so
+  full damage writes only changed cells, and scroll-region acceleration would need a surface
+  scroll hint and a full-width scrolled region.
+
+Measured at 400×120 with the same `debug-release` setup (tmux plus `script(1)`, `sample`):
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Idle frames | 43/s, 17% main thread busy | 0/s, idle |
+| `update` per key (held `j`, 60 Hz) | 1.23 ms | 0.06 ms |
+| Frame (`present_root_frame`), held `j` | 4.9 ms | 1.9 ms |
+| Frame, held PageDown (40 Hz) | 7.9 ms | 3.8 ms |
+| Content frames/s: `j` 60 Hz / PageDown 40 Hz | 32 / 27 | 44 / 38 |
+| Catch-up after held PageDown | 47 ms | 6 ms |
+| Burst of 100 `j` (and 300 `k`) | closes the review | stays open, last frame after 23 ms |
+
 ### 13.3 Phase 9: standalone app
 
 * **Crates.** `packages/code-review-ui` (the review UI, moved from `src/v2/tui/`) and

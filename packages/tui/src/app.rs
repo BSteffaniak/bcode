@@ -350,7 +350,7 @@ pub struct BmuxApp {
     /// Streaming-presentation policy last applied by the host shell (host configuration,
     /// shared by both transcript engines).
     streaming_presentation_policy: bcode_session_view_models::StreamingPresentationPolicy,
-    effective_keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    effective_keymap: std::sync::Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry>,
     /// Advances on every effective keymap replacement (plugin visual key hints depend on it).
     effective_keymap_generation: u64,
     diff_viewer_layout_override: Option<TuiDiffViewerLayout>,
@@ -524,7 +524,7 @@ impl BmuxApp {
             // `SessionView` starts with immediate presentation until configuration applies one.
             streaming_presentation_policy:
                 bcode_session_view_models::StreamingPresentationPolicy::immediate(),
-            effective_keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+            effective_keymap: std::sync::Arc::default(),
             effective_keymap_generation: 0,
             diff_viewer_layout_override: None,
             exit: ExitState::default(),
@@ -627,9 +627,11 @@ impl BmuxApp {
     /// Replace the terminal frontend's effective keymap snapshot without rereading config.
     pub fn set_effective_keymap(
         &mut self,
-        registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+        registry: std::sync::Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry>,
     ) {
-        if self.effective_keymap != registry {
+        if !std::sync::Arc::ptr_eq(&self.effective_keymap, &registry)
+            && self.effective_keymap != registry
+        {
             self.effective_keymap = registry;
             self.effective_keymap_generation = self.effective_keymap_generation.wrapping_add(1);
             self.key_hints = format!(
@@ -644,8 +646,16 @@ impl BmuxApp {
 
     /// Effective bindings shared by visual rendering and terminal dispatch.
     #[must_use]
-    pub const fn effective_keymap(&self) -> &bcode_plugin_sdk::tui::keymap::KeymapRegistry {
+    pub fn effective_keymap(&self) -> &bcode_plugin_sdk::tui::keymap::KeymapRegistry {
         &self.effective_keymap
+    }
+
+    /// Effective bindings as a shared handle; cloning it never copies the bindings.
+    #[must_use]
+    pub fn shared_effective_keymap(
+        &self,
+    ) -> std::sync::Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry> {
+        std::sync::Arc::clone(&self.effective_keymap)
     }
 
     /// Generation of the effective keymap: it advances whenever the keymap is replaced, so

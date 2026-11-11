@@ -4168,6 +4168,11 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
         }
     }
 
+    /// Review work runs on host tasks observed through `poll`; nothing waits for a drain.
+    fn has_pending_effects(&self) -> bool {
+        false
+    }
+
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if matches!(self.phase, Phase::Idle) {
             self.start_open(host);

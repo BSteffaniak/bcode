@@ -842,7 +842,7 @@ impl TranscriptScenarioDriver for V2Driver {
         self.model.chat.app.set_plugin_host(std::sync::Arc::new(
             bcode_plugin::PluginHost::load_static_plugins(&selected).expect("bundled plugins load"),
         ));
-        let keymap = self.model.settings.keymap().registry().clone();
+        let keymap = self.model.settings.keymap().shared_registry();
         self.model.chat.app.set_effective_keymap(keymap);
         self.model.request_full_redraw_for_test();
         self.sync();

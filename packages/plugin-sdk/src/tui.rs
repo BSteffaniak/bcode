@@ -2404,6 +2404,17 @@ pub trait PluginTuiSurface: Send {
         PluginTuiAction::None
     }
 
+    /// Whether [`Self::drain_effects`] has queued work to run.
+    ///
+    /// Hosts lend the surface to `drain_effects` only when this returns true, so a surface
+    /// whose asynchronous work runs elsewhere (host tasks observed through [`Self::poll`])
+    /// keeps receiving input and painting without the exclusive hand-off. The default is
+    /// conservative: hosts drain after accepted input.
+    #[must_use]
+    fn has_pending_effects(&self) -> bool {
+        true
+    }
+
     /// Drain effectful asynchronous work that was queued by synchronous input handling.
     ///
     /// This compatibility hook borrows the surface for the duration of the future. Hosts must

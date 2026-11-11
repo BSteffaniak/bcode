@@ -778,7 +778,7 @@ impl BcodeRuntimeModel {
 
     fn fresh_session_settings(&self) -> super::plugin_surface_host::FreshSessionSettings {
         super::plugin_surface_host::FreshSessionSettings {
-            keymap: self.settings.keymap().registry().clone(),
+            keymap: self.settings.keymap().shared_registry(),
             working_directory: self
                 .chat
                 .app
@@ -1253,6 +1253,11 @@ impl BcodeRuntimeModel {
             }
         }
         if has_effect {
+            // Plugin surfaces report no damage of their own, so accepted input repaints the
+            // whole surface. That costs little beyond regional damage: BMUX diffs cells and
+            // writes only the changed ones. The remaining gain, scroll-region acceleration,
+            // needs a scroll hint from the surface and a full-width scrolled region, which a
+            // surface with side panels cannot provide.
             super::invalidation::UiInvalidation::Structural
         } else {
             // Explicit Handled/None stays in the owning surface, without manufacturing damage.
@@ -3038,7 +3043,18 @@ impl BcodeRuntimeModel {
         let invalidation = match timer.as_str() {
             "bcode.invalidations" => {
                 let due = self.temporal_registry.take_due(now);
-                return self.chat.app.handle_invalidations_with_damage(&due, now);
+                let (invalidation, damage) =
+                    self.chat.app.handle_invalidations_with_damage(&due, now);
+                // A plugin surface covering the canvas hides the composer cursor and status
+                // activity, so their animation advances without presenting frames; the frame
+                // that reveals the chat again repaints it in full. Whole-screen work (theme
+                // transitions, which also restyle the surface) still presents.
+                if self.loop_state.foreground() == Some(super::foreground::Foreground::Plugin)
+                    && !damage.contains(&super::app::TemporalDamage::Full)
+                {
+                    return (super::invalidation::UiInvalidation::None, Vec::new());
+                }
+                return (invalidation, damage);
             }
             "bcode.artifact_retry" => {
                 self.loop_state.start_due_artifact_fetches(now);
@@ -3510,6 +3526,12 @@ impl BcodeRuntimeModel {
             self.selected_plain_text = None;
             self.chat.app.set_transcript_selection_pinned(false);
         }
+        if self.loop_state.foreground_owns_canvas() {
+            // The transcript and status row are hidden: the transcript stays invalidated and
+            // repaints in the frame that reveals it, so pending transcript work never asks
+            // for frames that would not paint it.
+            return super::invalidation::UiInvalidation::None;
+        }
         if notice {
             // Tooling notices report through the status row.
             return super::invalidation::UiInvalidation::Structural;
@@ -3598,9 +3620,12 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             self.invalidation = super::invalidation::UiInvalidation::Structural;
             self.presentation_damage = bmux_tui::damage::Damage::Full;
             bmux_tui_runtime::Update::redraw()
-        } else if transcript_redraw {
+        } else if transcript_redraw && !self.loop_state.foreground_owns_canvas() {
             // Work the commit ran (an accepted Markdown visual, a settled motion) repaints at
             // its own damage scope: the transcript region alone unless it changed more (F5).
+            // A foreground that owns the whole canvas hides the transcript, so its pending
+            // invalidation waits (it stays set) for the frame that reveals it again instead of
+            // requesting frames that never paint it.
             let invalidation = Self::transcript_v2_invalidation(self.transcript_host.take_damage());
             self.invalidation = invalidation;
             self.presentation_damage = self.select_presentation_damage(invalidation, &[]);
@@ -5648,7 +5673,7 @@ mod tests {
         model
             .chat
             .app
-            .set_effective_keymap(model.settings.keymap().registry().clone());
+            .set_effective_keymap(model.settings.keymap().shared_registry());
         let payload = serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
             "live_state_key":"shell-navigation-v2", "columns":80, "rows":24, "streaming":true,
             "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}});
@@ -5805,7 +5830,7 @@ mod tests {
         model
             .chat
             .app
-            .set_effective_keymap(model.settings.keymap().registry().clone());
+            .set_effective_keymap(model.settings.keymap().shared_registry());
         let requested = |sequence, call: &str, producer: Option<&str>| {
             super::super::transcript_v2_host::test_fixtures::event(
                 session_id,
@@ -5905,7 +5930,7 @@ mod tests {
         model
             .chat
             .app
-            .set_effective_keymap(bcode_plugin_sdk::tui::keymap::KeymapRegistry::default());
+            .set_effective_keymap(std::sync::Arc::default());
         Program::update(
             &mut model,
             RuntimeEvent::Timer(TimerId::new("bcode.transcript_v2")),
@@ -6218,6 +6243,109 @@ mod tests {
             "{:?}",
             model.presentation_damage
         );
+        drop(model);
+    }
+
+    /// A plugin foreground covering the canvas hides the transcript: pending transcript work
+    /// requests no frames while it is open (an idle screen presents nothing), and the
+    /// transcript repaints in the frame that closes the foreground.
+    #[tokio::test]
+    async fn hidden_transcript_requests_no_frames_until_the_foreground_closes() {
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let area = bmux_tui::geometry::Rect::new(0, 0, 40, 12);
+        let mut model = root_test_model_with_history(session_id, &[]);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("frame presents");
+        let _update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
+        model.queue_plugin_surface(
+            "test",
+            Box::new(GatedPluginPaint {
+                release: None,
+                completed: false,
+            }),
+        );
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("frame presents");
+        assert!(
+            model
+                .transcript_host_mut_for_test()
+                .set_markdown_details("transcript:item:x:details:0".to_owned(), true)
+        );
+        let update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
+        assert_eq!(update.invalidation, bmux_tui_runtime::Invalidation::None);
+        assert!(model.transcript_host_for_test().is_invalidated());
+        // Further idle commits stay quiet while the foreground remains.
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("frame presents");
+        let update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
+        assert_eq!(update.invalidation, bmux_tui_runtime::Invalidation::None);
+        // Unrelated updates (timers, messages) do not repaint the hidden transcript either.
+        assert_eq!(
+            model.flush_transcript(),
+            super::super::invalidation::UiInvalidation::None
+        );
+        assert!(model.transcript_host_for_test().is_invalidated());
+
+        let invalidation =
+            model.apply_root_surface_event_result(bcode_plugin_sdk::tui::PluginTuiEventResult {
+                outcome: bmux_tui::event::EventOutcome::Redraw,
+                action: bcode_plugin_sdk::tui::PluginTuiAction::Close { outcome: None },
+            });
+        assert!(!model.loop_state.has_root_plugin_surface());
+        model.presentation_damage = model.select_presentation_damage(invalidation, &[]);
+        let report = super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .expect("frame presents");
+        let _update = bmux_tui_runtime::Program::presentation_committed(&mut model, report);
+        assert!(!model.transcript_host_for_test().is_invalidated());
+        drop(model);
+    }
+
+    /// Composer cursor and status animation are hidden under a plugin surface, so their due
+    /// deadlines present nothing while it is open and repaint again once the chat is visible.
+    #[tokio::test]
+    async fn hidden_chat_animation_presents_nothing_under_a_plugin_surface() {
+        use std::time::{Duration, Instant};
+
+        let due_cursor = |model: &mut super::BcodeRuntimeModel| {
+            let now = Instant::now();
+            let requests = model
+                .chat
+                .app
+                .invalidation_requests(now + Duration::from_secs(60))
+                .into_iter()
+                .map(|request| {
+                    super::super::invalidation::InvalidationRequest::new(
+                        request.key,
+                        now.checked_sub(Duration::from_millis(1)).unwrap_or(now),
+                    )
+                });
+            model.temporal_registry.reconcile(requests);
+            std::thread::sleep(Duration::from_millis(600));
+            model.handle_timer(&bmux_tui_runtime::TimerId::new("bcode.invalidations"))
+        };
+        let mut model = root_test_model();
+        let (visible, _) = due_cursor(&mut model);
+        assert_ne!(visible, super::super::invalidation::UiInvalidation::None);
+
+        model.queue_plugin_surface(
+            "test",
+            Box::new(GatedPluginPaint {
+                release: None,
+                completed: false,
+            }),
+        );
+        let (hidden, damage) = due_cursor(&mut model);
+        assert_eq!(hidden, super::super::invalidation::UiInvalidation::None);
+        assert_eq!(damage, Vec::new());
         drop(model);
     }
 

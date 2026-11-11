@@ -423,7 +423,7 @@ fn apply_initial_config(
         settings.integrate_keymap_contributors(presentation.keymap_actions());
     }
     chat.app
-        .set_effective_keymap(settings.keymap().registry().clone());
+        .set_effective_keymap(settings.keymap().shared_registry());
     settings.set_completion_settings(config.presentation.completion);
     chat.app.apply_tui_config(config.tui.clone());
     chat.app

@@ -179,7 +179,82 @@ struct RootPluginSurface {
     workflow_view_requests: Option<tokio::sync::mpsc::Sender<WorkflowViewRequest>>,
 }
 
+/// Input held while an operation owns a plugin surface. Pointer motion and resizes coalesce,
+/// so the bound is reached only by discrete input arriving faster than a stalled operation
+/// settles; past it newer input is dropped and logged, and the surface stays open.
+const DEFERRED_PLUGIN_INPUT_LIMIT: usize = 4096;
+
+/// Whether `next` makes `previous` redundant when both are still queued: only the latest
+/// pointer position (without a held button) and the latest terminal size matter.
+fn deferred_input_supersedes(previous: &Event, next: &Event) -> bool {
+    match (previous, next) {
+        (Event::Resize(_), Event::Resize(_)) => true,
+        (Event::Mouse(previous), Event::Mouse(next)) => {
+            previous.kind == bmux_tui::event::MouseEventKind::Move
+                && next.kind == bmux_tui::event::MouseEventKind::Move
+                && previous.modifiers == next.modifiers
+        }
+        _ => false,
+    }
+}
+
 impl RootPluginSurface {
+    /// Queue input behind any already queued tail, coalescing superseded pointer motion and
+    /// resizes. The queue is bounded; it never closes the surface.
+    fn defer_input(&mut self, event: Event) {
+        if let Some(previous) = self.deferred_input.back_mut()
+            && deferred_input_supersedes(previous, &event)
+        {
+            *previous = event;
+            return;
+        }
+        if self.deferred_input.len() >= DEFERRED_PLUGIN_INPUT_LIMIT {
+            tracing::warn!(
+                plugin_id = %self.plugin_id,
+                limit = DEFERRED_PLUGIN_INPUT_LIMIT,
+                "plugin surface input queue is full; dropping input"
+            );
+            return;
+        }
+        self.deferred_input.push_back(event);
+    }
+
+    /// Replay all queued input in order before any drain starts. Replay stops early only at
+    /// an action the root must apply first (close, navigation, commands); the rest stays
+    /// queued for the next poll.
+    fn replay_deferred_input(
+        &mut self,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+        use bcode_plugin_sdk::tui::PluginTuiAction;
+        let Some(active) = self.surface.as_mut() else {
+            return PluginTuiAction::None;
+        };
+        let mut redraw = false;
+        while let Some(event) = self.deferred_input.pop_front() {
+            let result =
+                super::plugin_surface_host::compose_surface_input(active.as_mut(), &event, host);
+            self.effects_pending |= result.outcome != bmux_tui::event::EventOutcome::Ignored
+                || !matches!(result.action, PluginTuiAction::None);
+            redraw |= result.outcome == bmux_tui::event::EventOutcome::Redraw;
+            match result.action {
+                PluginTuiAction::None => {}
+                PluginTuiAction::Redraw => redraw = true,
+                action => {
+                    if !self.deferred_input.is_empty() {
+                        self.invalidation.request();
+                    }
+                    return action;
+                }
+            }
+        }
+        if redraw {
+            PluginTuiAction::Redraw
+        } else {
+            PluginTuiAction::None
+        }
+    }
+
     fn observe_finished_drain_task(
         &mut self,
     ) -> Result<(), bcode_plugin_sdk::tui::PluginTuiAction> {
@@ -1506,25 +1581,21 @@ impl ChatLoopState {
             || !surface.deferred_input.is_empty()
             || surface.close_after_drain
         {
-            if let Event::Key(key) = event
+            if surface.surface.is_none()
+                && let Event::Key(key) = event
                 && (key.key == bmux_keyboard::KeyCode::Escape
                     || (key.key == bmux_keyboard::KeyCode::Char('c') && key.modifiers.ctrl))
             {
+                // While an operation holds the surface, Esc / Ctrl-C ask to close it once the
+                // operation settles; queued input belongs to the closing surface and is dropped.
                 surface.close_after_drain = true;
                 surface.deferred_input.clear();
                 surface.invalidation.request();
             } else if !surface.close_after_drain {
-                if surface.deferred_input.len() < 32 {
-                    // Mouse press/drag/release and resize are ordered input too.
-                    // Keep later input behind the queued tail even once ownership returns.
-                    surface.deferred_input.push_back(event.clone());
-                    if surface.surface.is_some() {
-                        surface.invalidation.request();
-                    }
-                } else {
-                    // Fail closed instead of silently losing a reliable input or replaying it.
-                    surface.close_after_drain = true;
-                    surface.deferred_input.clear();
+                // Mouse press/drag/release and resize are ordered input too.
+                // Keep later input behind the queued tail even once ownership returns.
+                surface.defer_input(event.clone());
+                if surface.surface.is_some() {
                     surface.invalidation.request();
                 }
             }
@@ -1596,48 +1667,44 @@ impl ChatLoopState {
             }
         } else if surface.pending_session_navigation.is_some() {
             bcode_plugin_sdk::tui::PluginTuiAction::None
-        } else if let Some(active) = surface.surface.as_mut() {
-            let action = if let Some(event) = surface.deferred_input.pop_front() {
-                let result = super::plugin_surface_host::compose_surface_input(
-                    active.as_mut(),
-                    &event,
-                    &host,
-                );
-                surface.effects_pending |= result.outcome != bmux_tui::event::EventOutcome::Ignored
-                    || !matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None);
-                if !surface.deferred_input.is_empty() {
-                    surface.invalidation.request();
-                }
-                if result.outcome == bmux_tui::event::EventOutcome::Redraw
-                    && matches!(result.action, bcode_plugin_sdk::tui::PluginTuiAction::None)
-                {
-                    bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-                } else {
-                    result.action
-                }
+        } else if surface.surface.is_some() {
+            let action = if surface.deferred_input.is_empty() {
+                surface
+                    .surface
+                    .as_mut()
+                    .expect("exclusive surface available")
+                    .poll(&host)
             } else {
-                active.poll(&host)
+                surface.replay_deferred_input(&host)
             };
             surface.effects_pending |=
                 matches!(action, bcode_plugin_sdk::tui::PluginTuiAction::Redraw);
-            if surface.effects_pending
+            let settle = surface.effects_pending
                 && surface.drain_task.is_none()
                 && matches!(
                     action,
                     bcode_plugin_sdk::tui::PluginTuiAction::None
                         | bcode_plugin_sdk::tui::PluginTuiAction::Redraw
-                )
-            {
+                );
+            if settle {
                 surface.effects_pending = false;
-                let mut active = surface.surface.take().expect("exclusive surface available");
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                let invalidation = surface.invalidation.clone();
-                surface.drain_task = Some(tokio::spawn(async move {
-                    let action = active.drain_effects(&host).await;
-                    let _ = sender.send((active, action));
-                    invalidation.request();
-                }));
-                surface.drain = Some(receiver);
+                // Lend the surface to a drain only when it has queued effect work: a surface
+                // without any keeps handling input and painting in place.
+                if surface
+                    .surface
+                    .as_ref()
+                    .is_some_and(|active| active.has_pending_effects())
+                {
+                    let mut active = surface.surface.take().expect("exclusive surface available");
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let invalidation = surface.invalidation.clone();
+                    surface.drain_task = Some(tokio::spawn(async move {
+                        let action = active.drain_effects(&host).await;
+                        let _ = sender.send((active, action));
+                        invalidation.request();
+                    }));
+                    surface.drain = Some(receiver);
+                }
             }
             action
         } else {
@@ -2401,7 +2468,8 @@ impl ChatLoopState {
             .is_some_and(super::foreground::Foreground::is_modal)
     }
 
-    fn foreground_owns_canvas(&self) -> bool {
+    /// Whether the foreground paints the whole canvas, hiding the chat transcript and chrome.
+    pub(crate) fn foreground_owns_canvas(&self) -> bool {
         use super::foreground::Foreground;
         matches!(
             self.foreground(),
@@ -4312,7 +4380,7 @@ pub fn apply_config_result(
                 }
             }
             chat.app
-                .set_effective_keymap(settings.keymap.registry().clone());
+                .set_effective_keymap(settings.keymap.shared_registry());
             if let Err(error) = chat.app.apply_plugin_presentation_config(&config) {
                 chat.app.set_status(format!(
                     "plugin presentation configuration unavailable: {error}"
@@ -6047,7 +6115,7 @@ pub fn draw_chat_frame<W: Write>(
             let modal = loop_state.modal_foreground();
             let area = Rect::new(0, 0, frame.area().width, frame.area().height);
             let mut paint_background = |frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
-                if let Some(layout) = layout.filter(|_| !foreground_owns_canvas) {
+                if let Some(layout) = layout {
                     // The transcript body and latest bar are the transcript host's.
                     render::render_prepared_damage_with(
                         &mut chat.app,
@@ -6085,14 +6153,16 @@ pub fn draw_chat_frame<W: Write>(
                         surface_geometry.set(Some(placed));
                     }
                 }
-                if !foreground_owns_canvas {
-                    paint_interactive_surface(loop_state, surface_geometry.get(), frame);
-                }
+                paint_interactive_surface(loop_state, surface_geometry.get(), frame);
             };
-            if modal {
-                super::foreground::paint_backdrop(area, frame, paint_background);
-            } else {
-                paint_background(frame);
+            // A foreground owning the canvas covers every chat layer, so nothing is painted
+            // beneath it: no backdrop buffer is allocated or copied for a full-screen surface.
+            if !foreground_owns_canvas {
+                if modal {
+                    super::foreground::paint_backdrop(area, frame, paint_background);
+                } else {
+                    paint_background(frame);
+                }
             }
             paint_foreground(chat, loop_state, surface_geometry.get(), frame);
         },
@@ -6256,7 +6326,7 @@ fn paint_foreground(
     frame: &mut bmux_tui::paint::PaintCx<'_, '_>,
 ) {
     let foreground = loop_state.foreground();
-    let effective = super::keymap::BmuxKeyMap::from_registry(chat.app.effective_keymap().clone());
+    let effective = super::keymap::BmuxKeyMap::from_registry(chat.app.shared_effective_keymap());
     if loop_state.modal_foreground() {
         frame.set_cursor(bmux_tui::geometry::Point::new(0, 0), false);
         frame.set_focus_scope(Some(bmux_tui::hit::HitId::new("bcode.foreground")));
@@ -8119,6 +8189,206 @@ mod scheduler_tests {
             assert!(surface.surface.is_some());
             assert!(!signal.take());
         }
+    }
+
+    /// Records every routed event; optionally holds its first drain until released and can
+    /// declare that it never has drain work.
+    struct RecordingSurface {
+        delivered: std::sync::Arc<std::sync::Mutex<Vec<Event>>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        drains: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        has_effects: bool,
+    }
+
+    impl RecordingSurface {
+        fn new(has_effects: bool, release: Option<tokio::sync::oneshot::Receiver<()>>) -> Self {
+            Self {
+                delivered: std::sync::Arc::default(),
+                release,
+                drains: std::sync::Arc::default(),
+                has_effects,
+            }
+        }
+    }
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for RecordingSurface {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+        fn title(&self) -> &'static str {
+            "Recording"
+        }
+        fn render(&mut self, _area: Rect, _frame: &mut bmux_tui::paint::PaintCx<'_, '_>) {}
+        fn handle_event(
+            &mut self,
+            event: &Event,
+            _host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            self.delivered.lock().unwrap().push(event.clone());
+            bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+        }
+        fn has_pending_effects(&self) -> bool {
+            self.has_effects
+        }
+        fn drain_effects<'a>(
+            &'a mut self,
+            _host: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bcode_plugin_sdk::tui::PluginTuiAction>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.drains
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if let Some(release) = self.release.take() {
+                    let _ = release.await;
+                }
+                bcode_plugin_sdk::tui::PluginTuiAction::None
+            })
+        }
+    }
+
+    fn key_burst(count: usize) -> Vec<Event> {
+        (0..count)
+            .map(|index| {
+                let key = if index % 2 == 0 { 'j' } else { 'k' };
+                Event::Key(bmux_keyboard::KeyStroke::simple(
+                    bmux_keyboard::KeyCode::Char(key),
+                ))
+            })
+            .collect()
+    }
+
+    async fn settle_root_surface(
+        state: &mut ChatLoopState,
+        client: &bcode_client::BcodeClient,
+        launch: &super::super::plugin_surface_host::FreshSessionSettings,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let action = state.poll_root_plugin_surface(client, launch.clone());
+                assert!(
+                    !matches!(
+                        action,
+                        Some(bcode_plugin_sdk::tui::PluginTuiAction::Close { .. })
+                    ),
+                    "the surface must stay open"
+                );
+                let surface = state.plugin_surface.as_ref().unwrap();
+                if surface.surface.is_some()
+                    && surface.deferred_input.is_empty()
+                    && surface.drain_task.is_none()
+                    && !surface.effects_pending
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("surface settles");
+    }
+
+    #[tokio::test]
+    async fn input_burst_during_a_drain_keeps_the_surface_open_and_replays_in_order() {
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let surface = RecordingSurface::new(true, Some(receiver));
+        let delivered = surface.delivered.clone();
+        state.queue_root_plugin_surface("test", Box::new(surface));
+        // The opening drain holds the surface until released.
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        assert!(state.plugin_surface.as_ref().unwrap().surface.is_none());
+        let burst = key_burst(150);
+        for event in &burst {
+            let _ = state.handle_root_plugin_surface_event(event, &client, launch.clone());
+        }
+        let surface = state.plugin_surface.as_ref().unwrap();
+        assert!(!surface.close_after_drain);
+        assert_eq!(surface.deferred_input.len(), burst.len());
+        release.send(()).unwrap();
+        // Ownership returns, then a single poll replays the whole queued burst.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.plugin_surface.as_ref().unwrap().surface.is_none() {
+                let _ = state.poll_root_plugin_surface(&client, launch.clone());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain settles");
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        assert_eq!(*delivered.lock().unwrap(), burst);
+        settle_root_surface(&mut state, &client, &launch).await;
+        assert!(state.has_root_plugin_surface());
+        assert_eq!(*delivered.lock().unwrap(), burst);
+    }
+
+    #[tokio::test]
+    async fn surface_without_drain_work_handles_a_burst_in_place() {
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let surface = RecordingSurface::new(false, None);
+        let delivered = surface.delivered.clone();
+        let drains = surface.drains.clone();
+        state.queue_root_plugin_surface("test", Box::new(surface));
+        settle_root_surface(&mut state, &client, &launch).await;
+        let burst = key_burst(120);
+        for event in &burst {
+            let _ = state.handle_root_plugin_surface_event(event, &client, launch.clone());
+            assert!(state.plugin_surface.as_ref().unwrap().surface.is_some());
+        }
+        assert_eq!(*delivered.lock().unwrap(), burst);
+        settle_root_surface(&mut state, &client, &launch).await;
+        assert_eq!(drains.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(*delivered.lock().unwrap(), burst);
+    }
+
+    #[tokio::test]
+    async fn queued_pointer_motion_and_resizes_coalesce_while_keys_do_not() {
+        use bmux_tui::event::{MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Size};
+
+        let mut state = loop_state();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let surface = RecordingSurface::new(true, Some(receiver));
+        let delivered = surface.delivered.clone();
+        state.queue_root_plugin_surface("test", Box::new(surface));
+        let _ = state.poll_root_plugin_surface(&client, launch.clone());
+        let moved = |x| Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(x, 1)));
+        let key = key_burst(1).remove(0);
+        let queued = [
+            moved(1),
+            moved(2),
+            moved(3),
+            key.clone(),
+            key.clone(),
+            Event::Resize(Size::new(80, 24)),
+            Event::Resize(Size::new(100, 30)),
+            moved(4),
+        ];
+        for event in &queued {
+            let _ = state.handle_root_plugin_surface_event(event, &client, launch.clone());
+        }
+        release.send(()).unwrap();
+        settle_root_surface(&mut state, &client, &launch).await;
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            [
+                moved(3),
+                key.clone(),
+                key,
+                Event::Resize(Size::new(100, 30)),
+                moved(4),
+            ]
+        );
     }
 
     fn loop_state() -> ChatLoopState {

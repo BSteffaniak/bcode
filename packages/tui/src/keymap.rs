@@ -961,14 +961,17 @@ fn register_onboarding_actions(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BmuxKeyMap {
     error: Option<String>,
-    registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
+    /// Shared so per-frame and per-event consumers hold the registry without copying it.
+    registry: std::sync::Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry>,
     activations: BTreeMap<(BmuxScope, BmuxAction), BmuxKeyActivation>,
 }
 
 impl BmuxKeyMap {
     /// Adapt an already effective registry for host rendering.
     #[must_use]
-    pub const fn from_registry(registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry) -> Self {
+    pub const fn from_registry(
+        registry: std::sync::Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry>,
+    ) -> Self {
         Self {
             registry,
             error: None,
@@ -980,7 +983,7 @@ impl BmuxKeyMap {
     #[must_use]
     pub fn from_config(config: &TuiConfig) -> Self {
         Self::try_from_config(config).unwrap_or_else(|error| Self {
-            registry: bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+            registry: std::sync::Arc::default(),
             activations: BTreeMap::new(),
             error: Some(error.to_string()),
         })
@@ -1044,7 +1047,7 @@ impl BmuxKeyMap {
         registry.configure(overrides)?;
         Ok(Self {
             error: None,
-            registry,
+            registry: std::sync::Arc::new(registry),
             activations,
         })
     }
@@ -1074,8 +1077,14 @@ impl BmuxKeyMap {
 
     /// Effective registry shared with plugin input and shortcut presentation.
     #[must_use]
-    pub const fn registry(&self) -> &bcode_plugin_sdk::tui::keymap::KeymapRegistry {
+    pub fn registry(&self) -> &bcode_plugin_sdk::tui::keymap::KeymapRegistry {
         &self.registry
+    }
+
+    /// The effective registry as a shared handle; cloning it never copies the bindings.
+    #[must_use]
+    pub fn shared_registry(&self) -> std::sync::Arc<bcode_plugin_sdk::tui::keymap::KeymapRegistry> {
+        std::sync::Arc::clone(&self.registry)
     }
 
     /// Register a contributor-owned action without extending the built-in action enum.
@@ -1086,7 +1095,7 @@ impl BmuxKeyMap {
         &mut self,
         action: bcode_plugin_sdk::tui::keymap::KeymapAction,
     ) -> Result<(), bcode_plugin_sdk::tui::keymap::KeymapError> {
-        self.registry.register(action)
+        std::sync::Arc::make_mut(&mut self.registry).register(action)
     }
 
     /// Atomically integrate enabled contributors; failures disable dispatch.
@@ -1100,12 +1109,12 @@ impl BmuxKeyMap {
         if self.error.is_some() {
             return;
         }
-        let mut candidate = self.registry.clone();
+        let mut candidate = (*self.registry).clone();
         let result = actions.and_then(|actions| candidate.register_all(actions));
         match result {
-            Ok(()) => self.registry = candidate,
+            Ok(()) => self.registry = std::sync::Arc::new(candidate),
             Err(error) => {
-                self.registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+                self.registry = std::sync::Arc::default();
                 self.activations.clear();
                 self.error = Some(error.to_string());
             }

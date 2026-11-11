@@ -755,6 +755,13 @@ impl PluginTuiSurface for ReviewAppV2 {
         action
     }
 
+    fn has_pending_effects(&self) -> bool {
+        match &self.route {
+            Route::Review(review) => review.has_pending_effects(),
+            _ => false,
+        }
+    }
+
     fn drain_effects<'a>(
         &'a mut self,
         host: &'a dyn PluginTuiHost,

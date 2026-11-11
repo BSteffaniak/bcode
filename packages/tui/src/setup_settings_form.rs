@@ -43,7 +43,7 @@ impl SetupSettingsForm {
     pub fn new(path: &std::path::Path, key: &str) -> Self {
         Self {
             keymap: super::keymap::BmuxKeyMap::from_registry(
-                bcode_plugin_sdk::tui::keymap::KeymapRegistry::default(),
+                std::sync::Arc::default(),
             ),
             inputs: [path.to_string_lossy().into_owned(), key.to_owned(), String::new()]
                 .map(|value| TextInputState::new(TextEditBuffer::from_text(value))),
