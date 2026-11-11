@@ -30,7 +30,7 @@ use bmux_tui_components::virtual_list::{AnchorPolicy, Edge};
 use std::sync::Arc;
 
 /// Keymap scope of the composer.
-pub const COMPOSER_SCOPE: &str = "code-review-v2-composer";
+pub const COMPOSER_SCOPE: &str = "code-review-composer";
 
 /// Milliseconds since the Unix epoch.
 pub(super) fn now_ms() -> u64 {
@@ -55,7 +55,6 @@ impl ReviewSurfaceV2 {
             updated_at_ms: None,
             viewed_files: std::collections::BTreeSet::new(),
             archived_at_ms: None,
-            presentation_state: None,
             viewed_marks: Vec::new(),
             reviewed_revisions: std::collections::BTreeMap::new(),
             presentation_v2: None,

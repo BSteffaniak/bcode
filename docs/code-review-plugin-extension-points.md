@@ -7,7 +7,8 @@ Code Review is product behavior owned by `plugins/code-review-plugin`. GitHub re
 Code Review consumes these generic plugin-host capabilities:
 
 * Manifest-declared native plugin services with versioned interface IDs and typed JSON payloads.
-* Manifest-declared native TUI surfaces registered through `PluginTuiRegistry`.
+* Manifest-declared native TUI surfaces registered through `PluginTuiRegistry`. Code Review declares one surface, `code-review`, with internal routes (home, the new-review wizard, and the review). `bcode review` asks the host to open it through the generic standalone-surface launcher (`packages/tui/src/plugin_surface_launcher.rs`), which loads the plugin runtime once and runs whichever loaded plugin declares the requested surface kind. The host has no Code Review-specific launcher, routing, or types.
+* Manifest-declared keymap actions. Code Review's scopes are `code-review` (the review), `code-review-home`, `code-review-wizard`, `code-review-files`, `code-review-threads`, and `code-review-composer`; user keymap configuration overrides them by scope like any other contributor.
 * Renderer-neutral keyboard, mouse, clipboard, redraw, and surface-exit actions from the plugin SDK TUI host.
 * Generic semantic linked-session observation through complete bounded `SessionViewSnapshot` updates; the TUI host owns attachment, `SessionView` projection, reconnect, and authoritative resynchronization, while plugin surfaces never receive raw session events.
 * Typed `PluginTuiAction::OpenSession` suspension: the host retains the plugin surface in memory, runs the ordinary native session viewer with the caller-owned input stream, and redraws the same surface after the viewer exits.
@@ -53,12 +54,16 @@ without converting the session into plugin state.
 Reviewer AI exchanges persist only review-domain identity, anchor, question, linked session ID, and
 lifecycle metadata. Session transcript and runtime state remain session-owned.
 
-Workspaces also persist a versioned Code Review-owned semantic presentation state: selected stable
-path/thread/line, sidebar and filter modes, and collapsed/expanded thread identities. Raw terminal
-rows, focus internals, transcript, permissions, interactions, tools, and runtime state are excluded.
-Reopen restoration is best-effort and deterministically falls back to the first valid file/line when
-a saved path or anchor is stale. Exact native-session return remains in-memory through retained
-surface suspension.
+Workspaces also persist a versioned Code Review-owned semantic presentation state
+(`presentation_v2`): the scroll anchor by item identity, layout mode, panel sizes, context
+expansions, per-layer positions, collapsed threads, expanded answers, and the resolved-thread and
+viewed-file filters. Raw terminal rows, focus internals, transcript, permissions, interactions,
+tools, and runtime state are excluded. The state is disposable: an unreadable or newer value is
+dropped, and stale keys resolve best-effort. Exact native-session return remains in-memory through
+retained surface suspension. The first review interface's presentation column
+(`presentation_state_json`) stays in the schema but is no longer read or written; workspaces it
+wrote open with their sources, viewed files, drafts, AI exchanges, suggestions, and publish
+records.
 
 ## Disableability
 

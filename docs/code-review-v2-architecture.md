@@ -1,7 +1,10 @@
 # Code Review V2 architecture
 
-Status: proposed. This document is the contract for the Code Review V2 rewrite. Phases land in
-order; each phase is accepted against the criteria in section 11.
+Status: implemented (phases 0 to 7). This document is the contract for the Code Review V2
+rewrite. Phases landed in order; each phase was accepted against the criteria in section 11. V2 is
+the only review implementation: V1 was deleted in phase 7 (section 10). Appendix A keeps V1's
+behavior inventory, with its V1 file locations, as the record the parity decisions in Appendix B
+were made against.
 
 ## 1. Purpose and scope
 
@@ -20,9 +23,10 @@ order; each phase is accepted against the criteria in section 11.
 
 ### 1.2 Relation to V1
 
-V2 is a parallel rewrite. V1 receives no new features and no bug fixes. V2 is selectable at
-startup during development, becomes the default once parity criteria pass, and then V1 is
-deleted together with the host-side review launcher code (section 10, phase 7).
+V2 was a parallel rewrite. V1 received no new features and no bug fixes while V2 was selectable
+at startup during development; once the parity criteria passed, V2 became the only
+implementation and V1 was deleted together with the host-side review launcher code (section 10,
+phase 7).
 
 Durable review data is shared. V2 reads and writes the same workspaces, drafts, threads, AI
 exchanges, suggestions, publish records, and external imports. Schema additions are additive and
@@ -402,7 +406,8 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
   and `.git` segments are rejected. Working-tree reads come from disk: a symbolic link reads as
   its target path (git's blob content for links), and any other path must canonicalize inside
   the repository root.
-* `review.workspace.materialize` remains for V1 until deletion; V2 never calls it.
+* `review.workspace.materialize` served V1 only (V2 never called it) and was removed in phase 7.
+  The bundle operations still materialize workspaces internally (`review.bundle.get`).
 * **Refresh (deviation from the original plan).** `bcode_git_live` is not available on `master`,
   so working-tree and index sources are refreshed on an explicit refresh and when the terminal
   regains focus. The client first calls `review.sources.token` and only re-lists sources when the
@@ -715,11 +720,11 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   kept in the workspace's `presentation_v2.panels` (`ReviewPanelState`) and restored when the
   surface opens a workspace. Durable workspaces are saved with `review.workspace.update` (changes
   during a save are saved after it); transient workspaces keep the state in memory.
-* **Keys** (scope `code-review-v2`): `tab` next pane, `t` show/hide the file panel, `f` filter,
-  `>`/`<` widen/narrow the file panel, `T` threads panel. In the tree: `j`/`k`/arrows, pages,
-  `g`/`G`, `enter` open, `space` fold, `left` collapse or go to the parent, `right` expand,
-  `esc` back to the document (scope `code-review-v2-files` since phase 6 part 2; the threads
-  panel's `enter`, `esc`, and `left`/`right` filters are scope `code-review-v2-threads`).
+* **Keys** (scope `code-review`; `code-review-v2` before phase 7): `tab` next pane, `t`
+  show/hide the file panel, `f` filter, `>`/`<` widen/narrow the file panel, `T` threads panel.
+  In the tree: `j`/`k`/arrows, pages, `g`/`G`, `enter` open, `space` fold, `left` collapse or go
+  to the parent, `right` expand, `esc` back to the document (scope `code-review-files` since phase 6 part 2; the threads
+  panel's `enter`, `esc`, and `left`/`right` filters are scope `code-review-threads`).
 
 ### 6.2 Interaction
 
@@ -747,7 +752,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   (`enter` submits, `shift+enter` adds a line, 3 to 8 rows), and clickable buttons (submit,
   switch comment/question, preview, cancel). `ctrl+p` swaps the editor for a markdown preview.
   Its geometry is one `ComposerLayout` read by measuring, painting, and clicks; the list
-  re-measures it on every edit. Scope `code-review-v2-composer`: `ctrl+s` save, `ctrl+p`
+  re-measures it on every edit. Scope `code-review-composer`: `ctrl+s` save, `ctrl+p`
   preview, `ctrl+t` comment/question, `alt+k` kind, `alt+s` severity, `esc` cancel. Typing never
   reaches review actions. Empty text is discarded.
 * **Threads and answers.** Thread rows show a header (count, kind, severity, open/resolved,
@@ -871,8 +876,8 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
     written after the event or on the next poll, with a status message.
 * **Key bindings (phase 6 review).** Every V2 action is declared in the manifest keymap and is
   listed by the palette and help; help has sections for the review, the composer, the file
-  panel (`code-review-v2-files`: `enter` open, `space` fold, `left`/`right` collapse/expand,
-  `esc` back), and the threads panel (`code-review-v2-threads`: `enter` and `esc` back to the
+  panel (`code-review-files`: `enter` open, `space` fold, `left`/`right` collapse/expand,
+  `esc` back), and the threads panel (`code-review-threads`: `enter` and `esc` back to the
   review, `left`/`right` filters). Rarely used actions (structured AI commands, refine and
   reject, retry, open-thread and AI-answer navigation, `attention_next`, `view_all`,
   `unview_all`, `goto_line`, `copy_report`, `edit_sources`) have no default key: they run
@@ -941,7 +946,8 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * **Launch.** `bcode review <subcommand> --ui v2` (on every interactive review subcommand) or
   `BCODE_REVIEW_UI=v2` opens the `code-review-v2` surface kind; since phase 5 `bcode review`
   without a subcommand opens its home route (7.1). The host opens any registered plugin surface
-  as a standalone startup surface (7.1); V1 routing is unchanged.
+  as a standalone startup surface (7.1); V1 routing is unchanged. (Since phase 7, `bcode
+  review` and every subcommand open the `code-review` surface; there is no `--ui` switch.)
 * **Loading.** The first `poll` spawns the open task: provider routing, `review.sources.resolve`,
   a change token, and every index page. A BMUX `empty_state` with a spinner shows index progress
   until the document exists; input is never blocked. Afterwards `poll` applies finished work and
@@ -970,7 +976,8 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   lines and 8 MiB), highlighted on the blocking pool with BMUX's whole-text projection, and cached
   by blob identity (working-tree content by path and refresh generation) and palette (64 entries,
   400,000 lines). Rows look tokens up by line number verified against their text.
-* **Input.** Keys are declared in the manifest under the `code-review-v2` scope: `j`/`k`, half
+* **Input.** Keys are declared in the manifest under the `code-review` scope (`code-review-v2`
+  before phase 7): `j`/`k`, half
   pages (`ctrl+d`/`ctrl+u`), pages, `g`/`G`, files (`n`/`p`), hunks (`}`/`{`), changes
   (`]`/`[`), gap expansion on the cursor gap (`e` below, `E` above, `x` all, `X` whole file;
   count prefixes set the lines), layout (`S`), wrap (`W`), refresh (`r`), and exit (`q`, `esc`).
@@ -998,7 +1005,17 @@ manifest declares the requested surface kind, opens it with the caller's string 
 it until it closes. Startup surface kinds without a host special case (such as `code-review-v2`)
 go through it. The V1 `code-review` special cases remain until phase 7.
 
-**Implementation (phase 5).** `src/v2/tui/app.rs` is the `code-review-v2` surface
+**Implementation (phase 7).** The host special cases are gone: `packages/tui` has no
+`code_review_launcher` and no `code-review` routing in `terminal_shell.rs` or `run_plugin_surface`,
+and `packages/tui` no longer depends on `bcode_code_review_models`. `packages/cli` never had
+review-specific code (the plugin contributes `bcode review` through its static CLI registration).
+The app's surface kind is now the canonical `code-review` (it was `code-review-v2`), so every
+startup request for `code-review` reaches V2 through the generic launcher. The surface still
+accepts the option shapes V1's host launcher sent (`workspace`, or a JSON `target`), so an older
+caller opening `code-review` gets the matching V2 review.
+
+**Implementation (phase 5).** `src/v2/tui/app.rs` is the `code-review-v2` surface (`code-review`
+since phase 7)
 (`ReviewAppV2`):
 
 * Routes: `Home` (`home.rs`), `NewReview` (`wizard.rs`), `Opening` (an entry or a workspace
@@ -1071,7 +1088,7 @@ rows, suggestions; pure and unit-tested), `home/load.rs` (service calls):
 * **Preview** (a BMUX `pane`, from 100 columns, `d` toggles): sources (included or excluded),
   file totals, viewed count, drafts and threads, the last publish (age, publisher, message,
   changed since), and new commits; a group heading explains the group.
-* **Actions** (scope `code-review-v2-home`): `enter` open (an archived review refuses, pointing at
+* **Actions** (scope `code-review-home`): `enter` open (an archived review refuses, pointing at
   restore), `c` continue the latest unarchived review, `n` new review, `r` rename (footer input;
   an empty title is refused), `x` archive, `shift+r` restore (`review.workspace.update` with the
   archive mark cleared), one change at a time with a toast; `ctrl+r` reload, `?` help (the
@@ -1136,7 +1153,7 @@ error states), under a BMUX `stepper` (Source type, Details, Title & create):
   being configured.
 * Without a review-source provider the pull request and stack steps say so (other types still
   work); a provider failure (for example `unauthenticated`) shows its message.
-* Keys (scope `code-review-v2-wizard`): `tab` mark, `shift+tab` mark range, `esc` back one step
+* Keys (scope `code-review-wizard`): `tab` mark, `shift+tab` mark range, `esc` back one step
   (on step 1 to step 3 when sources exist, else to home); arrows, pages, `enter`, and clicks on
   rows come from the picker.
 * **Editing a review's sources (phase 6 part 2; closes INV-SRC-01's open question).**
@@ -1218,6 +1235,14 @@ opens home; the existing subcommands and `branch` (`CurrentBranch`), `compare` (
 `pr`, `stack`, and `resume` resolve first (7.1). With V1 the new subcommands fail with a message
 that they need `--ui v2`; V1 routing of the existing subcommands and home is unchanged until
 phase 7.
+
+**Implementation (phase 7).** `bcode review` and every subcommand open the `code-review` surface
+unconditionally with an `entry` option: the existing subcommands open transient `Sources` entries
+with the matching source kind (`unstaged` is `WorkingTreeUnstaged`, `range` is `CommitRange`,
+and so on), and `branch`, `compare`, `commit`, `pr`,
+`stack`, and `resume` behave as above. The `--ui` flag and the `BCODE_REVIEW_UI` environment
+variable are removed outright: passing `--ui` is a usage error from the argument parser, and the
+environment variable is ignored. `publish-github` is unchanged.
 
 * **Saving transient reviews.** `ctrl+s` (`save_review`, review scope, shown in the hints while
   the review is transient) creates a durable workspace with the same title and sources, copies
@@ -1387,9 +1412,14 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
     migration is needed, and older states read with everything expanded and shown.
 * Unknown future source kinds are preserved and surfaced as unsupported, not guessed: they
   deserialize as `ReviewSourceKind::Unsupported { kind, raw }`, serialize back verbatim, and
-  resolve to an `unsupported_source_kind` diagnostic. V1 reports the new and unknown kinds as an
-  unsupported-source materialization diagnostic.
-* V1 continues to open workspaces that contain only V1 source kinds until it is deleted.
+  resolve to an `unsupported_source_kind` diagnostic.
+* Workspaces V1 created open in V2 (phase 7 keeps this as a test,
+  `a_review_written_before_v2_opens_with_its_viewed_files_and_drafts`): path-only viewed files
+  read as legacy viewed marks (5.4), drafts whose anchors record neither head nor blob attach to
+  their lines, and the V1 presentation state is ignored. Migration `017` and its
+  `presentation_state_json` column stay so the migration history is unchanged, but since phase 7
+  nothing reads or writes the column and the model no longer has the field; older clients' JSON
+  that still carries `presentation_state` decodes (the field is ignored).
 
 ## 10. Phases
 
@@ -1415,6 +1445,44 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
 7. **Default and deletion.** V2 becomes the only implementation; delete V1 files, the
    `--ui`/environment switch, host review launcher code and duplicated types; update
    `docs/code-review-plugin-extension-points.md`.
+
+   **Implementation (phase 7).** Done.
+
+   * Deleted V1: `code_review_tui.rs`, `code_review_tui_render.rs`, `code_review_tui_view.rs`,
+     `code_review_tui_display.rs`, `code_review_controls.rs`, `code_review_home.rs`,
+     `async_values.rs`, `terminal_events.rs`, and `tui_host_types.rs` in the plugin; the V1
+     keymap scopes (`code-review` V1, `code-review-build`, `code-review-home` V1 and its
+     `-search`, `-new`, `-rename` scopes, `code-review-comment`, `code-review-prompt`,
+     `code-review-import`, `code-review-import-options`, `code-review-publish`,
+     `code-review-publish-options`) and V1 control adaptation in `keybindings.rs`; the
+     `code-review-home` and V1 `code-review` manifest surfaces; the V1 harness pieces
+     (`v1_smoke.rs`, `v1_baseline.rs`, `materialize_v1`). The V2 harness, fixtures, and
+     benchmarks are unchanged.
+   * Deleted host special cases: `packages/tui/src/code_review_launcher.rs`, the `code-review`
+     arms in `TerminalShell::dispatch_plugin_surface` and `run_plugin_surface`, and
+     `run_code_review*` / `run_review*` (7.1).
+   * Deleted V1-only service surface: `review.workspace.materialize` (4.2) and its request and
+     response models, the materialization picker fields (`repository_files`,
+     `repository_branches`, `repository_commits`, `ReviewRepositoryCommit`) and diagnostics,
+     `ReviewWorkspaceMaterialization` (now private to the plugin, used by the bundle
+     operations), and the V1 presentation state (`ReviewWorkspacePresentationState`, 9). Every
+     other `bcode.code_review/v1` operation is still served: agents use the context operations
+     the AI prompt names, and the remaining ones are part of the published interface (A.21).
+   * CLI: `--ui` and `BCODE_REVIEW_UI` removed (7.5).
+   * Naming: the surface kind is `code-review` and the keymap scopes are `code-review`,
+     `code-review-home`, `code-review-wizard`, `code-review-files`, `code-review-threads`, and
+     `code-review-composer` (each was `code-review-v2…`). Internal type and module names
+     (`src/v2/`, `ReviewAppV2`, `ReviewSurfaceV2`) are unchanged.
+   * Keymap configuration compatibility (decision): user overrides are keyed by scope and
+     action id. Overrides written for V1's `code-review` and `code-review-home` scopes now apply
+     to V2 where V2 declares the same action id (most navigation and annotation ids are shared,
+     such as `bcode.code_review.down`, `bcode.code_review.next_file`, and
+     `bcode.code_review.ask`); overrides naming V1-only actions are kept by the registry but never
+     dispatched and are reported as unresolved actions. A V1 override still owns its key in the
+     scope, so a V1 binding of a key V2 uses for another action shadows that action until the
+     override is removed. Overrides for the development-only `code-review-v2…` scopes are not
+     aliased: they need renaming to the scopes above (they also show as unresolved). No alias
+     mechanism was added to the generic keymap registry for this.
 
 ## 11. Acceptance criteria
 
@@ -1449,7 +1517,7 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
 
 ## 12. Decisions
 
-* Parallel rewrite; V1 is deleted after V2 reaches parity.
+* Parallel rewrite; V1 is deleted after V2 reaches parity (done in phase 7).
 * Stacks are linear PR chains (Graphite-style, GitHub native stacked PRs); no tool-specific
   metadata.
 * Side-by-side ships in the first release. Layout is configurable as `auto`, `unified`, or
@@ -2399,7 +2467,7 @@ All of `code-review-build` is (replaced: wizard plus source editing; see INV-SRC
 
 ## Appendix B. V2 parity status
 
-Status of every Appendix A item after phase 6. **Done**: V2 has the behavior (where the item
+Status of every Appendix A item after phase 6 (scope and surface names as renamed in phase 7). **Done**: V2 has the behavior (where the item
 names it, with the same keys or the keys given). **Replaced by X**: the spec supersedes the V1
 behavior and X covers its purpose. **Dropped**: V2 deliberately does not reproduce it, with the
 reason. V1 defects and unreachable bindings are dropped by the rule of Appendix A. Keys are V2
@@ -2425,7 +2493,7 @@ Behavioral coverage is in `src/v2/tui/tests/` (`parity.rs` for the phase 6 part 
 | INV-ENT-13 | Done: entries that fail show the opening route's error with a way back (7.1). |
 | INV-ENT-14 | Replaced by `q`/`esc` to leave (after saves finish; `esc` first clears a selection or search; an unsaved review with annotations offers saving, 7.5). `ctrl+d` is the half-page motion. Leaving is safe: everything is saved and home is one key from the review. |
 | INV-ENT-15 | Done: the plugin's `diff.toggle` palette command is unchanged. |
-| INV-ENT-16 | Replaced by the single `code-review-v2` surface with routes (7.1). |
+| INV-ENT-16 | Replaced by the single `code-review` surface with routes (7.1). |
 | INV-ENT-17 | Done: unchanged disableability features. |
 
 ### B.2 Home
@@ -2517,7 +2585,7 @@ Behavioral coverage is in `src/v2/tui/tests/` (`parity.rs` for the phase 6 part 
 | INV-TREE-01 | Replaced by the file panel and the threads panel (6.1). |
 | INV-TREE-02 | Replaced by `t` (show or hide), `<`/`>` (width), and width-based degradation (6.1). |
 | INV-TREE-03 | Replaced by rich tree rows (6.1). |
-| INV-TREE-04 | Done: arrows and `j`/`k` move; `right`/`left` expand/collapse; `enter` opens (scope `code-review-v2-files`). |
+| INV-TREE-04 | Done: arrows and `j`/`k` move; `right`/`left` expand/collapse; `enter` opens (scope `code-review-files`). |
 | INV-TREE-05 | Done: clicks and wheel. |
 | INV-TREE-06 | Done: the tree follows the cursor's file; sources are separate groups. |
 | INV-TREE-07 | Replaced by header chips and `edit_sources`. |
@@ -2625,7 +2693,7 @@ Behavioral coverage is in `src/v2/tui/tests/` (`parity.rs` for the phase 6 part 
 | INV-RPT-01 | Done: `local_markdown` in the publish flow. |
 | INV-RPT-02 | Done: `markdown_file` and `json_file`. |
 | INV-RPT-03 | Done: `copy_report` copies the Markdown report (6.2). |
-| INV-RPT-04 | Done: `review.bundle.get` is still served (CLI, V1); V2 builds bundles itself (7.6). |
+| INV-RPT-04 | Done: `review.bundle.get` is still served (`publish-github`); V2 builds bundles itself (7.6). |
 
 ### B.13 Viewed files
 
@@ -2657,7 +2725,7 @@ Behavioral coverage is in `src/v2/tui/tests/` (`parity.rs` for the phase 6 part 
 
 ### B.16 Keymap actions
 
-Home (`code-review-v2-home`):
+Home (`code-review-home`):
 
 | ID | Status |
 | --- | --- |
@@ -2686,7 +2754,7 @@ Home (`code-review-v2-home`):
 | INV-KEY-H23 | Done: the filter and rename inputs use the shared BMUX text-input policy. |
 | INV-KEY-H24 | Done: `esc` closes help and prompts; `tab` switches suggestions and reviews. |
 
-Review (`code-review-v2`; V1 `code-review`):
+Review (`code-review`):
 
 | ID | Status |
 | --- | --- |
@@ -2829,7 +2897,7 @@ Overlays:
 
 | ID | Status |
 | --- | --- |
-| INV-DATA-01 | Done: every operation is still served; V2 adds operations additively (4.2), including `review.suggestion.delete`. |
+| INV-DATA-01 | Done: every operation is still served except the V1-only `review.workspace.materialize` (removed in phase 7, 4.2); V2 adds operations additively (4.2), including `review.suggestion.delete`. |
 | INV-DATA-02 | Done: unchanged; additive pull-request fields (7.6). |
 | INV-DATA-03 | Done: unchanged. |
 | INV-DATA-04 | Done: left in place, not dispatched, for their owner's decision. |

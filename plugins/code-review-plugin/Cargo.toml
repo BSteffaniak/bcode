@@ -28,18 +28,15 @@ bcode_syntax_render = { workspace = true }
 bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = [
-    "action-row",
     "badge",
-    "button",
     "diff-viewer",
     "empty-state",
     "form",
     "form-field",
     "key-hint-bar",
     "menu",
-    "modal-frame",
     "pane",
     "panel-group",
     "picker-frame",
@@ -59,7 +56,6 @@ bmux_tui_components = { workspace = true, features = [
     "virtual-list",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }
-crossterm = { workspace = true, features = ["events"] }
 hex = { workspace = true }
 regex = { workspace = true, features = ["std", "unicode"] }
 serde = { workspace = true, features = ["derive", "std"] }

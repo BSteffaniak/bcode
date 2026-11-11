@@ -1,5 +1,5 @@
 //! Review annotations of the V2 surface: drafts, threads, AI exchanges, and suggestions, kept in
-//! the same persisted store V1 uses (`draft.*`, `thread.*`, `review.ai_exchange*`,
+//! the plugin's persisted store (`draft.*`, `thread.*`, `review.ai_exchange*`,
 //! `review.suggestions.list`).
 //!
 //! * Changes are optimistic: the store changes at once, and the matching service call is queued.
@@ -7,8 +7,8 @@
 //!   by body or position), and a failed call rolls its own change back.
 //! * A new draft has a local id until its save completes; local drafts cannot be edited or
 //!   deleted yet (the service does not know them).
-//! * Requests use the same review scope V1 derives from the workspace, so V1 and V2 read and
-//!   write the same threads.
+//! * Requests use the review scope the first review interface derived from the
+//!   workspace, so reviews written before V2 keep their threads.
 
 use crate::v2::document::Annotations;
 use bcode_code_review_models::{
@@ -57,7 +57,7 @@ pub struct NoteScope {
 }
 
 impl NoteScope {
-    /// The scope V1 uses for `workspace`: the workspace id with the first included source's
+    /// The scope of `workspace` (as the first review interface derived it): the workspace id with the first included source's
     /// target (the repository when it has none expressible as a target).
     #[must_use]
     pub fn for_workspace(workspace: &ReviewWorkspace) -> Self {
@@ -79,7 +79,7 @@ impl NoteScope {
     }
 }
 
-/// The V1 target of a source kind (the repository for kinds V1 has no target for).
+/// The legacy target of a source kind (the repository for kinds without one).
 fn target_of_kind(kind: &ReviewSourceKind) -> ReviewTarget {
     match kind {
         ReviewSourceKind::WorkingTreeUnstaged => ReviewTarget::WorkingTreeUnstaged,

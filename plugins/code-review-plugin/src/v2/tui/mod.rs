@@ -22,8 +22,8 @@
 //!   persistence; [`composer`] is the inline comment editor; [`agent`] asks Bcode about anchors
 //!   and observes linked sessions; [`palette`] is the command palette and the keymap help.
 //!
-//! The app is selected with `bcode review [subcommand] --ui v2` or `BCODE_REVIEW_UI=v2` and
-//! opened by the host's generic standalone-surface launcher.
+//! `bcode review [subcommand]` opens the app through the host's generic standalone-surface
+//! launcher.
 
 pub mod agent;
 pub mod app;
@@ -63,16 +63,16 @@ use std::sync::Arc;
 pub use app::{ReviewAppV2, RouteName};
 pub use surface::{Focus, ReviewSurfaceV2, SCOPE};
 
-/// Surface kind of the V2 code review app.
-pub const CODE_REVIEW_V2_SURFACE_KIND: &str = "code-review-v2";
+/// Surface kind of the code review app.
+pub const CODE_REVIEW_SURFACE_KIND: &str = "code-review";
 
-/// Factory of the V2 code review app.
+/// Factory of the code review app.
 #[derive(Debug, Default)]
 pub struct ReviewSurfaceV2Factory;
 
 impl PluginTuiSurfaceFactory for ReviewSurfaceV2Factory {
     fn surface_kind(&self) -> &'static str {
-        CODE_REVIEW_V2_SURFACE_KIND
+        CODE_REVIEW_SURFACE_KIND
     }
 
     fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {

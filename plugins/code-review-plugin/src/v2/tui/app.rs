@@ -645,7 +645,7 @@ fn paint_opening(opening: &Opening, theme: &ReviewTheme, area: Rect, cx: &mut Pa
 
 impl PluginTuiSurface for ReviewAppV2 {
     fn id(&self) -> &'static str {
-        super::CODE_REVIEW_V2_SURFACE_KIND
+        super::CODE_REVIEW_SURFACE_KIND
     }
 
     fn title(&self) -> &'static str {

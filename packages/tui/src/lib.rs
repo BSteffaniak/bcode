@@ -22,7 +22,6 @@ pub(crate) mod auth_pool_picker_render;
 pub(crate) mod chat_loop;
 mod child_request_fence;
 pub(crate) mod clipboard_image;
-pub mod code_review_launcher;
 pub(crate) mod command_palette;
 pub(crate) mod command_palette_render;
 pub(crate) mod composer_flow;
@@ -513,12 +512,6 @@ pub async fn run_plugin_surface(
     if surface_kind == "ralph-home" {
         return Box::pin(run_ralph_home(repo)).await;
     }
-    if surface_kind == "code-review" {
-        if let Some(target) = options.get("target") {
-            return run_code_review(repo, serde_json::from_str(target)?).await;
-        }
-        return Box::pin(run_code_review_home(repo)).await;
-    }
     if surface_kind == "eval-run-picker" {
         return run_eval_viewer_picker(repo).await;
     }
@@ -662,48 +655,6 @@ pub async fn run_with_static_bundled_and_options(
         .run_chat(session_id, static_plugins, launch_options)
         .await;
     terminal_finalization_result(result, shell.finish())
-}
-
-/// Run the full-screen review home/picker.
-///
-/// # Errors
-///
-/// Returns I/O, client, or plugin service errors.
-#[allow(clippy::future_not_send)]
-pub async fn run_code_review_home(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
-    let mut shell = TerminalShell::enter()?;
-    let result = Box::pin(shell.run_review_home(repo_path)).await;
-    shell.finish_with_result(result)
-}
-
-/// Run the full-screen local code review interface for an existing workspace.
-///
-/// # Errors
-///
-/// Returns I/O, client, or plugin service errors.
-#[allow(clippy::future_not_send)]
-pub async fn run_code_review_workspace(
-    workspace: bcode_code_review_models::ReviewWorkspace,
-    build_mode: bool,
-) -> Result<(), TuiError> {
-    let mut shell = TerminalShell::enter()?;
-    let result = Box::pin(shell.run_review_workspace(workspace, build_mode)).await;
-    shell.finish_with_result(result)
-}
-
-/// Run the full-screen local code review interface.
-///
-/// # Errors
-///
-/// Returns I/O, client, or plugin service errors.
-#[allow(clippy::future_not_send)]
-pub async fn run_code_review(
-    repo_path: std::path::PathBuf,
-    target: bcode_code_review_models::ReviewTarget,
-) -> Result<(), TuiError> {
-    let mut shell = TerminalShell::enter()?;
-    let result = shell.run_review(repo_path, target).await;
-    shell.finish_with_result(result)
 }
 
 /// Run the eval run picker TUI.

@@ -373,6 +373,59 @@ struct CacheKey {
     paint_revision: u64,
     syntax_epoch: u64,
     annotation_revision: u64,
+    content: ContentStamp,
+}
+
+/// Load state of one line's text, for [`ContentStamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TextState {
+    Text,
+    Loading,
+    Unavailable,
+}
+
+impl TextState {
+    const fn of(content: &LineContent) -> Self {
+        match content {
+            LineContent::Text(_) => Self::Text,
+            LineContent::Loading => Self::Loading,
+            LineContent::Unavailable(_) => Self::Unavailable,
+        }
+    }
+}
+
+/// The parts of an item that change while its key stays the same: revealed context arriving
+/// from its blob (loading, then text or unavailable), stack layers attributed later, and a gap
+/// shrinking from its far end. Rows are cached by key, so these must be part of the cache key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum ContentStamp {
+    /// Nothing beyond the key and the revisions.
+    #[default]
+    Fixed,
+    /// One unified line, or the two sides of a side-by-side row.
+    Lines([Option<(TextState, Option<u64>)>; 2]),
+    /// A gap: its last hidden line, whether it is open-ended, and its hidden threads.
+    Gap(Option<u32>, bool, usize),
+}
+
+impl ContentStamp {
+    fn of(item: &ReviewItem) -> Self {
+        let side = |side: &PairSide| (TextState::of(&side.content), side.layer);
+        match item {
+            ReviewItem::Line(line) => {
+                Self::Lines([Some((TextState::of(&line.content), line.layer)), None])
+            }
+            ReviewItem::LinePair(pair) => {
+                Self::Lines([pair.old.as_ref().map(side), pair.new.as_ref().map(side)])
+            }
+            ReviewItem::Gap(gap) => Self::Gap(
+                gap.end,
+                gap.state == GapState::OpenEnded,
+                gap.hidden_threads,
+            ),
+            _ => Self::Fixed,
+        }
+    }
 }
 
 /// Bounded two-generation cache of item rows. Lookups promote entries from the previous
@@ -466,6 +519,7 @@ impl RowContext<'_> {
             } else {
                 0
             },
+            content: ContentStamp::of(item),
         };
         self.cache.borrow_mut().get_or_build(key, || {
             let mut rows = self.build(index, item, width);

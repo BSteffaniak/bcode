@@ -98,7 +98,7 @@ impl FixtureSpec {
             unstaged_files: 500,
             worktree_changed_lines_per_file: 10,
             extra_branches: 8,
-            // Kept off so the phase 0 V1 baseline numbers stay comparable.
+            // Kept off so the phase 0 baseline numbers (spec 2.1) stay comparable.
             special_entries: false,
         }
     }
@@ -749,7 +749,7 @@ mod tests {
     }
 
     /// Write a fixture repository to `$BCODE_REVIEW_FIXTURE_DIR` for manual checks of the real
-    /// binary (`bcode review range fixture/base main --ui v2` inside it).
+    /// binary (`bcode review range fixture/base main` inside it).
     /// `BCODE_REVIEW_FIXTURE_SPEC=benchmark` writes the benchmark shape and `small` the small
     /// one; the default is a mid-sized review with every special entry.
     #[test]

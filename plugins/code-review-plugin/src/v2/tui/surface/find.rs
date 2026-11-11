@@ -5,7 +5,7 @@
 //!   cursor. Files with changes whose content is not resident are reported as pending, and the
 //!   search re-runs as content loads. `n`/`N` move between matches while a search is active.
 //! * **Viewed** (`v`) records an identity-pinned mark for the cursor's file (both workspace
-//!   fields, so V1 and home keep working) and moves to the next unviewed file; on a viewed file
+//!   fields, so home and older clients keep working) and moves to the next unviewed file; on a viewed file
 //!   it removes the mark.
 //! * **Presentation** (spec 9) is the scroll anchor by item identity, the layout toggle, the
 //!   panels, and the revealed context. It is compared with the stored state at most once a

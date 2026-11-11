@@ -7,17 +7,8 @@
 #[cfg(feature = "static-bundled")]
 mod cli;
 
-pub mod async_values;
-pub mod code_review_controls;
-mod code_review_home;
-pub mod code_review_tui;
-pub mod code_review_tui_display;
-pub mod code_review_tui_render;
-pub mod code_review_tui_view;
 mod keybindings;
-pub mod terminal_events;
 pub mod tui;
-pub mod tui_host_types;
 pub mod v2;
 
 use bcode_code_review_models::{
@@ -30,21 +21,18 @@ use bcode_code_review_models::{
     ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
     ListPublishRecordsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
     ListReviewPublishersResponse, ListReviewSuggestionsRequest, ListReviewSuggestionsResponse,
-    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
-    MaterializeReviewWorkspaceResponse, OP_REVIEW_EXTERNAL_IMPORT_SAVE,
+    ListReviewWorkspacesRequest, ListReviewWorkspacesResponse, OP_REVIEW_EXTERNAL_IMPORT_SAVE,
     OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_RECORDS_LIST,
     OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE,
-    OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE,
-    OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse, PublishReviewRequest,
-    PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest,
-    ResolveThreadResponse, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
-    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
-    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
-    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus,
-    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity,
-    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
+    OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_UPDATE,
+    PublishReviewPreviewResponse, PublishReviewRequest, PublishReviewResponse,
+    RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest, ResolveThreadResponse,
+    ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind, ReviewBundle, ReviewBundleLine,
+    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
+    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
+    ReviewPublisherManifest, ReviewScope, ReviewSource, ReviewSourceKind, ReviewSuggestion,
+    ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind,
+    ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem, SaveDraftRequest,
     SaveDraftResponse, SaveExternalReviewImportRequest, SaveExternalReviewImportResponse,
     SavePublishRecordRequest, SavePublishRecordResponse, SaveReviewAiExchangeRequest,
     SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest, SaveReviewSuggestionResponse,
@@ -204,7 +192,6 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_WORKSPACE_GET => review_workspace_get(&context),
             OP_REVIEW_WORKSPACE_UPDATE => review_workspace_update(&context),
             OP_REVIEW_WORKSPACE_ARCHIVE => review_workspace_archive(&context),
-            OP_REVIEW_WORKSPACE_MATERIALIZE => review_workspace_materialize(&context),
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
@@ -491,20 +478,6 @@ fn review_workspace_archive(context: &NativeServiceContext) -> ServiceResponse {
     match archive_review_workspace_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("workspace_archive_failed", error.to_string()),
-    }
-}
-
-fn review_workspace_materialize(context: &NativeServiceContext) -> ServiceResponse {
-    let request = match context
-        .request
-        .payload_json::<MaterializeReviewWorkspaceRequest>()
-    {
-        Ok(request) => request,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    match materialize_review_workspace_for_request(request) {
-        Ok(response) => json_response(&response),
-        Err(error) => ServiceResponse::error("workspace_materialize_failed", error.to_string()),
     }
 }
 
@@ -1146,12 +1119,7 @@ fn review_bundle_for_request(
 ) -> Result<ReviewBundle, ReviewError> {
     let workspace = request.workspace.clone();
     let (summary, surfaces) = if let Some(workspace) = workspace.clone() {
-        let materialization =
-            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
-                repo_path: request.repo_path.clone(),
-                workspace,
-            })?
-            .materialization;
+        let materialization = materialize_review_workspace(&request.repo_path, workspace)?;
         (
             review_summary_from_materialization(&materialization),
             materialization.surfaces,
@@ -1229,7 +1197,7 @@ fn review_bundle_for_request(
 }
 
 fn review_summary_from_materialization(
-    materialization: &ReviewWorkspaceMaterialization,
+    materialization: &WorkspaceMaterialization,
 ) -> ReviewSummary {
     ReviewSummary {
         title: materialization.workspace.title.clone(),
@@ -1949,7 +1917,6 @@ fn create_review_workspace_for_request(
         updated_at_ms: Some(now),
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
-        presentation_state: None,
         viewed_marks: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         presentation_v2: None,
@@ -2008,130 +1975,43 @@ fn archive_review_workspace_for_request(
     Ok(ArchiveReviewWorkspaceResponse { archived })
 }
 
-fn materialize_review_workspace_for_request(
-    request: MaterializeReviewWorkspaceRequest,
-) -> Result<MaterializeReviewWorkspaceResponse, ReviewError> {
-    let repo_root = resolve_repo_root(&request.repo_path)?;
+/// A workspace's included sources materialized into reviewable surfaces (for review bundles).
+#[derive(Debug)]
+struct WorkspaceMaterialization {
+    /// Source workspace.
+    workspace: ReviewWorkspace,
+    /// Reviewable surfaces produced from included sources.
+    surfaces: Vec<ReviewSurface>,
+    /// Total added lines across diff surfaces.
+    additions: u32,
+    /// Total removed lines across diff surfaces.
+    deletions: u32,
+}
+
+fn materialize_review_workspace(
+    repo_path: &Path,
+    workspace: ReviewWorkspace,
+) -> Result<WorkspaceMaterialization, ReviewError> {
+    let repo_root = resolve_repo_root(repo_path)?;
     let mut surfaces = Vec::new();
     let mut additions = 0_u32;
     let mut deletions = 0_u32;
-    let mut diagnostics = Vec::new();
-    for source in request
-        .workspace
-        .sources
-        .iter()
-        .filter(|source| source.included)
-    {
-        let before = surfaces.len();
-        if let Err(error) = materialize_source(
+    for source in workspace.sources.iter().filter(|source| source.included) {
+        // A source that fails contributes no surfaces; the bundle keeps the others.
+        let _ = materialize_source(
             &repo_root,
             source,
             &mut surfaces,
             &mut additions,
             &mut deletions,
-        ) {
-            let (code, message) = actionable_materialization_error(source, &error);
-            diagnostics.push(source_diagnostic(
-                source,
-                ReviewSourceDiagnosticSeverity::Error,
-                code,
-                message,
-            ));
-            continue;
-        }
-        if surfaces.len() == before {
-            diagnostics.push(source_diagnostic(
-                source,
-                ReviewSourceDiagnosticSeverity::Info,
-                "no_surfaces",
-                "source produced no reviewable surfaces",
-            ));
-        }
+        );
     }
-    let repository_files = repository_review_files(&repo_root)?
-        .into_iter()
-        .filter_map(|file| file.new_path.or(file.old_path))
-        .collect::<Vec<_>>();
-    let repository_branches = repository_review_branches(&repo_root)?;
-    let repository_commits = repository_review_commits(&repo_root)?;
-    Ok(MaterializeReviewWorkspaceResponse {
-        materialization: ReviewWorkspaceMaterialization {
-            workspace: request.workspace,
-            surfaces,
-            diagnostics,
-            repository_files,
-            repository_branches,
-            repository_commits,
-            additions,
-            deletions,
-        },
+    Ok(WorkspaceMaterialization {
+        workspace,
+        surfaces,
+        additions,
+        deletions,
     })
-}
-
-fn actionable_materialization_error(
-    source: &ReviewSource,
-    error: &ReviewError,
-) -> (&'static str, String) {
-    let recovery = match &source.kind {
-        ReviewSourceKind::LastCommit | ReviewSourceKind::Commit { .. } => {
-            "Verify the revision exists locally and fetch it if needed."
-        }
-        ReviewSourceKind::CommitRange { .. } => {
-            "Verify both revisions exist locally; fetch missing refs or edit the range."
-        }
-        ReviewSourceKind::BranchCompare { .. } => {
-            "Verify both branches exist locally; fetch missing branches or edit the comparison."
-        }
-        ReviewSourceKind::WorkingTreeAndIndex => {
-            "Create an initial commit first, or review staged and unstaged changes separately."
-        }
-        ReviewSourceKind::File { .. } | ReviewSourceKind::FileRange { .. } => {
-            "Verify the repository-relative path and range, then edit or remove this source."
-        }
-        ReviewSourceKind::WorkingTreeUnstaged
-        | ReviewSourceKind::IndexStaged
-        | ReviewSourceKind::Repository => "Verify the repository state, then refresh this source.",
-        ReviewSourceKind::Commits { .. }
-        | ReviewSourceKind::PullRequest { .. }
-        | ReviewSourceKind::StackLayer { .. }
-        | ReviewSourceKind::Stack { .. }
-        | ReviewSourceKind::CurrentBranch { .. }
-        | ReviewSourceKind::Unsupported { .. } => {
-            "Open this review in Code Review V2; this source kind is not supported here."
-        }
-    };
-    let code = match source.kind {
-        ReviewSourceKind::CommitRange { .. } | ReviewSourceKind::Commit { .. } => {
-            "invalid_revision"
-        }
-        ReviewSourceKind::BranchCompare { .. } => "missing_branch",
-        ReviewSourceKind::LastCommit | ReviewSourceKind::WorkingTreeAndIndex => "missing_head",
-        ReviewSourceKind::File { .. } | ReviewSourceKind::FileRange { .. } => "invalid_file_source",
-        ReviewSourceKind::WorkingTreeUnstaged
-        | ReviewSourceKind::IndexStaged
-        | ReviewSourceKind::Repository => "materialize_failed",
-        ReviewSourceKind::Commits { .. }
-        | ReviewSourceKind::PullRequest { .. }
-        | ReviewSourceKind::StackLayer { .. }
-        | ReviewSourceKind::Stack { .. }
-        | ReviewSourceKind::CurrentBranch { .. }
-        | ReviewSourceKind::Unsupported { .. } => "unsupported_source_kind",
-    };
-    (code, format!("{error}. {recovery}"))
-}
-
-fn source_diagnostic(
-    source: &ReviewSource,
-    severity: ReviewSourceDiagnosticSeverity,
-    code: &str,
-    message: impl Into<String>,
-) -> ReviewSourceDiagnostic {
-    ReviewSourceDiagnostic {
-        source_id: source.id.clone(),
-        severity,
-        code: code.to_string(),
-        message: message.into(),
-    }
 }
 
 fn materialize_source(
@@ -2989,7 +2869,6 @@ impl<'a> CodeReviewDb<'a> {
                 "updated_at_ms",
                 "archived_at_ms",
                 "viewed_files_json",
-                "presentation_state_json",
                 "viewed_marks_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
@@ -3028,7 +2907,6 @@ impl<'a> CodeReviewDb<'a> {
                 "updated_at_ms",
                 "archived_at_ms",
                 "viewed_files_json",
-                "presentation_state_json",
                 "viewed_marks_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
@@ -3045,11 +2923,6 @@ impl<'a> CodeReviewDb<'a> {
     async fn save_workspace(&self, workspace: &ReviewWorkspace) -> Result<(), ReviewError> {
         let sources_json = serde_json::to_string(&workspace.sources)?;
         let viewed_files_json = serde_json::to_string(&workspace.viewed_files)?;
-        let presentation_state_json = workspace
-            .presentation_state
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
         let viewed_marks_json = serde_json::to_string(&workspace.viewed_marks)?;
         let reviewed_revisions_json = serde_json::to_string(&workspace.reviewed_revisions)?;
         let presentation_v2_json = workspace
@@ -3064,7 +2937,6 @@ impl<'a> CodeReviewDb<'a> {
                 .value("title", workspace.title.clone())
                 .value("sources_json", sources_json)
                 .value("viewed_files_json", viewed_files_json.clone())
-                .value("presentation_state_json", presentation_state_json.clone())
                 .value("viewed_marks_json", viewed_marks_json.clone())
                 .value("reviewed_revisions_json", reviewed_revisions_json.clone())
                 .value("presentation_v2_json", presentation_v2_json.clone())
@@ -3085,7 +2957,6 @@ impl<'a> CodeReviewDb<'a> {
             .value("title", workspace.title.clone())
             .value("sources_json", sources_json)
             .value("viewed_files_json", viewed_files_json)
-            .value("presentation_state_json", presentation_state_json)
             .value("viewed_marks_json", viewed_marks_json)
             .value("reviewed_revisions_json", reviewed_revisions_json)
             .value("presentation_v2_json", presentation_v2_json)
@@ -4342,6 +4213,9 @@ fn workspace_v2_state_columns_migration() -> CodeMigration<'static> {
     )
 }
 
+/// The first review interface's presentation state. The column stays so the migration history
+/// is unchanged; nothing reads or writes it since that interface was removed (V2 keeps its own
+/// state in `presentation_v2_json`).
 fn workspace_presentation_state_column_migration() -> CodeMigration<'static> {
     CodeMigration::new(
         "017_workspace_presentation_state_column".to_string(),
@@ -4594,8 +4468,6 @@ fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
         updated_at_ms: Some(i64_to_u64(required_i64(row, "updated_at_ms")?)),
         viewed_files,
         archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
-        presentation_state: optional_text(row, "presentation_state_json")
-            .map_or_else(|| Ok(None), |json| serde_json::from_str(&json).map(Some))?,
         viewed_marks: optional_text(row, "viewed_marks_json")
             .map_or_else(|| Ok(Vec::new()), |json| serde_json::from_str(&json))?,
         reviewed_revisions: optional_text(row, "reviewed_revisions_json")
@@ -4873,45 +4745,6 @@ fn repository_review_files(repo_root: &Path) -> Result<Vec<ReviewFile>, ReviewEr
         .collect())
 }
 
-fn repository_review_branches(repo_root: &Path) -> Result<Vec<String>, ReviewError> {
-    let output = git_output(
-        repo_root,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/heads",
-            "refs/remotes",
-        ],
-    )?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|branch| !branch.is_empty() && !branch.ends_with("/HEAD"))
-        .map(ToString::to_string)
-        .collect())
-}
-
-fn repository_review_commits(repo_root: &Path) -> Result<Vec<ReviewRepositoryCommit>, ReviewError> {
-    let output = git_output(
-        repo_root,
-        &["log", "--max-count=50", "--format=%H%x1f%h%x1f%s", "--all"],
-    )?;
-    Ok(output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\u{1f}');
-            let rev = parts.next()?.to_string();
-            let short_rev = parts.next()?.to_string();
-            let subject = parts.next().unwrap_or_default().to_string();
-            Some(ReviewRepositoryCommit {
-                rev,
-                short_rev,
-                subject,
-            })
-        })
-        .collect())
-}
-
 fn diff_for_target(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewError> {
     match target {
         ReviewTarget::WorkingTreeUnstaged => git_output(repo_root, &["diff", "--find-renames"]),
@@ -5071,52 +4904,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn materialization_reports_invalid_revision_and_missing_branch() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = initialized_test_repository(temp.path());
-        let workspace = test_workspace(
-            &repo,
-            vec![
-                test_source(
-                    "invalid-revision",
-                    ReviewSourceKind::CommitRange {
-                        base: "does-not-exist".to_string(),
-                        head: "HEAD".to_string(),
-                        merge_base: false,
-                    },
-                ),
-                test_source(
-                    "missing-branch",
-                    ReviewSourceKind::BranchCompare {
-                        base_branch: "does-not-exist".to_string(),
-                        head_branch: "HEAD".to_string(),
-                        merge_base: true,
-                    },
-                ),
-            ],
-        );
-
-        let response =
-            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
-                repo_path: repo,
-                workspace,
-            })
-            .expect("materialization returns per-source diagnostics");
-        let diagnostics = response.materialization.diagnostics;
-
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.source_id == "invalid-revision"
-                && diagnostic.code == "invalid_revision"
-                && diagnostic.message.contains("Verify both revisions")
-        }));
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.source_id == "missing-branch"
-                && diagnostic.code == "missing_branch"
-                && diagnostic.message.contains("Verify both branches")
-        }));
-    }
-
-    #[test]
     fn materialization_reports_empty_diff_without_failing_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = initialized_test_repository(temp.path());
@@ -5128,27 +4915,12 @@ mod tests {
             )],
         );
 
-        let response =
-            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
-                repo_path: repo,
-                workspace,
-            })
+        let response = materialize_review_workspace(&repo, workspace)
             .expect("empty diff is a successful materialization");
 
         assert_eq!(
-            response.materialization.surfaces,
+            response.surfaces,
             [] as [bcode_code_review_models::ReviewSurface; 0]
-        );
-        assert!(
-            response
-                .materialization
-                .diagnostics
-                .iter()
-                .any(|diagnostic| {
-                    diagnostic.source_id == "empty-unstaged"
-                        && diagnostic.code == "no_surfaces"
-                        && diagnostic.severity == ReviewSourceDiagnosticSeverity::Info
-                })
         );
     }
 
@@ -5171,29 +4943,14 @@ mod tests {
             ],
         );
 
-        let response =
-            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
-                repo_path: repo,
-                workspace,
-            })
+        let response = materialize_review_workspace(&repo, workspace)
             .expect("partial workspace materialization");
 
         assert!(
             response
-                .materialization
                 .surfaces
                 .iter()
                 .any(|surface| surface.source_id == "valid")
-        );
-        assert!(
-            response
-                .materialization
-                .diagnostics
-                .iter()
-                .any(|diagnostic| {
-                    diagnostic.source_id == "invalid"
-                        && diagnostic.severity == ReviewSourceDiagnosticSeverity::Error
-                })
         );
     }
 
@@ -5220,7 +4977,6 @@ mod tests {
             updated_at_ms: None,
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
-            presentation_state: None,
             viewed_marks: Vec::new(),
             reviewed_revisions: std::collections::BTreeMap::new(),
             presentation_v2: None,
@@ -5309,49 +5065,6 @@ mod tests {
             .expect("utf8 git output")
             .trim()
             .to_string()
-    }
-
-    #[test]
-    fn invalid_target_diagnostics_include_actionable_recovery() {
-        let cases = [
-            (
-                ReviewSourceKind::CommitRange {
-                    base: "missing".to_string(),
-                    head: "HEAD".to_string(),
-                    merge_base: false,
-                },
-                "invalid_revision",
-                "Verify both revisions",
-            ),
-            (
-                ReviewSourceKind::BranchCompare {
-                    base_branch: "missing".to_string(),
-                    head_branch: "HEAD".to_string(),
-                    merge_base: true,
-                },
-                "missing_branch",
-                "Verify both branches",
-            ),
-            (
-                ReviewSourceKind::WorkingTreeAndIndex,
-                "missing_head",
-                "Create an initial commit",
-            ),
-        ];
-        for (kind, expected_code, expected_recovery) in cases {
-            let source = ReviewSource {
-                id: "source".to_string(),
-                label: "source".to_string(),
-                included: true,
-                kind,
-            };
-            let (code, message) = actionable_materialization_error(
-                &source,
-                &ReviewError::Git("ambiguous argument".to_string()),
-            );
-            assert_eq!(code, expected_code);
-            assert!(message.contains(expected_recovery));
-        }
     }
 
     #[test]
@@ -5456,7 +5169,6 @@ mod tests {
             updated_at_ms: None,
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
-            presentation_state: None,
             viewed_marks: Vec::new(),
             reviewed_revisions: std::collections::BTreeMap::new(),
             presentation_v2: None,
@@ -5644,61 +5356,109 @@ mod tests {
     }
 
     #[test]
-    fn workspace_presentation_state_round_trips_and_defaults_for_legacy_rows() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("repo");
-        git_test(&repo, &["init", "--quiet"]);
-        let config = CodeReviewPluginConfig {
-            state_location: CodeReviewStateLocation::User,
-            state_dir: Some(temp.path().join("state")),
-        };
-        let mut workspace = test_workspace(&repo, Vec::new());
-        workspace.presentation_state =
-            Some(bcode_code_review_models::ReviewWorkspacePresentationState {
-                schema_version:
-                    bcode_code_review_models::REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION,
-                selected_path: Some("src/lib.rs".to_string()),
-                selected_thread_key: Some("thread:1".to_string()),
-                selected_line: Some(42),
-                sidebar_mode: "threads".to_string(),
-                sidebar_visible: true,
-                thread_filter: "open".to_string(),
-                show_resolved_threads: false,
-                hide_viewed_files: true,
-                collapsed_thread_keys: BTreeSet::from(["thread:2".to_string()]),
-                expanded_agent_answer_keys: BTreeSet::from(["thread:1".to_string()]),
-            });
-
-        update_review_workspace_for_request(
-            UpdateReviewWorkspaceRequest {
-                repo_path: repo.clone(),
-                workspace: workspace.clone(),
-            },
-            &config,
-        )
-        .expect("save workspace");
-        let loaded = get_review_workspace_for_request(
-            GetReviewWorkspaceRequest {
-                repo_path: repo,
-                workspace_id: workspace.id.clone(),
-            },
-            &config,
-        )
-        .expect("get workspace")
-        .workspace
-        .expect("workspace");
-        assert_eq!(loaded.presentation_state, workspace.presentation_state);
-
+    fn workspace_payloads_with_the_first_interface_presentation_state_still_decode() {
         let legacy: ReviewWorkspace = serde_json::from_value(serde_json::json!({
             "id": "legacy",
             "title": "Legacy",
             "repo_root": "/repo",
             "sources": [],
-            "viewed_files": []
+            "viewed_files": ["src/lib.rs"],
+            "presentation_state": {
+                "schema_version": 1,
+                "selected_path": "src/lib.rs",
+                "sidebar_mode": "threads",
+            }
         }))
         .expect("legacy workspace");
-        assert!(legacy.presentation_state.is_none());
+        assert_eq!(
+            legacy.viewed_files,
+            BTreeSet::from(["src/lib.rs".to_owned()])
+        );
+        assert!(legacy.presentation_v2.is_none());
+    }
+
+    /// A row the first review interface stored (only its columns, with its own presentation
+    /// state, here unreadable) lists, opens, and saves through the workspace operations.
+    #[test]
+    fn workspace_rows_stored_by_the_first_interface_list_open_and_save() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = initialized_test_repository(temp.path());
+        let repo_root = resolve_repo_root(&repo).expect("repo root");
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let sources =
+            serde_json::to_string(&vec![test_source("staged", ReviewSourceKind::IndexStaged)])
+                .expect("sources encode");
+        let row_root = repo_root.display().to_string();
+        with_database(&repo_root, &config, move |database| {
+            Box::pin(async move {
+                database
+                    .insert("review_workspaces")
+                    .value("workspace_id", "first-interface")
+                    .value("repo_root", row_root)
+                    .value("title", "Written before V2")
+                    .value("sources_json", sources)
+                    .value("created_at_ms", 1_i64)
+                    .value("updated_at_ms", 2_i64)
+                    .value("viewed_files_json", r#"["src/lib.rs"]"#)
+                    .value("presentation_state_json", "{not json")
+                    .execute(database)
+                    .await?;
+                Ok(())
+            })
+        })
+        .expect("insert first-interface row");
+
+        let listed = list_review_workspaces_for_request(
+            &ListReviewWorkspacesRequest {
+                repo_path: repo.clone(),
+                include_archived: false,
+            },
+            &config,
+        )
+        .expect("list");
+        assert_eq!(listed.workspaces.len(), 1);
+        let get = |repo_path: PathBuf| {
+            get_review_workspace_for_request(
+                GetReviewWorkspaceRequest {
+                    repo_path,
+                    workspace_id: "first-interface".to_owned(),
+                },
+                &config,
+            )
+            .expect("get")
+            .workspace
+            .expect("stored workspace")
+        };
+        let workspace = get(repo.clone());
+        assert_eq!(workspace, listed.workspaces[0]);
+        assert_eq!(workspace.title, "Written before V2");
+        assert_eq!(
+            workspace.viewed_files,
+            BTreeSet::from(["src/lib.rs".to_owned()])
+        );
+        assert_eq!(workspace.viewed_marks, Vec::new());
+        assert_eq!(workspace.reviewed_revisions, BTreeMap::new());
+        assert!(workspace.presentation_v2.is_none());
+
+        let mut renamed = workspace;
+        renamed.title = "Renamed in V2".to_owned();
+        update_review_workspace_for_request(
+            UpdateReviewWorkspaceRequest {
+                repo_path: repo.clone(),
+                workspace: renamed,
+            },
+            &config,
+        )
+        .expect("update");
+        let reopened = get(repo);
+        assert_eq!(reopened.title, "Renamed in V2");
+        assert_eq!(
+            reopened.viewed_files,
+            BTreeSet::from(["src/lib.rs".to_owned()])
+        );
     }
 
     #[test]

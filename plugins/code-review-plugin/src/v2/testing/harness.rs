@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn scripted_host_resolves_manifest_defaults_and_overrides() {
-        let scope = crate::keybindings::REVIEW;
+        let scope = crate::v2::tui::SCOPE;
         let next = parse_key_stroke("n").unwrap();
         let host = ScriptedHost::new();
         assert_eq!(

@@ -476,8 +476,9 @@ impl TerminalShell {
 
     /// Dispatch a supported plugin startup surface while borrowing this terminal owner.
     ///
-    /// Review preparation uses progress/draining; other adapters retain their existing loading
-    /// behavior but never enter a second terminal guard. Repository paths must be resolved by CLI.
+    /// The generic standalone launcher shows progress while the plugin surface prepares; other
+    /// adapters retain their existing loading behavior but never enter a second terminal guard.
+    /// Repository paths must be resolved by CLI.
     ///
     /// # Errors
     /// Returns unresolved path/options, unsupported surface, launcher, or terminal errors.
@@ -501,13 +502,6 @@ impl TerminalShell {
     ) -> Result<(), TuiError> {
         let repo = crate::resolved_surface_repo_path(&surface_kind, repo_path)?;
         match surface_kind.as_str() {
-            "code-review" => {
-                if let Some(target) = options.get("target") {
-                    self.run_review(repo, serde_json::from_str(target)?).await
-                } else {
-                    Box::pin(self.run_review_home(repo)).await
-                }
-            }
             "ralph-home" => {
                 let request = Box::pin(crate::runtime::run_event_loop_with_startup(
                     &mut self.terminal()?,
@@ -577,157 +571,6 @@ impl TerminalShell {
         ))
         .await
         .map(|_| ())
-    }
-
-    /// Open review home, then its selected workspace and chat without terminal teardown.
-    ///
-    /// # Errors
-    /// Returns review plugin, client, or terminal errors.
-    #[allow(clippy::future_not_send)]
-    pub async fn run_review_home(&mut self, repo_path: std::path::PathBuf) -> Result<(), TuiError> {
-        self.stop_requested = false;
-        loop {
-            let result = {
-                let prepared = match self
-                    .wait(
-                        "Opening review home…",
-                        crate::code_review_launcher::prepare_home(repo_path.clone()),
-                    )
-                    .await
-                {
-                    Ok(Some(prepared)) if !self.stop_requested() => prepared,
-                    Ok(_) => return Ok(()),
-                    Err(error) => return self.review_preparation_error(error).await,
-                };
-                Box::pin(crate::code_review_launcher::run_prepared_home(
-                    &mut self.terminal()?,
-                    prepared,
-                ))
-                .await
-            };
-            match complete_runtime_screen(&mut self.handoff_blocked, result)? {
-                crate::code_review_launcher::ReviewHomeOutcome::OpenWorkspace {
-                    workspace,
-                    build_mode,
-                } => {
-                    Box::pin(self.run_review_workspace(workspace, build_mode)).await?;
-                    if self.stop_requested() {
-                        return Ok(());
-                    }
-                }
-                crate::code_review_launcher::ReviewHomeOutcome::Exit => return Ok(()),
-            }
-        }
-    }
-
-    /// Open a review workspace and its requested chat without terminal teardown.
-    ///
-    /// # Errors
-    /// Returns terminal, runtime, or recovery presentation errors. Preparation failures
-    /// with verified clean screen release are acknowledged in-app.
-    #[allow(clippy::future_not_send)]
-    pub async fn run_review_workspace(
-        &mut self,
-        workspace: bcode_code_review_models::ReviewWorkspace,
-        build_mode: bool,
-    ) -> Result<(), TuiError> {
-        self.stop_requested = false;
-        let result = {
-            let prepared = match self
-                .wait(
-                    "Opening review workspace…",
-                    crate::code_review_launcher::prepare_workspace(workspace, build_mode),
-                )
-                .await
-            {
-                Ok(Some(prepared)) if !self.stop_requested() => prepared,
-                Ok(_) => return Ok(()),
-                Err(error) => return self.review_preparation_error(error).await,
-            };
-            Box::pin(crate::code_review_launcher::run_prepared_review(
-                &mut self.terminal()?,
-                prepared,
-            ))
-            .await
-        };
-        let session_id = complete_runtime_screen(&mut self.handoff_blocked, result)?;
-        self.run_review_chat(session_id).await
-    }
-
-    /// Open a review target and its requested chat without terminal teardown.
-    ///
-    /// # Errors
-    /// Returns terminal, runtime, or recovery presentation errors. Preparation failures
-    /// with verified clean screen release are acknowledged in-app.
-    #[allow(clippy::future_not_send)]
-    pub async fn run_review(
-        &mut self,
-        repo_path: std::path::PathBuf,
-        target: bcode_code_review_models::ReviewTarget,
-    ) -> Result<(), TuiError> {
-        self.stop_requested = false;
-        let result = {
-            let prepared = match self
-                .wait(
-                    "Opening review target…",
-                    crate::code_review_launcher::prepare_review(repo_path, target),
-                )
-                .await
-            {
-                Ok(Some(prepared)) if !self.stop_requested() => prepared,
-                Ok(_) => return Ok(()),
-                Err(error) => return self.review_preparation_error(error).await,
-            };
-            Box::pin(crate::code_review_launcher::run_prepared_review(
-                &mut self.terminal()?,
-                prepared,
-            ))
-            .await
-        };
-        let session_id = complete_runtime_screen(&mut self.handoff_blocked, result)?;
-        self.run_review_chat(session_id).await
-    }
-
-    async fn review_preparation_error(&mut self, error: TuiError) -> Result<(), TuiError> {
-        // A preparation error is recoverable only when its foreground screen released
-        // authority cleanly. Otherwise return the original operation error for finalization.
-        if self.handoff_blocked || self.screen_error.is_some() {
-            return Err(error);
-        }
-        self.review_error().await
-    }
-
-    async fn review_error(&mut self) -> Result<(), TuiError> {
-        if self.stop_requested() {
-            // Preparation has settled; honor the already requested exit without admitting
-            // a second screen or repeating an operation whose effects may have committed.
-            return Ok(());
-        }
-        // Do not expose plugin-private errors or offer to repeat an operation whose effects
-        // may already have committed. Returning home performs navigation, not mutation retry.
-        let action = self.show_error_without_retry(
-            "Review could not be opened or completed. Its operations may already have taken effect. Return to inspect the current state, or close.",
-        ).await?;
-        self.stop_requested = action == TerminalRecoveryAction::Close;
-        Ok(())
-    }
-
-    #[allow(clippy::future_not_send)]
-    async fn run_review_chat(
-        &mut self,
-        session_id: Option<bcode_session_models::SessionId>,
-    ) -> Result<(), TuiError> {
-        if let Some(session_id) = session_id {
-            self.run_chat(
-                Some(session_id),
-                &crate::static_bundled_plugins(),
-                TuiLaunchOptions::default(),
-            )
-            .await?;
-        }
-        // Successful chat or workspace close ends the journey instead of reopening home.
-        self.stop_requested = true;
-        Ok(())
     }
 
     /// Display caller-owned initialization progress while awaiting an operation.

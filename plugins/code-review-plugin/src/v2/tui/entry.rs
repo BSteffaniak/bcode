@@ -157,7 +157,6 @@ pub fn transient_workspace(
         updated_at_ms: None,
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
-        presentation_state: None,
         viewed_marks: Vec::new(),
         reviewed_revisions: BTreeMap::new(),
         presentation_v2: None,

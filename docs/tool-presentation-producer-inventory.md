@@ -23,7 +23,7 @@ Every current bundled presentation schema is consumed by both renderer-native re
 
 Production searches used for this inventory:
 
-* `ToolContributionPlaced` under `plugins/` has no publisher; the sole match is code-review TUI event consumption.
+* `ToolContributionPlaced` under `plugins/` has no publisher or consumer.
 * `TransientProgressPublisher` and `transient_progress(` have no production callers outside `plugin-sdk`.
 * `PrimaryPresentationPublisher` is used by shell, filesystem, Vim edit, web search, document, OCR, git, and worktree producers.
 * Tool presentation manifest declarations remain only for filesystem and Vim request-draft schema ownership.

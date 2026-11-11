@@ -44,8 +44,6 @@ pub const OP_REVIEW_WORKSPACE_GET: &str = "review.workspace.get";
 pub const OP_REVIEW_WORKSPACE_UPDATE: &str = "review.workspace.update";
 /// Operation that archives a durable review workspace.
 pub const OP_REVIEW_WORKSPACE_ARCHIVE: &str = "review.workspace.archive";
-/// Operation that materializes review workspace sources into reviewable surfaces.
-pub const OP_REVIEW_WORKSPACE_MATERIALIZE: &str = "review.workspace.materialize";
 /// Operation that returns repository file content for review browsing.
 pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 /// Operation that lists durable AI-suggested review comments.
@@ -120,45 +118,6 @@ pub enum ReviewTarget {
     Repository,
 }
 
-pub const REVIEW_WORKSPACE_PRESENTATION_SCHEMA_VERSION: u16 = 1;
-
-/// Durable Code Review-owned semantic presentation state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewWorkspacePresentationState {
-    /// Presentation schema version.
-    pub schema_version: u16,
-    /// Stable selected source or file path, when known.
-    #[serde(default)]
-    pub selected_path: Option<String>,
-    /// Stable selected thread identity, when known.
-    #[serde(default)]
-    pub selected_thread_key: Option<String>,
-    /// Semantic selected line within the source, when known.
-    #[serde(default)]
-    pub selected_line: Option<u32>,
-    /// Plugin-owned sidebar mode identifier.
-    #[serde(default)]
-    pub sidebar_mode: String,
-    /// Whether the sidebar is visible.
-    #[serde(default = "default_true")]
-    pub sidebar_visible: bool,
-    /// Plugin-owned thread filter identifier.
-    #[serde(default)]
-    pub thread_filter: String,
-    /// Whether resolved threads are shown.
-    #[serde(default = "default_true")]
-    pub show_resolved_threads: bool,
-    /// Whether viewed files are hidden.
-    #[serde(default)]
-    pub hide_viewed_files: bool,
-    /// Stable collapsed thread identities.
-    #[serde(default)]
-    pub collapsed_thread_keys: BTreeSet<String>,
-    /// Stable expanded linked-session answer identities.
-    #[serde(default)]
-    pub expanded_agent_answer_keys: BTreeSet<String>,
-}
-
 /// Durable review workspace assembled from one or more review sources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewWorkspace {
@@ -182,9 +141,6 @@ pub struct ReviewWorkspace {
     /// Archived timestamp in milliseconds since Unix epoch, when archived.
     #[serde(default)]
     pub archived_at_ms: Option<u64>,
-    /// Stable semantic presentation state for useful workspace reopen.
-    #[serde(default)]
-    pub presentation_state: Option<ReviewWorkspacePresentationState>,
     /// Identity-pinned viewed marks (Code Review V2). `viewed_files` stays the authoritative set
     /// of viewed paths for compatibility; a viewed path without a mark here is a legacy mark of
     /// unknown identity.
@@ -475,7 +431,6 @@ impl ReviewWorkspace {
             updated_at_ms: None,
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
-            presentation_state: None,
             viewed_marks: Vec::new(),
             reviewed_revisions: BTreeMap::new(),
             presentation_v2: None,
@@ -768,58 +723,6 @@ pub struct ReviewSourceDiagnostic {
     pub code: String,
     /// Human-readable diagnostic message.
     pub message: String,
-}
-
-/// Repository commit available for source pickers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewRepositoryCommit {
-    /// Full commit revision.
-    pub rev: String,
-    /// Short commit revision.
-    pub short_rev: String,
-    /// Commit subject.
-    pub subject: String,
-}
-
-/// Materialized workspace review data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewWorkspaceMaterialization {
-    /// Source workspace.
-    pub workspace: ReviewWorkspace,
-    /// Reviewable surfaces produced from included sources.
-    pub surfaces: Vec<ReviewSurface>,
-    /// Diagnostics produced while materializing sources.
-    #[serde(default)]
-    pub diagnostics: Vec<ReviewSourceDiagnostic>,
-    /// Repository file paths available for source/file pickers.
-    #[serde(default)]
-    pub repository_files: Vec<String>,
-    /// Repository branch names available for source pickers.
-    #[serde(default)]
-    pub repository_branches: Vec<String>,
-    /// Recent repository commits available for source pickers.
-    #[serde(default)]
-    pub repository_commits: Vec<ReviewRepositoryCommit>,
-    /// Total added lines across diff surfaces.
-    pub additions: u32,
-    /// Total removed lines across diff surfaces.
-    pub deletions: u32,
-}
-
-/// Request payload for `review.workspace.materialize`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializeReviewWorkspaceRequest {
-    /// Repository path where the workspace lives.
-    pub repo_path: PathBuf,
-    /// Workspace to materialize.
-    pub workspace: ReviewWorkspace,
-}
-
-/// Response payload for `review.workspace.materialize`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializeReviewWorkspaceResponse {
-    /// Materialized workspace review data.
-    pub materialization: ReviewWorkspaceMaterialization,
 }
 
 /// Request payload for listing publish records for a workspace.

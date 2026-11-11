@@ -90,12 +90,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Keymap scope of the V2 review surface.
-pub const SCOPE: &str = "code-review-v2";
+/// Keymap scope of the review screen.
+pub const SCOPE: &str = "code-review";
 /// Keymap scope of the file panel (its own keys; motions come from [`SCOPE`]).
-pub const FILES_SCOPE: &str = "code-review-v2-files";
+pub const FILES_SCOPE: &str = "code-review-files";
 /// Keymap scope of the threads panel (its own keys; motions come from [`SCOPE`]).
-pub const THREADS_SCOPE: &str = "code-review-v2-threads";
+pub const THREADS_SCOPE: &str = "code-review-threads";
 /// Close outcome key asking the app to edit the review's sources.
 pub const EDIT_SOURCES_OUTCOME: &str = "edit_sources";
 /// Service calls in flight at once.
@@ -156,6 +156,7 @@ mod flows;
 mod pointer;
 mod stack;
 
+pub use annotate::COMPOSER_SCOPE;
 pub use flows::Modal;
 
 pub use find::{SearchState, ThreadsFilter};
@@ -3977,7 +3978,7 @@ const HINT_ACTIONS: &[&str] = &[
 
 impl PluginTuiSurface for ReviewSurfaceV2 {
     fn id(&self) -> &'static str {
-        super::CODE_REVIEW_V2_SURFACE_KIND
+        super::CODE_REVIEW_SURFACE_KIND
     }
 
     fn title(&self) -> &'static str {

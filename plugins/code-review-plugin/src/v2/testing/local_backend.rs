@@ -3,7 +3,7 @@
 //!
 //! Annotation and workspace operations (drafts, threads, AI exchanges, suggestions, workspace
 //! updates) go to the plugin's real persisted store in a private state directory, so surface
-//! tests exercise the same data V1 reads. Sessions are recorded instead of created.
+//! tests exercise the data the daemon serves. Sessions are recorded instead of created.
 
 use crate::v2::provider::ProviderCallError;
 use crate::v2::service::V2Service;

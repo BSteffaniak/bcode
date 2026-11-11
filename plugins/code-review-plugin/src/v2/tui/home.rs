@@ -52,7 +52,7 @@ use bmux_tui_components::toast_stack::ToastSeverity;
 use load::HomeMessage;
 use model::{
     Group, PullsAnswer, RowKey, RowRef, Suggestion, SuggestionAction, SuggestionInputs,
-    SuggestionKind, WorkspaceStats,
+    SuggestionKind, WorkspaceStats, plural,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Keymap scope of home.
-pub const HOME_SCOPE: &str = "code-review-v2-home";
+pub const HOME_SCOPE: &str = "code-review-home";
 /// Most reviews whose stats load per refresh.
 pub const MAX_STATS: usize = 40;
 /// Stats requests in flight at once.
@@ -1717,8 +1717,18 @@ impl Home {
             label("Notes   "),
             Span::styled(
                 format!(
-                    "{} drafts{}{} threads",
-                    item.draft_count, theme.icons.separator, item.thread_count
+                    "{}{}{}",
+                    plural(
+                        u64::try_from(item.draft_count).unwrap_or(u64::MAX),
+                        "draft",
+                        "drafts"
+                    ),
+                    theme.icons.separator,
+                    plural(
+                        u64::try_from(item.thread_count).unwrap_or(u64::MAX),
+                        "thread",
+                        "threads"
+                    )
                 ),
                 theme.text,
             ),

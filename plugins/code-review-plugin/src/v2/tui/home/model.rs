@@ -262,7 +262,9 @@ const MAX_REQUESTED: usize = 3;
 /// Most reviews with new commits suggested at once.
 const MAX_NEW_COMMITS: usize = 2;
 
-fn plural(count: u64, one: &str, many: &str) -> String {
+/// `count` with `one` (count 1) or `many`, such as "1 draft" or "2 drafts".
+#[must_use]
+pub fn plural(count: u64, one: &str, many: &str) -> String {
     if count == 1 {
         format!("1 {one}")
     } else {

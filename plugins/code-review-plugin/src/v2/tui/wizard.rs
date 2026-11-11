@@ -47,7 +47,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Keymap scope of the wizard.
-pub const WIZARD_SCOPE: &str = "code-review-v2-wizard";
+pub const WIZARD_SCOPE: &str = "code-review-wizard";
 /// Page size of reference, commit, and file listings.
 const PAGE: u32 = 100;
 

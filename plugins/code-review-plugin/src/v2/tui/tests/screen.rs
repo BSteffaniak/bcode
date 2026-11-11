@@ -313,6 +313,62 @@ fn expanding_a_gap_in_either_order_gives_the_same_screen() {
     assert_eq!(total, 8, "{counted:?}");
 }
 
+/// Text of the new (else old) side of a diff line item.
+fn item_text(item: &ReviewItem) -> Option<String> {
+    match item {
+        ReviewItem::Line(line) => line.content.text().map(str::to_owned),
+        ReviewItem::LinePair(pair) => pair
+            .new
+            .as_ref()
+            .or(pair.old.as_ref())
+            .and_then(|side| side.content.text().map(str::to_owned)),
+        _ => None,
+    }
+}
+
+#[test]
+fn revealed_lines_painted_while_loading_repaint_with_their_text() {
+    let fixture = fixture();
+    let (mut scenario, _) = open(&fixture, fixture_branch_compare(), 100, 40);
+    let doc = scenario.surface().document().unwrap();
+    let (gap, before) = (0..doc.len())
+        .find_map(|index| match doc.item(index) {
+            Some(ReviewItem::Gap(gap)) if gap.hidden_lines().is_some_and(|hidden| hidden > 20) => {
+                Some((index, gap.clone()))
+            }
+            _ => None,
+        })
+        .expect("a bounded gap wider than one step");
+    let hidden_before = before.hidden_lines().unwrap();
+    // Reach the gap moving up so it sits at the top of the viewport, the lines it reveals
+    // below it.
+    scenario.key("shift+g");
+    stable(&mut scenario);
+    move_to(&mut scenario, gap);
+    // Reveal context above the next hunk and paint before the blob lines arrive, as a real host
+    // does: the revealed rows paint as loading first, and the gap keeps its key (its first line).
+    scenario.key("shift+e");
+    let loading = scenario.render();
+    assert!(loading.contains("⋯"), "{}", loading.text());
+    let screen = stable(&mut scenario);
+    let doc = scenario.surface().document().unwrap();
+    let Some(ReviewItem::Gap(after)) = doc.item(gap) else {
+        panic!("gap stays in place");
+    };
+    let remaining = after.hidden_lines().unwrap();
+    assert_eq!(remaining, hidden_before - 20);
+    let first = item_text(doc.item(gap + 1).unwrap()).expect("revealed line loaded");
+    // Long lines wrap; their start is on one row.
+    let start: String = first.trim_start().chars().take(16).collect();
+    assert!(screen.contains(&start), "{first}\n{}", screen.text());
+    assert!(!screen.contains("⋯"), "{}", screen.text());
+    assert!(
+        screen.contains(&format!("{remaining} hidden lines")),
+        "{}",
+        screen.text()
+    );
+}
+
 #[test]
 fn gap_segments_reveal_on_click_and_hits_match_their_painted_cells() {
     let fixture = fixture();

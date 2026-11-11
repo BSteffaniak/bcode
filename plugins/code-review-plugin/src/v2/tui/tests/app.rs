@@ -659,8 +659,12 @@ fn saving_a_transient_review_makes_it_durable_with_its_drafts() {
             .is_some_and(|status| status.contains("already saved"))
     );
     scenario.key("q");
-    settled(&mut scenario);
+    let screen = settled(&mut scenario);
     assert_eq!(rows(&scenario)[1], "Last commit");
+    // Its preview counts its one draft in the singular.
+    assert!(screen.contains("Preview"), "{}", screen.text());
+    assert!(screen.contains("1 draft "), "{}", screen.text());
+    assert!(!screen.contains("1 drafts"), "{}", screen.text());
 }
 
 #[test]
@@ -731,4 +735,85 @@ fn an_empty_home_invites_a_first_review() {
     scenario.key("esc");
     settled(&mut scenario);
     assert_eq!(scenario.surface().route_name(), RouteName::Home);
+}
+
+/// A review written by the first review interface (before V2 state existed): path-only viewed
+/// files, its own presentation state, and drafts whose anchors record neither head nor blob.
+#[test]
+fn a_review_written_before_v2_opens_with_its_viewed_files_and_drafts() {
+    use crate::v2::document::{AnchorPlacement, LineKind, ReviewItem};
+    use bcode_code_review_models::{SaveDraftRequest, SaveDraftResponse};
+    let fixture = fixture();
+    let backend = Arc::new(LocalBackend::default());
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Before V2",
+        vec![ReviewSourceKind::BranchCompare {
+            base_branch: BASE_BRANCH.to_owned(),
+            head_branch: HEAD_BRANCH.to_owned(),
+            merge_base: true,
+        }],
+    );
+    let resume = || Entry::Resume {
+        workspace_id: Some(workspace.id.clone()),
+    };
+    // The anchor of the first added line, as the first interface recorded anchors.
+    let mut anchor = {
+        let (scenario, _) = open(&fixture, &backend, resume(), 140, 40);
+        let doc = scenario.surface().review().unwrap().document().unwrap();
+        let index = (0..doc.len())
+            .find(|index| {
+                matches!(doc.item(*index), Some(ReviewItem::Line(line)) if line.kind == LineKind::Added)
+                    || matches!(doc.item(*index), Some(ReviewItem::LinePair(pair))
+                        if pair.new.as_ref().is_some_and(|side| side.kind == LineKind::Added))
+            })
+            .expect("an added line");
+        doc.anchor_for(&doc.item(index).unwrap().key())
+            .expect("line anchor")
+            .to_draft_anchor()
+    };
+    anchor.head_oid = None;
+    anchor.blob_oid = None;
+    let scope = NoteScope::for_workspace(&workspace);
+    let _: SaveDraftResponse = backend.call_now(
+        crate::v2::tui::notes::OP_DRAFT_SAVE,
+        &SaveDraftRequest {
+            repo_path: scope.repo_path,
+            target: scope.target,
+            scope: scope.scope,
+            anchor: anchor.clone(),
+            body: "written before V2".to_owned(),
+        },
+    );
+    let mut legacy = serde_json::to_value(&workspace).expect("workspace encodes");
+    legacy["viewed_files"] = serde_json::json!([anchor.file_path]);
+    legacy["presentation_state"] = serde_json::json!({
+        "schema_version": 1,
+        "selected_path": anchor.file_path,
+        "sidebar_mode": "files",
+        "sidebar_visible": true,
+        "thread_filter": "open",
+        "show_resolved_threads": true,
+        "collapsed_thread_keys": ["thread:1"],
+    });
+    let _: serde_json::Value = backend.call_now(
+        OP_REVIEW_WORKSPACE_UPDATE,
+        &serde_json::json!({
+            "repo_path": fixture.root(),
+            "workspace": legacy,
+        }),
+    );
+    let (scenario, screen) = open(&fixture, &backend, resume(), 140, 40);
+    assert_eq!(scenario.surface().route_name(), RouteName::Review);
+    let doc = scenario.surface().review().unwrap().document().unwrap();
+    assert_eq!(doc.viewed_progress().viewed, 1, "{}", screen.text());
+    let placements: Vec<AnchorPlacement> = (0..doc.len())
+        .filter_map(|index| match doc.item(index) {
+            Some(ReviewItem::Thread(thread)) => Some(thread.placement),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(placements, [AnchorPlacement::Line]);
+    assert!(screen.contains("written before V2"), "{}", screen.text());
 }

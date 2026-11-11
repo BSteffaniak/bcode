@@ -1,9 +1,9 @@
 //! Identity-pinned viewed marks (spec section 5.4).
 //!
-//! `ReviewWorkspace::viewed_files` remains the authoritative set of viewed paths so V1 and the
-//! home screen keep working; `ReviewWorkspace::viewed_marks` adds the identity each path was
-//! viewed at. A viewed path without a mark (a V1 or pre-V2 mark) is a legacy mark of unknown
-//! identity, and a mark whose path is no longer in `viewed_files` (unmarked by V1) is ignored.
+//! `ReviewWorkspace::viewed_files` remains the authoritative set of viewed paths so home, review
+//! bundles, and reviews written before V2 keep working; `ReviewWorkspace::viewed_marks` adds the identity each path was
+//! viewed at. A viewed path without a mark (written before V2) is a legacy mark of unknown
+//! identity, and a mark whose path is no longer in `viewed_files` (unmarked by an older client) is ignored.
 
 use bcode_code_review_models::{ReviewIndexEntry, ReviewWorkspace, ViewedMark};
 

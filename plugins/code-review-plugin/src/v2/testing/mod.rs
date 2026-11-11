@@ -1,4 +1,4 @@
-//! Test-only infrastructure shared by V1 baseline and V2 tests.
+//! Test-only infrastructure of the code review tests.
 //!
 //! * [`fixture`] generates deterministic temporary git repositories, up to the 5k-file /
 //!   500k-diff-line benchmark shape.
@@ -11,29 +11,9 @@ pub mod fake_publisher;
 pub mod fixture;
 pub mod harness;
 pub mod local_backend;
-mod v1_baseline;
-mod v1_smoke;
 mod v2_data_benchmark;
 
-use bcode_code_review_models::{
-    MaterializeReviewWorkspaceRequest, MaterializeReviewWorkspaceResponse, ReviewTarget,
-    ReviewWorkspace,
-};
-use std::path::Path;
-
-/// Materialize a single-target V1 workspace through the plugin's service implementation.
-///
-/// # Panics
-///
-/// Panics when materialization fails.
-#[must_use]
-pub fn materialize_v1(repo: &Path, target: ReviewTarget) -> MaterializeReviewWorkspaceResponse {
-    crate::materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
-        repo_path: repo.to_path_buf(),
-        workspace: ReviewWorkspace::from_target(repo.to_path_buf(), target),
-    })
-    .expect("materialize V1 review workspace")
-}
+use bcode_code_review_models::ReviewTarget;
 
 /// Branch comparison from the fixture base branch to its head branch.
 #[must_use]
