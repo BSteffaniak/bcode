@@ -273,6 +273,12 @@ fn target_from_source_kind(kind: &ReviewSourceKind) -> ReviewTarget {
         },
         ReviewSourceKind::File { .. }
         | ReviewSourceKind::FileRange { .. }
-        | ReviewSourceKind::Repository => ReviewTarget::Repository,
+        | ReviewSourceKind::Repository
+        | ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => ReviewTarget::Repository,
     }
 }

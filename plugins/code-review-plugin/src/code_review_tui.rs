@@ -194,7 +194,15 @@ fn model_target_from_source_kind(
         },
         ReviewSourceKind::File { .. }
         | ReviewSourceKind::FileRange { .. }
-        | ReviewSourceKind::Repository => bcode_code_review_models::ReviewTarget::Repository,
+        | ReviewSourceKind::Repository
+        | ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => {
+            bcode_code_review_models::ReviewTarget::Repository
+        }
     }
 }
 
@@ -3214,7 +3222,13 @@ fn target_from_source_kind(kind: &ReviewSourceKind) -> ReviewOpenTarget {
         },
         ReviewSourceKind::File { .. }
         | ReviewSourceKind::FileRange { .. }
-        | ReviewSourceKind::Repository => ReviewOpenTarget::Repository,
+        | ReviewSourceKind::Repository
+        | ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => ReviewOpenTarget::Repository,
     }
 }
 
@@ -4246,6 +4260,12 @@ const fn source_kind_short_label_for_ui(kind: &ReviewSourceKind) -> &'static str
         ReviewSourceKind::File { .. } => "file",
         ReviewSourceKind::FileRange { .. } => "file-range",
         ReviewSourceKind::Repository => "repo",
+        ReviewSourceKind::Commits { .. } => "commits",
+        ReviewSourceKind::PullRequest { .. } => "pr",
+        ReviewSourceKind::StackLayer { .. } => "stack-layer",
+        ReviewSourceKind::Stack { .. } => "stack",
+        ReviewSourceKind::CurrentBranch { .. } => "current",
+        ReviewSourceKind::Unsupported { .. } => "unsupported",
     }
 }
 
@@ -4334,7 +4354,13 @@ fn edit_source_prompt_value(kind: &ReviewSourceKind) -> Option<(EditSourceTarget
         | ReviewSourceKind::IndexStaged
         | ReviewSourceKind::WorkingTreeAndIndex
         | ReviewSourceKind::LastCommit
-        | ReviewSourceKind::Repository => None,
+        | ReviewSourceKind::Repository
+        | ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => None,
     }
 }
 
@@ -9426,6 +9452,9 @@ impl ReviewApp {
             self.status_message = Some("no review file selected".to_string());
             return true;
         };
+        // A V1 toggle has no blob identity: drop Code Review V2 identity marks for the path so
+        // the shared viewed state falls back to the path-only (unknown identity) form.
+        self.workspace.viewed_marks.retain(|mark| mark.path != path);
         if self.viewed_files.remove(&path) {
             self.workspace.viewed_files.remove(&path);
             self.pending_workspace_save = true;
@@ -9649,6 +9678,7 @@ impl ReviewApp {
         }
         self.viewed_files.clear();
         self.workspace.viewed_files.clear();
+        self.workspace.viewed_marks.clear();
         self.sync_review_workspace();
         self.pending_workspace_save = true;
         let (_, total) = self.viewed_file_counts();
@@ -9665,6 +9695,7 @@ impl ReviewApp {
             .map(|file| file.display_path().to_string())
             .collect();
         self.workspace.viewed_files.clone_from(&self.viewed_files);
+        self.workspace.viewed_marks.clear();
         self.sync_review_workspace();
         self.pending_workspace_save = true;
         let (viewed, total) = self.viewed_file_counts();
@@ -15802,6 +15833,9 @@ pub(crate) mod tests {
                 viewed_files: BTreeSet::new(),
                 archived_at_ms: None,
                 presentation_state: None,
+                viewed_marks: Vec::new(),
+                reviewed_revisions: std::collections::BTreeMap::new(),
+                presentation_v2: None,
             }),
             surfaces,
             diagnostics,
@@ -16963,6 +16997,29 @@ pub(crate) mod tests {
         );
         assert_eq!(app.workspace.viewed_files, app.viewed_files);
         assert!(app.pending_workspace_save);
+    }
+
+    #[test]
+    fn v1_viewed_toggle_drops_v2_identity_marks_for_the_path() {
+        let mut app = sample_app();
+        let path = app.selected_file_path().expect("selected file");
+        app.workspace.viewed_marks = vec![
+            bcode_code_review_models::ViewedMark {
+                path: path.clone(),
+                old_oid: Some("o".to_string()),
+                new_oid: Some("n".to_string()),
+                patch_id: Some("p".to_string()),
+            },
+            bcode_code_review_models::ViewedMark::legacy("other.rs"),
+        ];
+
+        assert!(app.toggle_selected_file_viewed());
+
+        assert!(app.workspace.viewed_files.contains(&path));
+        assert_eq!(
+            app.workspace.viewed_marks,
+            vec![bcode_code_review_models::ViewedMark::legacy("other.rs")]
+        );
     }
 
     #[test]

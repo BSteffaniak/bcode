@@ -31,15 +31,20 @@ pub const GITHUB_HOST: &str = "github.com";
 #[cfg(feature = "http")]
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The GraphQL query for a repository's recent pull requests, with review decisions and the
-/// latest commit's checks.
+/// The GraphQL query for a repository's recent pull requests, with review decisions, the
+/// latest commit's checks, requested reviewers, the repository's default branch, and the
+/// authenticated user (to tell whether a review is requested from them).
 const PULL_REQUESTS_QUERY: &str = "query($owner: String!, $name: String!) {
+  viewer { login }
   repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
     pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
         number title url state isDraft
-        headRefName headRefOid baseRefName
+        headRefName headRefOid baseRefName baseRefOid
         headRepository { nameWithOwner }
+        author { login }
+        reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
         reviewDecision updatedAt
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
@@ -276,6 +281,7 @@ impl PullRequestSource for GitHub {
         Ok(PullRequestList {
             pull_requests: parse_pull_requests(&value)?,
             via,
+            default_branch: parse_default_branch(&value),
         })
     }
 }
@@ -320,10 +326,24 @@ pub fn parse_pull_requests(value: &Value) -> Result<Vec<PullRequest>, ForgeError
             "GitHub did not return the repository's pull requests".into(),
         ));
     };
-    Ok(nodes.iter().filter_map(parse_pull_request).collect())
+    let viewer = value["data"]["viewer"]["login"].as_str();
+    Ok(nodes
+        .iter()
+        .filter_map(|node| parse_pull_request(node, viewer))
+        .collect())
 }
 
-fn parse_pull_request(node: &Value) -> Option<PullRequest> {
+/// The repository's default branch from a GraphQL response to [`PULL_REQUESTS_QUERY`], when it
+/// reports one (empty repositories have none).
+#[must_use]
+pub fn parse_default_branch(value: &Value) -> Option<String> {
+    value["data"]["repository"]["defaultBranchRef"]["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_pull_request(node: &Value, viewer: Option<&str>) -> Option<PullRequest> {
     let text = |field: &str| node[field].as_str().map(str::to_owned);
     let state = match (
         node["state"].as_str()?,
@@ -362,6 +382,19 @@ fn parse_pull_request(node: &Value) -> Option<PullRequest> {
         review,
         checks,
         updated_at: text("updatedAt").unwrap_or_default(),
+        author: node["author"]["login"].as_str().map(str::to_owned),
+        base_oid: text("baseRefOid").filter(|oid| !oid.is_empty()),
+        review_requested_from_viewer: viewer.is_some_and(|viewer| {
+            node["reviewRequests"]["nodes"]
+                .as_array()
+                .is_some_and(|requests| {
+                    requests.iter().any(|request| {
+                        request["requestedReviewer"]["login"]
+                            .as_str()
+                            .is_some_and(|login| login.eq_ignore_ascii_case(viewer))
+                    })
+                })
+        }),
     })
 }
 
@@ -394,6 +427,19 @@ mod tests {
         assert_eq!(pulls[3].state, PullRequestState::Closed);
         assert_eq!(pulls[3].head_repository.as_deref(), Some("someone/hello"));
         assert_eq!(pulls[3].checks, Some(ChecksState::Pending));
+        assert_eq!(open.author.as_deref(), Some("octocat"));
+        assert_eq!(
+            open.base_oid.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        // Requested from the viewer (case-insensitively), from someone else, or from a team.
+        assert!(open.review_requested_from_viewer);
+        assert!(!pulls[1].review_requested_from_viewer);
+        assert!(!pulls[2].review_requested_from_viewer);
+        assert_eq!(pulls[3].author, None);
+        assert_eq!(pulls[3].base_oid, None);
+        assert_eq!(parse_default_branch(&response()).as_deref(), Some("main"));
+        assert_eq!(parse_default_branch(&json!({ "data": {} })), None);
     }
 
     #[test]

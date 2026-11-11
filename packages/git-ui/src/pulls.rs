@@ -573,6 +573,9 @@ mod tests {
             review: None,
             checks: None,
             updated_at: String::new(),
+            author: None,
+            base_oid: None,
+            review_requested_from_viewer: false,
         }
     }
 
@@ -642,6 +645,7 @@ mod tests {
             Ok(PullRequestList {
                 pull_requests: self.0.clone(),
                 via: Transport::Http,
+                default_branch: None,
             })
         }
     }

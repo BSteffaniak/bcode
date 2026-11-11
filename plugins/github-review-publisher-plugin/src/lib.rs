@@ -3,6 +3,12 @@
 #![allow(clippy::multiple_crate_versions)]
 
 //! GitHub review publisher plugin for Bcode.
+//!
+//! Serves three interfaces: the review publisher (`bcode.review_publisher/v1`), the read-only
+//! review importer (`bcode.review_importer/v1`), and the review-source provider
+//! (`bcode.review_source/v1`, see [`review_source`]).
+
+pub mod review_source;
 
 use bcode_code_review_models::{
     ExternalAnchorMappingStatus, ExternalPublishReviewRequest, ExternalReviewAnchorMapping,
@@ -11,8 +17,8 @@ use bcode_code_review_models::{
     OP_REVIEW_IMPORTER_IMPORT, OP_REVIEW_IMPORTER_MANIFEST, OP_REVIEW_PUBLISHER_MANIFEST,
     OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, PublishReviewPreviewResponse,
     PublishReviewResponse, REVIEW_IMPORTER_INTERFACE_ID, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewImporterManifest, ReviewLineKind,
-    ReviewPublisherCapabilities, ReviewPublisherManifest,
+    REVIEW_SOURCE_INTERFACE_ID, ReviewBundle, ReviewBundleLine, ReviewBundleThread,
+    ReviewImporterManifest, ReviewLineKind, ReviewPublisherCapabilities, ReviewPublisherManifest,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -50,6 +56,7 @@ impl RustPlugin for GitHubReviewPublisherPlugin {
                     "unsupported GitHub importer operation",
                 ),
             },
+            REVIEW_SOURCE_INTERFACE_ID => review_source::invoke(&context.request),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported GitHub review interface",

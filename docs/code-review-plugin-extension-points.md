@@ -11,13 +11,14 @@ Code Review consumes these generic plugin-host capabilities:
 * Renderer-neutral keyboard, mouse, clipboard, redraw, and surface-exit actions from the plugin SDK TUI host.
 * Generic semantic linked-session observation through complete bounded `SessionViewSnapshot` updates; the TUI host owns attachment, `SessionView` projection, reconnect, and authoritative resynchronization, while plugin surfaces never receive raw session events.
 * Typed `PluginTuiAction::OpenSession` suspension: the host retains the plugin surface in memory, runs the ordinary native session viewer with the caller-owned input stream, and redraws the same surface after the viewer exits.
-* Generic plugin service discovery and invocation for publisher and importer providers.
+* Generic plugin service discovery and invocation for publisher, importer, and review-source providers.
 
 The Code Review domain contracts are provider-neutral and live in `packages/code-review/models`:
 
 * `bcode.code_review/v1` owns local review workspace, draft, suggestion, publish-record, and external-import persistence operations.
 * `bcode.review_publisher/v1` lets provider plugins advertise, preview, and submit review output.
 * `bcode.review_importer/v1` lets provider plugins advertise and import external review state read-only.
+* `bcode.review_source/v1` lets provider plugins list pull requests, resolve stacks of pull requests, and fetch a pull request's commits into review-owned local refs. Plugin services cannot call each other, so the client routes these calls and passes the answers to `review.sources.resolve`.
 
 Provider-specific repository, pull-request, authentication, API, and anchor behavior must stay in the provider plugin. New host capabilities are appropriate only when the SDK cannot express a required mechanism generically; product-specific behavior must not be added to host/runtime crates.
 

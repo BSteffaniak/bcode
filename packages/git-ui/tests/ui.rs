@@ -2366,6 +2366,7 @@ impl bcode_forge_models::PullRequestSource for FakeForge {
             bcode_forge_models::PullRequestList {
                 pull_requests,
                 via: bcode_forge_models::Transport::Http,
+                default_branch: None,
             }
         })
     }
@@ -2402,6 +2403,9 @@ fn pull(
         review: None,
         checks: None,
         updated_at: "2026-11-05T00:00:00Z".into(),
+        author: None,
+        base_oid: None,
+        review_requested_from_viewer: false,
     }
 }
 

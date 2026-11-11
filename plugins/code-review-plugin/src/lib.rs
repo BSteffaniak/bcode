@@ -18,7 +18,7 @@ mod keybindings;
 pub mod terminal_events;
 pub mod tui;
 pub mod tui_host_types;
-mod v2;
+pub mod v2;
 
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,
@@ -152,7 +152,10 @@ pub struct CodeReviewPluginConfig {
 
 /// local code review plugin.
 #[derive(Default)]
-pub struct CodeReviewPlugin;
+pub struct CodeReviewPlugin {
+    /// Code Review V2 data layer state (long-lived `cat-file` processes and bounded caches).
+    v2: v2::service::V2Service,
+}
 
 impl RustPlugin for CodeReviewPlugin {
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
@@ -170,6 +173,9 @@ impl RustPlugin for CodeReviewPlugin {
                 "unsupported_interface",
                 "unsupported code review plugin service interface",
             );
+        }
+        if let Some(response) = self.v2.invoke(&context.request) {
+            return response;
         }
 
         match context.request.operation.as_str() {
@@ -1741,6 +1747,9 @@ fn create_review_workspace_for_request(
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
         presentation_state: None,
+        viewed_marks: Vec::new(),
+        reviewed_revisions: std::collections::BTreeMap::new(),
+        presentation_v2: None,
     };
     let saved = workspace.clone();
     with_database(&repo_root, config, move |database| {
@@ -1879,6 +1888,14 @@ fn actionable_materialization_error(
         ReviewSourceKind::WorkingTreeUnstaged
         | ReviewSourceKind::IndexStaged
         | ReviewSourceKind::Repository => "Verify the repository state, then refresh this source.",
+        ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => {
+            "Open this review in Code Review V2; this source kind is not supported here."
+        }
     };
     let code = match source.kind {
         ReviewSourceKind::CommitRange { .. } | ReviewSourceKind::Commit { .. } => {
@@ -1890,6 +1907,12 @@ fn actionable_materialization_error(
         ReviewSourceKind::WorkingTreeUnstaged
         | ReviewSourceKind::IndexStaged
         | ReviewSourceKind::Repository => "materialize_failed",
+        ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => "unsupported_source_kind",
     };
     (code, format!("{error}. {recovery}"))
 }
@@ -1986,6 +2009,17 @@ fn materialize_context_source(
         | ReviewSourceKind::LastCommit
         | ReviewSourceKind::CommitRange { .. }
         | ReviewSourceKind::BranchCompare { .. } => {}
+        ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => {
+            return Err(ReviewError::InvalidRequest(format!(
+                "source kind '{}' is not supported by this review view",
+                source.kind.label()
+            )));
+        }
     }
     Ok(())
 }
@@ -2089,7 +2123,13 @@ fn review_target_from_source_kind(kind: &ReviewSourceKind) -> Option<ReviewTarge
         }),
         ReviewSourceKind::File { .. }
         | ReviewSourceKind::FileRange { .. }
-        | ReviewSourceKind::Repository => None,
+        | ReviewSourceKind::Repository
+        | ReviewSourceKind::Commits { .. }
+        | ReviewSourceKind::PullRequest { .. }
+        | ReviewSourceKind::StackLayer { .. }
+        | ReviewSourceKind::Stack { .. }
+        | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::Unsupported { .. } => None,
     }
 }
 
@@ -2704,6 +2744,9 @@ impl<'a> CodeReviewDb<'a> {
                 "archived_at_ms",
                 "viewed_files_json",
                 "presentation_state_json",
+                "viewed_marks_json",
+                "reviewed_revisions_json",
+                "presentation_v2_json",
             ])
             .filter(Box::new(where_eq(
                 "repo_root",
@@ -2740,6 +2783,9 @@ impl<'a> CodeReviewDb<'a> {
                 "archived_at_ms",
                 "viewed_files_json",
                 "presentation_state_json",
+                "viewed_marks_json",
+                "reviewed_revisions_json",
+                "presentation_v2_json",
             ])
             .filter(Box::new(where_eq("workspace_id", workspace_id)))
             .execute_first(self.db)
@@ -2758,6 +2804,13 @@ impl<'a> CodeReviewDb<'a> {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let viewed_marks_json = serde_json::to_string(&workspace.viewed_marks)?;
+        let reviewed_revisions_json = serde_json::to_string(&workspace.reviewed_revisions)?;
+        let presentation_v2_json = workspace
+            .presentation_v2
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         if self.get_workspace(&workspace.id).await?.is_some() {
             self.db
                 .update("review_workspaces")
@@ -2766,6 +2819,9 @@ impl<'a> CodeReviewDb<'a> {
                 .value("sources_json", sources_json)
                 .value("viewed_files_json", viewed_files_json.clone())
                 .value("presentation_state_json", presentation_state_json.clone())
+                .value("viewed_marks_json", viewed_marks_json.clone())
+                .value("reviewed_revisions_json", reviewed_revisions_json.clone())
+                .value("presentation_v2_json", presentation_v2_json.clone())
                 .value(
                     "updated_at_ms",
                     u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
@@ -2784,6 +2840,9 @@ impl<'a> CodeReviewDb<'a> {
             .value("sources_json", sources_json)
             .value("viewed_files_json", viewed_files_json)
             .value("presentation_state_json", presentation_state_json)
+            .value("viewed_marks_json", viewed_marks_json)
+            .value("reviewed_revisions_json", reviewed_revisions_json)
+            .value("presentation_v2_json", presentation_v2_json)
             .value(
                 "created_at_ms",
                 u64_to_i64(workspace.created_at_ms.unwrap_or_else(now_ms)),
@@ -3910,7 +3969,33 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(external_review_imports_table_migration());
     source.add_migration(review_ai_exchanges_table_migration());
     source.add_migration(workspace_presentation_state_column_migration());
+    source.add_migration(workspace_v2_state_columns_migration());
     source
+}
+
+/// Code Review V2 workspace state: identity-pinned viewed marks, reviewed revisions per source,
+/// and V2 presentation state. All columns are nullable JSON text, so older rows read as empty.
+fn workspace_v2_state_columns_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "018_workspace_v2_state_columns".to_string(),
+        Box::new(
+            alter_table("review_workspaces")
+                .add_column("viewed_marks_json".to_string(), DataType::Text, true, None)
+                .add_column(
+                    "reviewed_revisions_json".to_string(),
+                    DataType::Text,
+                    true,
+                    None,
+                )
+                .add_column(
+                    "presentation_v2_json".to_string(),
+                    DataType::Text,
+                    true,
+                    None,
+                ),
+        ),
+        None,
+    )
 }
 
 fn workspace_presentation_state_column_migration() -> CodeMigration<'static> {
@@ -4167,6 +4252,21 @@ fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, ReviewError> {
         archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
         presentation_state: optional_text(row, "presentation_state_json")
             .map_or_else(|| Ok(None), |json| serde_json::from_str(&json).map(Some))?,
+        viewed_marks: optional_text(row, "viewed_marks_json")
+            .map_or_else(|| Ok(Vec::new()), |json| serde_json::from_str(&json))?,
+        reviewed_revisions: optional_text(row, "reviewed_revisions_json")
+            .map_or_else(|| Ok(BTreeMap::new()), |json| serde_json::from_str(&json))?,
+        // V2 presentation state is disposable: an unreadable value, or one written by a newer
+        // presentation schema, is dropped instead of failing the workspace or being guessed at.
+        presentation_v2: optional_text(row, "presentation_v2_json")
+            .and_then(|json| {
+                serde_json::from_str::<bcode_code_review_models::ReviewV2PresentationState>(&json)
+                    .ok()
+            })
+            .filter(|state| {
+                state.schema_version
+                    <= bcode_code_review_models::REVIEW_V2_PRESENTATION_SCHEMA_VERSION
+            }),
     })
 }
 
@@ -4771,6 +4871,9 @@ mod tests {
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
             presentation_state: None,
+            viewed_marks: Vec::new(),
+            reviewed_revisions: std::collections::BTreeMap::new(),
+            presentation_v2: None,
         }
     }
 
@@ -5004,6 +5107,9 @@ mod tests {
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
             presentation_state: None,
+            viewed_marks: Vec::new(),
+            reviewed_revisions: std::collections::BTreeMap::new(),
+            presentation_v2: None,
         };
         let anchor = DraftAnchor {
             kind: ReviewAnchorKind::Review,
@@ -5884,7 +5990,7 @@ mod command_registration_tests {
             registry.register(contribution);
         }
 
-        let mut plugin = CodeReviewPlugin;
+        let mut plugin = CodeReviewPlugin::default();
         let mut registry = bcode_command::CommandRegistry::new();
         plugin
             .register_commands(CommandRegistrar::new(

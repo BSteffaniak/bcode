@@ -14,6 +14,12 @@ description  = "Imports GitHub pull request review threads without remote mutati
 interface_id = "bcode.review_importer/v1"
 name         = "GitHub Review Importer"
 
+[[services]]
+class        = "service"
+description  = "Lists GitHub pull requests, detects stacked pull requests, and fetches them for review"
+interface_id = "bcode.review_source/v1"
+name         = "GitHub Review Source"
+
 [concurrency]
 max  = 2
 type = "limited"

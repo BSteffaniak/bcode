@@ -118,6 +118,34 @@ deleted files (whole-file removal) sort before the ordinary files and are exclud
 samples; their next-file frames measured about 0.5 s and 2.9 s respectively. Acceptance
 criterion B targets a steady scroll frame of ≤ 2 ms p95.
 
+#### V2 data layer (phase 1)
+
+Measured by the ignored test `v2::testing::v2_data_benchmark::v2_data_layer_benchmark`
+(`cargo test -p bcode_code_review_plugin v2_data_layer_benchmark -- --ignored --nocapture`) on the
+same fixture, machine, and **debug** profile as the V1 table. Times include the service call and
+the JSON encode and decode of its response. Two runs were made; the commit-to-commit rows show
+the later run (the earlier one came within about 10%), and the working-tree rows show the range
+across both runs and both listings of a run, because they vary with git's stat refresh.
+
+| Measurement | V1 (`review.workspace.materialize`) | V2 data layer |
+| --- | --- | --- |
+| Branch compare: resolve sources | — | 77 ms |
+| Branch compare: file list (5,063 entries) | 956 ms + 2,915 / 1,387 ms JSON, all content | `review.index.get`: 523 ms cold (all pages), 73 ms warm (cached listing) |
+| Branch compare: payload before the first file can render | 104.3 MiB | 330 KiB (first 1,000-entry index page); 1.68 MiB for the whole index |
+| Hunks of one ordinary file (10 hunks, 100 changed lines) | included in the 104.3 MiB payload | 16.5 ms avg, 18.2 ms p95; 19.7 KiB |
+| Hunks of the 40k-line file (31,997 diff lines) | included | 41 ms; 2.8 MiB at the default 20,000-line budget (truncated), 4.5 MiB untruncated |
+| 20 context lines of the 40k-line file | read from the working tree (wrong revision) | 2.2 ms avg via `cat-file --batch`; < 0.01 ms from the blob cache |
+| Working tree + index: file list (1,000 entries) | 348 ms + 115 / 56 ms JSON | `review.index.get`: 252–609 ms; 311 KiB |
+| Working tree change token | — | `review.sources.token`: 225–310 ms |
+
+Most of the cold index time is `git diff --numstat` computing line counts for every file; the
+listing is cached for commit-to-commit sources, so later pages and reopening are cheap. Working-tree
+listings and the change token are dominated by git re-checking files whose modification time
+equals the index's (the fixture writes both within the same second); in an ordinary working tree
+git's refreshed stat data makes these calls much cheaper. Listings with an index or working-tree
+side are not cached: each page re-runs the listing, and a cursor from a listing that has since
+changed is rejected with `cursor_stale`.
+
 ## 3. Layered architecture
 
 ```
@@ -147,8 +175,32 @@ criterion B targets a steady scroll frame of ≤ 2 ms p95.
 
 Every diff source resolves to concrete object IDs when a review is opened or refreshed:
 
-* `ResolvedSource { source_id, base: RevisionRef, head: RevisionRef }` where a `RevisionRef` is a
-  commit OID, the index, or the working tree.
+* `ResolvedSource { source_id, base: RevisionRef, head: RevisionRef, mode, paths, line_range,
+  part }` where a `RevisionRef` is a commit OID, the empty tree (base of a root commit or an
+  unborn branch), the index, or the working tree. `mode` is `diff` or `browse` (repository, file,
+  and file-range sources browse whole files at the working tree, limited to `paths` and
+  `line_range`).
+* `review.sources.resolve` resolves a workspace's included sources:
+  * unstaged: index → working tree; staged: `HEAD` → index; both: `HEAD` → working tree;
+  * last commit and `Commit { rev }`: first parent (or the empty tree) → commit;
+  * ranges and branch compares: base (or the merge base with merge-base semantics) → head;
+  * `CurrentBranch`: merge base of the base and `HEAD` → `HEAD`; without an explicit base, the
+    base is the branch's upstream, else `origin/HEAD`, else the first of `main`, `master`,
+    `trunk` that exists and is not the current branch;
+  * `Commits { revs }`: one range when the selection is a single first-parent chain; otherwise one
+    part per commit (against its first parent) in selection order, each carrying `part { index,
+    count, label }`;
+  * pull-request kinds resolve from provider answers carried in the request (4.4): `PullRequest`
+    is the merge base of its base branch and head → head; `StackLayer` is the merge base of the
+    layer below's head (the trunk for the bottom layer) and the layer's head → the layer's head;
+    `Stack` is the merge base of the trunk and the top layer → the top layer's head. Stack and
+    stack-layer sources also return their pinned layers (`ResolvedReviewStack`). Fetched object
+    ids must exist locally, else `unresolved_revision`;
+  * a pull-request kind without a provider answer (no provider enabled, or none with that
+    provider id) returns `provider_required`; a provider error returns `provider_failed`; unknown
+    kinds return `unsupported_source_kind`; revisions that do not exist return
+    `unresolved_revision`; file paths that fail confinement return `path_rejected`. A failing
+    source never fails the others.
 * Workspaces persist the last resolved OIDs per source (`reviewed_base_oid`, `reviewed_head_oid`)
   so re-review can compute what changed since the previous pass (section 7.4).
 * New source kinds (additive): `Commits { revs }` (non-contiguous selection), `PullRequest {
@@ -159,16 +211,43 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
 
 | Operation | Returns | Bound |
 | --- | --- | --- |
-| `review.index.get` | per-source file list: paths, status, rename info, old/new blob OIDs, +/- counts, binary flag, per-file patch-id | paged; cheap (`--raw -z --numstat`) |
-| `review.file.hunks.get` | parsed hunks for one file of one resolved source | per file; large files return a truncation marker |
-| `review.blob.lines.get` | line range of a blob by OID (old or new side; index and working-tree supported) | range-bounded |
+| `review.sources.resolve` | `ResolvedSource` values plus per-source diagnostics (4.1) | one `rev-parse` per revision |
+| `review.sources.token` | cheap change token for working-tree and index sources | three git calls; no diff |
+| `review.index.get` | per-source file list: paths, status, rename info and similarity, old/new blobs (object id, working-tree marker, or absent), modes, +/- counts, flags (binary, mode changed, symlink, submodule) | paged (default 1,000, max 5,000); cheap (`--raw -z --numstat`) |
+| `review.file.hunks.get` | parsed hunks (old/new start and length; lines with kind, old and new line numbers, text) for one file of one resolved source, plus the file's patch-id | per file (memory proportional to that file's diff); a line budget (default 20,000) returns a truncation marker |
+| `review.blob.lines.get` | line range and total line count of a blob, by object id or by (revision, path) for commits, the index, and the working tree | range-bounded (max 5,000 lines) |
 | `review.refs.search` | branches/tags matching a query | paged |
-| `review.commits.page` | commit log page with subject, author, date, refs | paged |
+| `review.commits.page` | commit log page with subject, author, date, refs, parents | paged; anchored to the first page's start commit |
 | `review.files.search` | repository paths matching a query (repository browse sources) | paged |
 
-* Blob reads use one long-lived `git cat-file --batch` process per repository in the service.
+* Paged operations return an opaque cursor bound to the listing it came from; a cursor from a
+  listing that has since changed is rejected with `cursor_stale`.
+* The patch-id is part of the hunks response, not the index: computing it needs the file's diff,
+  which the index deliberately does not load. It is a SHA-256 over the changed lines in order (`+`
+  or `-` plus the raw line text, without line numbers or context) and any mode change; it is
+  computed over the whole diff even when the response is truncated, and is absent for binary
+  files and whitespace-ignoring requests. A type change (for example a file replaced by a symbolic
+  link), which git prints as a deletion and an addition of the same path, is returned as one file
+  whose hunks cover both.
+* Blob reads use one long-lived `git cat-file --batch` process per repository root, held in a
+  bounded registry (at most 4 processes, least recently used evicted, processes idle for 5
+  minutes stopped on the next service call, a failed process restarted once per request, and a
+  process that reports an object above the 64 MiB read bound stopped instead of drained) and a
+  32 MiB blob cache keyed by full object id. Index reads name stage 0 explicitly (`:0:<path>`).
+  Repository-relative paths are confined in every operation: absolute paths, `.`/`..` segments,
+  and `.git` segments are rejected. Working-tree reads come from disk: a symbolic link reads as
+  its target path (git's blob content for links), and any other path must canonicalize inside
+  the repository root.
 * `review.workspace.materialize` remains for V1 until deletion; V2 never calls it.
-* Working-tree and index sources refresh from `bcode_git_live` change notifications. No polling.
+* **Refresh (deviation from the original plan).** `bcode_git_live` is not available on `master`,
+  so working-tree and index sources are refreshed on an explicit refresh and when the terminal
+  regains focus. The client first calls `review.sources.token` and only re-lists sources when the
+  token changed. The token covers the `HEAD` OID, the staged index content (`git ls-files
+  --stage`), and, when a working-tree source is open, a digest of `git status --porcelain=v2`
+  plus the size and modification time of every path with unstaged changes (status lines do not
+  change when an already modified file is edited again). Index stat data is excluded because git
+  rewrites the index when it refreshes stat information. There is no timer polling; the token can
+  be driven by `bcode_git_live` notifications once that lands.
 
 ### 4.3 Client-side residency
 
@@ -182,16 +261,53 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
 ### 4.4 Review-source provider interface (new)
 
 `bcode.review_source/v1` lets provider plugins advertise and resolve pull-request sources, keeping
-provider behavior out of the code review plugin (same pattern as publisher/importer):
+provider behavior out of the code review plugin (same pattern as publisher/importer). Contracts live
+in `packages/code-review/models` (`review_source.rs`) and carry no provider-specific fields.
 
-* `review_source.manifest` — provider id, display name, capabilities.
-* `review_source.pulls.list` — open PRs for the repository: number, title, author, base, head,
-  head OID, review-requested-from-me, updated time.
-* `review_source.stack.resolve` — given a PR, the full linear stack (section 7.3).
-* `review_source.pull.fetch` — ensure the PR's head and base commits exist locally (fetch refs),
-  returning resolved OIDs.
+| Operation | Request → response |
+| --- | --- |
+| `review_source.manifest` | → provider id (stored in source kinds), label, capabilities (`pulls_list`, `stack_resolve`, `pull_fetch`) |
+| `review_source.pulls.list` | repository (or detect from remotes) → repository, default branch, open `PullRequestSummary` values (number, title, author, base and head branch, head OID, base OID if known, review requested from me, draft, updated, URL), review-requested-from-me first, then most recently updated |
+| `review_source.stack.resolve` | pull request number → `ReviewStack`: trunk, whether it is the default branch, layers trunk → top (each a summary plus its parent layer), siblings, warnings |
+| `review_source.pull.fetch` | pull request number and optional base branch → `ReviewPullFetchResult`: local head/base refs and their OIDs |
 
-The GitHub implementation lives in `plugins/github-review-publisher-plugin` using `packages/forge`.
+* **Client-side routing (deviation from a service-side lookup).** Plugin services cannot call
+  other plugin services: the host's nested-service bridge serves host interfaces only. As with
+  publisher routing, the client discovers providers (`plugin_services()` filtered by interface,
+  then `review_source.manifest` to match the provider id), asks the matching provider to resolve
+  stacks and fetch every needed layer, and sends the answers with `review.sources.resolve` as
+  `provider_resolutions` (`Resolved { stack, fetched }` or `Failed { code, message }`). The
+  routing lives in `src/v2/provider.rs` behind a `ProviderTransport` trait (the daemon client in
+  production, fakes in tests). With the provider plugin disabled nothing answers, and only the
+  provider-backed sources report `provider_required`.
+* **Stack detection** (GitHub implementation): from the open pull requests whose head branch is in
+  the repository itself (forks are excluded), the chain extends down while some pull request's
+  head is the current base branch and stops at the default branch; it extends up while exactly one
+  pull request targets the current head. Several pull requests on one layer stop the upward walk
+  and are reported as siblings; several open pull requests with the same head branch below pick
+  the most recently updated, with a warning. A missing layer (for example a closed pull request
+  in the middle) ends the chain with `rooted_at_default_branch: false` and a warning. Cycles stop
+  at the first repeated pull request with a warning. Chains are cut at 64 layers. No
+  Graphite-specific metadata is used.
+* **Fetching** runs `git fetch --no-tags --no-write-fetch-head --refmap= <remote>` with explicit
+  refspecs `+refs/pull/N/head:refs/bcode-review/pull/N/head` and
+  `+refs/heads/<base>:refs/bcode-review/pull/N/base`, so only review-owned refs change (no
+  branches, no remote-tracking refs). The remote is the local remote that names the repository
+  (`origin` preferred), else its HTTPS URL. Each stack layer is fetched with its own base
+  branch. Layers are fetched one at a time when a source resolves (at most 64), and fetched
+  review refs are not pruned yet.
+* **Whole-stack attribution** (`review.stack.attribution`, code review service): given a
+  `ResolvedReviewStack` and one path (plus the base path for renames), returns for the
+  whole-stack diff the new-side line ranges each layer wrote last and the old-side line ranges
+  each layer removed. The file is followed from the stack base through each layer head, applying
+  the zero-context diff between consecutive heads (for a restacked stack, exactly each layer's
+  own diff) and mapping earlier lines forward through later hunks; renames and deletions are
+  followed. Work is one blob read and one `git diff -U0` per layer for one file, with at most
+  2,000,000 tracked lines. A comment publishes to the layer that wrote its anchor line (7.3).
+
+The GitHub implementation lives in `plugins/github-review-publisher-plugin` (`review_source.rs`)
+using `packages/forge`, which now also reports each pull request's author, base OID, and whether a
+review is requested from the authenticated user, and the repository's default branch.
 
 ## 5. Review document (`document/`)
 
@@ -208,8 +324,9 @@ The review is one keyed sequence of items:
 * `Thread { thread_id }`, `Composer { anchor }`, `AgentThread { thread_id }`
 * `FileNotice { file_key, kind }` — binary, too large, loading, unavailable
 
-Item keys are stable identities (`file_key` = source id + path; lines keyed by side and line
-number; threads by id), never list indices. Layout mode (unified/split) changes item
+Item keys are stable identities (`file_key` = source id + part index for multi-part sources +
+path; lines keyed by side and line number; threads by id), never list indices. Persisted keys
+(`ReviewItemKey`, `ReviewFileExpansion`) carry the optional part index for the same reason. Layout mode (unified/split) changes item
 construction but not item identity for threads and anchors.
 
 ### 5.2 Context expansion
@@ -234,9 +351,26 @@ line no longer exists after refresh is shown as outdated in its thread rather th
 
 ### 5.4 Viewed state
 
-Viewed marks are keyed by `(path, patch_id)`. A file stays viewed when its patch is unchanged after
-a rebase or new commits elsewhere, and becomes unviewed when its patch changes. Existing path-keyed
-marks migrate as "viewed at unknown patch" and display as viewed until the patch is first known.
+A viewed mark is `ViewedMark { path, old_oid, new_oid, patch_id }`: the identity of both blob
+sides (an object id, `absent` for a missing side, or unknown for working-tree content) and, when
+hunks were loaded, the patch-id. A file matches a mark with the same path as follows, in order:
+
+1. A mark of unknown identity shows as viewed until the file's identity is first known; the
+   client then re-records it with the current identity. A mark has an identity when it carries a
+   patch-id or both blob sides are pinned; migrated path-only marks and working-tree content
+   marked before its hunks were loaded have none.
+2. Both blob identities known on the mark and the file, and equal: viewed. This is checked first
+   because the index carries blob identities without loading hunks.
+3. Otherwise, both patch-ids known and equal: still viewed (the patch survived a rebase or new
+   commits elsewhere); the client re-records the mark with the new blob identities. Patch-ids are
+   compared once the file's hunks are loaded, so until then such a file shows as unviewed.
+4. Otherwise: unviewed.
+
+`viewed_files` stays the authoritative set of viewed paths so V1 and the home screen keep
+working: V2 writes both, a viewed path without a mark is a legacy mark of unknown identity, and a
+mark whose path V1 has unmarked is ignored. V1 viewed toggles (and mark-all / unmark-all) also
+drop the V2 marks of the paths they change, so a path V1 marks viewed again reads as a legacy
+mark rather than being judged by a stale identity.
 
 ## 6. Review screen (`tui/`)
 
@@ -405,7 +539,20 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
 
 * Additive columns/fields: resolved OIDs per source, new source kinds, patch-id viewed marks, V2
   presentation state (scroll anchor by item identity, layout mode, panel sizes, expansion sets).
-* Unknown future source kinds are preserved and surfaced as unsupported, not guessed.
+  * Migration `018_workspace_v2_state_columns` adds three nullable JSON columns to
+    `review_workspaces`: `viewed_marks_json` (`Vec<ViewedMark>`), `reviewed_revisions_json`
+    (source id → `ReviewedRevision { reviewed_base_oid, reviewed_head_oid, recorded_at_ms }`),
+    and `presentation_v2_json` (`ReviewV2PresentationState`). Rows written before the migration
+    read as empty.
+  * V2 presentation state is disposable: a value that cannot be read, or whose `schema_version`
+    is newer than this build's, is dropped instead of failing the workspace or being read as an
+    older form. Viewed marks and reviewed
+    revisions are durable review data and must parse.
+  * The fields are omitted from workspace JSON when empty, so existing payloads are unchanged.
+* Unknown future source kinds are preserved and surfaced as unsupported, not guessed: they
+  deserialize as `ReviewSourceKind::Unsupported { kind, raw }`, serialize back verbatim, and
+  resolve to an `unsupported_source_kind` diagnostic. V1 reports the new and unknown kinds as an
+  unsupported-source materialization diagnostic.
 * V1 continues to open workspaces that contain only V1 source kinds until it is deleted.
 
 ## 10. Phases
@@ -415,7 +562,7 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
    restore); build a deterministic multi-event scenario harness and a fixture generator (5k files,
    500k diff lines); record V1 baseline numbers.
 1. **Data layer.** Contracts in models, revision-pinned resolution, index/hunks/blob/search ops,
-   `cat-file --batch`, live refresh, schema additions.
+   `cat-file --batch`, token-based refresh (4.2), schema additions.
 2. **Document.** Items, gaps and interval-set expansion, side-by-side pairing, anchors, threads,
    viewed state, navigation targets; exhaustive unit tests.
 3. **BMUX upstream and review screen.** Section 8.2 items; virtualized review screen with sticky
@@ -425,8 +572,10 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
    manual smoke checklist.
 5. **Home, wizard, routes.** Single-surface routing, generic host standalone-surface capability,
    suggestions, table, wizard, new CLI entry points.
-6. **PRs, stacks, re-review, parity.** Review-source provider interface and GitHub implementation,
-   stack modes, re-review, publish/import, AI questions, report; close every inventory item.
+6. **PRs, stacks, re-review, parity.** Review-source provider interface and GitHub implementation
+   (contracts, provider, client routing, provider-backed resolution, and whole-stack attribution
+   landed ahead of the UI, 4.4), stack modes, re-review, publish/import, AI questions, report;
+   close every inventory item.
 7. **Default and deletion.** V2 becomes the only implementation; delete V1 files, the
    `--ui`/environment switch, host review launcher code and duplicated types; update
    `docs/code-review-plugin-extension-points.md`.

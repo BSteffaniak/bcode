@@ -1,6 +1,8 @@
 {
   "data": {
+    "viewer": { "login": "Reviewer" },
     "repository": {
+      "defaultBranchRef": { "name": "main" },
       "pullRequests": {
         "nodes": [
           {
@@ -12,7 +14,13 @@
             "headRefName": "feature/login",
             "headRefOid": "1111111111111111111111111111111111111111",
             "baseRefName": "main",
+            "baseRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "headRepository": { "nameWithOwner": "octo/hello" },
+            "author": { "login": "octocat" },
+            "reviewRequests": { "nodes": [
+              { "requestedReviewer": { "login": "someone" } },
+              { "requestedReviewer": { "login": "reviewer" } }
+            ] },
             "reviewDecision": "APPROVED",
             "updatedAt": "2026-11-05T12:00:00Z",
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
@@ -27,6 +35,8 @@
             "headRefOid": "2222222222222222222222222222222222222222",
             "baseRefName": "main",
             "headRepository": { "nameWithOwner": "octo/hello" },
+            "author": { "login": "octocat" },
+            "reviewRequests": { "nodes": [{ "requestedReviewer": { "login": "someone" } }] },
             "reviewDecision": "REVIEW_REQUIRED",
             "updatedAt": "2026-11-04T12:00:00Z",
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "FAILURE" } } }] }
@@ -41,6 +51,7 @@
             "headRefOid": "3333333333333333333333333333333333333333",
             "baseRefName": "main",
             "headRepository": { "nameWithOwner": "octo/hello" },
+            "reviewRequests": { "nodes": [{ "requestedReviewer": {} }] },
             "reviewDecision": null,
             "updatedAt": "2026-11-01T12:00:00Z",
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": null } }] }
@@ -55,6 +66,7 @@
             "headRefOid": "4444444444444444444444444444444444444444",
             "baseRefName": "main",
             "headRepository": { "nameWithOwner": "someone/hello" },
+            "author": null,
             "reviewDecision": null,
             "updatedAt": "2026-10-01T12:00:00Z",
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "PENDING" } } }] }

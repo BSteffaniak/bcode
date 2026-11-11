@@ -180,6 +180,16 @@ pub struct PullRequest {
     pub checks: Option<ChecksState>,
     /// Last update, RFC 3339.
     pub updated_at: String,
+    /// Login of the author, when the forge reports one (deleted accounts have none).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Commit the base branch pointed at, when the forge reports it.
+    #[serde(default)]
+    pub base_oid: Option<String>,
+    /// Whether the authenticated user is one of the requested reviewers (directly, not
+    /// through a team).
+    #[serde(default)]
+    pub review_requested_from_viewer: bool,
 }
 
 /// How a forge is reached.
@@ -215,6 +225,9 @@ pub struct PullRequestList {
     pub pull_requests: Vec<PullRequest>,
     /// The transport that answered: [`Transport::Http`] or [`Transport::Cli`].
     pub via: Transport,
+    /// The repository's default branch, when the forge reports it.
+    #[serde(default)]
+    pub default_branch: Option<String>,
 }
 
 /// Why pull requests could not be fetched.
@@ -295,6 +308,22 @@ mod tests {
         ] {
             assert_eq!(parsed(url), None, "{url}");
         }
+    }
+
+    #[test]
+    fn pull_requests_without_newer_fields_still_load() {
+        let pull: PullRequest = serde_json::from_str(
+            r#"{"number":1,"title":"t","url":"u","state":"open","head":"h",
+                "head_repository":null,"head_oid":"","base":"main","review":null,
+                "checks":null,"updated_at":""}"#,
+        )
+        .unwrap();
+        assert_eq!(pull.author, None);
+        assert_eq!(pull.base_oid, None);
+        assert!(!pull.review_requested_from_viewer);
+        let list: PullRequestList =
+            serde_json::from_str(r#"{"pull_requests":[],"via":"cli"}"#).unwrap();
+        assert_eq!(list.default_branch, None);
     }
 
     #[test]

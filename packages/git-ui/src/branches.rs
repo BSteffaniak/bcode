@@ -687,6 +687,9 @@ mod tests {
             review,
             checks,
             updated_at: String::new(),
+            author: None,
+            base_oid: None,
+            review_requested_from_viewer: false,
         };
         let style = |pull: Option<&PullRequest>| colors.style("x", BranchState::Ahead, false, pull);
         let failing = pull(PullRequestState::Open, None, Some(ChecksState::Failing));

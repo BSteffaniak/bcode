@@ -2,6 +2,7 @@
 //!
 //! * [`fixture`] generates deterministic temporary git repositories, up to the 5k-file /
 //!   500k-diff-line benchmark shape.
+//! * `v2_data_benchmark` measures the V2 data layer (ignored by default).
 //! * [`harness`] drives plugin TUI surfaces through scripted multi-event scenarios and renders
 //!   frames into BMUX test buffers.
 
@@ -9,6 +10,7 @@ pub mod fixture;
 pub mod harness;
 mod v1_baseline;
 mod v1_smoke;
+mod v2_data_benchmark;
 
 use bcode_code_review_models::{
     MaterializeReviewWorkspaceRequest, MaterializeReviewWorkspaceResponse, ReviewTarget,

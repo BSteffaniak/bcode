@@ -4,7 +4,13 @@
 
 //! Shared code review models for Bcode.
 
-use serde::{Deserialize, Serialize};
+mod data;
+mod review_source;
+
+pub use data::*;
+pub use review_source::*;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -170,6 +176,249 @@ pub struct ReviewWorkspace {
     /// Stable semantic presentation state for useful workspace reopen.
     #[serde(default)]
     pub presentation_state: Option<ReviewWorkspacePresentationState>,
+    /// Identity-pinned viewed marks (Code Review V2). `viewed_files` stays the authoritative set
+    /// of viewed paths for compatibility; a viewed path without a mark here is a legacy mark of
+    /// unknown identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewed_marks: Vec<ViewedMark>,
+    /// Last resolved revisions per source id, recorded when a review pass completes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reviewed_revisions: BTreeMap<String, ReviewedRevision>,
+    /// Code Review V2 presentation state. It is disposable: an unreadable value is dropped
+    /// rather than failing the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_v2: Option<ReviewV2PresentationState>,
+}
+
+/// A file marked viewed at a specific identity (Code Review V2).
+///
+/// Matching rule, in order:
+///
+/// * A mark of unknown identity (a migrated path-only mark, or working-tree content marked
+///   before its patch id was known; see [`ViewedMark::has_identity`]) matches by path until the
+///   file's identity is first known; the client then re-records it.
+/// * Same path and the same old and new blob identities: viewed. Index entries carry blob ids,
+///   so this needs no hunks.
+/// * Different blob identities but an equal `patch_id`: still viewed (the patch survived a
+///   rebase or unrelated commits). Patch ids are compared once hunks are loaded.
+/// * Otherwise: unviewed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ViewedMark {
+    /// Display path of the file.
+    pub path: String,
+    /// Old-side blob identity when marked: an object id, [`VIEWED_ABSENT_SIDE`], or `None` when
+    /// unknown (legacy mark or working-tree content).
+    #[serde(default)]
+    pub old_oid: Option<String>,
+    /// New-side blob identity when marked; same encoding as `old_oid`.
+    #[serde(default)]
+    pub new_oid: Option<String>,
+    /// Patch identity when marked, when hunks were loaded.
+    #[serde(default)]
+    pub patch_id: Option<String>,
+}
+
+impl ViewedMark {
+    /// Build a migrated mark with unknown identity for a legacy viewed path.
+    #[must_use]
+    pub fn legacy(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            old_oid: None,
+            new_oid: None,
+            patch_id: None,
+        }
+    }
+
+    /// Whether the mark carries no identity at all.
+    #[must_use]
+    pub const fn is_legacy(&self) -> bool {
+        self.old_oid.is_none() && self.new_oid.is_none() && self.patch_id.is_none()
+    }
+
+    /// Whether the mark can identify file content: it has a patch id, or both blob sides are
+    /// pinned. A mark without one (a legacy mark, or working-tree content marked before its
+    /// hunks were loaded) is a mark of unknown identity.
+    #[must_use]
+    pub const fn has_identity(&self) -> bool {
+        self.patch_id.is_some() || (self.old_oid.is_some() && self.new_oid.is_some())
+    }
+}
+
+/// Revisions a source resolved to when it was last reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewedRevision {
+    /// Base commit id, when the base side was a commit.
+    #[serde(default)]
+    pub reviewed_base_oid: Option<String>,
+    /// Head commit id, when the head side was a commit.
+    #[serde(default)]
+    pub reviewed_head_oid: Option<String>,
+    /// When the revisions were recorded, in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub recorded_at_ms: Option<u64>,
+}
+
+impl ReviewedRevision {
+    /// Record the commit sides of a resolved source.
+    #[must_use]
+    pub fn from_resolved(source: &ResolvedSource, recorded_at_ms: Option<u64>) -> Self {
+        Self {
+            reviewed_base_oid: source.base.commit_oid().map(str::to_string),
+            reviewed_head_oid: source.head.commit_oid().map(str::to_string),
+            recorded_at_ms,
+        }
+    }
+}
+
+/// Current schema version of [`ReviewV2PresentationState`].
+pub const REVIEW_V2_PRESENTATION_SCHEMA_VERSION: u16 = 1;
+
+/// Diff layout mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLayoutMode {
+    /// Side-by-side when wide enough, otherwise unified.
+    #[default]
+    Auto,
+    /// Unified diff.
+    Unified,
+    /// Side-by-side diff.
+    SideBySide,
+}
+
+/// Side of a diff line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLineSide {
+    /// Old side.
+    Old,
+    /// New side.
+    New,
+}
+
+/// Stable identity of one review document item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewItemKey {
+    /// Header of one source.
+    SourceHeader {
+        /// Workspace source id.
+        source_id: String,
+    },
+    /// Header of one file.
+    FileHeader {
+        /// Workspace source id.
+        source_id: String,
+        /// File display path.
+        path: String,
+        /// Part index for sources that resolve to several parts (see `ResolvedSourcePart`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part: Option<u32>,
+    },
+    /// Header of one hunk, identified by its new-side start line.
+    HunkHeader {
+        /// Workspace source id.
+        source_id: String,
+        /// File display path.
+        path: String,
+        /// New-side start line.
+        new_start: u32,
+        /// Part index for sources that resolve to several parts (see `ResolvedSourcePart`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part: Option<u32>,
+    },
+    /// One diff or context line.
+    Line {
+        /// Workspace source id.
+        source_id: String,
+        /// File display path.
+        path: String,
+        /// Side the line number refers to.
+        side: ReviewLineSide,
+        /// Line number on that side.
+        line: u32,
+        /// Part index for sources that resolve to several parts (see `ResolvedSourcePart`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part: Option<u32>,
+    },
+    /// A thread.
+    Thread {
+        /// Thread id.
+        thread_id: String,
+    },
+}
+
+/// Scroll position by item identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewScrollAnchor {
+    /// Item at the top of the viewport.
+    pub item: ReviewItemKey,
+    /// Rows of that item scrolled above the viewport top.
+    #[serde(default)]
+    pub row_offset: u32,
+}
+
+/// Panel visibility and sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewPanelState {
+    /// Whether the file panel is visible.
+    #[serde(default)]
+    pub file_panel_visible: Option<bool>,
+    /// File panel width in columns.
+    #[serde(default)]
+    pub file_panel_width: Option<u16>,
+    /// Whether the threads panel is visible.
+    #[serde(default)]
+    pub threads_panel_visible: Option<bool>,
+    /// Threads panel size in rows or columns, depending on its placement.
+    #[serde(default)]
+    pub threads_panel_size: Option<u16>,
+}
+
+/// Revealed context of one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFileExpansion {
+    /// Workspace source id.
+    pub source_id: String,
+    /// File display path.
+    pub path: String,
+    /// Part index for sources that resolve to several parts (see `ResolvedSourcePart`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
+    /// Revealed new-side line intervals.
+    pub revealed_new_lines: Vec<ReviewLineInterval>,
+}
+
+/// Code Review V2 presentation state persisted per workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewV2PresentationState {
+    /// Presentation schema version.
+    pub schema_version: u16,
+    /// Scroll position by item identity.
+    #[serde(default)]
+    pub scroll_anchor: Option<ReviewScrollAnchor>,
+    /// Layout chosen in the review; `None` follows configuration.
+    #[serde(default)]
+    pub layout_mode: Option<ReviewLayoutMode>,
+    /// Panel visibility and sizes.
+    #[serde(default)]
+    pub panels: ReviewPanelState,
+    /// Revealed context per file.
+    #[serde(default)]
+    pub expansions: Vec<ReviewFileExpansion>,
+}
+
+impl Default for ReviewV2PresentationState {
+    fn default() -> Self {
+        Self {
+            schema_version: REVIEW_V2_PRESENTATION_SCHEMA_VERSION,
+            scroll_anchor: None,
+            layout_mode: None,
+            panels: ReviewPanelState::default(),
+            expansions: Vec::new(),
+        }
+    }
 }
 
 impl ReviewWorkspace {
@@ -193,6 +442,9 @@ impl ReviewWorkspace {
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
             presentation_state: None,
+            viewed_marks: Vec::new(),
+            reviewed_revisions: BTreeMap::new(),
+            presentation_v2: None,
         }
     }
 }
@@ -211,8 +463,12 @@ pub struct ReviewSource {
 }
 
 /// Supported source kinds for building a review workspace.
+///
+/// A persisted kind this version does not recognize deserializes as
+/// [`ReviewSourceKind::Unsupported`] and serializes back unchanged, so newer workspaces survive a
+/// round trip through older code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(remote = "Self", tag = "kind", rename_all = "snake_case")]
 pub enum ReviewSourceKind {
     /// Unstaged working-tree changes.
     WorkingTreeUnstaged,
@@ -263,6 +519,77 @@ pub enum ReviewSourceKind {
     },
     /// Full repository browser context.
     Repository,
+    /// Non-contiguous selection of commits, each reviewed against its first parent.
+    Commits {
+        /// Commit revisions in selection order.
+        revs: Vec<String>,
+    },
+    /// One pull request from a review-source provider.
+    PullRequest {
+        /// Review-source provider id.
+        provider: String,
+        /// Provider repository identifier, such as `owner/name`.
+        repository: String,
+        /// Pull request number.
+        number: u64,
+    },
+    /// One layer of a stack: a pull request against its parent layer.
+    StackLayer {
+        /// Review-source provider id.
+        provider: String,
+        /// Provider repository identifier.
+        repository: String,
+        /// Pull request number of the layer.
+        number: u64,
+    },
+    /// A whole stack from trunk to its top pull request.
+    Stack {
+        /// Review-source provider id.
+        provider: String,
+        /// Provider repository identifier.
+        repository: String,
+        /// Pull request number of the top layer.
+        top: u64,
+    },
+    /// The current branch against its base (merge-base semantics).
+    CurrentBranch {
+        /// Base revision; `None` auto-detects the upstream, else the default branch.
+        #[serde(default)]
+        base: Option<String>,
+    },
+    /// A kind this version does not recognize, preserved verbatim.
+    #[serde(skip)]
+    Unsupported {
+        /// The unrecognized `kind` tag.
+        kind: String,
+        /// The original serialized value.
+        raw: serde_json::Value,
+    },
+}
+
+impl Serialize for ReviewSourceKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unsupported { raw, .. } => raw.serialize(serializer),
+            known => Self::serialize(known, serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewSourceKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Ok(
+            Self::deserialize(raw.clone()).unwrap_or_else(|_| Self::Unsupported {
+                kind: raw
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                raw,
+            }),
+        )
+    }
 }
 
 impl ReviewSourceKind {
@@ -294,7 +621,30 @@ impl ReviewSourceKind {
             Self::File { path } => format!("File {path}"),
             Self::FileRange { path, start, end } => format!("File {path}:{start}-{end}"),
             Self::Repository => "Repository browser".to_string(),
+            Self::Commits { revs } => match revs.as_slice() {
+                [] => "Commits".to_string(),
+                [rev] => format!("Commit {rev}"),
+                [first, rest @ ..] => format!("Commits {first} +{}", rest.len()),
+            },
+            Self::PullRequest {
+                repository, number, ..
+            } => format!("Pull request {repository}#{number}"),
+            Self::StackLayer {
+                repository, number, ..
+            } => format!("Stack layer {repository}#{number}"),
+            Self::Stack {
+                repository, top, ..
+            } => format!("Stack {repository}#{top}"),
+            Self::CurrentBranch { base: Some(base) } => format!("Current branch vs {base}"),
+            Self::CurrentBranch { base: None } => "Current branch".to_string(),
+            Self::Unsupported { kind, .. } => format!("Unsupported source ({kind})"),
         }
+    }
+
+    /// Whether this kind is unknown to this version.
+    #[must_use]
+    pub const fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Unsupported { .. })
     }
 }
 
@@ -2756,6 +3106,148 @@ mod tests {
             serde_json::from_str::<ReviewSuggestionStatus>("\"accepted\"")
                 .expect("deserialize suggestion status"),
             ReviewSuggestionStatus::Accepted
+        );
+    }
+}
+
+#[cfg(test)]
+mod workspace_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_workspace_json_reads_with_empty_v2_fields() {
+        let json = r#"{
+            "id": "w", "title": "t", "repo_root": "/repo",
+            "sources": [{"id": "s", "kind": {"kind": "working_tree_unstaged"}, "label": "u", "included": true}],
+            "viewed_files": ["a.rs"]
+        }"#;
+        let workspace: ReviewWorkspace = serde_json::from_str(json).unwrap();
+        assert_eq!(workspace.viewed_marks, Vec::new());
+        assert_eq!(workspace.reviewed_revisions, BTreeMap::new());
+        assert!(workspace.presentation_v2.is_none());
+        let encoded = serde_json::to_value(&workspace).unwrap();
+        assert!(
+            encoded.get("viewed_marks").is_none(),
+            "empty V2 fields are omitted"
+        );
+    }
+
+    #[test]
+    fn new_source_kinds_round_trip_with_labels() {
+        let kinds = [
+            ReviewSourceKind::Commits {
+                revs: vec!["a".into(), "b".into()],
+            },
+            ReviewSourceKind::PullRequest {
+                provider: "github".into(),
+                repository: "o/r".into(),
+                number: 7,
+            },
+            ReviewSourceKind::StackLayer {
+                provider: "github".into(),
+                repository: "o/r".into(),
+                number: 8,
+            },
+            ReviewSourceKind::Stack {
+                provider: "github".into(),
+                repository: "o/r".into(),
+                top: 9,
+            },
+            ReviewSourceKind::CurrentBranch { base: None },
+            ReviewSourceKind::CurrentBranch {
+                base: Some("main".into()),
+            },
+        ];
+        let labels: Vec<String> = kinds.iter().map(ReviewSourceKind::label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Commits a +1",
+                "Pull request o/r#7",
+                "Stack layer o/r#8",
+                "Stack o/r#9",
+                "Current branch",
+                "Current branch vs main"
+            ]
+        );
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: ReviewSourceKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind, "{json}");
+        }
+        assert_eq!(
+            serde_json::to_string(&ReviewSourceKind::CurrentBranch { base: None }).unwrap(),
+            r#"{"kind":"current_branch","base":null}"#
+        );
+    }
+
+    #[test]
+    fn unknown_source_kind_is_preserved_verbatim() {
+        let json = r#"{"kind":"future_kind","extra":{"n":1}}"#;
+        let kind: ReviewSourceKind = serde_json::from_str(json).unwrap();
+        assert!(kind.is_unsupported());
+        assert_eq!(kind.label(), "Unsupported source (future_kind)");
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+        let source: ReviewSource = serde_json::from_str(&format!(
+            r#"{{"id":"s","kind":{json},"label":"x","included":true}}"#
+        ))
+        .unwrap();
+        assert!(source.kind.is_unsupported());
+    }
+
+    #[test]
+    fn existing_source_kinds_keep_their_wire_format() {
+        let kind = ReviewSourceKind::BranchCompare {
+            base_branch: "a".into(),
+            head_branch: "b".into(),
+            merge_base: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            r#"{"kind":"branch_compare","base_branch":"a","head_branch":"b","merge_base":true}"#
+        );
+        let defaulted: ReviewSourceKind = serde_json::from_str(
+            r#"{"kind":"branch_compare","base_branch":"a","head_branch":"b"}"#,
+        )
+        .unwrap();
+        assert_eq!(defaulted, kind);
+    }
+
+    #[test]
+    fn v2_presentation_state_round_trips() {
+        let state = ReviewV2PresentationState {
+            scroll_anchor: Some(ReviewScrollAnchor {
+                item: ReviewItemKey::Line {
+                    source_id: "s".into(),
+                    path: "a.rs".into(),
+                    side: ReviewLineSide::New,
+                    line: 12,
+                    part: Some(1),
+                },
+                row_offset: 1,
+            }),
+            layout_mode: Some(ReviewLayoutMode::SideBySide),
+            panels: ReviewPanelState {
+                file_panel_visible: Some(true),
+                file_panel_width: Some(40),
+                threads_panel_visible: Some(false),
+                threads_panel_size: None,
+            },
+            expansions: vec![ReviewFileExpansion {
+                source_id: "s".into(),
+                path: "a.rs".into(),
+                part: None,
+                revealed_new_lines: vec![ReviewLineInterval { start: 1, end: 20 }],
+            }],
+            ..ReviewV2PresentationState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReviewV2PresentationState>(&json).unwrap(),
+            state
         );
     }
 }

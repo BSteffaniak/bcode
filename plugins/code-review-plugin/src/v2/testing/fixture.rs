@@ -11,7 +11,10 @@
 //!   based on the previous one and the first based on `main`; every layer adds its own file and
 //!   rewrites a distinct region of one shared file, so per-layer attribution is observable,
 //! * staged and unstaged working-tree changes on `main` (one file has both) and one untracked
-//!   file.
+//!   file,
+//! * optionally ([`FixtureSpec::special_entries`]) a file whose mode changes from `100644` to
+//!   `100755` without a content change, a CRLF file with one edited line, an added symbolic
+//!   link, and an added submodule gitlink (with `.gitmodules`).
 //!
 //! Commits and branches are streamed through one `git fast-import` process (a single pack, no
 //! per-file loose objects), then `main` is checked out with `git reset --hard` and the
@@ -55,6 +58,8 @@ pub struct FixtureSpec {
     pub worktree_changed_lines_per_file: usize,
     /// Extra branches unrelated to the stack.
     pub extra_branches: usize,
+    /// Add the mode-change, CRLF, symbolic link, and submodule gitlink entries.
+    pub special_entries: bool,
 }
 
 impl FixtureSpec {
@@ -73,6 +78,7 @@ impl FixtureSpec {
             unstaged_files: 1,
             worktree_changed_lines_per_file: 2,
             extra_branches: 2,
+            special_entries: true,
         }
     }
 
@@ -92,6 +98,8 @@ impl FixtureSpec {
             unstaged_files: 500,
             worktree_changed_lines_per_file: 10,
             extra_branches: 8,
+            // Kept off so the phase 0 V1 baseline numbers stay comparable.
+            special_entries: false,
         }
     }
 
@@ -133,6 +141,20 @@ pub const STACK_SHARED_FILE: &str = "stack/shared.rs";
 const STACK_SHARED_LINES: usize = 80;
 /// Path of the untracked working-tree file.
 pub const UNTRACKED_FILE: &str = "untracked/note.txt";
+/// Path of the file whose mode changes to executable in the second commit.
+pub const MODE_CHANGE_FILE: &str = "scripts/run.sh";
+/// Path of the CRLF file edited in the second commit.
+pub const CRLF_FILE: &str = "text/crlf.txt";
+/// Path of the symbolic link added in the second commit.
+pub const SYMLINK_FILE: &str = "links/huge-link";
+/// Target of [`SYMLINK_FILE`].
+pub const SYMLINK_TARGET: &str = "../large/huge.rs";
+/// Path of the submodule gitlink added in the second commit.
+pub const SUBMODULE_PATH: &str = "vendor/sub";
+/// Commit id recorded by the submodule gitlink (it does not exist in the fixture).
+pub const SUBMODULE_COMMIT: &str = "1111111111111111111111111111111111111111";
+/// Content of [`MODE_CHANGE_FILE`].
+const MODE_CHANGE_CONTENT: &str = "#!/bin/sh\necho fixture\n";
 
 impl GitFixture {
     /// Generate a repository with the given shape.
@@ -204,13 +226,23 @@ impl GitFixture {
     /// # Panics
     ///
     /// Panics when git cannot be started or exits unsuccessfully.
+    #[must_use]
     pub fn git(&self, args: &[&str]) -> String {
         run_git(&self.root, args, None)
     }
 
+    /// Run git in the fixture for its side effect, discarding standard output.
+    ///
+    /// # Panics
+    ///
+    /// Panics when git cannot be started or exits unsuccessfully.
+    pub fn run(&self, args: &[&str]) {
+        run_git(&self.root, args, None);
+    }
+
     fn build(&self) {
         let spec = self.spec;
-        self.git(&["init", "-q", "-b", HEAD_BRANCH]);
+        self.run(&["init", "-q", "-b", HEAD_BRANCH]);
         let base_ref = format!("refs/heads/{BASE_BRANCH}");
         let head_ref = format!("refs/heads/{HEAD_BRANCH}");
         let mut import = FastImport::start(&self.root);
@@ -245,6 +277,9 @@ impl GitFixture {
             STACK_SHARED_FILE,
             text_file(500_000, STACK_SHARED_LINES, None).as_bytes(),
         );
+        if spec.special_entries {
+            import_special_entries(&mut import, false);
+        }
 
         // Second commit.
         import.commit(&head_ref, Some(&base_ref), "second");
@@ -290,6 +325,9 @@ impl GitFixture {
         );
         import.modify(UNICODE_FILE, unicode_file(true).as_bytes());
         import.modify(BINARY_FILE, &binary_file(1));
+        if spec.special_entries {
+            import_special_entries(&mut import, true);
+        }
 
         // Extra branches alternate between the two commits.
         for index in 0..spec.extra_branches {
@@ -301,7 +339,7 @@ impl GitFixture {
         import.finish();
 
         // Populate the index and working tree of `main` from the imported objects.
-        self.git(&["reset", "-q", "--hard"]);
+        self.run(&["reset", "-q", "--hard"]);
         self.build_working_tree_changes();
     }
 
@@ -371,6 +409,24 @@ impl GitFixture {
         }
         std::fs::write(&path, contents).expect("write fixture file");
     }
+}
+
+/// Add the special entries: in the first commit a regular script and a CRLF file; in the second
+/// commit the script's mode change, a CRLF edit, a symbolic link, and a submodule gitlink.
+fn import_special_entries(import: &mut FastImport, second_commit: bool) {
+    if !second_commit {
+        import.modify(MODE_CHANGE_FILE, MODE_CHANGE_CONTENT.as_bytes());
+        import.modify(CRLF_FILE, crlf_file(false).as_bytes());
+        return;
+    }
+    import.modify_mode("100755", MODE_CHANGE_FILE, MODE_CHANGE_CONTENT.as_bytes());
+    import.modify(CRLF_FILE, crlf_file(true).as_bytes());
+    import.modify_mode("120000", SYMLINK_FILE, SYMLINK_TARGET.as_bytes());
+    import.gitlink(SUBMODULE_PATH, SUBMODULE_COMMIT);
+    let gitmodules = format!(
+        "[submodule \"{SUBMODULE_PATH}\"]\n\tpath = {SUBMODULE_PATH}\n\turl = ./missing-submodule\n"
+    );
+    import.modify(".gitmodules", gitmodules.as_bytes());
 }
 
 /// Import the linear stack on top of `head_ref`.
@@ -503,6 +559,11 @@ fn unicode_file(revised: bool) -> String {
     out
 }
 
+fn crlf_file(revised: bool) -> String {
+    let middle = if revised { "edited" } else { "original" };
+    format!("first line\r\nmiddle {middle} line\r\nlast line\r\n")
+}
+
 fn binary_file(revision: u8) -> Vec<u8> {
     let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
     for value in 0..=u8::MAX {
@@ -616,8 +677,17 @@ impl FastImport {
     }
 
     fn modify(&mut self, path: &str, contents: &[u8]) {
-        writeln!(self.input, "M 100644 inline {path}").expect("write fast-import");
+        self.modify_mode("100644", path, contents);
+    }
+
+    fn modify_mode(&mut self, mode: &str, path: &str, contents: &[u8]) {
+        writeln!(self.input, "M {mode} inline {path}").expect("write fast-import");
         self.data(contents);
+    }
+
+    /// Record a submodule gitlink pointing at `commit` (which need not exist).
+    fn gitlink(&mut self, path: &str, commit: &str) {
+        writeln!(self.input, "M 160000 {commit} {path}").expect("write fast-import");
     }
 
     fn delete(&mut self, path: &str) {
@@ -728,6 +798,24 @@ mod tests {
         assert!(unstaged.contains(&GitFixture::modified_path(1)));
         let untracked = fixture.git(&["ls-files", "--others", "--exclude-standard"]);
         assert_eq!(untracked.trim(), UNTRACKED_FILE);
+    }
+
+    #[test]
+    fn small_fixture_has_special_entries() {
+        let fixture = GitFixture::generate(FixtureSpec::small());
+        let range = format!("{BASE_BRANCH}..{HEAD_BRANCH}");
+        let raw = fixture.git(&["diff", "--raw", &range]);
+        let line = |path: &str| {
+            raw.lines()
+                .find(|line| line.ends_with(path))
+                .unwrap_or_else(|| panic!("{path} missing from:\n{raw}"))
+                .to_string()
+        };
+        assert!(line(MODE_CHANGE_FILE).starts_with(":100644 100755"));
+        assert!(line(SYMLINK_FILE).starts_with(":000000 120000"));
+        assert!(line(SUBMODULE_PATH).starts_with(":000000 160000"));
+        let crlf = fixture.git(&["show", &format!("{HEAD_BRANCH}:{CRLF_FILE}")]);
+        assert!(crlf.contains("\r\n"), "{crlf:?}");
     }
 
     #[test]

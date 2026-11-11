@@ -1926,6 +1926,12 @@ const fn source_kind_label(kind: &ReviewSourceKind) -> &'static str {
         ReviewSourceKind::File { .. } => "file",
         ReviewSourceKind::FileRange { .. } => "file range",
         ReviewSourceKind::Repository => "repository",
+        ReviewSourceKind::Commits { .. } => "commits",
+        ReviewSourceKind::PullRequest { .. } => "pull request",
+        ReviewSourceKind::StackLayer { .. } => "stack layer",
+        ReviewSourceKind::Stack { .. } => "stack",
+        ReviewSourceKind::CurrentBranch { .. } => "current branch",
+        ReviewSourceKind::Unsupported { .. } => "unsupported",
     }
 }
 
@@ -2010,6 +2016,7 @@ fn source_kind_search_text(kind: &ReviewSourceKind) -> String {
             format!("file range {path} {start} {end}").to_ascii_lowercase()
         }
         ReviewSourceKind::Repository => "repository".to_string(),
+        other => other.label().to_ascii_lowercase(),
     }
 }
 
@@ -2621,6 +2628,9 @@ mod tests {
             viewed_files: std::collections::BTreeSet::new(),
             archived_at_ms: archived.then_some(3),
             presentation_state: None,
+            viewed_marks: Vec::new(),
+            reviewed_revisions: std::collections::BTreeMap::new(),
+            presentation_v2: None,
         }
     }
 

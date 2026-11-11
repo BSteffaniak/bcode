@@ -560,6 +560,12 @@ const fn source_kind_short_label(kind: &ReviewSourceKind) -> &'static str {
         ReviewSourceKind::File { .. } => "file",
         ReviewSourceKind::FileRange { .. } => "file-range",
         ReviewSourceKind::Repository => "repo",
+        ReviewSourceKind::Commits { .. } => "commits",
+        ReviewSourceKind::PullRequest { .. } => "pr",
+        ReviewSourceKind::StackLayer { .. } => "stack-layer",
+        ReviewSourceKind::Stack { .. } => "stack",
+        ReviewSourceKind::CurrentBranch { .. } => "branch",
+        ReviewSourceKind::Unsupported { .. } => "unsupported",
     }
 }
 
