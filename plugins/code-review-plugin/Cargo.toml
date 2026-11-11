@@ -25,19 +25,33 @@ bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_session_models = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
+bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
     "action-row",
+    "badge",
     "button",
+    "diff-viewer",
     "empty-state",
     "key-hint-bar",
+    "menu",
     "modal-frame",
+    "pane",
+    "panel-group",
+    "picker-frame",
+    "progress-bar",
+    "scroll-view",
     "selectable-list",
+    "spinner",
+    "split-button",
+    "status-bar",
     "tab-bar",
     "text-input",
+    "toast-stack",
     "tree-view",
+    "virtual-list",
 ] }
 clap = { workspace = true, features = ["derive", "std"] }
 crossterm = { workspace = true, features = ["events"] }

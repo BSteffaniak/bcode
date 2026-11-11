@@ -1203,6 +1203,7 @@ fn map_external_anchor(
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         }),
         message: None,
     }
@@ -1728,6 +1729,7 @@ mod tests {
                 is_file_anchor: false,
                 surface_id: None,
                 source_id: None,
+                head_oid: None,
             },
             comments: vec![DraftComment {
                 comment_id: "comment".to_string(),
@@ -1748,6 +1750,7 @@ mod tests {
                     is_file_anchor: false,
                     surface_id: None,
                     source_id: None,
+                    head_oid: None,
                 },
                 body: "comment body".to_string(),
                 created_at_ms: 1,

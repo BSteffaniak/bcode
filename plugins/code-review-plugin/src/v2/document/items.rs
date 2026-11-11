@@ -326,6 +326,9 @@ pub enum OutdatedReason {
     /// The anchored line exists but is no longer the same kind of line (for example a removed
     /// line that is no longer removed).
     LineChanged,
+    /// The anchor was made at a different head commit than the one under review, so its line
+    /// numbers may refer to other content.
+    RevisionChanged,
 }
 
 /// A draft or imported thread.

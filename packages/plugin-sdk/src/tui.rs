@@ -719,6 +719,15 @@ pub trait PluginTuiHost: Send + Sync {
         Vec::new()
     }
 
+    /// Effective diff layout preference of the host (the user's diff viewer configuration,
+    /// including any in-session override), for surfaces that render diffs.
+    ///
+    /// Presentation only: it never affects routing or persisted outcomes. `None` means the host
+    /// does not provide one and the surface keeps its own default.
+    fn diff_layout(&self) -> Option<PluginTuiDiffLayout> {
+        None
+    }
+
     /// Resolve a key stroke to one host-configured text edit command.
     fn text_edit_command(&self, _stroke: KeyStroke) -> Option<TextEditCommand> {
         None

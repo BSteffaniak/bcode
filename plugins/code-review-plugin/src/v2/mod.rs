@@ -9,10 +9,12 @@
 //! * [`provider`] routes pull-request and stack sources to review-source provider plugins from
 //!   the client.
 //! * [`viewed`] matches identity-pinned viewed marks.
+//! * [`tui`] is the review surface over the document (phase 3).
 
 pub mod document;
 pub mod provider;
 pub mod service;
 #[cfg(test)]
 pub mod testing;
+pub mod tui;
 pub mod viewed;

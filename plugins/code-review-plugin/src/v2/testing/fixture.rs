@@ -730,6 +730,37 @@ mod tests {
         (additions, deletions, binary)
     }
 
+    /// Write a fixture repository to `$BCODE_REVIEW_FIXTURE_DIR` for manual checks of the real
+    /// binary (`bcode review range fixture/base main --ui v2` inside it).
+    /// `BCODE_REVIEW_FIXTURE_SPEC=benchmark` writes the benchmark shape and `small` the small
+    /// one; the default is a mid-sized review with every special entry.
+    #[test]
+    #[ignore = "manual tool; set BCODE_REVIEW_FIXTURE_DIR to a directory that does not exist"]
+    fn write_fixture_for_manual_checks() {
+        let Some(destination) = std::env::var_os("BCODE_REVIEW_FIXTURE_DIR") else {
+            return;
+        };
+        let spec = match std::env::var("BCODE_REVIEW_FIXTURE_SPEC").as_deref() {
+            Ok("benchmark") => FixtureSpec::benchmark(),
+            Ok("small") => FixtureSpec::small(),
+            _ => FixtureSpec {
+                modified_files: 120,
+                lines_per_file: 120,
+                changed_lines_per_file: 24,
+                large_file_lines: 4_000,
+                ..FixtureSpec::small()
+            },
+        };
+        let fixture = GitFixture::generate(spec);
+        let status = Command::new("cp")
+            .arg("-R")
+            .arg(fixture.root())
+            .arg(&destination)
+            .status()
+            .expect("run cp");
+        assert!(status.success(), "copy the fixture to {destination:?}");
+    }
+
     #[test]
     fn small_fixture_has_every_change_kind() {
         let fixture = GitFixture::generate(FixtureSpec::small());

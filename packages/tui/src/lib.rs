@@ -83,6 +83,7 @@ pub(crate) mod permission_present;
 pub(crate) mod picker_mouse;
 pub(crate) mod picker_render;
 pub(crate) mod plugin_surface_host;
+pub mod plugin_surface_launcher;
 pub mod plugin_tui;
 pub(crate) mod provider_picker;
 pub(crate) mod provider_picker_render;
@@ -531,10 +532,10 @@ pub async fn run_plugin_surface(
         )
         .await;
     }
-    Err(TuiError::PluginService {
-        code: "unsupported_startup_surface".to_owned(),
-        message: format!("plugin surface `{surface_kind}` cannot be opened as a startup surface"),
-    })
+    // Any other registered plugin surface runs through the generic standalone launcher.
+    let mut shell = TerminalShell::enter()?;
+    let result = Box::pin(shell.run_plugin_surface(surface_kind, Some(repo), options)).await;
+    shell.finish_with_result(result)
 }
 
 /// Require an absolute startup-surface repository path.

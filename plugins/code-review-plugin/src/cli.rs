@@ -16,11 +16,46 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const REVIEW_SURFACE_KIND: &str = "code-review";
+/// Environment variable selecting the review interface when `--ui` is not given.
+pub const REVIEW_UI_ENV: &str = "BCODE_REVIEW_UI";
+
 #[derive(Debug, Parser)]
 #[command(name = "review", about = "Review repository changes")]
 struct ReviewCli {
+    /// Review interface for interactive review subcommands (default: v1, or the
+    /// `BCODE_REVIEW_UI` environment variable). Review home stays on v1 until V2 has one.
+    #[arg(long, value_enum, global = true)]
+    ui: Option<ReviewUi>,
     #[command(subcommand)]
     command: Option<ReviewCommand>,
+}
+
+/// Review interface implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ReviewUi {
+    /// The current review interface.
+    #[default]
+    V1,
+    /// The Code Review V2 interface (in development).
+    V2,
+}
+
+impl ReviewUi {
+    /// The interface chosen by `--ui`, else by `BCODE_REVIEW_UI` (`v1` or `v2`, any case), else
+    /// v1. An unrecognized environment value selects v1.
+    fn select(flag: Option<Self>, env: Option<&str>) -> Self {
+        flag.or_else(|| {
+            env.and_then(|value| <Self as ValueEnum>::from_str(value.trim(), true).ok())
+        })
+        .unwrap_or_default()
+    }
+
+    const fn surface_kind(self) -> &'static str {
+        match self {
+            Self::V1 => REVIEW_SURFACE_KIND,
+            Self::V2 => crate::v2::tui::CODE_REVIEW_V2_SURFACE_KIND,
+        }
+    }
 }
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -49,7 +84,8 @@ fn requires_daemon(matches: &clap::ArgMatches) -> bool {
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let cli = ReviewCli::from_arg_matches(&matches).map_err(|e| e.to_string())?;
-        run(cli.command).await.map_err(|e| e.to_string())
+        let ui = ReviewUi::select(cli.ui, std::env::var(REVIEW_UI_ENV).ok().as_deref());
+        run(cli.command, ui).await.map_err(|e| e.to_string())
     })
 }
 /// Resolve a `--repo` argument against the CLI process working directory.
@@ -65,7 +101,11 @@ fn resolve_repo_argument(repo: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
-fn surface_outcome(repo: PathBuf, target: Option<ReviewTarget>) -> StaticCliOutcome {
+fn surface_outcome(
+    repo: PathBuf,
+    target: Option<ReviewTarget>,
+    surface_kind: &str,
+) -> StaticCliOutcome {
     let mut options = BTreeMap::new();
     if let Some(target) = target {
         options.insert(
@@ -75,7 +115,7 @@ fn surface_outcome(repo: PathBuf, target: Option<ReviewTarget>) -> StaticCliOutc
     }
     StaticCliOutcome {
         host_action: Some(StaticCliHostAction::OpenTuiSurface {
-            surface_kind: REVIEW_SURFACE_KIND.into(),
+            surface_kind: surface_kind.into(),
             repo_path: Some(repo),
             options,
         }),
@@ -195,11 +235,13 @@ impl From<ReviewTargetArg> for ReviewTarget {
     }
 }
 
-async fn run(command: Option<ReviewCommand>) -> Result<StaticCliOutcome, CliError> {
+async fn run(command: Option<ReviewCommand>, ui: ReviewUi) -> Result<StaticCliOutcome, CliError> {
     let Some(command) = command else {
+        // Review home is V1 until V2 gains its home route (spec phase 5).
         return Ok(surface_outcome(
             resolve_repo_argument(Path::new("."))?,
             None,
+            REVIEW_SURFACE_KIND,
         ));
     };
     let (repo, target) = match command {
@@ -247,7 +289,11 @@ async fn run(command: Option<ReviewCommand>) -> Result<StaticCliOutcome, CliErro
             return Ok(StaticCliOutcome::default());
         }
     };
-    Ok(surface_outcome(resolve_repo_argument(&repo)?, Some(target)))
+    Ok(surface_outcome(
+        resolve_repo_argument(&repo)?,
+        Some(target),
+        ui.surface_kind(),
+    ))
 }
 
 struct GithubPublishCliRequest {
@@ -418,6 +464,69 @@ mod tests {
         ] {
             let matches = (registration.command)().try_get_matches_from(args).unwrap();
             assert!(!(registration.requires_daemon)(&matches));
+        }
+    }
+
+    #[test]
+    fn ui_flag_reaches_every_interactive_subcommand_and_overrides_the_environment() {
+        let registration = registration();
+        for args in [
+            vec!["review", "unstaged", "--ui", "v2"],
+            vec!["review", "--ui", "v2", "staged"],
+            vec!["review", "all", "--ui", "v2"],
+            vec!["review", "last-commit", "--ui", "v2"],
+            vec!["review", "range", "main", "HEAD", "--ui", "v2"],
+            vec!["review", "repo", "--ui", "v2"],
+        ] {
+            let matches = (registration.command)()
+                .try_get_matches_from(args.clone())
+                .unwrap();
+            let cli = ReviewCli::from_arg_matches(&matches).unwrap();
+            assert_eq!(
+                ReviewUi::select(cli.ui, Some("v1")),
+                ReviewUi::V2,
+                "{args:?}"
+            );
+        }
+        assert_eq!(ReviewUi::select(None, Some("V2")), ReviewUi::V2);
+        assert_eq!(ReviewUi::select(None, Some(" v2 ")), ReviewUi::V2);
+        assert_eq!(ReviewUi::select(None, Some("other")), ReviewUi::V1);
+        assert_eq!(ReviewUi::select(None, None), ReviewUi::V1);
+        assert_eq!(
+            ReviewUi::select(Some(ReviewUi::V1), Some("v2")),
+            ReviewUi::V1
+        );
+    }
+
+    #[test]
+    fn v2_opens_the_v2_surface_with_the_target_and_home_stays_v1() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let repo = std::env::temp_dir();
+        let outcome = runtime
+            .block_on(run(Some(ReviewCommand::Unstaged { repo }), ReviewUi::V2))
+            .unwrap();
+        let Some(StaticCliHostAction::OpenTuiSurface {
+            surface_kind,
+            options,
+            ..
+        }) = outcome.host_action
+        else {
+            panic!("expected a surface");
+        };
+        assert_eq!(surface_kind, crate::v2::tui::CODE_REVIEW_V2_SURFACE_KIND);
+        assert_eq!(
+            serde_json::from_str::<ReviewTarget>(&options["target"]).unwrap(),
+            ReviewTarget::WorkingTreeUnstaged
+        );
+        let outcome = runtime.block_on(run(None, ReviewUi::V2));
+        // Home resolves the process working directory; only its surface kind matters here.
+        if let Ok(StaticCliOutcome {
+            host_action: Some(StaticCliHostAction::OpenTuiSurface { surface_kind, .. }),
+        }) = outcome
+        {
+            assert_eq!(surface_kind, REVIEW_SURFACE_KIND);
         }
     }
 

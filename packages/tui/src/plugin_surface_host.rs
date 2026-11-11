@@ -51,6 +51,20 @@ pub fn compose_surface_input(
     }
 }
 
+/// Map the effective diff viewer configuration onto the plugin presentation contract.
+pub const fn plugin_diff_layout(
+    config: bcode_config::TuiDiffViewerConfig,
+) -> bcode_plugin_sdk::tui::PluginTuiDiffLayout {
+    use bcode_plugin_sdk::tui::PluginTuiDiffLayout;
+    match config.layout {
+        bcode_config::TuiDiffViewerLayout::Auto => PluginTuiDiffLayout::Auto {
+            breakpoint: config.side_by_side_breakpoint,
+        },
+        bcode_config::TuiDiffViewerLayout::Unified => PluginTuiDiffLayout::Unified,
+        bcode_config::TuiDiffViewerLayout::SideBySide => PluginTuiDiffLayout::SideBySide,
+    }
+}
+
 /// Host services for plugin-owned TUI surfaces running inside Bcode's TUI.
 #[derive(Debug, Clone)]
 struct BcodePluginTuiHost {
@@ -70,6 +84,8 @@ pub struct FreshSessionSettings {
     pub agent: Option<String>,
     pub effort: Option<String>,
     pub summary: Option<String>,
+    /// Effective diff layout preference offered to plugin surfaces.
+    pub diff_layout: Option<bcode_plugin_sdk::tui::PluginTuiDiffLayout>,
 }
 
 fn workflow_start_request(
@@ -152,6 +168,10 @@ impl PluginTuiHost for BcodePluginTuiHost {
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    fn diff_layout(&self) -> Option<bcode_plugin_sdk::tui::PluginTuiDiffLayout> {
+        self.launch.diff_layout
     }
 
     fn validate_judgement_setup(

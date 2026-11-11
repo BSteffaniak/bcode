@@ -1643,6 +1643,177 @@ keymap_actions = [
     { id = "bcode.code_review.text.select_end", scope = "code-review-publish-options", description = "Select to boundary end", defaults = [
         "shift+end",
     ] },
+    { id = "bcode.code_review.down", scope = "code-review-v2", description = "Move down", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.up", scope = "code-review-v2", description = "Move up", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.half_page_down", scope = "code-review-v2", description = "Half page down", defaults = [
+        "ctrl+d",
+    ] },
+    { id = "bcode.code_review.half_page_up", scope = "code-review-v2", description = "Half page up", defaults = [
+        "ctrl+u",
+    ] },
+    { id = "bcode.code_review.page_down", scope = "code-review-v2", description = "Page down", defaults = [
+        "pagedown",
+    ] },
+    { id = "bcode.code_review.page_up", scope = "code-review-v2", description = "Page up", defaults = [
+        "pageup",
+    ] },
+    { id = "bcode.code_review.first", scope = "code-review-v2", description = "Top of review", defaults = [
+        "g",
+        "home",
+    ] },
+    { id = "bcode.code_review.last", scope = "code-review-v2", description = "End of review", defaults = [
+        "shift+g",
+        "end",
+    ] },
+    { id = "bcode.code_review.next_file", scope = "code-review-v2", description = "Next file", defaults = [
+        "n",
+    ] },
+    { id = "bcode.code_review.previous_file", scope = "code-review-v2", description = "Previous file", defaults = [
+        "p",
+    ] },
+    { id = "bcode.code_review.hunk_next", scope = "code-review-v2", description = "Next hunk", defaults = [
+        "}",
+    ] },
+    { id = "bcode.code_review.hunk_previous", scope = "code-review-v2", description = "Previous hunk", defaults = [
+        "{",
+    ] },
+    { id = "bcode.code_review.change_next", scope = "code-review-v2", description = "Next change", defaults = [
+        "]",
+    ] },
+    { id = "bcode.code_review.change_previous", scope = "code-review-v2", description = "Previous change", defaults = [
+        "[",
+    ] },
+    { id = "bcode.code_review.expand_down", scope = "code-review-v2", description = "Reveal context below", defaults = [
+        "e",
+    ] },
+    { id = "bcode.code_review.expand_up", scope = "code-review-v2", description = "Reveal context above", defaults = [
+        "shift+e",
+    ] },
+    { id = "bcode.code_review.expand_all", scope = "code-review-v2", description = "Reveal hidden lines", defaults = [
+        "x",
+    ] },
+    { id = "bcode.code_review.expand_file", scope = "code-review-v2", description = "Reveal whole file", defaults = [
+        "shift+x",
+    ] },
+    { id = "bcode.code_review.layout_toggle", scope = "code-review-v2", description = "Toggle unified / side-by-side", defaults = [
+        "shift+s",
+    ] },
+    { id = "bcode.code_review.wrap_toggle", scope = "code-review-v2", description = "Toggle line wrapping", defaults = [
+        "shift+w",
+    ] },
+    { id = "bcode.code_review.refresh", scope = "code-review-v2", description = "Refresh review", defaults = [
+        "r",
+    ] },
+    { id = "bcode.code_review.exit", scope = "code-review-v2", description = "Exit review", defaults = [
+        "q",
+        "esc",
+    ] },
+    { id = "bcode.code_review.focus_next", scope = "code-review-v2", description = "Focus next pane", defaults = [
+        "tab",
+    ] },
+    { id = "bcode.code_review.files_toggle", scope = "code-review-v2", description = "Show / hide file panel", defaults = [
+        "t",
+    ] },
+    { id = "bcode.code_review.files_filter", scope = "code-review-v2", description = "Filter files", defaults = [
+        "f",
+    ] },
+    { id = "bcode.code_review.files_grow", scope = "code-review-v2", description = "Widen file panel", defaults = [
+        ">",
+    ] },
+    { id = "bcode.code_review.files_shrink", scope = "code-review-v2", description = "Narrow file panel", defaults = [
+        "<",
+    ] },
+    { id = "bcode.code_review.threads_toggle", scope = "code-review-v2", description = "Show / hide threads panel", defaults = [
+        "shift+t",
+    ] },
+    { id = "bcode.code_review.comment", scope = "code-review-v2", description = "Comment on the line, range, or file (reply on a thread)", defaults = [
+        "c",
+    ] },
+    { id = "bcode.code_review.ask", scope = "code-review-v2", description = "Ask Bcode about the line, range, or file", defaults = [
+        "a",
+    ] },
+    { id = "bcode.code_review.file_comment", scope = "code-review-v2", description = "Comment on the file", defaults = [
+        "shift+f",
+    ] },
+    { id = "bcode.code_review.review_comment", scope = "code-review-v2", description = "Comment on the whole review", defaults = [
+        "shift+c",
+    ] },
+    { id = "bcode.code_review.range", scope = "code-review-v2", description = "Select a range of lines", defaults = [
+        "shift+v",
+    ] },
+    { id = "bcode.code_review.copy", scope = "code-review-v2", description = "Copy the selected lines", defaults = [
+        "y",
+    ] },
+    { id = "bcode.code_review.edit", scope = "code-review-v2", description = "Edit the thread's latest comment", defaults = [
+        "i",
+    ] },
+    { id = "bcode.code_review.delete", scope = "code-review-v2", description = "Delete the latest comment or AI answer", defaults = [
+        "shift+d",
+    ] },
+    { id = "bcode.code_review.resolve", scope = "code-review-v2", description = "Resolve or reopen the thread", defaults = [
+        "shift+r",
+    ] },
+    { id = "bcode.code_review.thread_kind", scope = "code-review-v2", description = "Change the thread's kind", defaults = [
+        "shift+k",
+    ] },
+    { id = "bcode.code_review.thread_severity", scope = "code-review-v2", description = "Change the thread's severity", defaults = [
+        "!",
+    ] },
+    { id = "bcode.code_review.open_session", scope = "code-review-v2", description = "Open the AI answer's Bcode session", defaults = [
+        "o",
+    ] },
+    { id = "bcode.code_review.thread_next", scope = "code-review-v2", description = "Next thread", defaults = [
+        ")",
+    ] },
+    { id = "bcode.code_review.thread_previous", scope = "code-review-v2", description = "Previous thread", defaults = [
+        "(",
+    ] },
+    { id = "bcode.code_review.viewed", scope = "code-review-v2", description = "Mark the file viewed and go to the next unviewed file", defaults = [
+        "v",
+    ] },
+    { id = "bcode.code_review.unviewed_next", scope = "code-review-v2", description = "Next unviewed file", defaults = [
+        "u",
+    ] },
+    { id = "bcode.code_review.unviewed_previous", scope = "code-review-v2", description = "Previous unviewed file", defaults = [
+        "shift+u",
+    ] },
+    { id = "bcode.code_review.search", scope = "code-review-v2", description = "Search the review", defaults = [
+        "/",
+    ] },
+    { id = "bcode.code_review.search_previous", scope = "code-review-v2", description = "Previous search match", defaults = [
+        "shift+n",
+    ] },
+    { id = "bcode.code_review.palette", scope = "code-review-v2", description = "Command palette", defaults = [
+        ":",
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.help", scope = "code-review-v2", description = "Keyboard help", defaults = [
+        "?",
+    ] },
+    { id = "bcode.code_review.composer_submit", scope = "code-review-v2-composer", description = "Save the comment", defaults = [
+        "ctrl+s",
+    ] },
+    { id = "bcode.code_review.composer_preview", scope = "code-review-v2-composer", description = "Toggle markdown preview", defaults = [
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.composer_switch", scope = "code-review-v2-composer", description = "Switch between comment and question", defaults = [
+        "ctrl+t",
+    ] },
+    { id = "bcode.code_review.composer_kind", scope = "code-review-v2-composer", description = "Change the thread kind", defaults = [
+        "alt+k",
+    ] },
+    { id = "bcode.code_review.composer_severity", scope = "code-review-v2-composer", description = "Change the thread severity", defaults = [
+        "alt+s",
+    ] },
+    { id = "bcode.code_review.composer_cancel", scope = "code-review-v2-composer", description = "Cancel the comment", defaults = [
+        "esc",
+    ] },
 ]
 
 
@@ -1673,6 +1844,11 @@ title       = "Code Review Home"
 [[tui_surfaces]]
 description = "Full-screen local Git code review UI"
 kind        = "code-review"
+title       = "Code Review"
+
+[[tui_surfaces]]
+description = "Full-screen local Git code review UI (Code Review V2, in development)"
+kind        = "code-review-v2"
 title       = "Code Review"
 
 [concurrency]

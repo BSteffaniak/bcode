@@ -191,6 +191,7 @@ impl RustPlugin for CodeReviewPlugin {
             bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_DELETE => delete_ai_exchange(&context),
             OP_THREAD_LINK_SESSION => link_thread_session(&context),
             OP_THREAD_RESOLVE => resolve_thread(&context),
+            bcode_code_review_models::OP_THREAD_CLASSIFY => classify_thread(&context),
             OP_REVIEW_CONTEXT_GET => review_context_get(&context),
             OP_REVIEW_COMMENTS_LIST => review_comments_list(&context),
             OP_REVIEW_THREAD_GET => review_thread_get(&context),
@@ -700,6 +701,101 @@ fn resolve_thread(context: &NativeServiceContext) -> ServiceResponse {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("thread_resolve_failed", error.to_string()),
     }
+}
+
+fn classify_thread(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<bcode_code_review_models::ClassifyThreadRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match classify_thread_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("thread_classify_failed", error.to_string()),
+    }
+}
+
+/// Serve the stateful annotation and workspace operations Code Review V2 uses (drafts, threads,
+/// AI exchanges, suggestions, workspace reads and updates) with an explicit configuration.
+/// Returns `None` for other operations. The plugin service routes these operations through the
+/// same `*_for_request` functions; this entry point lets in-process V2 surface tests use the real
+/// persisted store.
+#[cfg(test)]
+pub(crate) fn invoke_stateful_for_tests(
+    request: &bcode_plugin_sdk::prelude::ServiceRequest,
+    config: &CodeReviewPluginConfig,
+) -> Option<ServiceResponse> {
+    fn run<Req: serde::de::DeserializeOwned, Resp: serde::Serialize>(
+        request: &bcode_plugin_sdk::prelude::ServiceRequest,
+        code: &str,
+        serve: impl FnOnce(Req) -> Result<Resp, ReviewError>,
+    ) -> ServiceResponse {
+        match request.payload_json::<Req>() {
+            Ok(payload) => match serve(payload) {
+                Ok(response) => json_response(&response),
+                Err(error) => ServiceResponse::error(code, error.to_string()),
+            },
+            Err(error) => ServiceResponse::error("invalid_request", error.to_string()),
+        }
+    }
+    Some(match request.operation.as_str() {
+        OP_DRAFT_LIST => run(request, "draft_list_failed", |r: ListDraftsRequest| {
+            list_drafts_for_request(&r, config)
+        }),
+        OP_DRAFT_SAVE => run(request, "draft_save_failed", |r| {
+            save_draft_for_request(r, config)
+        }),
+        OP_DRAFT_DELETE => run(request, "draft_delete_failed", |r| {
+            delete_draft_for_request(r, config)
+        }),
+        OP_DRAFT_UPDATE => run(request, "draft_update_failed", |r| {
+            update_draft_for_request(r, config)
+        }),
+        OP_THREAD_LINK_SESSION => run(request, "thread_link_failed", |r| {
+            link_thread_session_for_request(r, config)
+        }),
+        OP_THREAD_RESOLVE => run(request, "thread_resolve_failed", |r| {
+            resolve_thread_for_request(r, config)
+        }),
+        bcode_code_review_models::OP_THREAD_CLASSIFY => {
+            run(request, "thread_classify_failed", |r| {
+                classify_thread_for_request(r, config)
+            })
+        }
+        bcode_code_review_models::OP_REVIEW_AI_EXCHANGES_LIST => run(
+            request,
+            "ai_exchanges_failed",
+            |r: ListReviewAiExchangesRequest| list_ai_exchanges_for_request(&r, config),
+        ),
+        bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_SAVE => {
+            run(request, "ai_exchange_failed", |r| {
+                save_ai_exchange_for_request(r, config)
+            })
+        }
+        bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_DELETE => {
+            run(request, "ai_exchange_failed", |r| {
+                delete_ai_exchange_for_request(r, config)
+            })
+        }
+        bcode_code_review_models::OP_REVIEW_SUGGESTIONS_LIST => run(
+            request,
+            "suggestions_failed",
+            |r: ListReviewSuggestionsRequest| list_suggestions_for_request(&r, config),
+        ),
+        OP_REVIEW_WORKSPACE_UPDATE => run(request, "workspace_update_failed", |r| {
+            update_review_workspace_for_request(r, config)
+        }),
+        OP_REVIEW_WORKSPACE_GET => run(request, "workspace_get_failed", |r| {
+            get_review_workspace_for_request(r, config)
+        }),
+        _ => return None,
+    })
 }
 
 fn review_context_get(context: &NativeServiceContext) -> ServiceResponse {
@@ -2373,6 +2469,32 @@ fn resolve_thread_for_request(
     Ok(response)
 }
 
+fn classify_thread_for_request(
+    request: bcode_code_review_models::ClassifyThreadRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<bcode_code_review_models::ClassifyThreadResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let target_kind = target_kind(&request.target).to_string();
+    let target_json = serde_json::to_string(&request.target)?;
+    with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .classify_thread(
+                    &review_key,
+                    &db_repo_root,
+                    &target_kind,
+                    &target_json,
+                    &request.anchor,
+                    request.thread_kind,
+                    request.severity,
+                )
+                .await
+        })
+    })
+}
+
 fn threads_from_drafts(drafts: Vec<DraftComment>) -> Vec<ReviewThread> {
     let mut threads: BTreeMap<String, ReviewThread> = BTreeMap::new();
     for draft in drafts {
@@ -3238,6 +3360,7 @@ impl<'a> CodeReviewDb<'a> {
                 "is_file_anchor",
                 "surface_id",
                 "source_id",
+                "head_oid",
             ])
             .filter(Box::new(where_eq("review_key", review_key)))
             .execute(self.db)
@@ -3277,6 +3400,7 @@ impl<'a> CodeReviewDb<'a> {
                 is_file_anchor: optional_bool(&thread, "is_file_anchor"),
                 surface_id: optional_text(&thread, "surface_id"),
                 source_id: optional_text(&thread, "source_id"),
+                head_oid: optional_text(&thread, "head_oid"),
             };
             let comment_rows = self
                 .db
@@ -3490,6 +3614,34 @@ impl<'a> CodeReviewDb<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_thread(
+        &self,
+        review_key: &str,
+        repo_root: &Path,
+        target_kind: &str,
+        target_json: &str,
+        anchor: &DraftAnchor,
+        kind: ReviewThreadKind,
+        severity: ReviewThreadSeverity,
+    ) -> Result<bcode_code_review_models::ClassifyThreadResponse, ReviewError> {
+        let now = now_ms();
+        let thread_id = thread_id(review_key, anchor)?;
+        self.ensure_review(review_key, repo_root, target_kind, target_json, now)
+            .await?;
+        self.ensure_thread(review_key, &thread_id, anchor, now)
+            .await?;
+        self.db
+            .update("draft_threads")
+            .value("thread_kind", thread_kind_str(kind))
+            .value("severity", thread_severity_str(severity))
+            .value("updated_at_ms", u64_to_i64(now))
+            .filter(Box::new(where_eq("thread_id", thread_id.clone())))
+            .execute(self.db)
+            .await?;
+        Ok(bcode_code_review_models::ClassifyThreadResponse { thread_id })
+    }
+
     async fn ensure_review(
         &self,
         review_key: &str,
@@ -3573,6 +3725,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("is_file_anchor", anchor.is_file_anchor)
             .value("surface_id", anchor.surface_id.clone())
             .value("source_id", anchor.source_id.clone())
+            .value("head_oid", anchor.head_oid.clone())
             .value("resolved_at_ms", Option::<i64>::None)
             .value("created_at_ms", u64_to_i64(now))
             .value("updated_at_ms", u64_to_i64(now))
@@ -3970,7 +4123,23 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(review_ai_exchanges_table_migration());
     source.add_migration(workspace_presentation_state_column_migration());
     source.add_migration(workspace_v2_state_columns_migration());
+    source.add_migration(thread_head_oid_column_migration());
     source
+}
+
+/// Code Review V2 anchors record the head commit they were made at (`DraftAnchor::head_oid`).
+/// Nullable, so threads written before the migration read as having no recorded head.
+fn thread_head_oid_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "019_thread_head_oid_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "head_oid".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
 }
 
 /// Code Review V2 workspace state: identity-pinned viewed marks, reviewed revisions per source,
@@ -4366,11 +4535,16 @@ fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewE
     Ok(format!("review-{}", hex::encode(hasher.finalize())))
 }
 
+/// Thread identity: the review and the anchor's location. The anchor's head commit is not part
+/// of it, so a thread keeps its identity however its anchor was recorded (and anchors without a
+/// head hash exactly as they did before the field existed).
 fn thread_id(review_key: &str, anchor: &DraftAnchor) -> Result<String, ReviewError> {
+    let mut location = anchor.clone();
+    location.head_oid = None;
     let mut hasher = Sha256::new();
     hasher.update(review_key.as_bytes());
     hasher.update(b"\0");
-    hasher.update(serde_json::to_string(anchor)?.as_bytes());
+    hasher.update(serde_json::to_string(&location)?.as_bytes());
     Ok(format!("thread-{}", hex::encode(hasher.finalize())))
 }
 
@@ -5127,6 +5301,7 @@ mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         };
         let request = ServiceRequest {
             interface_id: CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
@@ -5190,6 +5365,7 @@ mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         };
         save_draft_for_request(
             SaveDraftRequest {
@@ -5251,6 +5427,7 @@ mod tests {
                 is_file_anchor: false,
                 surface_id: None,
                 source_id: None,
+                head_oid: None,
             },
             question: "delete me".to_string(),
             session_id: None,
@@ -5378,6 +5555,7 @@ mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         };
         let exchange = ReviewAiExchange {
             schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
@@ -5464,6 +5642,7 @@ mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         };
         let scope = Some(ReviewScope::Workspace {
             workspace_id: "workspace-1".to_string(),
@@ -5697,6 +5876,7 @@ mod tests {
                     is_file_anchor: false,
                     surface_id: None,
                     source_id: None,
+                    head_oid: None,
                 },
                 comments: vec![DraftComment {
                     comment_id: "comment-1".to_string(),
@@ -5717,6 +5897,7 @@ mod tests {
                         is_file_anchor: false,
                         surface_id: None,
                         source_id: None,
+                        head_oid: None,
                     },
                     body: "Needs local follow-up".to_string(),
                     created_at_ms: 1,
@@ -5775,6 +5956,7 @@ mod tests {
                     is_file_anchor: false,
                     surface_id: None,
                     source_id: None,
+                    head_oid: None,
                 },
                 comments: vec![DraftComment {
                     comment_id: "comment-review".to_string(),
@@ -5795,6 +5977,7 @@ mod tests {
                         is_file_anchor: false,
                         surface_id: None,
                         source_id: None,
+                        head_oid: None,
                     },
                     body: "Overall review summary".to_string(),
                     created_at_ms: 1,
@@ -5897,6 +6080,7 @@ mod tests {
                     is_file_anchor: false,
                     surface_id: None,
                     source_id: None,
+                    head_oid: None,
                 },
                 comments: vec![DraftComment {
                     comment_id: "comment-1".to_string(),
@@ -5917,6 +6101,7 @@ mod tests {
                         is_file_anchor: false,
                         surface_id: None,
                         source_id: None,
+                        head_oid: None,
                     },
                     body: "Selected actionable comment".to_string(),
                     created_at_ms: 1,

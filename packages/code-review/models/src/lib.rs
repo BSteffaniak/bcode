@@ -56,6 +56,8 @@ pub const OP_REVIEW_SUGGESTION_SAVE: &str = "review.suggestion.save";
 pub const OP_REVIEW_AI_EXCHANGES_LIST: &str = "review.ai_exchanges.list";
 /// Operation that creates or updates a durable, non-publishable review AI exchange.
 pub const OP_REVIEW_AI_EXCHANGE_SAVE: &str = "review.ai_exchange.save";
+/// Set a thread's kind and severity (Code Review V2).
+pub const OP_THREAD_CLASSIFY: &str = "thread.classify";
 /// Operation that explicitly deletes a durable review AI exchange.
 pub const OP_REVIEW_AI_EXCHANGE_DELETE: &str = "review.ai_exchange.delete";
 /// Current persisted schema version for review AI exchanges.
@@ -1284,6 +1286,32 @@ pub struct ResolveThreadRequest {
     pub resolved: bool,
 }
 
+/// Request payload for `thread.classify`: set the kind and severity of the thread at `anchor`
+/// (created when it does not exist yet, like `thread.resolve`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifyThreadRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped threads.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// Thread anchor.
+    pub anchor: DraftAnchor,
+    /// Thread kind.
+    pub thread_kind: ReviewThreadKind,
+    /// Thread severity.
+    pub severity: ReviewThreadSeverity,
+}
+
+/// Response payload for `thread.classify`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifyThreadResponse {
+    /// Updated thread id.
+    pub thread_id: String,
+}
+
 /// Response payload for `thread.resolve`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveThreadResponse {
@@ -1360,6 +1388,12 @@ pub struct DraftAnchor {
     /// Source id for normalized mixed-surface anchors.
     #[serde(default)]
     pub source_id: Option<String>,
+    /// Commit the anchored source's head resolved to when the anchor was created (Code Review
+    /// V2), when the head was a commit. An anchor whose head differs from the source's current
+    /// head may point at moved lines, so V2 shows it as outdated rather than re-attaching it.
+    /// Omitted when absent, so anchors without it serialize (and hash) exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
 }
 
 /// Local review thread kind.
@@ -3039,6 +3073,7 @@ mod tests {
                 is_file_anchor: false,
                 surface_id: Some("surface-1".to_string()),
                 source_id: Some("source-1".to_string()),
+                head_oid: None,
             },
             question: "Why is this safe?".to_string(),
             session_id: Some("session-1".to_string()),
@@ -3079,6 +3114,7 @@ mod tests {
                 is_file_anchor: false,
                 surface_id: Some("surface-1".to_string()),
                 source_id: Some("source-1".to_string()),
+                head_oid: None,
             },
             body: "Handle the error explicitly.".to_string(),
             session_id: Some("session-1".to_string()),

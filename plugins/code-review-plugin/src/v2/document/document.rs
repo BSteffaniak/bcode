@@ -661,6 +661,13 @@ impl ReviewDocument {
         self.len() == 0
     }
 
+    /// Number of anchored annotations (threads, AI exchanges, and suggestions) shown in the
+    /// document.
+    #[must_use]
+    pub const fn annotation_count(&self) -> usize {
+        self.annotations.len()
+    }
+
     /// Current revision; increases with every splice.
     #[must_use]
     pub const fn revision(&self) -> u64 {
@@ -1571,6 +1578,7 @@ impl ReviewDocument {
             ReviewItem::FileHeader(item) => Some(DocAnchor {
                 file: Some(item.file.clone()),
                 target: AnchorTarget::File,
+                head_oid: self.head_oid(&item.file),
             }),
             item @ (ReviewItem::Line(_) | ReviewItem::LinePair(_)) => {
                 self.range_anchor_between(index, index, item.file()?.clone())
@@ -1643,6 +1651,7 @@ impl ReviewDocument {
         };
         let span = |range: Option<(u32, u32)>| range.is_some_and(|(s, e)| s != e);
         Some(DocAnchor {
+            head_oid: self.head_oid(&file),
             file: Some(file),
             target: AnchorTarget::Lines(anchors::AnchorLines {
                 old,
@@ -1652,6 +1661,17 @@ impl ReviewDocument {
                 is_range: lines > 1 || span(old) || span(new),
             }),
         })
+    }
+
+    /// Commit the source of `file` resolved its head to, when the head is a commit.
+    #[must_use]
+    pub fn head_oid(&self, file: &FileKey) -> Option<String> {
+        let state = &self.files[*self.file_index.get(file)?];
+        self.groups[state.group]
+            .source
+            .head
+            .commit_oid()
+            .map(str::to_owned)
     }
 
     // ----------------------------------------------------------------------------------------

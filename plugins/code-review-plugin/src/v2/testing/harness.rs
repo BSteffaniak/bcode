@@ -44,6 +44,10 @@ pub struct ScriptedHost {
     tasks: Mutex<VecDeque<PluginTask>>,
     blocking: Mutex<VecDeque<BlockingTask>>,
     spawned: AtomicUsize,
+    diff_layout: Option<bcode_plugin_sdk::tui::PluginTuiDiffLayout>,
+    session_views: Mutex<
+        BTreeMap<String, tokio::sync::mpsc::Sender<bcode_plugin_sdk::tui::PluginSessionViewUpdate>>,
+    >,
 }
 
 impl std::fmt::Debug for ScriptedHost {
@@ -85,7 +89,19 @@ impl ScriptedHost {
             tasks: Mutex::new(VecDeque::new()),
             blocking: Mutex::new(VecDeque::new()),
             spawned: AtomicUsize::new(0),
+            diff_layout: None,
+            session_views: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Offer `layout` as the host's diff layout preference.
+    #[must_use]
+    pub const fn with_diff_layout(
+        mut self,
+        layout: bcode_plugin_sdk::tui::PluginTuiDiffLayout,
+    ) -> Self {
+        self.diff_layout = Some(layout);
+        self
     }
 
     /// Text written to the clipboard, oldest first.
@@ -96,6 +112,23 @@ impl ScriptedHost {
     #[must_use]
     pub fn clipboard(&self) -> Vec<String> {
         self.clipboard.lock().expect("clipboard lock").clone()
+    }
+
+    /// Sender of session-view updates for a session the surface subscribed to.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    #[must_use]
+    pub fn session_view(
+        &self,
+        session: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<bcode_plugin_sdk::tui::PluginSessionViewUpdate>> {
+        self.session_views
+            .lock()
+            .expect("session views lock")
+            .get(session)
+            .cloned()
     }
 
     /// Total redraw requests received through [`PluginTuiHost::request_redraw`].
@@ -119,6 +152,36 @@ impl ScriptedHost {
     pub fn pending_tasks(&self) -> usize {
         self.tasks.lock().expect("task lock").len()
             + self.blocking.lock().expect("blocking lock").len()
+    }
+
+    /// Execute one round of the captured async tasks and leave blocking jobs queued, as if work
+    /// on the host's blocking pool (such as syntax highlighting) had not finished yet. Returns
+    /// the number of executed tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a task panics or the round exceeds the harness timeout.
+    pub fn run_async_round(&self, runtime: &tokio::runtime::Runtime) -> usize {
+        let tasks: Vec<_> = self.tasks.lock().expect("task lock").drain(..).collect();
+        let executed = tasks.len();
+        Self::await_tasks(runtime, tasks);
+        executed
+    }
+
+    fn await_tasks(runtime: &tokio::runtime::Runtime, tasks: Vec<PluginTask>) {
+        if tasks.is_empty() {
+            return;
+        }
+        runtime.block_on(async {
+            let handles: Vec<_> = tasks.into_iter().map(tokio::spawn).collect();
+            tokio::time::timeout(TASK_ROUND_TIMEOUT, async {
+                for handle in handles {
+                    handle.await.expect("scripted task panicked");
+                }
+            })
+            .await
+            .expect("scripted tasks did not finish within the harness timeout");
+        });
     }
 
     /// Execute captured work until no task remains, including tasks spawned by tasks.
@@ -147,18 +210,7 @@ impl ScriptedHost {
             for job in blocking {
                 job();
             }
-            if !tasks.is_empty() {
-                runtime.block_on(async {
-                    let handles: Vec<_> = tasks.into_iter().map(tokio::spawn).collect();
-                    tokio::time::timeout(TASK_ROUND_TIMEOUT, async {
-                        for handle in handles {
-                            handle.await.expect("scripted task panicked");
-                        }
-                    })
-                    .await
-                    .expect("scripted tasks did not finish within the harness timeout");
-                });
-            }
+            Self::await_tasks(runtime, tasks);
         }
         panic!("scripted tasks kept spawning for {MAX_SETTLE_ROUNDS} rounds");
     }
@@ -199,19 +251,53 @@ impl PluginTuiHost for ScriptedHost {
             .map(str::to_owned)
             .collect()
     }
+
+    fn diff_layout(&self) -> Option<bcode_plugin_sdk::tui::PluginTuiDiffLayout> {
+        self.diff_layout
+    }
+
+    fn subscribe_session_view(
+        &self,
+        request: bcode_plugin_sdk::tui::PluginSessionViewSubscriptionRequest,
+    ) -> Result<bcode_plugin_sdk::tui::PluginSessionViewSubscription, PluginTuiHostError> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(request.buffer.max(1));
+        self.session_views
+            .lock()
+            .expect("session views lock")
+            .insert(request.session_id.to_string(), sender);
+        Ok(bcode_plugin_sdk::tui::PluginSessionViewSubscription { receiver })
+    }
 }
 
 /// One rendered terminal frame.
 #[derive(Debug, Clone)]
 pub struct Screen {
     buffer: Buffer,
+    hits: Vec<bmux_tui::hit::HitRegion>,
+    selection: bmux_tui::selection::SelectionScene,
 }
 
 impl Screen {
     /// Wrap a painted buffer.
     #[must_use]
     pub const fn new(buffer: Buffer) -> Self {
-        Self { buffer }
+        Self {
+            buffer,
+            hits: Vec::new(),
+            selection: bmux_tui::selection::SelectionScene::new(),
+        }
+    }
+
+    /// Selection scopes and text fragments registered while painting this frame.
+    #[must_use]
+    pub const fn selection(&self) -> &bmux_tui::selection::SelectionScene {
+        &self.selection
+    }
+
+    /// Interaction regions registered while painting this frame.
+    #[must_use]
+    pub fn hits(&self) -> &[bmux_tui::hit::HitRegion] {
+        &self.hits
     }
 
     /// Frame width in cells.
@@ -233,6 +319,40 @@ impl Screen {
             .row_symbols(y)
             .map(|row| row.trim_end().to_owned())
             .unwrap_or_default()
+    }
+
+    /// Symbols of the cells of row `y` inside `area`, trailing whitespace removed; empty when
+    /// the row is outside `area`.
+    #[must_use]
+    pub fn text_in(&self, area: Rect, y: u16) -> String {
+        if !(area.y..area.bottom()).contains(&y) {
+            return String::new();
+        }
+        (area.x..area.right())
+            .filter_map(|x| self.cell(x, y).map(|cell| cell.symbol.as_str()))
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    /// Cell column where `needle` starts in row `y`, comparing cell symbols (so wide graphemes
+    /// count as the cells they cover).
+    #[must_use]
+    pub fn column_of(&self, y: u16, needle: &str) -> Option<u16> {
+        let mut row = String::new();
+        let mut starts = Vec::new();
+        for x in 0..self.width() {
+            starts.push((row.len(), x));
+            if let Some(cell) = self.cell(x, y) {
+                row.push_str(&cell.symbol);
+            }
+        }
+        let byte = row.find(needle)?;
+        starts
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= byte)
+            .map(|(_, x)| *x)
     }
 
     /// All rows joined with newlines, trailing whitespace removed per row.
@@ -299,12 +419,17 @@ impl Screen {
 pub fn paint(width: u16, height: u16, draw: impl FnOnce(Rect, &mut PaintCx<'_, '_>)) -> Screen {
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
-    {
+    let (hits, selection) = {
         let mut frame = Frame::new(&mut buffer);
         let mut cx = PaintCx::new(&mut frame);
         draw(area, &mut cx);
+        (frame.hits().regions().to_vec(), frame.selection().clone())
+    };
+    Screen {
+        buffer,
+        hits,
+        selection,
     }
-    Screen::new(buffer)
 }
 
 /// A surface driven through scripted events and frames.
@@ -463,6 +588,14 @@ impl<S: PluginTuiSurface> Scenario<S> {
             }
         }
         panic!("surface did not settle within {MAX_SETTLE_ROUNDS} rounds");
+    }
+
+    /// Run one round of async tasks (blocking jobs stay queued, as if still running on the
+    /// host's blocking pool) and poll the surface once.
+    pub fn step_async(&mut self) {
+        self.host.run_async_round(&self.runtime);
+        let action = self.surface.poll(&self.host);
+        self.record(action);
     }
 
     /// Await the surface's queued effect drain once (may contact services the surface uses).

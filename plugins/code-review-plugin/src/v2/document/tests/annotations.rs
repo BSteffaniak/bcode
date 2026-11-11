@@ -29,6 +29,7 @@ fn anchor(path: &str, kind: ReviewLineKind, old: Option<u32>, new: Option<u32>) 
         is_file_anchor: false,
         surface_id: None,
         source_id: None,
+        head_oid: None,
     }
 }
 

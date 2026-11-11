@@ -75,6 +75,9 @@ pub struct DocAnchor {
     pub file: Option<FileRef>,
     /// Target.
     pub target: AnchorTarget,
+    /// Commit the file's source head resolved to when the anchor was made, when it is a
+    /// commit (recorded on the persisted anchor; see [`DraftAnchor::head_oid`]).
+    pub head_oid: Option<String>,
 }
 
 impl DocAnchor {
@@ -84,6 +87,7 @@ impl DocAnchor {
         Self {
             file: None,
             target: AnchorTarget::Review,
+            head_oid: None,
         }
     }
 
@@ -113,6 +117,7 @@ impl DocAnchor {
             is_file_anchor: false,
             surface_id: None,
             source_id,
+            head_oid: self.head_oid.clone(),
         };
         match &self.target {
             AnchorTarget::Review => {}
@@ -138,6 +143,7 @@ impl DocAnchor {
 }
 
 /// Target of a persisted anchor, before it is matched to a file.
+#[must_use]
 pub fn target_of(anchor: &DraftAnchor) -> AnchorTarget {
     match anchor.kind {
         ReviewAnchorKind::Review => AnchorTarget::Review,
@@ -327,6 +333,7 @@ mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         }
     }
 
@@ -372,9 +379,11 @@ mod tests {
                 "s", None, "a.rs",
             ))),
             target: AnchorTarget::Lines(lines),
+            head_oid: Some("abc".to_owned()),
         };
         let draft = doc.to_draft_anchor();
         assert_eq!(draft.source_id.as_deref(), Some("s"));
+        assert_eq!(draft.head_oid.as_deref(), Some("abc"));
         assert_eq!(target_of(&draft), AnchorTarget::Lines(lines));
     }
 }

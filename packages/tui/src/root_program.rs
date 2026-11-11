@@ -800,6 +800,9 @@ impl BcodeRuntimeModel {
             ),
             effort: self.chat.app.reasoning_effort().map(ToOwned::to_owned),
             summary: self.chat.app.reasoning_summary().map(ToOwned::to_owned),
+            diff_layout: Some(super::plugin_surface_host::plugin_diff_layout(
+                self.chat.app.effective_diff_viewer_config(),
+            )),
         }
     }
 

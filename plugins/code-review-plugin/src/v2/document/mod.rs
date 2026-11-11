@@ -32,9 +32,9 @@ mod keys;
 mod navigation;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-pub use anchors::{AnchorLines, AnchorTarget, Annotations, DocAnchor};
+pub use anchors::{AnchorLines, AnchorTarget, Annotations, DocAnchor, target_of};
 pub use build::estimate_rows;
 pub use document::{
     DEFAULT_RESIDENCY_BUDGET_BYTES, DocumentConfig, DocumentNeed, REVIEW_LEVEL_PATH,

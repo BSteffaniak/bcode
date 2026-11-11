@@ -20,6 +20,7 @@ pub fn tui_registry() -> PluginTuiRegistry {
     }
     registry.register_factory(Box::new(CodeReviewHomeSurfaceFactory));
     registry.register_factory(Box::new(CodeReviewSurfaceFactory));
+    registry.register_factory(Box::new(crate::v2::tui::ReviewSurfaceV2Factory));
     registry
 }
 

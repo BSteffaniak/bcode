@@ -166,6 +166,107 @@ shows the first of two runs; the second came within 5%.
 | Page read: `item`, `sections`, and `index_of` for 60 items | 0.062 ms avg, 0.076 ms p95 |
 | Resident content | peak 64.0 MiB at the default 64 MiB budget; 1,647 files resident at the end |
 
+#### V2 screen (phase 3a)
+
+Measured by the ignored test `v2::tui::tests::benchmark::v2_screen_benchmark`
+(`cargo test -p bcode_code_review_plugin v2_screen_benchmark -- --ignored --nocapture`) on the
+same fixture, machine, and **debug** profile, at 200×60 through the harness frame driver against
+the real V2 service in-process (branch compare, 5,063 files). Only `render` is timed; service calls
+and highlighting run between frames, as on the host. One run is shown; a second came within
+about 10%.
+
+| Measurement | V1 | V2 screen |
+| --- | --- | --- |
+| Open: resolve sources and list the whole index | 956 ms materialize + 4.3 s JSON | 738 ms |
+| First frame after the index (document built) | 3,077 ms first frame after `ReviewApp::new` | 68 ms first render (10,126 items measured); 208 ms until the first files' hunks are loaded and painted |
+| Scroll the 5k-file review (wheel, page every 10th frame, 50-file jump every 100th) | 2,862 ms avg next-file frame, 3,879 ms p95 | 3,000 frames: 3.4 ms avg, 8.0 ms p95, 107 ms max (a frame measuring a freshly loaded file) |
+| Jump to the 40k-line file, then load and show it | 12,581 ms first frame | 1.1 ms jump frame; 1.14 s until loaded (31,997 diff lines measured) |
+| Scroll the 40k-line file | 6,966 ms avg, 7,301 ms p95 | 2,000 frames: 2.9 ms avg, 6.3 ms p95, 11 ms max |
+| Resident content after the 5k-file scroll | whole review | 15.7 MiB, 436 files |
+
+Two generic BMUX additions came out of profiling: `VirtualItemSource::measure_hint` lets a source
+report exact heights of fixed-height rows and placeholders without constructing them (the first
+render measured every item by construction before), and `diff_viewer::diff_row_height` measures a
+wrapped diff row with the same wrap geometry as `layout_diff_row` without producing rows (loading
+the 40k-line file previously built every line once only to measure it: 1.76 s). Criterion B's
+2 ms p95 target is for an optimized build; these debug numbers are the like-for-like comparison
+with the V1 table.
+
+#### V2 screen with chrome and panels (phases 3b and 4)
+
+The same benchmark after the review chrome landed: header, footer, and the file panel on the left
+(44 columns at 200×60, so the document list is about 150 columns wide and still side by side).
+Wheel events are sent over the document list. The "after the index" latency now starts when the
+index arrives, so it includes building the document and the 5,063-file tree. One run is shown.
+
+| Measurement | Phase 3a | Phases 3b and 4 |
+| --- | --- | --- |
+| Open: resolve sources and list the whole index | 738 ms | 829 ms |
+| File tree from the opened document (5,170 rows) | — | 23 ms |
+| First frame after the index | 68 ms first render; 208 ms with content | 73 ms first render; 251 ms with content (includes document and tree construction) |
+| Scroll the 5k-file review | 3.4 ms avg, 8.0 ms p95, 107 ms max | 4.9 ms avg, 9.8 ms p95, 81 ms max |
+| Jump to the 40k-line file, then load and show it | 1.1 ms jump; 1.14 s until loaded | 3.2 ms jump; 1.11 s until loaded |
+| Scroll the 40k-line file | 2.9 ms avg, 6.3 ms p95, 11 ms max | 3.7 ms avg, 5.7 ms p95, 11 ms max |
+| Resident content after the 5k-file scroll | 15.7 MiB, 436 files | 15.5 MiB, 432 files |
+
+A frame now lays the body out twice (a probe pass that sizes the document, then the real pass)
+and paints the header, the file tree's visible rows, and the footer. A side experiment over 600
+scroll frames measured 3.6 ms avg (4.9 ms p95) with the file panel shown and 4.1 ms (6.6 ms) with
+it hidden, where the document is wider: the panel itself is cheap and the list's width dominates.
+
+#### V2 screen with review interaction (phase 3c)
+
+The same benchmark after review interaction landed (annotations, composer, pointer, search,
+selection). One run is shown.
+
+| Measurement | Phases 3b and 4 | Phase 3c |
+| --- | --- | --- |
+| First frame after the index | 73 ms first render; 251 ms with content | 83 ms first render; 423 ms with content (now also lists the review's annotations) |
+| Scroll the 5k-file review | 4.9 ms avg, 9.8 ms p95, 81 ms max | 6.9 ms avg, 12.9 ms p95, 54 ms max |
+| Jump to the 40k-line file, then load and show it | 3.2 ms jump; 1.11 s until loaded | 2.7 ms jump; 1.11 s until loaded |
+| Scroll the 40k-line file | 3.7 ms avg, 5.7 ms p95, 11 ms max | 4.9 ms avg, 7.9 ms p95, 37 ms max |
+
+Most of the added frame time is registering the painted diff text as BMUX selection fragments
+(one per grapheme, so selections and copies map to exact cells). The fragments are built once per
+item and width with its rows; each frame clones and translates the visible ones. Generating them
+per frame instead measured 8.6 ms avg (13.5 ms p95) on the 5k-file scroll. BMUX has no way for a
+paint pass to say that no selection controller will read the scene; such an opt-in would remove
+this cost where selection is not used.
+
+#### V2 screen at phase 3 close (review pass)
+
+The same benchmark after the phase 3 review. The benchmark now starts the "after the index"
+clock as soon as the document exists and reaches first content by running async work only
+(`Scenario::step_async`); the harness runs blocking-pool work such as syntax highlighting
+serially on the test thread, so settling it there (as earlier rows did) added every visible
+file's highlighting to the latency. Rows paint unhighlighted until highlighting lands. One run is
+shown.
+
+| Measurement | Phase 3c | Phase 3 close |
+| --- | --- | --- |
+| First frame after the index | 83 ms first render; 423 ms with content (settled, including highlighting) | 59 ms first render; 289 ms with content; 379 ms highlighted |
+| Scroll the 5k-file review | 6.9 ms avg, 12.9 ms p95, 54 ms max | 7.2 ms avg, 13.8 ms p95, 58 ms max |
+| Jump to the 40k-line file, then load and show it | 2.7 ms jump; 1.11 s until loaded | 2.9 ms jump; 1.14 s until loaded |
+| Scroll the 40k-line file | 4.9 ms avg, 7.9 ms p95, 37 ms max | 5.2 ms avg, 8.4 ms p95, 40 ms max |
+
+Criterion B status (debug build only; an optimized build was not run, so the optimized targets
+are unverified):
+
+* First frame with tree and content ≤ 150 ms: 289 ms in debug. Of that, about 40 ms is building
+  the document and the file tree, 59 ms the first render (measuring all 10,126 items through
+  `measure_hint`), and the rest the in-process hunk service calls for the first files (git,
+  JSON encode and decode) and the concurrent annotation listing.
+* Steady scroll ≤ 2 ms p95: 13.8 ms p95 in debug. A sampling profile of the scroll frames
+  attributes about 64% to painting (diff text writes, the file tree's visible rows, and 15%
+  registering selection fragments), 26% to laying out the list (building newly visible rows,
+  of which selection fragments are 40%, and measuring newly loaded files), and 5.5% to the
+  canvas fill. No frame rebuilds unaffected items, and no algorithmic hotspot remains; the
+  selection-fragment cost is BMUX's per-grapheme fragment model (the host does not yet read
+  plugin-surface selections).
+* Resident content stays at the 64 MiB budget (15.5 MiB, 432 files after the 5k-file scroll).
+* No service call or syntax highlighting on the render path: confirmed by review (`render`
+  only reports the viewport; `poll` issues requests and highlighting runs on the blocking pool).
+
 ## 3. Layered architecture
 
 ```
@@ -432,10 +533,18 @@ annotation with an identical anchor, else to their own agent item. A line anchor
 its last line (in either layout), or after the gap that hides that line. It is outdated when a
 range endpoint no longer exists, or when a single-line anchor's line exists but is no longer the
 same kind (for example a removed line that is now context); outdated anchors are shown at the
-file level, and anchors to files no longer in the review at the review level. The resolved head
-OID (above) is not yet stored on `DraftAnchor`: adding the field touches every V1 anchor
-constructor, and outdated detection does not need it because it checks the anchored line itself.
-It lands with the V2 composer (phase 3).
+file level, and anchors to files no longer in the review at the review level.
+
+**Implementation (phase 3c).** `DraftAnchor::head_oid` (serde-defaulted, omitted when absent)
+records the commit the file's source head resolved to when the anchor was made, when the head is
+a commit (working-tree and index heads record none). Every V2 anchor carries it
+(`ReviewDocument::head_oid`). A line anchor made at a head other than the source's current head
+is outdated with `OutdatedReason::RevisionChanged` and shown at the file level, since its line
+numbers may name other content; anchors without a recorded head keep the line checks above.
+Thread identity ignores the head: `thread_id` hashes the anchor with `head_oid` cleared, so V1
+(which records none) and V2 address the same thread, and anchors without a head hash exactly as
+before. The service stores it in `draft_threads.head_oid` (migration `019_thread_head_oid_column`);
+AI exchanges and suggestions keep it in their anchor JSON.
 
 ### 5.4 Viewed state
 
@@ -490,6 +599,67 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * Wrap toggle; hide-whitespace toggle (re-requests hunks with `-w`).
 * Scrollbar over the whole review, with markers for threads and the current file.
 
+**Implementation (phases 3b and 4).** `src/v2/tui/` (`chrome.rs`, `panels.rs`, `files.rs`):
+
+* **Body.** A BMUX `panel_group` of bordered BMUX `pane`s: the file panel, the review document,
+  and the threads panel. Dividers lie on the panes' shared borders and can be dragged; the focused
+  pane's border uses the focused-border role. Each frame lays the body out twice, first with a
+  probe in the document's place (to learn its exact size), then for real after the document list
+  is prepared at that size; painting, hit regions, and event routing all use the second layout.
+* **Narrow-width degradation** (`panels.rs`), decided per frame from the body size:
+  1. Below 24 columns or 5 rows the document takes the whole body without pane chrome and no
+     side panel shows.
+  2. The file panel shows when the user opened it (from 60 columns of body), or when nobody chose
+     and the body has at least 100 columns. Its width is the user's (default a quarter of the
+     body, 18 to 44 columns), clamped so the document keeps 40 columns.
+  3. The threads panel shows when opened: to the right from 150 columns, under the document from
+     20 rows, otherwise not at all.
+  4. Focus never stays on a hidden pane; it returns to the document.
+* **File panel.** A BMUX `text_input` filter row over a BMUX `tree_view` in a `scroll_view` (the
+  pane border carries its scrollbar). One group per source (or part) when there is more than one;
+  directories in path order with single-directory chains compacted (`src/v2/tui/`); files in
+  document order. File rows: status letter in its status color, the name (muted when viewed,
+  crossed out when deleted), and right-aligned decorations, leftmost dropped first on narrow
+  rows: stack layers, drafts, threads, a five-cell change bar (cells by size, split by
+  added/removed share), `+/−` counts (`bin` for binary files), and the viewed mark. Directory
+  rows: threads, aggregate counts, and viewed progress (`v/n`, or `✓ n` when all are viewed).
+  The tree is built once per document (23 ms for 5,063 files); afterwards only files whose
+  header the document rebuilt (noted from splices) refresh their row and ancestors in place, and
+  the tree view's `items_revision` changes only then, so its projection is reused across frames.
+  Clicking a directory toggles it (BMUX `toggle_on_click`).
+* **Filter.** `f` focuses the filter; every word must occur in the path (case-insensitive);
+  matches keep their directories, which cannot collapse while filtering. `enter` opens the first
+  match and moves to the tree, `down`/`tab` move to the tree, `esc` clears (then leaves). Typing
+  never reaches review actions.
+* **Tree ↔ document.** Selecting a file row (click, `j`/`k`, arrows, pages) moves the document
+  cursor to its header; `enter` also focuses the document. When the cursor reaches another file
+  (keys, scrolling, wheel), the tree selects it, or its outermost collapsed directory, and
+  scrolls it into view. Tree-originated jumps do not echo back.
+* **Header** (`chrome.rs`): title, source chips (BMUX `badge`; a single source named like the
+  review is not repeated, more than two collapse into `+N`), `+/−` totals, `viewed x/y` with a
+  BMUX `progress_bar`, the draft count, the layout mode, and a BMUX `split_button` publish
+  placeholder (it explains that publishing is not in V2 yet). Parts are measured by their own
+  component or text width. Elision order when narrow: publish, the second chip (`+N`), drafts,
+  totals, the first chip, the progress bar, the mode, the viewed count; parts are dropped while
+  the title would get fewer than its width (at most 40) cells, then the title is truncated.
+* **Footer.** BMUX `key_hint_bar` with contextual hints from the keymap (expansion first on a
+  gap; tree, filter, and threads hints when those have focus); hints that do not fit whole are
+  dropped from the end, never cut. A BMUX `status_bar` message (and the count prefix) sits on
+  the right, using at most half the row.
+* **Toasts.** BMUX `toast_stack` (card style) at the bottom right of the body for async results
+  and errors: review refreshed, refresh failed, failing sources, layout save failed, the publish
+  placeholder. Information expires after 4 s, errors after 10 s; at most three show.
+* **Threads panel.** Lists threads and AI answers from the document (selecting one moves the
+  cursor to it); until annotations load (phase 3c) it shows a BMUX `empty_state`.
+* **Persistence.** File panel visibility and width, and threads panel visibility and size, are
+  kept in the workspace's `presentation_v2.panels` (`ReviewPanelState`) and restored when the
+  surface opens a workspace. Durable workspaces are saved with `review.workspace.update` (changes
+  during a save are saved after it); transient workspaces keep the state in memory.
+* **Keys** (scope `code-review-v2`): `tab` next pane, `t` show/hide the file panel, `f` filter,
+  `>`/`<` widen/narrow the file panel, `T` threads panel. In the tree: `j`/`k`/arrows, pages,
+  `g`/`G`, `enter` open, `space` fold, `left` collapse or go to the parent, `right` expand,
+  `esc` back to the document.
+
 ### 6.2 Interaction
 
 * Keyboard: line/page/half-page scrolling, next/previous file, hunk, thread, and unviewed file;
@@ -501,6 +671,84 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * AI questions keep using `PluginTuiAction::OpenSession`; returning restores the exact position.
 * All keys are declared in the plugin manifest keymap (configurable), as today.
 
+**Implementation (phase 3c).** `src/v2/tui/` (`notes.rs`, `composer.rs`, `agent.rs`,
+`palette.rs`, `surface/annotate.rs`, `surface/pointer.rs`, `surface/find.rs`):
+
+* **Annotations** (`notes.rs`). Drafts, AI exchanges, and suggestions load through the existing
+  operations (`draft.list`, `review.ai_exchanges.list`, `review.suggestions.list`) with V1's
+  workspace scope, so V1 and V2 read and write the same threads. Changes are optimistic and go
+  to the document at once; their calls run one at a time in order (`draft.save`, `draft.update`,
+  `draft.delete`, `thread.resolve`, the new `thread.classify` for kind and severity,
+  `review.ai_exchange.delete`), each reconciled by its job and rolled back with a toast when it
+  fails. A draft keeps a local id until saved and cannot be edited or deleted meanwhile.
+* **Composer** (`composer.rs`). The document's composer item under its anchor: a title (anchor,
+  kind, severity), a BMUX `TextInputComponent` with the shared chat-composer editing policy
+  (`enter` submits, `shift+enter` adds a line, 3 to 8 rows), and clickable buttons (submit,
+  switch comment/question, preview, cancel). `ctrl+p` swaps the editor for a markdown preview.
+  Its geometry is one `ComposerLayout` read by measuring, painting, and clicks; the list
+  re-measures it on every edit. Scope `code-review-v2-composer`: `ctrl+s` save, `ctrl+p`
+  preview, `ctrl+t` comment/question, `alt+k` kind, `alt+s` severity, `esc` cancel. Typing never
+  reaches review actions. Empty text is discarded.
+* **Threads and answers.** Thread rows show a header (count, kind, severity, open/resolved,
+  outdated reason, saving), markdown comments (bounded), and actions (Reply, Edit, Delete,
+  Resolve/Reopen, Ask Bcode), all clickable where painted. AI answer rows show live status, the
+  question, the latest answer (markdown, bounded) or status, suggestions, and Open session,
+  Retry (after the stream stopped), and Delete. Keys: `c` comment (reply on a thread), `a` ask,
+  `F` file comment, `C` review comment, `i` edit, `D` delete, `R` resolve/reopen, `K` kind, `!`
+  severity, `o` open session, `)`/`(` next/previous thread.
+* **AI questions** (`agent.rs`). Submitting records a pending exchange at once; the next poll
+  saves it, creates a session titled `Review: <path>` in the repository, sends a bounded prompt
+  (anchor, ranges, up to 80 anchored diff lines, the question, the review service operations),
+  links the session (`thread.link_session`), saves the exchange as linked, and returns
+  `PluginTuiAction::OpenSession`. The cursor and list position are kept in memory and restored
+  by `session_navigation_finished`. Linked sessions are observed with
+  `PluginTuiHost::subscribe_session_view` (status waiting, working, answered, or failed, plus the
+  latest completed answer). The backend gained `create_session` and `send_message`.
+* **Pointer** (`surface/pointer.rs`). Items report clicks and pointer events through the list's
+  routing, so only painted, visible items receive them. Hovering a diff line shows a `+` on its
+  first gutter cell (a hit region on exactly that cell); clicking it comments on the line.
+  Pressing on a line moves the cursor; dragging selects a line range within the file (every row
+  of wrapped lines is painted selected) and scrolls a row at a time when the pointer leaves the
+  list, extending to the line on the first uncovered row at that edge (below the pinned headers
+  at the top); releasing over another line opens a range composer. A resize drops the hover and any
+  drag. The wheel starts (or extends from its target) a keyed BMUX `ScrollMotion` (90 ms, ease
+  out; the list's own wheel handling is off); polls ask for frames while it runs.
+* **Selection.** The document list is a BMUX selection scope; every painted diff row registers
+  its text as selection fragments from the row layout's source mapping (`DiffRowSegment::x` and
+  byte ranges, `painted_text_fragments`), so fragments cover exactly the painted cells and
+  partially hidden rows register none. `V` selects lines from the keyboard and `y` copies the
+  selected lines (else the cursor line) through `PluginTuiHost::copy_text`.
+* **Threads panel.** Rows come from the annotations (sorted by path and line): status,
+  severity, location, and the first line. `←`/`→` cycle the filter (all, open, needs attention
+  (unresolved warnings, blockers, questions, and to-dos, plus failed questions), general
+  (review-level)). Selecting a row jumps to the thread; one in a file whose content is not
+  resident lands on the file header and finishes once the file loads.
+* **Viewed** (`v`). Marks the cursor's file with its identity (`viewed::mark_viewed`, which keeps
+  `viewed_files` in step) and moves to the next unviewed file; on a viewed file it removes the
+  mark. `u`/`U` move between unviewed files. Marks the document reports as needing a new
+  identity are re-recorded as content loads. Durable workspaces are saved.
+* **Search** (`/`, `surface/find.rs`). A footer input (BMUX text input) searches resident
+  content on every edit (smart case) and moves to the first match at or after the cursor;
+  matches are restyled over exactly their cells (`DiffRowLayout::source_cells`), the current one
+  distinctly. The status shows `i/n` and `N unloaded files pending` for files with changes whose
+  content is not resident; the search re-runs as the document changes. `enter` keeps the
+  results, `n`/`N` step (wrapping), `esc` clears.
+* **Palette and help** (`palette.rs`). `:` or `ctrl+p` opens a BMUX `picker_frame` with a filter
+  input over a BMUX `menu` of every declared review action with its effective keys; `?` opens
+  the same menu without the input, with sections for the review and the composer. Both are
+  generated from the manifest keymap and run the chosen action; pointer events route through the
+  painted layout, and a press outside the panel closes it.
+* **Presentation** (spec 9). The scroll anchor (the item on the viewport's first row with a
+  persisted form and the rows of it scrolled above), the layout toggle, the panels, and the
+  revealed context are compared with the stored state at most once a second and saved when they
+  changed, and always on exit. On open they are restored once; a scroll anchor in a file whose
+  content is not resident applies when the file loads. Exiting while a workspace save or an
+  annotation call is still running shows `saving…` and closes once they finish (at most 5 s;
+  exiting again closes at once), because the host may end the process as soon as the surface
+  closes.
+* **Not yet.** Host completion and history in the composer (`FocusedTextFieldAdapter`), the V1
+  structured AI commands, suggestion accept/refine/reject, collapsing threads, and publishing.
+
 ### 6.3 Visual system
 
 * `ReviewTheme` is derived from the presentation theme's `ComponentTheme` with semantic roles:
@@ -510,6 +758,35 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * Every row is composed from styled spans; no formatted single-string rows.
 * Icons have ASCII fallbacks selected by presentation policy.
 * Home and review share one theme derivation.
+
+**Implementation (phase 4).** `src/v2/tui/theme.rs`:
+
+* `ReviewTheme::derive` takes the host's `PluginTuiTheme`: its `ComponentTheme` (when the
+  contract version matches) and its diff styles. Without a host theme, the roles derive from a
+  built-in dark seed palette through `ComponentTheme::derive`, so tests and older hosts still get
+  a complete, colorful theme.
+* Roles: status (added and removed follow the diff's added/removed colors; modified uses
+  warning, renamed info, binary muted italic), file path (bold; muted once viewed), directory,
+  `+`/`−` counts and change-bar cells (the diff's colors, unused cells in the border color),
+  badges (draft warning, open info, resolved success, outdated muted italic, AI accent italic),
+  viewed mark, gutter (the diff layout's gutter style, so line numbers and the role agree), hunk
+  header text and a full-row hunk fill (overlay surface), file header fill (raised surface; both
+  stay pinned as sticky headers), gaps and their actions (link), threads, the cursor line
+  (inactive-selection background) versus a selected range (selection background, kept distinct),
+  pane border versus focused border, header and footer bars, filter input and placeholder, and
+  scrollbar marks. The BMUX component styles (tree focused and unfocused, dividers, badges,
+  progress bar, key hints, status bar, toasts, publish button) derive from the same theme.
+* A theme change restyles every row (the row cache keys on a paint revision) and rebuilds the
+  tree's items once.
+* Icons: `Icons::UNICODE` or `Icons::ASCII`, chosen by
+  `[plugins.config."bcode.code_review".review_v2] icons = "unicode" | "ascii"`. The set covers
+  viewed/unviewed marks, thread, draft and AI icons, the file-header accent bar, separators, the
+  rename arrow, the minus sign, gap rules and reveal arrows, ellipses, change-bar and progress
+  cells, the publish menu toggle, the filter prompt, and the panel's hide action; the loading
+  spinner switches to ASCII frames too. BMUX-owned glyphs (pane borders, tree disclosure
+  markers) are not part of it.
+* Every row is composed from styled spans (rows, tree labels and decorations, header parts,
+  hints, toasts).
 
 ### 6.4 Performance pipeline
 
@@ -522,6 +799,52 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * Frames are pure: one snapshot per frame, no service calls, no recomputation of unchanged items,
   regional damage on scroll.
 
+**Implementation (phase 3a).** `src/v2/tui/` implements the review screen core:
+
+* **Launch.** `bcode review <subcommand> --ui v2` (on every interactive review subcommand) or
+  `BCODE_REVIEW_UI=v2` opens the `code-review-v2` surface kind; `bcode review` without a
+  subcommand stays on V1 home until phase 5. The host opens any registered plugin surface as a
+  standalone startup surface (7.1); V1 routing is unchanged.
+* **Loading.** The first `poll` spawns the open task: provider routing, `review.sources.resolve`,
+  a change token, and every index page. A BMUX `empty_state` with a spinner shows index progress
+  until the document exists; input is never blocked. Afterwards `poll` applies finished work and
+  serves `take_needs` with at most four service calls in flight. Rendering only reports the
+  visible range to the document; frames make no service calls.
+* **List.** The document is a lazy BMUX `VirtualItemSource` keyed by item keys, with sticky file
+  (level 0) and hunk (level 1) sections, document splices noted on the list state, wheel
+  scrolling and a scrollbar with marks for the cursor's file and (once annotations exist) threads.
+  Items report exact heights without construction (`measure_hint`), so only visible items are
+  built.
+* **Rows.** Diff lines and pairs are laid out by BMUX `layout_diff_row` with one gutter per
+  document (growing with the largest line number seen, at least four digits), intra-line
+  emphasis (side-by-side pairs, and unified removed/added runs paired positionally), syntax
+  ranges, and an explicit overflow (wrap toggle: `Wrap` or `Truncate`). Headers, hunk headers,
+  notices, placeholders, gaps (`↑ 20 · N hidden lines · ↓ 20 · all`, degrading to `↑20 N ↓20 all`
+  and `⋯ N` when narrow, with click segments only while fully shown), and minimal annotation rows
+  are styled spans clipped by BMUX text primitives. Rows are cached per item, width, and
+  presentation revision in a bounded two-generation cache; measurement, painting, and hit
+  regions read the same rows.
+* **Layout.** Unified, side-by-side, or automatic by width: the host's `[tui.diff_viewer]`
+  preference arrives through the generic `PluginTuiHost::diff_layout`, the plugin's
+  `[plugins.config."bcode.code_review".review_v2]` (`diff_layout`, `side_by_side_breakpoint`)
+  overrides it, and the in-review toggle overrides both for the session. Switching keeps the top
+  item and the cursor on the same lines (`map_key`).
+* **Highlighting.** Both sides of visible resident text files are read whole (bounded to 100,000
+  lines and 8 MiB), highlighted on the blocking pool with BMUX's whole-text projection, and cached
+  by blob identity (working-tree content by path and refresh generation) and palette (64 entries,
+  400,000 lines). Rows look tokens up by line number verified against their text.
+* **Input.** Keys are declared in the manifest under the `code-review-v2` scope: `j`/`k`, half
+  pages (`ctrl+d`/`ctrl+u`), pages, `g`/`G`, files (`n`/`p`), hunks (`}`/`{`), changes
+  (`]`/`[`), gap expansion on the cursor gap (`e` below, `E` above, `x` all, `X` whole file;
+  count prefixes set the lines), layout (`S`), wrap (`W`), refresh (`r`), and exit (`q`, `esc`).
+  The cursor is a keyed item revealed below the sticky headers; viewport scrolling drags it
+  along. Motions into unloaded files land on the file header and repeat once it loads.
+* **Refresh.** `r` and terminal focus regain compare `review.sources.token`; a changed token
+  re-opens the review keeping expansions, layout, the cursor, and the top item.
+* **Not yet.** Tabs render as one replacement cell (BMUX's control-character policy for painted
+  text); tab expansion belongs in BMUX's row layout. Wheel and page scrolling move immediately
+  rather than through `ScrollMotion`.
+
 ## 7. Home and new-review flow
 
 ### 7.1 One surface, internal routes
@@ -531,6 +854,12 @@ plugin runtime loads once per `bcode review` invocation; moving between routes n
 or reinitializes the TUI. The host gains one generic capability: run any registered plugin surface
 as a standalone startup surface by plugin id and surface kind. All `code-review` special cases are
 removed from `packages/tui` and `packages/cli`.
+
+**Implementation (phase 3a).** The generic capability landed first: `packages/tui`'s
+`plugin_surface_launcher` loads the plugin runtime once, finds the single loaded plugin whose
+manifest declares the requested surface kind, opens it with the caller's string options, and runs
+it until it closes. Startup surface kinds without a host special case (such as `code-review-v2`)
+go through it. The V1 `code-review` special cases remain until phase 7.
 
 ### 7.2 Home
 
@@ -626,6 +955,15 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
   scrollbar.
 * Any performance work found by the phase 0 benchmarks in virtual-list measurement, painting, or
   damage tracking.
+* **Found while building the chrome (phases 3b and 4):** `TreeViewComponent::toggle_on_click`
+  (a click on an expandable row toggles it as well as selecting it), and event routing in
+  `PanelGroupComponent` and `PaneComponent`, which added a child's absolute position to an
+  already translated event context, so panels and panes not at the screen origin (or nested)
+  delivered pointer events at doubled offsets. Both route children relative to themselves now,
+  with BMUX tests for placed and nested containers.
+* **Found in the phase 3 review:** `ToastStack` measured its close button by byte length and
+  painted it after the title while its hit region (and `close_at`) used the toast's last column;
+  the glyph is now painted on that column and titles are truncated by display width before it.
 
 ## 9. Persistence and compatibility
 
@@ -641,6 +979,9 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
     older form. Viewed marks and reviewed
     revisions are durable review data and must parse.
   * The fields are omitted from workspace JSON when empty, so existing payloads are unchanged.
+  * Migration `019_thread_head_oid_column` adds the nullable `draft_threads.head_oid` (5.3). The
+    additive operation `thread.classify` (`ClassifyThreadRequest`) sets a thread's kind and
+    severity, creating the thread like `thread.resolve` does.
 * Unknown future source kinds are preserved and surfaced as unsupported, not guessed: they
   deserialize as `ReviewSourceKind::Unsupported { kind, raw }`, serialize back verbatim, and
   resolve to an `unsupported_source_kind` diagnostic. V1 reports the new and unknown kinds as an

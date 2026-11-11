@@ -8,6 +8,7 @@
 
 pub mod fixture;
 pub mod harness;
+pub mod local_backend;
 mod v1_baseline;
 mod v1_smoke;
 mod v2_data_benchmark;

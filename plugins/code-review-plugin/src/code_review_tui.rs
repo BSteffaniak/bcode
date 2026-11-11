@@ -3383,6 +3383,7 @@ impl From<ReviewCommentAnchor> for ModelDraftAnchor {
             is_file_anchor: local.is_file_anchor,
             surface_id: local.surface_id,
             source_id: local.source_id,
+            head_oid: None,
         }
     }
 }
@@ -16146,6 +16147,7 @@ pub(crate) mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         };
         let statuses = [
             ModelReviewSuggestionStatus::Suggested,
@@ -16442,6 +16444,7 @@ pub(crate) mod tests {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            head_oid: None,
         };
         app.load_external_imports(vec![ExternalReviewImportRecord {
             workspace_id: app.workspace.id.clone(),

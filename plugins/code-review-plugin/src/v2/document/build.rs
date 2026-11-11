@@ -310,9 +310,23 @@ impl ReviewDocument {
                 Slot::Hidden(line) => slots.hidden.entry(line).or_default().push(emit),
             }
         };
+        let head = self.groups[state.group].source.head.commit_oid();
         for &index in &self.file_annotations[file] {
+            let annotation = &self.annotations[index];
+            // An anchor made at another head commit cannot be matched exactly: it is shown as
+            // outdated rather than re-attached to whatever line now has its number.
+            if matches!(annotation.target, AnchorTarget::Lines(_))
+                && let (Some(made), Some(head)) = (annotation.anchor.head_oid.as_deref(), head)
+                && made != head
+            {
+                slots.file_level.push(Emit::Annotation(
+                    index,
+                    AnchorPlacement::Outdated(OutdatedReason::RevisionChanged),
+                ));
+                continue;
+            }
             let emit = Emit::Annotation(index, AnchorPlacement::File);
-            place(emit, &self.annotations[index].target, &mut slots);
+            place(emit, &annotation.target, &mut slots);
         }
         if let Some(anchor) = &self.composer
             && anchor.file.as_ref() == Some(&state.key)

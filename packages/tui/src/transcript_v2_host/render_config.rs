@@ -558,16 +558,10 @@ struct VisualContextBase {
 
 impl VisualContextBase {
     fn of(app: &BmuxApp) -> Self {
-        use bcode_plugin_sdk::tui::PluginTuiDiffLayout;
-        let diff = app.effective_diff_viewer_config();
         Self {
-            diff_layout: match diff.layout {
-                TuiDiffViewerLayout::Auto => PluginTuiDiffLayout::Auto {
-                    breakpoint: diff.side_by_side_breakpoint,
-                },
-                TuiDiffViewerLayout::Unified => PluginTuiDiffLayout::Unified,
-                TuiDiffViewerLayout::SideBySide => PluginTuiDiffLayout::SideBySide,
-            },
+            diff_layout: crate::plugin_surface_host::plugin_diff_layout(
+                app.effective_diff_viewer_config(),
+            ),
             theme: crate::render::plugin_theme_for_app(app),
         }
     }
