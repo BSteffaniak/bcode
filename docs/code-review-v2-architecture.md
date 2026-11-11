@@ -146,6 +146,26 @@ git's refreshed stat data makes these calls much cheaper. Listings with an index
 side are not cached: each page re-runs the listing, and a cursor from a listing that has since
 changed is rejected with `cursor_stale`.
 
+#### V2 document (phase 2)
+
+Measured by the ignored test `v2::document::tests::benchmark::v2_document_benchmark`
+(`cargo test -p bcode_code_review_plugin v2_document_benchmark -- --ignored --nocapture`) on the
+same fixture, machine, and **debug** profile. The document is built from the real 5,063-entry
+branch-compare index; scrolling then pages through the whole review 60 items at a time, keeping
+the viewport anchored through splices as a virtual list does. Every hunk and blob request the
+document issues is answered at once with synthetic content shaped by the entry's `+/-` counts, so
+the numbers measure the document (needs, item construction, splices, residency), not git. Each
+page read also resolves every item's key back to its index, as scroll anchoring does. The table
+shows the first of two runs; the second came within 5%.
+
+| Measurement | V2 document |
+| --- | --- |
+| Build from the index (5,063 files, 10,126 items) | 18 ms |
+| Scroll the whole review (15,909 pages, 5,063 hunk loads, 18,564 splices) | 2.0 s total, page steps and page reads |
+| Page step: viewport, needs, loads, and splices | 0.064 ms avg, 0.12 ms p95, 21 ms max (one large file load) |
+| Page read: `item`, `sections`, and `index_of` for 60 items | 0.062 ms avg, 0.076 ms p95 |
+| Resident content | peak 64.0 MiB at the default 64 MiB budget; 1,647 files resident at the end |
+
 ## 3. Layered architecture
 
 ```
@@ -258,6 +278,15 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
 * Unloaded files occupy estimated height (from `+/-` counts) so the scrollbar and jump targets work
   across the whole review before content arrives.
 
+* **Implementation (phase 2).** The client reports the visible item range; the document derives
+  a protected window (default 120 estimated rows each side of the viewport, loaded even over the
+  budget) and a prefetch window (default 400 rows, loaded while under the budget). Content beyond
+  the budget (default 64 MiB, counting hunk and context text plus per-line and per-item
+  overhead) is evicted least recently used, never inside the prefetch window, which keeps the
+  window from thrashing. Resident files are kept ordered by last use, so enforcing the budget
+  costs the window plus the evicted files, not the whole review. Requests carry tickets; results
+  for tickets that are no longer outstanding (the file was evicted or re-requested) are ignored.
+
 ### 4.4 Review-source provider interface (new)
 
 `bcode.review_source/v1` lets provider plugins advertise and resolve pull-request sources, keeping
@@ -329,6 +358,36 @@ path; lines keyed by side and line number; threads by id), never list indices. P
 (`ReviewItemKey`, `ReviewFileExpansion`) carry the optional part index for the same reason. Layout mode (unified/split) changes item
 construction but not item identity for threads and anchors.
 
+**Implementation (phase 2).** `src/v2/document/` implements this section with a renderer-neutral
+`ReviewDocument`:
+
+* Items are built per file block; a file whose content is not resident is its `FileHeader` plus
+  one `Placeholder` item carrying an estimated height (changed lines plus a header and six
+  context lines per estimated hunk of ten changed lines). File-level annotations stay visible for
+  non-resident files; line annotations appear once the file is resident.
+* The sequence API is item count, item at index, index of key (layout-mapped), sticky sections
+  (file header level 0, hunk header level 1; expanded context and gaps belong to the file only),
+  and splices (`start`, `removed`, `inserted`, `revision`) with prefix/suffix trimming so an
+  expansion only replaces the gap region. Block offsets live in a Fenwick tree and each block
+  keeps a lookup of its items (line items by side and line number, other items by key), so
+  `item`, `sections`, and `index_of` cost `O(log n)`; thread keys find their block through a
+  key map. Switching layout rebuilds every file, because placeholder estimates depend on it.
+* Side-by-side pairs removed and added runs of a hunk positionally; a row with both a removed and
+  an added line carries an intra-line emphasis hint. A line key resolves to the item showing
+  that side's line in the current layout: a unified line key to the row containing it, a row
+  key to its new-side line (its old-side line when it has none).
+* Navigation (6.2) reports a target inside a non-resident file at that file's header with
+  `needs_load`, at the position of its placeholder in the motion's order (after the file's
+  file-level annotations); the client loads the file and repeats the motion from its original
+  position.
+* `SourceHeader` items appear when there is more than one source (or part) or a stack source.
+  Whole-stack sources request `review.stack.attribution` for each resident text file and label
+  file headers, hunk headers, and changed lines with the layer that wrote or removed them.
+* Browse sources have no hunks: their files are resident without a request, and their
+  `line_range` (or the whole file) starts revealed. Browse expansion is not persisted.
+* The document performs no I/O. It does not depend on BMUX, crossterm, or terminal types; this is
+  enforced by review within the plugin crate (section 3).
+
 ### 5.2 Context expansion
 
 * Per file, expansion state is an interval set of revealed new-side lines (`BTreeMap`-backed,
@@ -344,10 +403,39 @@ construction but not item identity for threads and anchors.
 * Expanded context lines are anchorable. Publishers that cannot anchor outside diff hunks use the
   existing unmapped-to-summary fallback.
 
+**Implementation (phase 2).**
+
+* The context side is the new side, or the old side when the new side is absent (deleted
+  files); revealed intervals, gap keys, and blob reads use that side. A region between hunks has
+  a constant offset to the other side, so both line numbers come from hunk headers.
+* The file's line count comes from the first of: a whole-file hunk (added and deleted files),
+  a last hunk with fewer trailing context lines than were requested (git ran out of lines), or a
+  `review.blob.lines.get` response (a zero-line probe, or the first revealed chunk). Until then
+  the region after the last hunk is an open-ended gap. A truncated diff has no gap after its last
+  returned hunk; binary files and submodules have no gaps.
+* "Reveal N above" reveals the gap's last N lines (directly above the content below it); "reveal
+  N below" reveals its first N lines. Operations on a gap address it by key (file and first hidden
+  line); a stale key whose first line is already revealed does nothing. The revealed set is
+  normalized after every change (hunk coverage removed, clamped to the line count), so its
+  representation is independent of operation and load order.
+* Revealed lines whose text is not resident are `Loading` until their blob range arrives;
+  failed ranges are `Unavailable` with the reason and are not retried automatically.
+
 ### 5.3 Anchors
 
 Anchors keep the existing source-identity model and add the resolved head OID. An anchor whose
 line no longer exists after refresh is shown as outdated in its thread rather than silently moved.
+
+**Implementation (phase 2).** Drafts sharing a thread id form one `Thread` item; AI exchanges
+are `AgentThread` items; suggestions attach to the exchange from the same session, else to an
+annotation with an identical anchor, else to their own agent item. A line anchor is shown after
+its last line (in either layout), or after the gap that hides that line. It is outdated when a
+range endpoint no longer exists, or when a single-line anchor's line exists but is no longer the
+same kind (for example a removed line that is now context); outdated anchors are shown at the
+file level, and anchors to files no longer in the review at the review level. The resolved head
+OID (above) is not yet stored on `DraftAnchor`: adding the field touches every V1 anchor
+constructor, and outdated detection does not need it because it checks the anchored line itself.
+It lands with the V2 composer (phase 3).
 
 ### 5.4 Viewed state
 
@@ -371,6 +459,10 @@ working: V2 writes both, a viewed path without a mark is a legacy mark of unknow
 mark whose path V1 has unmarked is ignored. V1 viewed toggles (and mark-all / unmark-all) also
 drop the V2 marks of the paths they change, so a path V1 marks viewed again reads as a legacy
 mark rather than being judged by a stale identity.
+
+**Implementation (phase 2).** The document matches the workspace's effective marks against each
+file's index blob identities and, once its hunks were loaded, its patch id (which is kept after
+eviction), reports files whose marks should be re-recorded, and counts viewed files for progress.
 
 ## 6. Review screen (`tui/`)
 

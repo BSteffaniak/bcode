@@ -4,11 +4,13 @@
 //! `docs/code-review-v2-architecture.md`. It lives beside V1 so V1 can be deleted wholesale once
 //! V2 reaches parity.
 //!
+//! * [`document`] is the renderer-neutral review document (phase 2).
 //! * [`service`] is the lazy, revision-pinned data layer (phase 1).
 //! * [`provider`] routes pull-request and stack sources to review-source provider plugins from
 //!   the client.
 //! * [`viewed`] matches identity-pinned viewed marks.
 
+pub mod document;
 pub mod provider;
 pub mod service;
 #[cfg(test)]
