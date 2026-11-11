@@ -313,7 +313,11 @@ impl TranscriptV2Host {
             i64::from(viewport.y),
             LocalRect::new(0, 0, viewport.width, viewport.height),
             |child| {
-                engine.paint_frame(snapshot, child);
+                // Items sit on the canvas: a surface or fill that sets no background of its
+                // own (a tool frame, a speaker bar) keeps the canvas instead of clearing it.
+                child.with_style(style.background, |child| {
+                    engine.paint_frame(snapshot, child);
+                });
                 engine.paint_selection(snapshot, child, style.selection);
                 paint_interaction(snapshot, child, style.focus);
                 self.paint_markdown_focus(child);

@@ -1796,13 +1796,23 @@ impl SurfaceState {
             || Style::new().add_modifier(bmux_tui::style::Modifier::REVERSED),
             |policy| policy.style("selection"),
         );
+        let canvas = self
+            .bindings
+            .effective
+            .policy
+            .as_ref()
+            .map_or_else(Style::new, |policy| policy.style("surface"));
         let engine = self.transcript.engine();
         cx.with_child(
             i32::from(viewport.x),
             i64::from(viewport.y),
             LocalRect::new(0, 0, viewport.width, viewport.height),
             |child| {
-                engine.paint_frame(snapshot, child);
+                // Items sit on the canvas: a surface or fill that sets no background of its
+                // own (a tool frame, a speaker bar) keeps the canvas instead of clearing it.
+                child.with_style(canvas, |child| {
+                    engine.paint_frame(snapshot, child);
+                });
                 engine.paint_selection(snapshot, child, selection);
                 for (index, hit) in snapshot.hit_regions.iter().enumerate() {
                     let rect = terminal_rect(

@@ -247,3 +247,37 @@ fn f7_d7_activity_advances_only_on_accepted_frames() {
     let _ = paint(&mut host, at + Duration::from_secs(5), Duration::ZERO);
     assert_eq!(host.last_frame().expect("frame").activity, phase);
 }
+
+#[test]
+fn items_keep_the_canvas_background_where_they_set_none() {
+    use bmux_tui::style::{Color, Style};
+    let at = Instant::now();
+    let mut host = attached(3, at);
+    host.sync_geometry(REGION, at);
+    let canvas = Color::Rgb(10, 20, 30);
+    let mut paint_style = style(Duration::ZERO);
+    paint_style.background = Style::new().bg(canvas);
+    let area = Rect::new(0, 0, REGION.width, REGION.bottom() + COMPOSER.height + 1);
+    let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+    {
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        frame.set_clock(Some(bmux_tui::clock::PresentationClock::new(at)));
+        host.paint(
+            REGION,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            &paint_style,
+            at,
+        );
+    }
+    for y in REGION.y..REGION.bottom() {
+        for x in REGION.x..REGION.right() {
+            let cell = buffer.get(Point::new(x, y)).expect("cell");
+            assert_eq!(
+                cell.style.bg,
+                Some(canvas),
+                "cell ({x}, {y}) of row {:?} lost the canvas background",
+                buffer.row_symbols(y)
+            );
+        }
+    }
+}
