@@ -13,13 +13,16 @@
 use crate::v2::document::Annotations;
 use bcode_code_review_models::{
     ClassifyThreadRequest, ClassifyThreadResponse, DeleteDraftRequest,
-    DeleteReviewAiExchangeRequest, DraftAnchor, DraftComment, ListDraftsRequest,
-    ListDraftsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
+    DeleteReviewAiExchangeRequest, DraftAnchor, DraftComment, ExternalAnchorMappingStatus,
+    ExternalReviewImportRecord, ExternalReviewThreadState, ListDraftsRequest, ListDraftsResponse,
+    ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
+    ListPublishRecordsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
     ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, OP_REVIEW_AI_EXCHANGE_DELETE,
-    OP_REVIEW_AI_EXCHANGES_LIST, OP_REVIEW_SUGGESTIONS_LIST, OP_THREAD_CLASSIFY,
-    ResolveThreadRequest, ReviewAiExchange, ReviewScope, ReviewSourceKind, ReviewSuggestion,
-    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, SaveDraftRequest,
-    SaveDraftResponse, UpdateDraftRequest,
+    OP_REVIEW_AI_EXCHANGES_LIST, OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_PUBLISH_RECORDS_LIST,
+    OP_REVIEW_SUGGESTION_SAVE, OP_REVIEW_SUGGESTIONS_LIST, OP_THREAD_CLASSIFY,
+    ResolveThreadRequest, ReviewAiExchange, ReviewPublishRecord, ReviewScope, ReviewSourceKind,
+    ReviewSuggestion, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace,
+    SaveDraftRequest, SaveDraftResponse, SaveReviewSuggestionRequest, UpdateDraftRequest,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -119,7 +122,33 @@ pub struct LoadedNotes {
     pub exchanges: Vec<ReviewAiExchange>,
     /// Suggestions.
     pub suggestions: Vec<ReviewSuggestion>,
+    /// External review snapshots (durable reviews).
+    pub external: Vec<ExternalReviewImportRecord>,
+    /// Publish records (durable reviews).
+    pub published: Vec<ReviewPublishRecord>,
 }
+
+/// What an imported (external, read-only) thread carries besides its comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalThread {
+    /// Importer that produced it.
+    pub importer_id: String,
+    /// Provider of the thread.
+    pub provider_id: String,
+    /// Remote state.
+    pub state: ExternalReviewThreadState,
+    /// How its anchor mapped onto this review.
+    pub mapping: ExternalAnchorMappingStatus,
+    /// Mapping explanation.
+    pub message: Option<String>,
+    /// Browser URL.
+    pub url: Option<String>,
+    /// Author label per comment id.
+    pub authors: std::collections::BTreeMap<String, String>,
+}
+
+/// Prefix of imported thread and comment ids.
+pub const EXTERNAL_PREFIX: &str = "external:";
 
 /// One queued service call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +209,13 @@ pub enum Mutation {
         /// The deleted exchange, restored on failure.
         exchange: ReviewAiExchange,
     },
+    /// Create or update a suggestion.
+    SaveSuggestion {
+        /// The suggestion as saved.
+        suggestion: Box<ReviewSuggestion>,
+        /// The suggestion before the change (`None` when it is new), restored on failure.
+        previous: Option<Box<ReviewSuggestion>>,
+    },
 }
 
 /// Result of one finished mutation.
@@ -197,6 +233,12 @@ pub enum MutationResult {
 #[derive(Debug, Default)]
 pub struct ReviewNotes {
     drafts: Vec<DraftComment>,
+    /// Imported threads as read-only comments (never persisted as drafts).
+    external_drafts: Vec<DraftComment>,
+    external: std::collections::BTreeMap<String, ExternalThread>,
+    external_records: Vec<ExternalReviewImportRecord>,
+    /// Anchors recorded as published (with revision fields cleared).
+    published: Vec<DraftAnchor>,
     exchanges: Vec<ReviewAiExchange>,
     suggestions: Vec<ReviewSuggestion>,
     queue: VecDeque<Mutation>,
@@ -228,14 +270,125 @@ impl ReviewNotes {
         self.drafts.extend(local);
         self.exchanges = loaded.exchanges;
         self.suggestions = loaded.suggestions;
+        self.set_external(loaded.external);
+        self.set_published(&loaded.published);
         self.touch();
     }
 
-    /// The annotations as the document shows them.
+    /// Replace the imported threads with these snapshots (one per importer).
+    pub fn set_external(&mut self, records: Vec<ExternalReviewImportRecord>) {
+        self.external_drafts.clear();
+        self.external.clear();
+        for record in &records {
+            for thread in &record.threads {
+                let thread_id = format!(
+                    "{EXTERNAL_PREFIX}{}:{}",
+                    record.importer_id, thread.identity.external_id
+                );
+                let anchor = thread
+                    .mapping
+                    .anchor
+                    .clone()
+                    .filter(|_| thread.mapping.status != ExternalAnchorMappingStatus::Unmappable)
+                    .unwrap_or_else(review_anchor);
+                let resolved = thread.state == ExternalReviewThreadState::Resolved;
+                let mut authors = std::collections::BTreeMap::new();
+                for (index, comment) in thread.comments.iter().enumerate() {
+                    let comment_id = format!("{thread_id}:{}", comment.identity.external_id);
+                    if let Some(author) = &comment.author_label {
+                        authors.insert(comment_id.clone(), author.clone());
+                    }
+                    let created = comment
+                        .created_at_ms
+                        .unwrap_or_else(|| u64::try_from(index).unwrap_or(u64::MAX));
+                    self.external_drafts.push(DraftComment {
+                        comment_id,
+                        thread_id: thread_id.clone(),
+                        anchor: anchor.clone(),
+                        body: comment.body.clone(),
+                        created_at_ms: created,
+                        updated_at_ms: comment.updated_at_ms.unwrap_or(created),
+                        session_id: None,
+                        resolved_at_ms: resolved.then_some(created),
+                        thread_kind: ReviewThreadKind::Note,
+                        severity: ReviewThreadSeverity::Info,
+                    });
+                }
+                self.external.insert(
+                    thread_id,
+                    ExternalThread {
+                        importer_id: record.importer_id.clone(),
+                        provider_id: thread.identity.provider_id.clone(),
+                        state: thread.state,
+                        mapping: thread.mapping.status,
+                        message: thread.mapping.message.clone(),
+                        url: thread.identity.url.clone(),
+                        authors,
+                    },
+                );
+            }
+        }
+        self.external_records = records;
+        self.touch();
+    }
+
+    /// Add (or replace) one importer's snapshot.
+    pub fn put_external(&mut self, record: ExternalReviewImportRecord) {
+        let mut records = std::mem::take(&mut self.external_records);
+        records.retain(|existing| existing.importer_id != record.importer_id);
+        records.push(record);
+        self.set_external(records);
+    }
+
+    /// The imported thread `thread_id`, when it is one.
+    #[must_use]
+    pub fn external(&self, thread_id: &str) -> Option<&ExternalThread> {
+        self.external.get(thread_id)
+    }
+
+    /// Imported comments.
+    #[must_use]
+    pub fn external_drafts(&self) -> &[DraftComment] {
+        &self.external_drafts
+    }
+
+    /// Imported threads.
+    #[must_use]
+    pub fn external_count(&self) -> usize {
+        self.external.len()
+    }
+
+    /// Replace the published anchors with those of `records` (submitted ones).
+    pub fn set_published(&mut self, records: &[ReviewPublishRecord]) {
+        self.published = records
+            .iter()
+            .filter(|record| record.submitted)
+            .flat_map(|record| record.published_thread_anchors.iter().map(anchor_identity))
+            .collect();
+        self.touch();
+    }
+
+    /// Whether the thread `thread_id` was published.
+    #[must_use]
+    pub fn is_published(&self, thread_id: &str) -> bool {
+        !self.published.is_empty()
+            && self
+                .drafts
+                .iter()
+                .find(|draft| draft.thread_id == thread_id)
+                .is_some_and(|draft| self.published.contains(&anchor_identity(&draft.anchor)))
+    }
+
+    /// The annotations as the document shows them (imported threads included).
     #[must_use]
     pub fn annotations(&self) -> Annotations {
         Annotations {
-            drafts: self.drafts.clone(),
+            drafts: self
+                .drafts
+                .iter()
+                .chain(&self.external_drafts)
+                .cloned()
+                .collect(),
             exchanges: self.exchanges.clone(),
             suggestions: self.suggestions.clone(),
         }
@@ -246,14 +399,19 @@ impl ReviewNotes {
     pub fn comment(&self, comment_id: &str) -> Option<&DraftComment> {
         self.drafts
             .iter()
+            .chain(&self.external_drafts)
             .find(|draft| draft.comment_id == comment_id)
     }
 
     /// Comments of a thread, oldest first.
     #[must_use]
     pub fn thread(&self, thread_id: &str) -> Vec<&DraftComment> {
-        let mut comments: Vec<&DraftComment> = self
-            .drafts
+        let source = if thread_id.starts_with(EXTERNAL_PREFIX) {
+            &self.external_drafts
+        } else {
+            &self.drafts
+        };
+        let mut comments: Vec<&DraftComment> = source
             .iter()
             .filter(|draft| draft.thread_id == thread_id)
             .collect();
@@ -295,6 +453,31 @@ impl ReviewNotes {
     #[must_use]
     pub const fn draft_count(&self) -> usize {
         self.drafts.len()
+    }
+
+    /// Every suggestion.
+    #[must_use]
+    pub fn suggestions(&self) -> &[ReviewSuggestion] {
+        &self.suggestions
+    }
+
+    /// Insert or replace a suggestion at once and queue its save (its id is its identity).
+    pub fn save_suggestion(&mut self, suggestion: ReviewSuggestion) {
+        let previous = if let Some(existing) = self
+            .suggestions
+            .iter_mut()
+            .find(|existing| existing.suggestion_id == suggestion.suggestion_id)
+        {
+            Some(Box::new(std::mem::replace(existing, suggestion.clone())))
+        } else {
+            self.suggestions.push(suggestion.clone());
+            None
+        };
+        self.queue.push_back(Mutation::SaveSuggestion {
+            suggestion: Box::new(suggestion),
+            previous,
+        });
+        self.touch();
     }
 
     /// Mutations queued or running.
@@ -454,6 +637,24 @@ impl ReviewNotes {
         Ok(())
     }
 
+    /// Put back the suggestion `id` as it was before a failed save (`None`: it was new).
+    fn restore_suggestion(&mut self, id: &str, previous: Option<ReviewSuggestion>) {
+        match previous {
+            Some(previous) => {
+                if let Some(existing) = self
+                    .suggestions
+                    .iter_mut()
+                    .find(|existing| existing.suggestion_id == id)
+                {
+                    *existing = previous;
+                }
+            }
+            None => self
+                .suggestions
+                .retain(|existing| existing.suggestion_id != id),
+        }
+    }
+
     /// Remove an AI exchange at once and queue the delete.
     ///
     /// # Errors
@@ -535,18 +736,23 @@ impl ReviewNotes {
                 }
                 None
             }
-            (Mutation::Save { local, .. }, MutationResult::Failed(error)) => {
+            (mutation, MutationResult::Failed(error)) => Some(self.roll_back(mutation, &error)),
+            _ => None,
+        }
+    }
+
+    /// Undo a failed mutation's change. Returns the message.
+    fn roll_back(&mut self, mutation: Mutation, error: &str) -> String {
+        match mutation {
+            Mutation::Save { local, .. } => {
                 self.drafts.retain(|draft| draft.comment_id != local);
-                Some(format!("could not save the comment: {error}"))
+                format!("could not save the comment: {error}")
             }
-            (
-                Mutation::Update {
-                    comment_id,
-                    previous,
-                    ..
-                },
-                MutationResult::Failed(error),
-            ) => {
+            Mutation::Update {
+                comment_id,
+                previous,
+                ..
+            } => {
                 if let Some(draft) = self
                     .drafts
                     .iter_mut()
@@ -554,14 +760,14 @@ impl ReviewNotes {
                 {
                     draft.body = previous;
                 }
-                Some(format!("could not update the comment: {error}"))
+                format!("could not update the comment: {error}")
             }
-            (Mutation::Delete { comment, index }, MutationResult::Failed(error)) => {
+            Mutation::Delete { comment, index } => {
                 let index = index.min(self.drafts.len());
                 self.drafts.insert(index, comment);
-                Some(format!("could not delete the comment: {error}"))
+                format!("could not delete the comment: {error}")
             }
-            (Mutation::Resolve { previous, .. }, MutationResult::Failed(error)) => {
+            Mutation::Resolve { previous, .. } => {
                 for (comment_id, resolved) in previous {
                     if let Some(draft) = self
                         .drafts
@@ -571,16 +777,13 @@ impl ReviewNotes {
                         draft.resolved_at_ms = resolved;
                     }
                 }
-                Some(format!("could not change the thread: {error}"))
+                format!("could not change the thread: {error}")
             }
-            (
-                Mutation::Classify {
-                    thread_id,
-                    previous,
-                    ..
-                },
-                MutationResult::Failed(error),
-            ) => {
+            Mutation::Classify {
+                thread_id,
+                previous,
+                ..
+            } => {
                 for draft in self
                     .drafts
                     .iter_mut()
@@ -588,15 +791,57 @@ impl ReviewNotes {
                 {
                     (draft.thread_kind, draft.severity) = previous;
                 }
-                Some(format!("could not change the thread: {error}"))
+                format!("could not change the thread: {error}")
             }
-            (Mutation::DeleteExchange { exchange }, MutationResult::Failed(error)) => {
+            Mutation::DeleteExchange { exchange } => {
                 self.exchanges.push(exchange);
-                Some(format!("could not delete the AI exchange: {error}"))
+                format!("could not delete the AI exchange: {error}")
             }
-            _ => None,
+            Mutation::SaveSuggestion {
+                suggestion,
+                previous,
+            } => {
+                self.restore_suggestion(
+                    &suggestion.suggestion_id,
+                    previous.map(|previous| *previous),
+                );
+                format!("could not save the suggestion: {error}")
+            }
         }
     }
+}
+
+/// A review-level anchor (imported threads that do not map onto the review).
+fn review_anchor() -> DraftAnchor {
+    DraftAnchor {
+        kind: bcode_code_review_models::ReviewAnchorKind::Review,
+        file_path: crate::v2::document::REVIEW_LEVEL_PATH.to_owned(),
+        diff_row: 0,
+        start_diff_row: None,
+        end_diff_row: None,
+        old_start: None,
+        old_end: None,
+        new_start: None,
+        new_end: None,
+        old_line: None,
+        new_line: None,
+        line_kind: bcode_code_review_models::ReviewLineKind::Context,
+        is_file_anchor: false,
+        surface_id: None,
+        source_id: None,
+        head_oid: None,
+        blob_oid: None,
+    }
+}
+
+/// An anchor with its revision fields cleared: its identity for comparing anchors across
+/// revisions (published anchors, follow-up questions, duplicate suggestions).
+#[must_use]
+pub fn anchor_identity(anchor: &DraftAnchor) -> DraftAnchor {
+    let mut anchor = anchor.clone();
+    anchor.head_oid = None;
+    anchor.blob_oid = None;
+    anchor
 }
 
 /// Whether `id` is a local (unsaved) comment or thread id.
@@ -645,10 +890,38 @@ pub async fn load(backend: SharedBackend, scope: NoteScope) -> Result<LoadedNote
     )
     .await
     .map_err(|error| error.message)?;
+    // External imports and publish records belong to durable workspaces.
+    let (mut external, mut published) = (Vec::new(), Vec::new());
+    if let Some(ReviewScope::Workspace { workspace_id, .. }) = &scope.scope
+        && workspace_id != super::entry::TRANSIENT_WORKSPACE_ID
+    {
+        let imports: Result<ListExternalReviewImportsResponse, _> = call_json(
+            backend,
+            OP_REVIEW_EXTERNAL_IMPORTS_LIST,
+            &ListExternalReviewImportsRequest {
+                repo_path: scope.repo_path.clone(),
+                workspace_id: workspace_id.clone(),
+            },
+        )
+        .await;
+        external = imports.map_err(|error| error.message)?.records;
+        let records: Result<ListPublishRecordsResponse, _> = call_json(
+            backend,
+            OP_REVIEW_PUBLISH_RECORDS_LIST,
+            &ListPublishRecordsRequest {
+                repo_path: scope.repo_path.clone(),
+                workspace_id: workspace_id.clone(),
+            },
+        )
+        .await;
+        published = records.map_err(|error| error.message)?.records;
+    }
     Ok(LoadedNotes {
         drafts: drafts.drafts,
         exchanges: exchanges.exchanges,
         suggestions: suggestions.suggestions,
+        external,
+        published,
     })
 }
 
@@ -726,6 +999,15 @@ pub async fn run(backend: SharedBackend, scope: NoteScope, mutation: Mutation) -
                 severity,
             })),
         ),
+        Mutation::SaveSuggestion { suggestion, .. } => (
+            OP_REVIEW_SUGGESTION_SAVE,
+            json(serde_json::to_value(SaveReviewSuggestionRequest {
+                repo_path,
+                target,
+                scope,
+                suggestion: *suggestion,
+            })),
+        ),
         Mutation::DeleteExchange { exchange } => (
             OP_REVIEW_AI_EXCHANGE_DELETE,
             json(serde_json::to_value(DeleteReviewAiExchangeRequest {
@@ -742,6 +1024,167 @@ pub async fn run(backend: SharedBackend, scope: NoteScope, mutation: Mutation) -
             |error| MutationResult::Failed(error.message),
             |_| MutationResult::Done,
         )
+}
+
+/// Move persisted drafts from `from` to `to` (saving a transient review).
+///
+/// Each draft is saved in `to`, each thread gets its kind, severity, and resolution there, and
+/// the draft is then deleted from `from`. Drafts with local ids (not saved yet) are skipped.
+///
+/// # Errors
+///
+/// Returns the first failing call's message; drafts moved before it stay moved.
+pub async fn move_drafts(
+    backend: SharedBackend,
+    from: NoteScope,
+    to: NoteScope,
+    mut drafts: Vec<DraftComment>,
+) -> Result<(), String> {
+    let backend = backend.as_ref();
+    drafts.retain(|draft| !is_local(&draft.comment_id));
+    drafts.sort_by_key(|draft| draft.created_at_ms);
+    let mut threads = std::collections::BTreeSet::new();
+    for draft in drafts {
+        let _: SaveDraftResponse = call_json(
+            backend,
+            OP_DRAFT_SAVE,
+            &SaveDraftRequest {
+                repo_path: to.repo_path.clone(),
+                target: to.target.clone(),
+                scope: to.scope.clone(),
+                anchor: draft.anchor.clone(),
+                body: draft.body.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.message)?;
+        if threads.insert(draft.thread_id.clone()) {
+            let _: ClassifyThreadResponse = call_json(
+                backend,
+                OP_THREAD_CLASSIFY,
+                &ClassifyThreadRequest {
+                    repo_path: to.repo_path.clone(),
+                    target: to.target.clone(),
+                    scope: to.scope.clone(),
+                    anchor: draft.anchor.clone(),
+                    thread_kind: draft.thread_kind,
+                    severity: draft.severity,
+                },
+            )
+            .await
+            .map_err(|error| error.message)?;
+            if draft.resolved_at_ms.is_some() {
+                let _: serde_json::Value = call_json(
+                    backend,
+                    OP_THREAD_RESOLVE,
+                    &ResolveThreadRequest {
+                        repo_path: to.repo_path.clone(),
+                        target: to.target.clone(),
+                        scope: to.scope.clone(),
+                        anchor: draft.anchor.clone(),
+                        resolved: true,
+                    },
+                )
+                .await
+                .map_err(|error| error.message)?;
+            }
+        }
+        let _: serde_json::Value = call_json(
+            backend,
+            OP_DRAFT_DELETE,
+            &DeleteDraftRequest {
+                repo_path: from.repo_path.clone(),
+                target: from.target.clone(),
+                scope: from.scope.clone(),
+                comment_id: draft.comment_id.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.message)?;
+    }
+    Ok(())
+}
+
+/// Move AI exchanges and suggestions from `from` to `to` (saving a transient review).
+///
+/// Their ids are unique across scopes (a save of an existing id updates it in its own scope),
+/// so each is deleted from `from` first and then saved in `to`; when that save fails it is
+/// saved back in `from`.
+///
+/// # Errors
+///
+/// Returns the first failing call's message; annotations moved before it stay moved.
+pub async fn move_agent_notes(
+    backend: SharedBackend,
+    from: NoteScope,
+    to: NoteScope,
+    exchanges: Vec<ReviewAiExchange>,
+    suggestions: Vec<ReviewSuggestion>,
+) -> Result<(), String> {
+    use bcode_code_review_models::{
+        DeleteReviewSuggestionRequest, OP_REVIEW_AI_EXCHANGE_SAVE, OP_REVIEW_SUGGESTION_DELETE,
+        SaveReviewAiExchangeRequest,
+    };
+    let backend = backend.as_ref();
+    let save_exchange = |scope: &NoteScope, exchange: ReviewAiExchange| {
+        let request = SaveReviewAiExchangeRequest {
+            repo_path: scope.repo_path.clone(),
+            target: scope.target.clone(),
+            scope: scope.scope.clone(),
+            exchange,
+        };
+        async move {
+            call_json::<_, serde_json::Value>(backend, OP_REVIEW_AI_EXCHANGE_SAVE, &request).await
+        }
+    };
+    for exchange in exchanges {
+        let _: serde_json::Value = call_json(
+            backend,
+            OP_REVIEW_AI_EXCHANGE_DELETE,
+            &DeleteReviewAiExchangeRequest {
+                repo_path: from.repo_path.clone(),
+                target: from.target.clone(),
+                scope: from.scope.clone(),
+                exchange_id: exchange.exchange_id.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.message)?;
+        if let Err(error) = save_exchange(&to, exchange.clone()).await {
+            let _ = save_exchange(&from, exchange).await;
+            return Err(error.message);
+        }
+    }
+    let save_suggestion = |scope: &NoteScope, suggestion: ReviewSuggestion| {
+        let request = SaveReviewSuggestionRequest {
+            repo_path: scope.repo_path.clone(),
+            target: scope.target.clone(),
+            scope: scope.scope.clone(),
+            suggestion,
+        };
+        async move {
+            call_json::<_, serde_json::Value>(backend, OP_REVIEW_SUGGESTION_SAVE, &request).await
+        }
+    };
+    for suggestion in suggestions {
+        let _: serde_json::Value = call_json(
+            backend,
+            OP_REVIEW_SUGGESTION_DELETE,
+            &DeleteReviewSuggestionRequest {
+                repo_path: from.repo_path.clone(),
+                target: from.target.clone(),
+                scope: from.scope.clone(),
+                suggestion_id: suggestion.suggestion_id.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.message)?;
+        if let Err(error) = save_suggestion(&to, suggestion.clone()).await {
+            let _ = save_suggestion(&from, suggestion).await;
+            return Err(error.message);
+        }
+    }
+    Ok(())
 }
 
 /// Save a draft, then give a new thread its kind and severity.

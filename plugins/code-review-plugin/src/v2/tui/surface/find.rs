@@ -48,6 +48,8 @@ pub enum ThreadsFilter {
     Attention,
     /// Review-level threads.
     General,
+    /// Resolved threads.
+    Resolved,
 }
 
 impl ThreadsFilter {
@@ -58,7 +60,8 @@ impl ThreadsFilter {
             Self::All => Self::Open,
             Self::Open => Self::Attention,
             Self::Attention => Self::General,
-            Self::General => Self::All,
+            Self::General => Self::Resolved,
+            Self::Resolved => Self::All,
         }
     }
 
@@ -66,7 +69,8 @@ impl ThreadsFilter {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::All => Self::General,
+            Self::All => Self::Resolved,
+            Self::Resolved => Self::General,
             Self::Open => Self::All,
             Self::Attention => Self::Open,
             Self::General => Self::Attention,
@@ -81,6 +85,7 @@ impl ThreadsFilter {
             Self::Open => "open",
             Self::Attention => "needs attention",
             Self::General => "general",
+            Self::Resolved => "resolved",
         }
     }
 
@@ -101,6 +106,7 @@ impl ThreadsFilter {
                 ))
             }
             Self::General => first.anchor.kind == ReviewAnchorKind::Review,
+            Self::Resolved => !open,
         }
     }
 
@@ -111,6 +117,7 @@ impl ThreadsFilter {
             Self::All | Self::Open => true,
             Self::Attention => exchange.status == ReviewAiExchangeStatus::Failed,
             Self::General => exchange.anchor.kind == ReviewAnchorKind::Review,
+            Self::Resolved => false,
         }
     }
 }
@@ -523,6 +530,11 @@ impl ReviewSurfaceV2 {
             .and_then(|workspace| workspace.presentation_v2.clone())
             .unwrap_or_default();
         state.panels = self.panels.state();
+        state.layer_positions.clone_from(&self.layer_positions);
+        state.collapsed_threads.clone_from(&self.folds.collapsed);
+        state.expanded_answers.clone_from(&self.folds.expanded);
+        state.hide_resolved_threads = self.hide_resolved;
+        state.hide_viewed_files = self.hide_viewed_files;
         state.layout_mode = self.layout_override.map(|mode| match mode {
             LayoutMode::Unified => ReviewLayoutMode::Unified,
             LayoutMode::SideBySide => ReviewLayoutMode::SideBySide,

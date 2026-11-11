@@ -156,6 +156,28 @@ pub fn mark_viewed(workspace: &mut ReviewWorkspace, file: &ViewedIdentity<'_>) {
     workspace.viewed_files.insert(file.path.to_string());
 }
 
+/// Mark every file in `files` viewed (as [`mark_viewed`] does for one), sorting the marks once.
+pub fn mark_all_viewed(workspace: &mut ReviewWorkspace, files: &[ViewedIdentity<'_>]) {
+    let paths: std::collections::BTreeMap<&str, &ViewedIdentity<'_>> =
+        files.iter().map(|file| (file.path, file)).collect();
+    workspace.viewed_marks.retain(|existing| {
+        paths.get(existing.path.as_str()).is_none_or(|file| {
+            existing.has_identity() && match_mark(existing, file) == ViewedState::Unviewed
+        })
+    });
+    for file in files {
+        workspace.viewed_marks.push(ViewedMark {
+            path: file.path.to_string(),
+            old_oid: file.old_oid.map(str::to_string),
+            new_oid: file.new_oid.map(str::to_string),
+            patch_id: file.patch_id.map(str::to_string),
+        });
+        workspace.viewed_files.insert(file.path.to_string());
+    }
+    workspace.viewed_marks.sort();
+    workspace.viewed_marks.dedup();
+}
+
 /// Remove every mark matching `file`. The path leaves `viewed_files` once no mark for it
 /// remains.
 pub fn unmark_viewed(workspace: &mut ReviewWorkspace, file: &ViewedIdentity<'_>) {

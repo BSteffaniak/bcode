@@ -95,7 +95,11 @@ fn import(request: &ServiceRequest) -> ServiceResponse {
 fn import_for_request(
     request: &ExternalReviewImportRequest,
 ) -> Result<ExternalReviewImportResponse, GitHubPublisherError> {
-    let options = GitHubImportOptions::from_json(&request.options, &request.repo_root)?;
+    let options = GitHubImportOptions::from_json(
+        &request.options,
+        &request.repo_root,
+        request.pull_request.as_ref(),
+    )?;
     let resolved = options.resolve()?;
     let (imported, thread_states) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -124,6 +128,7 @@ fn import_for_request(
 
 fn github_manifest() -> ReviewPublisherManifest {
     ReviewPublisherManifest {
+        pull_request_provider: Some(review_source::PROVIDER_ID.to_string()),
         id: PUBLISHER_ID.to_string(),
         label: "GitHub PR review".to_string(),
         description: "Publish review comments to a GitHub pull request".to_string(),
@@ -347,7 +352,8 @@ fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) ->
 }
 
 fn should_summarize_thread(thread: &ReviewBundleThread) -> bool {
-    thread.anchor.is_file_anchor
+    thread.summary_only
+        || thread.anchor.is_file_anchor
         || thread
             .selected_lines
             .iter()
@@ -477,27 +483,41 @@ struct GitHubImportOptions {
     token_env: String,
 }
 
+/// Repository and pull request from the options, else from the request's pull request target
+/// when it belongs to this provider. Options always win.
+fn target_options(
+    value: &serde_json::Value,
+    target: Option<&bcode_code_review_models::ReviewPullRequestTarget>,
+) -> Result<(Option<String>, Option<u64>), GitHubPublisherError> {
+    let target = target.filter(|target| target.provider == review_source::PROVIDER_ID);
+    let repository = string_option(value, "repository")
+        .or_else(|| target.map(|target| target.repository.clone()));
+    if repository
+        .as_ref()
+        .is_some_and(|repository| !repository.contains('/'))
+    {
+        return Err(GitHubPublisherError::InvalidOption(
+            "repository must be owner/repo".to_string(),
+        ));
+    }
+    let pull_request = string_option(value, "pull_request")
+        .map(|pull_request| {
+            pull_request
+                .parse::<u64>()
+                .map_err(|error| GitHubPublisherError::InvalidOption(error.to_string()))
+        })
+        .transpose()?
+        .or_else(|| target.map(|target| target.number));
+    Ok((repository, pull_request))
+}
+
 impl GitHubImportOptions {
     fn from_json(
         value: &serde_json::Value,
         repo_root: &Path,
+        target: Option<&bcode_code_review_models::ReviewPullRequestTarget>,
     ) -> Result<Self, GitHubPublisherError> {
-        let repository = string_option(value, "repository");
-        if repository
-            .as_ref()
-            .is_some_and(|repository| !repository.contains('/'))
-        {
-            return Err(GitHubPublisherError::InvalidOption(
-                "repository must be owner/repo".to_string(),
-            ));
-        }
-        let pull_request = string_option(value, "pull_request")
-            .map(|pull_request| {
-                pull_request
-                    .parse::<u64>()
-                    .map_err(|error| GitHubPublisherError::InvalidOption(error.to_string()))
-            })
-            .transpose()?;
+        let (repository, pull_request) = target_options(value, target)?;
         Ok(Self {
             repository,
             pull_request,
@@ -539,22 +559,7 @@ impl GitHubPublishOptions {
         value: &serde_json::Value,
         bundle: &ReviewBundle,
     ) -> Result<Self, GitHubPublisherError> {
-        let repository = string_option(value, "repository");
-        if repository
-            .as_ref()
-            .is_some_and(|repository| !repository.contains('/'))
-        {
-            return Err(GitHubPublisherError::InvalidOption(
-                "repository must be owner/repo".to_string(),
-            ));
-        }
-        let pull_request = string_option(value, "pull_request")
-            .map(|pull_request| {
-                pull_request
-                    .parse::<u64>()
-                    .map_err(|error| GitHubPublisherError::InvalidOption(error.to_string()))
-            })
-            .transpose()?;
+        let (repository, pull_request) = target_options(value, bundle.pull_request.as_ref())?;
         let token_env =
             string_option(value, "token_env").unwrap_or_else(|| DEFAULT_TOKEN_ENV.to_string());
         let submit_event = string_option(value, "submit_event")
@@ -1417,6 +1422,7 @@ mod tests {
         lines: Vec<bcode_code_review_models::ReviewLine>,
     ) -> ExternalReviewImportRequest {
         ExternalReviewImportRequest {
+            pull_request: None,
             repo_root: PathBuf::from("/repo"),
             files: vec![bcode_code_review_models::ReviewFile {
                 old_path: None,
@@ -1486,6 +1492,7 @@ mod tests {
     fn preview_is_local_and_does_not_require_submit_auth_or_http() {
         let request = ExternalPublishReviewRequest {
             bundle: ReviewBundle {
+                pull_request: None,
                 review_id: "review".to_string(),
                 title: "Review".to_string(),
                 repo_root: PathBuf::from("/repo"),
@@ -1518,8 +1525,69 @@ mod tests {
     }
 
     #[test]
+    fn preview_targets_the_bundles_pull_request_and_summarizes_summary_only_threads() {
+        let mut summary_only = review_thread(bundle_line(
+            "src/lib.rs",
+            ReviewLineKind::Context,
+            None,
+            Some(7),
+            0,
+            "context",
+        ));
+        summary_only.summary_only = true;
+        summary_only.thread_id = "whole-stack".to_string();
+        let mut bundle = empty_bundle();
+        bundle.pull_request = Some(bcode_code_review_models::ReviewPullRequestTarget {
+            provider: review_source::PROVIDER_ID.to_string(),
+            repository: "owner/stacked".to_string(),
+            number: 42,
+        });
+        bundle.threads = vec![
+            review_thread(bundle_line(
+                "src/lib.rs",
+                ReviewLineKind::Added,
+                None,
+                Some(3),
+                1,
+                "added",
+            )),
+            summary_only,
+        ];
+        let request = ExternalPublishReviewRequest {
+            bundle: bundle.clone(),
+            options: serde_json::json!({ "token_env": "INTENTIONALLY_MISSING_GITHUB_TOKEN" }),
+        };
+        let response = preview_for_request(&request).expect("offline preview");
+        assert!(
+            response.preview.contains("`owner/stacked`"),
+            "{}",
+            response.preview
+        );
+        assert!(response.preview.contains("`#42`"), "{}", response.preview);
+        assert!(response.preview.contains("Inline comments: `1`"));
+        assert!(
+            response
+                .preview
+                .contains("Repository comments in summary: `1`")
+        );
+
+        // Options still win over the target; a target of another provider is ignored.
+        let request = ExternalPublishReviewRequest {
+            bundle: bundle.clone(),
+            options: serde_json::json!({ "repository": "owner/other", "pull_request": "7" }),
+        };
+        let response = preview_for_request(&request).expect("preview");
+        assert!(response.preview.contains("`owner/other`") && response.preview.contains("`#7`"));
+        bundle.pull_request.as_mut().unwrap().provider = "elsewhere".to_string();
+        let options =
+            GitHubPublishOptions::from_json(&serde_json::json!({}), &bundle).expect("options");
+        assert_eq!((options.repository, options.pull_request), (None, None));
+    }
+
+    #[test]
     fn preview_reports_unmappable_comments() {
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -1561,6 +1629,7 @@ mod tests {
         ));
         thread.resolved_at_ms = Some(123);
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -1675,6 +1744,7 @@ mod tests {
 
     fn empty_bundle() -> ReviewBundle {
         ReviewBundle {
+            pull_request: None,
             review_id: "review".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -1713,6 +1783,7 @@ mod tests {
     fn review_thread_with_lines(lines: Vec<ReviewBundleLine>) -> ReviewBundleThread {
         let line = lines.first().expect("at least one line").clone();
         ReviewBundleThread {
+            summary_only: false,
             thread_id: "thread".to_string(),
             anchor: DraftAnchor {
                 kind: ReviewAnchorKind::Range,

@@ -85,6 +85,25 @@ pub struct SourceInput {
 /// Identifies one outstanding request.
 pub type Ticket = u64;
 
+/// One source group of the document (a source, or one part of a multi-part source).
+#[derive(Debug, Clone)]
+pub struct GroupInfo<'a> {
+    /// The resolved source.
+    pub source: &'a ResolvedSource,
+    /// Display label.
+    pub label: &'a str,
+    /// Stack structure, for stack and stack-layer sources.
+    pub stack: Option<&'a SourceStack>,
+    /// Position of the group (for [`ReviewDocument::group_files`]).
+    pub index: usize,
+    /// Number of files in the group.
+    pub file_count: usize,
+    /// Files of the group shown as viewed.
+    pub viewed: usize,
+    /// The group's source header item, when headers are shown.
+    pub header: Option<ItemKey>,
+}
+
 /// A request the client should issue on the document's behalf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentNeed {
@@ -271,6 +290,8 @@ pub(super) struct FileState {
     pub attribution: AttributionState,
     pub last_used: u64,
     pub resident_bytes: usize,
+    /// Patch unchanged since the last review pass (spec 7.4).
+    pub carried_over: bool,
 }
 
 impl FileState {
@@ -630,6 +651,7 @@ impl ReviewDocument {
                 attribution,
                 last_used: 0,
                 resident_bytes: 0,
+                carried_over: false,
             });
             self.blocks.push(Block::new(BlockKind::File(index)));
             self.file_annotations.push(Vec::new());
@@ -1778,6 +1800,62 @@ impl ReviewDocument {
             .filter(|file| file.viewed == ViewedState::ViewedNeedsUpdate)
             .map(|file| file.key.clone())
             .collect()
+    }
+
+    /// Mark the files whose patch is unchanged since the last review pass (spec 7.4); every
+    /// other file loses the mark. Rebuilds only the files whose mark changed.
+    pub fn set_carried_over(&mut self, files: &BTreeSet<FileKey>) {
+        for index in 0..self.files.len() {
+            let carried = files.contains(self.files[index].key.as_ref());
+            if self.files[index].carried_over != carried {
+                self.files[index].carried_over = carried;
+                self.rebuild_file(index);
+            }
+        }
+    }
+
+    /// Whether a file is marked unchanged since the last review pass.
+    #[must_use]
+    pub fn carried_over(&self, file: &FileKey) -> bool {
+        self.file_index
+            .get(file)
+            .is_some_and(|index| self.files[*index].carried_over)
+    }
+
+    /// The file's patch id, once its hunks were loaded (kept after eviction).
+    #[must_use]
+    pub fn patch_id(&self, file: &FileKey) -> Option<&str> {
+        self.file_index
+            .get(file)
+            .and_then(|index| self.files[*index].patch_id.as_deref())
+    }
+
+    /// The document's source groups (one per source or source part), in order.
+    pub fn groups(&self) -> impl Iterator<Item = GroupInfo<'_>> {
+        self.groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| GroupInfo {
+                index,
+                source: &group.source,
+                label: &group.label,
+                stack: group.stack.as_ref(),
+                file_count: group.files.len(),
+                viewed: group.viewed,
+                header: group.show_header.then(|| ItemKey::SourceHeader {
+                    source_id: group.source.source_id.clone(),
+                    part: group.source.part.as_ref().map(|part| part.index),
+                }),
+            })
+    }
+
+    /// Files of group `index` (see [`GroupInfo::index`]), in document order.
+    pub fn group_files(&self, index: usize) -> impl Iterator<Item = &FileRef> {
+        self.groups
+            .get(index)
+            .map_or(&[][..], |group| &self.files[group.files.clone()])
+            .iter()
+            .map(|file| &file.key)
     }
 
     /// Viewed progress across the whole review (`O(1)`).

@@ -622,7 +622,8 @@ fn whole_stack_attribution_labels_each_layers_region_of_the_shared_file() {
         vec![ReviewStackLineAttribution {
             start: 1,
             end: 20,
-            layer: 102
+            layer: 102,
+            layer_line: Some(1),
         }]
     );
     assert_eq!(added.old_ranges.len(), 0);
@@ -754,10 +755,25 @@ fn attribution_follows_renames_and_maps_lines_through_later_layers() {
         "g.rs",
         Some("f.rs"),
     );
-    let range = |start, end, layer| ReviewStackLineAttribution { start, end, layer };
+    let range = |start, end, layer, layer_line| ReviewStackLineAttribution {
+        start,
+        end,
+        layer,
+        layer_line: Some(layer_line),
+    };
     // Top file: two, three_v1 (layer 1), four, five, added_a, added_b (layer 2), six, seven,
-    // eight.
-    assert_eq!(attribution.new_ranges, vec![range(2, 2, 1), range(5, 6, 2)]);
-    // Base file: line 1 removed by layer 2, line 3 replaced by layer 1.
-    assert_eq!(attribution.old_ranges, vec![range(1, 1, 2), range(3, 3, 1)]);
+    // eight. `three_v1` is line 3 of layer 1's head (layer 2 later removed line 1 above it);
+    // the added lines are lines 5 and 6 of layer 2's head.
+    assert_eq!(
+        attribution.new_ranges,
+        vec![range(2, 2, 1, 3), range(5, 6, 2, 5)]
+    );
+    assert_eq!(attribution.new_line_origin(2), Some((1, Some(3))));
+    assert_eq!(attribution.new_line_origin(6), Some((2, Some(6))));
+    // Base file: line 1 removed by layer 2 (line 1 of layer 1's head), line 3 replaced by
+    // layer 1 (line 3 of the base).
+    assert_eq!(
+        attribution.old_ranges,
+        vec![range(1, 1, 2, 1), range(3, 3, 1, 3)]
+    );
 }

@@ -2,8 +2,9 @@
 //!
 //! Implements the lazy, revision-pinned operations declared in
 //! `bcode_code_review_models::data`: source resolution and change tokens, the per-source file
-//! index, per-file hunks, blob line ranges, paged reference, commit, and path search, and
-//! per-file stack layer attribution. Every operation is bounded; none loads the whole review.
+//! index, per-file hunks, blob line ranges, paged reference, commit, and path search,
+//! per-file stack layer attribution, and a repository state summary for review suggestions.
+//! Every operation is bounded; none loads the whole review.
 //!
 //! State kept between calls is bounded and disposable: one `git cat-file --batch` process per
 //! repository root (idle-evicted, restarted on failure), a byte-budgeted blob cache, a small
@@ -13,6 +14,7 @@ mod blob;
 mod git;
 mod hunks;
 mod index;
+mod rereview;
 mod resolve;
 mod search;
 mod stack;
@@ -21,14 +23,17 @@ pub use blob::{BlobService, CatFileRegistry};
 
 use bcode_code_review_models::{
     OP_REVIEW_BLOB_LINES_GET, OP_REVIEW_COMMITS_PAGE, OP_REVIEW_FILE_HUNKS_GET,
-    OP_REVIEW_FILES_SEARCH, OP_REVIEW_INDEX_GET, OP_REVIEW_REFS_SEARCH, OP_REVIEW_SOURCES_RESOLVE,
+    OP_REVIEW_FILES_SEARCH, OP_REVIEW_INDEX_GET, OP_REVIEW_PATCH_IDS_GET, OP_REVIEW_REFS_SEARCH,
+    OP_REVIEW_REPO_STATE, OP_REVIEW_REVISIONS_COMPARE, OP_REVIEW_SOURCES_RESOLVE,
     OP_REVIEW_SOURCES_TOKEN, OP_REVIEW_STACK_ATTRIBUTION, REVIEW_ERROR_CURSOR_STALE,
     REVIEW_ERROR_GIT_FAILED, REVIEW_ERROR_INVALID_REQUEST, REVIEW_ERROR_NOT_FOUND,
     REVIEW_ERROR_PATH_REJECTED, REVIEW_ERROR_TOO_LARGE, ResolveReviewSourcesRequest,
     ResolveReviewSourcesResponse, ReviewBlobLinesRequest, ReviewBlobLinesResponse,
     ReviewCommitsPageRequest, ReviewCommitsPageResponse, ReviewFileHunksRequest,
     ReviewFileHunksResponse, ReviewFilesSearchRequest, ReviewFilesSearchResponse,
-    ReviewIndexRequest, ReviewIndexResponse, ReviewRefsSearchRequest, ReviewRefsSearchResponse,
+    ReviewIndexRequest, ReviewIndexResponse, ReviewPatchIdsRequest, ReviewPatchIdsResponse,
+    ReviewRefsSearchRequest, ReviewRefsSearchResponse, ReviewRepoStateRequest,
+    ReviewRepoStateResponse, ReviewRevisionsCompareRequest, ReviewRevisionsCompareResponse,
     ReviewSourcesTokenRequest, ReviewSourcesTokenResponse, ReviewStackAttributionRequest,
     ReviewStackAttributionResponse,
 };
@@ -107,6 +112,9 @@ impl V2Service {
             OP_REVIEW_COMMITS_PAGE => handle(request, |req| self.commits_page(&req)),
             OP_REVIEW_FILES_SEARCH => handle(request, |req| self.files_search(&req)),
             OP_REVIEW_STACK_ATTRIBUTION => handle(request, |req| self.stack_attribution(&req)),
+            OP_REVIEW_REPO_STATE => handle(request, |req| self.repo_state(&req)),
+            OP_REVIEW_REVISIONS_COMPARE => handle(request, |req| self.revisions_compare(&req)),
+            OP_REVIEW_PATCH_IDS_GET => handle(request, |req| self.patch_ids_get(&req)),
             _ => return None,
         };
         Some(response)
@@ -143,6 +151,51 @@ impl V2Service {
     ) -> Result<ReviewStackAttributionResponse, ServiceError> {
         let root = self.repo_root(&request.repo_path)?;
         stack::attribution(&root, request)
+    }
+
+    /// Summarize repository state for review suggestions (branch, detected base, commits ahead,
+    /// unstaged and staged change counts).
+    ///
+    /// # Errors
+    ///
+    /// * [`ServiceError::InvalidRequest`] when the repository path is invalid.
+    /// * [`ServiceError::Git`] / [`ServiceError::Io`] when git cannot run.
+    pub fn repo_state(
+        &mut self,
+        request: &ReviewRepoStateRequest,
+    ) -> Result<ReviewRepoStateResponse, ServiceError> {
+        let root = self.repo_root(&request.repo_path)?;
+        resolve::repo_state(&root)
+    }
+
+    /// Compare a previously reviewed commit with the current one (re-review, spec 7.4).
+    ///
+    /// # Errors
+    ///
+    /// * [`ServiceError::InvalidRequest`] for invalid object ids or repository paths.
+    /// * [`ServiceError::NotFound`] when the new commit does not exist.
+    /// * [`ServiceError::Git`] / [`ServiceError::Io`] when git fails.
+    pub fn revisions_compare(
+        &mut self,
+        request: &ReviewRevisionsCompareRequest,
+    ) -> Result<ReviewRevisionsCompareResponse, ServiceError> {
+        let root = self.repo_root(&request.repo_path)?;
+        rereview::compare(&root, request)
+    }
+
+    /// Patch ids of several files of one revision pair (re-review, spec 7.4).
+    ///
+    /// # Errors
+    ///
+    /// * [`ServiceError::InvalidRequest`] for too many paths or an unsupported revision pair.
+    /// * [`ServiceError::PathRejected`] for unconfined paths.
+    /// * [`ServiceError::Git`] / [`ServiceError::Io`] when git fails.
+    pub fn patch_ids_get(
+        &mut self,
+        request: &ReviewPatchIdsRequest,
+    ) -> Result<ReviewPatchIdsResponse, ServiceError> {
+        let root = self.repo_root(&request.repo_path)?;
+        rereview::patch_ids(&root, request)
     }
 
     /// Compute the cheap change token for working-tree and index sources.

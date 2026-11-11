@@ -5,6 +5,9 @@
 //!   the anchor's thread (`thread.link_session`), and saves the exchange as linked. A failure
 //!   after the exchange exists records it as failed; a failed save is never retried
 //!   automatically, so no second session is created for one question.
+//! * A later question on an anchor that already has a linked session is a follow-up: it is
+//!   sent to that session (no new session, no new link) and saved as linked to it.
+//! * Structured commands ([`AiCommand`]) ask a fixed instruction about the anchor.
 //! * Linked sessions are observed through the host's semantic session view
 //!   ([`PluginTuiHost::subscribe_session_view`]); each update replaces the session's derived
 //!   status (waiting, working, answered, failed) and the latest completed answer.
@@ -34,6 +37,97 @@ use std::path::PathBuf;
 pub const MAX_PROMPT_LINES: usize = 80;
 /// Bytes of the whole prompt.
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
+/// Other threads of the file listed in a prompt, and characters kept of each.
+pub const MAX_PROMPT_THREADS: usize = 12;
+const MAX_PROMPT_THREAD_CHARS: usize = 160;
+
+/// A structured AI review command with a fixed instruction (inventory INV-AI-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiCommand {
+    /// Explain the selected change.
+    Explain,
+    /// Identify concrete review risks.
+    Risks,
+    /// Draft one review comment.
+    SuggestComment,
+    /// Assess test coverage.
+    Tests,
+    /// Summarize the file's changes.
+    Summarize,
+}
+
+impl AiCommand {
+    /// Every command, in menu order.
+    pub const ALL: [Self; 5] = [
+        Self::Explain,
+        Self::Risks,
+        Self::SuggestComment,
+        Self::Tests,
+        Self::Summarize,
+    ];
+
+    /// Keymap action id (without the `bcode.code_review.` prefix).
+    #[must_use]
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::Explain => "ai_explain",
+            Self::Risks => "ai_risks",
+            Self::SuggestComment => "ai_suggest_comment",
+            Self::Tests => "ai_tests",
+            Self::Summarize => "ai_summarize",
+        }
+    }
+
+    /// The command of a keymap action id.
+    #[must_use]
+    pub fn from_action(action: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|command| command.action() == action)
+    }
+
+    /// The instruction sent as the question.
+    #[must_use]
+    pub const fn instruction(self) -> &'static str {
+        match self {
+            Self::Explain => {
+                "Explain what the selected change does, why it may exist, and any important behavior changes."
+            }
+            Self::Risks => {
+                "Identify concrete correctness, security, performance, and maintainability risks in the selected change."
+            }
+            Self::SuggestComment => {
+                "Draft one concise, actionable code review comment for the strongest supported issue; say when no comment is warranted."
+            }
+            Self::Tests => {
+                "Assess test coverage for the selected change and identify specific missing or weak tests."
+            }
+            Self::Summarize => {
+                "Summarize the selected file's changes, intent, and review-relevant consequences."
+            }
+        }
+    }
+
+    /// Short label for status messages.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Explain => "explain the change",
+            Self::Risks => "find risks",
+            Self::SuggestComment => "suggest a comment",
+            Self::Tests => "check tests",
+            Self::Summarize => "summarize the file",
+        }
+    }
+}
+
+/// The instruction of a refinement request for a suggested comment.
+#[must_use]
+pub fn refine_question(body: &str) -> String {
+    format!(
+        "Refine this suggested review comment. Keep it concise, actionable, and suitable for a code review comment.\n\n{body}"
+    )
+}
 
 /// What a question is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +136,11 @@ pub struct AskContext {
     pub title: String,
     /// Repository root.
     pub repo: PathBuf,
+    /// Labels of the review's included sources.
+    pub sources: Vec<String>,
+    /// Other threads on the same file (or the review): `location: first comment`, bounded by
+    /// [`MAX_PROMPT_THREADS`].
+    pub threads: Vec<String>,
     /// File path, or the review-level marker.
     pub path: String,
     /// Old and new line ranges.
@@ -69,14 +168,34 @@ pub fn prompt(context: &AskContext) -> String {
         .take(MAX_PROMPT_LINES)
         .map(String::as_str)
         .collect();
+    let threads: Vec<String> = context
+        .threads
+        .iter()
+        .take(MAX_PROMPT_THREADS)
+        .map(|thread| {
+            let mut thread = thread.replace('\n', " ");
+            if let Some((end, _)) = thread.char_indices().nth(MAX_PROMPT_THREAD_CHARS) {
+                thread.truncate(end);
+                thread.push('…');
+            }
+            format!("- {thread}")
+        })
+        .collect();
+    let threads = if threads.is_empty() {
+        "none".to_owned()
+    } else {
+        threads.join("\n")
+    };
     let mut text = format!(
-        "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nFile: {}\nOld lines: {}\nNew lines: {}\n\nSelected diff lines:\n```diff\n{}\n```\n\nReview context is also available through the code-review plugin service `bcode.code_review/v1` (`review.context.get`, `review.comments.list`, `review.thread.get`, `review.diff.get`).\n\nQuestion:\n{}\n",
+        "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nSources: {}\nFile: {}\nOld lines: {}\nNew lines: {}\n\nSelected diff lines:\n```diff\n{}\n```\n\nOther review threads on this file:\n{}\n\nReview context is also available through the code-review plugin service `bcode.code_review/v1` (`review.context.get`, `review.comments.list`, `review.thread.get`, `review.diff.get`).\n\nQuestion:\n{}\n",
         context.title,
         context.repo.display(),
+        context.sources.join(", "),
         context.path,
         range(context.old),
         range(context.new),
         lines.join("\n"),
+        threads,
         context.question.trim(),
     );
     if text.len() > MAX_PROMPT_BYTES {
@@ -90,6 +209,9 @@ pub fn prompt(context: &AskContext) -> String {
 }
 
 /// Ask: persist the exchange, create and prompt the session, link it, and persist the link.
+///
+/// When the exchange already names a session (a follow-up), the prompt goes to that session
+/// instead and nothing new is created or linked.
 ///
 /// # Errors
 ///
@@ -124,7 +246,15 @@ pub async fn ask(
         Ok(saved) => saved,
         Err(error) => return Err(Box::new((exchange, error))),
     };
+    let follow_up = exchange.session_id.clone();
     let linked = async {
+        if let Some(session) = follow_up {
+            backend
+                .send_message(session.clone(), text)
+                .await
+                .map_err(|error| error.message)?;
+            return Ok::<_, String>(session);
+        }
         let session = backend
             .create_session(
                 format!("Review: {}", exchange.anchor.file_path),
@@ -421,6 +551,10 @@ mod tests {
         let context = AskContext {
             title: "Review".to_owned(),
             repo: PathBuf::from("/repo"),
+            sources: vec!["Last commit".to_owned()],
+            threads: (0..40)
+                .map(|index| format!("src/lib.rs:{index}: {}", "y".repeat(400)))
+                .collect(),
             path: "src/lib.rs".to_owned(),
             old: Some((3, 4)),
             new: None,
@@ -438,5 +572,13 @@ mod tests {
             !text.contains("+line 80 "),
             "at most {MAX_PROMPT_LINES} lines"
         );
+        assert!(text.contains("Sources: Last commit"));
+        assert!(text.contains("- src/lib.rs:11: "));
+        assert!(
+            !text.contains("src/lib.rs:12: "),
+            "at most {MAX_PROMPT_THREADS} threads"
+        );
+        assert!(!text.contains(&"y".repeat(200)), "threads are shortened");
+        assert!(text.contains("Question:\nWhy?"));
     }
 }

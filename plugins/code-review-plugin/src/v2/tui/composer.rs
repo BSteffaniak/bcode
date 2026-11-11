@@ -8,19 +8,33 @@
 //!
 //! [`Composer::layout`] is the single geometry of the item: its height, the editor's rows, and
 //! the clickable action buttons. Measuring, painting, and click routing all read it.
+//!
+//! The editor is offered to the host as a focused text field (the shared
+//! `FocusedTextFieldAdapter`), so host completions apply to it as one undoable edit. It is
+//! eligible only while it is focused, visible, painted, not in preview, and the terminal has
+//! focus; any edit, focus, or visibility change invalidates earlier completion requests.
 
 use super::rows::ActionCells;
 use super::theme::ReviewTheme;
 use crate::v2::document::{AnchorTarget, DocAnchor};
 use bcode_code_review_models::{ReviewThreadKind, ReviewThreadSeverity};
+use bcode_plugin_sdk::tui::{
+    FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
+    FocusedTextFieldSnapshot,
+};
 use bmux_keyboard::KeyStroke;
 use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutNode};
+use bmux_tui::geometry::Rect;
 use bmux_tui::text::{Line, Span};
 use bmux_tui::text_width::display_width;
 use bmux_tui_components::text_input::{
     TextInputComponent, TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+
+/// Owner and field ids of the composer as a focused text field.
+const FIELD_OWNER: &str = "bcode.code-review";
+const FIELD_ID: &str = "review-v2-comment";
 
 /// Layout id of the composer's editor.
 pub const EDITOR_ID: &str = "review.composer.editor";
@@ -109,6 +123,13 @@ pub struct Composer {
     pub severity: ReviewThreadSeverity,
     policy: TextInputPolicy,
     revision: u64,
+    /// The editor as a focused text field for host completion.
+    field: RefCell<FocusedTextFieldAdapter>,
+    /// Whether the surface lets the editor take completions (focus, no overlay, terminal
+    /// focus); painting adds visibility.
+    eligible: Cell<bool>,
+    /// Whether the editor was painted in the current frame.
+    painted: Cell<bool>,
 }
 
 impl Composer {
@@ -130,7 +151,60 @@ impl Composer {
             severity: ReviewThreadSeverity::Info,
             policy,
             revision: 0,
+            field: RefCell::new(FocusedTextFieldAdapter::new(FIELD_OWNER, FIELD_ID)),
+            eligible: Cell::new(false),
+            painted: Cell::new(false),
         }
+    }
+
+    /// Observe the editor's eligibility for completion (`eligible` from the surface; preview
+    /// and an unpainted editor are never eligible).
+    pub fn observe(&self, eligible: bool) {
+        self.eligible.set(eligible);
+        let visible = eligible && !self.preview && self.painted.get();
+        self.field
+            .borrow_mut()
+            .observe_input(&self.input.borrow(), visible);
+    }
+
+    /// Start a frame: the editor counts as visible only once painted in it.
+    pub fn begin_frame(&self) {
+        self.painted.set(false);
+    }
+
+    /// End a frame: an editor that was not painted is not eligible.
+    pub fn end_frame(&self) {
+        if !self.painted.get() {
+            self.field
+                .borrow_mut()
+                .observe_input(&self.input.borrow(), false);
+        }
+    }
+
+    /// Record the painted editor: its visible content rectangle and caret, in terminal cells.
+    pub fn painted(&self, content: Rect, caret: Rect) {
+        self.painted.set(true);
+        let visible =
+            !content.is_empty() && !caret.is_empty() && content.intersection(caret) == caret;
+        let mut field = self.field.borrow_mut();
+        let input = self.input.borrow();
+        field.observe_input(&input, self.eligible.get() && !self.preview && visible);
+        field.painted_input(&input, content, caret);
+    }
+
+    /// The editor as a focused text field, while eligible.
+    #[must_use]
+    pub fn focused_field(&self) -> Option<FocusedTextFieldSnapshot> {
+        self.field.borrow().snapshot_input(&self.input.borrow())
+    }
+
+    /// Apply a host completion edit as one undoable change.
+    pub fn apply_field_edit(&mut self, edit: &FocusedTextFieldEdit) -> FocusedTextFieldEditResult {
+        let result = self.field.get_mut().apply_input(self.input.get_mut(), edit);
+        if result == FocusedTextFieldEditResult::Applied {
+            self.touch();
+        }
+        result
     }
 
     /// Editing policy of the editor.

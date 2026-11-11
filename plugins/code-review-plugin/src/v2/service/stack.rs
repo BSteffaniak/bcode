@@ -31,8 +31,8 @@ pub const MAX_ATTRIBUTION_LINES: usize = 2_000_000;
 enum Origin {
     /// Line `n` (1-based) of the file at the stack's base.
     Base(u32),
-    /// Written by the layer at this index.
-    Layer(usize),
+    /// Written by the layer at this index, as line `n` (1-based) of that layer's head.
+    Layer(usize, u32),
 }
 
 /// The file as followed through the stack: its path at the current head (`None` while it does
@@ -77,8 +77,8 @@ pub fn attribution(
         return Ok(response);
     };
     let base_lines = tracked.lines.len();
-    // Which layer removed each base line.
-    let mut removed_by: Vec<Option<usize>> = vec![None; base_lines];
+    // Which layer removed each base line, and the line's number in the head below that layer.
+    let mut removed_by: Vec<Option<(usize, u32)>> = vec![None; base_lines];
 
     let pathspecs: Vec<&str> = if base_path == request.path {
         vec![base_path]
@@ -102,10 +102,14 @@ pub fn attribution(
 
     let number = |index: usize| stack.layers[index].number;
     response.new_ranges = ranges(tracked.lines.iter().map(|origin| match origin {
-        Origin::Layer(index) => Some(number(*index)),
+        Origin::Layer(index, line) => Some((number(*index), *line)),
         Origin::Base(_) => None,
     }));
-    response.old_ranges = ranges(removed_by.iter().map(|layer| layer.map(number)));
+    response.old_ranges = ranges(
+        removed_by
+            .iter()
+            .map(|removed| removed.map(|(index, line)| (number(index), line))),
+    );
     Ok(response)
 }
 
@@ -206,12 +210,13 @@ fn path_after(file: &DiffFile) -> Option<String> {
 }
 
 /// Apply one step's hunks: keep untouched lines (shifted), drop removed lines (recording which
-/// layer removed base lines), and insert added lines attributed to `layer`.
+/// layer removed base lines, and where they were in the head below it), and insert added lines
+/// attributed to `layer` at their line in its head.
 fn apply(
     tracked: &mut Tracked,
     file: &DiffFile,
     layer: usize,
-    removed_by: &mut [Option<usize>],
+    removed_by: &mut [Option<(usize, u32)>],
 ) -> Result<(), ServiceError> {
     let inconsistent = || {
         ServiceError::Git(format!(
@@ -237,17 +242,21 @@ fn apply(
             return Err(inconsistent());
         }
         next.extend_from_slice(&old[cursor..keep_until]);
-        for origin in &old[keep_until..removed_end] {
+        for (offset, origin) in old[keep_until..removed_end].iter().enumerate() {
             if let Origin::Base(line) = origin
                 && let Some(slot) = usize::try_from(*line)
                     .ok()
                     .and_then(|line| line.checked_sub(1))
                     .and_then(|index| removed_by.get_mut(index))
             {
-                slot.get_or_insert(layer);
+                let below = u32::try_from(keep_until + offset + 1).unwrap_or(u32::MAX);
+                slot.get_or_insert((layer, below));
             }
         }
-        next.extend(std::iter::repeat_n(Origin::Layer(layer), new_count));
+        let first = next.len();
+        next.extend((0..new_count).map(|offset| {
+            Origin::Layer(layer, u32::try_from(first + offset + 1).unwrap_or(u32::MAX))
+        }));
         if next.len() > MAX_ATTRIBUTION_LINES {
             return Err(ServiceError::TooLarge(format!(
                 "attribution is limited to {MAX_ATTRIBUTION_LINES} lines"
@@ -260,20 +269,28 @@ fn apply(
     Ok(())
 }
 
-/// Merge consecutive lines with the same layer into inclusive 1-based ranges.
-fn ranges(lines: impl Iterator<Item = Option<u64>>) -> Vec<ReviewStackLineAttribution> {
+/// Merge consecutive lines with the same layer (and consecutive lines in that layer's diff)
+/// into inclusive 1-based ranges.
+fn ranges(lines: impl Iterator<Item = Option<(u64, u32)>>) -> Vec<ReviewStackLineAttribution> {
     let mut ranges: Vec<ReviewStackLineAttribution> = Vec::new();
-    for (index, layer) in lines.enumerate() {
-        let Some(layer) = layer else {
+    for (index, origin) in lines.enumerate() {
+        let Some((layer, layer_line)) = origin else {
             continue;
         };
         let line = u32::try_from(index + 1).unwrap_or(u32::MAX);
         match ranges.last_mut() {
-            Some(last) if last.layer == layer && last.end + 1 == line => last.end = line,
+            Some(last)
+                if last.layer == layer
+                    && last.end + 1 == line
+                    && last.layer_line_of(last.end).map(|end| end + 1) == Some(layer_line) =>
+            {
+                last.end = line;
+            }
             _ => ranges.push(ReviewStackLineAttribution {
                 start: line,
                 end: line,
                 layer,
+                layer_line: Some(layer_line),
             }),
         }
     }

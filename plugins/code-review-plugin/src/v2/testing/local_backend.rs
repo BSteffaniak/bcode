@@ -13,9 +13,11 @@ use bcode_plugin_sdk::prelude::ServiceRequest;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Serves `bcode.code_review/v1` data-layer operations with an in-process [`V2Service`]. No
-/// review-source providers are enabled.
+/// Serves `bcode.code_review/v1` data-layer operations with an in-process [`V2Service`].
+/// Review-source providers are disabled unless one is set with [`LocalBackend::with_provider`].
 pub struct LocalBackend {
+    provider: Option<super::fake_provider::FakeProvider>,
+    publisher: Option<super::fake_publisher::FakePublisher>,
     service: Mutex<V2Service>,
     calls: AtomicUsize,
     state: tempfile::TempDir,
@@ -28,6 +30,8 @@ pub struct LocalBackend {
 impl Default for LocalBackend {
     fn default() -> Self {
         Self {
+            provider: None,
+            publisher: None,
             service: Mutex::default(),
             calls: AtomicUsize::new(0),
             state: tempfile::tempdir().expect("state directory"),
@@ -48,6 +52,32 @@ impl std::fmt::Debug for LocalBackend {
 }
 
 impl LocalBackend {
+    /// Enable `provider` as the only review-source provider.
+    #[must_use]
+    pub fn with_provider(mut self, provider: super::fake_provider::FakeProvider) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Enable `publisher` as the only external review publisher and importer.
+    #[must_use]
+    pub fn with_publisher(mut self, publisher: super::fake_publisher::FakePublisher) -> Self {
+        self.publisher = Some(publisher);
+        self
+    }
+
+    /// The enabled fake publisher.
+    #[must_use]
+    pub const fn publisher(&self) -> Option<&super::fake_publisher::FakePublisher> {
+        self.publisher.as_ref()
+    }
+
+    /// The enabled fake provider.
+    #[must_use]
+    pub const fn provider(&self) -> Option<&super::fake_provider::FakeProvider> {
+        self.provider.as_ref()
+    }
+
     /// Service calls answered so far.
     #[must_use]
     pub fn calls(&self) -> usize {
@@ -200,21 +230,46 @@ impl ReviewBackend for LocalBackend {
         Box::pin(async { Ok(()) })
     }
 
-    fn plugins_serving(&self, _interface_id: String) -> BackendFuture<Vec<String>> {
-        Box::pin(async { Ok(Vec::new()) })
+    fn plugins_serving(&self, interface_id: String) -> BackendFuture<Vec<String>> {
+        let plugins = if self.provider.is_some()
+            && interface_id == bcode_code_review_models::REVIEW_SOURCE_INTERFACE_ID
+        {
+            vec![super::fake_provider::FAKE_PLUGIN.to_owned()]
+        } else if self.publisher.is_some()
+            && (interface_id == bcode_code_review_models::REVIEW_PUBLISHER_INTERFACE_ID
+                || interface_id == bcode_code_review_models::REVIEW_IMPORTER_INTERFACE_ID)
+        {
+            vec![super::fake_publisher::FAKE_PUBLISHER_PLUGIN.to_owned()]
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move { Ok(plugins) })
     }
 
     fn invoke(
         &self,
         plugin_id: String,
-        _interface_id: String,
+        interface_id: String,
         operation: String,
-        _payload: Vec<u8>,
+        payload: Vec<u8>,
     ) -> BackendFuture<Vec<u8>> {
+        let answer = self
+            .provider
+            .as_ref()
+            .filter(|_| plugin_id == super::fake_provider::FAKE_PLUGIN)
+            .map(|provider| provider.answer(&operation, &payload))
+            .or_else(|| {
+                self.publisher
+                    .as_ref()
+                    .filter(|_| plugin_id == super::fake_publisher::FAKE_PUBLISHER_PLUGIN)
+                    .map(|publisher| publisher.answer(&interface_id, &operation, &payload))
+            });
         Box::pin(async move {
-            Err(ProviderCallError {
-                code: REVIEW_SOURCE_ERROR_FAILED.to_owned(),
-                message: format!("no provider {plugin_id} for {operation}"),
+            answer.unwrap_or_else(|| {
+                Err(ProviderCallError {
+                    code: REVIEW_SOURCE_ERROR_FAILED.to_owned(),
+                    message: format!("no provider {plugin_id} for {operation}"),
+                })
             })
         })
     }

@@ -1,10 +1,15 @@
 //! V2 review surface tests, driven through the phase 0 scenario harness against the real V2
 //! service (in-process) over generated fixture repositories.
 
+mod app;
 mod benchmark;
 mod chrome;
 mod interaction;
+mod parity;
+mod publish;
+mod rereview;
 mod screen;
+mod wizard;
 
 use super::ReviewSurfaceV2;
 use super::config::ReviewViewConfig;

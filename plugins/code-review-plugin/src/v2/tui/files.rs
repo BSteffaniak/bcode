@@ -100,6 +100,8 @@ pub struct FileTree {
     query: Vec<String>,
     filter: String,
     matches: usize,
+    /// Viewed files are left out (with directories that keep no file).
+    hide_viewed: bool,
 }
 
 impl FileTree {
@@ -349,22 +351,41 @@ impl FileTree {
         true
     }
 
-    /// Rebuild every displayed item (after a filter or theme change).
+    /// Show or hide viewed files. Returns whether the shown items changed.
+    pub fn set_hide_viewed(&mut self, hide: bool, theme: &ReviewTheme) -> bool {
+        if hide == self.hide_viewed {
+            return false;
+        }
+        self.hide_viewed = hide;
+        self.rebuild_items(theme);
+        true
+    }
+
+    /// Whether viewed files are hidden.
+    #[must_use]
+    pub const fn hides_viewed(&self) -> bool {
+        self.hide_viewed
+    }
+
+    /// Rebuild every displayed item (after a filter, the hide-viewed toggle, or a theme change).
     pub fn rebuild_items(&mut self, theme: &ReviewTheme) {
         let filtering = !self.query.is_empty();
-        let mut keep = vec![!filtering; self.nodes.len()];
+        let mut keep = vec![false; self.nodes.len()];
         let mut matches = 0;
         for (index, node) in self.nodes.iter().enumerate() {
             let NodeKind::File(row) = &node.kind else {
                 continue;
             };
+            if self.hide_viewed && row.decorations.viewed {
+                continue;
+            }
             let path = row.file.path.to_lowercase();
             if self.query.iter().all(|word| path.contains(word.as_str())) {
                 matches += 1;
                 keep[index] = true;
                 let mut parent = node.parent;
                 while let Some(ancestor) = parent {
-                    if keep[ancestor] && filtering {
+                    if keep[ancestor] {
                         break;
                     }
                     keep[ancestor] = true;
@@ -401,6 +422,7 @@ impl FileTree {
         if row.decorations == decorations {
             return false;
         }
+        let membership = self.hide_viewed && row.decorations.viewed != decorations.viewed;
         let before = file_totals(row);
         row.decorations = decorations;
         let after = file_totals(row);
@@ -416,6 +438,11 @@ impl FileTree {
             }
             changed.push(ancestor);
             parent = self.nodes[ancestor].parent;
+        }
+        if membership {
+            // The file joins or leaves the shown items.
+            self.rebuild_items(theme);
+            return true;
         }
         for node in changed {
             if let Some(item) = self.item_of[node] {
@@ -491,12 +518,12 @@ impl FileTree {
                 label: name,
                 totals,
             } => {
-                let style = if matches!(node.kind, NodeKind::Group { .. }) {
-                    theme.source_header
+                // Directories end with a slash; source groups are named, not paths.
+                let label = if matches!(node.kind, NodeKind::Group { .. }) {
+                    Line::from_spans(vec![Span::styled(name.clone(), theme.source_header)])
                 } else {
-                    theme.directory
+                    Line::from_spans(vec![Span::styled(format!("{name}/"), theme.directory)])
                 };
-                let label = Line::from_spans(vec![Span::styled(format!("{name}/"), style)]);
                 let mut trailing = Vec::new();
                 if totals.drafts > 0 {
                     trailing.push(badge(icons.draft, totals.drafts, theme.badge_draft));

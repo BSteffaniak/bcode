@@ -6,6 +6,8 @@
 //! * [`harness`] drives plugin TUI surfaces through scripted multi-event scenarios and renders
 //!   frames into BMUX test buffers.
 
+pub mod fake_provider;
+pub mod fake_publisher;
 pub mod fixture;
 pub mod harness;
 pub mod local_backend;

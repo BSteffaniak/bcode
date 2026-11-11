@@ -52,6 +52,9 @@ pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 pub const OP_REVIEW_SUGGESTIONS_LIST: &str = "review.suggestions.list";
 /// Operation that creates or updates a durable AI-suggested review comment.
 pub const OP_REVIEW_SUGGESTION_SAVE: &str = "review.suggestion.save";
+/// Operation that deletes a durable AI-suggested review comment from one review scope (Code
+/// Review V2 moves suggestions when a transient review is saved).
+pub const OP_REVIEW_SUGGESTION_DELETE: &str = "review.suggestion.delete";
 /// Operation that lists durable, non-publishable review AI exchanges.
 pub const OP_REVIEW_AI_EXCHANGES_LIST: &str = "review.ai_exchanges.list";
 /// Operation that creates or updates a durable, non-publishable review AI exchange.
@@ -76,6 +79,10 @@ pub const OP_REVIEW_PUBLISHER_SUBMIT: &str = "review.publisher.submit";
 pub const OP_REVIEW_IMPORTER_MANIFEST: &str = "review.importer.manifest";
 /// Operation that imports external review state without mutating it.
 pub const OP_REVIEW_IMPORTER_IMPORT: &str = "review.importer.import";
+/// Operation that previews a client-built [`ReviewBundle`] with a built-in publisher.
+pub const OP_REVIEW_PUBLISH_BUNDLE_PREVIEW: &str = "review.publish.bundle.preview";
+/// Operation that submits a client-built [`ReviewBundle`] with a built-in publisher.
+pub const OP_REVIEW_PUBLISH_BUNDLE_SUBMIT: &str = "review.publish.bundle.submit";
 
 /// Supported local Git review target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +416,26 @@ pub struct ReviewV2PresentationState {
     /// Revealed context per file.
     #[serde(default)]
     pub expansions: Vec<ReviewFileExpansion>,
+    /// Last position in each stack layer of a step-through review, by workspace source id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub layer_positions: BTreeMap<String, ReviewItemKey>,
+    /// Thread ids shown collapsed (header only).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub collapsed_threads: BTreeSet<String>,
+    /// AI exchange ids whose whole answer is shown instead of the preview.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub expanded_answers: BTreeSet<String>,
+    /// Resolved threads are hidden from the document.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_resolved_threads: bool,
+    /// Viewed files are hidden from the file panel.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_viewed_files: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for ReviewV2PresentationState {
@@ -419,6 +446,11 @@ impl Default for ReviewV2PresentationState {
             layout_mode: None,
             panels: ReviewPanelState::default(),
             expansions: Vec::new(),
+            layer_positions: BTreeMap::new(),
+            collapsed_threads: BTreeSet::new(),
+            expanded_answers: BTreeSet::new(),
+            hide_resolved_threads: false,
+            hide_viewed_files: false,
         }
     }
 }
@@ -603,14 +635,14 @@ impl ReviewSourceKind {
             Self::IndexStaged => "Staged changes".to_string(),
             Self::WorkingTreeAndIndex => "Working tree and index".to_string(),
             Self::LastCommit => "Last commit".to_string(),
-            Self::Commit { rev } => format!("Commit {rev}"),
+            Self::Commit { rev } => format!("Commit {}", short_rev(rev)),
             Self::CommitRange {
                 base,
                 head,
                 merge_base,
             } => {
                 let separator = if *merge_base { "..." } else { ".." };
-                format!("Range {base}{separator}{head}")
+                format!("Range {}{separator}{}", short_rev(base), short_rev(head))
             }
             Self::BranchCompare {
                 base_branch,
@@ -625,8 +657,8 @@ impl ReviewSourceKind {
             Self::Repository => "Repository browser".to_string(),
             Self::Commits { revs } => match revs.as_slice() {
                 [] => "Commits".to_string(),
-                [rev] => format!("Commit {rev}"),
-                [first, rest @ ..] => format!("Commits {first} +{}", rest.len()),
+                [rev] => format!("Commit {}", short_rev(rev)),
+                [first, rest @ ..] => format!("Commits {} +{}", short_rev(first), rest.len()),
             },
             Self::PullRequest {
                 repository, number, ..
@@ -648,6 +680,13 @@ impl ReviewSourceKind {
     pub const fn is_unsupported(&self) -> bool {
         matches!(self, Self::Unsupported { .. })
     }
+}
+
+/// A revision for display: full object ids (SHA-1 or SHA-256 hex) shortened to 7 characters,
+/// anything else (branch names, short ids, expressions) as written.
+fn short_rev(rev: &str) -> &str {
+    let full = matches!(rev.len(), 40 | 64) && rev.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if full { &rev[..7] } else { rev }
 }
 
 impl From<ReviewTarget> for ReviewSourceKind {
@@ -1071,6 +1110,27 @@ pub struct DeleteReviewAiExchangeRequest {
     pub scope: Option<ReviewScope>,
     /// Stable exchange identity to delete.
     pub exchange_id: String,
+}
+
+/// Request payload for `review.suggestion.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteReviewSuggestionRequest {
+    /// Repository path where Git commands should run.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope, when using durable workspace-scoped suggestions.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// Stable suggestion identity to delete.
+    pub suggestion_id: String,
+}
+
+/// Response payload for `review.suggestion.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteReviewSuggestionResponse {
+    /// Whether a persisted suggestion was deleted.
+    pub deleted: bool,
 }
 
 /// Response payload for `review.ai_exchange.delete`.
@@ -1642,6 +1702,22 @@ pub struct ReviewBundle {
     pub threads: Vec<ReviewBundleThread>,
     /// Generated timestamp in milliseconds since Unix epoch.
     pub generated_at_ms: u64,
+    /// Pull request this bundle is published to, when the reviewed source is a pull request
+    /// (or one layer of a stack) from a review-source provider. Publishers for that provider
+    /// use it instead of detecting the pull request from the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<ReviewPullRequestTarget>,
+}
+
+/// A pull request of a review-source provider, as a publish or import target.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReviewPullRequestTarget {
+    /// Review-source provider id (see `ReviewSourceProviderManifest::id`).
+    pub provider: String,
+    /// Provider repository identifier.
+    pub repository: String,
+    /// Pull request number.
+    pub number: u64,
 }
 
 /// Provider-neutral review thread bundle.
@@ -1665,6 +1741,11 @@ pub struct ReviewBundleThread {
     pub selected_diff_lines: Vec<String>,
     /// Hunk context.
     pub hunk_context: Vec<String>,
+    /// The thread could not be mapped onto the bundle's diff (for example a whole-stack comment
+    /// on a line no single layer introduced), so a publisher should include it in its summary
+    /// rather than anchor it inline.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_only: bool,
 }
 
 /// Review publisher capabilities.
@@ -1712,6 +1793,24 @@ pub struct ReviewPublisherManifest {
     /// Optional external plugin route.
     #[serde(default)]
     pub route: Option<ReviewPublisherRoute>,
+    /// Review-source provider whose pull requests this publisher publishes to. A client
+    /// publishing pull-request or stack sources of that provider sends one bundle per pull
+    /// request, with [`ReviewBundle::pull_request`] set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_provider: Option<String>,
+}
+
+/// Request payload for `review.publish.bundle.preview` and `review.publish.bundle.submit`:
+/// publish a bundle the client built (Code Review V2) with a built-in publisher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishBundleRequest {
+    /// Built-in publisher id.
+    pub publisher_id: String,
+    /// The bundle.
+    pub bundle: ReviewBundle,
+    /// Publisher options.
+    #[serde(default)]
+    pub options: serde_json::Value,
 }
 
 /// Response payload for publisher list.
@@ -1895,6 +1994,10 @@ pub struct ExternalReviewImportRequest {
     /// Provider options such as repository and pull request.
     #[serde(default)]
     pub options: serde_json::Value,
+    /// Pull request to import from, when the reviewed source is a pull request of a
+    /// review-source provider; importers for that provider use it when the options name none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<ReviewPullRequestTarget>,
 }
 
 /// Read-only external review import response.
@@ -3175,6 +3278,27 @@ mod workspace_compat_tests {
             encoded.get("viewed_marks").is_none(),
             "empty V2 fields are omitted"
         );
+    }
+
+    #[test]
+    fn labels_shorten_full_object_ids_only() {
+        let oid = "8dfce61a83e6c65e7b4d6a5ce0aa59e84ee3acfb";
+        let commits = ReviewSourceKind::Commits {
+            revs: vec![oid.into(), "HEAD~1".into(), "abc1234".into()],
+        };
+        assert_eq!(commits.label(), "Commits 8dfce61 +2");
+        let commit = ReviewSourceKind::Commit { rev: oid.into() };
+        assert_eq!(commit.label(), "Commit 8dfce61");
+        let range = ReviewSourceKind::CommitRange {
+            base: "main".into(),
+            head: oid.into(),
+            merge_base: true,
+        };
+        assert_eq!(range.label(), "Range main...8dfce61");
+        let branch = ReviewSourceKind::Commit {
+            rev: "feature/abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+        };
+        assert!(branch.label().ends_with("abcd"));
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Statically bundled code-review CLI contribution.
 
+use crate::v2::tui::entry::{ENTRY_OPTION, Entry};
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
     CODE_REVIEW_SERVICE_INTERFACE_ID, ExternalPublishReviewRequest, OP_REVIEW_BUNDLE_GET,
     OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewBundle, ReviewContextRequest, ReviewTarget,
+    ReviewBundle, ReviewContextRequest, ReviewSourceKind, ReviewTarget,
 };
 use bcode_plugin_sdk::{
     StaticCliFuture, StaticCliHostAction, StaticCliOutcome, StaticCliRegistration,
@@ -22,8 +23,9 @@ pub const REVIEW_UI_ENV: &str = "BCODE_REVIEW_UI";
 #[derive(Debug, Parser)]
 #[command(name = "review", about = "Review repository changes")]
 struct ReviewCli {
-    /// Review interface for interactive review subcommands (default: v1, or the
-    /// `BCODE_REVIEW_UI` environment variable). Review home stays on v1 until V2 has one.
+    /// Review interface for interactive review subcommands and the review home (default: v1, or
+    /// the `BCODE_REVIEW_UI` environment variable). The `branch`, `compare`, `commit`, `pr`,
+    /// `stack`, and `resume` subcommands require v2.
     #[arg(long, value_enum, global = true)]
     ui: Option<ReviewUi>,
     #[command(subcommand)]
@@ -101,18 +103,12 @@ fn resolve_repo_argument(repo: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
+/// Open `surface_kind` for `repo` with `options`.
 fn surface_outcome(
     repo: PathBuf,
-    target: Option<ReviewTarget>,
+    options: BTreeMap<String, String>,
     surface_kind: &str,
 ) -> StaticCliOutcome {
-    let mut options = BTreeMap::new();
-    if let Some(target) = target {
-        options.insert(
-            "target".into(),
-            serde_json::to_string(&target).expect("review target serializes"),
-        );
-    }
     StaticCliOutcome {
         host_action: Some(StaticCliHostAction::OpenTuiSurface {
             surface_kind: surface_kind.into(),
@@ -163,6 +159,61 @@ enum ReviewCommand {
     },
     /// Browse repository files and comment anywhere.
     Repo {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review the current branch against its base (merge-base semantics; requires --ui v2).
+    Branch {
+        /// Base revision; detected from the upstream, else the default branch, when omitted.
+        base: Option<String>,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Compare two branches or revisions (merge-base semantics; requires --ui v2).
+    Compare {
+        /// Base revision.
+        base: String,
+        /// Head revision.
+        head: String,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Use two-dot semantics instead of merge-base semantics.
+        #[arg(long)]
+        two_dot: bool,
+    },
+    /// Review one or more commits (requires --ui v2).
+    Commit {
+        /// Commit revisions; one range when they form a first-parent chain.
+        #[arg(required = true, num_args = 1..)]
+        revs: Vec<String>,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review a pull request by number or URL (requires --ui v2 and a review-source provider).
+    Pr {
+        /// Pull request number or URL.
+        reference: String,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Review a whole stack of pull requests; without a reference, the stack of the current
+    /// branch's pull request (requires --ui v2 and a review-source provider).
+    Stack {
+        /// Pull request number or URL of any layer.
+        reference: Option<String>,
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Resume a saved review; without an id, the most recently updated one (requires --ui v2).
+    Resume {
+        /// Review workspace id.
+        id: Option<String>,
         /// Repository path.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -235,20 +286,40 @@ impl From<ReviewTargetArg> for ReviewTarget {
     }
 }
 
-async fn run(command: Option<ReviewCommand>, ui: ReviewUi) -> Result<StaticCliOutcome, CliError> {
-    let Some(command) = command else {
-        // Review home is V1 until V2 gains its home route (spec phase 5).
-        return Ok(surface_outcome(
-            resolve_repo_argument(Path::new("."))?,
-            None,
-            REVIEW_SURFACE_KIND,
-        ));
-    };
-    let (repo, target) = match command {
-        ReviewCommand::Unstaged { repo } => (repo, ReviewTarget::WorkingTreeUnstaged),
-        ReviewCommand::Staged { repo } => (repo, ReviewTarget::IndexStaged),
-        ReviewCommand::All { repo } => (repo, ReviewTarget::WorkingTreeAndIndex),
-        ReviewCommand::LastCommit { repo } => (repo, ReviewTarget::LastCommit),
+/// Options opening the V2 app at `entry`.
+fn entry_options(entry: &Entry) -> BTreeMap<String, String> {
+    BTreeMap::from([(ENTRY_OPTION.to_owned(), entry.to_option())])
+}
+
+/// Options opening a V1 review of `target` (none: V1 home).
+fn target_options(target: Option<&ReviewTarget>) -> BTreeMap<String, String> {
+    target
+        .map(|target| {
+            BTreeMap::from([(
+                "target".to_owned(),
+                serde_json::to_string(target).expect("review target serializes"),
+            )])
+        })
+        .unwrap_or_default()
+}
+
+/// What an interactive subcommand opens.
+enum Opens {
+    /// A target both interfaces review.
+    Target(ReviewTarget),
+    /// An entry only V2 has, with the subcommand's name.
+    V2Only(Entry, &'static str),
+}
+
+/// What an interactive subcommand opens, or the publish request of `publish-github`.
+fn opens_of(command: ReviewCommand) -> Result<(PathBuf, Opens), Box<GithubPublishCliRequest>> {
+    Ok(match command {
+        ReviewCommand::Unstaged { repo } => {
+            (repo, Opens::Target(ReviewTarget::WorkingTreeUnstaged))
+        }
+        ReviewCommand::Staged { repo } => (repo, Opens::Target(ReviewTarget::IndexStaged)),
+        ReviewCommand::All { repo } => (repo, Opens::Target(ReviewTarget::WorkingTreeAndIndex)),
+        ReviewCommand::LastCommit { repo } => (repo, Opens::Target(ReviewTarget::LastCommit)),
         ReviewCommand::Range {
             repo,
             base,
@@ -256,13 +327,68 @@ async fn run(command: Option<ReviewCommand>, ui: ReviewUi) -> Result<StaticCliOu
             two_dot,
         } => (
             repo,
-            ReviewTarget::CommitRange {
+            Opens::Target(ReviewTarget::CommitRange {
                 base,
                 head,
                 merge_base: !two_dot,
-            },
+            }),
         ),
-        ReviewCommand::Repo { repo } => (repo, ReviewTarget::Repository),
+        ReviewCommand::Repo { repo } => (repo, Opens::Target(ReviewTarget::Repository)),
+        ReviewCommand::Branch { base, repo } => (
+            repo,
+            Opens::V2Only(
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::CurrentBranch { base }],
+                },
+                "branch",
+            ),
+        ),
+        ReviewCommand::Compare {
+            base,
+            head,
+            repo,
+            two_dot,
+        } => (
+            repo,
+            Opens::V2Only(
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::BranchCompare {
+                        base_branch: base,
+                        head_branch: head,
+                        merge_base: !two_dot,
+                    }],
+                },
+                "compare",
+            ),
+        ),
+        ReviewCommand::Commit { revs, repo } => {
+            let source = match <[String; 1]>::try_from(revs) {
+                Ok([rev]) => ReviewSourceKind::Commit { rev },
+                Err(revs) => ReviewSourceKind::Commits { revs },
+            };
+            (
+                repo,
+                Opens::V2Only(
+                    Entry::Sources {
+                        title: None,
+                        sources: vec![source],
+                    },
+                    "commit",
+                ),
+            )
+        }
+        ReviewCommand::Pr { reference, repo } => {
+            (repo, Opens::V2Only(Entry::PullRequest { reference }, "pr"))
+        }
+        ReviewCommand::Stack { reference, repo } => {
+            (repo, Opens::V2Only(Entry::Stack { reference }, "stack"))
+        }
+        ReviewCommand::Resume { id, repo } => (
+            repo,
+            Opens::V2Only(Entry::Resume { workspace_id: id }, "resume"),
+        ),
         ReviewCommand::PublishGithub {
             github_repo,
             pr,
@@ -274,7 +400,7 @@ async fn run(command: Option<ReviewCommand>, ui: ReviewUi) -> Result<StaticCliOu
             submit,
             target,
         } => {
-            publish_github_review(GithubPublishCliRequest {
+            return Err(Box::new(GithubPublishCliRequest {
                 github_repo,
                 pr,
                 repo,
@@ -284,14 +410,42 @@ async fn run(command: Option<ReviewCommand>, ui: ReviewUi) -> Result<StaticCliOu
                 fallback_unmapped_to_summary,
                 submit,
                 target: target.into(),
-            })
-            .await?;
+            }));
+        }
+    })
+}
+
+async fn run(command: Option<ReviewCommand>, ui: ReviewUi) -> Result<StaticCliOutcome, CliError> {
+    let Some(command) = command else {
+        let repo = resolve_repo_argument(Path::new("."))?;
+        return Ok(match ui {
+            ReviewUi::V1 => surface_outcome(repo, target_options(None), REVIEW_SURFACE_KIND),
+            ReviewUi::V2 => surface_outcome(repo, entry_options(&Entry::Home), ui.surface_kind()),
+        });
+    };
+    let (repo, opens) = match opens_of(command) {
+        Ok(opens) => opens,
+        Err(request) => {
+            publish_github_review(*request).await?;
             return Ok(StaticCliOutcome::default());
+        }
+    };
+    let options = match (opens, ui) {
+        (Opens::Target(target), ReviewUi::V1) => target_options(Some(&target)),
+        (Opens::Target(target), ReviewUi::V2) => entry_options(&Entry::Sources {
+            title: None,
+            sources: vec![ReviewSourceKind::from(target)],
+        }),
+        (Opens::V2Only(entry, _), ReviewUi::V2) => entry_options(&entry),
+        (Opens::V2Only(_, name), ReviewUi::V1) => {
+            return Err(CliError::Review(format!(
+                "`bcode review {name}` requires the V2 review interface; pass --ui v2 or set {REVIEW_UI_ENV}=v2"
+            )));
         }
     };
     Ok(surface_outcome(
         resolve_repo_argument(&repo)?,
-        Some(target),
+        options,
         ui.surface_kind(),
     ))
 }
@@ -477,6 +631,11 @@ mod tests {
             vec!["review", "last-commit", "--ui", "v2"],
             vec!["review", "range", "main", "HEAD", "--ui", "v2"],
             vec!["review", "repo", "--ui", "v2"],
+            vec!["review", "branch", "--ui", "v2"],
+            vec!["review", "--ui", "v2", "pr", "12"],
+            vec!["review", "stack", "--ui", "v2"],
+            vec!["review", "resume", "--ui", "v2"],
+            vec!["review", "--ui", "v2"],
         ] {
             let matches = (registration.command)()
                 .try_get_matches_from(args.clone())
@@ -498,15 +657,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v2_opens_the_v2_surface_with_the_target_and_home_stays_v1() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
             .build()
-            .unwrap();
-        let repo = std::env::temp_dir();
-        let outcome = runtime
-            .block_on(run(Some(ReviewCommand::Unstaged { repo }), ReviewUi::V2))
-            .unwrap();
+            .unwrap()
+    }
+
+    /// The surface kind and parsed entry (or V1 target option) a command opens.
+    fn opened(command: Option<ReviewCommand>, ui: ReviewUi) -> (String, BTreeMap<String, String>) {
+        let outcome = runtime().block_on(run(command, ui)).expect("command runs");
         let Some(StaticCliHostAction::OpenTuiSurface {
             surface_kind,
             options,
@@ -515,18 +674,186 @@ mod tests {
         else {
             panic!("expected a surface");
         };
-        assert_eq!(surface_kind, crate::v2::tui::CODE_REVIEW_V2_SURFACE_KIND);
+        (surface_kind, options)
+    }
+
+    fn entry_of(options: &BTreeMap<String, String>) -> Entry {
+        Entry::from_options(&serde_json::json!({ ENTRY_OPTION: options[ENTRY_OPTION] }))
+            .expect("entry parses")
+    }
+
+    #[test]
+    fn v2_opens_the_v2_app_with_an_entry_and_v1_keeps_targets() {
+        let repo = std::env::temp_dir();
+        let (kind, options) = opened(
+            Some(ReviewCommand::Unstaged { repo: repo.clone() }),
+            ReviewUi::V2,
+        );
+        assert_eq!(kind, crate::v2::tui::CODE_REVIEW_V2_SURFACE_KIND);
+        assert_eq!(
+            entry_of(&options),
+            Entry::Sources {
+                title: None,
+                sources: vec![ReviewSourceKind::WorkingTreeUnstaged],
+            }
+        );
+        let (kind, options) = opened(Some(ReviewCommand::Unstaged { repo }), ReviewUi::V1);
+        assert_eq!(kind, REVIEW_SURFACE_KIND);
         assert_eq!(
             serde_json::from_str::<ReviewTarget>(&options["target"]).unwrap(),
             ReviewTarget::WorkingTreeUnstaged
         );
-        let outcome = runtime.block_on(run(None, ReviewUi::V2));
-        // Home resolves the process working directory; only its surface kind matters here.
-        if let Ok(StaticCliOutcome {
-            host_action: Some(StaticCliHostAction::OpenTuiSurface { surface_kind, .. }),
-        }) = outcome
-        {
-            assert_eq!(surface_kind, REVIEW_SURFACE_KIND);
+        // `bcode review` opens home: the V2 app's home route, or V1 home.
+        let (kind, options) = opened(None, ReviewUi::V2);
+        assert_eq!(kind, crate::v2::tui::CODE_REVIEW_V2_SURFACE_KIND);
+        assert_eq!(entry_of(&options), Entry::Home);
+        let (kind, options) = opened(None, ReviewUi::V1);
+        assert_eq!(kind, REVIEW_SURFACE_KIND);
+        assert!(options.is_empty());
+    }
+
+    /// Parse each command line and check the V2 entry it opens (without a daemon).
+    fn assert_entries(cases: Vec<(Vec<&str>, Entry)>) {
+        let registration = registration();
+        for (args, expected) in cases {
+            let matches = (registration.command)()
+                .try_get_matches_from(&args)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(!(registration.requires_daemon)(&matches), "{args:?}");
+            let command = ReviewCli::from_arg_matches(&matches).unwrap().command;
+            let (kind, options) = opened(command, ReviewUi::V2);
+            assert_eq!(
+                kind,
+                crate::v2::tui::CODE_REVIEW_V2_SURFACE_KIND,
+                "{args:?}"
+            );
+            assert_eq!(entry_of(&options), expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn branch_compare_and_commit_subcommands_open_transient_reviews() {
+        assert_entries(vec![
+            (
+                vec!["review", "branch"],
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::CurrentBranch { base: None }],
+                },
+            ),
+            (
+                vec!["review", "branch", "origin/main"],
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::CurrentBranch {
+                        base: Some("origin/main".into()),
+                    }],
+                },
+            ),
+            (
+                vec!["review", "compare", "main", "feature"],
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::BranchCompare {
+                        base_branch: "main".into(),
+                        head_branch: "feature".into(),
+                        merge_base: true,
+                    }],
+                },
+            ),
+            (
+                vec!["review", "compare", "main", "feature", "--two-dot"],
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::BranchCompare {
+                        base_branch: "main".into(),
+                        head_branch: "feature".into(),
+                        merge_base: false,
+                    }],
+                },
+            ),
+            (
+                vec!["review", "commit", "abc123"],
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::Commit {
+                        rev: "abc123".into(),
+                    }],
+                },
+            ),
+            (
+                vec!["review", "commit", "a1", "b2", "c3"],
+                Entry::Sources {
+                    title: None,
+                    sources: vec![ReviewSourceKind::Commits {
+                        revs: vec!["a1".into(), "b2".into(), "c3".into()],
+                    }],
+                },
+            ),
+        ]);
+        assert!(
+            (registration().command)()
+                .try_get_matches_from(["review", "commit"])
+                .is_err(),
+            "commit needs a revision"
+        );
+    }
+
+    #[test]
+    fn pr_stack_and_resume_subcommands_open_resolving_entries() {
+        assert_entries(vec![
+            (
+                vec!["review", "pr", "42"],
+                Entry::PullRequest {
+                    reference: "42".into(),
+                },
+            ),
+            (
+                vec!["review", "pr", "https://example.com/o/r/pull/42"],
+                Entry::PullRequest {
+                    reference: "https://example.com/o/r/pull/42".into(),
+                },
+            ),
+            (vec!["review", "stack"], Entry::Stack { reference: None }),
+            (
+                vec!["review", "stack", "#7"],
+                Entry::Stack {
+                    reference: Some("#7".into()),
+                },
+            ),
+            (
+                vec!["review", "resume"],
+                Entry::Resume { workspace_id: None },
+            ),
+            (
+                vec!["review", "resume", "ws-1"],
+                Entry::Resume {
+                    workspace_id: Some("ws-1".into()),
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn new_subcommands_require_v2() {
+        for command in [
+            ReviewCommand::Branch {
+                base: None,
+                repo: PathBuf::from("."),
+            },
+            ReviewCommand::Pr {
+                reference: "1".into(),
+                repo: PathBuf::from("."),
+            },
+            ReviewCommand::Resume {
+                id: None,
+                repo: PathBuf::from("."),
+            },
+        ] {
+            let error = runtime()
+                .block_on(run(Some(command), ReviewUi::V1))
+                .expect_err("v1 refuses");
+            assert!(error.to_string().contains("--ui v2"), "{error}");
         }
     }
 
@@ -583,7 +910,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
 
-        let outcome = surface_outcome(repo.clone(), Some(ReviewTarget::IndexStaged));
+        let outcome = surface_outcome(
+            repo.clone(),
+            target_options(Some(&ReviewTarget::IndexStaged)),
+            REVIEW_SURFACE_KIND,
+        );
 
         let Some(StaticCliHostAction::OpenTuiSurface { repo_path, .. }) = outcome.host_action
         else {

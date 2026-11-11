@@ -186,6 +186,7 @@ impl RustPlugin for CodeReviewPlugin {
             OP_DRAFT_UPDATE => update_draft(&context),
             bcode_code_review_models::OP_REVIEW_SUGGESTIONS_LIST => list_suggestions(&context),
             bcode_code_review_models::OP_REVIEW_SUGGESTION_SAVE => save_suggestion(&context),
+            bcode_code_review_models::OP_REVIEW_SUGGESTION_DELETE => delete_suggestion(&context),
             bcode_code_review_models::OP_REVIEW_AI_EXCHANGES_LIST => list_ai_exchanges(&context),
             bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_SAVE => save_ai_exchange(&context),
             bcode_code_review_models::OP_REVIEW_AI_EXCHANGE_DELETE => delete_ai_exchange(&context),
@@ -207,6 +208,12 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(&context.request),
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
+            bcode_code_review_models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW => {
+                review_publish_bundle(&context.request, false)
+            }
+            bcode_code_review_models::OP_REVIEW_PUBLISH_BUNDLE_SUBMIT => {
+                review_publish_bundle(&context.request, true)
+            }
             OP_REVIEW_PUBLISH_RECORD_SAVE => review_publish_record_save(&context),
             OP_REVIEW_PUBLISH_RECORDS_LIST => review_publish_records_list(&context),
             OP_REVIEW_EXTERNAL_IMPORT_SAVE => review_external_import_save(&context),
@@ -671,6 +678,24 @@ fn delete_ai_exchange(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
+fn delete_suggestion(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<bcode_code_review_models::DeleteReviewSuggestionRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match delete_suggestion_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("suggestion_delete_failed", error.to_string()),
+    }
+}
+
 fn link_thread_session(context: &NativeServiceContext) -> ServiceResponse {
     let request = match context.request.payload_json::<LinkThreadSessionRequest>() {
         Ok(request) => request,
@@ -727,6 +752,8 @@ fn classify_thread(context: &NativeServiceContext) -> ServiceResponse {
 /// same `*_for_request` functions; this entry point lets in-process V2 surface tests use the real
 /// persisted store.
 #[cfg(test)]
+// One arm per operation: a dispatch table.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn invoke_stateful_for_tests(
     request: &bcode_plugin_sdk::prelude::ServiceRequest,
     config: &CodeReviewPluginConfig,
@@ -788,12 +815,57 @@ pub(crate) fn invoke_stateful_for_tests(
             "suggestions_failed",
             |r: ListReviewSuggestionsRequest| list_suggestions_for_request(&r, config),
         ),
+        bcode_code_review_models::OP_REVIEW_SUGGESTION_SAVE => {
+            run(request, "suggestion_save_failed", |r| {
+                save_suggestion_for_request(r, config)
+            })
+        }
+        bcode_code_review_models::OP_REVIEW_SUGGESTION_DELETE => {
+            run(request, "suggestion_delete_failed", |r| {
+                delete_suggestion_for_request(r, config)
+            })
+        }
         OP_REVIEW_WORKSPACE_UPDATE => run(request, "workspace_update_failed", |r| {
             update_review_workspace_for_request(r, config)
         }),
         OP_REVIEW_WORKSPACE_GET => run(request, "workspace_get_failed", |r| {
             get_review_workspace_for_request(r, config)
         }),
+        OP_REVIEW_WORKSPACE_LIST => run(
+            request,
+            "workspace_list_failed",
+            |r: ListReviewWorkspacesRequest| list_review_workspaces_for_request(&r, config),
+        ),
+        OP_REVIEW_WORKSPACE_CREATE => run(request, "workspace_create_failed", |r| {
+            create_review_workspace_for_request(r, config)
+        }),
+        OP_REVIEW_WORKSPACE_ARCHIVE => run(request, "workspace_archive_failed", |r| {
+            archive_review_workspace_for_request(r, config)
+        }),
+        OP_REVIEW_PUBLISHERS_LIST => review_publishers_list(request),
+        bcode_code_review_models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW => {
+            review_publish_bundle(request, false)
+        }
+        bcode_code_review_models::OP_REVIEW_PUBLISH_BUNDLE_SUBMIT => {
+            review_publish_bundle(request, true)
+        }
+        OP_REVIEW_PUBLISH_RECORD_SAVE => match save_publish_record_for_request(request, config) {
+            Ok(response) => json_response(&response),
+            Err(error) => ServiceResponse::error("publish_record_save_failed", error.to_string()),
+        },
+        OP_REVIEW_PUBLISH_RECORDS_LIST => run(
+            request,
+            "publish_records_list_failed",
+            |r: ListPublishRecordsRequest| list_publish_records_for_request(&r, config),
+        ),
+        OP_REVIEW_EXTERNAL_IMPORT_SAVE => run(request, "external_import_save_failed", |r| {
+            save_external_import_for_request(r, config)
+        }),
+        OP_REVIEW_EXTERNAL_IMPORTS_LIST => run(
+            request,
+            "external_imports_list_failed",
+            |r: ListExternalReviewImportsRequest| list_external_imports_for_request(&r, config),
+        ),
         _ => return None,
     })
 }
@@ -905,6 +977,36 @@ fn review_publish_submit(context: &NativeServiceContext) -> ServiceResponse {
     match publish_submit_for_request(request, &config) {
         Ok(response) => json_response(&response),
         Err(error) => ServiceResponse::error("review_publish_submit_failed", error.to_string()),
+    }
+}
+
+/// Preview or submit a client-built bundle with a built-in publisher (Code Review V2). Unlike
+/// `review.publish.submit`, no publish record is saved here: the client saves one per published
+/// bundle with `review.publish.record.save`.
+fn review_publish_bundle(request: &ServiceRequest, submit: bool) -> ServiceResponse {
+    let request = match request.payload_json::<bcode_code_review_models::PublishBundleRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    if submit {
+        match with_publisher(&request.publisher_id, |publisher| {
+            publisher.submit(&request.bundle, &request.options)
+        }) {
+            Ok(response) => json_response(&response),
+            Err(error) => ServiceResponse::error("review_publish_submit_failed", error.to_string()),
+        }
+    } else {
+        match with_publisher(&request.publisher_id, |publisher| {
+            publisher.preview(&request.bundle, &request.options)
+        }) {
+            Ok(preview) => json_response(&PublishReviewPreviewResponse {
+                publisher_id: request.publisher_id.clone(),
+                preview,
+            }),
+            Err(error) => {
+                ServiceResponse::error("review_publish_preview_failed", error.to_string())
+            }
+        }
     }
 }
 
@@ -1090,6 +1192,7 @@ fn review_bundle_for_request(
             context_for_anchor(&summary, &thread.anchor);
         hydrate_bundle_line_anchor_metadata(&mut selected_lines, &thread.anchor);
         ReviewBundleThread {
+            summary_only: false,
             thread_id: thread.thread_id,
             anchor: thread.anchor,
             comments: thread.comments,
@@ -1102,6 +1205,7 @@ fn review_bundle_for_request(
     })
     .collect();
     Ok(ReviewBundle {
+        pull_request: None,
         review_id: review_key,
         title: summary.title,
         repo_root: summary.repo_root,
@@ -1161,6 +1265,7 @@ struct LocalMarkdownPublisher;
 impl ReviewPublisher for LocalMarkdownPublisher {
     fn manifest(&self) -> ReviewPublisherManifest {
         ReviewPublisherManifest {
+            pull_request_provider: None,
             id: "local_markdown".to_string(),
             label: "Local review markdown".to_string(),
             description: "Write a local-first Markdown review notebook export".to_string(),
@@ -1198,6 +1303,7 @@ struct MarkdownFilePublisher;
 impl ReviewPublisher for MarkdownFilePublisher {
     fn manifest(&self) -> ReviewPublisherManifest {
         ReviewPublisherManifest {
+            pull_request_provider: None,
             id: "markdown_file".to_string(),
             label: "Markdown file".to_string(),
             description: "Write a local Markdown review export".to_string(),
@@ -1235,6 +1341,7 @@ struct JsonFilePublisher;
 impl ReviewPublisher for JsonFilePublisher {
     fn manifest(&self) -> ReviewPublisherManifest {
         ReviewPublisherManifest {
+            pull_request_provider: None,
             id: "json_file".to_string(),
             label: "JSON file".to_string(),
             description: "Write a local JSON review bundle".to_string(),
@@ -2320,6 +2427,23 @@ fn delete_ai_exchange_for_request(
     Ok(DeleteReviewAiExchangeResponse { deleted })
 }
 
+fn delete_suggestion_for_request(
+    request: bcode_code_review_models::DeleteReviewSuggestionRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<bcode_code_review_models::DeleteReviewSuggestionResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let review_key = review_key_for_scope(&repo_root, &request.target, request.scope.as_ref())?;
+    let suggestion_id = request.suggestion_id;
+    let deleted = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .delete_suggestion(&review_key, &suggestion_id)
+                .await
+        })
+    })?;
+    Ok(bcode_code_review_models::DeleteReviewSuggestionResponse { deleted })
+}
+
 fn list_suggestions_for_request(
     request: &ListReviewSuggestionsRequest,
     config: &CodeReviewPluginConfig,
@@ -3191,6 +3315,37 @@ impl<'a> CodeReviewDb<'a> {
             .delete("review_ai_exchanges")
             .filter(Box::new(where_eq("review_key", review_key.to_string())))
             .filter(Box::new(where_eq("exchange_id", exchange_id.to_string())))
+            .execute(self.db)
+            .await?;
+        Ok(true)
+    }
+
+    async fn delete_suggestion(
+        &self,
+        review_key: &str,
+        suggestion_id: &str,
+    ) -> Result<bool, ReviewError> {
+        let existing = self
+            .db
+            .select("review_suggestions")
+            .columns(&["suggestion_id"])
+            .filter(Box::new(where_eq("review_key", review_key.to_string())))
+            .filter(Box::new(where_eq(
+                "suggestion_id",
+                suggestion_id.to_string(),
+            )))
+            .execute_first(self.db)
+            .await?;
+        if existing.is_none() {
+            return Ok(false);
+        }
+        self.db
+            .delete("review_suggestions")
+            .filter(Box::new(where_eq("review_key", review_key.to_string())))
+            .filter(Box::new(where_eq(
+                "suggestion_id",
+                suggestion_id.to_string(),
+            )))
             .execute(self.db)
             .await?;
         Ok(true)
@@ -5871,6 +6026,7 @@ mod tests {
     #[test]
     fn local_markdown_publisher_preview_is_local_review_report() {
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review-1".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -5885,6 +6041,7 @@ mod tests {
                 is_binary: false,
             }],
             threads: vec![ReviewBundleThread {
+                summary_only: false,
                 thread_id: "thread-1".to_string(),
                 anchor: DraftAnchor {
                     kind: ReviewAnchorKind::Range,
@@ -5960,6 +6117,7 @@ mod tests {
     #[test]
     fn local_markdown_groups_review_level_threads() {
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review-1".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -5967,6 +6125,7 @@ mod tests {
             surfaces: Vec::new(),
             files: Vec::new(),
             threads: vec![ReviewBundleThread {
+                summary_only: false,
                 thread_id: "thread-review".to_string(),
                 anchor: DraftAnchor {
                     kind: ReviewAnchorKind::Review,
@@ -6040,6 +6199,7 @@ mod tests {
     #[test]
     fn json_publisher_preview_is_review_bundle_json() {
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review-1".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),
@@ -6064,6 +6224,7 @@ mod tests {
         let error = with_publisher("missing", |publisher| {
             publisher.preview(
                 &ReviewBundle {
+                    pull_request: None,
                     review_id: "review-1".to_string(),
                     title: "Review".to_string(),
                     repo_root: PathBuf::from("/repo"),
@@ -6086,6 +6247,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("selected-review.md");
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review-selection".to_string(),
             title: "Selected review".to_string(),
             repo_root: temp.path().to_path_buf(),
@@ -6093,6 +6255,7 @@ mod tests {
             surfaces: Vec::new(),
             files: Vec::new(),
             threads: vec![ReviewBundleThread {
+                summary_only: false,
                 thread_id: "thread-1".to_string(),
                 anchor: DraftAnchor {
                     kind: ReviewAnchorKind::Range,
@@ -6168,6 +6331,7 @@ mod tests {
     #[test]
     fn output_path_override_is_used() {
         let bundle = ReviewBundle {
+            pull_request: None,
             review_id: "review-1".to_string(),
             title: "Review".to_string(),
             repo_root: PathBuf::from("/repo"),

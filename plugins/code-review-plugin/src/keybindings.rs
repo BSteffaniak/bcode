@@ -318,6 +318,16 @@ mod tests {
     fn declared_bindings_are_unique_and_all_modes_register() {
         let registry = resolve_registry(actions(), BTreeMap::new()).unwrap();
         for action in actions() {
+            // Code Review V2 declares rarely used actions without a default key: they run from
+            // the palette and help, and users can bind them.
+            if action.defaults.is_empty() {
+                assert!(action.scope.starts_with("code-review-v2"), "{}", action.id);
+                assert_eq!(
+                    registry.keys_for_action(&action.scope, &action.id),
+                    Vec::<&str>::new()
+                );
+                continue;
+            }
             assert!(
                 !registry
                     .keys_for_action(&action.scope, &action.id)

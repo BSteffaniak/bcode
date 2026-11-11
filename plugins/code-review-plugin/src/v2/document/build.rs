@@ -229,6 +229,7 @@ impl ReviewDocument {
                 .map(super::document::Attribution::layers)
                 .unwrap_or_default(),
             thread_count: self.file_annotations[file].len(),
+            carried_over: state.carried_over,
         })];
         let mut parents = vec![None];
         let regions = state.regions();

@@ -167,6 +167,14 @@ pub enum ThreadAction {
     Resolve,
     /// Ask Bcode about the thread's anchor.
     Ask,
+    /// Collapse or expand the thread.
+    Fold,
+    /// Accept the latest pending suggestion as a draft.
+    Accept,
+    /// Ask Bcode to refine the latest pending suggestion.
+    Refine,
+    /// Reject the latest pending suggestion.
+    Reject,
 }
 
 /// An action on an AI answer item.
@@ -178,6 +186,33 @@ pub enum AgentAction {
     Delete,
     /// Observe the session again after its stream stopped.
     Retry,
+    /// Ask a follow-up question in the linked session.
+    FollowUp,
+    /// Copy the answer to the clipboard.
+    Copy,
+    /// Show the whole answer, or the preview again.
+    Expand,
+    /// Turn the answer into a suggested comment.
+    Suggest,
+    /// Turn the answer into a draft comment.
+    Draft,
+    /// Accept the latest pending suggestion as a draft.
+    Accept,
+    /// Ask Bcode to refine the latest pending suggestion.
+    Refine,
+    /// Reject the latest pending suggestion.
+    Reject,
+}
+
+/// How threads and AI answers are folded (presentation only; persisted with the workspace).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Folds {
+    /// Threads shown as their header only.
+    pub collapsed: std::collections::BTreeSet<String>,
+    /// AI exchanges whose whole answer is shown.
+    pub expanded: std::collections::BTreeSet<String>,
+    /// Changes whenever the folds change.
+    pub revision: u64,
 }
 
 /// What a clickable item cell does.
@@ -398,6 +433,8 @@ pub struct RowContext<'a> {
     pub notes: &'a super::notes::ReviewNotes,
     /// Live AI answer states.
     pub agents: &'a super::agent::AgentStreams,
+    /// Folded threads and expanded answers.
+    pub folds: &'a Folds,
     /// The open composer.
     pub composer: Option<&'a super::composer::Composer>,
     /// Search matches to highlight.
@@ -491,13 +528,19 @@ impl RowContext<'_> {
             ReviewItem::Line(line) => self.unified_rows(index, line, width),
             ReviewItem::LinePair(pair) => self.pair_rows(pair, width),
             ReviewItem::Gap(gap) => gap_rows(gap, self.params, cells, self.gutter_indent(width)),
-            ReviewItem::Thread(thread) => {
-                thread_rows(thread, self.notes, styles, cells, self.gutter_indent(width))
-            }
+            ReviewItem::Thread(thread) => thread_rows(
+                thread,
+                self.notes,
+                self.folds,
+                styles,
+                cells,
+                self.gutter_indent(width),
+            ),
             ReviewItem::AgentThread(agent) => agent_rows(
                 agent,
                 self.notes,
                 self.agents,
+                self.folds,
                 styles,
                 cells,
                 self.gutter_indent(width),
@@ -868,13 +911,20 @@ fn file_header(item: &FileHeaderItem, theme: &ReviewTheme, width: usize) -> Line
     }
     content.push(Span::styled(
         item.file.path.clone(),
-        if item.viewed {
+        if item.viewed || item.carried_over {
             theme.path_viewed
         } else {
             theme.path
         },
     ));
     let mut trailing = Vec::new();
+    if item.carried_over {
+        trailing.push(Span::styled(
+            "unchanged since last review",
+            theme.badge_outdated,
+        ));
+        trailing.push(Span::raw(" "));
+    }
     for (flag, label, style) in [
         (ReviewIndexFlag::Binary, "binary", theme.status_binary),
         (ReviewIndexFlag::ModeChanged, "mode", theme.muted),
@@ -937,7 +987,14 @@ fn source_header(item: &SourceHeaderItem, theme: &ReviewTheme, width: usize) -> 
     header_line(
         &Line::from_spans(content),
         &Line::from_spans(vec![
-            Span::styled(format!("{} files", item.file_count), theme.muted),
+            Span::styled(
+                format!(
+                    "{} file{}",
+                    item.file_count,
+                    if item.file_count == 1 { "" } else { "s" }
+                ),
+                theme.muted,
+            ),
             Span::styled(separator, theme.muted),
             Span::styled(
                 format!("{} {} viewed", theme.icons.viewed, item.viewed_count),
@@ -1198,6 +1255,8 @@ pub const SELECTION_SCOPE: &str = "review.document";
 const MAX_COMMENT_ROWS: usize = 12;
 /// Answer lines shown per AI answer.
 const MAX_ANSWER_ROWS: usize = 8;
+/// Answer lines shown per expanded AI answer.
+const MAX_EXPANDED_ANSWER_ROWS: usize = 400;
 
 /// `lines` with `prefix` cells of padding before each, clipped to `width`.
 fn indented(lines: Vec<Line>, prefix: &str, width: usize) -> Vec<Line> {
@@ -1232,38 +1291,49 @@ fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Li
     lines
 }
 
-/// An action row: labelled buttons placed left to right after `indent`, each kept whole or
-/// dropped (with every later one) when it does not fit.
+/// Action rows: labelled buttons placed left to right after `indent`, wrapping onto further
+/// rows (starting at item row `row`) when the next one does not fit. Each button is kept whole;
+/// one wider than a whole row is dropped (with every later one).
 fn action_row(
     buttons: &[(&str, ItemAction)],
     row: u16,
     indent: usize,
     width: usize,
     theme: &ReviewTheme,
-) -> (Line, Vec<ActionCells<ItemAction>>) {
-    let mut spans = vec![Span::raw(" ".repeat(indent.min(width)))];
+) -> (Vec<Line>, Vec<ActionCells<ItemAction>>) {
+    let indent = indent.min(width);
+    let separator = display_width(theme.icons.separator);
+    let mut lines = Vec::new();
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
     let mut actions = Vec::new();
     let mut x = indent;
-    for (index, (label, action)) in buttons.iter().enumerate() {
-        let gap = usize::from(index > 0) * display_width(theme.icons.separator);
+    let mut first = true;
+    for (label, action) in buttons {
         let cells = display_width(label);
-        if x + gap + cells > width {
+        if indent + cells > width {
             break;
         }
-        if gap > 0 {
+        let gap = if first { 0 } else { separator };
+        if x + gap + cells > width {
+            lines.push(Line::from_spans(std::mem::take(&mut spans)).truncate(width));
+            spans.push(Span::raw(" ".repeat(indent)));
+            x = indent;
+        } else if gap > 0 {
             spans.push(Span::styled(theme.icons.separator, theme.muted));
             x += gap;
         }
+        first = false;
         spans.push(Span::styled((*label).to_owned(), theme.gap_action));
         actions.push(ActionCells {
-            row,
+            row: row.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
             cells: u16::try_from(x).unwrap_or(u16::MAX)
                 ..u16::try_from(x + cells).unwrap_or(u16::MAX),
             action: *action,
         });
         x += cells;
     }
-    (Line::from_spans(spans).truncate(width), actions)
+    lines.push(Line::from_spans(spans).truncate(width));
+    (lines, actions)
 }
 
 const fn outdated_label(reason: crate::v2::document::OutdatedReason) -> &'static str {
@@ -1277,21 +1347,30 @@ const fn outdated_label(reason: crate::v2::document::OutdatedReason) -> &'static
     }
 }
 
-/// Rows of a thread: a header, its comments (markdown), and its actions.
-fn thread_rows(
+/// Header spans of a thread: fold marker, comment count, kind, severity, state, and badges.
+fn thread_header(
     thread: &crate::v2::document::ThreadItem,
     notes: &super::notes::ReviewNotes,
+    comments: &[&bcode_code_review_models::DraftComment],
+    collapsed: bool,
     theme: &ReviewTheme,
-    width: usize,
     indent: usize,
-) -> ItemRows {
+) -> Vec<Span> {
     let icons = &theme.icons;
-    let comments = notes.thread(&thread.thread_id);
     let saving = comments
         .iter()
         .any(|comment| super::notes::is_local(&comment.comment_id));
     let mut header = vec![
         Span::raw(" ".repeat(indent)),
+        Span::styled(
+            if collapsed {
+                icons.collapsed
+            } else {
+                icons.menu
+            },
+            theme.muted,
+        ),
+        Span::raw(" "),
         Span::styled(icons.thread, theme.thread),
         Span::raw(" "),
         Span::styled(
@@ -1321,6 +1400,10 @@ fn thread_rows(
         header.push(Span::raw(" "));
         header.push(Span::styled("saving…", theme.badge_draft));
     }
+    if notes.is_published(&thread.thread_id) {
+        header.push(Span::raw(" "));
+        header.push(Span::styled("published", theme.badge_resolved));
+    }
     if let Some((_, start, end)) = thread.lines {
         header.push(Span::styled(icons.separator, theme.muted));
         header.push(Span::styled(
@@ -1332,7 +1415,30 @@ fn thread_rows(
             theme.muted,
         ));
     }
+    header
+}
+
+/// Rows of a thread: a header (a click folds it), its comments (markdown), its suggestions,
+/// and its actions. A collapsed thread is its header only.
+fn thread_rows(
+    thread: &crate::v2::document::ThreadItem,
+    notes: &super::notes::ReviewNotes,
+    folds: &Folds,
+    theme: &ReviewTheme,
+    width: usize,
+    indent: usize,
+) -> ItemRows {
+    if let Some(external) = notes.external(&thread.thread_id) {
+        return external_thread_rows(thread, external, notes, theme, width, indent);
+    }
+    let comments = notes.thread(&thread.thread_id);
+    let collapsed = folds.collapsed.contains(&thread.thread_id);
+    let header = thread_header(thread, notes, &comments, collapsed, theme, indent);
     let mut lines = vec![Line::from_spans(header).truncate(width)];
+    let fold = header_fold(indent, width);
+    if collapsed {
+        return ItemRows::lines(lines, fold.into_iter().collect());
+    }
     let body_indent = indent + 2;
     let body_width = width.saturating_sub(body_indent);
     if !thread.resolved {
@@ -1353,6 +1459,24 @@ fn thread_rows(
             lines.extend(rows);
         }
     }
+    let mut actions: Vec<ActionCells<ItemAction>> = fold.into_iter().collect();
+    let (suggestion_lines, suggestion_actions) = suggestion_rows(
+        &thread.suggestion_ids,
+        notes,
+        theme,
+        body_indent,
+        width,
+        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+        |action| {
+            ItemAction::Thread(match action {
+                SuggestionAction::Accept => ThreadAction::Accept,
+                SuggestionAction::Refine => ThreadAction::Refine,
+                SuggestionAction::Reject => ThreadAction::Reject,
+            })
+        },
+    );
+    lines.extend(suggestion_lines);
+    actions.extend(suggestion_actions);
     let buttons: Vec<(&str, ItemAction)> = if thread.resolved {
         vec![
             ("Reopen", ItemAction::Thread(ThreadAction::Resolve)),
@@ -1368,9 +1492,177 @@ fn thread_rows(
         ]
     };
     let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let (line, actions) = action_row(&buttons, row, body_indent.min(width), width, theme);
-    lines.push(line);
+    let (rows, placed) = action_row(&buttons, row, body_indent.min(width), width, theme);
+    lines.extend(rows);
+    actions.extend(placed);
     ItemRows::lines(lines, actions)
+}
+
+/// The fold action over a header row's cells after the indent.
+fn header_fold(indent: usize, width: usize) -> Option<ActionCells<ItemAction>> {
+    (width > indent).then(|| ActionCells {
+        row: 0,
+        cells: u16::try_from(indent).unwrap_or(u16::MAX)..u16::try_from(width).unwrap_or(u16::MAX),
+        action: ItemAction::Thread(ThreadAction::Fold),
+    })
+}
+
+/// An action on the latest pending suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestionAction {
+    Accept,
+    Refine,
+    Reject,
+}
+
+/// Rows of suggestions: one per suggestion (status and first line), then Accept, Refine, and
+/// Reject buttons for the latest pending one. Rows start at `first_row` of the item.
+fn suggestion_rows(
+    ids: &[String],
+    notes: &super::notes::ReviewNotes,
+    theme: &ReviewTheme,
+    indent: usize,
+    width: usize,
+    first_row: u16,
+    action: impl Fn(SuggestionAction) -> ItemAction,
+) -> (Vec<Line>, Vec<ActionCells<ItemAction>>) {
+    use bcode_code_review_models::ReviewSuggestionStatus;
+    let pad = " ".repeat(indent.min(width));
+    let mut lines = Vec::new();
+    let suggestions: Vec<_> = ids.iter().filter_map(|id| notes.suggestion(id)).collect();
+    for suggestion in &suggestions {
+        let (label, style) = match suggestion.status {
+            ReviewSuggestionStatus::Suggested => ("suggested ", theme.badge_ai),
+            ReviewSuggestionStatus::Refining => ("refining… ", theme.badge_draft),
+            ReviewSuggestionStatus::Accepted => ("accepted ", theme.badge_resolved),
+            ReviewSuggestionStatus::Rejected => ("rejected ", theme.badge_outdated),
+        };
+        lines.push(
+            Line::from_spans(vec![
+                Span::raw(pad.clone()),
+                Span::styled(label, style),
+                Span::styled(
+                    suggestion
+                        .body
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    theme.text,
+                ),
+            ])
+            .truncate(width),
+        );
+    }
+    let pending = suggestions
+        .iter()
+        .any(|suggestion| suggestion.status == ReviewSuggestionStatus::Suggested);
+    let actions = if pending {
+        let row = first_row.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+        let buttons = [
+            ("Accept", action(SuggestionAction::Accept)),
+            ("Refine", action(SuggestionAction::Refine)),
+            ("Reject", action(SuggestionAction::Reject)),
+        ];
+        let (rows, placed) = action_row(&buttons, row, indent.min(width), width, theme);
+        lines.extend(rows);
+        placed
+    } else {
+        Vec::new()
+    };
+    (lines, actions)
+}
+
+/// Rows of an imported (read-only) thread: a header with the provider, remote state, and
+/// mapping, then each comment with its author. Imported threads have no actions.
+fn external_thread_rows(
+    thread: &crate::v2::document::ThreadItem,
+    external: &super::notes::ExternalThread,
+    notes: &super::notes::ReviewNotes,
+    theme: &ReviewTheme,
+    width: usize,
+    indent: usize,
+) -> ItemRows {
+    use bcode_code_review_models::{ExternalAnchorMappingStatus, ExternalReviewThreadState};
+    let icons = &theme.icons;
+    let comments = notes.thread(&thread.thread_id);
+    let mut header = vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(icons.thread, theme.thread),
+        Span::raw(" "),
+        Span::styled("imported", theme.badge_ai),
+        Span::styled(icons.separator, theme.muted),
+        Span::styled(external.provider_id.clone(), theme.muted),
+        Span::styled(icons.separator, theme.muted),
+        Span::styled(
+            format!(
+                "{} comment{}",
+                comments.len(),
+                if comments.len() == 1 { "" } else { "s" }
+            ),
+            theme.thread,
+        ),
+        Span::raw(" "),
+        match external.state {
+            ExternalReviewThreadState::Open => Span::styled("open", theme.badge_open),
+            ExternalReviewThreadState::Resolved => Span::styled("resolved", theme.badge_resolved),
+            ExternalReviewThreadState::Outdated => Span::styled("outdated", theme.badge_outdated),
+        },
+    ];
+    match external.mapping {
+        ExternalAnchorMappingStatus::Exact => {}
+        ExternalAnchorMappingStatus::Approximate => {
+            header.push(Span::raw(" "));
+            header.push(Span::styled("approximate", theme.badge_outdated));
+        }
+        ExternalAnchorMappingStatus::Unmappable => {
+            header.push(Span::raw(" "));
+            header.push(Span::styled("not in this review", theme.badge_outdated));
+        }
+    }
+    if let crate::v2::document::AnchorPlacement::Outdated(reason) = thread.placement {
+        header.push(Span::raw(" "));
+        header.push(Span::styled(outdated_label(reason), theme.badge_outdated));
+    }
+    if let Some((_, start, end)) = thread.lines {
+        header.push(Span::styled(icons.separator, theme.muted));
+        header.push(Span::styled(
+            if start == end {
+                format!("L{end}")
+            } else {
+                format!("L{start}-{end}")
+            },
+            theme.muted,
+        ));
+    }
+    let mut lines = vec![Line::from_spans(header).truncate(width)];
+    let body_indent = indent + 2;
+    let body_width = width.saturating_sub(body_indent);
+    if let Some(message) = &external.message {
+        lines.push(
+            Line::from_spans(vec![
+                Span::raw(" ".repeat(body_indent.min(width))),
+                Span::styled(message.clone(), theme.muted),
+            ])
+            .truncate(width),
+        );
+    }
+    if external.state != ExternalReviewThreadState::Resolved {
+        for comment in &comments {
+            if let Some(author) = external.authors.get(&comment.comment_id) {
+                lines.push(
+                    Line::from_spans(vec![
+                        Span::raw(" ".repeat(body_indent.min(width))),
+                        Span::styled(author.clone(), theme.title),
+                    ])
+                    .truncate(width),
+                );
+            }
+            let rows = markdown(&comment.body, body_width, MAX_COMMENT_ROWS, theme);
+            lines.extend(indented(rows, &" ".repeat(body_indent), width));
+        }
+    }
+    ItemRows::lines(lines, Vec::new())
 }
 
 /// Header of an AI answer: icon, live status, and an outdated label. Returns whether the
@@ -1413,10 +1705,12 @@ fn agent_header(
 
 /// Rows of an AI answer: a header with live status, the question, the answer preview (or the
 /// status), suggestions, and actions.
+#[allow(clippy::too_many_lines)]
 fn agent_rows(
     agent: &crate::v2::document::AgentThreadItem,
     notes: &super::notes::ReviewNotes,
     agents: &super::agent::AgentStreams,
+    folds: &Folds,
     theme: &ReviewTheme,
     width: usize,
     indent: usize,
@@ -1459,49 +1753,63 @@ fn agent_rows(
             );
         }
     }
+    let expanded = agent
+        .exchange_id
+        .as_ref()
+        .is_some_and(|id| folds.expanded.contains(id));
+    let answered = session_state.is_some_and(|state| !state.answer.trim().is_empty());
     match session_state {
         Some(state) if !state.answer.is_empty() => {
+            let max = if expanded {
+                MAX_EXPANDED_ANSWER_ROWS
+            } else {
+                MAX_ANSWER_ROWS
+            };
             lines.extend(indented(
-                markdown(&state.answer, body_width, MAX_ANSWER_ROWS, theme),
+                markdown(&state.answer, body_width, max, theme),
                 &pad,
                 width,
             ));
         }
         Some(state) if !state.status.is_empty() => lines.push(
             Line::from_spans(vec![
-                Span::raw(pad.clone()),
+                Span::raw(pad),
                 Span::styled(state.status.clone(), theme.muted),
             ])
             .truncate(width),
         ),
         _ => {}
     }
-    for suggestion in agent
-        .suggestion_ids
-        .iter()
-        .filter_map(|id| notes.suggestion(id))
-    {
-        lines.push(
-            Line::from_spans(vec![
-                Span::raw(pad.clone()),
-                Span::styled("suggested ", theme.badge_ai),
-                Span::styled(
-                    suggestion
-                        .body
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned(),
-                    theme.text,
-                ),
-            ])
-            .truncate(width),
-        );
-    }
+    let (suggestion_lines, mut actions) = suggestion_rows(
+        &agent.suggestion_ids,
+        notes,
+        theme,
+        body_indent,
+        width,
+        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+        |action| {
+            ItemAction::Agent(match action {
+                SuggestionAction::Accept => AgentAction::Accept,
+                SuggestionAction::Refine => AgentAction::Refine,
+                SuggestionAction::Reject => AgentAction::Reject,
+            })
+        },
+    );
+    lines.extend(suggestion_lines);
     let session = exchange.and_then(|exchange| exchange.session_id.as_ref());
     let mut buttons = Vec::new();
     if session.is_some() {
         buttons.push(("Open session", ItemAction::Agent(AgentAction::Open)));
+        buttons.push(("Follow up", ItemAction::Agent(AgentAction::FollowUp)));
+    }
+    if answered {
+        buttons.push((
+            if expanded { "Less" } else { "More" },
+            ItemAction::Agent(AgentAction::Expand),
+        ));
+        buttons.push(("Copy", ItemAction::Agent(AgentAction::Copy)));
+        buttons.push(("Suggest comment", ItemAction::Agent(AgentAction::Suggest)));
+        buttons.push(("Draft", ItemAction::Agent(AgentAction::Draft)));
     }
     if failed && session.is_some() {
         buttons.push(("Retry", ItemAction::Agent(AgentAction::Retry)));
@@ -1509,15 +1817,13 @@ fn agent_rows(
     if exchange.is_some() {
         buttons.push(("Delete", ItemAction::Agent(AgentAction::Delete)));
     }
-    let actions = if buttons.is_empty() {
-        Vec::new()
-    } else {
+    if !buttons.is_empty() {
         let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let (line, placed_actions) =
+        let (rows, placed_actions) =
             action_row(&buttons, row, body_indent.min(width), width, theme);
-        lines.push(line);
-        placed_actions
-    };
+        lines.extend(rows);
+        actions.extend(placed_actions);
+    }
     ItemRows::lines(lines, actions)
 }
 
@@ -1581,12 +1887,20 @@ impl<'a> ItemView<'a> {
             let editor = composer.editor(theme);
             let size = bmux_tui::geometry::Size::new(inner, layout.editor_rows);
             let node = editor.layout(Constraints::tight(size), &mut LayoutCx::new());
-            cx.with_child(
-                i32::from(layout.indent),
-                1,
-                LocalRect::new(0, 0, inner, layout.editor_rows),
-                |cx| editor.paint(&node, cx),
-            );
+            let area = LocalRect::new(0, 0, inner, layout.editor_rows);
+            let mut placed = (Rect::default(), Rect::default());
+            cx.with_child(i32::from(layout.indent), 1, area, |cx| {
+                editor.paint(&node, cx);
+                let content = cx.project_raster_rect(area).unwrap_or_default();
+                let caret = cx
+                    .cursor()
+                    .filter(|cursor| cursor.visible)
+                    .map_or_else(Rect::default, |cursor| {
+                        Rect::new(cursor.position.x, cursor.position.y, 1, 1)
+                    });
+                placed = (content, caret);
+            });
+            composer.painted(placed.0, placed.1);
         }
         let last = height.saturating_sub(1);
         cx.write_line(

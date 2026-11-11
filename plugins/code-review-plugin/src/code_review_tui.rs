@@ -1227,6 +1227,7 @@ async fn invoke_external_importer(
 ) -> Result<ExternalReviewImportResponse, TuiError> {
     let files = app.review.files.iter().map(ReviewFile::to_model).collect();
     let request = ExternalReviewImportRequest {
+        pull_request: None,
         repo_root: repo_path,
         files,
         options,

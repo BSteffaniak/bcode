@@ -18,7 +18,7 @@ use crate::v2::tui::notes::{self, MutationResult, NoteScope};
 use crate::v2::tui::rows::{AgentAction, ThreadAction};
 use bcode_code_review_models::{
     REVIEW_AI_EXCHANGE_SCHEMA_VERSION, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
-    ReviewLineSide, ReviewWorkspace,
+    ReviewLineSide, ReviewSuggestionStatus, ReviewWorkspace,
 };
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost};
 use bmux_keyboard::KeyStroke;
@@ -129,13 +129,16 @@ impl ReviewSurfaceV2 {
         match result {
             Ok(exchange) => {
                 let session = exchange.session_id.clone();
+                // A follow-up stays in the review; a new session opens.
+                let follow_up = self.follow_ups.remove(&exchange.exchange_id);
                 self.notes.put_exchange(exchange);
-                if let Some(session) = session {
+                if let Some(session) = session.filter(|_| !follow_up) {
                     self.pending_action = self.open_session(&session);
                 }
             }
             Err(failed) => {
                 let (exchange, error) = *failed;
+                self.follow_ups.remove(&exchange.exchange_id);
                 self.notes.put_exchange(exchange);
                 self.toasts
                     .push(ToastSeverity::Error, "Could not ask Bcode", Some(error));
@@ -146,7 +149,7 @@ impl ReviewSurfaceV2 {
 
     /// Show the current annotations in the document when they changed.
     pub(super) fn sync_notes(&mut self) {
-        let revision = self.notes.revision();
+        let revision = self.notes.revision().wrapping_mul(2) | u64::from(self.hide_resolved);
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -154,7 +157,20 @@ impl ReviewSurfaceV2 {
             return;
         }
         review.notes_applied = Some(revision);
-        review.doc.set_annotations(&self.notes.annotations());
+        let mut annotations = self.notes.annotations();
+        if self.hide_resolved {
+            // A thread is resolved when every comment is (as the document decides).
+            let open: std::collections::BTreeSet<String> = annotations
+                .drafts
+                .iter()
+                .filter(|draft| draft.resolved_at_ms.is_none())
+                .map(|draft| draft.thread_id.clone())
+                .collect();
+            annotations
+                .drafts
+                .retain(|draft| open.contains(&draft.thread_id));
+        }
+        review.doc.set_annotations(&annotations);
         review.note_splices();
         review.threads.borrow_mut().revision = None;
         review.marks_revision = None;
@@ -243,7 +259,7 @@ impl ReviewSurfaceV2 {
                 .update_draft(&comment_id, text)
                 .map(|()| "comment updated"),
             ComposerMode::Ask => {
-                self.ask(&anchor, text, now);
+                self.ask_question(&anchor, text, now);
                 Ok("asking Bcode…")
             }
         };
@@ -310,6 +326,53 @@ impl ReviewSurfaceV2 {
         }
     }
 
+    /// Tell the composer whether it may take host completions: it has keyboard focus, nothing
+    /// covers it, and the terminal has focus (painting adds visibility).
+    pub(super) fn observe_composer(&self) {
+        let eligible = self.terminal_focused
+            && self.focus == Focus::Composer
+            && self.overlay.is_none()
+            && self.modal.is_none()
+            && !self.publish.open
+            && self.closing.is_none();
+        if let Some(composer) = &self.composer {
+            composer.observe(eligible);
+        }
+    }
+
+    /// The composer as a focused text field, while it may take completions.
+    #[must_use]
+    pub fn focused_text_field_snapshot(
+        &self,
+    ) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        self.observe_composer();
+        self.composer.as_ref()?.focused_field()
+    }
+
+    /// Apply a host completion edit to the composer.
+    pub fn apply_focused_text_field(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+    ) -> bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult {
+        use bcode_plugin_sdk::tui::{
+            FocusedTextFieldEditResult, PluginTuiEventResult, PluginTuiFocusedTextFieldEditResult,
+        };
+        self.observe_composer();
+        let Some(composer) = self.composer.as_mut() else {
+            return PluginTuiFocusedTextFieldEditResult::rejected(
+                bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+            );
+        };
+        let edit_result = composer.apply_field_edit(edit);
+        let event = if edit_result == FocusedTextFieldEditResult::Applied {
+            PluginTuiEventResult::from_legacy(PluginTuiAction::Redraw)
+        } else {
+            PluginTuiEventResult::consumed()
+        };
+        self.observe_composer();
+        PluginTuiFocusedTextFieldEditResult { edit_result, event }
+    }
+
     /// Anchor of a new comment from the cursor: the selected range, else the cursor's line or
     /// file header.
     pub(super) fn cursor_anchor(&self) -> Option<DocAnchor> {
@@ -327,8 +390,13 @@ impl ReviewSurfaceV2 {
         review.doc.anchor_for(review.cursor.as_ref()?)
     }
 
-    /// Start a comment (or a question) at the cursor; on a thread, reply to it.
+    /// Start a comment (or a question) at the cursor; on a thread, reply to it; asking on an AI
+    /// answer asks a follow-up in its session.
     pub(super) fn start_comment(&mut self, ask: bool) {
+        if ask && self.agent_at_cursor().is_some() {
+            self.follow_up();
+            return;
+        }
         if self.thread_at_cursor().is_some() {
             let action = if ask {
                 ThreadAction::Ask
@@ -388,7 +456,7 @@ impl ReviewSurfaceV2 {
         }
     }
 
-    fn agent_at_cursor(&self) -> Option<String> {
+    pub(super) fn agent_at_cursor(&self) -> Option<String> {
         let review = self.review.as_ref()?;
         match review.doc.item(review.cursor_index)? {
             ReviewItem::AgentThread(agent) => agent.exchange_id.clone(),
@@ -398,6 +466,13 @@ impl ReviewSurfaceV2 {
 
     /// Run a thread action on the cursor's thread.
     pub(super) fn thread_action(&mut self, action: ThreadAction) -> Option<PluginTuiAction> {
+        if action == ThreadAction::Fold {
+            self.fold();
+            return None;
+        }
+        if self.refuse_external_thread() {
+            return None;
+        }
         let Some(thread_id) = self.thread_at_cursor() else {
             self.set_status("move to a thread first", StatusSeverity::Warning);
             return None;
@@ -449,6 +524,22 @@ impl ReviewSurfaceV2 {
                 self.open_composer(anchor, ComposerMode::Ask, "");
                 Ok(None)
             }
+            ThreadAction::Fold => {
+                self.fold();
+                return None;
+            }
+            ThreadAction::Accept => {
+                self.decide_suggestion(ReviewSuggestionStatus::Accepted);
+                return None;
+            }
+            ThreadAction::Refine => {
+                self.decide_suggestion(ReviewSuggestionStatus::Refining);
+                return None;
+            }
+            ThreadAction::Reject => {
+                self.decide_suggestion(ReviewSuggestionStatus::Rejected);
+                return None;
+            }
         };
         match result {
             Ok(Some(message)) => self.set_status(message, StatusSeverity::Success),
@@ -461,6 +552,9 @@ impl ReviewSurfaceV2 {
 
     /// Cycle the cursor thread's kind or severity.
     pub(super) fn classify_thread(&mut self, severity: bool) {
+        if self.refuse_external_thread() {
+            return;
+        }
         let Some(thread_id) = self.thread_at_cursor() else {
             self.set_status("move to a thread first", StatusSeverity::Warning);
             return;
@@ -486,6 +580,24 @@ impl ReviewSurfaceV2 {
 
     /// Run an AI answer action on the cursor's answer.
     pub(super) fn agent_action(&mut self, action: AgentAction) -> Option<PluginTuiAction> {
+        match action {
+            AgentAction::Accept => self.decide_suggestion(ReviewSuggestionStatus::Accepted),
+            AgentAction::Refine => self.decide_suggestion(ReviewSuggestionStatus::Refining),
+            AgentAction::Reject => self.decide_suggestion(ReviewSuggestionStatus::Rejected),
+            AgentAction::FollowUp => self.follow_up(),
+            AgentAction::Expand => self.fold(),
+            AgentAction::Suggest => self.suggest_from_answer(),
+            AgentAction::Draft => self.draft_from_answer(),
+            AgentAction::Copy => self.copy_answer(),
+            AgentAction::Open | AgentAction::Retry | AgentAction::Delete => {
+                return self.exchange_action(action);
+            }
+        }
+        None
+    }
+
+    /// Open, retry, or delete the cursor's exchange.
+    fn exchange_action(&mut self, action: AgentAction) -> Option<PluginTuiAction> {
         let Some(exchange_id) = self.agent_at_cursor() else {
             self.set_status("move to an AI answer first", StatusSeverity::Warning);
             return None;
@@ -515,28 +627,69 @@ impl ReviewSurfaceV2 {
                     self.set_status(error, StatusSeverity::Warning);
                 }
             }
+            _ => {}
         }
         self.sync_notes();
         None
     }
 
-    /// Ask Bcode about `anchor`: record a pending exchange and queue the question.
-    fn ask(&mut self, anchor: &DocAnchor, question: String, now: u64) {
+    /// Ask Bcode about `anchor`: record a pending exchange and queue the question. When the
+    /// anchor already has a linked session (an earlier question, or a linked thread), the
+    /// question is a follow-up in that session.
+    pub(super) fn ask_question(&mut self, anchor: &DocAnchor, question: String, now: u64) {
         self.next_exchange += 1;
+        let draft_anchor = anchor.to_draft_anchor();
+        let identity = notes::anchor_identity(&draft_anchor);
+        let session = self
+            .notes
+            .exchanges()
+            .iter()
+            .rev()
+            .filter(|exchange| notes::anchor_identity(&exchange.anchor) == identity)
+            .find_map(|exchange| exchange.session_id.clone())
+            .or_else(|| {
+                self.notes
+                    .drafts()
+                    .iter()
+                    .filter(|draft| notes::anchor_identity(&draft.anchor) == identity)
+                    .find_map(|draft| draft.session_id.clone())
+            });
+        let exchange_id = format!("exchange-{now}-{}", self.next_exchange);
+        if session.is_some() {
+            self.follow_ups.insert(exchange_id.clone());
+        }
         let exchange = ReviewAiExchange {
             schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
-            exchange_id: format!("exchange-{now}-{}", self.next_exchange),
-            anchor: anchor.to_draft_anchor(),
+            exchange_id,
+            anchor: draft_anchor,
             question: question.clone(),
-            session_id: None,
+            session_id: session,
             status: ReviewAiExchangeStatus::Pending,
             error: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
+        let path = exchange.anchor.file_path.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        let threads: Vec<String> = self
+            .notes
+            .drafts()
+            .iter()
+            .filter(|draft| draft.anchor.file_path == path && seen.insert(&draft.thread_id))
+            .filter_map(|draft| self.notes.thread(&draft.thread_id).first().copied())
+            .take(agent::MAX_PROMPT_THREADS)
+            .map(|first| format!("{}: {}", location_label(&first.anchor), first.body.trim()))
+            .collect();
         let context = AskContext {
             title: self.title.clone(),
             repo: self.repo_path.clone(),
+            sources: self
+                .sources
+                .iter()
+                .filter(|source| source.included)
+                .map(|source| source.label.clone())
+                .collect(),
+            threads,
             path: exchange.anchor.file_path.clone(),
             old: anchor_range(anchor, ReviewLineSide::Old),
             new: anchor_range(anchor, ReviewLineSide::New),
@@ -617,7 +770,7 @@ impl ReviewSurfaceV2 {
     }
 
     /// The document anchor of a persisted anchor (at its file in this review).
-    fn doc_anchor(&self, anchor: &bcode_code_review_models::DraftAnchor) -> DocAnchor {
+    pub(super) fn doc_anchor(&self, anchor: &bcode_code_review_models::DraftAnchor) -> DocAnchor {
         let file = self.review.as_ref().and_then(|review| {
             if anchor.kind == ReviewAnchorKind::Review {
                 return None;
@@ -705,6 +858,7 @@ impl ReviewSurfaceV2 {
                 ]),
             ));
         }
+        entries.extend(self.external_thread_entries());
         for exchange in self.notes.exchanges() {
             if !self.threads_filter.matches_exchange(exchange) {
                 continue;
@@ -744,6 +898,46 @@ impl ReviewSurfaceV2 {
             rows.keys.push(key);
         }
     }
+
+    /// Threads panel entries of imported threads: `(path, line, key, row)`.
+    fn external_thread_entries(&self) -> Vec<(String, u32, ItemKey, Line)> {
+        let theme = &self.theme;
+        let mut entries = Vec::new();
+        let mut seen_external = std::collections::BTreeSet::new();
+        for draft in self.notes.external_drafts() {
+            if !seen_external.insert(draft.thread_id.clone())
+                || !self.threads_filter.matches_thread(draft)
+            {
+                continue;
+            }
+            let Some(external) = self.notes.external(&draft.thread_id) else {
+                continue;
+            };
+            let line = draft.anchor.new_line.or(draft.anchor.old_line).unwrap_or(0);
+            entries.push((
+                draft.anchor.file_path.clone(),
+                line,
+                ItemKey::Thread {
+                    thread_id: draft.thread_id.clone(),
+                },
+                Line::from_spans(vec![
+                    Span::styled(theme.icons.thread, theme.thread),
+                    Span::raw(" "),
+                    Span::styled("imported", theme.badge_ai),
+                    Span::raw(" "),
+                    Span::styled(external.provider_id.clone(), theme.muted),
+                    Span::raw(" "),
+                    Span::styled(location_label(&draft.anchor), theme.path),
+                    Span::raw(" "),
+                    Span::styled(
+                        draft.body.lines().next().unwrap_or_default().to_owned(),
+                        theme.text,
+                    ),
+                ]),
+            ));
+        }
+        entries
+    }
 }
 
 /// Move the cursor to an annotation; one in a file whose content is not resident moves to the
@@ -781,7 +975,7 @@ const fn anchor_range(anchor: &DocAnchor, side: ReviewLineSide) -> Option<(u32, 
     }
 }
 
-fn location_label(anchor: &bcode_code_review_models::DraftAnchor) -> String {
+pub(super) fn location_label(anchor: &bcode_code_review_models::DraftAnchor) -> String {
     if anchor.kind == ReviewAnchorKind::Review {
         return "review".to_owned();
     }

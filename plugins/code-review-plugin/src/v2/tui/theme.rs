@@ -84,6 +84,8 @@ pub struct Icons {
     pub filter: &'static str,
     /// Hide-the-panel action of the file panel.
     pub collapse: &'static str,
+    /// A collapsed group (the menu toggle marks an expanded one).
+    pub collapsed: &'static str,
 }
 
 impl Icons {
@@ -110,6 +112,7 @@ impl Icons {
         menu: "▾",
         filter: "⌕",
         collapse: "«",
+        collapsed: "▸",
     };
 
     /// ASCII glyphs.
@@ -135,6 +138,7 @@ impl Icons {
         menu: "v",
         filter: "/",
         collapse: "<<",
+        collapsed: ">",
     };
 
     /// The glyph set of `style`.

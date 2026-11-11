@@ -10,11 +10,12 @@
 //! diagnostic; every other source keeps working.
 
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_STACK_RESOLVE,
-    REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_INTERFACE_ID,
-    ResolveReviewSourcesRequest, ReviewPullFetchResult, ReviewSource, ReviewSourceKind,
-    ReviewSourceProviderManifest, ReviewSourceProviderOutcome, ReviewSourceProviderResolution,
-    ReviewSourcePullFetchRequest, ReviewSourceStackResolveRequest,
+    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
+    OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
+    REVIEW_SOURCE_INTERFACE_ID, ResolveReviewSourcesRequest, ReviewPullFetchResult, ReviewSource,
+    ReviewSourceKind, ReviewSourceProviderManifest, ReviewSourceProviderOutcome,
+    ReviewSourceProviderResolution, ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest,
+    ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
     ReviewSourceStackResolveResponse, ReviewStack,
 };
 use serde::Serialize;
@@ -188,6 +189,55 @@ pub async fn resolve_request_with_providers<T: ProviderTransport + Sync>(
         sources,
         provider_resolutions,
     })
+}
+
+/// List the open pull requests of `repository` (detected from the remotes when `None`) through
+/// `route`: review requested from me first, then most recently updated.
+///
+/// # Errors
+///
+/// * The provider's error (for example `unauthenticated` or `unsupported_repository`).
+pub async fn list_pulls<T: ProviderTransport + Sync>(
+    transport: &T,
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: Option<String>,
+) -> Result<ReviewSourcePullsListResponse, ProviderCallError> {
+    call(
+        transport,
+        &route.plugin_id,
+        OP_REVIEW_SOURCE_PULLS_LIST,
+        &ReviewSourcePullsListRequest {
+            repo_path: repo_path.to_path_buf(),
+            repository,
+        },
+    )
+    .await
+}
+
+/// Resolve the stack containing pull request `number` through `route`.
+///
+/// # Errors
+///
+/// * The provider's error (for example `pull_not_found`).
+pub async fn resolve_stack<T: ProviderTransport + Sync>(
+    transport: &T,
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: Option<String>,
+    number: u64,
+) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
+    call(
+        transport,
+        &route.plugin_id,
+        OP_REVIEW_SOURCE_STACK_RESOLVE,
+        &ReviewSourceStackResolveRequest {
+            repo_path: repo_path.to_path_buf(),
+            repository,
+            number,
+        },
+    )
+    .await
 }
 
 /// One provider and repository being asked about a source.

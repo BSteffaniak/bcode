@@ -37,7 +37,7 @@ pub(crate) mod tests;
 pub use anchors::{AnchorLines, AnchorTarget, Annotations, DocAnchor, target_of};
 pub use build::estimate_rows;
 pub use document::{
-    DEFAULT_RESIDENCY_BUDGET_BYTES, DocumentConfig, DocumentNeed, REVIEW_LEVEL_PATH,
+    DEFAULT_RESIDENCY_BUDGET_BYTES, DocumentConfig, DocumentNeed, GroupInfo, REVIEW_LEVEL_PATH,
     ReviewDocument, Sections, SourceInput, SourceStack, Splice, Ticket, ViewedProgress,
 };
 pub use interval::IntervalSet;

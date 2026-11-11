@@ -579,6 +579,7 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
                 cache: &cache,
                 notes: &notes,
                 agents: &agents,
+                folds: &crate::v2::tui::rows::Folds::default(),
                 composer: None,
                 search: None,
             };

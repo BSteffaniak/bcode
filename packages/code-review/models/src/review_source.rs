@@ -327,6 +327,12 @@ pub struct ReviewStackLineAttribution {
     /// Pull request number of the layer that introduced (new side) or removed (old side) the
     /// lines.
     pub layer: u64,
+    /// Where the range starts in that layer's own diff: on the new side, the line in the
+    /// layer's head; on the old side, the line in the head of the layer below (the trunk merge
+    /// base for the bottom layer). Consecutive lines of a range are consecutive there too.
+    /// Absent in answers from services that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_line: Option<u32>,
 }
 
 /// Response payload for `review.stack.attribution`.
@@ -346,6 +352,20 @@ pub struct ReviewStackAttributionResponse {
 }
 
 impl ReviewStackAttributionResponse {
+    /// Layer that introduced new-side line `line` and the line's number in that layer's head,
+    /// if any (the number is `None` when the service did not report it).
+    #[must_use]
+    pub fn new_line_origin(&self, line: u32) -> Option<(u64, Option<u32>)> {
+        find_range(&self.new_ranges, line).map(|range| (range.layer, range.layer_line_of(line)))
+    }
+
+    /// Layer that removed old-side line `line` and the line's number in the head of the layer
+    /// below it, if any.
+    #[must_use]
+    pub fn old_line_origin(&self, line: u32) -> Option<(u64, Option<u32>)> {
+        find_range(&self.old_ranges, line).map(|range| (range.layer, range.layer_line_of(line)))
+    }
+
     /// Layer that introduced new-side line `line`, if any.
     #[must_use]
     pub fn new_line_layer(&self, line: u32) -> Option<u64> {
@@ -360,11 +380,26 @@ impl ReviewStackAttributionResponse {
 }
 
 fn find_layer(ranges: &[ReviewStackLineAttribution], line: u32) -> Option<u64> {
+    find_range(ranges, line).map(|range| range.layer)
+}
+
+fn find_range(
+    ranges: &[ReviewStackLineAttribution],
+    line: u32,
+) -> Option<&ReviewStackLineAttribution> {
     let index = ranges.partition_point(|range| range.end < line);
-    ranges
-        .get(index)
-        .filter(|range| range.start <= line)
-        .map(|range| range.layer)
+    ranges.get(index).filter(|range| range.start <= line)
+}
+
+impl ReviewStackLineAttribution {
+    /// The number of `line` (inside this range) in the layer's own diff.
+    #[must_use]
+    pub fn layer_line_of(&self, line: u32) -> Option<u32> {
+        let offset = line.checked_sub(self.start)?;
+        (line <= self.end)
+            .then_some(self.layer_line?)
+            .and_then(|start| start.checked_add(offset))
+    }
 }
 
 #[cfg(test)]
@@ -416,7 +451,12 @@ mod tests {
 
     #[test]
     fn attribution_looks_up_lines_by_range() {
-        let range = |start, end, layer| ReviewStackLineAttribution { start, end, layer };
+        let range = |start, end, layer| ReviewStackLineAttribution {
+            start,
+            end,
+            layer,
+            layer_line: None,
+        };
         let response = ReviewStackAttributionResponse {
             path: "a".into(),
             new_ranges: vec![range(1, 3, 10), range(7, 7, 11)],

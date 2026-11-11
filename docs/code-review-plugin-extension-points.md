@@ -20,6 +20,8 @@ The Code Review domain contracts are provider-neutral and live in `packages/code
 * `bcode.review_importer/v1` lets provider plugins advertise and import external review state read-only.
 * `bcode.review_source/v1` lets provider plugins list pull requests, resolve stacks of pull requests, and fetch a pull request's commits into review-owned local refs. Plugin services cannot call each other, so the client routes these calls and passes the answers to `review.sources.resolve`.
 
+Pull-request targets are provider-neutral. A publisher manifest may name the review-source provider whose pull requests it publishes (`pull_request_provider`); Code Review then sends one bundle per pull request of that provider's sources, with `ReviewBundle::pull_request` naming the target and `ReviewBundleThread::summary_only` marking threads the publisher should summarize rather than anchor inline (for example a whole-stack comment no single layer introduced). An import request names the review's pull request the same way (`ExternalReviewImportRequest::pull_request`). Providers use these only when their own options name no target. Built-in publishers also accept client-built bundles (`review.publish.bundle.preview` and `review.publish.bundle.submit`).
+
 Provider-specific repository, pull-request, authentication, API, and anchor behavior must stay in the provider plugin. New host capabilities are appropriate only when the SDK cannot express a required mechanism generically; product-specific behavior must not be added to host/runtime crates.
 
 ## Plugin semantic session observation

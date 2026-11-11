@@ -35,7 +35,7 @@ use super::notes::ReviewNotes;
 use super::palette::Overlay;
 use super::panels::{PanelId, Panels};
 use super::rows::{
-    GapAction, Interaction, RowCache, RowContext, RowKey, SearchHighlights, ViewParams,
+    Folds, GapAction, Interaction, RowCache, RowContext, RowKey, SearchHighlights, ViewParams,
 };
 use super::source::Decor;
 use super::source::DocumentSource;
@@ -92,6 +92,12 @@ use std::time::{Duration, Instant};
 
 /// Keymap scope of the V2 review surface.
 pub const SCOPE: &str = "code-review-v2";
+/// Keymap scope of the file panel (its own keys; motions come from [`SCOPE`]).
+pub const FILES_SCOPE: &str = "code-review-v2-files";
+/// Keymap scope of the threads panel (its own keys; motions come from [`SCOPE`]).
+pub const THREADS_SCOPE: &str = "code-review-v2-threads";
+/// Close outcome key asking the app to edit the review's sources.
+pub const EDIT_SOURCES_OUTCOME: &str = "edit_sources";
 /// Service calls in flight at once.
 pub const MAX_IN_FLIGHT: usize = 4;
 /// Lines a gap reveals per step without a count prefix.
@@ -128,7 +134,7 @@ const RESIZE_STEP: i32 = 4;
 /// Longest wait for running saves and annotation calls when exiting.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Id of a transient (unsaved) workspace.
-const TRANSIENT_WORKSPACE_ID: &str = "transient-review-workspace";
+use super::entry::TRANSIENT_WORKSPACE_ID;
 
 /// Phase of the surface.
 #[derive(Debug)]
@@ -144,8 +150,13 @@ enum Phase {
 }
 
 mod annotate;
+mod assist;
 mod find;
+mod flows;
 mod pointer;
+mod stack;
+
+pub use flows::Modal;
 
 pub use find::{SearchState, ThreadsFilter};
 
@@ -233,6 +244,7 @@ struct Selection {
 struct Extras<'a> {
     notes: &'a ReviewNotes,
     agents: &'a AgentStreams,
+    folds: &'a Folds,
     composer: Option<&'a Composer>,
     search: Option<&'a SearchHighlights>,
 }
@@ -250,6 +262,7 @@ const fn row_context<'a>(
         cache: &review.rows,
         notes: extras.notes,
         agents: extras.agents,
+        folds: extras.folds,
         composer: extras.composer,
         search: extras.search,
     }
@@ -319,6 +332,8 @@ struct Review {
     dirty_files: BTreeSet<FileRef>,
     threads: RefCell<ThreadRows>,
     threads_state: RefCell<TreeViewState>,
+    /// Commit sides each source resolved to, recorded as the pass when the review closes.
+    revisions: BTreeMap<String, bcode_code_review_models::ReviewedRevision>,
 }
 
 impl Review {
@@ -342,6 +357,24 @@ impl Review {
                 )
             })
         });
+        let recorded_at = Some(annotate::now_ms());
+        let mut revisions = BTreeMap::new();
+        for input in &inputs {
+            // A source resolving to several parts records its first part.
+            revisions
+                .entry(input.source.source_id.clone())
+                .or_insert_with(|| {
+                    bcode_code_review_models::ReviewedRevision::from_resolved(
+                        &input.source,
+                        recorded_at,
+                    )
+                });
+        }
+        revisions.retain(
+            |_, revision: &mut bcode_code_review_models::ReviewedRevision| {
+                revision.reviewed_head_oid.is_some()
+            },
+        );
         let doc = ReviewDocument::new(repo_path, inputs, config);
         let files = FileTree::new(&doc, theme);
         let mut tree = TreeViewState::new(None);
@@ -378,6 +411,7 @@ impl Review {
             dirty_files: BTreeSet::new(),
             threads: RefCell::new(ThreadRows::default()),
             threads_state: RefCell::new(TreeViewState::new(None)),
+            revisions,
         };
         review.cursor = review.doc.item(0).map(ReviewItem::key);
         review
@@ -549,6 +583,46 @@ pub struct ReviewSurfaceV2 {
     next_exchange: u64,
     /// Whether the open document's annotations were requested.
     notes_requested: bool,
+    /// Whether a transient review is being saved as a durable one.
+    saving_as: bool,
+    /// The open publish or import flow.
+    modal: Option<Modal>,
+    /// Stack rail tab state, and the rail's area and layout in the last frame.
+    rail_state: RefCell<bmux_tui_components::tab_bar::TabBarState>,
+    rail: Option<(Rect, LayoutNode)>,
+    /// Layer (source id) the cursor was last in, for items outside every layer.
+    rail_layer: Option<String>,
+    /// Last position in each stack layer, by source id (persisted).
+    layer_positions: BTreeMap<String, bcode_code_review_models::ReviewItemKey>,
+    /// Commit sides each source of the whole review resolved to (the pass recorded when the
+    /// reviewer completes it or publishes).
+    pass_revisions: BTreeMap<String, bcode_code_review_models::ReviewedRevision>,
+    /// What changed since the last recorded pass.
+    rereview: Option<super::rereview::RereviewPlan>,
+    rereview_checked: bool,
+    /// The whole review's sources while the changes since the last review are shown.
+    since_last: Option<Vec<ReviewSource>>,
+    /// Files whose patch is unchanged since the last pass.
+    carried: BTreeSet<crate::v2::document::FileKey>,
+    /// A re-open that is not a refresh (switching to or from the changes since the last
+    /// review): no "refreshed" toast.
+    switching: bool,
+    /// Folded threads and expanded AI answers (persisted).
+    folds: Folds,
+    /// Resolved threads are hidden from the document (persisted).
+    hide_resolved: bool,
+    /// Viewed files are hidden from the file panel (persisted).
+    hide_viewed_files: bool,
+    /// Text to copy once the host is at hand, and what it is.
+    clipboard: Option<(String, &'static str)>,
+    /// Exiting an unsaved review with annotations was asked once (the next exit leaves).
+    exit_armed: bool,
+    /// Whether the terminal has focus (the composer offers completion only then).
+    terminal_focused: bool,
+    /// Closing asks the app to edit the review's sources.
+    edit_requested: bool,
+    /// Questions sent as follow-ups in an existing session (their session is not opened).
+    follow_ups: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for ReviewSurfaceV2 {
@@ -634,6 +708,26 @@ impl ReviewSurfaceV2 {
             asks: VecDeque::new(),
             next_exchange: 0,
             notes_requested: false,
+            saving_as: false,
+            modal: None,
+            rail_state: RefCell::new(bmux_tui_components::tab_bar::TabBarState::new(None)),
+            rail: None,
+            rail_layer: None,
+            layer_positions: BTreeMap::new(),
+            pass_revisions: BTreeMap::new(),
+            rereview: None,
+            rereview_checked: false,
+            since_last: None,
+            carried: BTreeSet::new(),
+            switching: false,
+            folds: Folds::default(),
+            hide_resolved: false,
+            hide_viewed_files: false,
+            clipboard: None,
+            exit_armed: false,
+            terminal_focused: true,
+            edit_requested: false,
+            follow_ups: BTreeSet::new(),
         }
     }
 
@@ -648,6 +742,7 @@ impl ReviewSurfaceV2 {
         Extras {
             notes: &self.notes,
             agents: &self.agents,
+            folds: &self.folds,
             composer: self.composer.as_ref(),
             search: self.search.as_ref().map(|search| &search.highlights),
         }
@@ -675,6 +770,11 @@ impl ReviewSurfaceV2 {
         }
         if let Some(state) = &workspace.presentation_v2 {
             self.panels = Panels::restore(&state.panels);
+            self.layer_positions.clone_from(&state.layer_positions);
+            self.folds.collapsed.clone_from(&state.collapsed_threads);
+            self.folds.expanded.clone_from(&state.expanded_answers);
+            self.hide_resolved = state.hide_resolved_threads;
+            self.hide_viewed_files = state.hide_viewed_files;
         }
         self.workspace = Some(workspace);
         self
@@ -828,10 +928,56 @@ impl ReviewSurfaceV2 {
         self.overlay.as_ref()
     }
 
+    /// The open publish or import flow.
+    #[must_use]
+    pub const fn modal(&self) -> Option<&Modal> {
+        self.modal.as_ref()
+    }
+
+    /// What changed since the last recorded review pass, once compared.
+    #[must_use]
+    pub const fn rereview(&self) -> Option<&super::rereview::RereviewPlan> {
+        self.rereview.as_ref()
+    }
+
+    /// Whether the changes since the last review are shown instead of the whole review.
+    #[must_use]
+    pub const fn showing_since_last(&self) -> bool {
+        self.since_last.is_some()
+    }
+
+    /// The sources the review currently shows.
+    #[must_use]
+    pub fn sources(&self) -> &[ReviewSource] {
+        &self.sources
+    }
+
+    /// Labels of the stack rail's tabs (full form), in order, and the selected one.
+    #[must_use]
+    pub fn rail(&self) -> (Vec<String>, Option<usize>) {
+        let entries = self.rail_entries();
+        let current = self.current_layer(&entries);
+        (
+            entries
+                .iter()
+                .map(|entry| entry.labels[0].plain_text())
+                .collect(),
+            current,
+        )
+    }
+
     /// The workspace (with viewed marks and presentation state) as the surface keeps it.
     #[must_use]
     pub const fn workspace(&self) -> Option<&ReviewWorkspace> {
         self.workspace.as_ref()
+    }
+
+    /// Whether the review is not saved (a direct entry); `save_review` makes it durable.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        self.workspace
+            .as_ref()
+            .is_none_or(|workspace| workspace.id == TRANSIENT_WORKSPACE_ID)
     }
 
     /// Search status text (match position, pending files), while a search is active.
@@ -898,7 +1044,8 @@ impl ReviewSurfaceV2 {
                 .wrapping_add(u64::from(review.gutter_digits)),
             paint_revision: self.paint_revision,
             annotation_revision: self.notes.revision().wrapping_mul(1_000_003)
-                ^ self.agents.revision(),
+                ^ self.agents.revision()
+                ^ self.folds.revision.wrapping_mul(0x5851_f42d),
         }
     }
 
@@ -978,6 +1125,71 @@ impl ReviewSurfaceV2 {
     /// Save the workspace's presentation state when it changed and the workspace is durable.
     /// Whether nothing is left to save: no workspace save and no annotation call is running
     /// or queued.
+    /// Whether leaving should first offer saving: the review is transient and has drafts, AI
+    /// questions, or suggestions.
+    fn offers_save(&self) -> bool {
+        self.is_transient()
+            && (!self.notes.drafts().is_empty()
+                || !self.notes.exchanges().is_empty()
+                || !self.notes.suggestions().is_empty())
+    }
+
+    /// Save presentation state and close once saves finished (at once when they have, or when
+    /// closing already started).
+    fn begin_close(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        self.persist_presentation(true);
+        self.save(host);
+        // Exiting again while saving closes at once.
+        if self.close_ready() || self.closing.is_some() {
+            return self.close_action();
+        }
+        // Finish saving first: the host may end the process once the surface closes.
+        self.closing = Some(Instant::now());
+        self.set_status("saving…", StatusSeverity::Info);
+        PluginTuiAction::Redraw
+    }
+
+    /// The close action: plain, or asking the app to edit the review's sources.
+    fn close_action(&self) -> PluginTuiAction {
+        PluginTuiAction::Close {
+            outcome: self
+                .edit_requested
+                .then(|| serde_json::json!({ EDIT_SOURCES_OUTCOME: true })),
+        }
+    }
+
+    /// Leave the review to edit its sources (the app shows the wizard with them).
+    fn edit_sources(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.notes.pending() > 0 || !self.asks.is_empty() {
+            self.set_status(
+                "comments are still saving; try again in a moment",
+                StatusSeverity::Warning,
+            );
+            return PluginTuiAction::Redraw;
+        }
+        self.edit_requested = true;
+        self.begin_close(host)
+    }
+
+    /// The workspace to edit: the review's own, or a transient one of its sources.
+    #[must_use]
+    pub fn edit_target(&self) -> ReviewWorkspace {
+        let mut workspace = self.workspace.clone().unwrap_or_else(|| {
+            super::entry::transient_workspace(
+                self.repo_path.clone(),
+                Some(self.title.clone()),
+                Vec::new(),
+            )
+        });
+        // The whole review's sources (not the changes since the last review).
+        workspace.sources = self
+            .since_last
+            .clone()
+            .unwrap_or_else(|| self.sources.clone());
+        workspace.presentation_v2 = Some(self.current_presentation());
+        workspace
+    }
+
     fn close_ready(&self) -> bool {
         self.save == SaveState::Idle && self.notes.pending() == 0
     }
@@ -1017,6 +1229,107 @@ impl ReviewSurfaceV2 {
                 SaveState::Idle | SaveState::Pending => SaveState::Pending,
                 SaveState::Running | SaveState::RunningThenPending => SaveState::RunningThenPending,
             };
+        }
+    }
+
+    /// Record the revisions this pass reviewed (durable reviews; saved with the workspace).
+    fn record_pass(&mut self) {
+        let revisions = self.pass_revisions.clone();
+        if revisions.is_empty() {
+            return;
+        }
+        if self.is_transient() {
+            return;
+        }
+        let workspace = self.workspace_mut();
+        let same = workspace.reviewed_revisions.len() == revisions.len()
+            && revisions.iter().all(|(id, revision)| {
+                workspace
+                    .reviewed_revisions
+                    .get(id)
+                    .is_some_and(|recorded| {
+                        recorded.reviewed_base_oid == revision.reviewed_base_oid
+                            && recorded.reviewed_head_oid == revision.reviewed_head_oid
+                    })
+            });
+        if same {
+            return;
+        }
+        workspace.reviewed_revisions = revisions;
+        self.request_save();
+    }
+
+    /// Save a transient review as a durable one: create the workspace, copy its viewed and
+    /// presentation state, and move its drafts.
+    fn save_review(&mut self, host: &dyn PluginTuiHost) {
+        if self.saving_as {
+            self.set_status("saving the review…", StatusSeverity::Info);
+            return;
+        }
+        if !self.is_transient() {
+            self.set_status("this review is already saved", StatusSeverity::Info);
+            return;
+        }
+        if self.notes.pending() > 0 {
+            self.set_status(
+                "comments are still saving; try again in a moment",
+                StatusSeverity::Warning,
+            );
+            return;
+        }
+        if !self.pass_revisions.is_empty() {
+            self.workspace_mut().reviewed_revisions = self.pass_revisions.clone();
+        }
+        let workspace = self.workspace_mut().clone();
+        let notes = super::notes::LoadedNotes {
+            drafts: self.notes.drafts().to_vec(),
+            exchanges: self
+                .notes
+                .exchanges()
+                .iter()
+                .filter(|exchange| {
+                    exchange.status != bcode_code_review_models::ReviewAiExchangeStatus::Pending
+                })
+                .cloned()
+                .collect(),
+            suggestions: self.notes.suggestions().to_vec(),
+            ..super::notes::LoadedNotes::default()
+        };
+        self.saving_as = true;
+        let backend = Arc::clone(&self.backend);
+        let inbox = self.inbox.clone();
+        host.spawn(Box::pin(async move {
+            let result = loader::save_as(backend, workspace, notes).await;
+            inbox.push(Message::SavedAs(Box::new(result)));
+        }));
+        self.set_status("saving the review…", StatusSeverity::Info);
+    }
+
+    fn finish_save_review(&mut self, result: Result<ReviewWorkspace, String>) {
+        self.saving_as = false;
+        match result {
+            Ok(saved) => {
+                // Keep what changed while saving; take the durable identity.
+                let workspace = self.workspace_mut();
+                workspace.id = saved.id;
+                workspace.created_at_ms = saved.created_at_ms;
+                workspace.updated_at_ms = saved.updated_at_ms;
+                workspace.repo_root = saved.repo_root;
+                self.request_save();
+                // Annotations now live in the saved review's scope.
+                self.notes_requested = false;
+                self.status = None;
+                self.toasts
+                    .push(ToastSeverity::Success, "Review saved", None);
+            }
+            Err(error) => {
+                self.status = None;
+                self.toasts.push(
+                    ToastSeverity::Error,
+                    "Could not save the review",
+                    Some(error),
+                );
+            }
         }
     }
 
@@ -1153,6 +1466,7 @@ impl ReviewSurfaceV2 {
             }
             Message::Opened(opened) => self.apply_opened(*opened),
             Message::OpenFailed(error) => {
+                self.switching = false;
                 if self.review.is_some() {
                     self.status = None;
                     self.toasts
@@ -1213,6 +1527,11 @@ impl ReviewSurfaceV2 {
             }
             Message::NoteDone(result) => self.finish_note(result),
             Message::Asked(result) => self.finish_ask(*result),
+            Message::SavedAs(result) => self.finish_save_review(*result),
+            Message::Publish(result) => self.apply_publish(result),
+            Message::Import(result) => self.apply_import(result),
+            Message::Rereview(plan) => self.apply_rereview(*plan, host),
+            Message::Carried(result) => self.apply_carried(result),
         }
     }
 
@@ -1258,6 +1577,9 @@ impl ReviewSurfaceV2 {
             self.document_config,
             &self.theme,
         );
+        review
+            .files
+            .set_hide_viewed(self.hide_viewed_files, &self.theme);
         if let Some(previous) = self.review.as_ref() {
             // Refresh: keep expansions, layout, the cursor, the top item, and the tree state.
             review.doc.restore_expansions(&previous.doc.expansions());
@@ -1288,9 +1610,14 @@ impl ReviewSurfaceV2 {
             carry_tree(previous, &mut review, &self.theme);
             self.queue.clear();
             self.syntax.next_generation();
-            self.status = None;
-            self.toasts
-                .push(ToastSeverity::Success, "Review refreshed", None);
+            if !std::mem::take(&mut self.switching) {
+                self.status = None;
+                self.toasts
+                    .push(ToastSeverity::Success, "Review refreshed", None);
+            }
+        }
+        if self.since_last.is_none() {
+            self.pass_revisions.clone_from(&review.revisions);
         }
         if !review.diagnostics.is_empty() {
             let body = review
@@ -1304,6 +1631,7 @@ impl ReviewSurfaceV2 {
         }
         let workspace = self.workspace_mut().clone();
         review.doc.set_viewed_marks(&workspace);
+        review.doc.set_carried_over(&self.carried);
         let _ = review.doc.take_splices();
         let previous = self.review.replace(review);
         self.phase = Phase::Ready;
@@ -1334,19 +1662,7 @@ impl ReviewSurfaceV2 {
             }
             Ok(_) => {
                 self.set_status("refreshing review…", StatusSeverity::Info);
-                self.refreshing = true;
-                let backend = Arc::clone(&self.backend);
-                let repo = self.repo_path.clone();
-                let sources = self.sources.clone();
-                let inbox = self.inbox.clone();
-                host.spawn(Box::pin(async move {
-                    let message = match loader::open(backend, repo, sources, Inbox::default()).await
-                    {
-                        Ok(opened) => Message::Opened(Box::new(opened)),
-                        Err(error) => Message::OpenFailed(error),
-                    };
-                    inbox.push(message);
-                }));
+                self.reopen(host);
             }
             Err(error) => {
                 if manual {
@@ -1358,13 +1674,33 @@ impl ReviewSurfaceV2 {
         }
     }
 
+    /// Open the review's current sources again, keeping position and expansions (refresh, and
+    /// switching to or from the changes since the last review).
+    fn reopen(&mut self, host: &dyn PluginTuiHost) {
+        self.refreshing = true;
+        let backend = Arc::clone(&self.backend);
+        let repo = self.repo_path.clone();
+        let sources = self.sources.clone();
+        let inbox = self.inbox.clone();
+        host.spawn(Box::pin(async move {
+            let message = match loader::open(backend, repo, sources, Inbox::default()).await {
+                Ok(opened) => Message::Opened(Box::new(opened)),
+                Err(error) => Message::OpenFailed(error),
+            };
+            inbox.push(message);
+        }));
+    }
+
     // ----------------------------------------------------------------------------------------
     // Input
     // ----------------------------------------------------------------------------------------
 
     fn handle_key(&mut self, stroke: KeyStroke, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.modal.is_some() {
+            return self.modal_key(stroke, host);
+        }
         if self.publish.open {
-            return self.publish_input(&Event::Key(stroke));
+            return self.publish_input(&Event::Key(stroke), host);
         }
         if let Some(overlay) = self.overlay.as_mut() {
             let outcome = overlay.key(stroke, &self.theme);
@@ -1401,6 +1737,9 @@ impl ReviewSurfaceV2 {
         };
         let count = self.count.take();
         let action = action.strip_prefix("bcode.code_review.").unwrap_or(&action);
+        if action != "exit" {
+            self.exit_armed = false;
+        }
         self.run_action(action, count, host)
     }
 
@@ -1430,15 +1769,26 @@ impl ReviewSurfaceV2 {
                     self.clear_search();
                     return Some(PluginTuiAction::Redraw);
                 }
-                self.persist_presentation(true);
-                self.save(host);
-                // Exiting again while saving closes at once.
-                if self.close_ready() || self.closing.is_some() {
-                    return Some(PluginTuiAction::Close { outcome: None });
+                // An unsaved review with annotations offers saving once before leaving.
+                if !std::mem::take(&mut self.exit_armed) && self.offers_save() {
+                    self.exit_armed = true;
+                    let save = self
+                        .action_keys
+                        .get("save_review")
+                        .cloned()
+                        .unwrap_or_else(|| "the palette".to_owned());
+                    self.set_status(
+                        format!(
+                            "this review is not saved: {save} saves it with its comments; exit again to leave without saving"
+                        ),
+                        StatusSeverity::Warning,
+                    );
+                    return Some(PluginTuiAction::Redraw);
                 }
-                // Finish saving first: the host may end the process once the surface closes.
-                self.closing = Some(Instant::now());
-                self.set_status("saving…", StatusSeverity::Info);
+                self.begin_close(host)
+            }
+            "save_review" => {
+                self.save_review(host);
                 PluginTuiAction::Redraw
             }
             "refresh" => {
@@ -1561,8 +1911,79 @@ impl ReviewSurfaceV2 {
                 self.copy_lines(host);
                 PluginTuiAction::Redraw
             }
-            _ => return None,
+            "publish" => {
+                self.open_publish();
+                PluginTuiAction::Redraw
+            }
+            "import" => {
+                self.open_import(host);
+                PluginTuiAction::Redraw
+            }
+            "layer_next" | "layer_previous" => {
+                self.step_layer(action == "layer_next");
+                PluginTuiAction::Redraw
+            }
+            "since_last_review" => {
+                self.toggle_since_last(host);
+                PluginTuiAction::Redraw
+            }
+            "complete_pass" => {
+                self.complete_pass();
+                PluginTuiAction::Redraw
+            }
+            _ => return self.assist_action(action, host),
         })
+    }
+
+    /// Folding, AI answers and suggestions, bulk viewed marks, menus, the report, and editing
+    /// the review's sources.
+    fn assist_action(&mut self, action: &str, host: &dyn PluginTuiHost) -> Option<PluginTuiAction> {
+        use bcode_code_review_models::ReviewSuggestionStatus;
+        if let Some(line) = action
+            .strip_prefix(super::palette::GOTO_LINE_PREFIX)
+            .and_then(|line| line.parse::<u32>().ok())
+        {
+            self.goto_line(line);
+            return Some(PluginTuiAction::Redraw);
+        }
+        if let Some(command) = super::agent::AiCommand::from_action(action) {
+            self.ai_command(command);
+            return Some(PluginTuiAction::Redraw);
+        }
+        match action {
+            "fold" => self.fold(),
+            "fold_all" => self.fold_all(),
+            "resolved_toggle" => self.toggle_resolved(),
+            "viewed_files_toggle" => self.toggle_viewed_files(),
+            "copy_answer" => self.copy_answer(),
+            "suggest_comment" => self.suggest_from_answer(),
+            "draft_answer" => self.draft_from_answer(),
+            "accept_suggestion" => self.decide_suggestion(ReviewSuggestionStatus::Accepted),
+            "refine_suggestion" => self.decide_suggestion(ReviewSuggestionStatus::Refining),
+            "reject_suggestion" => self.decide_suggestion(ReviewSuggestionStatus::Rejected),
+            "retry" => {
+                return Some(
+                    self.agent_action(super::rows::AgentAction::Retry)
+                        .unwrap_or(PluginTuiAction::Redraw),
+                );
+            }
+            "view_all" => self.view_all(true),
+            "unview_all" => self.view_all(false),
+            "attention_next" => self.attention_next(),
+            "copy_report" => self.copy_report(),
+            "ai_menu" => self.open_ai_menu(host),
+            "activate" => return Some(self.activate(host)),
+            "goto_line" => {
+                self.open_overlay(false, host);
+                self.set_status(
+                    "type a line number of this file, then enter",
+                    StatusSeverity::Info,
+                );
+            }
+            "edit_sources" => return Some(self.edit_sources(host)),
+            _ => return None,
+        }
+        Some(PluginTuiAction::Redraw)
     }
 
     /// Actions on the document: cursor motions, scrolling, navigation, and expansion.
@@ -1614,10 +2035,25 @@ impl ReviewSurfaceV2 {
                 review.list.borrow_mut().scroll_by(rows, viewport);
                 review.follow_viewport = true;
             }
-            "next_file" | "previous_file" | "hunk_next" | "hunk_previous" | "change_next"
-            | "change_previous" | "thread_next" | "thread_previous" | "unviewed_next"
-            | "unviewed_previous" => {
+            "next_file"
+            | "previous_file"
+            | "hunk_next"
+            | "hunk_previous"
+            | "change_next"
+            | "change_previous"
+            | "thread_next"
+            | "thread_previous"
+            | "unviewed_next"
+            | "unviewed_previous"
+            | "open_thread_next"
+            | "open_thread_previous"
+            | "ai_thread_next"
+            | "ai_thread_previous" => {
                 let (kind, direction) = match action {
+                    "open_thread_next" => (NavKind::OpenThread, Direction::Forward),
+                    "open_thread_previous" => (NavKind::OpenThread, Direction::Backward),
+                    "ai_thread_next" => (NavKind::AiAnswer, Direction::Forward),
+                    "ai_thread_previous" => (NavKind::AiAnswer, Direction::Backward),
                     "next_file" => (NavKind::File, Direction::Forward),
                     "previous_file" => (NavKind::File, Direction::Backward),
                     "hunk_next" => (NavKind::Hunk, Direction::Forward),
@@ -1736,20 +2172,25 @@ impl ReviewSurfaceV2 {
     /// Keys of the file tree. Returns `None` for keys the tree does not use.
     fn tree_key(&mut self, stroke: KeyStroke, host: &dyn PluginTuiHost) -> Option<PluginTuiAction> {
         let review = self.review.as_ref()?;
-        let plain = stroke.modifiers.is_empty();
-        let action = host.keymap_action(SCOPE, stroke);
-        let action = action
-            .as_deref()
-            .map(|action| action.strip_prefix("bcode.code_review.").unwrap_or(action));
+        let strip = |action: Option<String>| {
+            action.map(|action| {
+                action
+                    .strip_prefix("bcode.code_review.")
+                    .unwrap_or(&action)
+                    .to_owned()
+            })
+        };
+        // The panel's own keys come first; motions are the review's.
+        let panel = strip(host.keymap_action(FILES_SCOPE, stroke));
+        let action = strip(host.keymap_action(SCOPE, stroke));
         let selected = review.tree.borrow().selected_id().map(str::to_owned);
         let rows = i64::from(
             self.body_area(TREE_VIEWPORT_ID)
                 .map_or(10, |area| area.height.max(1)),
         );
         let count = i64::from(self.count.unwrap_or(1));
-        let delta = match (stroke.key, action) {
-            (KeyCode::Down, _) if plain => Some(1),
-            (KeyCode::Up, _) if plain => Some(-1),
+        let delta = match (panel.as_deref(), action.as_deref()) {
+            (Some(_), _) => None,
             (_, Some("down")) => Some(count),
             (_, Some("up")) => Some(-count),
             (_, Some("half_page_down")) => Some(rows / 2),
@@ -1765,24 +2206,28 @@ impl ReviewSurfaceV2 {
             self.move_tree(delta);
             return Some(PluginTuiAction::Redraw);
         }
+        if panel.as_deref() == Some("files_back") {
+            self.focus = Focus::Review;
+            return Some(PluginTuiAction::Redraw);
+        }
         let selected = selected?;
         let expandable = review.files.is_expandable(&selected);
         let expanded = review.tree.borrow().is_expanded(&selected);
-        match stroke.key {
-            KeyCode::Enter if plain => {
+        match panel.as_deref() {
+            Some("files_open") => {
                 self.open_tree_item(&selected, true, true);
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char(' ') if plain && expandable => {
+            Some("files_fold") if expandable => {
                 review.tree.borrow_mut().toggle_expanded(&selected);
                 self.tree_reveal = true;
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Right if plain && expandable && !expanded => {
+            Some("files_expand") if expandable && !expanded => {
                 review.tree.borrow_mut().set_expanded(&selected, true);
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Left if plain => {
+            Some("files_collapse") => {
                 if expandable && expanded {
                     review.tree.borrow_mut().set_expanded(&selected, false);
                 } else if let Some(parent) = review.files.ancestors(&selected).last() {
@@ -1791,11 +2236,8 @@ impl ReviewSurfaceV2 {
                 }
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Escape if plain => {
-                self.focus = Focus::Review;
-                Some(PluginTuiAction::Redraw)
-            }
-            _ => None,
+            Some(_) => Some(PluginTuiAction::None),
+            None => None,
         }
     }
 
@@ -1855,14 +2297,19 @@ impl ReviewSurfaceV2 {
         host: &dyn PluginTuiHost,
     ) -> Option<PluginTuiAction> {
         let review = self.review.as_mut()?;
-        let plain = stroke.modifiers.is_empty();
-        let action = host.keymap_action(SCOPE, stroke);
-        let action = action
-            .as_deref()
-            .map(|action| action.strip_prefix("bcode.code_review.").unwrap_or(action));
-        let delta: i64 = match (stroke.key, action) {
-            (KeyCode::Left | KeyCode::Right, _) if plain => {
-                self.threads_filter = if stroke.key == KeyCode::Right {
+        let strip = |action: Option<String>| {
+            action.map(|action| {
+                action
+                    .strip_prefix("bcode.code_review.")
+                    .unwrap_or(&action)
+                    .to_owned()
+            })
+        };
+        let panel = strip(host.keymap_action(THREADS_SCOPE, stroke));
+        let action = strip(host.keymap_action(SCOPE, stroke));
+        let delta: i64 = match (panel.as_deref(), action.as_deref()) {
+            (Some(filter @ ("threads_filter_next" | "threads_filter_previous")), _) => {
+                self.threads_filter = if filter == "threads_filter_next" {
                     self.threads_filter.next()
                 } else {
                     self.threads_filter.previous()
@@ -1870,14 +2317,13 @@ impl ReviewSurfaceV2 {
                 review.threads_state.borrow_mut().set_selected_visible(None);
                 return Some(PluginTuiAction::Redraw);
             }
-            (KeyCode::Down, _) if plain => 1,
-            (KeyCode::Up, _) if plain => -1,
-            (_, Some("down")) => 1,
-            (_, Some("up")) => -1,
-            (KeyCode::Escape | KeyCode::Enter, _) if plain => {
+            (Some("threads_open" | "threads_back"), _) => {
                 self.focus = Focus::Review;
                 return Some(PluginTuiAction::Redraw);
             }
+            (Some(_), _) => return Some(PluginTuiAction::None),
+            (_, Some("down")) => 1,
+            (_, Some("up")) => -1,
             _ => return None,
         };
         let count = review.threads.borrow().keys.len();
@@ -1920,7 +2366,9 @@ impl ReviewSurfaceV2 {
             return false;
         };
         let policy = match kind {
-            NavKind::Change | NavKind::Thread => AnchorPolicy::Center,
+            NavKind::Change | NavKind::Thread | NavKind::OpenThread | NavKind::AiAnswer => {
+                AnchorPolicy::Center
+            }
             NavKind::File | NavKind::Hunk | NavKind::UnviewedFile => AnchorPolicy::ItemTopAtTop,
         };
         review.set_cursor(target.index, policy);
@@ -1994,7 +2442,17 @@ impl ReviewSurfaceV2 {
         }
     }
 
-    fn publish_input(&mut self, event: &Event) -> PluginTuiAction {
+    fn publish_menu_action(&mut self, id: &str, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        match id {
+            chrome::PUBLISH_MENU_IMPORT => self.open_import(host),
+            chrome::PUBLISH_MENU_COMPLETE => self.complete_pass(),
+            chrome::PUBLISH_MENU_SINCE_LAST => self.toggle_since_last(host),
+            _ => self.open_publish(),
+        }
+        PluginTuiAction::Redraw
+    }
+
+    fn publish_input(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let Some((row, plan)) = &self.header else {
             self.publish.close();
             return PluginTuiAction::Redraw;
@@ -2008,14 +2466,11 @@ impl ReviewSurfaceV2 {
             chrome::publish_event(&self.theme, &mut self.publish, button, self.screen, event);
         match outcome {
             SplitButtonOutcome::Ignored => PluginTuiAction::None,
-            SplitButtonOutcome::Primary | SplitButtonOutcome::Selected { .. } => {
-                self.toasts.push(
-                    ToastSeverity::Info,
-                    "Publishing is not available in Code Review V2 yet",
-                    Some("Use `bcode review --ui v1` to publish.".to_owned()),
-                );
+            SplitButtonOutcome::Primary => {
+                self.open_publish();
                 PluginTuiAction::Redraw
             }
+            SplitButtonOutcome::Selected { id, .. } => self.publish_menu_action(&id, host),
             _ => PluginTuiAction::Redraw,
         }
     }
@@ -2024,9 +2479,15 @@ impl ReviewSurfaceV2 {
         let Event::Mouse(mouse) = event else {
             return PluginTuiAction::None;
         };
+        if self.modal.is_some() {
+            return self.modal_mouse(event, host);
+        }
         if let Some(overlay) = self.overlay.as_mut() {
             let outcome = overlay.mouse(event, &self.theme);
             return self.overlay_outcome(outcome, host);
+        }
+        if self.rail_mouse(event) {
+            return PluginTuiAction::Redraw;
         }
         let wheel = match mouse.kind {
             MouseEventKind::ScrollDown => 3,
@@ -2049,7 +2510,7 @@ impl ReviewSurfaceV2 {
             .as_ref()
             .is_some_and(|(row, _)| row.contains(mouse.position));
         if self.publish.open || header_hit {
-            let action = self.publish_input(event);
+            let action = self.publish_input(event, host);
             if action != PluginTuiAction::None || self.publish.open {
                 return action;
             }
@@ -2277,6 +2738,17 @@ impl ReviewSurfaceV2 {
     }
 
     fn render_frame(&mut self, area: Rect, cx: &mut PaintCx<'_, '_>) {
+        self.observe_composer();
+        if let Some(composer) = &self.composer {
+            composer.begin_frame();
+        }
+        self.paint_frame(area, cx);
+        if let Some(composer) = &self.composer {
+            composer.end_frame();
+        }
+    }
+
+    fn paint_frame(&mut self, area: Rect, cx: &mut PaintCx<'_, '_>) {
         self.screen = area;
         cx.fill(
             LocalRect::new(area.x.into(), area.y.into(), area.width, area.height),
@@ -2292,12 +2764,23 @@ impl ReviewSurfaceV2 {
         }
         let header = area.height >= 3;
         let footer = area.height >= 2;
+        // The stack rail takes a row under the header when the body keeps at least 6 rows.
+        let rail = header
+            && matches!(self.phase, Phase::Ready)
+            && area.height >= 9
+            && !self.rail_entries().is_empty();
+        let top = u16::from(header) + u16::from(rail);
         let body = Rect::new(
             area.x,
-            area.y + u16::from(header),
+            area.y + top,
             area.width,
-            area.height - u16::from(header) - u16::from(footer),
+            area.height - top - u16::from(footer),
         );
+        if rail {
+            self.paint_rail(Rect::new(area.x, area.y + 1, area.width, 1), cx);
+        } else {
+            self.rail = None;
+        }
         if matches!(self.phase, Phase::Ready) {
             self.render_body(body, cx);
         } else {
@@ -2315,6 +2798,11 @@ impl ReviewSurfaceV2 {
         let theme = self.theme;
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.paint(&theme, area, cx);
+        }
+        match self.modal.as_mut() {
+            Some(Modal::Publish(flow)) => flow.paint(&theme, area, cx),
+            Some(Modal::Import(flow)) => flow.paint(&theme, area, cx),
+            None => {}
         }
         if self.publish.open
             && let Some((row, plan)) = &self.header
@@ -2446,39 +2934,30 @@ impl ReviewSurfaceV2 {
                 push(Some("esc".to_owned()), "clear");
                 push(Some("↓".to_owned()), "files");
             }
-            Focus::Files | Focus::Threads => {
+            Focus::Files => {
                 push(key("down"), "move");
-                push(Some("enter".to_owned()), "open");
-                if self.focus == Focus::Files {
-                    push(Some("space".to_owned()), "fold");
-                    push(key("files_filter"), "filter");
-                    push(key("files_toggle"), "hide");
-                }
+                push(key("files_open"), "open");
+                push(key("files_fold"), "fold");
+                push(key("files_filter"), "filter");
+                push(key("viewed_files_toggle"), "hide viewed");
+                push(key("files_toggle"), "hide");
                 push(key("focus_next"), "next pane");
-                push(Some("esc".to_owned()), "back");
+                push(key("files_back"), "back");
+            }
+            Focus::Threads => {
+                push(key("down"), "move");
+                push(key("threads_open"), "open");
+                push(key("threads_filter_next"), "filter");
+                push(key("focus_next"), "next pane");
+                push(key("threads_back"), "back");
             }
             Focus::Review => {
                 let cursor = self
                     .review
                     .as_ref()
                     .and_then(|review| review.cursor.as_ref());
-                if matches!(cursor, Some(ItemKey::Thread { .. })) {
-                    push(key("comment"), "reply");
-                    push(key("edit"), "edit");
-                    push(key("delete"), "delete");
-                    push(key("resolve"), "resolve");
-                    push(key("thread_kind"), "kind");
-                    push(key("thread_severity"), "severity");
-                } else if matches!(cursor, Some(ItemKey::AgentThread { .. })) {
-                    push(key("open_session"), "open session");
-                    push(key("delete"), "delete");
-                } else if matches!(
-                    cursor,
-                    Some(ItemKey::Line { .. } | ItemKey::LinePair { .. })
-                ) {
-                    push(key("comment"), "comment");
-                    push(key("ask"), "ask Bcode");
-                    push(key("range"), "select");
+                for (action, label) in item_hints(cursor) {
+                    push(key(action), label);
                 }
                 let on_gap = self
                     .review
@@ -2505,6 +2984,9 @@ impl ReviewSurfaceV2 {
                 push(key("layout_toggle"), "layout");
                 push(key("wrap_toggle"), "wrap");
                 push(key("refresh"), "refresh");
+                if self.is_transient() {
+                    push(key("save_review"), "save review");
+                }
                 push(key("exit"), "quit");
             }
         }
@@ -2599,6 +3081,16 @@ impl ReviewSurfaceV2 {
                 &crate::keybindings::actions_for(annotate::COMPOSER_SCOPE),
                 keys(annotate::COMPOSER_SCOPE),
                 Some("Comment composer"),
+            ));
+            entries.extend(super::palette::entries(
+                &crate::keybindings::actions_for(FILES_SCOPE),
+                keys(FILES_SCOPE),
+                Some("File panel"),
+            ));
+            entries.extend(super::palette::entries(
+                &crate::keybindings::actions_for(THREADS_SCOPE),
+                keys(THREADS_SCOPE),
+                Some("Threads panel"),
             ));
             entries
         } else {
@@ -2788,6 +3280,7 @@ impl ReviewSurfaceV2 {
         let extras = Extras {
             notes: &self.notes,
             agents: &self.agents,
+            folds: &self.folds,
             composer: self.composer.as_ref(),
             search: self.search.as_ref().map(|search| &search.highlights),
         };
@@ -2945,7 +3438,13 @@ impl ReviewSurfaceV2 {
             Pane::new()
                 .title(Line::from_spans(vec![
                     Span::styled(" Review ", theme.title),
-                    Span::styled(format!("{} files ", review.files.file_count()), theme.muted),
+                    Span::styled(
+                        {
+                            let files = review.files.file_count();
+                            format!("{files} file{} ", if files == 1 { "" } else { "s" })
+                        },
+                        theme.muted,
+                    ),
                 ]))
                 .styles(self.pane_styles())
                 .chrome(theme.component.chrome),
@@ -3401,8 +3900,43 @@ fn digit_of(stroke: KeyStroke) -> Option<u32> {
     }
 }
 
+/// Hints of the cursor item's own actions, as `(action, label)`.
+const fn item_hints(cursor: Option<&ItemKey>) -> &'static [(&'static str, &'static str)] {
+    match cursor {
+        Some(ItemKey::Thread { .. }) => &[
+            ("activate", "actions"),
+            ("comment", "reply"),
+            ("edit", "edit"),
+            ("delete", "delete"),
+            ("resolve", "resolve"),
+            ("fold", "fold"),
+            ("thread_kind", "kind"),
+            ("thread_severity", "severity"),
+        ],
+        Some(ItemKey::AgentThread { .. }) => &[
+            ("activate", "actions"),
+            ("open_session", "open session"),
+            ("ask", "follow up"),
+            ("fold", "more"),
+            ("copy_answer", "copy"),
+            ("suggest_comment", "suggest"),
+            ("accept_suggestion", "accept"),
+            ("delete", "delete"),
+        ],
+        Some(ItemKey::Line { .. } | ItemKey::LinePair { .. }) => &[
+            ("comment", "comment"),
+            ("ask", "ask Bcode"),
+            ("ai_menu", "AI commands"),
+            ("range", "select"),
+        ],
+        _ => &[],
+    }
+}
+
 /// Actions whose first key the footer hints show.
 const HINT_ACTIONS: &[&str] = &[
+    "since_last_review",
+    "publish",
     "comment",
     "ask",
     "range",
@@ -3430,7 +3964,15 @@ const HINT_ACTIONS: &[&str] = &[
     "layout_toggle",
     "wrap_toggle",
     "refresh",
+    "save_review",
     "exit",
+    "activate",
+    "fold",
+    "ai_menu",
+    "copy_answer",
+    "suggest_comment",
+    "accept_suggestion",
+    "viewed_files_toggle",
 ];
 
 impl PluginTuiSurface for ReviewSurfaceV2 {
@@ -3453,6 +3995,18 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
                     .map(|key| ((*action).to_owned(), key))
             })
             .collect();
+        for scope in [FILES_SCOPE, THREADS_SCOPE] {
+            for action in crate::keybindings::actions_for(scope) {
+                if let Some(key) = host.keymap_keys(scope, &action.id).into_iter().next() {
+                    let name = action
+                        .id
+                        .strip_prefix("bcode.code_review.")
+                        .unwrap_or(&action.id)
+                        .to_owned();
+                    self.action_keys.insert(name, key);
+                }
+            }
+        }
         for action in [
             "composer_submit",
             "composer_preview",
@@ -3512,9 +4066,11 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
     ) -> PluginTuiEventResult {
         let action = match event {
             Event::Key(stroke) => {
-                let status_shown = self.status.is_some();
+                let before = self.status.clone();
                 let action = self.handle_key(*stroke, host);
-                if status_shown
+                // A status set by this key stays.
+                if before.is_some()
+                    && self.status == before
                     && action != PluginTuiAction::None
                     && !matches!(action, PluginTuiAction::Close { .. })
                 {
@@ -3526,6 +4082,7 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
                 }
                 action
             }
+            Event::Paste(text) if self.modal.is_some() => self.modal_paste(text, host),
             Event::Paste(text) if self.overlay.is_some() => {
                 let theme = self.theme;
                 if let Some(overlay) = self.overlay.as_mut() {
@@ -3561,12 +4118,36 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
                 PluginTuiAction::Redraw
             }
             Event::Focus(FocusEvent::Gained) => {
+                self.terminal_focused = true;
                 self.request_token(host, false);
+                PluginTuiAction::None
+            }
+            Event::Focus(FocusEvent::Lost) => {
+                self.terminal_focused = false;
+                self.observe_composer();
                 PluginTuiAction::None
             }
             _ => PluginTuiAction::None,
         };
+        let action = if self.flush_clipboard(host) && action == PluginTuiAction::None {
+            PluginTuiAction::Redraw
+        } else {
+            action
+        };
+        self.observe_composer();
         PluginTuiEventResult::from_legacy(action)
+    }
+
+    fn focused_text_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
+        self.focused_text_field_snapshot()
+    }
+
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        edit: &bcode_plugin_sdk::tui::FocusedTextFieldEdit,
+        _host: &dyn PluginTuiHost,
+    ) -> bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult {
+        self.apply_focused_text_field(edit)
     }
 
     fn session_navigation_finished(
@@ -3592,6 +4173,7 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
             return PluginTuiAction::Redraw;
         }
         let mut changed = self.drain(host);
+        changed |= self.flush_clipboard(host);
         if let Some(action) = self.pending_action.take() {
             return action;
         }
@@ -3600,13 +4182,16 @@ impl PluginTuiSurface for ReviewSurfaceV2 {
             self.save(host);
             if self.close_ready() || started.elapsed() >= CLOSE_GRACE {
                 self.closing = None;
-                return PluginTuiAction::Close { outcome: None };
+                return self.close_action();
             }
             return PluginTuiAction::None;
         }
         if self.review.is_some() && !self.notes_requested {
             self.notes_requested = true;
             self.load_notes(host);
+        }
+        if self.review.is_some() && !self.rereview_checked {
+            self.start_rereview(host);
         }
         let notes_before = self.notes.pending();
         self.pump_notes(host);

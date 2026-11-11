@@ -28,6 +28,10 @@ pub enum NavKind {
     Hunk,
     /// Threads and AI exchanges (including outdated ones).
     Thread,
+    /// Threads with an unresolved comment.
+    OpenThread,
+    /// AI exchanges (answers and suggestions).
+    AiAnswer,
     /// File headers of unviewed files.
     UnviewedFile,
     /// The first line of each run of changed lines.
@@ -165,6 +169,8 @@ impl ReviewDocument {
             }
             NavKind::Hunk => matches!(item, ReviewItem::HunkHeader(_)),
             NavKind::Thread => matches!(item, ReviewItem::Thread(_) | ReviewItem::AgentThread(_)),
+            NavKind::OpenThread => matches!(item, ReviewItem::Thread(thread) if !thread.resolved),
+            NavKind::AiAnswer => matches!(item, ReviewItem::AgentThread(_)),
             NavKind::Change => {
                 item.is_change()
                     && !items[..local]
@@ -190,12 +196,14 @@ impl ReviewDocument {
         match kind {
             NavKind::File | NavKind::UnviewedFile => false,
             NavKind::Hunk | NavKind::Change => changed,
-            NavKind::Thread => self.file_annotations[file].iter().any(|annotation| {
-                matches!(
-                    self.annotations[*annotation].target,
-                    super::anchors::AnchorTarget::Lines(_)
-                )
-            }),
+            NavKind::Thread | NavKind::OpenThread | NavKind::AiAnswer => {
+                self.file_annotations[file].iter().any(|annotation| {
+                    matches!(
+                        self.annotations[*annotation].target,
+                        super::anchors::AnchorTarget::Lines(_)
+                    )
+                })
+            }
         }
     }
 

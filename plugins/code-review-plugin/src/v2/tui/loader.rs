@@ -67,6 +67,8 @@ pub enum Message {
     },
     /// A workspace save finished.
     Saved(Result<(), String>),
+    /// A transient review was saved as a durable one (or failed to).
+    SavedAs(Box<Result<bcode_code_review_models::ReviewWorkspace, String>>),
     /// The review's annotations were listed.
     NotesLoaded {
         /// Document generation they were listed for.
@@ -76,6 +78,14 @@ pub enum Message {
     },
     /// The running annotation mutation finished.
     NoteDone(super::notes::MutationResult),
+    /// Work of the publish flow finished.
+    Publish(super::publish::FlowResult),
+    /// Work of the import flow finished.
+    Import(super::import::ImportResult),
+    /// The re-review comparison finished.
+    Rereview(Box<super::rereview::RereviewPlan>),
+    /// Patches unchanged since the last pass: `(source id, path, patch id)`.
+    Carried(Result<Vec<(String, String, String)>, String>),
     /// An AI question finished: the linked exchange, or the exchange as recorded and the error.
     Asked(
         Box<
@@ -302,6 +312,49 @@ pub async fn save_workspace(
     .await
     .map_err(|error| error.message)?;
     Ok(())
+}
+
+/// Save a transient review as a durable workspace and return it.
+///
+/// The workspace is created with the same title and sources, gets the viewed, presentation, and
+/// reviewed-revision state, and the drafts, AI exchanges, and suggestions move into its scope.
+///
+/// # Errors
+///
+/// Returns the first failing call's message.
+pub async fn save_as(
+    backend: SharedBackend,
+    transient: bcode_code_review_models::ReviewWorkspace,
+    notes: super::notes::LoadedNotes,
+) -> Result<bcode_code_review_models::ReviewWorkspace, String> {
+    let created: bcode_code_review_models::CreateReviewWorkspaceResponse = call_json(
+        backend.as_ref(),
+        bcode_code_review_models::OP_REVIEW_WORKSPACE_CREATE,
+        &bcode_code_review_models::CreateReviewWorkspaceRequest {
+            repo_path: transient.repo_root.clone(),
+            title: Some(transient.title.clone()),
+            sources: transient.sources.clone(),
+        },
+    )
+    .await
+    .map_err(|error| error.message)?;
+    let mut workspace = created.workspace;
+    workspace.viewed_files.clone_from(&transient.viewed_files);
+    workspace.viewed_marks.clone_from(&transient.viewed_marks);
+    workspace
+        .reviewed_revisions
+        .clone_from(&transient.reviewed_revisions);
+    workspace
+        .presentation_v2
+        .clone_from(&transient.presentation_v2);
+    save_workspace(Arc::clone(&backend), workspace.clone()).await?;
+    let (from, to) = (
+        super::notes::NoteScope::for_workspace(&transient),
+        super::notes::NoteScope::for_workspace(&workspace),
+    );
+    super::notes::move_drafts(Arc::clone(&backend), from.clone(), to.clone(), notes.drafts).await?;
+    super::notes::move_agent_notes(backend, from, to, notes.exchanges, notes.suggestions).await?;
+    Ok(workspace)
 }
 
 /// Serve one document need.

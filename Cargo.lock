@@ -1944,6 +1944,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_session_view_models",
  "bcode_syntax_render",
+ "bmux_color",
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",

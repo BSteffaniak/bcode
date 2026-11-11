@@ -176,6 +176,24 @@ impl GitFixture {
         fixture
     }
 
+    /// An empty repository on an unborn `main`, for tests that build their own history.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary directory cannot be created or `git init` fails.
+    #[must_use]
+    pub fn empty() -> Self {
+        let dir = tempfile::tempdir().expect("create fixture directory");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture path");
+        let fixture = Self {
+            _dir: dir,
+            root,
+            spec: FixtureSpec::small(),
+        };
+        fixture.run(&["init", "-q", "-b", HEAD_BRANCH]);
+        fixture
+    }
+
     /// Repository root (canonicalized).
     #[must_use]
     pub fn root(&self) -> &Path {

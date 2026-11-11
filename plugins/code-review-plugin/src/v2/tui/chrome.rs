@@ -149,12 +149,23 @@ impl HeaderPlan {
     }
 }
 
-/// Publish menu entries (publishing lands with spec phase 6).
+/// Publish menu entry: choose a publisher.
+pub const PUBLISH_MENU_CHOOSE: &str = "publish.choose";
+/// Publish menu entry: import an external review.
+pub const PUBLISH_MENU_IMPORT: &str = "publish.import";
+/// Publish menu entry: show the changes since the last review.
+pub const PUBLISH_MENU_SINCE_LAST: &str = "publish.since_last";
+/// Publish menu entry: mark the review pass complete.
+pub const PUBLISH_MENU_COMPLETE: &str = "publish.complete";
+
+/// Publish menu entries (provider-neutral; publishers are chosen in the publish flow).
 #[must_use]
 pub fn publish_items() -> Vec<MenuItem> {
     vec![
-        MenuItem::new("publish.github", "Publish to GitHub…"),
-        MenuItem::new("publish.report", "Write review report…"),
+        MenuItem::new(PUBLISH_MENU_CHOOSE, "Publish…"),
+        MenuItem::new(PUBLISH_MENU_IMPORT, "Import external review…"),
+        MenuItem::new(PUBLISH_MENU_SINCE_LAST, "Changes since last review"),
+        MenuItem::new(PUBLISH_MENU_COMPLETE, "Mark review pass complete"),
     ]
 }
 

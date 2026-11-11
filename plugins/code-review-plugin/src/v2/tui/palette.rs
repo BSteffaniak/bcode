@@ -5,6 +5,10 @@
 //!   in the description or the action id), `enter` or a click runs the action.
 //! * Help is the same menu without the input: every action of the review, composer, and tree
 //!   contexts grouped under section rows, scrollable, and runnable.
+//! * A menu is the same list without the input for a chosen set of actions (the actions of a
+//!   thread or an AI answer, or the structured AI commands).
+//! * A palette query that is a line number offers "Go to line N" first (the jump-to-line of
+//!   inventory INV-NAV-13, by source line number).
 //!
 //! The overlay keeps the layout it was painted with; pointer events are routed through exactly
 //! that layout.
@@ -77,7 +81,12 @@ pub enum OverlayKind {
     Palette,
     /// Keyboard help.
     Help,
+    /// A menu of chosen actions.
+    Menu,
 }
+
+/// Action id prefix of the palette's go-to-line entry (followed by the line number).
+pub const GOTO_LINE_PREFIX: &str = "goto_line:";
 
 /// What an input did to the overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,19 +159,37 @@ impl Overlay {
             .collect()
     }
 
+    /// Action ids of the runnable rows shown, in order (the go-to-line row included).
+    #[must_use]
+    pub fn shown_actions(&self) -> Vec<&str> {
+        self.items
+            .iter()
+            .filter(|item| !item.section)
+            .map(|item| item.id.as_str())
+            .collect()
+    }
+
     fn filter(&mut self, theme: &ReviewTheme) {
         let query = self.input.borrow().buffer().text().to_lowercase();
+        let line = query
+            .trim()
+            .trim_start_matches(':')
+            .parse::<u32>()
+            .ok()
+            .filter(|line| *line > 0);
+        let query = if line.is_some() { String::new() } else { query };
         let words: Vec<&str> = query.split_whitespace().collect();
         self.shown = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                words.is_empty()
-                    || entry.action.as_ref().is_some_and(|action| {
-                        let haystack = format!("{} {action}", entry.label.to_lowercase());
-                        words.iter().all(|word| haystack.contains(word))
-                    })
+                line.is_none()
+                    && (words.is_empty()
+                        || entry.action.as_ref().is_some_and(|action| {
+                            let haystack = format!("{} {action}", entry.label.to_lowercase());
+                            words.iter().all(|word| haystack.contains(word))
+                        }))
             })
             .map(|(index, _)| index)
             .collect();
@@ -193,6 +220,19 @@ impl Overlay {
                 )
             })
             .collect();
+        if let Some(line) = line {
+            self.items.insert(
+                0,
+                MenuItem::rich(
+                    format!("{GOTO_LINE_PREFIX}{line}"),
+                    Line::from_spans(vec![
+                        Span::styled(format!("Go to line {line}"), theme.accent),
+                        Span::raw("  "),
+                        Span::styled("in this file", theme.muted),
+                    ]),
+                ),
+            );
+        }
         self.menu.set(MenuState::new(None));
         self.active = None;
         let first = self.items.iter().position(|item| !item.section);
@@ -238,6 +278,7 @@ impl Overlay {
         let (title, footer) = match self.kind {
             OverlayKind::Palette => ("Commands", "enter run · esc close"),
             OverlayKind::Help => ("Keys", "enter run · esc close"),
+            OverlayKind::Menu => ("Actions", "enter run · esc close"),
         };
         let max = Size::new(
             area.width.saturating_sub(4).min(84),
@@ -304,7 +345,7 @@ impl Overlay {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => return self.navigate(stroke),
-            KeyCode::Char('j' | 'k') if self.kind == OverlayKind::Help && plain => {
+            KeyCode::Char('j' | 'k') if self.kind != OverlayKind::Palette && plain => {
                 let key = if stroke.key == KeyCode::Char('j') {
                     KeyCode::Down
                 } else {

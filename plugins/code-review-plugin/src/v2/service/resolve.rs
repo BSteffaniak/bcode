@@ -4,9 +4,10 @@ use super::{ServiceError, git};
 use bcode_code_review_models::{
     REVIEW_DIAGNOSTIC_PROVIDER_FAILED, REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED,
     REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION, REVIEW_DIAGNOSTIC_UNSUPPORTED_SOURCE,
-    REVIEW_ERROR_PATH_REJECTED, ResolveReviewSourcesResponse, ResolvedReviewStack, ResolvedSource,
-    ResolvedSourceMode, ResolvedSourcePart, ResolvedStackLayer, ReviewLineInterval,
-    ReviewPullFetchResult, ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity,
+    REVIEW_ERROR_PATH_REJECTED, REVIEW_REPO_STATE_MAX_AHEAD, ResolveReviewSourcesResponse,
+    ResolvedReviewStack, ResolvedSource, ResolvedSourceMode, ResolvedSourcePart,
+    ResolvedStackLayer, ReviewChangeCount, ReviewLineInterval, ReviewPullFetchResult,
+    ReviewRepoStateResponse, ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity,
     ReviewSourceKind, ReviewSourceProviderOutcome, ReviewSourceProviderResolution,
     ReviewSourcesTokenResponse, ReviewStack, RevisionRef, source_kind_requires_provider,
 };
@@ -617,6 +618,77 @@ fn detect_base(root: &Path) -> Result<Option<String>, ServiceError> {
         }
     }
     Ok(None)
+}
+
+/// Repository state for review suggestions: the branch, the base `CurrentBranch` detects and how
+/// far `HEAD` is ahead of it, and unstaged and staged change counts. Bounded: two
+/// `git diff --shortstat` calls, the base detection, one `merge-base`, and one capped
+/// `rev-list --count`.
+pub fn repo_state(root: &Path) -> Result<ReviewRepoStateResponse, ServiceError> {
+    let head_oid = git::resolve_commit(root, "HEAD")?;
+    let branch = git::optional_output(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .flatten()
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .filter(|branch| !branch.is_empty());
+    let unstaged = shortstat(root, &["diff", "--shortstat"]);
+    let staged = shortstat(root, &["diff", "--cached", "--shortstat"]);
+    let mut state = ReviewRepoStateResponse {
+        branch,
+        head_oid: head_oid.clone(),
+        unstaged,
+        staged,
+        ..ReviewRepoStateResponse::default()
+    };
+    let Some(head) = head_oid else {
+        return Ok(state);
+    };
+    state.base = detect_base(root)?;
+    let Some(base) = state.base.as_deref() else {
+        return Ok(state);
+    };
+    let Some(base_oid) = git::resolve_commit(root, base)? else {
+        return Ok(state);
+    };
+    state.merge_base_oid = git::merge_base(root, &base_oid, &head)?;
+    if let Some(merge_base) = &state.merge_base_oid {
+        let range = format!("{merge_base}..{head}");
+        let cap = format!("--max-count={REVIEW_REPO_STATE_MAX_AHEAD}");
+        state.ahead = git::optional_output(root, &["rev-list", "--count", &cap, &range])?
+            .and_then(|bytes| String::from_utf8_lossy(&bytes).trim().parse().ok());
+    }
+    Ok(state)
+}
+
+/// Files and lines of a `git diff --shortstat` call; nothing when git reports nothing or fails
+/// (an unborn branch has no `HEAD` to compare the index with).
+fn shortstat(root: &Path, args: &[&str]) -> ReviewChangeCount {
+    let Ok(Some(output)) = git::optional_output(root, args) else {
+        return ReviewChangeCount::default();
+    };
+    parse_shortstat(&String::from_utf8_lossy(&output))
+}
+
+/// Parse ` 3 files changed, 10 insertions(+), 2 deletions(-)`.
+fn parse_shortstat(text: &str) -> ReviewChangeCount {
+    let mut count = ReviewChangeCount::default();
+    for part in text.trim().split(',') {
+        let mut words = part.split_whitespace();
+        let (Some(number), Some(label)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u64>() else {
+            continue;
+        };
+        if label.starts_with("file") {
+            count.files = u32::try_from(number).unwrap_or(u32::MAX);
+        } else if label.starts_with("insertion") {
+            count.additions = number;
+        } else if label.starts_with("deletion") {
+            count.deletions = number;
+        }
+    }
+    count
 }
 
 /// Token over `HEAD`, the staged index content (`git ls-files --stage`), and (optionally) the

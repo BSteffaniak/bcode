@@ -133,6 +133,9 @@ pub struct FileHeaderItem {
     pub layers: Vec<LayerNumber>,
     /// Threads anchored in this file (including outdated ones), resident or not.
     pub thread_count: usize,
+    /// Whether the file's patch is unchanged since the last review pass (a re-review after a
+    /// rebase, spec 7.4): shown de-emphasized.
+    pub carried_over: bool,
 }
 
 /// Estimated-height stand-in for a file whose content is not resident (spec 4.3).

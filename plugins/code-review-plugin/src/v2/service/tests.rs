@@ -16,7 +16,7 @@ use bcode_code_review_models::{
     ReviewBlobRef, ReviewBlobSelector, ReviewCommitsPageRequest, ReviewFileHunksRequest,
     ReviewFileHunksResponse, ReviewFileStatus, ReviewFilesSearchRequest, ReviewIndexEntry,
     ReviewIndexFlag, ReviewIndexRequest, ReviewLineKind, ReviewRefKind, ReviewRefsSearchRequest,
-    ReviewSource, ReviewSourceKind, ReviewSourcesTokenRequest, RevisionRef,
+    ReviewRepoStateRequest, ReviewSource, ReviewSourceKind, ReviewSourcesTokenRequest, RevisionRef,
 };
 use std::path::Path;
 use std::process::Command;
@@ -247,6 +247,47 @@ fn current_branch_detects_origin_head_as_base() {
         current.head,
         RevisionRef::commit(rev_parse(&fixture, "HEAD"))
     );
+}
+
+#[test]
+fn repo_state_reports_branch_base_ahead_and_change_counts() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    let mut service = V2Service::default();
+    fixture.run(&["update-ref", "refs/remotes/origin/main", BASE_BRANCH]);
+    fixture.run(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    let state = service
+        .repo_state(&ReviewRepoStateRequest {
+            repo_path: repo.to_path_buf(),
+        })
+        .expect("repo state");
+    assert_eq!(state.branch.as_deref(), Some(HEAD_BRANCH));
+    assert_eq!(state.head_oid, Some(rev_parse(&fixture, "HEAD")));
+    assert_eq!(state.base.as_deref(), Some("origin/main"));
+    assert_eq!(state.merge_base_oid, Some(rev_parse(&fixture, BASE_BRANCH)));
+    assert_eq!(state.ahead, Some(1));
+    let count = |args: &[&str]| fixture.git(args).lines().count();
+    let unstaged = count(&["diff", "--name-only"]);
+    let staged = count(&["diff", "--cached", "--name-only"]);
+    assert!(unstaged > 0 && staged > 0);
+    assert_eq!(state.unstaged.files as usize, unstaged);
+    assert_eq!(state.staged.files as usize, staged);
+    assert!(state.unstaged.additions > 0 && state.unstaged.deletions > 0);
+
+    // A detached head has no branch; a clean tree has no changes.
+    fixture.run(&["reset", "--hard", "-q"]);
+    fixture.run(&["checkout", "-q", "--detach", "HEAD"]);
+    let state = service
+        .repo_state(&ReviewRepoStateRequest {
+            repo_path: repo.to_path_buf(),
+        })
+        .expect("repo state");
+    assert_eq!(state.branch, None);
+    assert!(state.unstaged.is_empty() && state.staged.is_empty());
 }
 
 #[test]

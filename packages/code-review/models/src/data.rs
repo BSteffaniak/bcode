@@ -35,6 +35,8 @@ pub const OP_REVIEW_REFS_SEARCH: &str = "review.refs.search";
 pub const OP_REVIEW_COMMITS_PAGE: &str = "review.commits.page";
 /// Operation that returns one page of repository paths matching a query.
 pub const OP_REVIEW_FILES_SEARCH: &str = "review.files.search";
+/// Operation summarizing repository state for review suggestions.
+pub const OP_REVIEW_REPO_STATE: &str = "review.repo.state";
 
 /// Default page size for `review.index.get`.
 pub const REVIEW_INDEX_DEFAULT_PAGE_SIZE: u32 = 1_000;
@@ -218,6 +220,62 @@ pub struct ReviewSourcesTokenResponse {
     /// Current `HEAD` commit id, or `None` on an unborn branch.
     #[serde(default)]
     pub head_oid: Option<String>,
+}
+
+/// Upper bound on the commit count reported by [`ReviewRepoStateResponse::ahead`].
+pub const REVIEW_REPO_STATE_MAX_AHEAD: u32 = 10_000;
+
+/// Request payload for `review.repo.state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRepoStateRequest {
+    /// Absolute repository path.
+    pub repo_path: PathBuf,
+}
+
+/// Changed files and lines of one working-tree state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewChangeCount {
+    /// Changed files.
+    pub files: u32,
+    /// Added lines.
+    pub additions: u64,
+    /// Removed lines.
+    pub deletions: u64,
+}
+
+impl ReviewChangeCount {
+    /// Whether nothing changed.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.files == 0
+    }
+}
+
+/// Response payload for `review.repo.state`: what review suggestions are derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewRepoStateResponse {
+    /// Checked-out branch, or `None` when `HEAD` is detached.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// `HEAD` commit, or `None` on an unborn branch.
+    #[serde(default)]
+    pub head_oid: Option<String>,
+    /// Base the `CurrentBranch` source detects: the upstream, else `origin/HEAD`, else the first
+    /// existing default-branch candidate other than the current branch.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Merge base of `base` and `HEAD`.
+    #[serde(default)]
+    pub merge_base_oid: Option<String>,
+    /// Commits on `HEAD` that are not on `base`, capped at [`REVIEW_REPO_STATE_MAX_AHEAD`].
+    #[serde(default)]
+    pub ahead: Option<u32>,
+    /// Unstaged changes (index to working tree; untracked files excluded).
+    #[serde(default)]
+    pub unstaged: ReviewChangeCount,
+    /// Staged changes (`HEAD` to index).
+    #[serde(default)]
+    pub staged: ReviewChangeCount,
 }
 
 /// Blob identity of one side of an index entry.
@@ -608,6 +666,62 @@ pub struct ReviewFilesSearchResponse {
     pub next_cursor: Option<String>,
     /// Total matches across all pages.
     pub total_matches: u32,
+}
+
+/// Operation that compares a previously reviewed commit with the current one (re-review).
+pub const OP_REVIEW_REVISIONS_COMPARE: &str = "review.revisions.compare";
+/// Operation that returns the patch ids of several files of one revision pair (re-review).
+pub const OP_REVIEW_PATCH_IDS_GET: &str = "review.patch_ids.get";
+/// Maximum paths one `review.patch_ids.get` request may name.
+pub const REVIEW_PATCH_IDS_MAX_PATHS: usize = 500;
+/// Upper bound on [`ReviewRevisionsCompareResponse::commits_ahead`].
+pub const REVIEW_REVISIONS_MAX_AHEAD: u32 = 10_000;
+
+/// Request payload for `review.revisions.compare`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRevisionsCompareRequest {
+    /// Absolute repository path.
+    pub repo_path: PathBuf,
+    /// Commit reviewed last time (full object id).
+    pub old_oid: String,
+    /// Commit the source resolves to now (full object id).
+    pub new_oid: String,
+}
+
+/// Response payload for `review.revisions.compare`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRevisionsCompareResponse {
+    /// Whether the old commit still exists locally.
+    pub old_exists: bool,
+    /// Whether the old commit is an ancestor of the new one (a fast-forward update).
+    pub fast_forward: bool,
+    /// Commits reachable from the new commit but not the old one, capped at
+    /// [`REVIEW_REVISIONS_MAX_AHEAD`]; `None` when the old commit is missing.
+    #[serde(default)]
+    pub commits_ahead: Option<u32>,
+}
+
+/// Request payload for `review.patch_ids.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPatchIdsRequest {
+    /// Absolute repository path.
+    pub repo_path: PathBuf,
+    /// Base side.
+    pub base: RevisionRef,
+    /// Head side.
+    pub head: RevisionRef,
+    /// Repository-relative paths (at most [`REVIEW_PATCH_IDS_MAX_PATHS`]); a renamed file is
+    /// named by either path.
+    pub paths: Vec<String>,
+}
+
+/// Response payload for `review.patch_ids.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewPatchIdsResponse {
+    /// Patch id per requested path that has a textual difference (the same identity
+    /// `review.file.hunks.get` reports). Paths without a difference, and binary files, are
+    /// absent.
+    pub patch_ids: std::collections::BTreeMap<String, String>,
 }
 
 /// Whether a source kind is resolved by a review-source provider plugin.

@@ -1044,12 +1044,12 @@ fn palette_and_help_come_from_the_keymap_and_run_actions() {
     assert!(help.contains(&"Comment composer"));
     assert!(help.contains(&"Save the comment"));
     assert!(screen.contains("Keys"), "{}", screen.text());
-    for _ in 0..80 {
-        setup.scenario.key("j");
-    }
+    assert!(help.contains(&"File panel") && help.contains(&"Threads panel"));
+    assert!(help.contains(&"Next threads filter"));
+    setup.scenario.key("end");
     let scrolled = setup.scenario.render();
     assert!(
-        scrolled.contains("Cancel the comment"),
+        scrolled.contains("Previous threads filter"),
         "{}",
         scrolled.text()
     );

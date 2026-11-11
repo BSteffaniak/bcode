@@ -378,6 +378,11 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
 | `review.refs.search` | branches/tags matching a query | paged |
 | `review.commits.page` | commit log page with subject, author, date, refs, parents | paged; anchored to the first page's start commit |
 | `review.files.search` | repository paths matching a query (repository browse sources) | paged |
+| `review.repo.state` | current branch, `HEAD`, the base `CurrentBranch` detects, its merge base, commits ahead (capped at 10,000), unstaged and staged file and line counts | two `diff --shortstat`, base detection, one `merge-base`, one capped `rev-list --count` |
+| `review.revisions.compare` | whether a previously reviewed commit still exists, whether it is an ancestor of the current one (fast-forward), and the commits added (capped at 10,000) | one `cat-file -e` per commit, one `merge-base --is-ancestor`, one capped `rev-list --count` |
+| `review.patch_ids.get` | patch ids (the `review.file.hunks.get` identity) of up to 500 paths of one revision pair; paths without a textual difference and binary files are absent | one `git diff -U0` limited to the paths |
+| `review.publish.bundle.preview` / `review.publish.bundle.submit` | a built-in publisher's preview or submit of a bundle the client built (`PublishBundleRequest`); no publish record is saved by the operation | the bundle's size |
+| `review.suggestion.delete` | deletes one suggestion from one review scope (`DeleteReviewSuggestionRequest`); used to move suggestions when a transient review is saved (7.5) | one row |
 
 * Paged operations return an opaque cursor bound to the listing it came from; a cursor from a
   listing that has since changed is rejected with `cursor_stale`.
@@ -472,6 +477,10 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   own diff) and mapping earlier lines forward through later hunks; renames and deletions are
   followed. Work is one blob read and one `git diff -U0` per layer for one file, with at most
   2,000,000 tracked lines. A comment publishes to the layer that wrote its anchor line (7.3).
+  Each range also carries `layer_line` (serde-defaulted): where the range starts in that layer's
+  own diff, on the new side the line in the layer's head and on the old side the line in the head
+  below it, so a comment can be published at the right line of the layer's pull request; ranges
+  merge only while those lines stay consecutive.
 
 The GitHub implementation lives in `plugins/github-review-publisher-plugin` (`review_source.rs`)
 using `packages/forge`, which now also reports each pull request's author, base OID, and whether a
@@ -687,8 +696,9 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   scrolls it into view. Tree-originated jumps do not echo back.
 * **Header** (`chrome.rs`): title, source chips (BMUX `badge`; a single source named like the
   review is not repeated, more than two collapse into `+N`), `+/−` totals, `viewed x/y` with a
-  BMUX `progress_bar`, the draft count, the layout mode, and a BMUX `split_button` publish
-  placeholder (it explains that publishing is not in V2 yet). Parts are measured by their own
+  BMUX `progress_bar`, the draft count, the layout mode, and a BMUX `split_button` that opens
+  the publish flow (its menu: publish, import an external review, changes since the last review,
+  mark the pass complete; 7.6). Parts are measured by their own
   component or text width. Elision order when narrow: publish, the second chip (`+N`), drafts,
   totals, the first chip, the progress bar, the mode, the viewed count; parts are dropped while
   the title would get fewer than its width (at most 40) cells, then the title is truncated.
@@ -708,7 +718,8 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * **Keys** (scope `code-review-v2`): `tab` next pane, `t` show/hide the file panel, `f` filter,
   `>`/`<` widen/narrow the file panel, `T` threads panel. In the tree: `j`/`k`/arrows, pages,
   `g`/`G`, `enter` open, `space` fold, `left` collapse or go to the parent, `right` expand,
-  `esc` back to the document.
+  `esc` back to the document (scope `code-review-v2-files` since phase 6 part 2; the threads
+  panel's `enter`, `esc`, and `left`/`right` filters are scope `code-review-v2-threads`).
 
 ### 6.2 Interaction
 
@@ -809,8 +820,71 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   annotation call is still running shows `saving…` and closes once they finish (at most 5 s;
   exiting again closes at once), because the host may end the process as soon as the surface
   closes.
-* **Not yet.** Host completion and history in the composer (`FocusedTextFieldAdapter`), the V1
-  structured AI commands, suggestion accept/refine/reject, collapsing threads, and publishing.
+* **Implementation (phase 6, part 2: V1 parity).** `src/v2/tui/surface/assist.rs` and the
+  changes listed here close the remaining inventory items (Appendix B):
+  * **Composer completion.** The composer's editor is offered to the host as a focused text
+    field through the shared `FocusedTextFieldAdapter` (`PluginTuiSurface::focused_text_field`,
+    `apply_focused_text_field_edit_result`, routed by the app to the review route). It is
+    eligible only while the composer has keyboard focus, nothing covers it (palette, help, a
+    modal, the publish menu), the terminal has focus, it is not in preview, and its editor was
+    painted in the frame; its content rectangle and caret come from the painted editor. A
+    completion is one undoable edit; any edit, focus, or visibility change makes earlier
+    completion requests stale.
+  * **Folding.** `z` (`fold`) folds the cursor's thread to its header (a click on the header
+    does the same) and, on an AI answer, shows the whole answer (at most 400 rows) or the
+    8-row preview again. `shift+z` (`fold_all`) collapses every thread, or expands them all when
+    all are collapsed. `shift+h` (`resolved_toggle`) hides resolved threads from the document
+    (a thread is resolved when every comment is). Collapsed threads, expanded answers, and the
+    resolved filter are saved in `presentation_v2`.
+  * **AI.** A question on an anchor that already has a linked session (an earlier exchange, or
+    a draft linked with `thread.link_session`) is a follow-up: it is sent to that session, no
+    session is created or linked, and the review stays on screen (only a new session opens).
+    `a` on an AI answer asks a follow-up. `shift+a` (`ai_menu`) lists the structured commands
+    (`ai_explain`, `ai_risks`, `ai_suggest_comment`, `ai_tests`, `ai_summarize`, with V1's fixed
+    instructions) and a free question; on a thread or an answer they ask about its anchor.
+    Prompts also carry the review's sources and up to 12 other threads of the file (160
+    characters each). An answered exchange can be copied (`shift+y`, `copy_answer`), turned into
+    a suggested comment (`s`, `suggest_comment`; a pending duplicate is refused), or turned into
+    a draft at its anchor (`m`, `draft_answer`; an identical draft is refused).
+  * **Suggestions.** Suggestion rows show their state (suggested, refining, accepted,
+    rejected); the latest pending one has Accept, Refine, and Reject buttons. Accept (`;`,
+    `accept_suggestion`) saves it as accepted and adds a draft with its body at its anchor;
+    Refine (`refine_suggestion`) saves it as refining and asks for a refinement in the linked
+    session; Reject (`reject_suggestion`) saves it as rejected. Changes are optimistic, saved
+    with `review.suggestion.save`, and rolled back when the save fails.
+  * **Item menus.** `enter` (`activate`) on a thread or an AI answer opens a BMUX menu of the
+    actions that apply to it (with their effective keys); on a gap it reveals lines below.
+  * **Navigation.** `open_thread_next`/`open_thread_previous` (threads with an unresolved
+    comment), `ai_thread_next`/`ai_thread_previous`, and `attention_next` (the next unviewed
+    file, else the next open thread). A palette query that is a line number offers "Go to line
+    N": the cursor's file's new-side line N (else the old-side line), revealing hidden context
+    when needed (`goto_line` opens the palette for it).
+  * **Viewed.** `view_all`/`unview_all` mark every file viewed or unviewed (marks are recorded
+    in one batch). `h` (`viewed_files_toggle`) hides viewed files from the file panel (saved in
+    `presentation_v2`); a file that becomes viewed leaves the panel at once.
+  * **Report.** `copy_report` copies a Markdown review report: title, repository, sources,
+    viewed progress, up to 50 unviewed files, up to 500 threads (location, kind, severity,
+    state, linked session, comments), and the AI questions with their sessions. The
+    `local_markdown`, `markdown_file`, and `json_file` publishers remain the file reports.
+  * **Threads panel.** The filters are all, open, needs attention, general, and resolved.
+  * **Copying.** Clipboard writes from clicks (which have no host at hand) are queued and
+    written after the event or on the next poll, with a status message.
+* **Key bindings (phase 6 review).** Every V2 action is declared in the manifest keymap and is
+  listed by the palette and help; help has sections for the review, the composer, the file
+  panel (`code-review-v2-files`: `enter` open, `space` fold, `left`/`right` collapse/expand,
+  `esc` back), and the threads panel (`code-review-v2-threads`: `enter` and `esc` back to the
+  review, `left`/`right` filters). Rarely used actions (structured AI commands, refine and
+  reject, retry, open-thread and AI-answer navigation, `attention_next`, `view_all`,
+  `unview_all`, `goto_line`, `copy_report`, `edit_sources`) have no default key: they run
+  from the palette, help, or menus and can be bound. Conventions shared with Bcode's other
+  surfaces: `q`/`esc` leave (eval viewers, git UI back), `?` help, `ctrl+p` palette (host and
+  git UI), `y` copies (git UI), `/` searches or filters, `j`/`k`/`g`/`G`/pages move, `tab`
+  focuses the next pane, `ctrl+r` reloads (also on home). Digits are count prefixes in the
+  review, so V1's `1`–`5` AI commands moved into the AI menu. No key is bound twice in a scope
+  (the manifest test checks it). V2 drops V1's `ctrl+d` exit (it is the half-page motion here,
+  as in the git UI); `q` and `esc` leave the review, `esc` first clearing a selection or
+  search. Text inputs, pickers, forms, and modals keep the shared BMUX editing and picker
+  policies (arrows, `enter`, `esc`, `tab`), as host pickers do.
 
 ### 6.3 Visual system
 
@@ -865,9 +939,9 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 **Implementation (phase 3a).** `src/v2/tui/` implements the review screen core:
 
 * **Launch.** `bcode review <subcommand> --ui v2` (on every interactive review subcommand) or
-  `BCODE_REVIEW_UI=v2` opens the `code-review-v2` surface kind; `bcode review` without a
-  subcommand stays on V1 home until phase 5. The host opens any registered plugin surface as a
-  standalone startup surface (7.1); V1 routing is unchanged.
+  `BCODE_REVIEW_UI=v2` opens the `code-review-v2` surface kind; since phase 5 `bcode review`
+  without a subcommand opens its home route (7.1). The host opens any registered plugin surface
+  as a standalone startup surface (7.1); V1 routing is unchanged.
 * **Loading.** The first `poll` spawns the open task: provider routing, `review.sources.resolve`,
   a change token, and every index page. A BMUX `empty_state` with a spinner shows index progress
   until the document exists; input is never blocked. Afterwards `poll` applies finished work and
@@ -924,6 +998,30 @@ manifest declares the requested surface kind, opens it with the caller's string 
 it until it closes. Startup surface kinds without a host special case (such as `code-review-v2`)
 go through it. The V1 `code-review` special cases remain until phase 7.
 
+**Implementation (phase 5).** `src/v2/tui/app.rs` is the `code-review-v2` surface
+(`ReviewAppV2`):
+
+* Routes: `Home` (`home.rs`), `NewReview` (`wizard.rs`), `Opening` (an entry or a workspace
+  creation resolving on a task: a spinner, or the failure with `esc`/`enter` back to home), and
+  `Review` (`ReviewSurfaceV2`). A route change replaces the route value only; the plugin runtime,
+  the terminal, and the backend stay. Home is kept while a review is open (its filter, selection,
+  and folded groups survive) and reloads when the review closes.
+* Transitions: a review's own exit (after its saves finished, as before) returns to home instead
+  of closing the surface; `q` on home closes it. Home opens reviews (enter, continue-latest,
+  suggestions), starts transient reviews (suggestions), or the wizard (`n`); the wizard cancels
+  to home or creates a durable workspace (`review.workspace.create`) and opens it.
+* Entries (`entry.rs`): the CLI passes `entry` (JSON `Entry`: `home`, `sources`,
+  `pull_request`, `stack`, `resume`, `workspace`) as the surface option; the older `workspace`
+  and `target` options still open those directly. Pull request and stack entries ask the first
+  enabled provider with the needed capabilities: a number or a URL (its last numeric path
+  segment, matched against the providers' pull request URLs, so nothing provider-specific is
+  parsed), the repository from `review_source.pulls.list`, and for `stack` without a reference
+  the open pull request whose head is the current branch (`review.repo.state`), resolved to its
+  top layer. `resume` without an id opens the most recently updated unarchived review; an
+  archived review is refused with a pointer to home.
+* Routes read the keymap again after every route change, so hosts need not call
+  `prepare_keymap` themselves. Home and the wizard derive the same `ReviewTheme` as the review.
+
 ### 7.2 Home
 
 * **Suggestions** at the top, derived from repository state: uncommitted changes, current branch
@@ -933,6 +1031,53 @@ go through it. The V1 `code-review` special cases remain until phase 7.
   status, updated. Grouped: needs attention, in progress, published, archived (collapsed).
 * Type-to-filter search, preview panel (file stats, sources, last publish), rename, archive,
   restore, and one-key continue-latest.
+
+**Implementation (phase 5).** `src/v2/tui/home.rs` (screen), `home/model.rs` (groups, filter,
+rows, suggestions; pure and unit-tested), `home/load.rs` (service calls):
+
+* **Loading.** A refresh (first show, returning from a review, `ctrl+r`, terminal focus regain)
+  spawns three tasks: `review.workspace.list` (archived included), `review.repo.state`, and the
+  first provider's `review_source.pulls.list`; once the branch and its pull request are known,
+  `review_source.stack.resolve` for it. Per-review stats resolve the review's sources without
+  provider answers (no network; provider-backed sources count as unresolved) and read one index
+  page per resolved source for its totals; they load for the visible rows first, then for the most
+  recent reviews, two at a time and at most 40 per refresh. A review has new commits when a
+  source's current head commit differs from its recorded `reviewed_head_oid` (the first part of a
+  multi-part source). Nothing blocks input; rows and suggestions update as answers arrive.
+  Answers carry the refresh generation they were started in: a listing, repository state,
+  pull request list, or stack from an older refresh that is still running never replaces a
+  newer refresh's answer. Stats scheduling returns at once while the in-flight or per-refresh
+  cap is reached, so polling costs nothing once the cap is used.
+* **Suggestions** (a BMUX `menu`, keys `1`–`9`, or `tab` to focus it): uncommitted changes
+  (unstaged, staged, or both, with file and line counts), the current branch ahead of its base
+  (commit count), the stack of the current branch's pull request (or the pull request itself when
+  it has one layer), up to three pull requests requesting my review, up to two reviews with new
+  commits since the last pass, and always "New review…" last. Without a provider the
+  pull-request suggestions are absent; a failing provider (for example without credentials) is
+  reported in the footer and the local suggestions stay.
+* **Groups** (V1 health mapped): *Needs attention*: no included sources (V1 `setup`, `needs
+  sources`), drafts changed since the last publish (`changed since publish`), or new commits since
+  the last pass. *In progress*: unpublished drafts (`drafts`) and everything else active
+  (`active`). *Published*: published with no draft changes since (`published`). *Archived*:
+  archived, folded by default. Group headings are table rows (`enter`/`space` fold); reviews sort
+  by last update within a group. Selection follows the review (or heading) identity across
+  reloads.
+* **Table** (BMUX `table`): title, sources, viewed progress (five progress cells and
+  `viewed/total` once the total is known), drafts and threads, publish state (`published` and its
+  age, `changed`, or `—`), and the update age. Columns degrade by width: publish below 96
+  columns, sources below 80, notes below 70, viewed below 56; title and age always show.
+* **Filter** (`/`): a BMUX text input; every word must occur in the title, a source label, or the
+  id; archived matches show while filtering; `enter` keeps it, `esc` clears it.
+* **Preview** (a BMUX `pane`, from 100 columns, `d` toggles): sources (included or excluded),
+  file totals, viewed count, drafts and threads, the last publish (age, publisher, message,
+  changed since), and new commits; a group heading explains the group.
+* **Actions** (scope `code-review-v2-home`): `enter` open (an archived review refuses, pointing at
+  restore), `c` continue the latest unarchived review, `n` new review, `r` rename (footer input;
+  an empty title is refused), `x` archive, `shift+r` restore (`review.workspace.update` with the
+  archive mark cleared), one change at a time with a toast; `ctrl+r` reload, `?` help (the
+  keymap, as in the review), `q` quit. A press on the selected row opens it.
+* An empty repository shows "Your next review starts here"; a filter without matches "No
+  matching reviews".
 
 ### 7.3 New-review wizard
 
@@ -963,12 +1108,99 @@ metadata is required.
   layer whose diff contains its anchor line; if none can be determined it falls back to the top
   PR's review summary.
 
+**Implementation (phase 5).** `src/v2/tui/wizard.rs` over `picker.rs` (a BMUX `picker_frame`
+with an optional query input over a BMUX `menu`, or a BMUX `empty_state` for loading, empty, and
+error states), under a BMUX `stepper` (Source type, Details, Title & create):
+
+* Step 2 by type: *Working tree*: unstaged, staged, or both with counts from `review.repo.state`.
+  *Current branch*: the detected base prefilled and focused; any reference can be searched
+  (`review.refs.search`); keeping the detected base stores `CurrentBranch { base: None }`, so the
+  base stays automatic. *Compare branches*: a base, then a head reference (merge-base
+  semantics). *Commits*: the paged log (`review.commits.page`, message search); `tab` marks a
+  commit, `shift+tab` marks every commit from the last mark to the focused one; one commit
+  becomes `Commit`, several `Commits` (oldest first; the resolver makes a contiguous chain one
+  range). *Pull request*: the provider's open pull requests, review requested from me first,
+  filterable. *Stack*: the current branch's pull request first, then its stack resolved: whole
+  stack (`Stack`), step through every layer (one `StackLayer` source per layer; the stack rail of
+  7.3 is phase 6), or one layer. *Files*: `review.files.search`; `tab` marks files; a trailing
+  `:START-END` makes the picked file a `FileRange`.
+* Step 3: the title (prefilled from the sources, kept when typed) above "Create review", "Add
+  another source…" (back to step 1 for a composite review), and the sources (`enter` removes
+  one). Creating calls `review.workspace.create` and opens the durable review.
+* Listings page on demand (100 entries, the next page when the focus comes within eight rows of
+  the end); a newer query drops older answers, and a query typed while a request runs is asked
+  again when it finishes. The request sequence keeps counting across steps, so an answer to an
+  earlier step's listing is never taken for the current step's. `enter` pressed before the
+  listing answers the current query is deferred until it does (any other key cancels it), so
+  it never picks a row of an older query. Going back to step 1 focuses the type that was
+  being configured.
+* Without a review-source provider the pull request and stack steps say so (other types still
+  work); a provider failure (for example `unauthenticated`) shows its message.
+* Keys (scope `code-review-v2-wizard`): `tab` mark, `shift+tab` mark range, `esc` back one step
+  (on step 1 to step 3 when sources exist, else to home); arrows, pages, `enter`, and clicks on
+  rows come from the picker.
+* **Editing a review's sources (phase 6 part 2; closes INV-SRC-01's open question).**
+  `edit_sources` (palette) leaves the review after its saves (close outcome
+  `{"edit_sources": true}`, which the app turns into the wizard instead of home) and opens the
+  wizard at step 3 with the review's title and sources ("Edit sources", "Save changes"). Sources
+  are added through step 1 ("Add another source…"), removed with `enter`, and included or
+  excluded with `tab`; at least one must stay included. Saving keeps existing source ids (so
+  threads, viewed marks, and reviewed revisions stay attached) and gives new sources unused
+  `source-N` ids; a durable review is saved with `review.workspace.update` and reopened, a
+  transient one reopens with the new sources. `esc` returns to the review unchanged.
+
+**Implementation (phase 6, stacks in the review).** `src/v2/tui/surface/stack.rs`:
+
+* **Layer mode** is a `StackLayer` source: the merge base of the layer below's head and the
+  layer's head → the layer's head (4.1), so exactly the pull request's own diff; its comments
+  publish to that pull request (7.6). **Step-through** is one `StackLayer` source per layer.
+  **Whole-stack** is a `Stack` source: file headers, hunk headers, and changed lines carry the
+  layer that introduced them from `review.stack.attribution` (5.1).
+* **Stack rail.** A BMUX `tab_bar` row under the header whenever the review has stack or
+  stack-layer sources and the screen has at least 9 rows: one tab per such source group with
+  `#N Title`, its position in the stack (`2/4`), five viewed-progress cells and `viewed/files`,
+  and the draft threads anchored in it; a whole-stack group shows `Whole stack #first–#last`. The
+  tab of the layer the cursor is in (by its item's source; items outside every layer keep the
+  last one) is selected. Labels degrade by display width: full, then compact (`#101 2/5 ✎1`),
+  then the numbers only; a bar that still does not fit is truncated by the component.
+* **Stepping.** `.`/`,` (`layer_next`/`layer_previous`, wrapping) and clicks on a tab enter a
+  layer. Leaving a layer remembers the cursor in it (persisted form); entering returns to the
+  remembered position (resolved by key, loading its file first when needed), else to the layer's
+  header. Positions are saved in `presentation_v2.layer_positions` and restored with the
+  workspace.
+
 ### 7.4 Re-review
 
 When a review's sources resolve to new OIDs, the review offers "changes since last review". For
 fast-forward updates this is the diff between the previous and current head. After a rebase,
 files are compared by patch-id: unchanged patches stay viewed and are de-emphasized, changed
 patches are shown.
+
+**Implementation (phase 6).** `src/v2/tui/rereview.rs`, `src/v2/tui/surface/flows.rs`, and
+`src/v2/service/rereview.rs`:
+
+* **Passes.** A pass is recorded (`reviewed_revisions`, each source's first resolved part, from
+  the whole review even while the changes-since view is shown) only when the reviewer marks it
+  complete (`shift+m`, `complete_pass`, or the publish menu) or publishes (7.6). Leaving a review
+  no longer records one, so a review never marked complete has no baseline and offers nothing.
+* **Detection.** On the first open of a durable review, every source whose current head commit
+  differs from the recorded `reviewed_head_oid` is compared with `review.revisions.compare`. A
+  toast summarizes the result (`N new commits since your last review`, `rebased since your last
+  review`) and names the key of the changes-since view.
+* **Changes since last review** (`shift+l`, `since_last_review`, a toggle): fast-forwarded
+  sources are replaced by `CommitRange { old head, new head, two-dot }` with the same source id
+  (so annotations keep their source), rebased sources stay whole, and unchanged sources are left
+  out; toggling again reopens the whole review. The view reopens like a refresh (expansions,
+  cursor, and top item carried by key). Comments made in it anchor to the new head's lines, which
+  are the same in the whole review; old-side line numbers there refer to the old head. Viewed
+  marks recorded in the view carry the delta's old blob and so do not match the whole review's
+  files (by design: the whole file was not viewed).
+* **Rebased sources.** When both reviewed commits are known and the old head still exists, the
+  patch ids of the source's files in the reviewed diff (`reviewed base..reviewed head`) and the
+  current diff are compared in chunks of 500 paths. Files whose patch is unchanged are marked
+  viewed with their current blob identity and patch id (5.4), and the document marks them
+  `carried_over`: the file header shows the path muted with `unchanged since last review`. The
+  set is kept across reopens of the same surface.
 
 ### 7.5 CLI
 
@@ -978,6 +1210,100 @@ which can be saved:
 * existing: `unstaged`, `staged`, `all`, `last-commit`, `range`, `repo`, `publish-github`
 * new: `branch [BASE]`, `compare BASE HEAD`, `commit REV...`, `pr NUMBER|URL`,
   `stack [NUMBER|URL]`, `resume [ID]`
+
+**Implementation (phase 5).** `plugins/code-review-plugin/src/cli.rs` passes an `entry` option
+(7.1) to the `code-review-v2` surface with `--ui v2` (or `BCODE_REVIEW_UI=v2`): `bcode review`
+opens home; the existing subcommands and `branch` (`CurrentBranch`), `compare` (`BranchCompare`,
+`--two-dot` available), and `commit` (`Commit`, or `Commits` for several) open transient reviews;
+`pr`, `stack`, and `resume` resolve first (7.1). With V1 the new subcommands fail with a message
+that they need `--ui v2`; V1 routing of the existing subcommands and home is unchanged until
+phase 7.
+
+* **Saving transient reviews.** `ctrl+s` (`save_review`, review scope, shown in the hints while
+  the review is transient) creates a durable workspace with the same title and sources, copies
+  its viewed marks, presentation state, and reviewed revisions, and moves its drafts (saved in the
+  new scope with their kind, severity, and resolution, then deleted from the transient scope).
+  Since phase 6 part 2 its AI exchanges and suggestions move too: their ids are unique across
+  scopes (a save of an existing id updates it where it is), so each is deleted from the
+  transient scope and then saved in the new one, and saved back when that fails
+  (`review.suggestion.delete` is additive for this).
+* **Transient persistence (decision, phase 6 part 2).** A transient review is not listed on
+  home and keeps no presentation state; its annotations live in the shared transient scope
+  (`transient-review-workspace` plus the first source's target), as V1's direct reviews did, so
+  reopening the same target shows them again. Leaving a transient review that has drafts, AI
+  questions, or suggestions offers saving once: the first exit shows "this review is not saved:
+  ctrl+s saves it with its comments; exit again to leave without saving" (any other key
+  cancels the offer), and saving makes it a durable review on home. Without annotations, exit
+  leaves at once.
+* **Reviewed revisions.** Each source's resolved commit sides (`reviewed_revisions`, the first
+  part of a multi-part source) are recorded when the pass is marked complete or published (7.4)
+  and saved with the workspace; home compares them with the current heads (7.2).
+
+### 7.6 Publishing and import
+
+**Implementation (phase 6).** `src/v2/publish.rs` (renderer-neutral planning),
+`src/v2/tui/publish.rs`, `src/v2/tui/import.rs`, `src/v2/tui/options_form.rs`,
+`src/v2/tui/modal.rs`, and `src/v2/tui/surface/flows.rs`:
+
+* **Publish flow** (`shift+p`, `publish`, the palette, or the header's split button; V1's `x`
+  expands context in V2). A modal over a BMUX `picker_frame`:
+  1. *Checklist* (a BMUX `menu`): readiness (complete or incomplete), viewed files with the first
+     three unviewed paths, open, resolved, and draft counts with the first three open threads,
+     then every persisted thread with an include toggle (`space`; resolved and already published
+     threads are labeled). `enter` continues.
+  2. *Publisher*: built-in publishers (`review.publishers.list`) and every external publisher
+     discovered over `bcode.review_publisher/v1` (manifest per plugin), with capability labels. A
+     publisher whose `pull_request_provider` is the provider of one of the review's pull-request
+     sources is preselected, else `markdown_file`.
+  3. *Options*: the schema as BMUX `form`/`form_field` (`options_form.rs`): strings are text
+     inputs (every key types, fixing V1's `j`/`k` defect), enums and booleans cycle with
+     `←`/`→`/`space`, required fields block `enter`. When the publisher publishes the review's
+     pull requests, the targets are listed from the sources (`Publishes to owner/repo#101, …`);
+     nothing provider-specific is asked or prefilled by key name.
+  4. *Preview*: a scrollable BMUX `text_view` with every bundle's preview (a heading per pull
+     request when there are several). `enter` asks for confirmation; `enter` again submits.
+  5. *Submit*: bundles are submitted one at a time; each success saves a publish record
+     (`review.publish.record.save`, durable reviews) with the bundle's persisted thread anchors.
+     A failure returns to the preview with the error; retrying skips the bundles already
+     published. Success records the pass (7.4), reloads the records (threads show `published`),
+     and toasts each provider message.
+* **Routing** (`src/v2/publish.rs`). For a publisher of the sources' provider: a pull-request or
+  stack-layer source publishes its threads to its own pull request (layer mode: the layer's own
+  diff); a whole-stack source maps each line comment with `review.stack.attribution` (fetched per
+  anchored file when publishing) to the layer that introduced or removed its lines and re-anchors
+  it at the line's number in that layer's own diff (`layer_line`), reading its selected lines from
+  that diff; a range across layers narrows to its last line's layer; a comment no layer accounts
+  for (a context line, or a file without attribution) and file-level comments go to the top pull
+  request's summary (`summary_only`). Review-level comments go to the top pull request of a whole
+  stack, else to the last pull-request source. Other sources, and every thread for other
+  publishers, form one bundle for the publisher's default target. Bundles are ordered bottom of
+  the stack first.
+* **Bundles** are built by the client (V2 never materializes the review): files from the
+  document's index entries, threads with their selected lines and hunk context from
+  `review.file.hunks.get` of the target diff (lines outside every hunk select nothing, and the
+  publisher's unmapped fallback applies, 5.2), the target as a two-dot commit range when the diff
+  is commit to commit, and `review_id` `review-workspace-<id>` as in V1. Built-in publishers are
+  called with `review.publish.bundle.preview/submit`; external ones with
+  `ExternalPublishReviewRequest`. Additive, provider-neutral contract fields: publisher manifest
+  `pull_request_provider`, `ReviewBundle::pull_request` (`ReviewPullRequestTarget { provider,
+  repository, number }`), `ReviewBundleThread::summary_only`, and
+  `ExternalReviewImportRequest::pull_request`. The GitHub plugin declares `github`, uses the
+  target when its options name no repository or pull request (options always win, and a target
+  of another provider is ignored), and summarizes `summary_only` threads.
+* **Import** (`shift+i`, `import`, or the publish menu; V1's `X` reveals a whole file in V2).
+  Importers are discovered over `bcode.review_importer/v1`; one is picked from a BMUX `menu`, its
+  options come from the same form, and `enter` imports. The request carries the review's files
+  with their hunks (at most 500 files and 200,000 diff lines) and, when the review is one pull
+  request or stack layer, that pull request; mapped anchors without a source get that source.
+  The importer id must match its manifest. The snapshot replaces the previous one from the same
+  importer (`review.external_import.save`, durable reviews; in memory for transient ones) and is
+  listed again with the annotations on open.
+* **Imported threads** are read-only thread items: mapped threads at their anchor (outdated
+  placement rules apply), unmappable ones at the review level. Their header shows `imported`, the
+  provider, the comment count, the remote state, and `approximate` or `not in this review`
+  mappings with the provider's message; comments show their authors; there are no actions, and
+  reply, edit, delete, resolve, kind, and severity are refused with a status message. The threads
+  panel lists them with an `imported` badge. (V1 showed them only in its sidebar.)
 
 ## 8. BMUX usage and upstream work
 
@@ -1053,6 +1379,12 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
     additive operation `thread.classify` (`ClassifyThreadRequest`) sets a thread's kind and
     severity, creating the thread like `thread.resolve` does.
   * Migration `020_thread_blob_oid_column` adds the nullable `draft_threads.blob_oid` (5.3).
+  * `ReviewV2PresentationState::layer_positions` (source id → `ReviewItemKey`, omitted when
+    empty) keeps the last position in each stack layer (7.3); no migration is needed (it is part
+    of `presentation_v2_json`).
+  * Phase 6 part 2 adds `collapsed_threads` and `expanded_answers` (sets, omitted when empty),
+    `hide_resolved_threads`, and `hide_viewed_files` (omitted when false) to the same JSON; no
+    migration is needed, and older states read with everything expanded and shown.
 * Unknown future source kinds are preserved and surfaced as unsupported, not guessed: they
   deserialize as `ReviewSourceKind::Unsupported { kind, raw }`, serialize back verbatim, and
   resolve to an `unsupported_source_kind` diagnostic. V1 reports the new and unknown kinds as an
@@ -2064,3 +2396,440 @@ All of `code-review-build` is (replaced: wizard plus source editing; see INV-SRC
   `review.consensus.validate`, and the adversarial review contracts. `lib.rs:101`–`lib.rs:109`,
   `models:1589`+
   * Out of scope for V1 parity; V2 must not delete them without their owner's decision.
+
+## Appendix B. V2 parity status
+
+Status of every Appendix A item after phase 6. **Done**: V2 has the behavior (where the item
+names it, with the same keys or the keys given). **Replaced by X**: the spec supersedes the V1
+behavior and X covers its purpose. **Dropped**: V2 deliberately does not reproduce it, with the
+reason. V1 defects and unreachable bindings are dropped by the rule of Appendix A. Keys are V2
+defaults (every action is in the manifest keymap, the palette, and help; 6.2 "Key bindings").
+Behavioral coverage is in `src/v2/tui/tests/` (`parity.rs` for the phase 6 part 2 items).
+
+### B.1 Entry points and CLI
+
+| ID | Status |
+| --- | --- |
+| INV-ENT-01 | Done: `bcode review` opens the home route (7.1, 7.5). |
+| INV-ENT-02 | Done: `unstaged` opens a transient review (7.5). |
+| INV-ENT-03 | Done: `staged`. |
+| INV-ENT-04 | Done: `all`. |
+| INV-ENT-05 | Done: `last-commit`. |
+| INV-ENT-06 | Done: `range BASE HEAD [--two-dot]`; also `compare` and `commit`. |
+| INV-ENT-07 | Done: `repo` opens a browse source (5.1). |
+| INV-ENT-08 | Done: `publish-github` is a UI-independent CLI command over `review.bundle.get`; unchanged. |
+| INV-ENT-09 | Done: unchanged (same command). |
+| INV-ENT-10 | Replaced by transient reviews that can be saved (`ctrl+s`) and the new entry points (7.5). |
+| INV-ENT-11 | Replaced by internal routes: leaving a review returns to home (7.1). |
+| INV-ENT-12 | Replaced by route changes without runtime reloads (7.1, 11.C). |
+| INV-ENT-13 | Done: entries that fail show the opening route's error with a way back (7.1). |
+| INV-ENT-14 | Replaced by `q`/`esc` to leave (after saves finish; `esc` first clears a selection or search; an unsaved review with annotations offers saving, 7.5). `ctrl+d` is the half-page motion. Leaving is safe: everything is saved and home is one key from the review. |
+| INV-ENT-15 | Done: the plugin's `diff.toggle` palette command is unchanged. |
+| INV-ENT-16 | Replaced by the single `code-review-v2` surface with routes (7.1). |
+| INV-ENT-17 | Done: unchanged disableability features. |
+
+### B.2 Home
+
+| ID | Status |
+| --- | --- |
+| INV-HOME-01 | Replaced by group headings and per-group counts in the header, and the filter input (7.2). |
+| INV-HOME-02 | Replaced by repository-state suggestions and the wizard (7.2, 7.3). |
+| INV-HOME-03 | Replaced by the wizard's step 3 (title and sources). |
+| INV-HOME-04 | Replaced by the BMUX table (7.2). |
+| INV-HOME-05 | Replaced by groups; the label mapping is in 7.2. |
+| INV-HOME-06 | Replaced by the *Needs attention* group (7.2). Threads alone no longer mean attention; open threads are a review's own state, shown in the notes column. |
+| INV-HOME-07 | Replaced by the preview pane, which explains a group and shows what changed (new commits, drafts since publish). |
+| INV-HOME-08 | Replaced by the preview pane (`d`). |
+| INV-HOME-09 | Done: both empty states. |
+| INV-HOME-10 | Done: `enter` opens; an archived review refuses with a pointer to restore. A review without included sources opens with a diagnostic, and `edit_sources` fixes it. |
+| INV-HOME-11 | Done: `c`. |
+| INV-HOME-12 | Replaced: Build mode is gone; sources are edited with `edit_sources` (7.3). |
+| INV-HOME-13 | Done: `r` rename, empty titles refused, `esc` cancels. |
+| INV-HOME-14 | Done: `x` archive. |
+| INV-HOME-15 | Done: `shift+r` restore. |
+| INV-HOME-16 | Replaced by the archived group, folded by default. |
+| INV-HOME-17 | Replaced by groups: reviews of one state are adjacent under one heading, and headings fold. |
+| INV-HOME-18 | Done: `g`/`G`, `j`/`k`, arrows, pages. |
+| INV-HOME-19 | Done: `tab` moves between suggestions and reviews. |
+| INV-HOME-20 | Done: one change at a time, failures as toasts. |
+| INV-HOME-21 | Done: selection follows the review identity. |
+| INV-HOME-22 | Done: footer hints from the keymap and input prompts. |
+| INV-HOME-23 | Replaced by the shared `ReviewTheme` (6.3). |
+
+### B.3 Workspace and sources
+
+| ID | Status |
+| --- | --- |
+| INV-SRC-01 | Replaced by the wizard and `edit_sources` (7.3), which closes the open question. |
+| INV-SRC-02 | Done: every kind resolves (4.1); unknown kinds are preserved (9). |
+| INV-SRC-03 | Replaced by the wizard's working-tree step and home suggestions. |
+| INV-SRC-04 | Replaced by wizard step 1 (seven source types). |
+| INV-SRC-05 | Replaced by the wizard's paged, searchable commit log, and `bcode review commit REV`. |
+| INV-SRC-06 | Replaced by commit ranges in the wizard (`shift+tab`), typed revisions in compare, and `range`. |
+| INV-SRC-07 | Done: compare branches (base, then head; typed revisions). |
+| INV-SRC-08 | Done: wizard file search; a source already chosen is not added twice. |
+| INV-SRC-09 | Done: `:START-END` in the file step. |
+| INV-SRC-10 | Replaced by removing and re-adding a source in `edit_sources`. |
+| INV-SRC-11 | Replaced by `tab` (include or exclude) per source in `edit_sources`; reviews have few sources, so bulk inclusion keys are not kept. |
+| INV-SRC-12 | Replaced: sources resolve lazily, an empty source adds no files, and `edit_sources` removes it. |
+| INV-SRC-13 | Replaced by the failing-sources toast with each diagnostic, and `edit_sources`. |
+| INV-SRC-14 | Replaced by re-adding the source (compare uses merge-base semantics) or `range`/`compare --two-dot`. |
+| INV-SRC-15 | Replaced by removal in `edit_sources`. |
+| INV-SRC-16 | Done for renaming the review (home `r`, or the title in `edit_sources`); renaming and reordering sources were unreachable in V1 and are dropped. |
+| INV-SRC-17 | Replaced by source headers in the document and per-source groups in the file panel. |
+| INV-SRC-18 | Done: `r`/`ctrl+r` refresh (token-based, 4.2); saves are automatic. |
+| INV-SRC-19 | Replaced by `edit_sources` and the header's source chips. |
+| INV-SRC-20 | Done: per-source diagnostics with codes and messages; one failure never fails the others (4.1). |
+| INV-SRC-21 | Done: source headers (5.1). |
+| INV-SRC-22 | Done: same workspace fields, plus additive V2 state (9). |
+| INV-SRC-23 | Done: browse sources read whole files at the working tree, bounded (4.1, 4.2). |
+
+### B.4 Navigation
+
+| ID | Status |
+| --- | --- |
+| INV-NAV-01 | Replaced by one continuous document (5.1). |
+| INV-NAV-02 | Done: `j`/`k`/arrows by item; in a focused panel they move its selection. |
+| INV-NAV-03 | Done: `g`/`G`. |
+| INV-NAV-04 | Done: `n`/`p`; `n` steps search matches while a search is active. |
+| INV-NAV-05 | Replaced by `}`/`{` (hunks); `J`/`K` are free for V2. |
+| INV-NAV-06 | Replaced by `u`/`shift+u`. |
+| INV-NAV-07 | Done: `attention_next`. |
+| INV-NAV-08 | Replaced by `)`/`(` over every thread (drafts are threads). |
+| INV-NAV-09 | Replaced by `)`/`(`. |
+| INV-NAV-10 | Replaced by `open_thread_next`/`open_thread_previous` across the review. |
+| INV-NAV-11 | Done: `open_thread_next`/`open_thread_previous`. |
+| INV-NAV-12 | Done: `ai_thread_next`, and `ai_thread_previous` (unreachable in V1). |
+| INV-NAV-13 | Replaced by "Go to line N" in the palette, with source line numbers (6.2). |
+| INV-NAV-14 | Replaced by `shift+v` (keyboard range); `v` marks viewed. |
+| INV-NAV-15 | Done: `esc` clears a selection, then a search; folded threads expand with `shift+z`. |
+| INV-NAV-16 | Done: `enter` (`activate`): a thread's or answer's action menu, a gap's reveal; panels have their own `enter`. |
+| INV-NAV-17 | Done: selecting a threads-panel row jumps to the thread (loading its file first). |
+| INV-NAV-18 | Replaced by the styled header (6.1). |
+| INV-NAV-19 | Done: footer status and contextual key hints. |
+| INV-NAV-20 | Replaced by criterion B (2.1 measurements). |
+| INV-NAV-21 | Dropped (V1 defect): V2 handles pages, half pages, home, and end. |
+
+### B.5 File tree and panels
+
+| ID | Status |
+| --- | --- |
+| INV-TREE-01 | Replaced by the file panel and the threads panel (6.1). |
+| INV-TREE-02 | Replaced by `t` (show or hide), `<`/`>` (width), and width-based degradation (6.1). |
+| INV-TREE-03 | Replaced by rich tree rows (6.1). |
+| INV-TREE-04 | Done: arrows and `j`/`k` move; `right`/`left` expand/collapse; `enter` opens (scope `code-review-v2-files`). |
+| INV-TREE-05 | Done: clicks and wheel. |
+| INV-TREE-06 | Done: the tree follows the cursor's file; sources are separate groups. |
+| INV-TREE-07 | Replaced by header chips and `edit_sources`. |
+| INV-TREE-08 | Replaced by `edit_sources` and source diagnostics. |
+| INV-TREE-09 | Replaced by the header (viewed progress, totals, drafts), the threads panel filters, and the home preview. |
+| INV-TREE-10 | Replaced by the threads panel (status, severity, location, first line, imported and AI rows) with filters all, open, needs attention, general, and resolved; thread headers carry published, imported, and outdated badges. |
+| INV-TREE-11 | Replaced by the general and needs-attention filters (`!` changes severity in V2). |
+| INV-TREE-12 | Replaced by inline thread and answer rows with clickable actions, and the `enter` menu. |
+| INV-TREE-13 | Replaced by the threads panel's `left`/`right` filters. |
+| INV-TREE-14 | Replaced by `shift+f` and `shift+c` (and the palette). |
+| INV-TREE-15 | Replaced by `tab` focusing panes and the palette for every action. |
+| INV-TREE-16 | Done: `h` hides viewed files from the file panel. |
+
+### B.6 Context expansion
+
+| ID | Status |
+| --- | --- |
+| INV-CTX-01 | Done: gaps above, between, and after hunks (5.2). |
+| INV-CTX-02 | Replaced by interval-set expansion: `e`/`shift+e` with counts, `x`, `shift+x`, gap clicks, `enter` (5.2). |
+| INV-CTX-03 | Done: loading and unavailable states. |
+| INV-CTX-04 | Done: keyed list positions keep the viewport. |
+| INV-CTX-05 | Dropped (V1 defect): revision-correct reads, both line numbers, anchorable expanded lines. |
+
+### B.7 Comments and threads
+
+| ID | Status |
+| --- | --- |
+| INV-CMT-01 | Done: `c` (line or range), `shift+f`, `shift+c`; hunk headers are not commentable. |
+| INV-CMT-02 | Done: the same anchor model plus `head_oid` and `blob_oid` (5.3). |
+| INV-CMT-03 | Done: inline composer with titles per mode and `ctrl+p` preview. |
+| INV-CMT-04 | Done: Save draft, Ask Bcode (switch), preview, cancel buttons; publishing is `shift+p` after saving. |
+| INV-CMT-05 | Done: `enter`/`ctrl+s` submit, `esc` cancels, empty text discarded, paste; `shift+enter` adds a line (V1 defect fixed). |
+| INV-CMT-06 | Done: host completion through `FocusedTextFieldAdapter` (6.2). |
+| INV-CMT-07 | Replaced by saving the comment, then `shift+p`; the checklist shows readiness instead of a second press. |
+| INV-CMT-08 | Done: optimistic, serialized, reconciled by job (6.2). |
+| INV-CMT-09 | Done: `i` edits the thread's latest comment; unsaved comments are refused. |
+| INV-CMT-10 | Done: `shift+d`, optimistic with rollback. |
+| INV-CMT-11 | Done: `shift+r` resolves or reopens. |
+| INV-CMT-12 | Done: `shift+h` hides or shows resolved threads (persisted). |
+| INV-CMT-13 | Done: inline rows; header clicks and `z` fold a thread; `shift+z` collapses or expands every thread (persisted). |
+| INV-CMT-14 | Done: thread actions Reply, Edit, Delete, Resolve or Reopen, Ask Bcode; answer actions Open session, Follow up, More/Less, Copy, Suggest comment, Draft, Retry, Delete; suggestion actions Accept, Refine, Reject. Per-thread publish is replaced by the checklist's include toggles. |
+| INV-CMT-15 | Done: kinds and severities persist and can be changed (`shift+k`, `!`, composer `alt+k`/`alt+s`). |
+| INV-CMT-16 | Replaced by the hover `+` and cursor/range styling (6.2, 6.3). |
+| INV-CMT-17 | Done: V1's scope derivation (`NoteScope`). |
+| INV-CMT-18 | Done: reloaded on open; outdated anchors are labeled (5.3). |
+
+### B.8 AI questions and sessions
+
+| ID | Status |
+| --- | --- |
+| INV-AI-01 | Done: `a`, or Ask Bcode on a thread. |
+| INV-AI-02 | Done: `shift+a` menu with the five commands (digits are count prefixes in V2). |
+| INV-AI-03 | Done: first questions create and link a session; later questions on the anchor are follow-ups in it. |
+| INV-AI-04 | Done: bounded prompt with review, repository, sources, file, ranges, up to 80 lines, up to 12 other threads, the question, and the service operations. Line kinds are the diff markers; nearby hunk context and the draft being edited are reachable through `review.context.get` and `review.thread.get`, which the prompt names. |
+| INV-AI-05 | Done: persisted exchanges; a failed save is not retried into a second session. |
+| INV-AI-06 | Replaced by live status and the answer preview; tool calls and activity are in the linked session (`o`). |
+| INV-AI-07 | Done: `subscribe_session_view`. |
+| INV-AI-08 | Done: Retry button and `retry`. |
+| INV-AI-09 | Done: `z`/More shows the whole answer (persisted); reachable by key now. |
+| INV-AI-10 | Done: `shift+d` on an answer. |
+| INV-AI-11 | Done: `o`; the position is restored on return. |
+| INV-AI-12 | Done: `m` (`draft_answer`), deduplicated. |
+
+### B.9 Suggestions
+
+| ID | Status |
+| --- | --- |
+| INV-SUG-01 | Done: `s` (`suggest_comment`), duplicates refused. |
+| INV-SUG-02 | Done: `;` accepts into a draft. |
+| INV-SUG-03 | Done: `refine_suggestion` (button, menu, palette). |
+| INV-SUG-04 | Done: `reject_suggestion`. |
+| INV-SUG-05 | Done: persisted states shown inline on answers and threads. |
+
+### B.10 Publish
+
+| ID | Status |
+| --- | --- |
+| INV-PUB-01 | Replaced by `shift+p` (`x` reveals context in V2); readiness is shown in the checklist rather than by a second press. |
+| INV-PUB-02 | Done: checklist with readiness, viewed, first unviewed paths and open threads, and per-thread include toggles; jumping from it is replaced by closing it and `u`/`open_thread_next`. |
+| INV-PUB-03 | Done: publisher picker with capability labels; the provider's publisher is preselected for pull-request reviews, else `markdown_file`. |
+| INV-PUB-04 | Done: built-in publishers through `review.publish.bundle.*`. |
+| INV-PUB-05 | Done: external publishers, deselected threads excluded. |
+| INV-PUB-06 | Done: schema form; `j`/`k` type into values (V1 defect fixed). |
+| INV-PUB-07 | Done: scrollable preview, confirm, retry after a failure. |
+| INV-PUB-08 | Done: published threads are marked; the pass is recorded. |
+| INV-PUB-09 | Done: records saved and reloaded; home shows the last publish. |
+| INV-PUB-10 | Done: GitHub publisher unchanged; it also takes the review's pull request target (7.6). |
+| INV-PUB-11 | Done: unchanged mapping; `summary_only` threads go to the summary. |
+| INV-PUB-12 | Done: unchanged preview. |
+
+### B.11 External import
+
+| ID | Status |
+| --- | --- |
+| INV-IMP-01 | Replaced by `shift+i` (`X` reveals a whole file in V2). |
+| INV-IMP-02 | Done: the shared options form. |
+| INV-IMP-03 | Done: importer id validated, snapshot replaced and reloaded. |
+| INV-IMP-04 | Replaced by inline read-only threads plus threads-panel rows (7.6). |
+| INV-IMP-05 | Done: GitHub importer unchanged. |
+
+### B.12 Report
+
+| ID | Status |
+| --- | --- |
+| INV-RPT-01 | Done: `local_markdown` in the publish flow. |
+| INV-RPT-02 | Done: `markdown_file` and `json_file`. |
+| INV-RPT-03 | Done: `copy_report` copies the Markdown report (6.2). |
+| INV-RPT-04 | Done: `review.bundle.get` is still served (CLI, V1); V2 builds bundles itself (7.6). |
+
+### B.13 Viewed files
+
+| ID | Status |
+| --- | --- |
+| INV-VIEW-01 | Replaced by `v` (mark viewed and advance) with identity-keyed marks (5.4). |
+| INV-VIEW-02 | Done: `view_all`, `unview_all`. |
+| INV-VIEW-03 | Replaced by the header progress bar, checklist, home table, and preview. |
+| INV-VIEW-04 | Done: `v` always advances to the next unviewed file. |
+
+### B.14 Presentation state
+
+| ID | Status |
+| --- | --- |
+| INV-PRES-01 | Done: `presentation_v2` keeps the scroll anchor, layout, panels, expansions, layer positions, collapsed threads, expanded answers, and the resolved and viewed-file filters (9). The selected thread is the scroll anchor; the threads-panel filter is per session. |
+| INV-PRES-02 | Done: disposable, version-checked state; stale keys resolve best-effort (9). |
+| INV-PRES-03 | Done: the return position is kept in memory. |
+
+### B.15 Search and filters
+
+| ID | Status |
+| --- | --- |
+| INV-SRCH-01 | Replaced by the file panel filter (`f`); `ctrl+p` is the palette. |
+| INV-SRCH-02 | Replaced by `/` over the whole review, `n`/`shift+n`. |
+| INV-SRCH-03 | Replaced by the threads panel filters (`left`/`right`). |
+| INV-SRCH-04 | Replaced by home `/`. |
+| INV-SRCH-05 | Replaced by home groups (drafts and attention are groups). |
+| INV-SRCH-06 | Dropped (V1 defect): picker queries take every character. |
+
+### B.16 Keymap actions
+
+Home (`code-review-v2-home`):
+
+| ID | Status |
+| --- | --- |
+| INV-KEY-H01 | Done: `/`. |
+| INV-KEY-H02 | Done: `r`. |
+| INV-KEY-H03 | Done: `j`/`k`/arrows. |
+| INV-KEY-H04 | Done: `d` (preview). |
+| INV-KEY-H05 | Replaced by groups (INV-SRCH-05). |
+| INV-KEY-H06 | Replaced by the *Needs attention* group. |
+| INV-KEY-H07 | Done: `?`. |
+| INV-KEY-H08 | Done: `enter`. |
+| INV-KEY-H09 | Done: `c`. |
+| INV-KEY-H10 | Replaced: `enter` always opens the review (no Build mode). |
+| INV-KEY-H11 | Replaced by `edit_sources` inside the review. |
+| INV-KEY-H12 | Done: `x`. |
+| INV-KEY-H13 | Replaced by `n` (wizard). |
+| INV-KEY-H14 | Replaced by suggestions `1`–`9` and the wizard. |
+| INV-KEY-H15 | Replaced by groups (INV-HOME-17). |
+| INV-KEY-H16 | Replaced by groups. |
+| INV-KEY-H17 | Replaced by groups. |
+| INV-KEY-H18 | Replaced by groups. |
+| INV-KEY-H19 | Replaced by the archived group. |
+| INV-KEY-H20 | Done: `g`/`G`. |
+| INV-KEY-H21 | Done: `shift+r`. |
+| INV-KEY-H22 | Replaced by `q` (Bcode surfaces close with `q`). |
+| INV-KEY-H23 | Done: the filter and rename inputs use the shared BMUX text-input policy. |
+| INV-KEY-H24 | Done: `esc` closes help and prompts; `tab` switches suggestions and reviews. |
+
+Review (`code-review-v2`; V1 `code-review`):
+
+| ID | Status |
+| --- | --- |
+| INV-KEY-R01 | Replaced by `t` (file panel). |
+| INV-KEY-R02 | Replaced by `edit_sources`. |
+| INV-KEY-R03 | Replaced by `edit_sources`. |
+| INV-KEY-R04 | Replaced by `t` and `shift+t` (panels). |
+| INV-KEY-R05 | Replaced by `f` (file filter). |
+| INV-KEY-R06 | Replaced by `edit_sources`. |
+| INV-KEY-R07 | Replaced by `edit_sources`. |
+| INV-KEY-R08 | Done: `j`/`k`/arrows. |
+| INV-KEY-R09 | Done: `g`/`G`. |
+| INV-KEY-R10 | Done: `?`. |
+| INV-KEY-R11 | Done: `attention_next`. |
+| INV-KEY-R12 | Replaced by the palette's go-to-line. |
+| INV-KEY-R13 | Done: `/` (whole review). |
+| INV-KEY-R14 | Done: `shift+n`. |
+| INV-KEY-R15 | Done: `n`. |
+| INV-KEY-R16 | Done: `p`. |
+| INV-KEY-R17 | Replaced by `)`/`(`. |
+| INV-KEY-R18 | Replaced by `}`/`{`. |
+| INV-KEY-R19 | Done: `shift+f`. |
+| INV-KEY-R20 | Replaced by `shift+d` on an answer. |
+| INV-KEY-R21 | Replaced by `shift+i`. |
+| INV-KEY-R22 | Done: `shift+y`. |
+| INV-KEY-R23 | Replaced by `)`/`(`. |
+| INV-KEY-R24 | Replaced by the threads panel's needs-attention filter. |
+| INV-KEY-R25 | Replaced by the threads panel filters. |
+| INV-KEY-R26 | Done: `view_all`, `unview_all`. |
+| INV-KEY-R27 | Replaced by `u`/`shift+u`. |
+| INV-KEY-R28 | Replaced by `v`. |
+| INV-KEY-R29 | Replaced by `open_thread_next`/`open_thread_previous`. |
+| INV-KEY-R30 | Done: `open_thread_next`/`open_thread_previous`. |
+| INV-KEY-R31 | Done: `ai_thread_next`. |
+| INV-KEY-R32 | Done: `shift+h`. |
+| INV-KEY-R33 | Replaced by `shift+r` (`r` refreshes). |
+| INV-KEY-R34 | Done: `h` (file panel). |
+| INV-KEY-R35 | Done: `shift+z` (collapse all, or expand all when all are collapsed) and `z` per thread. |
+| INV-KEY-R36 | Done: `shift+d`. |
+| INV-KEY-R37 | Replaced by `i` (`e` reveals context in V2). |
+| INV-KEY-R38 | Replaced by `shift+v`. |
+| INV-KEY-R39 | Done: `c`. |
+| INV-KEY-R40 | Done: `shift+c`. |
+| INV-KEY-R41 | Replaced by `shift+p`; inline actions run with `enter` or clicks. |
+| INV-KEY-R42 | Done: `a`. |
+| INV-KEY-R43 | Done: `s`. |
+| INV-KEY-R44 | Done: `;`. |
+| INV-KEY-R45 | Replaced by `retry` and the Retry button (`y` copies lines in V2). |
+| INV-KEY-R46 | Done: `o`. |
+| INV-KEY-R47 | Replaced by the `shift+a` menu (digits are count prefixes). |
+| INV-KEY-R48 | Replaced by `q`/`esc` (INV-ENT-14). |
+| INV-KEY-R49 | Done: `enter` activates, `esc` clears, `tab` focuses panes, panel `left`/`right`, and pages, half pages, home, and end all move. |
+| INV-KEY-R50 | Done where V1 hid them: refine, reject, draft answer (`m`), expand answer (`z`), and previous AI thread are reachable actions with honest labels. |
+
+Build mode (`code-review-build`):
+
+| ID | Status |
+| --- | --- |
+| INV-KEY-B01 | Replaced by the review's keys and `edit_sources` (no Build mode). |
+| INV-KEY-B02 | Replaced by the wizard's file step in `edit_sources`. |
+| INV-KEY-B03 | Replaced by "Add another source…" in `edit_sources`. |
+| INV-KEY-B04 | Replaced by the wizard's picker navigation. |
+| INV-KEY-B05 | Replaced by `r`/`ctrl+r` refresh. |
+| INV-KEY-B06 | Replaced by the working-tree step. |
+| INV-KEY-B07 | Replaced by per-source `tab` (INV-SRC-11). |
+| INV-KEY-B08 | Replaced as INV-SRC-12. |
+| INV-KEY-B09 | Replaced as INV-SRC-13. |
+| INV-KEY-B10 | Replaced as INV-SRC-10. |
+| INV-KEY-B11 | Replaced as INV-SRC-14. |
+| INV-KEY-B12 | Replaced as INV-SRC-15. |
+| INV-KEY-B13 | Replaced by `tab` in `edit_sources`. |
+| INV-KEY-B14 | Replaced by home `r` and the title in `edit_sources`. |
+| INV-KEY-B15 | Replaced by source headers and file panel groups. |
+
+Overlays:
+
+| ID | Status |
+| --- | --- |
+| INV-KEY-P01 | Dropped (V1 defect: declared without a handler); wizard and palette inputs submit with `enter`. |
+| INV-KEY-P02 | Done: pickers move with arrows, `enter` submits, `esc` cancels, and every character types. |
+| INV-KEY-C01 | Done: composer `ctrl+s`. |
+| INV-KEY-C02 | Done: composer `ctrl+p`. |
+| INV-KEY-C03 | Done: `enter` submits, `shift+enter` adds a line, buttons are clickable, `esc` cancels, `ctrl+t` switches comment and question. |
+| INV-KEY-I01 | Done: importer menu (arrows, `enter`, `esc`). |
+| INV-KEY-I02 | Done: the shared options form. |
+| INV-KEY-U01 | Replaced: the checklist lists open threads; the threads panel's needs-attention filter replaces the attention sidebar. |
+| INV-KEY-U02 | Replaced by closing the checklist and `u`. |
+| INV-KEY-U03 | Replaced by closing the checklist and `open_thread_next`. |
+| INV-KEY-U04 | Done: arrows in the picker and preview. |
+| INV-KEY-U05 | Done: `p` (or `esc`) returns from the confirmation to the preview. |
+| INV-KEY-U06 | Done: `space` toggles a thread, `enter` advances, `esc` closes. |
+| INV-KEY-U07 | Done: form keys; the checklist jump keys are replaced as U01–U03. |
+| INV-KEY-X01 | Resolved: `v` marks viewed, `shift+v` selects a range. |
+| INV-KEY-X02 | Resolved: `:` is the palette, with go-to-line. |
+| INV-KEY-X03 | Resolved: `ctrl+p` is the palette in the review and the preview in the composer (focus decides). |
+| INV-KEY-X04 | Resolved: `w` is free; `shift+w` toggles wrapping. |
+
+### B.17 Mouse
+
+| ID | Status |
+| --- | --- |
+| INV-MOUSE-01 | Replaced by keyed wheel motion and per-pane wheel scrolling. |
+| INV-MOUSE-02 | Replaced by stack-rail tabs, the publish split button, and `shift+f`/`shift+c`. |
+| INV-MOUSE-03 | Done: inline thread and answer buttons. |
+| INV-MOUSE-04 | Done: composer buttons. |
+| INV-MOUSE-05 | Done: threads panel rows. |
+| INV-MOUSE-06 | Done: tree rows. |
+| INV-MOUSE-07 | Done: press-and-drag selects a range and opens a range composer (6.2). |
+| INV-MOUSE-08 | Done: gap halves reveal, thread headers fold, inline actions run, expanded context is commentable. |
+| INV-MOUSE-09 | Done: home clicks. |
+| INV-MOUSE-10 | Done: hit regions only for painted content; overlays and modals isolate the background. |
+| INV-MOUSE-11 | Dropped (V1 unreachable code). |
+
+### B.18 Clipboard
+
+| ID | Status |
+| --- | --- |
+| INV-CLIP-01 | Done: `shift+y` and the Copy button, with V1's status messages. |
+| INV-CLIP-02 | Done: paste into the composer, inputs, and forms; `y` copies selected lines. |
+
+### B.19 Help
+
+| ID | Status |
+| --- | --- |
+| INV-HELP-01 | Replaced by complete, scrollable help generated from the keymap (review, composer, file panel, threads panel). |
+| INV-HELP-02 | Done: home help. |
+| INV-HELP-03 | Done: modal footers carry their keys. |
+| INV-HELP-04 | Replaced by status messages for refused actions, key hints, and toasts. |
+
+### B.20 Display
+
+| ID | Status |
+| --- | --- |
+| INV-DISP-01 | Replaced by whole-blob highlighting and unified/side-by-side layouts (6.1, 6.4). |
+| INV-DISP-02 | Done: markdown comments and answers. |
+| INV-DISP-03 | Replaced by `ReviewTheme` (6.3). |
+| INV-DISP-04 | Done: empty states for the document, the threads panel, and home. |
+
+### B.21 Service contracts
+
+| ID | Status |
+| --- | --- |
+| INV-DATA-01 | Done: every operation is still served; V2 adds operations additively (4.2), including `review.suggestion.delete`. |
+| INV-DATA-02 | Done: unchanged; additive pull-request fields (7.6). |
+| INV-DATA-03 | Done: unchanged. |
+| INV-DATA-04 | Done: left in place, not dispatched, for their owner's decision. |

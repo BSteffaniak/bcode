@@ -124,7 +124,7 @@ fn select_file(files: Vec<DiffFile>, path: &str) -> Option<DiffFile> {
 /// SHA-256 over the changed lines in order (marker plus raw text, no line numbers, no context)
 /// and any mode change. Rebasing a patch onto a different base keeps this identity as long as
 /// its changed lines are the same.
-fn patch_id(file: Option<&DiffFile>, hunks: &[DiffHunk]) -> String {
+pub(super) fn patch_id(file: Option<&DiffFile>, hunks: &[DiffHunk]) -> String {
     let mut hasher = Sha256::new();
     if let Some(file) = file
         && let (Some(old), Some(new)) = (&file.old_mode, &file.new_mode)
