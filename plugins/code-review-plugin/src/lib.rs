@@ -18,6 +18,7 @@ mod keybindings;
 pub mod terminal_events;
 pub mod tui;
 pub mod tui_host_types;
+mod v2;
 
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,

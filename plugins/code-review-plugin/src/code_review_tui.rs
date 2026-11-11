@@ -254,6 +254,38 @@ impl CodeReviewSurface {
         self.app.take_session_to_open()
     }
 
+    /// Build a surface around an already constructed app without contacting the daemon.
+    #[cfg(test)]
+    pub(crate) fn from_app(
+        repo_path: PathBuf,
+        review_target: ReviewOpenTarget,
+        app: ReviewApp,
+    ) -> Self {
+        let mut surface = Self {
+            client: BcodeClient::default_endpoint(),
+            repo_path,
+            review_target,
+            app,
+            theme: None,
+            file_store: AsyncValueStore::new(),
+            agent_streams: ReviewAgentStreamStore::default(),
+        };
+        surface.app.queue_selected_file_load();
+        surface
+    }
+
+    /// Borrow the review app state.
+    #[cfg(test)]
+    pub(crate) const fn app(&self) -> &ReviewApp {
+        &self.app
+    }
+
+    /// Mutably borrow the review app state.
+    #[cfg(test)]
+    pub(crate) const fn app_mut(&mut self) -> &mut ReviewApp {
+        &mut self.app
+    }
+
     fn ensure_selected_repository_file_load(&mut self, host: &dyn PluginTuiHost) -> bool {
         ensure_selected_repository_file_load(
             host,
@@ -1794,6 +1826,13 @@ async fn load_workspace_review(
     }
     let response: MaterializeReviewWorkspaceResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(review_summary_from_materialization(response))
+}
+
+/// Convert a materialized workspace response into the summary displayed by the V1 TUI.
+pub(crate) fn review_summary_from_materialization(
+    response: MaterializeReviewWorkspaceResponse,
+) -> ReviewSummary {
     let materialization = response.materialization;
     let mut files = Vec::new();
     let mut surfaces = Vec::new();
@@ -1803,26 +1842,7 @@ async fn load_workspace_review(
             surfaces.push(surface);
         }
     }
-    let diagnostics = materialization.diagnostics;
-    let repository_files = materialization.repository_files;
-    let repository_branches = materialization.repository_branches;
-    let repository_commits = materialization.repository_commits;
-    if files.is_empty() {
-        return Ok(ReviewSummary {
-            title: materialization.workspace.title.clone(),
-            repo_root: materialization.workspace.repo_root.clone(),
-            files,
-            additions: materialization.additions,
-            deletions: materialization.deletions,
-            workspace: Some(materialization.workspace),
-            surfaces,
-            diagnostics,
-            repository_files,
-            repository_branches,
-            repository_commits,
-        });
-    }
-    Ok(ReviewSummary {
+    ReviewSummary {
         title: materialization.workspace.title.clone(),
         repo_root: materialization.workspace.repo_root.clone(),
         files,
@@ -1830,11 +1850,11 @@ async fn load_workspace_review(
         deletions: materialization.deletions,
         workspace: Some(materialization.workspace),
         surfaces,
-        diagnostics,
-        repository_files,
-        repository_branches,
-        repository_commits,
-    })
+        diagnostics: materialization.diagnostics,
+        repository_files: materialization.repository_files,
+        repository_branches: materialization.repository_branches,
+        repository_commits: materialization.repository_commits,
+    }
 }
 
 async fn load_review(
@@ -13730,7 +13750,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_plugin_theme(red: u8) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+    pub fn test_plugin_theme(red: u8) -> bcode_plugin_sdk::tui::PluginTuiTheme {
         let style = bmux_tui::style::Style::new();
         let syntax_color = bcode_plugin_sdk::tui::PluginTuiSyntaxColor::rgb(red, 34, 56);
         bcode_plugin_sdk::tui::PluginTuiTheme {
