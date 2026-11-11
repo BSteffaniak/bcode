@@ -366,6 +366,7 @@ impl ReviewSurfaceV2 {
             };
             DocAnchor {
                 head_oid: review.doc.head_oid(&file),
+                blob_oid: None,
                 file: Some(file),
                 target: AnchorTarget::File,
             }
@@ -637,6 +638,7 @@ impl ReviewSurfaceV2 {
             file,
             target: crate::v2::document::target_of(anchor),
             head_oid: anchor.head_oid.clone(),
+            blob_oid: anchor.blob_oid.clone(),
         }
     }
 

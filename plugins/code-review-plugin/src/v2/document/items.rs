@@ -327,8 +327,11 @@ pub enum OutdatedReason {
     /// line that is no longer removed).
     LineChanged,
     /// The anchor was made at a different head commit than the one under review, so its line
-    /// numbers may refer to other content.
+    /// numbers may refer to other content (anchors that recorded no blob).
     RevisionChanged,
+    /// The anchored file side's content changed since the anchor was made (its blob differs),
+    /// so its line numbers may refer to other content.
+    ContentChanged,
 }
 
 /// A draft or imported thread.

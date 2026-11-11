@@ -1579,6 +1579,7 @@ impl ReviewDocument {
                 file: Some(item.file.clone()),
                 target: AnchorTarget::File,
                 head_oid: self.head_oid(&item.file),
+                blob_oid: None,
             }),
             item @ (ReviewItem::Line(_) | ReviewItem::LinePair(_)) => {
                 self.range_anchor_between(index, index, item.file()?.clone())
@@ -1652,6 +1653,7 @@ impl ReviewDocument {
         let span = |range: Option<(u32, u32)>| range.is_some_and(|(s, e)| s != e);
         Some(DocAnchor {
             head_oid: self.head_oid(&file),
+            blob_oid: self.blob_oid(&file, end_side),
             file: Some(file),
             target: AnchorTarget::Lines(anchors::AnchorLines {
                 old,
@@ -1661,6 +1663,19 @@ impl ReviewDocument {
                 is_range: lines > 1 || span(old) || span(new),
             }),
         })
+    }
+
+    /// Object id of `file`'s blob on `side`, when that side is a blob object (not working-tree
+    /// content or absent).
+    #[must_use]
+    pub fn blob_oid(&self, file: &FileKey, side: ReviewLineSide) -> Option<String> {
+        let entry = &self.files[*self.file_index.get(file)?].entry;
+        match side {
+            ReviewLineSide::New => &entry.new_blob,
+            ReviewLineSide::Old => &entry.old_blob,
+        }
+        .oid()
+        .map(str::to_owned)
     }
 
     /// Commit the source of `file` resolved its head to, when the head is a commit.

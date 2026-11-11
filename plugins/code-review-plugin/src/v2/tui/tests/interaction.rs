@@ -1112,27 +1112,45 @@ fn presentation_persists_on_exit_and_restores_on_reopen() {
 }
 
 #[test]
-fn anchors_made_at_another_head_are_outdated_not_moved() {
+fn anchors_are_outdated_only_when_their_content_changed() {
+    use crate::v2::document::{AnchorPlacement, OutdatedReason};
     let fixture = fixture();
     let backend = Arc::new(LocalBackend::default());
     let workspace = workspace(&fixture);
     let mut scenario = Scenario::new(build(&backend, &workspace, Duration::ZERO), 100, 40);
     stable(&mut scenario);
-    let index = find(&scenario, 0, added_line);
-    let next = find(&scenario, index + 1, added_line);
+    let mut lines = vec![find(&scenario, 0, added_line)];
+    for _ in 0..3 {
+        let last = *lines.last().unwrap();
+        lines.push(find(&scenario, last + 1, added_line));
+    }
     let doc = scenario.surface().document().unwrap();
     let anchor = |index: usize| -> DraftAnchor {
         doc.anchor_for(&doc.item(index).unwrap().key())
             .unwrap()
             .to_draft_anchor()
     };
-    let mut stale = anchor(index);
-    stale.head_oid = Some("0".repeat(40));
-    let current = anchor(next);
-    assert!(current.head_oid.is_some());
+    let other = Some("0".repeat(40));
+    // Made at another head on the same file content: still exact.
+    let mut same_content = anchor(lines[0]);
+    same_content.head_oid.clone_from(&other);
+    // Made on other content of the file: outdated.
+    let mut changed = anchor(lines[1]);
+    changed.blob_oid.clone_from(&other);
+    // Made at another head before blobs were recorded: outdated by the head.
+    let mut legacy = anchor(lines[2]);
+    legacy.head_oid.clone_from(&other);
+    legacy.blob_oid = None;
+    let current = anchor(lines[3]);
+    assert!(current.head_oid.is_some() && current.blob_oid.is_some());
     assert_eq!(current.line_kind, ReviewLineKind::Added);
     let scope = NoteScope::for_workspace(&workspace);
-    for (anchor, body) in [(stale, "made earlier"), (current, "made now")] {
+    for (anchor, body) in [
+        (same_content, "same content"),
+        (changed, "changed content"),
+        (legacy, "legacy"),
+        (current, "made now"),
+    ] {
         let _: SaveDraftResponse = backend.call_now(
             crate::v2::tui::notes::OP_DRAFT_SAVE,
             &SaveDraftRequest {
@@ -1148,18 +1166,22 @@ fn anchors_made_at_another_head_are_outdated_not_moved() {
     let mut scenario = Scenario::new(build(&backend, &workspace, Duration::ZERO), 100, 40);
     stable(&mut scenario);
     let doc = scenario.surface().document().unwrap();
-    let placements: Vec<_> = (0..doc.len())
+    let mut placements: Vec<_> = (0..doc.len())
         .filter_map(|index| match doc.item(index) {
             Some(ReviewItem::Thread(thread)) => Some(thread.placement),
             _ => None,
         })
         .collect();
-    assert!(
-        placements.contains(&crate::v2::document::AnchorPlacement::Outdated(
-            crate::v2::document::OutdatedReason::RevisionChanged
-        ))
+    placements.sort_by_key(|placement| format!("{placement:?}"));
+    assert_eq!(
+        placements,
+        [
+            AnchorPlacement::Line,
+            AnchorPlacement::Line,
+            AnchorPlacement::Outdated(OutdatedReason::ContentChanged),
+            AnchorPlacement::Outdated(OutdatedReason::RevisionChanged),
+        ]
     );
-    assert!(placements.contains(&crate::v2::document::AnchorPlacement::Line));
 }
 
 #[test]
@@ -1174,8 +1196,16 @@ fn diff_text_registers_selection_fragments_matching_the_painted_cells() {
             0,
             |item| matches!(item, ReviewItem::FileHeader(header) if header.file.path == UNICODE_FILE),
         );
-        move_to(&mut setup.scenario, header);
-        setup.scenario.key("j");
+        // The line with tabs, with the file's other unicode lines around it.
+        let tabbed = |text: Option<&str>| text.is_some_and(|text| text.contains('\t'));
+        let tab_line = find(&setup.scenario, header, |item| match item {
+            ReviewItem::Line(line) => tabbed(line.content.text()),
+            ReviewItem::LinePair(pair) => {
+                tabbed(pair.new.as_ref().and_then(|side| side.content.text()))
+            }
+            _ => false,
+        });
+        move_to(&mut setup.scenario, tab_line);
         let screen = stable(&mut setup.scenario);
         let doc = setup.scenario.surface().document().unwrap();
         let mut texts = std::collections::BTreeMap::new();
@@ -1212,6 +1242,7 @@ fn diff_text_registers_selection_fragments_matching_the_painted_cells() {
             fragments.len()
         );
         let list = setup.scenario.surface().list_area().unwrap();
+        let mut tabs = 0;
         for fragment in fragments {
             assert!(list.contains(bmux_tui::geometry::Point::new(
                 fragment.area.x,
@@ -1220,7 +1251,16 @@ fn diff_text_registers_selection_fragments_matching_the_painted_cells() {
             let text = &texts[fragment.content_id.as_str()];
             let source = &text[fragment.source_range.clone()];
             let painted = screen.text_in(fragment.area, fragment.area.y);
-            if fragment.area.width > 0 && !source.chars().any(char::is_control) {
+            if source == "\t" {
+                // Tabs expand to the configured stops (four cells by default) as spaces, and
+                // the fragment covers the whole expansion.
+                tabs += 1;
+                assert!((1..=4).contains(&fragment.area.width), "{fragment:?}");
+                for x in fragment.area.x..fragment.area.right() {
+                    let cell = screen.cell(x, fragment.area.y).expect("painted cell");
+                    assert_eq!(cell.symbol, " ", "{width}: {fragment:?}");
+                }
+            } else if fragment.area.width > 0 && !source.chars().any(char::is_control) {
                 assert_eq!(
                     painted.trim_end(),
                     source.trim_end(),
@@ -1234,5 +1274,6 @@ fn diff_text_registers_selection_fragments_matching_the_painted_cells() {
                 );
             }
         }
+        assert!(tabs > 0, "{width}: the tab line is on screen");
     }
 }

@@ -563,6 +563,7 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
                 theme: ReviewTheme::derive(None, IconStyle::Unicode),
                 overflow,
                 gutter: DiffRowGutter::new(4, DiffGutterShape::LineNumbersThenMarker),
+                tab_width: 4,
                 expand_step: 20,
                 layout_revision: 0,
                 paint_revision: 0,
@@ -637,6 +638,7 @@ fn host_and_plugin_configuration_choose_the_layout() {
                 diff_layout: Some(ConfiguredLayout::SideBySide),
                 side_by_side_breakpoint: None,
                 icons: None,
+                tab_width: None,
             },
             80
         ),

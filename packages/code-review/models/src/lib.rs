@@ -1394,6 +1394,13 @@ pub struct DraftAnchor {
     /// Omitted when absent, so anchors without it serialize (and hash) exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_oid: Option<String>,
+    /// Blob of the anchored file side when the anchor was created (Code Review V2): the new
+    /// side, or the old side for anchors ending on a removed line, when that side is a blob
+    /// object (working-tree content records none). A line anchor stays exact while the side's
+    /// current blob is the same; V2 shows it as outdated once the file's content changed.
+    /// Omitted when absent, so anchors without it serialize (and hash) exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_oid: Option<String>,
 }
 
 /// Local review thread kind.
@@ -3074,6 +3081,7 @@ mod tests {
                 surface_id: Some("surface-1".to_string()),
                 source_id: Some("source-1".to_string()),
                 head_oid: None,
+                blob_oid: None,
             },
             question: "Why is this safe?".to_string(),
             session_id: Some("session-1".to_string()),
@@ -3115,6 +3123,7 @@ mod tests {
                 surface_id: Some("surface-1".to_string()),
                 source_id: Some("source-1".to_string()),
                 head_oid: None,
+                blob_oid: None,
             },
             body: "Handle the error explicitly.".to_string(),
             session_id: Some("session-1".to_string()),

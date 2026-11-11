@@ -856,6 +856,7 @@ mod tests {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         }
     }
 

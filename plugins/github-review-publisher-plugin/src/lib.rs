@@ -1204,6 +1204,7 @@ fn map_external_anchor(
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         }),
         message: None,
     }
@@ -1730,6 +1731,7 @@ mod tests {
                 surface_id: None,
                 source_id: None,
                 head_oid: None,
+                blob_oid: None,
             },
             comments: vec![DraftComment {
                 comment_id: "comment".to_string(),
@@ -1751,6 +1753,7 @@ mod tests {
                     surface_id: None,
                     source_id: None,
                     head_oid: None,
+                    blob_oid: None,
                 },
                 body: "comment body".to_string(),
                 created_at_ms: 1,

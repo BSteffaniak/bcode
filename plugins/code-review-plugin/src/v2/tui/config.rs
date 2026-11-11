@@ -16,6 +16,12 @@ const PLUGIN_ID: &str = "bcode.code_review";
 /// Side-by-side breakpoint when nobody configures one (spec section 12).
 pub const DEFAULT_BREAKPOINT: u16 = 120;
 
+/// Tab stop interval of diff text when the configuration sets none.
+pub const DEFAULT_TAB_WIDTH: u16 = 4;
+
+/// Largest configurable tab stop interval.
+const MAX_TAB_WIDTH: u16 = 16;
+
 /// Layout configured in the code review plugin's section
 /// (`[plugins.config."bcode.code_review".review_v2]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -29,6 +35,9 @@ pub struct ReviewViewConfig {
     /// Glyph set: `unicode` (default) or `ascii`.
     #[serde(default)]
     pub icons: Option<super::theme::IconStyle>,
+    /// Tab stop interval of diff text, in cells (default [`DEFAULT_TAB_WIDTH`]).
+    #[serde(default)]
+    pub tab_width: Option<u16>,
 }
 
 /// Configured layout choice.
@@ -61,6 +70,14 @@ impl ReviewViewConfig {
             |_| Self::default(),
             |config| Self::from_plugin_config(config.plugins.config.get(PLUGIN_ID)),
         )
+    }
+
+    /// Tab stop interval of diff text: the configured width clamped to `1..=16`, else
+    /// [`DEFAULT_TAB_WIDTH`].
+    #[must_use]
+    pub fn tab_width(self) -> u16 {
+        self.tab_width
+            .map_or(DEFAULT_TAB_WIDTH, |width| width.clamp(1, MAX_TAB_WIDTH))
     }
 
     /// The effective policy: this configuration over the host's preference over the default.
@@ -131,6 +148,17 @@ mod tests {
             ReviewViewConfig::from_plugin_config(Some(&auto))
                 .policy(Some(PluginTuiDiffLayout::Auto { breakpoint: 90 })),
             PluginTuiDiffLayout::Auto { breakpoint: 150 }
+        );
+        let tabs: toml::Value = toml::from_str("[review_v2]\ntab_width = 8\n").unwrap();
+        assert_eq!(
+            ReviewViewConfig::from_plugin_config(Some(&tabs)).tab_width(),
+            8
+        );
+        assert_eq!(none.tab_width(), DEFAULT_TAB_WIDTH);
+        let zero: toml::Value = toml::from_str("[review_v2]\ntab_width = 0\n").unwrap();
+        assert_eq!(
+            ReviewViewConfig::from_plugin_config(Some(&zero)).tab_width(),
+            1
         );
         let invalid: toml::Value = toml::from_str("[review_v2]\ndiff_layout = 3\n").unwrap();
         assert_eq!(

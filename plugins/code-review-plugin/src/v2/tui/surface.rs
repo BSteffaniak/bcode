@@ -890,6 +890,7 @@ impl ReviewSurfaceV2 {
                 review.gutter_digits as usize,
                 DiffGutterShape::LineNumbersThenMarker,
             ),
+            tab_width: self.config.tab_width(),
             expand_step: EXPAND_STEP,
             layout_revision: self
                 .layout_revision

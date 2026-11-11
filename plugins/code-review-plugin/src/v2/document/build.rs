@@ -313,17 +313,33 @@ impl ReviewDocument {
         let head = self.groups[state.group].source.head.commit_oid();
         for &index in &self.file_annotations[file] {
             let annotation = &self.annotations[index];
-            // An anchor made at another head commit cannot be matched exactly: it is shown as
-            // outdated rather than re-attached to whatever line now has its number.
-            if matches!(annotation.target, AnchorTarget::Lines(_))
-                && let (Some(made), Some(head)) = (annotation.anchor.head_oid.as_deref(), head)
-                && made != head
-            {
-                slots.file_level.push(Emit::Annotation(
-                    index,
-                    AnchorPlacement::Outdated(OutdatedReason::RevisionChanged),
-                ));
-                continue;
+            // A line anchor names lines of the content it was made on. With a recorded blob it
+            // stays exact while the anchored side still has that blob, whatever the head; once
+            // the content changed it is shown as outdated rather than re-attached to whatever
+            // line now has its number. Anchors without a blob fall back to the head commit.
+            if let AnchorTarget::Lines(lines) = &annotation.target {
+                let current_blob = match lines.end_side {
+                    ReviewLineSide::New => state.entry.new_blob.oid(),
+                    ReviewLineSide::Old => state.entry.old_blob.oid(),
+                };
+                let anchor = &annotation.anchor;
+                let outdated = anchor.blob_oid.as_deref().map_or_else(
+                    || {
+                        anchor
+                            .head_oid
+                            .as_deref()
+                            .zip(head)
+                            .is_some_and(|(made, head)| made != head)
+                            .then_some(OutdatedReason::RevisionChanged)
+                    },
+                    |made| (current_blob != Some(made)).then_some(OutdatedReason::ContentChanged),
+                );
+                if let Some(reason) = outdated {
+                    slots
+                        .file_level
+                        .push(Emit::Annotation(index, AnchorPlacement::Outdated(reason)));
+                    continue;
+                }
             }
             let emit = Emit::Annotation(index, AnchorPlacement::File);
             place(emit, &annotation.target, &mut slots);

@@ -78,6 +78,9 @@ pub struct DocAnchor {
     /// Commit the file's source head resolved to when the anchor was made, when it is a
     /// commit (recorded on the persisted anchor; see [`DraftAnchor::head_oid`]).
     pub head_oid: Option<String>,
+    /// Blob of the anchored side when a line anchor was made, when that side is a blob object
+    /// (recorded on the persisted anchor; see [`DraftAnchor::blob_oid`]).
+    pub blob_oid: Option<String>,
 }
 
 impl DocAnchor {
@@ -88,6 +91,7 @@ impl DocAnchor {
             file: None,
             target: AnchorTarget::Review,
             head_oid: None,
+            blob_oid: None,
         }
     }
 
@@ -118,6 +122,7 @@ impl DocAnchor {
             surface_id: None,
             source_id,
             head_oid: self.head_oid.clone(),
+            blob_oid: self.blob_oid.clone(),
         };
         match &self.target {
             AnchorTarget::Review => {}
@@ -334,6 +339,7 @@ mod tests {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         }
     }
 
@@ -380,10 +386,12 @@ mod tests {
             ))),
             target: AnchorTarget::Lines(lines),
             head_oid: Some("abc".to_owned()),
+            blob_oid: Some("def".to_owned()),
         };
         let draft = doc.to_draft_anchor();
         assert_eq!(draft.source_id.as_deref(), Some("s"));
         assert_eq!(draft.head_oid.as_deref(), Some("abc"));
+        assert_eq!(draft.blob_oid.as_deref(), Some("def"));
         assert_eq!(target_of(&draft), AnchorTarget::Lines(lines));
     }
 }

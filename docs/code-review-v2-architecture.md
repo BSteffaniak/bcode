@@ -267,6 +267,44 @@ are unverified):
 * No service call or syntax highlighting on the render path: confirmed by review (`render`
   only reports the viewport; `poll` issues requests and highlighting runs on the blocking pool).
 
+#### V2 screen, optimized build (performance pass)
+
+The same benchmark built with the release profile (`cargo test --release -p
+bcode_code_review_plugin v2_screen_benchmark -- --ignored --nocapture`), same machine and
+fixture. "Before" is the phase 3 close code measured at the start of this pass (two runs; the
+earlier 2.82 ms p95 recorded during phase 4 was not reproduced); "after" is two runs after the
+changes below. Timings include the harness's own per-frame work (a freshly allocated 200×60
+buffer and the cloned selection scene of every frame), which the host does not repeat.
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Open: resolve sources and list the whole index | 534 ms | 526–544 ms |
+| First frame with content after the index | 136 ms; highlighted after 163 ms | 142–165 ms; highlighted after 167–190 ms |
+| Scroll the 5k-file review (3,000 frames) | 2.4–2.5 ms avg, 4.6–5.4 ms p95, 122–154 ms max | 0.74–0.86 ms avg, **1.39–1.56 ms p95**, 7–13 ms max |
+| Jump to the 40k-line file, then load and show it | 0.6–0.8 ms jump; 538–573 ms until loaded | 0.6 ms jump; 497–616 ms until loaded |
+| Scroll the 40k-line file (2,000 frames) | 1.2 ms avg, 2.0 ms p95 | 0.59–0.61 ms avg, 0.87–0.90 ms p95 |
+
+Profile state (macOS `sample` over the 5k-file scroll, unstripped release build):
+
+* **Before.** About 40% of each frame was selection metadata: cloning one BMUX
+  `SelectionFragment` per painted grapheme (three heap strings each) into the frame, the clone
+  of the frame's scene, and dropping it, plus formatting fragment ids when rows were built. The
+  rest: laying out the list (20%, mostly building newly visible rows), painting text and fills,
+  the file tree's rows, and the harness's buffer allocation.
+* **Change.** BMUX gained `SelectionTextRun`: a row of selectable text registered as one value
+  (with a shared cell table) and materialized into fragments only when the scene is queried.
+  Diff rows register one run per painted row segment from `DiffRowLayout::selection_cells`, built
+  once per item and width with the row cache.
+* **After.** No selection cost remains on the frame path. The frame is now generic painting
+  (`write_line` and `fill` cell writes, about a third), laying out the list (about a quarter:
+  rows built for newly visible items and measurement of newly loaded files), the file panel's
+  visible rows (about a fifth), and the harness's buffer allocation (about a tenth). No single
+  hotspot remains; page and jump frames (one frame in ten) set the p95.
+* Criterion B: the steady scroll target (≤ 2 ms p95) is met in an optimized build for both the
+  5k-file review and the 40k-line file. The first frame with content stays near the 150 ms
+  target (142–165 ms across runs): its two renders take 11–15 ms, and the rest is the in-process
+  service calls (git, JSON) for the first files' hunks.
+
 ## 3. Layered architecture
 
 ```
@@ -546,6 +584,18 @@ Thread identity ignores the head: `thread_id` hashes the anchor with `head_oid` 
 before. The service stores it in `draft_threads.head_oid` (migration `019_thread_head_oid_column`);
 AI exchanges and suggestions keep it in their anchor JSON.
 
+**Implementation (exact outdated anchors).** `DraftAnchor::blob_oid` (serde-defaulted, omitted
+when absent) records the blob of the anchored file side when a line anchor is made: the new
+side, or the old side for anchors ending on a removed line, when that side is a blob object
+(working-tree content records none). A line anchor with a recorded blob is placed by its lines
+while the file's current blob on that side is the same, whatever the head commit, and is
+outdated with `OutdatedReason::ContentChanged` (labeled "file changed") once it differs or is not
+a pinned object. Anchors without a blob (V1, and V2 anchors made before the field) keep the
+head check above. Thread identity also ignores the blob. The service stores it in
+`draft_threads.blob_oid` (migration `020_thread_blob_oid_column`). For a range spanning both
+sides only the end side's blob is recorded; the other side's lines are checked by existence and
+kind.
+
 ### 5.4 Viewed state
 
 A viewed mark is `ViewedMark { path, old_oid, new_oid, patch_id }`: the identity of both blob
@@ -714,10 +764,23 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   drag. The wheel starts (or extends from its target) a keyed BMUX `ScrollMotion` (90 ms, ease
   out; the list's own wheel handling is off); polls ask for frames while it runs.
 * **Selection.** The document list is a BMUX selection scope; every painted diff row registers
-  its text as selection fragments from the row layout's source mapping (`DiffRowSegment::x` and
-  byte ranges, `painted_text_fragments`), so fragments cover exactly the painted cells and
-  partially hidden rows register none. `V` selects lines from the keyboard and `y` copies the
-  selected lines (else the cursor line) through `PluginTuiHost::copy_text`.
+  its text as one BMUX `SelectionTextRun` per row segment, with the units of the row layout's own
+  grapheme placement (`DiffRowLayout::selection_cells`), so materialized fragments cover exactly
+  the painted cells (a tab's whole expansion, a wide grapheme's two cells) and rows outside the
+  viewport register none. Runs materialize per-grapheme fragments only when the scene is
+  queried. `V` selects lines from the keyboard and `y` copies the selected lines (else the cursor
+  line) through `PluginTuiHost::copy_text`.
+  * **Open: host consumption of plugin-surface selections.** The host does not route terminal
+    drag-select over plugin surfaces through a BMUX `SelectionController` (only the transcript
+    engine owns one), so drag-to-copy text does not work in V2 yet; V2's own press-and-drag
+    selects a line range for commenting. Wiring it is generic host plumbing (a controller over
+    the committed scene for the surface region, the copy and clear-after-copy policy shared with
+    the transcript, and the paint of its highlights), but it first needs a gesture policy that
+    separates text selection from a surface's own drag handling (for example a modifier, or a
+    surface declaring which scopes the host may select in). It is left for a separate change.
+* **Tabs.** Diff text expands tabs to tab stops of the whole line (BMUX
+  `DiffRowOptions::tab_width`); the width comes from
+  `[plugins.config."bcode.code_review".review_v2] tab_width` (default 4, clamped to 1–16).
 * **Threads panel.** Rows come from the annotations (sorted by path and line): status,
   severity, location, and the first line. `←`/`→` cycle the filter (all, open, needs attention
   (unresolved warnings, blockers, questions, and to-dos, plus failed questions), general
@@ -961,6 +1024,13 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
   already translated event context, so panels and panes not at the screen origin (or nested)
   delivered pointer events at doubled offsets. Both route children relative to themselves now,
   with BMUX tests for placed and nested containers.
+* **Found in the performance pass:** `selection::SelectionTextRun` (lazily materialized
+  selection rows; `PaintCx::push_selection_text_run`, `painted_text_cells`), and tab expansion
+  in row-level diff layout (`DiffRowOptions::tab_width`, column-aware stops, tabs painted as
+  spaces with one unit mapped to the tab byte) with `DiffRowLayout::selection_cells`. BMUX
+  `source_viewer` has a related tab defect (its `TextBlock` rows paint a tab as one replacement
+  cell while its selection registration expands tabs to eight cells); fixing it needs tab
+  expansion in `TextBlock`, which V2 does not use, and is left open.
 * **Found in the phase 3 review:** `ToastStack` measured its close button by byte length and
   painted it after the title while its hit region (and `close_at`) used the toast's last column;
   the glyph is now painted on that column and titles are truncated by display width before it.
@@ -982,6 +1052,7 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
   * Migration `019_thread_head_oid_column` adds the nullable `draft_threads.head_oid` (5.3). The
     additive operation `thread.classify` (`ClassifyThreadRequest`) sets a thread's kind and
     severity, creating the thread like `thread.resolve` does.
+  * Migration `020_thread_blob_oid_column` adds the nullable `draft_threads.blob_oid` (5.3).
 * Unknown future source kinds are preserved and surfaced as unsupported, not guessed: they
   deserialize as `ReviewSourceKind::Unsupported { kind, raw }`, serialize back verbatim, and
   resolve to an `unsupported_source_kind` diagnostic. V1 reports the new and unknown kinds as an

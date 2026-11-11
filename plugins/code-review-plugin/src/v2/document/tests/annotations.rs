@@ -30,6 +30,7 @@ fn anchor(path: &str, kind: ReviewLineKind, old: Option<u32>, new: Option<u32>) 
         surface_id: None,
         source_id: None,
         head_oid: None,
+        blob_oid: None,
     }
 }
 
@@ -221,6 +222,113 @@ fn annotations_are_placed_at_their_anchor_or_labeled_outdated() {
         placement_of(&all, &thread("hidden")),
         (AnchorPlacement::Line, line(ReviewLineSide::New, 31))
     );
+}
+
+#[test]
+fn line_anchors_are_exact_while_their_side_keeps_its_blob() {
+    let fake = sample();
+    let synth = SynthFile::modified(
+        "a.rs",
+        40,
+        &[Edit {
+            at: 10,
+            remove: 2,
+            add: 3,
+        }],
+        3,
+    );
+    let (old_oid, new_oid) = (synth.old_oid(), synth.new_oid());
+    let other = Some("f".repeat(40));
+    let with = |kind, old, new, head: Option<String>, blob: Option<String>| {
+        let mut anchor = anchor("a.rs", kind, old, new);
+        anchor.head_oid = head;
+        anchor.blob_oid = blob;
+        anchor
+    };
+    let annotations = Annotations {
+        drafts: vec![
+            // Same new-side blob at another head: exact.
+            draft(
+                "new-same",
+                with(
+                    ReviewLineKind::Added,
+                    None,
+                    Some(11),
+                    other.clone(),
+                    Some(new_oid.clone()),
+                ),
+                1,
+            ),
+            // Removed lines check the old side's blob.
+            draft(
+                "old-same",
+                with(
+                    ReviewLineKind::Removed,
+                    Some(10),
+                    None,
+                    other.clone(),
+                    Some(old_oid.clone()),
+                ),
+                2,
+            ),
+            draft(
+                "old-changed",
+                with(
+                    ReviewLineKind::Removed,
+                    Some(11),
+                    None,
+                    None,
+                    Some(new_oid.clone()),
+                ),
+                3,
+            ),
+            draft(
+                "new-changed",
+                with(ReviewLineKind::Added, None, Some(12), None, other.clone()),
+                4,
+            ),
+            // No blob recorded: the head decides.
+            draft(
+                "legacy",
+                with(ReviewLineKind::Added, None, Some(10), other, None),
+                5,
+            ),
+        ],
+        ..Annotations::default()
+    };
+    let mut doc = fake.document(DocumentConfig::default());
+    doc.set_annotations(&annotations);
+    fake.load_all(&mut doc);
+    let all = items(&doc);
+    let placement = |id: &str| placement_of(&all, &thread(id)).0;
+    assert_eq!(placement("new-same"), AnchorPlacement::Line);
+    assert_eq!(placement("old-same"), AnchorPlacement::Line);
+    for id in ["old-changed", "new-changed"] {
+        assert_eq!(
+            placement(id),
+            AnchorPlacement::Outdated(OutdatedReason::ContentChanged),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        placement("legacy"),
+        AnchorPlacement::Outdated(OutdatedReason::RevisionChanged)
+    );
+    // New anchors record the blob of the side they end on.
+    let file = std::sync::Arc::new(fake.file("a.rs"));
+    let recorded = |side, line| {
+        let key = ItemKey::Line {
+            file: file.clone(),
+            side,
+            line,
+        };
+        doc.anchor_for(&key)
+            .expect("anchor")
+            .to_draft_anchor()
+            .blob_oid
+    };
+    assert_eq!(recorded(ReviewLineSide::New, 11), Some(new_oid));
+    assert_eq!(recorded(ReviewLineSide::Old, 10), Some(old_oid));
 }
 
 #[test]

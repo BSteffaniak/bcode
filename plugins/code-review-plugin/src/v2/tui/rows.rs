@@ -26,6 +26,7 @@ use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::HitRegion;
 use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::selection::SelectionTextRun;
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span, TrailingAlign, TrailingPlacement};
 use bmux_tui::text_width::display_width;
@@ -130,6 +131,8 @@ pub struct ViewParams {
     pub overflow: DiffRowOverflow,
     /// Gutter shared by every diff row of the document.
     pub gutter: DiffRowGutter,
+    /// Tab stop interval of diff text.
+    pub tab_width: u16,
     /// Lines a gap segment reveals.
     pub expand_step: u32,
     /// Changes whenever row geometry can change (wrap, gutter, layout mode).
@@ -287,8 +290,9 @@ pub struct ItemRows {
     pub actions: Vec<ActionCells<ItemAction>>,
     /// Row layout and source mapping of diff lines and rows.
     pub diff: Option<DiffRowLayout>,
-    /// Selection fragments of the painted diff text, in item coordinates.
-    pub fragments: Vec<bmux_tui::selection::SelectionFragment>,
+    /// Selection runs of the painted diff text (one per painted row segment) with their row,
+    /// in item coordinates.
+    pub selection: Vec<(u16, SelectionTextRun)>,
 }
 
 impl ItemRows {
@@ -298,7 +302,7 @@ impl ItemRows {
             height: 1,
             actions: Vec::new(),
             diff: None,
-            fragments: Vec::new(),
+            selection: Vec::new(),
         }
     }
 
@@ -308,7 +312,7 @@ impl ItemRows {
             lines,
             actions,
             diff: None,
-            fragments: Vec::new(),
+            selection: Vec::new(),
         }
     }
 
@@ -428,7 +432,7 @@ impl RowContext<'_> {
         };
         self.cache.borrow_mut().get_or_build(key, || {
             let mut rows = self.build(index, item, width);
-            rows.fragments = selection_fragments(item, &rows, self.params.layout_revision);
+            rows.selection = selection_runs(item, &rows, self.params.layout_revision);
             rows
         })
     }
@@ -514,7 +518,9 @@ impl RowContext<'_> {
     }
 
     const fn options(&self) -> DiffRowOptions {
-        DiffRowOptions::new(self.params.gutter).with_overflow(self.params.overflow)
+        DiffRowOptions::new(self.params.gutter)
+            .with_overflow(self.params.overflow)
+            .with_tab_width(self.params.tab_width)
     }
 
     fn unified_rows(&self, index: usize, line: &LineItem, width: u16) -> ItemRows {
@@ -762,7 +768,7 @@ fn diff_item_rows(layout: DiffRowLayout) -> ItemRows {
         lines,
         actions: Vec::new(),
         diff: Some(layout),
-        fragments: Vec::new(),
+        selection: Vec::new(),
     }
 }
 
@@ -956,7 +962,7 @@ fn placeholder(item: &PlaceholderItem, theme: &ReviewTheme, width: usize) -> Ite
         height: u64::from(item.estimated_rows.max(1)),
         actions: Vec::new(),
         diff: None,
-        fragments: Vec::new(),
+        selection: Vec::new(),
     }
 }
 
@@ -1139,62 +1145,50 @@ fn gap_rows(gap: &GapItem, params: &ViewParams, width: usize, indent: usize) -> 
         height: 1,
         actions,
         diff: None,
-        fragments: Vec::new(),
+        selection: Vec::new(),
     }
 }
 
-/// Selection fragments of a diff item's painted text, in item coordinates: one run per painted
-/// row segment of the row layout's source mapping (see [`ItemView`]).
-fn selection_fragments(
+/// Selection runs of a diff item's painted text, in item coordinates: one run per painted row
+/// segment, with the units of the row layout's own grapheme placement (so tabs, wide graphemes,
+/// and zero-width characters map exactly as painted). The order is the side; the item's
+/// position is added when painting (indices move).
+fn selection_runs(
     item: &ReviewItem,
     rows: &ItemRows,
     revision: u64,
-) -> Vec<bmux_tui::selection::SelectionFragment> {
+) -> Vec<(u16, SelectionTextRun)> {
     let Some(layout) = rows.diff.as_ref() else {
         return Vec::new();
     };
-    let text = |side: DiffSourceSide| match item {
-        ReviewItem::Line(line) => line.content.text(),
-        ReviewItem::LinePair(pair) => match side {
-            DiffSourceSide::Old => pair.old.as_ref(),
-            DiffSourceSide::New => pair.new.as_ref(),
-        }
-        .and_then(|side| side.content.text()),
-        _ => None,
-    };
     let key = RowKey(item.key()).to_string();
-    let mut fragments = Vec::new();
+    let content = [format!("{key}.0"), format!("{key}.1")];
+    let mut runs = Vec::new();
     for segment in layout.segments() {
-        let (Ok(row), Ok(x), Ok(end)) = (
-            u16::try_from(segment.row),
-            u16::try_from(segment.x),
-            u16::try_from(segment.content.end),
-        ) else {
+        let Ok(row) = u16::try_from(segment.row) else {
             continue;
         };
-        let Some(source) = text(segment.side).and_then(|text| text.get(segment.bytes.clone()))
-        else {
-            continue;
-        };
-        if source.is_empty() || x >= end {
+        let cells = layout.selection_cells(segment);
+        if cells.is_empty() {
             continue;
         }
         let side = match segment.side {
             DiffSourceSide::Old => 0,
             DiffSourceSide::New => 1,
         };
-        fragments.extend(bmux_tui::selection::painted_text_fragments(
-            SELECTION_SCOPE,
-            format!("{key}.{side}"),
-            Rect::new(x, row, end - x, 1),
-            // The side; the item's position is added when painting (indices move).
-            side,
-            source,
-            segment.bytes.start,
-            revision,
+        runs.push((
+            row,
+            SelectionTextRun::new(
+                SELECTION_SCOPE,
+                content[usize::from(side == 1)].as_str(),
+                bmux_tui::geometry::Point::new(0, row),
+                side,
+                cells.into(),
+            )
+            .revision(revision),
         ));
     }
-    fragments
+    runs
 }
 
 /// Selection scope of the document's diff text.
@@ -1279,6 +1273,7 @@ const fn outdated_label(reason: crate::v2::document::OutdatedReason) -> &'static
         OutdatedReason::LineMissing => "outdated: line removed",
         OutdatedReason::LineChanged => "outdated: line changed",
         OutdatedReason::RevisionChanged => "outdated: older revision",
+        OutdatedReason::ContentChanged => "outdated: file changed",
     }
 }
 
@@ -1614,19 +1609,16 @@ impl<'a> ItemView<'a> {
         cx.push_damage(LocalRect::new(0, 0, width, height));
     }
 
-    /// Register the painted diff text as selection fragments of the document's selection scope
-    /// (one fragment run per painted row segment, from the row layout's source mapping), so a
-    /// host selection controller copies exactly the source text under the selected cells.
+    /// Register the painted diff text in the document's selection scope as one BMUX text run
+    /// per painted row segment, so a selection controller copies exactly the source text under
+    /// the selected cells. Runs materialize their per-grapheme fragments only when the scene is
+    /// queried, so registering costs one value per visible row.
     fn register_selection(&self, rows: &ItemRows, height: u16, cx: &mut PaintCx<'_, '_>) {
         let base = (self.index as u64).saturating_mul(2);
-        for fragment in rows
-            .fragments
-            .iter()
-            .filter(|fragment| fragment.area.y < height)
-        {
-            let mut fragment = fragment.clone();
-            fragment.order += base;
-            cx.push_selection_fragment(fragment);
+        for (_, run) in rows.selection.iter().filter(|(row, _)| *row < height) {
+            let mut run = run.clone();
+            run.order += base;
+            cx.push_selection_text_run(run);
         }
     }
 

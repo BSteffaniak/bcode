@@ -3361,6 +3361,7 @@ impl<'a> CodeReviewDb<'a> {
                 "surface_id",
                 "source_id",
                 "head_oid",
+                "blob_oid",
             ])
             .filter(Box::new(where_eq("review_key", review_key)))
             .execute(self.db)
@@ -3401,6 +3402,7 @@ impl<'a> CodeReviewDb<'a> {
                 surface_id: optional_text(&thread, "surface_id"),
                 source_id: optional_text(&thread, "source_id"),
                 head_oid: optional_text(&thread, "head_oid"),
+                blob_oid: optional_text(&thread, "blob_oid"),
             };
             let comment_rows = self
                 .db
@@ -3726,6 +3728,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("surface_id", anchor.surface_id.clone())
             .value("source_id", anchor.source_id.clone())
             .value("head_oid", anchor.head_oid.clone())
+            .value("blob_oid", anchor.blob_oid.clone())
             .value("resolved_at_ms", Option::<i64>::None)
             .value("created_at_ms", u64_to_i64(now))
             .value("updated_at_ms", u64_to_i64(now))
@@ -4124,7 +4127,24 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(workspace_presentation_state_column_migration());
     source.add_migration(workspace_v2_state_columns_migration());
     source.add_migration(thread_head_oid_column_migration());
+    source.add_migration(thread_blob_oid_column_migration());
     source
+}
+
+/// Code Review V2 line anchors record the blob of the anchored file side
+/// (`DraftAnchor::blob_oid`). Nullable, so threads written before the migration read as having
+/// no recorded blob.
+fn thread_blob_oid_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "020_thread_blob_oid_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "blob_oid".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
 }
 
 /// Code Review V2 anchors record the head commit they were made at (`DraftAnchor::head_oid`).
@@ -4535,12 +4555,13 @@ fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewE
     Ok(format!("review-{}", hex::encode(hasher.finalize())))
 }
 
-/// Thread identity: the review and the anchor's location. The anchor's head commit is not part
-/// of it, so a thread keeps its identity however its anchor was recorded (and anchors without a
-/// head hash exactly as they did before the field existed).
+/// Thread identity: the review and the anchor's location. The anchor's head commit and blob are
+/// not part of it, so a thread keeps its identity however its anchor was recorded (and anchors
+/// without them hash exactly as they did before the fields existed).
 fn thread_id(review_key: &str, anchor: &DraftAnchor) -> Result<String, ReviewError> {
     let mut location = anchor.clone();
     location.head_oid = None;
+    location.blob_oid = None;
     let mut hasher = Sha256::new();
     hasher.update(review_key.as_bytes());
     hasher.update(b"\0");
@@ -5302,6 +5323,7 @@ mod tests {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         };
         let request = ServiceRequest {
             interface_id: CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
@@ -5366,6 +5388,7 @@ mod tests {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         };
         save_draft_for_request(
             SaveDraftRequest {
@@ -5428,6 +5451,7 @@ mod tests {
                 surface_id: None,
                 source_id: None,
                 head_oid: None,
+                blob_oid: None,
             },
             question: "delete me".to_string(),
             session_id: None,
@@ -5556,6 +5580,7 @@ mod tests {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         };
         let exchange = ReviewAiExchange {
             schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
@@ -5643,6 +5668,7 @@ mod tests {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         };
         let scope = Some(ReviewScope::Workspace {
             workspace_id: "workspace-1".to_string(),
@@ -5877,6 +5903,7 @@ mod tests {
                     surface_id: None,
                     source_id: None,
                     head_oid: None,
+                    blob_oid: None,
                 },
                 comments: vec![DraftComment {
                     comment_id: "comment-1".to_string(),
@@ -5898,6 +5925,7 @@ mod tests {
                         surface_id: None,
                         source_id: None,
                         head_oid: None,
+                        blob_oid: None,
                     },
                     body: "Needs local follow-up".to_string(),
                     created_at_ms: 1,
@@ -5957,6 +5985,7 @@ mod tests {
                     surface_id: None,
                     source_id: None,
                     head_oid: None,
+                    blob_oid: None,
                 },
                 comments: vec![DraftComment {
                     comment_id: "comment-review".to_string(),
@@ -5978,6 +6007,7 @@ mod tests {
                         surface_id: None,
                         source_id: None,
                         head_oid: None,
+                        blob_oid: None,
                     },
                     body: "Overall review summary".to_string(),
                     created_at_ms: 1,
@@ -6081,6 +6111,7 @@ mod tests {
                     surface_id: None,
                     source_id: None,
                     head_oid: None,
+                    blob_oid: None,
                 },
                 comments: vec![DraftComment {
                     comment_id: "comment-1".to_string(),
@@ -6102,6 +6133,7 @@ mod tests {
                         surface_id: None,
                         source_id: None,
                         head_oid: None,
+                        blob_oid: None,
                     },
                     body: "Selected actionable comment".to_string(),
                     created_at_ms: 1,

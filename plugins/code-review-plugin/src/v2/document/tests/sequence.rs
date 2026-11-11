@@ -58,6 +58,7 @@ fn draft(thread: &str, path: &str, new_line: u32) -> DraftComment {
             surface_id: None,
             source_id: None,
             head_oid: None,
+            blob_oid: None,
         },
         body: "body".into(),
         created_at_ms: 1,
