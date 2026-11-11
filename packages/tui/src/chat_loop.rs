@@ -2382,6 +2382,15 @@ impl ChatLoopState {
         })
     }
 
+    /// Keep the committed terminal scene while an async operation owns the surface.
+    pub(crate) fn root_plugin_paint_pending(&self) -> bool {
+        self.foreground() == Some(super::foreground::Foreground::Plugin)
+            && self
+                .plugin_surface
+                .as_ref()
+                .is_some_and(|surface| surface.surface.is_none())
+    }
+
     /// Resolve one foreground in input priority order. Painting and routing share this policy.
     pub(crate) fn foreground(&self) -> Option<super::foreground::Foreground> {
         use super::foreground::Foreground;

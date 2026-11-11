@@ -3480,6 +3480,16 @@ fn present_root_frame<W: std::io::Write>(
     program: &mut BcodeRuntimeModel,
     terminal: &mut bmux_tui::terminal::Terminal<&mut W>,
 ) -> Result<bmux_tui_runtime::PresentReport, TuiError> {
+    // Async effects temporarily own the plugin, not its visible scene. Do not
+    // prepare or commit a replacement frame until it can render again. This also
+    // leaves resize damage pending; BMUX will repaint at the new size on return.
+    // Other foregrounds still use the normal presentation path.
+    if program.loop_state.root_plugin_paint_pending() {
+        return Ok(bmux_tui_runtime::PresentReport {
+            changed_cells: 0,
+            full_repaint: false,
+        });
+    }
     // BMUX resolves against the prepared scene's focus scope (or the committed
     // scope when no frame is prepared); PointerContext.scope is not consulted
     // by that resolver. Bcode exposes no separate HitId capture owner.
@@ -12203,6 +12213,128 @@ mod tests {
         assert!(
             output.len() < 128,
             "only bounded cursor/style/sync controls are expected"
+        );
+    }
+
+    struct GatedPluginPaint {
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        completed: bool,
+    }
+
+    impl bcode_plugin_sdk::tui::PluginTuiSurface for GatedPluginPaint {
+        fn id(&self) -> &'static str {
+            "gated-paint"
+        }
+        fn title(&self) -> &'static str {
+            "Gated paint"
+        }
+        fn render(
+            &mut self,
+            area: bmux_tui::geometry::Rect,
+            cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
+        ) {
+            cx.write_line(
+                bmux_tui::paint::LocalRect::new(0, 0, area.width, 1),
+                &bmux_tui::text::Line::from(if self.completed {
+                    "Completed operation"
+                } else {
+                    "Review stays visible"
+                }),
+            );
+        }
+        fn handle_event(
+            &mut self,
+            _: &bmux_tui::event::Event,
+            _: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> bcode_plugin_sdk::tui::PluginTuiAction {
+            bcode_plugin_sdk::tui::PluginTuiAction::None
+        }
+        fn drain_effects<'a>(
+            &'a mut self,
+            _: &'a dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bcode_plugin_sdk::tui::PluginTuiAction>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                if let Some(release) = self.release.take() {
+                    let _ = release.await;
+                }
+                self.completed = true;
+                bcode_plugin_sdk::tui::PluginTuiAction::Redraw
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_plugin_pending_operation_retains_committed_frame_until_completion() {
+        use bmux_tui_runtime::Presenter;
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let mut model = root_test_model();
+        model.queue_plugin_surface(
+            "test",
+            Box::new(GatedPluginPaint {
+                release: Some(receiver),
+                completed: false,
+            }),
+        );
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut bytes,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        let committed = terminal.retained_buffer().unwrap().clone();
+        let client = bcode_client::BcodeClient::default_endpoint();
+        let launch = super::super::plugin_surface_host::FreshSessionSettings::default();
+        model
+            .loop_state
+            .poll_root_plugin_surface(&client, launch.clone());
+        assert!(model.loop_state.root_plugin_paint_pending());
+        terminal.writer_mut().clear();
+        for _ in 0..3 {
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            let report = super::bcode_runtime_presenter(&mut terminal)
+                .present(&mut model)
+                .unwrap();
+            assert_eq!(report.changed_cells, 0);
+            assert!(!report.full_repaint);
+            assert_eq!(terminal.retained_buffer(), Some(&committed));
+            assert_eq!(terminal.writer_mut().as_slice(), &[] as &[u8]);
+        }
+        // A resize while borrowed must also wait, without consuming redraw damage.
+        terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 48, 16));
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        assert_eq!(terminal.writer_mut().as_slice(), &[] as &[u8]);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while model.loop_state.root_plugin_paint_pending() {
+                tokio::task::yield_now().await;
+                model
+                    .loop_state
+                    .poll_root_plugin_surface(&client, launch.clone());
+            }
+        })
+        .await
+        .unwrap();
+        super::bcode_runtime_presenter(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        drop(model);
+        let buffer = terminal.retained_buffer().unwrap();
+        assert_eq!(buffer.area().width, 48);
+        assert!(
+            buffer
+                .row_symbols(0)
+                .unwrap()
+                .contains("Completed operation")
         );
     }
 
