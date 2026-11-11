@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -11,25 +15,38 @@
       self,
       nixpkgs,
       flake-utils,
+      rust-overlay,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
-        # Keep the native formatter crates and development tools on a compatible toolchain.
-        rustc =
-          assert pkgs.lib.versionAtLeast pkgs.rustc.version "1.99";
-          pkgs.rustc;
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+        # One toolchain supplies rustc, cargo, rustfmt, and clippy so the native
+        # formatter crates and development tools stay compatible. The wasm32
+        # standard library is required by BMUX's embedded Mermaid guest build.
+        rustToolchain =
+          let
+            toolchain = pkgs.rust-bin.stable.latest.default.override {
+              extensions = [
+                "rust-src"
+                "rustfmt"
+                "clippy"
+              ];
+              targets = [ "wasm32-unknown-unknown" ];
+            };
+          in
+          assert pkgs.lib.versionAtLeast toolchain.version "1.99";
+          toolchain;
       in
       {
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            rustc
+            rustToolchain
           ]
           ++ (with pkgs; [
-            cargo
-            rustfmt
-            clippy
             llvmPackages.lld
             cmake
             markdownlint-cli
