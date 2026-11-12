@@ -4,9 +4,11 @@
 
 //! Shared code review models for Bcode.
 
+mod assistant;
 mod data;
 mod review_source;
 
+pub use assistant::*;
 pub use data::*;
 pub use review_source::*;
 

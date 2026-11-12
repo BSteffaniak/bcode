@@ -82,9 +82,17 @@ Generic mutating tools support exact-name overrides (no wildcard matching):
 "workflow.publish_run_graph_edit" = "deny"
 ```
 
-These rules apply only to the generic mutating-operation fallback; they do not override
+These rules apply only to the generic mutating and read-only operations; they do not override
 filesystem, shell, or web operation rules or disabled tools. Declarative and runtime-state
-overlays retain their usual precedence. Unlisted mutating tools still ask by default.
+overlays retain their usual precedence. Unlisted mutating tools still ask by default, and
+unlisted read-only tools are still allowed; a read-only tool listed as `ask` or `deny` asks or is
+refused:
+
+```toml
+[agent.build.permission.tools]
+"code_review.add_comment" = "allow"   # a review write that asks by default
+"code_review.file_content" = "ask"    # a review read that is allowed by default
+```
 
 ## Reviewing pending requests
 

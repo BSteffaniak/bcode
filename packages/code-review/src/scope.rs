@@ -8,7 +8,9 @@
 //!   repository and source kinds, so reopening the same target shows its annotations again
 //!   while transient reviews of other targets (or other repositories) do not see them.
 
-use bcode_code_review_models::{ReviewSource, ReviewSourceKind, ReviewWorkspace};
+use bcode_code_review_models::{
+    ReviewScope, ReviewSource, ReviewSourceKind, ReviewTarget, ReviewWorkspace,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -105,6 +107,62 @@ pub fn annotation_workspace_id(workspace: &ReviewWorkspace) -> String {
         "{TRANSIENT_WORKSPACE_ID}-{}",
         &digest[..FINGERPRINT_HEX_LEN]
     )
+}
+
+/// The fallback target and scope annotation requests of `workspace` use.
+///
+/// The scope is its annotation scope id (see [`annotation_workspace_id`]); the fallback target is
+/// the first included source's target (the repository when that source has none expressible as a
+/// target).
+#[must_use]
+pub fn annotation_scope(workspace: &ReviewWorkspace) -> (ReviewTarget, ReviewScope) {
+    let target = workspace
+        .sources
+        .iter()
+        .find(|source| source.included)
+        .map_or(ReviewTarget::Repository, |source| {
+            target_of_kind(&source.kind)
+        });
+    let scope = ReviewScope::Workspace {
+        workspace_id: annotation_workspace_id(workspace),
+        target: target.clone(),
+    };
+    (target, scope)
+}
+
+/// The target of a source kind (the repository for kinds without one).
+#[must_use]
+pub fn target_of_kind(kind: &ReviewSourceKind) -> ReviewTarget {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => ReviewTarget::WorkingTreeUnstaged,
+        ReviewSourceKind::IndexStaged => ReviewTarget::IndexStaged,
+        ReviewSourceKind::WorkingTreeAndIndex => ReviewTarget::WorkingTreeAndIndex,
+        ReviewSourceKind::LastCommit => ReviewTarget::LastCommit,
+        ReviewSourceKind::Commit { rev } => ReviewTarget::CommitRange {
+            base: format!("{rev}^"),
+            head: rev.clone(),
+            merge_base: false,
+        },
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => ReviewTarget::CommitRange {
+            base: base.clone(),
+            head: head.clone(),
+            merge_base: *merge_base,
+        },
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => ReviewTarget::BranchCompare {
+            base_branch: base_branch.clone(),
+            head_branch: head_branch.clone(),
+            merge_base: *merge_base,
+        },
+        _ => ReviewTarget::Repository,
+    }
 }
 
 /// The working tree root containing `path`: the nearest of `path` and its ancestors with a

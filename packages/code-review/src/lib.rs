@@ -20,7 +20,10 @@
 //! * [`provider`] routes pull-request and stack sources to review-source provider plugins.
 //! * [`viewed`] matches identity-pinned viewed marks.
 //! * [`scope`] builds transient workspaces and derives the scope annotations are stored under.
+//! * [`assistant`] is what agents read and change in a review: the operations behind the code
+//!   review plugin's tools.
 
+pub mod assistant;
 pub mod data;
 pub mod document;
 pub mod provider;

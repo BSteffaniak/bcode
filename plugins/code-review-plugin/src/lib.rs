@@ -5,7 +5,8 @@
 //! Local Git code review plugin for Bcode.
 //!
 //! The plugin serves `bcode.code_review/v1` as JSON adapters over the `bcode_code_review` data
-//! layer and, when statically bundled, contributes the review app's keymap actions to bcode's
+//! layer, offers the review to agents as `code_review.*` tools ([`tools`]), and, when statically
+//! bundled, contributes the review app's keymap actions to bcode's
 //! keymap and registers the `bcode review` command, which runs the `bcode_code_review_ui` app in
 //! process.
 
@@ -13,6 +14,7 @@
 mod cli;
 
 mod service;
+pub mod tools;
 #[cfg(feature = "static-bundled")]
 pub mod tui;
 
@@ -83,6 +85,9 @@ impl RustPlugin for CodeReviewPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == COMMAND_INTERFACE_ID {
             return invoke_command_service(&context.request);
+        }
+        if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID {
+            return tools::invoke_service(&mut self.data, &context);
         }
         if context.request.interface_id != CODE_REVIEW_SERVICE_INTERFACE_ID {
             return ServiceResponse::error(

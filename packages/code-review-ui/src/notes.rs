@@ -18,9 +18,9 @@ use bcode_code_review_models::{
     ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
     ListPublishRecordsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
     ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, ResolveThreadRequest,
-    ReviewAiExchange, ReviewPublishRecord, ReviewScope, ReviewSourceKind, ReviewSuggestion,
-    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, SaveDraftRequest,
-    SaveDraftResponse, SaveReviewSuggestionRequest, UpdateDraftRequest,
+    ReviewAiExchange, ReviewPublishRecord, ReviewScope, ReviewSuggestion, ReviewTarget,
+    ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, SaveDraftRequest, SaveDraftResponse,
+    SaveReviewSuggestionRequest, UpdateDraftRequest,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -61,55 +61,12 @@ impl NoteScope {
     /// stored durable workspaces have always used.
     #[must_use]
     pub fn for_workspace(workspace: &ReviewWorkspace) -> Self {
-        let target = workspace
-            .sources
-            .iter()
-            .find(|source| source.included)
-            .map_or(ReviewTarget::Repository, |source| {
-                target_of_kind(&source.kind)
-            });
+        let (target, scope) = bcode_code_review::scope::annotation_scope(workspace);
         Self {
             repo_path: workspace.repo_root.clone(),
-            target: target.clone(),
-            scope: Some(ReviewScope::Workspace {
-                workspace_id: bcode_code_review::scope::annotation_workspace_id(workspace),
-                target,
-            }),
+            target,
+            scope: Some(scope),
         }
-    }
-}
-
-/// The legacy target of a source kind (the repository for kinds without one).
-fn target_of_kind(kind: &ReviewSourceKind) -> ReviewTarget {
-    match kind {
-        ReviewSourceKind::WorkingTreeUnstaged => ReviewTarget::WorkingTreeUnstaged,
-        ReviewSourceKind::IndexStaged => ReviewTarget::IndexStaged,
-        ReviewSourceKind::WorkingTreeAndIndex => ReviewTarget::WorkingTreeAndIndex,
-        ReviewSourceKind::LastCommit => ReviewTarget::LastCommit,
-        ReviewSourceKind::Commit { rev } => ReviewTarget::CommitRange {
-            base: format!("{rev}^"),
-            head: rev.clone(),
-            merge_base: false,
-        },
-        ReviewSourceKind::CommitRange {
-            base,
-            head,
-            merge_base,
-        } => ReviewTarget::CommitRange {
-            base: base.clone(),
-            head: head.clone(),
-            merge_base: *merge_base,
-        },
-        ReviewSourceKind::BranchCompare {
-            base_branch,
-            head_branch,
-            merge_base,
-        } => ReviewTarget::BranchCompare {
-            base_branch: base_branch.clone(),
-            head_branch: head_branch.clone(),
-            merge_base: *merge_base,
-        },
-        _ => ReviewTarget::Repository,
     }
 }
 

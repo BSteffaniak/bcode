@@ -17,28 +17,30 @@ use db::{
 };
 
 use bcode_code_review_models::{
-    ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,
-    CreateReviewWorkspaceResponse, DeleteDraftRequest, DeleteDraftResponse,
-    DeleteReviewAiExchangeRequest, DeleteReviewAiExchangeResponse, DraftAnchor, DraftComment,
-    ExternalReviewImportRecord, GetReviewDiffRequest, GetReviewThreadRequest,
-    GetReviewWorkspaceRequest, GetReviewWorkspaceResponse, LinkThreadSessionRequest,
-    LinkThreadSessionResponse, ListDraftsRequest, ListDraftsResponse,
+    ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, BindReviewAssistantRequest,
+    BindReviewAssistantResponse, CreateReviewWorkspaceRequest, CreateReviewWorkspaceResponse,
+    DeleteDraftRequest, DeleteDraftResponse, DeleteReviewAiExchangeRequest,
+    DeleteReviewAiExchangeResponse, DraftAnchor, DraftComment, ExternalReviewImportRecord,
+    GetReviewAssistantRequest, GetReviewAssistantResponse, GetReviewDiffRequest,
+    GetReviewThreadRequest, GetReviewWorkspaceRequest, GetReviewWorkspaceResponse,
+    LinkThreadSessionRequest, LinkThreadSessionResponse, ListDraftsRequest, ListDraftsResponse,
     ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
     ListPublishRecordsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
     ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, ListReviewWorkspacesRequest,
     ListReviewWorkspacesResponse, PublishReviewPreviewResponse, PublishReviewRequest,
     PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest,
     ResolveThreadResponse, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
-    ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile,
-    ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope,
-    ReviewSource, ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus, ReviewSurface,
-    ReviewSurfaceKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace,
-    ReviewWorkspaceListItem, SaveDraftRequest, SaveDraftResponse, SaveExternalReviewImportRequest,
-    SaveExternalReviewImportResponse, SavePublishRecordRequest, SavePublishRecordResponse,
-    SaveReviewAiExchangeRequest, SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest,
-    SaveReviewSuggestionResponse, UpdateDraftRequest, UpdateDraftResponse,
-    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
+    ReviewAssistantBinding, ReviewAssistantLookup, ReviewBundle, ReviewBundleLine,
+    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
+    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
+    ReviewPublisherManifest, ReviewScope, ReviewSource, ReviewSourceKind, ReviewSuggestion,
+    ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind,
+    ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem, SaveDraftRequest,
+    SaveDraftResponse, SaveExternalReviewImportRequest, SaveExternalReviewImportResponse,
+    SavePublishRecordRequest, SavePublishRecordResponse, SaveReviewAiExchangeRequest,
+    SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest, SaveReviewSuggestionResponse,
+    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
+    UpdateReviewWorkspaceResponse,
 };
 use bcode_path_display::display_from_current_dir;
 use serde::{Deserialize, Serialize};
@@ -222,6 +224,12 @@ store_operations! {
     /// Replace a workspace's snapshot from one importer.
     save_external_import(SaveExternalReviewImportRequest) -> SaveExternalReviewImportResponse
         => save_external_import_for_request;
+    /// Bind a session to the review it assists (or refresh its binding).
+    bind_assistant(BindReviewAssistantRequest) -> BindReviewAssistantResponse
+        => bind_assistant_for_request;
+    /// The binding of a session, or the newest binding of a review.
+    assistant_binding(&GetReviewAssistantRequest) -> GetReviewAssistantResponse
+        => assistant_binding_for_request;
     /// Summary of a review target with its draft counts.
     review_context(ReviewContextRequest) -> ReviewContextResponse => review_context_for_request;
     /// Draft threads of a review target.
@@ -1636,6 +1644,57 @@ fn list_drafts_for_request(
         Box::pin(async move { CodeReviewDb::new(database).list_drafts(&review_key).await })
     })?;
     Ok(ListDraftsResponse { drafts })
+}
+
+fn bind_assistant_for_request(
+    request: BindReviewAssistantRequest,
+    config: &CodeReviewConfig,
+) -> Result<BindReviewAssistantResponse, StoreError> {
+    let binding = request.binding;
+    if binding.schema_version != bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION {
+        return Err(StoreError::InvalidRequest(format!(
+            "unsupported review assistant binding schema version: {}",
+            binding.schema_version
+        )));
+    }
+    if binding.session_id.trim().is_empty() {
+        return Err(StoreError::InvalidRequest(
+            "a review assistant binding needs a session id".to_owned(),
+        ));
+    }
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let db_repo_root = repo_root.clone();
+    let workspace_id = crate::scope::annotation_workspace_id(&binding.workspace);
+    let binding = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .save_assistant_binding(&workspace_id, &db_repo_root, binding)
+                .await
+        })
+    })?;
+    Ok(BindReviewAssistantResponse { binding })
+}
+
+fn assistant_binding_for_request(
+    request: &GetReviewAssistantRequest,
+    config: &CodeReviewConfig,
+) -> Result<GetReviewAssistantResponse, StoreError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let lookup = request.lookup.clone();
+    let binding = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            let db = CodeReviewDb::new(database);
+            match lookup {
+                ReviewAssistantLookup::Session { session_id } => {
+                    db.assistant_binding_for_session(&session_id).await
+                }
+                ReviewAssistantLookup::Review { workspace_id } => {
+                    db.assistant_binding_for_review(&workspace_id).await
+                }
+            }
+        })
+    })?;
+    Ok(GetReviewAssistantResponse { binding })
 }
 
 fn list_ai_exchanges_for_request(

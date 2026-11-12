@@ -453,6 +453,87 @@ impl<'a> CodeReviewDb<'a> {
         Ok(exchange)
     }
 
+    /// Record `binding` for its session (replacing an earlier one), keyed by the annotation scope
+    /// id `workspace_id` of its review.
+    pub async fn save_assistant_binding(
+        &self,
+        workspace_id: &str,
+        repo_root: &Path,
+        mut binding: ReviewAssistantBinding,
+    ) -> Result<ReviewAssistantBinding, StoreError> {
+        let now = now_ms();
+        let existing = self
+            .assistant_binding_for_session(&binding.session_id)
+            .await?;
+        binding.updated_at_ms = now;
+        binding.created_at_ms = existing.map_or(now, |existing| existing.created_at_ms);
+        let json = serde_json::to_string(&binding)?;
+        if self
+            .db
+            .select("review_assistant_sessions")
+            .columns(&["session_id"])
+            .filter(Box::new(where_eq("session_id", binding.session_id.clone())))
+            .execute_first(self.db)
+            .await?
+            .is_some()
+        {
+            self.db
+                .update("review_assistant_sessions")
+                .value("workspace_id", workspace_id.to_string())
+                .value("repo_root", repo_root.display().to_string())
+                .value("binding_json", json)
+                .value("updated_at_ms", u64_to_i64(now))
+                .filter(Box::new(where_eq("session_id", binding.session_id.clone())))
+                .execute(self.db)
+                .await?;
+        } else {
+            self.db
+                .insert("review_assistant_sessions")
+                .value("session_id", binding.session_id.clone())
+                .value("workspace_id", workspace_id.to_string())
+                .value("repo_root", repo_root.display().to_string())
+                .value("binding_json", json)
+                .value("created_at_ms", u64_to_i64(binding.created_at_ms))
+                .value("updated_at_ms", u64_to_i64(now))
+                .execute(self.db)
+                .await?;
+        }
+        Ok(binding)
+    }
+
+    /// The binding of `session_id`, when it has one this version can read.
+    pub async fn assistant_binding_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ReviewAssistantBinding>, StoreError> {
+        let row = self
+            .db
+            .select("review_assistant_sessions")
+            .columns(&["binding_json"])
+            .filter(Box::new(where_eq("session_id", session_id.to_string())))
+            .execute_first(self.db)
+            .await?;
+        Ok(row.as_ref().and_then(assistant_binding_from_row))
+    }
+
+    /// The most recently refreshed readable binding of the review scoped by `workspace_id`.
+    pub async fn assistant_binding_for_review(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<ReviewAssistantBinding>, StoreError> {
+        let rows = self
+            .db
+            .select("review_assistant_sessions")
+            .columns(&["binding_json"])
+            .filter(Box::new(where_eq("workspace_id", workspace_id.to_string())))
+            .execute(self.db)
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(assistant_binding_from_row)
+            .max_by_key(|binding| (binding.updated_at_ms, binding.session_id.clone())))
+    }
+
     pub async fn list_suggestions(
         &self,
         review_key: &str,
@@ -1335,7 +1416,27 @@ pub fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(workspace_state_columns_migration());
     source.add_migration(thread_head_oid_column_migration());
     source.add_migration(thread_blob_oid_column_migration());
+    source.add_migration(review_assistant_sessions_table_migration());
     source
+}
+
+/// Sessions bound to the review they assist, with the binding as recorded.
+pub fn review_assistant_sessions_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "021_review_assistant_sessions_table".to_string(),
+        Box::new(
+            create_table("review_assistant_sessions")
+                .if_not_exists(true)
+                .column(text_column("session_id"))
+                .column(text_column("workspace_id"))
+                .column(text_column("repo_root"))
+                .column(text_column("binding_json"))
+                .column(int_column("created_at_ms"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("session_id"),
+        ),
+        None,
+    )
 }
 
 /// Line anchors record the blob of the anchored file side
@@ -1599,6 +1700,18 @@ pub fn ai_exchange_status_from_str(value: &str) -> Result<ReviewAiExchangeStatus
             "unsupported review AI exchange status: {value}"
         ))),
     }
+}
+
+/// A stored binding, or `None` when it is unreadable or of a schema version this version does
+/// not know (it is left in place for the version that wrote it).
+pub fn assistant_binding_from_row(row: &Row) -> Option<ReviewAssistantBinding> {
+    let json = optional_text(row, "binding_json")?;
+    serde_json::from_str::<ReviewAssistantBinding>(&json)
+        .ok()
+        .filter(|binding| {
+            binding.schema_version
+                == bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION
+        })
 }
 
 pub fn suggestion_from_row(row: &Row) -> Result<ReviewSuggestion, StoreError> {

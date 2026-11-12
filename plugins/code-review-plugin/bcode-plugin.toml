@@ -17,6 +17,12 @@ invocation_operations = ["invoke"]
 name                  = "Code Review Commands"
 
 [[services]]
+class        = "tool_execution"
+description  = "Review tools: read the code review, draft comments, mark files viewed, publish"
+interface_id = "bcode.tool/v1"
+name         = "Code Review Tools"
+
+[[services]]
 class        = "service"
 description  = "Local Git code review services"
 interface_id = "bcode.code_review/v1"

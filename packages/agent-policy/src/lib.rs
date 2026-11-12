@@ -339,9 +339,7 @@ fn evaluate_after_path(
         ToolPolicyOperation::Read { .. } => {
             evaluate_filesystem_path(config, request, &config.permission.read)
         }
-        ToolPolicyOperation::ReadOnly => {
-            evaluation(AgentDecision::Allow, String::new(), None, None)
-        }
+        ToolPolicyOperation::ReadOnly => evaluate_read_only(config, request),
         ToolPolicyOperation::Mutating => evaluate_mutating_fallback(config, request),
     }
 }
@@ -398,6 +396,27 @@ fn evaluate_web_url(config: &AgentConfig, request: &EvaluateToolCallRequest) -> 
             None,
             None,
         )
+    }
+}
+
+/// A read-only operation is allowed unless an exact tool rule (`permission.tools`) says to ask or
+/// deny.
+fn evaluate_read_only(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
+    match config.permission.tools.get(&request.tool_name) {
+        Some(action @ (Action::Ask | Action::Deny)) => evaluation(
+            if *action == Action::Ask {
+                AgentDecision::Ask
+            } else {
+                AgentDecision::Deny
+            },
+            format!(
+                "{} agent tool rule for {}: {action:?}",
+                request.agent_id, request.tool_name
+            ),
+            Some(request.tool_name.clone()),
+            None,
+        ),
+        _ => evaluation(AgentDecision::Allow, String::new(), None, None),
     }
 }
 
@@ -3363,6 +3382,43 @@ mod tests {
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
 
         assert_eq!(result.response.decision, AgentDecision::Ask);
+    }
+
+    #[test]
+    fn exact_tool_rules_can_ask_or_deny_read_only_tools() {
+        let request = |tool: &str| EvaluateToolCallRequest {
+            session_id: bcode_session_models::SessionId::new(),
+            agent_id: BUILD_AGENT.to_string(),
+            tool_name: tool.to_string(),
+            operation: ToolPolicyOperation::ReadOnly,
+            aliases: Vec::new(),
+            requires_permission: false,
+            policy_profile: None,
+            cwd: Some("/tmp/project".to_string()),
+            effective_config_toml: None,
+        };
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                tools: BTreeMap::from([
+                    ("review.read".to_string(), Action::Ask),
+                    ("review.secret".to_string(), Action::Deny),
+                    ("review.listed".to_string(), Action::Allow),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        let decision = |tool: &str| {
+            evaluate_tool_call(&config, &request(tool), Path::new("/tmp/project"))
+                .response
+                .decision
+        };
+        assert_eq!(decision("review.read"), AgentDecision::Ask);
+        assert_eq!(decision("review.secret"), AgentDecision::Deny);
+        assert_eq!(decision("review.listed"), AgentDecision::Allow);
+        // Without a rule a read-only tool stays allowed.
+        assert_eq!(decision("review.other"), AgentDecision::Allow);
     }
 
     #[test]
