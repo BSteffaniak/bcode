@@ -34,18 +34,14 @@ pub async fn connect_command() -> Result<(), CliError> {
         .await
         .map_err(external_error)?;
     println!("Connection approved. Bcode will read it in place; nothing was copied.");
-    let mut shell = bcode_tui::TerminalShell::enter()?;
-    let result = Box::pin(super::startup::select_external_model_in_shell(
-        &mut shell, &candidate,
-    ))
-    .await;
-    shell.finish()?;
-    if result? {
-        println!("Connection and model saved for startup.");
-    } else {
-        println!(
-            "No model selection changed. The approval remains available; explicit provider/model selections take precedence."
-        );
+    match super::startup::save_recommended_external_model(&candidate)? {
+        Some(model) => println!(
+            "Bcode will start with {model} using {}. Change the model anytime with /model.",
+            candidate.application
+        ),
+        None => println!(
+            "Your explicit provider/model selection is unchanged; choose this connection with /model in a session."
+        ),
     }
     Ok(())
 }

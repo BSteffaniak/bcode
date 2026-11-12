@@ -8,10 +8,17 @@ pub(super) async fn run(
         bcode_tui::NativeSetupOutcome::Unchanged => false,
         bcode_tui::NativeSetupOutcome::Refresh => true,
         bcode_tui::NativeSetupOutcome::ExternalApproved(candidate) => {
-            Box::pin(super::external_setup::select_external_model_in_shell(
-                shell, &candidate,
-            ))
-            .await?
+            // One confirmation: save the recommended model and start chatting.
+            super::external_setup::save_recommended_external_model(&candidate)?;
+            if !shell.stop_requested() {
+                Box::pin(super::super::run_new_session_tui_in_shell(
+                    shell,
+                    None,
+                    bcode_tui::TuiLaunchOptions::default(),
+                ))
+                .await?;
+            }
+            false
         }
     };
     if refresh && !shell.stop_requested() {

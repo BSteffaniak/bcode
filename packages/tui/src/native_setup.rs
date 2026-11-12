@@ -136,31 +136,51 @@ pub async fn run(
         return Ok(NativeSetupOutcome::Refresh);
     };
     let external = external_candidates().await;
-    let mut choices: Vec<_> = observed
+    let entries = ordered_entries(
+        &observed
+            .iter()
+            .map(|candidate| {
+                bcode_session_view::external_projection::harness_display_label(&candidate.plugin_id)
+            })
+            .collect::<Vec<_>>(),
+        &external
+            .iter()
+            .map(|candidate| agent_name(&candidate.application).to_owned())
+            .collect::<Vec<_>>(),
+    );
+    let mut choices: Vec<_> = entries
         .iter()
-        .map(|candidate| crate::QuickConnectionChoice {
-            label: format!(
-                "Use {}",
-                bcode_session_view::external_projection::harness_display_label(
-                    &candidate.plugin_id
-                )
-            ),
-            detail: format!(
-                "{} · {} · {} · {}",
-                candidate.native_version,
-                readiness_label(candidate.readiness),
-                home_relative(candidate.executable.invocation()),
-                home_relative(&candidate.config_namespace)
-            ),
+        .map(|entry| match *entry {
+            SetupEntry::Native(index) => {
+                let candidate = &observed[index];
+                crate::QuickConnectionChoice {
+                    label: format!(
+                        "Run {}",
+                        bcode_session_view::external_projection::harness_display_label(
+                            &candidate.plugin_id
+                        )
+                    ),
+                    detail: format!(
+                        "{} · {} · {} · {}",
+                        candidate.native_version,
+                        readiness_label(candidate.readiness),
+                        home_relative(candidate.executable.invocation()),
+                        home_relative(&candidate.config_namespace)
+                    ),
+                }
+            }
+            SetupEntry::External(index) => {
+                let candidate = &external[index];
+                crate::QuickConnectionChoice {
+                    label: format!("Use {} credentials in Bcode", candidate.application),
+                    detail: format!(
+                        "{} ({}) · read in place when Bcode makes requests; never copied, refreshed, or modified",
+                        candidate.target.provider_id, candidate.target.method_id
+                    ),
+                }
+            }
         })
         .collect();
-    choices.extend(external.iter().map(|candidate| crate::QuickConnectionChoice {
-        label: format!("Use {} credentials in Bcode", candidate.application),
-        detail: format!(
-            "{} ({}) · read in place when Bcode makes requests; never copied, refreshed, or modified",
-            candidate.target.provider_id, candidate.target.method_id
-        ),
-    }));
     let provider_index = choices.len();
     choices.push(crate::QuickConnectionChoice {
         label: "Provider connections and advanced settings".into(),
@@ -171,21 +191,25 @@ pub async fn run(
         recovery: Some(format!("{} Each tool keeps its own sign-in; nothing is installed or changed until you confirm.", if complete { "Found these coding agents on this machine." } else { "Found these coding agents; some locations could not be checked." })),
     }).await?;
     match outcome {
-        crate::QuickOnboardingOutcome::Selected(index) if index < observed.len() => {
-            let refresh = Box::pin(configure(shell, observed[index].clone())).await?;
-            Ok(if refresh {
-                NativeSetupOutcome::Refresh
-            } else {
-                NativeSetupOutcome::Unchanged
-            })
-        }
         crate::QuickOnboardingOutcome::Selected(index) if index < provider_index => {
-            let candidate = &external[index - observed.len()];
-            Ok(if Box::pin(approve_external(shell, candidate)).await? {
-                NativeSetupOutcome::ExternalApproved(candidate.clone())
-            } else {
-                NativeSetupOutcome::Unchanged
-            })
+            match entries[index] {
+                SetupEntry::Native(native) => {
+                    let refresh = Box::pin(configure(shell, observed[native].clone())).await?;
+                    Ok(if refresh {
+                        NativeSetupOutcome::Refresh
+                    } else {
+                        NativeSetupOutcome::Unchanged
+                    })
+                }
+                SetupEntry::External(external_index) => {
+                    let candidate = &external[external_index];
+                    Ok(if Box::pin(approve_external(shell, candidate)).await? {
+                        NativeSetupOutcome::ExternalApproved(candidate.clone())
+                    } else {
+                        NativeSetupOutcome::Unchanged
+                    })
+                }
+            }
         }
         crate::QuickOnboardingOutcome::Selected(index) if index == provider_index => {
             shell.run_setup(!no_discovery).await?;
@@ -197,6 +221,51 @@ pub async fn run(
         }
         _ => Ok(NativeSetupOutcome::Unchanged),
     }
+}
+
+/// One Setup picker entry, by index into its source list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupEntry {
+    Native(usize),
+    External(usize),
+}
+
+/// Agent a credential source belongs to: `Codex (ChatGPT sign-in)` belongs to `Codex`.
+fn agent_name(application: &str) -> &str {
+    application
+        .split_once(" (")
+        .map_or(application, |(agent, _)| agent)
+}
+
+/// Group entries by agent, keeping each agent's native installation before its credentials and
+/// otherwise preserving discovery order.
+fn ordered_entries(native_agents: &[String], external_agents: &[String]) -> Vec<SetupEntry> {
+    let entries: Vec<(&str, SetupEntry)> = native_agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| (agent.as_str(), SetupEntry::Native(index)))
+        .chain(
+            external_agents
+                .iter()
+                .enumerate()
+                .map(|(index, agent)| (agent.as_str(), SetupEntry::External(index))),
+        )
+        .collect();
+    let mut agents: Vec<&str> = Vec::new();
+    for (agent, _) in &entries {
+        if !agents.contains(agent) {
+            agents.push(agent);
+        }
+    }
+    agents
+        .iter()
+        .flat_map(|agent| {
+            entries
+                .iter()
+                .filter(move |(other, _)| other == agent)
+                .map(|(_, entry)| *entry)
+        })
+        .collect()
 }
 
 /// A path for display, abbreviating the user's home directory as `~`.
@@ -324,6 +393,7 @@ async fn configure(
     shell: &mut crate::TerminalShell,
     candidate: HarnessInstallationCandidate,
 ) -> Result<bool, CliError> {
+    let signed_in = candidate.readiness == HarnessCandidateReadiness::ExistingNativeLogin;
     let mut config = bcode_config::load_config()?;
     let client = bcode_client::ManagedSessionClient::default_endpoint();
     let snapshot = client.native_registration_snapshot().await?;
@@ -402,14 +472,18 @@ async fn configure(
         })
         .await?;
     let instance = prepared.native.instance;
+    // Already signed in: go straight to choosing a model.
+    if signed_in {
+        return Ok(!shell.stop_requested());
+    }
     let outcome = crate::run_backend_selection_in_shell(shell, crate::QuickOnboardingInput {
         choices: vec![
-            crate::QuickConnectionChoice { label: "Choose a model".into(), detail: "Pick a model and start chatting".into() },
             crate::QuickConnectionChoice { label: "Sign in".into(), detail: "Run the tool's own sign-in in this terminal; your credentials never pass through Bcode".into() },
+            crate::QuickConnectionChoice { label: "Choose a model".into(), detail: "Pick a model and start chatting".into() },
         ],
-        recovery: Some("All set. Choose a model to start, or sign in first if you haven't yet.".into()),
+        recovery: Some("All set. Sign in to the tool first, then choose a model.".into()),
     }).await?;
-    if matches!(outcome, crate::QuickOnboardingOutcome::Selected(1)) {
+    if matches!(outcome, crate::QuickOnboardingOutcome::Selected(0)) {
         sign_in(shell, instance).await?;
     }
     Ok(
@@ -488,6 +562,27 @@ async fn sign_in(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn setup_entries_group_each_agent_with_native_first() {
+        let native = ["Codex".to_owned(), "Claude Code".to_owned()];
+        let external = [
+            "OpenCode".to_owned(),
+            agent_name("Codex (ChatGPT sign-in)").to_owned(),
+            agent_name("Codex (API key)").to_owned(),
+        ];
+        assert_eq!(
+            ordered_entries(&native, &external),
+            [
+                SetupEntry::Native(0),
+                SetupEntry::External(1),
+                SetupEntry::External(2),
+                SetupEntry::Native(1),
+                SetupEntry::External(0),
+            ]
+        );
+        assert_eq!(agent_name("Pi"), "Pi");
+    }
 
     fn proposal() -> (
         HarnessPrepareCandidateRequest,

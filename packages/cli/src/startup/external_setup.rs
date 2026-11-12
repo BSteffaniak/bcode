@@ -1,23 +1,27 @@
-//! Model selection for an approved connection to another coding agent's credentials.
+//! Startup model for an approved connection to another coding agent's credentials.
 //!
-//! Discovery and approval happen in the shared Setup picker; this saves the chosen model
-//! together with the approved connection for startup.
+//! Discovery and approval happen in the shared Setup picker or `bcode auth connect`; this saves
+//! the provider's recommended model together with the approved connection, so setup takes one
+//! confirmation. The model can be changed later with `/model`.
 
 use super::CliError;
 use bcode_provider_auth_models::external::ExternalAuthCandidate;
 
-/// Save a model choice together with an approved connection, never credential material.
-/// Returns false when no model was chosen or an explicit selection already exists.
-pub async fn select_external_model_in_shell(
-    shell: &mut bcode_tui::TerminalShell,
+/// Save the provider's top recommended model with an approved connection, never credential
+/// material. Returns the saved model, or `None` when an explicit selection already exists or the
+/// provider recommends no model for the connection's method.
+///
+/// # Errors
+/// Fails when configuration, the plugin host, or the startup selection cannot be loaded or saved.
+pub fn save_recommended_external_model(
     candidate: &ExternalAuthCandidate,
-) -> Result<bool, CliError> {
+) -> Result<Option<String>, CliError> {
     let config = bcode_config::load_config()?;
     if super::has_explicit_selection(&config) {
-        return Ok(false);
+        return Ok(None);
     }
     let mut host = super::load_cli_plugin_host()?;
-    let mut selections = if host
+    let selections = if host
         .auth_provider(&candidate.target.provider_id)
         .is_some_and(|provider| provider.plugin_id == candidate.target.plugin_id)
     {
@@ -33,35 +37,15 @@ pub async fn select_external_model_in_shell(
         Vec::new()
     };
     host.deactivate_all()?;
-    for selection in &mut selections {
-        selection.external_auth_binding = Some(candidate.binding_id.clone());
-    }
-    if selections.is_empty() {
-        return Ok(false);
-    }
-    let outcome = bcode_tui::run_backend_selection_in_shell(
-        shell,
-        bcode_tui::QuickOnboardingInput {
-            choices: selections
-                .iter()
-                .map(|selection| bcode_tui::QuickConnectionChoice {
-                    label: format!("Use {} with {}", selection.model_id, candidate.application),
-                    detail:
-                        "Saved as your startup model. No session starts from this choice alone."
-                            .into(),
-                })
-                .collect(),
-            recovery: Some(
-                "Choose a model to use with this connection, or close to keep only the approval."
-                    .into(),
-            ),
-        },
-    )
-    .await?;
-    super::consent_enrolled_selection(&outcome, &selections, |selection| {
-        bcode_config::startup::save(selection)
-            .map(|_| ())
-            .map_err(|_| "Connection approved, but the startup model could not be saved.")
-    })
-    .map_err(|message| CliError::InvalidArguments(message.into()))
+    // Providers return recommendations first.
+    let Some(mut selection) = selections.into_iter().next() else {
+        return Ok(None);
+    };
+    selection.external_auth_binding = Some(candidate.binding_id.clone());
+    bcode_config::startup::save(&selection).map_err(|_| {
+        CliError::InvalidArguments(
+            "Connection approved, but the startup model could not be saved.".into(),
+        )
+    })?;
+    Ok(Some(selection.model_id))
 }

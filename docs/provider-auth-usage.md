@@ -66,13 +66,14 @@ with explicit consent. Nothing is imported into sshenv, copied, refreshed, or re
   verification route through generic daemon plugin calls, not dispatch, and reject external
   connections explicitly.
 
-Native Claude Code and Codex accounts are handled by the native harness setup in the same
-first-run picker; their credentials stay with the native agent. Bcode does not set
-`CLAUDE_CONFIG_DIR` for the default `~/.claude` namespace, because Claude Code selects a different
-OS credential-store entry when the variable is set, even to the default path. Automatic Codex
-native setup still requires an app-server mode that excludes user, project, and managed settings
-layers while keeping native credential custody; empty CLI table overrides merge instead of
-replacing inherited MCP and provider settings.
+The first-run Setup picker groups options by agent: for Codex, "Run Codex" (the native harness,
+using Codex's own sign-in and settings) sits next to "Use Codex credentials in Bcode" (Bcode's agent
+reading the approved document in place). Choosing a connection takes one confirmation: Bcode saves
+the provider's recommended model with it and starts a session; `/model` changes the model later.
+Native installations that are already signed in go straight to choosing a model; otherwise setup
+offers the tool's own sign-in first. Native credentials stay with the native agent. Bcode does not
+set `CLAUDE_CONFIG_DIR` for the default `~/.claude` namespace, because Claude Code selects a
+different OS credential-store entry when the variable is set, even to the default path.
 
 ## Operation
 

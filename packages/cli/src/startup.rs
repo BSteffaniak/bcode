@@ -7,7 +7,7 @@ use std::io::IsTerminal as _;
 
 mod external_setup;
 mod native_setup;
-pub use external_setup::select_external_model_in_shell;
+pub use external_setup::save_recommended_external_model;
 
 /// Interactive startup is opt-in for terminal launches, not automation.
 const fn interactive_startup(terminal: bool, ci: bool, opted_out: bool) -> bool {
