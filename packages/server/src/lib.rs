@@ -487,6 +487,9 @@ pub struct ServerState {
     tool_catalog: tool_catalog::ToolCatalogCache,
     client_tools: client_tools::ClientToolRegistry,
     request_only_contexts: turn_context::RequestOnlyContexts,
+    /// Serializes imports of named files, so two imports of the same conversation cannot both
+    /// miss the other and create it twice.
+    session_file_imports: Mutex<()>,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
     session_search_enabled: bool,
@@ -2678,6 +2681,7 @@ impl ServerState {
             tool_catalog: tool_catalog::ToolCatalogCache::default(),
             client_tools: client_tools::ClientToolRegistry::default(),
             request_only_contexts: turn_context::RequestOnlyContexts::default(),
+            session_file_imports: Mutex::new(()),
             startup_plugin_selection: init.startup_plugin_selection,
             default_plugin_ids: init.default_plugin_ids,
             session_search_enabled: init.session_search_enabled,

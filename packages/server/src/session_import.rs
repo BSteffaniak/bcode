@@ -774,6 +774,10 @@ impl ImportFileError {
 /// * `session_import_load_failed` when the plugin cannot read or decode the file.
 /// * `session_import_invalid_source` when the plugin answers for another source or file.
 /// * `session_import_conflict` when the external session was imported with other content.
+/// * `session_import_incomplete` when an earlier import of the same content stopped before
+///   all of its events were written; that session must be deleted before importing again.
+/// * `session_import_catalog_unavailable` when the session catalog cannot be loaded, so an
+///   earlier import of the same conversation cannot be ruled out.
 /// * `session_origin_invalid` or `session_import_failed` when canonical creation fails.
 pub async fn import_session_file(
     state: &ServerState,
@@ -796,6 +800,16 @@ pub async fn import_session_file(
     }
     let (importable, locator) = load_session_file(state, source_id, path).await?;
     let digest = import_content_digest(&importable.events)?;
+    // One file import at a time, against the fully loaded catalog: an earlier import of the
+    // same conversation is always found, so it is never created twice.
+    let _serialized = state.session_file_imports.lock().await;
+    state.sessions.wait_catalog_loaded().await.map_err(|_| {
+        ImportFileError::new(
+            "session_import_catalog_unavailable",
+            "the session catalog could not be loaded, so an earlier import of this conversation cannot be ruled out",
+        )
+    })?;
+    let event_count = importable.events.len();
     if let Some(existing) = all_cached_sessions(state)
         .await
         .into_iter()
@@ -811,7 +825,17 @@ pub async fn import_session_file(
             .as_ref()
             .and_then(|import| import.content_digest.as_deref());
         return if recorded == Some(digest.as_str()) {
-            Ok((existing.id, Vec::new(), false))
+            if imported_events_complete(state, existing.id, event_count).await {
+                Ok((existing.id, Vec::new(), false))
+            } else {
+                Err(ImportFileError::new(
+                    "session_import_incomplete",
+                    format!(
+                        "session {} holds an import of this conversation that stopped before all of its events were written; delete it and import again",
+                        existing.id
+                    ),
+                ))
+            }
         } else {
             Err(ImportFileError::new(
                 "session_import_conflict",
@@ -862,6 +886,37 @@ pub async fn import_session_file(
             ),
         })?;
     Ok((session.id, importable.warnings, true))
+}
+
+/// Whether all `event_count` imported events follow the import record of `session_id`.
+///
+/// Imported events are written in order right after the import record, so the import is
+/// complete exactly when the last of them exists. Two bounded reads; nothing is replayed.
+async fn imported_events_complete(
+    state: &ServerState,
+    session_id: SessionId,
+    event_count: usize,
+) -> bool {
+    let Ok(prefix) = state
+        .sessions
+        .session_events_range(session_id, 0, u64::MAX, 3)
+        .await
+    else {
+        return false;
+    };
+    let Some(imported) = prefix
+        .iter()
+        .find(|event| matches!(event.kind, SessionEventKind::SessionImported { .. }))
+        .map(|event| event.sequence)
+    else {
+        return false;
+    };
+    let last = imported.saturating_add(u64::try_from(event_count).unwrap_or(u64::MAX));
+    state
+        .sessions
+        .session_events_range(session_id, last, last, 1)
+        .await
+        .is_ok_and(|events| events.iter().any(|event| event.sequence == last))
 }
 
 /// Ask the source's plugin to read one named file; returns the session and its locator.
@@ -2508,6 +2563,96 @@ mod tests {
                 .code,
             "unknown_import_source"
         );
+        drop(state);
+    }
+
+    fn sdk_import_state(root: &std::path::Path) -> crate::ServerState {
+        crate::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent(root.join("sessions")).unwrap(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::from(["bcode.sdk-session-import".into()]),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &[bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
+                    bcode_sdk_session_import_plugin::static_plugin(),
+                )],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_and_restarted_imports_of_one_file_create_one_session() {
+        let root = tempfile::tempdir().unwrap();
+        let file = sdk_file(root.path(), "conversation.json", &["orders and users"]);
+        let state = sdk_import_state(root.path());
+        let (first, second) = tokio::join!(
+            super::import_session_file(&state, "sdk-json", &file, root.path(), None),
+            super::import_session_file(&state, "sdk-json", &file, root.path(), None),
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first.0, second.0, "both imports name one session");
+        assert_ne!(first.2, second.2, "exactly one of them created it");
+        drop(state);
+
+        // A daemon that starts again finds the earlier import before its catalog is warm.
+        let restarted = sdk_import_state(root.path());
+        let (again, _, created) =
+            super::import_session_file(&restarted, "sdk-json", &file, root.path(), None)
+                .await
+                .unwrap();
+        assert_eq!((again, created), (first.0, false));
+        drop(restarted);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_import_that_stopped_early_is_reported_not_returned() {
+        let root = tempfile::tempdir().unwrap();
+        let state = sdk_import_state(root.path());
+        let file = sdk_file(root.path(), "conversation.json", &["first", "second"]);
+        let (importable, locator) = super::load_session_file(&state, "sdk-json", &file)
+            .await
+            .unwrap();
+        let digest = super::import_content_digest(&importable.events).unwrap();
+        // An earlier import recorded the content but only wrote its first event.
+        let partial = importable
+            .events
+            .into_iter()
+            .take(1)
+            .scan(0_u64, |compacted, event| {
+                let provenance = super::import_event_provenance(&event, &locator);
+                Some((
+                    super::imported_session_event_kind(event.kind, compacted),
+                    provenance,
+                ))
+            })
+            .collect();
+        let stopped = state
+            .sessions
+            .import_session(
+                None,
+                root.path().to_path_buf(),
+                SessionImportSummary {
+                    source_id: "sdk-json".into(),
+                    source_display_name: "Bcode SDK JSON".into(),
+                    external_session_id: importable.summary.external_session_id,
+                    imported_at_ms: 1,
+                    content_digest: Some(digest),
+                },
+                partial,
+            )
+            .await
+            .unwrap();
+        let error = super::import_session_file(&state, "sdk-json", &file, root.path(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "session_import_incomplete");
+        assert!(error.message.contains(&stopped.id.to_string()), "{error:?}");
         drop(state);
     }
 }
