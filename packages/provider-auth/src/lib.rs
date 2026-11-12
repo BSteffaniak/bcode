@@ -14,10 +14,12 @@ pub mod auth_pool_state;
 pub mod custody_storage;
 pub mod discovery;
 pub mod enrollment;
+pub mod external_auth;
 pub mod interactive;
 pub mod lifecycle;
 pub mod managed;
 pub mod managed_pool;
+pub mod native_connections;
 #[cfg(target_os = "macos")]
 pub mod native_device;
 pub mod operations;
@@ -211,6 +213,32 @@ pub struct ProviderRequestContextResolution<'a> {
 pub fn resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> bcode_model::ProviderRequestContext {
+    if request
+        .selection
+        .settings
+        .contains_key("external_auth_binding")
+    {
+        return try_resolve_provider_request_context(request).unwrap_or_else(|_| {
+            bcode_model::ProviderRequestContext {
+                auth_profile: Some("external-unavailable".to_owned()),
+                auth: Some(bcode_model::ProviderAuthContext {
+                    backend: Some("external".to_owned()),
+                    diagnostics: vec![bcode_model::ProviderAuthDiagnostic {
+                        severity: "error".to_owned(),
+                        code: "external_auth_unavailable".to_owned(),
+                        remediation: Some(
+                            "Review and reconnect the explicitly selected external source"
+                                .to_owned(),
+                        ),
+                        message: "External authentication unavailable; no fallback source selected"
+                            .to_owned(),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        });
+    }
     match startup::resolve_remembered_environment(request.config, &request.selection) {
         Ok(Some(context)) => return context,
         Err(_) => return bcode_model::ProviderRequestContext {
@@ -243,10 +271,16 @@ pub fn resolve_provider_request_context(
 ///
 /// # Errors
 /// Returns a configuration error before credential materialization if required runtime
-/// metadata is unreadable, oversized, malformed, or unsupported.
+/// metadata is unreadable, oversized, malformed, or unsupported. External selections
+/// require [`startup::resolve_external_execution`] with execution-owned consent,
+/// authenticated declarations, verified optional caller identity, and destination evidence;
+/// this generic resolver never acquires them through ambient/default state.
 pub fn try_resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> Result<bcode_model::ProviderRequestContext, bcode_config::ConfigError> {
+    if let Some(context) = startup::resolve_selected_external(&request.selection)? {
+        return Ok(context);
+    }
     if let Some(context) =
         startup::resolve_remembered_environment(request.config, &request.selection)?
     {

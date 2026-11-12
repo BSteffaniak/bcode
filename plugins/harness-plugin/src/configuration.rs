@@ -275,7 +275,28 @@ impl InstanceDefinition {
 }
 
 fn catalog(context: &NativeServiceContext) -> Result<InstanceCatalog, ServiceResponse> {
-    catalog_from_config(&context.config.config)
+    let unconfigured = context.config.config.is_null()
+        || context
+            .config
+            .config
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    let mut catalog = if unconfigured {
+        InstanceCatalog {
+            default_instance: None,
+            instances: BTreeMap::new(),
+        }
+    } else {
+        catalog_from_config(&context.config.config)?
+    };
+    merge_published(&mut catalog.instances, published(context)?)?;
+    if unconfigured && catalog.instances.is_empty() {
+        return Err(ServiceResponse::error(
+            "configuration_disabled",
+            "managed instance configuration is disabled",
+        ));
+    }
+    Ok(catalog)
 }
 
 /// Resolve the enabled instance catalog from plugin configuration without native inspection.
@@ -345,6 +366,85 @@ fn catalog_from_config(config: &serde_json::Value) -> Result<InstanceCatalog, Se
         default_instance: settings.default_instance,
         instances,
     })
+}
+
+fn published(
+    context: &NativeServiceContext,
+) -> Result<Vec<bcode_harness_models::native_connections::NativeConnectionRecord>, ServiceResponse>
+{
+    use bcode_harness_models::native_connections::{
+        NATIVE_CONNECTION_LOOKUP_INTERFACE, NativeConnectionLookupRequest,
+        NativeConnectionLookupResponse,
+    };
+    if !context.bridge.is_available() {
+        return Ok(Vec::new());
+    }
+    let unavailable = || {
+        ServiceResponse::error(
+            "native_connections_unavailable",
+            "Canonical native connections are unavailable",
+        )
+    };
+    let reply = context
+        .bridge
+        .request(&ServiceBridgeRequest::InvokeService(
+            bcode_tool::ToolInvocationServiceRequest {
+                invocation_id: "native-catalog".into(),
+                request_id: "native-catalog".into(),
+                route_id: None,
+                interface_id: NATIVE_CONNECTION_LOOKUP_INTERFACE.into(),
+                operation: "lookup".into(),
+                payload: serde_json::to_value(NativeConnectionLookupRequest::Catalog {})
+                    .map_err(|_| unavailable())?,
+            },
+        ))
+        .map_err(|_| unavailable())?;
+    match reply {
+        ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+        ) => {
+            let response: NativeConnectionLookupResponse =
+                serde_json::from_value(payload).map_err(|_| unavailable())?;
+            Ok(response.records)
+        }
+        // Older bridges explicitly lacking this optional capability preserve configured catalogs.
+        ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Unsupported,
+        ) => Ok(Vec::new()),
+        _ => Err(unavailable()),
+    }
+}
+
+fn merge_published(
+    instances: &mut BTreeMap<String, HarnessInstance>,
+    records: Vec<bcode_harness_models::native_connections::NativeConnectionRecord>,
+) -> Result<(), ServiceResponse> {
+    let invalid = || {
+        ServiceResponse::error(
+            "invalid_native_connections",
+            "Invalid or conflicting canonical native connections",
+        )
+    };
+    if records.len() > MAX_INSTANCES {
+        return Err(invalid());
+    }
+    for record in records {
+        record.validate().map_err(|_| invalid())?;
+        if !record.approved {
+            return Err(invalid());
+        }
+        let prepared = record.prepared.ok_or_else(invalid)?;
+        if instances
+            .insert(prepared.instance.instance_id.clone(), prepared.instance)
+            .is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    if instances.len() > MAX_INSTANCES {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {

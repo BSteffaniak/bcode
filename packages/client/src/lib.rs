@@ -2661,6 +2661,26 @@ fn configured_runtime_context_with_auth(
             )
         })?);
     let resolved = config.resolved_model_selection();
+    if resolved.settings.contains_key("external_auth_binding") {
+        // Transport the selected recipe only. The serving daemon validates its fresh
+        // registry/destination and consent before acquiring anything at dispatch.
+        let provider_context = bcode_model::ProviderRequestContext {
+            model_profile: resolved.model_profile.clone(),
+            auth_profile: resolved.auth_profile.clone(),
+            auth_pool: resolved.auth_pool.clone(),
+            settings: resolved.settings.clone(),
+            request: resolved.request.clone(),
+            ..Default::default()
+        };
+        return Ok(runtime_context_from_selection(
+            working_directory,
+            effective_config_toml,
+            resolved,
+            provider_context,
+            BTreeMap::new(),
+            None,
+        ));
+    }
     let selected_environment = bcode_provider_auth::startup::selected_environment_for_selection(
         config,
         &resolved,
@@ -2723,6 +2743,50 @@ fn runtime_context_from_selection(
 #[cfg(test)]
 mod runtime_context_auth_tests {
     use super::*;
+
+    #[test]
+    fn external_client_selection_transports_recipe_without_materialization() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.provider_plugin_id = Some("synthetic.provider".into());
+        config.model.model_id = Some("synthetic-model".into());
+        config
+            .model
+            .settings
+            .insert("external_auth_binding".into(), "ab".repeat(32));
+        config
+            .model
+            .settings
+            .insert("dialect".into(), "synthetic".into());
+        config
+            .model
+            .settings
+            .insert("base_url".into(), "https://example.invalid/v1".into());
+        let context = configured_runtime_context_with_auth(
+            &config,
+            PathBuf::from("/synthetic-workspace"),
+            |_, _| panic!("external selections must not acquire client-side credentials"),
+        )
+        .unwrap();
+        assert_eq!(context.provider_context.settings, config.model.settings);
+        assert_eq!(
+            context.selected_provider_plugin_id.as_deref(),
+            Some("synthetic.provider")
+        );
+        assert_eq!(
+            context.selected_model_id.as_deref(),
+            Some("synthetic-model")
+        );
+        assert!(context.provider_context.auth.is_none());
+        assert_eq!(context.provider_context.auth_candidates, []);
+        assert!(context.provider_context.env.is_empty());
+        assert!(context.process_env.is_empty());
+        assert!(context.env_keys.is_empty());
+        // The public constructor also succeeds without any registered declaration,
+        // consent store, source file, or credential present on this client.
+        let actual =
+            configured_runtime_context(&config, PathBuf::from("/synthetic-workspace")).unwrap();
+        assert_eq!(actual.provider_context, context.provider_context);
+    }
 
     #[test]
     fn provider_validation_decode_preserves_negative_result_and_redacts_errors() {
@@ -9667,6 +9731,28 @@ impl BcodeClient {
         }
     }
 
+    /// Discover, approve, prepare, list, or revoke a native connection.
+    ///
+    /// This bootstrap operation does not resolve or acquire provider-profile credentials.
+    /// Native preparation remains consent-gated by the owning application.
+    ///
+    /// # Errors
+    /// Returns transport, daemon, or unexpected-response failures. Application failures
+    /// remain typed in `NativeConnectionResponse::Failed`.
+    pub async fn native_connection(
+        &self,
+        request: bcode_harness_models::native_connections::NativeConnectionRequest,
+    ) -> Result<bcode_harness_models::native_connections::NativeConnectionResponse, ClientError>
+    {
+        match self
+            .send_request(Request::NativeConnection { request })
+            .await?
+        {
+            ResponsePayload::NativeConnection { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     async fn send_request(&self, request: Request) -> Result<ResponsePayload, ClientError> {
         // Keep transport state machines out of every application caller's future.
         // This is owned, inline dispatch: dropping the box still cancels the lane
@@ -12355,6 +12441,87 @@ mod client_timeout_tests {
             .await
             .unwrap();
         assert_eq!(refreshed.catalog_revision, 2);
+        server.await.unwrap();
+        std::fs::remove_dir_all(socket_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_connection_bootstrap_uses_portable_transport_without_profile_auth() {
+        use bcode_harness_models::native_connections::{
+            NativeConnectionError, NativeConnectionRequest, NativeConnectionResponse,
+        };
+        use bcode_ipc::{Request, ResponsePayload};
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcs-{}", SessionOpenOperationId::new()));
+        create_private_socket_fixture(&socket_dir);
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("native.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            for expected_response in [
+                ResponsePayload::NativeConnection {
+                    response: NativeConnectionResponse::Records { records: vec![] },
+                },
+                ResponsePayload::NativeConnection {
+                    response: NativeConnectionResponse::Failed {
+                        error: NativeConnectionError::StateUnavailable,
+                    },
+                },
+                ResponsePayload::Pong,
+            ] {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = bcode_ipc::Response::Ok(ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion::current(),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                assert!(matches!(
+                    bcode_ipc::decode_request(&envelope.payload).unwrap(),
+                    Request::NativeConnection {
+                        request: NativeConnectionRequest::List {}
+                    }
+                ));
+                let response = bcode_ipc::Response::Ok(expected_response);
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(envelope.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        // No model, auth pool, or auth profile is selected for this bootstrap client.
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(5));
+        assert_eq!(
+            client
+                .native_connection(NativeConnectionRequest::List {})
+                .await
+                .unwrap(),
+            NativeConnectionResponse::Records { records: vec![] }
+        );
+        assert_eq!(
+            client
+                .native_connection(NativeConnectionRequest::List {})
+                .await
+                .unwrap(),
+            NativeConnectionResponse::Failed {
+                error: NativeConnectionError::StateUnavailable
+            }
+        );
+        assert!(matches!(
+            client
+                .native_connection(NativeConnectionRequest::List {})
+                .await,
+            Err(ClientError::UnexpectedResponse)
+        ));
         server.await.unwrap();
         std::fs::remove_dir_all(socket_dir).unwrap();
     }

@@ -18,10 +18,16 @@ bcode_claude_code          = { workspace = true }
 bcode_harness_models       = { workspace = true }
 bcode_plugin_sdk           = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
+bcode_tool                 = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }
+sha2                       = { workspace = true }
+tempfile                   = { workspace = true }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing                    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

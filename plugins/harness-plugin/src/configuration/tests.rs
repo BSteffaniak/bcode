@@ -1,4 +1,5 @@
 use super::*;
+mod native_connections;
 use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
 use serde_json::{Value, json};
 

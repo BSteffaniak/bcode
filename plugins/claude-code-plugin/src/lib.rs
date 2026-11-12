@@ -8,9 +8,12 @@ mod candidates;
 mod capabilities;
 mod config;
 mod diagnostics;
+mod discovery;
+mod discovery_service;
 mod execution;
 mod live;
 mod model_selection;
+mod native_connection;
 mod normalize;
 mod observation_wake;
 mod parent_bridge;
@@ -41,7 +44,16 @@ use bcode_harness_models::{
     MAX_HARNESS_WIRE_BYTES,
 };
 use bcode_plugin_sdk::prelude::*;
-use config::{Config, InstanceConfig};
+pub use config::{ApiBilling, Config, InstanceConfig};
+pub use discovery::{
+    ClaudeCodeCandidate, ClaudeCodeCompatibility, ClaudeCodeDiscovery, ClaudeCodePreparationError,
+    discover_candidates, discover_candidates_in,
+};
+pub use discovery_service::{
+    CLAUDE_DISCOVERY_INTERFACE_ID, CLAUDE_DISCOVERY_OPERATION, ClaudeDiscoveryCandidate,
+    ClaudeDiscoveryEvidence, ClaudeDiscoveryRequest, ClaudeDiscoveryResponse, ClaudeDiscoverySetup,
+    MAX_DISCOVERY_CANDIDATES, MAX_DISCOVERY_PATH_BYTES,
+};
 use normalize::Normalizer;
 use serde_json::Value;
 use std::{
@@ -679,20 +691,23 @@ impl PluginState {
                 "Harness contract or operation mismatch",
             );
         }
-        let configuration: Config = match context.config() {
+        let configuration: Config = match context.config_or_default() {
             Ok(value) => value,
             Err(_) => {
-                return ServiceResponse::error(
-                    "invalid_config",
-                    "Invalid Claude harness configuration",
-                );
+                return ServiceResponse::error("invalid_config", "Invalid Claude configuration");
             }
         };
-        let Some(selected) = configuration.instances.get(&request.instance.instance_id) else {
-            return reply(
-                &request,
-                HarnessServiceResponseKind::Failure(HarnessFailure::Unavailable),
-            );
+        let resolved;
+        let selected = if let Some(selected) =
+            configuration.instances.get(&request.instance.instance_id)
+        {
+            selected
+        } else {
+            resolved = match native_connection::resolve(&context, &request.instance) {
+                Ok(value) => value,
+                Err(error) => return reply(&request, HarnessServiceResponseKind::Failure(error)),
+            };
+            &resolved
         };
         if self.runtime.is_none() {
             match tokio::runtime::Builder::new_multi_thread()
@@ -1894,11 +1909,20 @@ fn prepare_handoff(context: &NativeServiceContext) -> ServiceResponse {
     {
         return ServiceResponse::error("invalid_request", "Invalid handoff identity or version");
     }
-    let Ok(config) = context.config::<Config>() else {
+    let Ok(config) = context.config_or_default::<Config>() else {
         return ServiceResponse::error("invalid_config", "Invalid native handoff configuration");
     };
-    let Some(selected) = config.instances.get(&request.instance.instance_id) else {
-        return ServiceResponse::error("unavailable", "Unknown native handoff instance");
+    let resolved;
+    let selected = if let Some(selected) = config.instances.get(&request.instance.instance_id) {
+        selected
+    } else {
+        resolved = match native_connection::resolve(context, &request.instance) {
+            Ok(value) => value,
+            Err(_) => {
+                return ServiceResponse::error("unavailable", "Native connection unavailable");
+            }
+        };
+        &resolved
     };
     let result = selected
         .options(&request.instance, selected.config_directory.clone(), None)

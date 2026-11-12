@@ -13,6 +13,9 @@ mod account_lifecycle;
 pub(crate) mod account_routing;
 pub(crate) mod artifact_operations;
 mod auxiliary_generation;
+mod external_auth;
+mod external_dispatch;
+mod native_connections;
 #[cfg(test)]
 use bcode_plugin_config::{
     redact_plugin_config_value, resolve_invocation_secrets,
@@ -5286,12 +5289,19 @@ async fn run_with_services(
     );
     skills_phase.finish();
     let auth_phase = bcode_metrics::startup::phase("server.auth_materialization");
-    let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
-        bcode_provider_auth::ProviderRequestContextResolution {
-            config: &config,
-            selection: resolved_model.clone(),
-        },
-    );
+    let selected_provider_context = if resolved_model
+        .settings
+        .contains_key("external_auth_binding")
+    {
+        external_auth_recipe(&resolved_model)
+    } else {
+        bcode_provider_auth::resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config: &config,
+                selection: resolved_model.clone(),
+            },
+        )
+    };
     auth_phase.finish();
     let workflow_store = bcode_workflow_store::WorkflowStore::unavailable_placeholder()?;
     let workflow_store_unavailable = Some(WorkflowInitializationFailure {
@@ -7003,6 +7013,11 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SetAccountRouting { .. } => "set_account_routing",
         Request::SetAccountPause { .. } => "set_account_pause",
         Request::RenameAccount { .. } => "rename_account",
+        Request::NativeConnection { .. } => "native_connection",
+        Request::DiscoverExternalAuth => "discover_external_auth",
+        Request::ApproveExternalAuth { .. } => "approve_external_auth",
+        Request::ListExternalAuth => "list_external_auth",
+        Request::RevokeExternalAuth { .. } => "revoke_external_auth",
         Request::AccountLifecycleCatalog => "account_lifecycle_catalog",
         Request::PreviewAccountLifecycle { .. } => "preview_account_lifecycle",
         Request::ExecuteAccountLifecycle { .. } => "execute_account_lifecycle",
@@ -11232,6 +11247,61 @@ async fn handle_core_runtime_request(
                 Err(error) => Response::Err(ErrorResponse::new(error.code, error.message)),
             };
             send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::NativeConnection { request } => {
+            let response = ServicesApplicationHandle::new(state, client_id)
+                .native_connection(request)
+                .await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::NativeConnection { response }),
+            )
+            .await
+        }
+        CoreRuntimeRequest::DiscoverExternalAuth => {
+            use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+            let result = ServicesApplicationHandle::new(state, client_id)
+                .discover_external_auth()
+                .await;
+            let payload = result.map_or_else(
+                |error| ResponsePayload::ExternalAuthFailed { error },
+                |candidates| ResponsePayload::ExternalAuthDiscovered { candidates },
+            );
+            send_response(writer, request_id, Response::Ok(payload)).await
+        }
+        CoreRuntimeRequest::ApproveExternalAuth { candidate, scope } => {
+            use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+            let result = ServicesApplicationHandle::new(state, client_id)
+                .approve_external_auth(candidate, scope)
+                .await;
+            let payload = result.map_or_else(
+                |error| ResponsePayload::ExternalAuthFailed { error },
+                |grant| ResponsePayload::ExternalAuthApproved { grant },
+            );
+            send_response(writer, request_id, Response::Ok(payload)).await
+        }
+        CoreRuntimeRequest::ListExternalAuth => {
+            use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+            let result = ServicesApplicationHandle::new(state, client_id)
+                .list_external_auth()
+                .await;
+            let payload = result.map_or_else(
+                |error| ResponsePayload::ExternalAuthFailed { error },
+                |grants| ResponsePayload::ExternalAuthListed { grants },
+            );
+            send_response(writer, request_id, Response::Ok(payload)).await
+        }
+        CoreRuntimeRequest::RevokeExternalAuth { grant } => {
+            use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+            let result = ServicesApplicationHandle::new(state, client_id)
+                .revoke_external_auth(grant)
+                .await;
+            let payload = result.map_or_else(
+                |error| ResponsePayload::ExternalAuthFailed { error },
+                |removed| ResponsePayload::ExternalAuthRevoked { removed },
+            );
+            send_response(writer, request_id, Response::Ok(payload)).await
         }
         CoreRuntimeRequest::AccountLifecycleCatalog => {
             let result = bcode_provider_auth_models::application::AccountLifecycleApplication::account_lifecycle_catalog(&ServicesApplicationHandle::new(state, client_id)).await;
@@ -25248,6 +25318,17 @@ async fn run_model_turn_round(
     let (delivery, provider_turn_id) = if let Some((push_plugin_id, push_interface_id)) =
         model_provider_push_route(state, provider_plugin_id)
     {
+        let mut push_request = request.clone();
+        if let Some(context) =
+            external_context_for_dispatch(state, Some(&push_plugin_id), request, None)
+                .await
+                .map_err(|message| {
+                    ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
+                })?
+        {
+            push_request.provider_context = context;
+        }
+        let request = &push_request;
         let payload = match serde_json::to_vec(request) {
             Ok(payload) => payload,
             Err(error) => {
@@ -25257,20 +25338,30 @@ async fn run_model_turn_round(
                 ));
             }
         };
-        let invocation = Box::pin(state.plugins.invoke_service_with_events_and_bridge_scoped(
-            &push_plugin_id,
-            push_interface_id,
-            OP_RUN_TURN,
-            payload,
-            scope,
-            Some(server_model_provider_bridge(
-                state.plugins.clone(),
-                config.clone(),
-                state.optional_judgement.invalidation_handle(),
-                &request.turn_id,
+        let invocation = Box::pin(
+            state.plugins.invoke_service_with_events_and_bridge_scoped(
                 &push_plugin_id,
-            )),
-        ))
+                push_interface_id,
+                OP_RUN_TURN,
+                payload,
+                scope,
+                if request
+                    .provider_context
+                    .settings
+                    .contains_key("external_auth_binding")
+                {
+                    None
+                } else {
+                    Some(server_model_provider_bridge(
+                        state.plugins.clone(),
+                        config.clone(),
+                        state.optional_judgement.invalidation_handle(),
+                        &request.turn_id,
+                        &push_plugin_id,
+                    ))
+                },
+            ),
+        )
         .await;
         state.metrics.record_histogram_with_labels(
             "model.provider.run_turn_start_duration_ms",
@@ -28785,21 +28876,38 @@ async fn attached_client_runtime_context(
         .then_some(first)
 }
 
+use external_dispatch::recipe as external_auth_recipe;
+
+/// Acquire external credentials at the authoritative dispatch boundary only.
+async fn external_context_for_dispatch(
+    state: &ServerState,
+    provider: Option<&str>,
+    request: &ModelTurnRequest,
+    home: Option<&Path>,
+) -> Result<Option<bcode_model::ProviderRequestContext>, String> {
+    if !request
+        .provider_context
+        .settings
+        .contains_key("external_auth_binding")
+    {
+        return Ok(None);
+    }
+    let default_home;
+    let home = if let Some(home) = home {
+        home
+    } else {
+        default_home = std::env::home_dir()
+            .ok_or("external authentication unavailable; no fallback permitted")?;
+        &default_home
+    };
+    external_dispatch::context_for_dispatch(state, provider, request, home).await
+}
+
 /// Resolve the provider context a session should use for an explicitly selected provider/model.
 ///
-/// Provider auth is provider-scoped: the daemon's default `selected_provider_context` belongs to
-/// the provider its default model profile targets and must never be stamped onto a selection for
-/// another provider (`ChatGPT` credentials on a Bedrock turn shadow Bedrock's own auth and produce
-/// misleading "missing credential" failures).
-///
-/// Resolution order:
-///
-/// * The default context when the selected provider matches the default provider.
-/// * Otherwise the best-matching `[model.profiles.*]` in `config` that targets the selected
-///   provider — an exact model match first, then any profile for that provider — resolved through
-///   the same auth materialization path startup uses.
-/// * Otherwise an empty context, letting the provider plugin fall back to its own environment and
-///   configuration resolution.
+/// Provider auth is provider-scoped: the daemon's default context must not be stamped onto
+/// a selection for another provider. Prefer the default context for the same provider,
+/// otherwise resolve the best matching configured profile (exact model first).
 fn provider_context_for_selection(
     state: &ServerState,
     config: &bcode_config::BcodeConfig,
@@ -28831,6 +28939,9 @@ fn provider_context_for_selection(
     let Some(selection) = config.resolved_model_profile(profile_name) else {
         return bcode_model::ProviderRequestContext::default();
     };
+    if selection.settings.contains_key("external_auth_binding") {
+        return external_auth_recipe(&selection);
+    }
     bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution { config, selection },
     )
@@ -28844,6 +28955,20 @@ fn overlay_transient_provider_context(
     selection: &mut bcode_model::ProviderRequestContext,
     runtime: bcode_model::ProviderRequestContext,
 ) {
+    if runtime.settings.contains_key("external_auth_binding") {
+        *selection = bcode_model::ProviderRequestContext {
+            model_profile: runtime.model_profile,
+            auth_profile: runtime.auth_profile,
+            auth_pool: runtime.auth_pool,
+            settings: runtime.settings,
+            request: runtime.request,
+            ..Default::default()
+        };
+        return;
+    }
+    if selection.settings.contains_key("external_auth_binding") {
+        return;
+    }
     if runtime.auth_profile.is_some() {
         selection.auth_profile = runtime.auth_profile;
     }
@@ -29246,6 +29371,28 @@ async fn invoke_model_provider_start_turn_with_custody(
     config: &bcode_config::BcodeConfig,
     custody: Option<Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>>,
 ) -> Result<StartTurnResponse, String> {
+    invoke_model_provider_start_turn_at_home(
+        state,
+        provider_plugin_id,
+        request,
+        scope,
+        config,
+        custody,
+        None,
+    )
+    .await
+}
+
+/// Home is host-owned dependency injection, never a serialized client parameter.
+async fn invoke_model_provider_start_turn_at_home(
+    state: &ServerState,
+    provider_plugin_id: Option<String>,
+    request: &ModelTurnRequest,
+    scope: PluginInvocationScope,
+    config: &bcode_config::BcodeConfig,
+    custody: Option<Arc<dyn bcode_provider_auth::operations::AuthCredentialCustody>>,
+    home: Option<&Path>,
+) -> Result<StartTurnResponse, String> {
     let (provider_plugin_id, interface_id) =
         if let Some(provider_plugin_id) = provider_plugin_id.as_deref() {
             let interface_id = model_provider_interface_for_plugin(state, provider_plugin_id)
@@ -29254,15 +29401,30 @@ async fn invoke_model_provider_start_turn_with_custody(
         } else {
             unique_model_provider_route(state)?
         };
+    let mut dispatch_request = request.clone();
+    if let Some(context) =
+        external_context_for_dispatch(state, Some(&provider_plugin_id), request, home).await?
+    {
+        dispatch_request.provider_context = context;
+    }
+    let request = &dispatch_request;
     let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let bridge = server_model_provider_bridge_with_custody(
-        state.plugins.clone(),
-        config.clone(),
-        state.optional_judgement.invalidation_handle(),
-        &request.turn_id,
-        &provider_plugin_id,
-        custody,
-    );
+    let bridge = if request
+        .provider_context
+        .settings
+        .contains_key("external_auth_binding")
+    {
+        None
+    } else {
+        Some(server_model_provider_bridge_with_custody(
+            state.plugins.clone(),
+            config.clone(),
+            state.optional_judgement.invalidation_handle(),
+            &request.turn_id,
+            &provider_plugin_id,
+            custody,
+        ))
+    };
     let mut labels = MetricLabels::new();
     labels.insert("provider_plugin_id".to_owned(), provider_plugin_id.clone());
     labels.insert("operation".to_owned(), OP_START_TURN.to_owned());
@@ -29278,7 +29440,7 @@ async fn invoke_model_provider_start_turn_with_custody(
                     OP_START_TURN,
                     payload,
                     scope,
-                    Some(bridge),
+                    bridge,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -70586,6 +70748,33 @@ library = "test"
             generation: 1,
             fencing_token: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    #[test]
+    fn external_recipe_overlay_discards_client_credential_payloads() {
+        let mut selection = bcode_model::ProviderRequestContext::default();
+        let mut runtime = bcode_model::ProviderRequestContext::default();
+        runtime
+            .settings
+            .insert("external_auth_binding".into(), "ab".repeat(32));
+        runtime
+            .env
+            .insert("SYNTHETIC_SECRET".into(), "fixture-only".into());
+        runtime.auth = Some(bcode_model::ProviderAuthContext::default());
+        runtime
+            .auth_candidates
+            .push(bcode_model::ProviderAuthCandidate::default());
+        overlay_transient_provider_context(&mut selection, runtime);
+        assert!(selection.settings.contains_key("external_auth_binding"));
+        assert!(selection.env.is_empty());
+        assert!(selection.auth.is_none());
+        assert_eq!(selection.auth_candidates, []);
+        let stale = bcode_model::ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext::default()),
+            ..Default::default()
+        };
+        overlay_transient_provider_context(&mut selection, stale);
+        assert!(selection.auth.is_none());
     }
 
     pub fn test_server_state(sessions: SessionManager) -> ServerState {

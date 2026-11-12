@@ -64,12 +64,25 @@ impl Launch {
     }
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
+        // Closed allowlist: provider keys, proxy/base-URL routes, preload hooks,
+        // remote app-server selectors and future Codex environment switches must
+        // not cross this boundary. Native credentials remain under CODEX_HOME.
         command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "en_US.UTF-8")
             .env("CODEX_HOME", &self.codex_home)
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CODEX_API_KEY")
-            .env_remove("OPENAI_BASE_URL")
             .current_dir(&self.working_directory);
+        // HOME is needed by native OS credential custody. Derive it from the
+        // explicitly admitted default namespace, never the parent environment.
+        if self
+            .codex_home
+            .file_name()
+            .is_some_and(|name| name == ".codex")
+            && let Some(home) = self.codex_home.parent()
+        {
+            command.env("HOME", home);
+        }
         command
     }
 }
@@ -729,6 +742,33 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, CodexError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_environment_is_closed_not_a_provider_denylist() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = Launch {
+            executable: PathBuf::from("/usr/bin/env"),
+            codex_home: temp.path().join(".codex"),
+            working_directory: temp.path().to_owned(),
+            ephemeral_credentials: false,
+            timeout: Duration::from_secs(1),
+        };
+        let output = launch.command().output().unwrap();
+        assert!(output.status.success());
+        let actual: BTreeMap<_, _> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| line.split_once('=').unwrap())
+            .collect();
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                ("PATH", "/usr/bin:/bin"),
+                ("LANG", "en_US.UTF-8"),
+                ("HOME", temp.path().to_str().unwrap()),
+                ("CODEX_HOME", launch.codex_home.to_str().unwrap()),
+            ])
+        );
+    }
     #[test]
     fn frame_bounds_and_truncated_eof_are_not_success() {
         assert!(read_frame(&mut &b"{}\n"[..]).unwrap().is_some());

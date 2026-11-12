@@ -325,7 +325,12 @@ fn require_public_operation(interface_id: &str, operation: &str) -> Result<(), P
 }
 
 fn require_public_service(interface_id: &str) -> Result<(), PublicPluginError> {
-    if interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID {
+    if matches!(
+        interface_id,
+        bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID
+            | bcode_harness_models::native_connections::NATIVE_PREPARATION_INTERFACE
+            | bcode_harness_models::native_connections::NATIVE_CONNECTION_LOOKUP_INTERFACE
+    ) {
         return Err(PublicPluginError {
             code: "host_only_service",
             message: "managed tool queue requires daemon admission",
@@ -428,6 +433,7 @@ pub async fn invoke_service(
             invocation,
             owner_for_driver,
             command_owner,
+            Some(plugin_id.clone()),
         ),
     ))
     .await
@@ -521,6 +527,7 @@ async fn drive_service_bridge<T>(
         invocation,
         None,
         None,
+        None,
     )
     .await
 }
@@ -532,6 +539,7 @@ async fn drive_service_bridge_owned<T>(
     invocation: impl std::future::Future<Output = T>,
     model_owner: Option<(String, String)>,
     command_owner: Option<(String, String, String)>,
+    bridge_owner: Option<String>,
 ) -> T {
     let _owner_guard = ModelOwnerGuard {
         host: state.model_host.clone(),
@@ -551,6 +559,15 @@ async fn drive_service_bridge_owned<T>(
                     return result;
                 };
                 let response = if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) = &bridge_call.request
+                    && request.interface_id == bcode_harness_models::native_connections::NATIVE_CONNECTION_LOOKUP_INTERFACE
+                {
+                    match bridge_owner.as_deref() {
+                        Some(caller) if !bridge_call.cancellation.is_cancelled() => {
+                            native_lookup_bridge(state, caller, request).await
+                        }
+                        _ => Err("native connection lookup requires authenticated plugin ownership".into()),
+                    }
+                } else if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) = &bridge_call.request
                     && request.interface_id == bcode_model::host_operation::INTERFACE_ID
                 {
                     let result = match &model_owner {
@@ -617,6 +634,18 @@ async fn drive_service_bridge_owned<T>(
     }
 }
 
+/// Resolve only the native publication lookup bound to the actual invoking plugin.
+async fn native_lookup_bridge(
+    state: &ServerState,
+    caller: &str,
+    request: &bcode_tool::ToolInvocationServiceRequest,
+) -> Result<bcode_plugin_sdk::ServiceBridgeResponse, String> {
+    let payload = super::native_connections::resolve_bridge_async(state, caller, request).await?;
+    Ok(bcode_plugin_sdk::ServiceBridgeResponse::Service(
+        bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+    ))
+}
+
 /// Call the unique provider of one typed plugin service interface.
 pub async fn call_service(
     state: &ServerState,
@@ -624,6 +653,31 @@ pub async fn call_service(
     operation: String,
     payload: Vec<u8>,
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
+    if interface_id
+        == bcode_harness_models::native_connections::NATIVE_CONNECTION_APPLICATION_INTERFACE
+    {
+        if operation != "execute"
+            || payload.len() > bcode_harness_models::native_connections::MAX_NATIVE_CONNECTION_BYTES
+        {
+            return Err(PublicPluginError {
+                code: "invalid_request",
+                message: "invalid native connection operation",
+            });
+        }
+        let request = serde_json::from_slice(&payload).map_err(|_| PublicPluginError {
+            code: "invalid_request",
+            message: "invalid native connection request",
+        })?;
+        let response = super::native_connections::execute(state, request).await;
+        let payload = serde_json::to_vec(&response).map_err(|_| PublicPluginError {
+            code: "native_connection_unavailable",
+            message: "native connection unavailable",
+        })?;
+        return Ok(PluginServiceOperationResult {
+            payload,
+            error: None,
+        });
+    }
     // Activity identity is scoped to an explicitly selected producer. Interface discovery
     // alone must not bypass the producer/revision checks in `invoke_service`.
     if interface_id == bcode_harness_models::MANAGED_TOOL_QUEUE_INTERFACE_ID {
@@ -667,6 +721,56 @@ pub async fn publish_event(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_preparation_and_lookup_require_host_admission() {
+        use bcode_harness_models::native_connections::{
+            NATIVE_CONNECTION_LOOKUP_INTERFACE, NATIVE_PREPARATION_INTERFACE,
+        };
+        for interface in [
+            NATIVE_PREPARATION_INTERFACE,
+            NATIVE_CONNECTION_LOOKUP_INTERFACE,
+        ] {
+            assert_eq!(
+                super::require_public_service(interface).unwrap_err().code,
+                "host_only_service"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_application_bootstrap_lists_without_model_auth_and_rejects_direct_prepare() {
+        use bcode_harness_models::native_connections::{
+            NATIVE_CONNECTION_APPLICATION_INTERFACE, NATIVE_PREPARATION_INTERFACE,
+            NativeConnectionResponse,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        state.state_root = root.path().to_owned();
+        let response = super::call_service(
+            &state,
+            NATIVE_CONNECTION_APPLICATION_INTERFACE,
+            "execute".into(),
+            br#"{"kind":"list"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(serde_json::from_slice::<NativeConnectionResponse>(&response.payload).unwrap(),
+            NativeConnectionResponse::Records { records } if records.is_empty())
+        );
+        let error = super::invoke_service(
+            &state,
+            "fixture.native",
+            NATIVE_PREPARATION_INTERFACE,
+            "prepare".into(),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "host_only_service");
+        drop(state);
+    }
+
     #[test]
     fn invocation_input_budget_counts_envelope_escaping_and_utf8() {
         for character in ['a', '\n', 'λ'] {

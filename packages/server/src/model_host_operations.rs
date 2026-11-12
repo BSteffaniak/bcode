@@ -545,6 +545,18 @@ impl ModelHostOperations {
         state: &ServerState,
         selection: &bcode_config::ResolvedModelSelection,
     ) -> Result<PreparedAuth, &'static str> {
+        if selection.settings.contains_key("external_auth_binding") {
+            if self.admission.custody.is_some() {
+                return Err("auth_unavailable");
+            }
+            // Carry only the recipe through model discovery; dispatch revalidates consent,
+            // destination and fresh credential bytes after authoritative model resolution.
+            return Ok(PreparedAuth {
+                context: external_auth_recipe(selection),
+                request_custody: None,
+                credential_custody: None,
+            });
+        }
         #[cfg(target_os = "linux")]
         if let Some(custody) = self.retained_custody(state, selection)? {
             let runtime = bcode_config::try_load_runtime_auth_subscriptions()
@@ -1364,6 +1376,30 @@ mod tests {
             panic!("settled normalized host poll must succeed");
         };
         serde_json::from_value(payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn external_dispatch_direct_host_preserves_recipe_through_model_resolution() {
+        let settings = BTreeMap::from([
+            ("external_auth_binding".into(), "ab".repeat(32)),
+            ("transport".into(), "synthetic".into()),
+        ]);
+        let (host, state) = fake_host(settings.clone());
+        let turn = retained_test_turn();
+        let prepared = host
+            .prepare_turn(&state, "external-recipe", &turn)
+            .await
+            .unwrap();
+        assert_eq!(prepared.route, "bcode.fake-provider");
+        assert_eq!(prepared.request.model_id, "fake-echo");
+        assert_eq!(prepared.request.provider_context.settings, settings);
+        assert!(prepared.request.provider_context.auth.is_none());
+        assert_eq!(
+            prepared.request.provider_context.auth_candidates,
+            Vec::<bcode_model::ProviderAuthCandidate>::new()
+        );
+        assert!(prepared.request.provider_context.env.is_empty());
+        assert!(prepared.credential_custody.is_none());
     }
 
     #[tokio::test]

@@ -878,6 +878,58 @@ impl bcode_daemon_lifecycle::application::RuntimeApplication for ServicesApplica
     }
 }
 
+impl bcode_provider_auth_models::external::ExternalAuthApplication
+    for ServicesApplicationHandle<'_>
+{
+    async fn discover_external_auth(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::external::ExternalAuthCandidate>,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        self.require_running().map_err(|_| {
+            bcode_provider_auth_models::external::ExternalAuthError::StateUnavailable
+        })?;
+        crate::external_auth::discover(self.state).await
+    }
+
+    async fn approve_external_auth(
+        &self,
+        candidate: bcode_provider_auth_models::external::ExternalAuthCandidate,
+        scope: Option<bcode_provider_auth_models::external::ExternalAuthScope>,
+    ) -> Result<
+        bcode_provider_auth_models::external::ExternalAuthGrant,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        self.require_running().map_err(|_| {
+            bcode_provider_auth_models::external::ExternalAuthError::StateUnavailable
+        })?;
+        crate::external_auth::approve(self.state, candidate, scope).await
+    }
+
+    async fn list_external_auth(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::external::ExternalAuthGrant>,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        self.require_running().map_err(|_| {
+            bcode_provider_auth_models::external::ExternalAuthError::StateUnavailable
+        })?;
+        crate::external_auth::list(self.state).await
+    }
+
+    async fn revoke_external_auth(
+        &self,
+        grant: bcode_provider_auth_models::external::ExternalAuthGrant,
+    ) -> Result<bool, bcode_provider_auth_models::external::ExternalAuthError> {
+        self.require_running().map_err(|_| {
+            bcode_provider_auth_models::external::ExternalAuthError::StateUnavailable
+        })?;
+        crate::external_auth::revoke(self.state, grant).await
+    }
+}
+
 impl bcode_provider_auth_models::application::AccountLifecycleApplication
     for ServicesApplicationHandle<'_>
 {
@@ -1081,6 +1133,142 @@ mod tests {
         Arc::new(crate::tests::test_server_state(
             bcode_session::SessionManager::default(),
         ))
+    }
+
+    #[tokio::test]
+    async fn native_connection_stopped_boundary_rejects_every_operation() {
+        use bcode_harness_models::native_connections::{
+            NativeCandidate, NativeConnectionError, NativeConnectionRequest,
+            NativeConnectionResponse,
+        };
+        let state = state();
+        state
+            .shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = ServicesApplicationHandle::new(&state, ClientId::new());
+        for request in [
+            NativeConnectionRequest::Discover {
+                plugin_id: "synthetic-plugin".into(),
+            },
+            NativeConnectionRequest::Approve {
+                candidate: NativeCandidate {
+                    candidate_id: "synthetic-native".into(),
+                    plugin_id: "synthetic-plugin".into(),
+                    executable: "/synthetic/bin/native".into(),
+                    config_namespace: "/synthetic/config".into(),
+                    installation_id: "synthetic-installation".into(),
+                },
+                expected_revision: 0,
+                mutation_id: "approve-synthetic".into(),
+            },
+            NativeConnectionRequest::Prepare {
+                candidate_id: "synthetic-native".into(),
+                expected_revision: 1,
+                mutation_id: "prepare-synthetic".into(),
+            },
+            NativeConnectionRequest::List {},
+            NativeConnectionRequest::Revoke {
+                candidate_id: "synthetic-native".into(),
+                expected_revision: 2,
+                mutation_id: "revoke-synthetic".into(),
+            },
+        ] {
+            assert_eq!(
+                handle.native_connection(request).await,
+                NativeConnectionResponse::Failed {
+                    error: NativeConnectionError::StateUnavailable
+                }
+            );
+        }
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn external_auth_boundary_rejects_unregistered_plugin_ownership() {
+        use bcode_provider_auth_models::external::{
+            ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthError,
+            ExternalAuthSourceKind, ExternalAuthTarget,
+        };
+        let state = state();
+        let handle = ServicesApplicationHandle::new(&state, ClientId::new());
+        let candidate = ExternalAuthCandidate {
+            source: ExternalAuthSourceKind::Codex,
+            binding_id: "ab".repeat(32),
+            target: ExternalAuthTarget {
+                plugin_id: "unregistered".into(),
+                provider_id: "unregistered".into(),
+                method_id: "method".into(),
+                credential_id: "credential".into(),
+            },
+            label: "Codex".into(),
+            available: true,
+        };
+        assert_eq!(
+            handle
+                .approve_external_auth(
+                    candidate.clone(),
+                    Some(
+                        bcode_provider_auth_models::external::ExternalAuthScope::Application {
+                            application_id: "bcode".into(),
+                        }
+                    )
+                )
+                .await,
+            Err(ExternalAuthError::ScopeDenied)
+        );
+        assert_eq!(
+            handle.approve_external_auth(candidate, None).await,
+            Err(ExternalAuthError::DeclarationChanged)
+        );
+    }
+
+    #[tokio::test]
+    async fn external_auth_stopped_boundary_rejects_every_operation() {
+        use bcode_provider_auth_models::external::{
+            ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthError,
+            ExternalAuthGrant, ExternalAuthScope, ExternalAuthSourceKind, ExternalAuthTarget,
+        };
+        let state = state();
+        state
+            .shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = ServicesApplicationHandle::new(&state, ClientId::new());
+        let candidate = ExternalAuthCandidate {
+            source: ExternalAuthSourceKind::Codex,
+            binding_id: "ab".repeat(32),
+            target: ExternalAuthTarget {
+                plugin_id: "disabled".into(),
+                provider_id: "provider".into(),
+                method_id: "method".into(),
+                credential_id: "credential".into(),
+            },
+            label: "Codex".into(),
+            available: true,
+        };
+        let grant = ExternalAuthGrant {
+            source: candidate.source.clone(),
+            binding_id: candidate.binding_id.clone(),
+            target: candidate.target.clone(),
+            scope: ExternalAuthScope::AllLocalApplications,
+            approved_at_unix: 1,
+        };
+        assert_eq!(
+            handle.discover_external_auth().await,
+            Err(ExternalAuthError::StateUnavailable)
+        );
+        assert_eq!(
+            handle.approve_external_auth(candidate, None).await,
+            Err(ExternalAuthError::StateUnavailable)
+        );
+        assert_eq!(
+            handle.list_external_auth().await,
+            Err(ExternalAuthError::StateUnavailable)
+        );
+        assert_eq!(
+            handle.revoke_external_auth(grant).await,
+            Err(ExternalAuthError::StateUnavailable)
+        );
+        drop(state);
     }
 
     #[tokio::test]

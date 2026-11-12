@@ -13,6 +13,68 @@ for provider-owned fallback; preparation neither retries turns nor interprets pr
 CLI verification applies this at each typed `BlockingModelProviderInvoker::start_turn`, including
 all prompt-cache scenario rounds, rather than relying only on the configured profile.
 
+## External connections without credential import
+
+`bcode auth connect` offers supported external API-key sources for explicit approval.
+`bcode auth connections` lists approvals; `bcode auth disconnect` revokes one.
+Approval stores a source binding and consent, not a credential copy in sshenv.
+The source application remains responsible for its credential file. Normal model
+execution acquires the selected credential at daemon dispatch, so source rotation
+and revocation are observed on subsequent dispatches. Explicit external selection
+fails closed rather than falling back to another account or billing route.
+
+Discovery inspects bounded source metadata, not credential contents. Presence is
+not remote validity. Acquisition validates the provider-declared file format after
+consent. Supported static-key declarations cover Codex API-key mode, OpenCode API
+entries, and Pi literal API-key entries. Dynamic Pi commands, environment references,
+OAuth entries, and mixed/unsupported Codex authentication documents are rejected.
+Automatic discovery respects the onboarding discovery opt-out. Headless operation
+never implicitly approves a source.
+
+Consent currently covers local Bcode applications. Application-specific approval
+is rejected until the application boundary supplies an authenticated application
+identity; caller-provided labels are not authority. Explicit provider/model/profile
+selection remains authoritative. Import remains a separate, optional operation.
+
+### Native subscriptions and harnesses
+
+Native Claude Code and Codex accounts remain native-managed; discovery is not
+permission to extract or refresh their OAuth tokens. Enabled plugins expose bounded
+passive installation discovery and consent-gated preparation through
+`bcode.harness.native-connection/v1`. `auth native-connect`, `auth native-connections`,
+and `auth native-disconnect` use the application boundary for approval, inspection,
+and revocation. Startup also offers native setup through the existing backend picker.
+Approval records the exact installation/namespace binding in durable Bcode user state;
+no native credentials, declarative configuration, or plugin cache become consent authority.
+
+Preparation publication rechecks the consent revision. Approved prepared records are
+merged into the managed harness catalog, and native plugins resolve only their own
+host-published instance through an invocation-bound lookup. Revocation blocks new use
+without logging out the source account or claiming ongoing work was cancelled.
+Provider-independent bootstrap does not require a model provider or vault login.
+
+Claude has a narrowly pinned `2.1.308` wrapper/payload profile for isolated optional
+settings, native-account status, and stream initialization. Preparation requires a
+logged-in native Claude account and rechecks artifact/namespace identity. This profile
+retains **unknown settlement** and does not claim successful generation, tool execution,
+authentication mutation, or durable recovery. A bounded installed-account generation
+attempt returned an error with limit/reset indicators; it did not establish live success.
+Codex preparation remains `CompatibilityUnavailable`: empty CLI table overlays merge
+rather than remove inherited MCP/provider settings, and no verified public settings-layer
+exclusion retaining native credentials has been established. See the plugin READMEs for
+exact compatibility scope and the required upstream capability.
+
+Do not auto-enable verified flags or describe installation/login status as successful
+execution. Existing explicitly configured harnesses retain their admission requirements.
+Synthetic tests cover canonical admission, approval denial, interrupt retention, and
+stale-owner fencing—not installed protocol settlement or successful restart recovery.
+
+Native application consent and publication filesystem operations run on blocking tasks;
+the global catalog lookup also moves durable reads off executor threads. Synchronous
+instance-bound lookup remains on the native plugin's blocking invocation thread. Dropping
+an application request does not prove an already-admitted blocking mutation had no effects;
+revision/mutation checks remain the authority for retries.
+
 ## Operation
 
 Request type: `bcode_model::AuthUsageRequest`

@@ -50,6 +50,18 @@ description  = "Optional independently negotiated evidence; Close acknowledgemen
 interface_id = "bcode.harness.recovery/v1"
 name         = "Exact constrained resume and physical transport release evidence"
 
+[[services]]
+class        = "query"
+description  = "Passive bounded installed Claude discovery only; compatibility and authentication readiness remain unknown; never executes native commands or reads credentials"
+interface_id = "bcode.harness.discovery/v1"
+name         = "Claude Code passive native discovery"
+
+[[services]]
+class        = "service"
+description  = "Consent-gated native preparation with exact installation provenance; unsupported compatibility fails closed"
+interface_id = "bcode.harness.native-connection/v1"
+name         = "Claude Code native connection preparation"
+
 [concurrency]
 # Operations still serialize on retained plugin state; only a waiting observe
 # releases that lock while it waits for native output.

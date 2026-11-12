@@ -9,6 +9,10 @@
 //! the host to decide whether the item may be replayed. Unknown item fields must survive an exact
 //! deserialize/persist/replay round trip.
 
+/// Provider-owned external credential formats and bounded source declarations.
+pub mod external_auth;
+pub use external_auth::api_key_discovery_sources;
+
 mod diagnostics;
 mod discovery;
 /// Provider-owned conversion of external conversation history.

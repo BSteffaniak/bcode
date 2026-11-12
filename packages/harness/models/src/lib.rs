@@ -10,6 +10,7 @@ mod execution;
 mod lifecycle;
 mod live;
 pub use live::*;
+pub mod native_connections;
 mod recovery;
 pub use execution::*;
 pub use recovery::*;

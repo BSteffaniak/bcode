@@ -584,7 +584,7 @@ impl PluginState {
                 return Err(CodexError::Bounds);
             }
         }
-        let launch = launch(instance, &open.working_directory)?;
+        let launch = launch(instance, &open.working_directory, context)?;
         let binding = open
             .resume
             .clone()

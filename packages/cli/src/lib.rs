@@ -940,7 +940,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Judgement { command } => Box::pin(handle_judgement_command(command)).await?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => {
-            handle_auth_entry(command, cli.no_credential_discovery).await?;
+            Box::pin(handle_auth_entry(command, cli.no_credential_discovery)).await?;
         }
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
@@ -7824,6 +7824,22 @@ enum AuthCommand {
         #[arg(long)]
         recipient: Option<String>,
     },
+    /// Discover and approve native coding-agent account reuse without token import.
+    NativeConnect,
+    /// List native account approvals and preparation state.
+    NativeConnections,
+    /// Revoke native connection consent without logging out the source agent.
+    NativeDisconnect,
+    /// Review and approve in-place use of an existing external credential source.
+    Connect {
+        /// Restrict approval to this application instead of all local Bcode applications.
+        #[arg(long)]
+        application: Option<String>,
+    },
+    /// List remembered external connection approvals without exposing credentials.
+    Connections,
+    /// Forget an external connection approval without logging out its source application.
+    Disconnect,
     /// Discover provider-declared external API keys without displaying their values.
     Discover,
     /// Review and copy one provider-declared external API key into an owned sshenv profile.
@@ -10747,7 +10763,7 @@ async fn handle_auth_entry(
         println!("Automatic credential discovery is disabled.");
         Ok(())
     } else if let Some(command) = command {
-        handle_auth_command(command).await
+        Box::pin(handle_auth_command(command)).await
     } else {
         auth_management::manage().await
     }
@@ -10761,6 +10777,23 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
         AccountLifecycleAction::Logout
     };
     match command {
+        AuthCommand::NativeConnect => {
+            Box::pin(startup::native_connections::connect_command(false)).await
+        }
+        AuthCommand::NativeConnections => startup::native_connections::list_command().await,
+        AuthCommand::NativeDisconnect => startup::native_connections::revoke_command().await,
+        AuthCommand::Connect { application } => {
+            Box::pin(external_connections::connect_command(application.map(
+                |application_id| {
+                    bcode_provider_auth_models::external::ExternalAuthScope::Application {
+                        application_id,
+                    }
+                },
+            )))
+            .await
+        }
+        AuthCommand::Connections => external_connections::list_command().await,
+        AuthCommand::Disconnect => external_connections::disconnect_command().await,
         AuthCommand::Discover | AuthCommand::Import { .. } => {
             credential_setup::handle_command(command)
         }
@@ -11527,6 +11560,8 @@ fn auth_usage_status(
     refresh: bool,
     json: bool,
 ) -> Result<(), CliError> {
+    let context = configured_provider_context(&bcode_config::load_config()?);
+    external_execution::reject_unsupported(&context, "auth usage").map_err(CliError::PluginCli)?;
     let plan = auth_prime_plan(pool, profile, include_primary)?;
     let refresh_debug = if refresh {
         refresh_prime_usage_windows(&plan)?
@@ -12999,6 +13034,8 @@ mod auth_login;
 mod auth_management;
 mod auth_prompts;
 mod credential_setup;
+mod external_connections;
+mod external_execution;
 mod harness;
 mod headless;
 mod startup;
@@ -15406,6 +15443,8 @@ fn write_model_catalog_diagnostics(
 async fn model_capabilities(json: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = config.resolved_model_selection();
+    external_execution::reject_unsupported(&configured_provider_context(&config), "capabilities")
+        .map_err(CliError::PluginCli)?;
     let request = bcode_model::ProviderCapabilitiesRequest {
         provider_context: configured_provider_context(&config),
         selected_model_id: selection.selected_model_id,
@@ -15578,13 +15617,23 @@ async fn verify_cache_candidates(
     selected_model_id: Option<&str>,
     args: &VerifyCacheArgs,
 ) -> Result<Vec<bcode_model::ModelInfo>, CliError> {
+    let location = external_execution::ExecutionLocation::current();
+    let resolved_context = external_execution::resolve(
+        host,
+        Some(provider_plugin_id),
+        context,
+        selected_model_id.unwrap_or_default(),
+        &location.state_root,
+        location.home.as_deref(),
+    )
+    .map_err(CliError::PluginCli)?;
     let models: bcode_model::ModelList = host
         .invoke_service_json(
             provider_plugin_id,
             bcode_model::MODEL_PROVIDER_INTERFACE_ID,
             bcode_model::OP_MODELS,
             &bcode_model::ModelListRequest {
-                provider_context: context.clone(),
+                provider_context: resolved_context.unwrap_or_else(|| context.clone()),
                 selected_model_id: selected_model_id.map(ToOwned::to_owned),
             },
         )
@@ -15734,6 +15783,8 @@ fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
         .provider_plugin_id
         .ok_or_else(|| CliError::PluginCli("no provider configured".to_string()))?;
     let mut context = configured_provider_context(&config);
+    external_execution::reject_unsupported(&context, "image upload verification")
+        .map_err(CliError::PluginCli)?;
     bcode_provider_auth::auth_pool_routing::apply_auth_pool_selection(&mut context);
     let visual_probe = if verify_reference {
         Some(bcode_model::image_upload::UploadedImageVisualProbe {
@@ -15831,7 +15882,10 @@ async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
     };
     let mut results = BTreeMap::new();
     let mut failed = candidates.is_empty();
-    let mut invoker = CliPluginTurnInvoker { host: &mut host };
+    let mut invoker = CliPluginTurnInvoker {
+        host: &mut host,
+        location: external_execution::ExecutionLocation::current(),
+    };
     for model in candidates {
         let model_id = model.model_id.clone();
         let result = if let Some(image) = &fixture {
@@ -15908,7 +15962,10 @@ async fn verify_model_caches(args: &VerifyCacheArgs) -> Result<(), CliError> {
 
     let mut results = BTreeMap::new();
     let mut passed = true;
-    let mut invoker = CliPluginTurnInvoker { host: &mut host };
+    let mut invoker = CliPluginTurnInvoker {
+        host: &mut host,
+        location: external_execution::ExecutionLocation::current(),
+    };
     for model in &candidates {
         let model_id = &model.model_id;
         let result = if args.dry_run {
@@ -16042,6 +16099,7 @@ fn print_verify_cache_result(model_id: &str, result: &CliVerifyCacheModelResult)
 
 struct CliPluginTurnInvoker<'a> {
     host: &'a mut bcode_plugin::PluginHost,
+    location: external_execution::ExecutionLocation,
 }
 
 impl BlockingModelProviderInvoker for CliPluginTurnInvoker<'_> {
@@ -16054,6 +16112,17 @@ impl BlockingModelProviderInvoker for CliPluginTurnInvoker<'_> {
             apply_auth_pool_selection, prepare_auth_pool_usage, record_auth_pool_usage,
         };
         let mut request = request.clone();
+        if let Some(context) = external_execution::resolve(
+            self.host,
+            provider_plugin_id,
+            &request.provider_context,
+            &request.model_id,
+            &self.location.state_root,
+            self.location.home.as_deref(),
+        )? {
+            request.provider_context = context;
+            return self.invoke_json(provider_plugin_id, bcode_model::OP_START_TURN, &request);
+        }
         bcode_provider_auth::session_routing::prepare_session_auth_pool(
             &request.session_id.to_string(),
             &mut request.provider_context,
@@ -16237,11 +16306,12 @@ fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
 fn configured_provider_context(
     config: &bcode_config::BcodeConfig,
 ) -> bcode_model::ProviderRequestContext {
+    let selection = config.resolved_model_selection();
+    if selection.settings.contains_key("external_auth_binding") {
+        return external_execution::recipe(selection);
+    }
     bcode_provider_auth::resolve_provider_request_context(
-        bcode_provider_auth::ProviderRequestContextResolution {
-            config,
-            selection: config.resolved_model_selection(),
-        },
+        bcode_provider_auth::ProviderRequestContextResolution { config, selection },
     )
 }
 

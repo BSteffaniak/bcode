@@ -4,6 +4,51 @@
 Its manifest declares `bcode.harness/v2`; it never registers a model provider or
 executes an observed native tool through Bcode's tool dispatcher.
 
+## Passive installed-agent reuse API
+
+`discover_candidates()` only examines HOME, PATH and an explicit CLAUDE_CONFIG_DIR.
+`discover_candidates_in(&ClaudeCodeDiscovery)` accepts synthetic or caller-resolved
+inputs. Discovery is bounded to 128 PATH entries, ignores relative search entries,
+deduplicates canonical paths, and checks executable/namespace metadata only. It never
+runs `claude`, opens credentials/settings, reads sshenv, installs anything, or claims
+that a namespace is authenticated. An absent namespace returns no candidate.
+
+`ClaudeCodeCandidate::prepare(approved, &ClaudeCodeCompatibility)` returns the
+public, serializable `InstanceConfig` for existing managed-harness execution.
+`harness_instance(instance_id, profile)` supplies its matching native-managed
+binding. The host must obtain explicit first-use consent with its configured scope
+(all local applications by default), revalidate that consent before use, admit the
+installation against trusted exact-version compatibility evidence, and separately
+authorize status/launch. Discovery/binding construction grants none of these.
+
+Compatibility must establish native status and empty optional setting-source
+behavior, including managed-policy retention. Version output alone is not evidence.
+Preparation disables optional user/project/local settings sources and preserves the
+existing native permission/tool path. It does not infer login-handoff support or
+session-state/background settlement. No tokens are exported to Bcode or a vault;
+this is explicitly a Claude managed harness, not native Bcode provider execution.
+
+A metadata stamp rejects ordinary executable replacement/in-place updates, even
+with unchanged claimed version. It is **not** a cryptographic artifact digest,
+does not close process-spawn TOCTOU races, and does not identify script interpreters
+or wrapped dependencies. The host's trusted executable admission must cover those
+identities and revalidate immediately before use; the existing launch path also
+checks exact version. No installed version is automatically declared compatible.
+Synthetic fixture tests establish preparation behavior only, not live compatibility.
+Central consent/CLI registration remains host wiring. Passive discovery is production-reachable
+through the manifest-registered query service `bcode.harness.discovery/v1`, operation
+`discover`, routed before runtime/configuration initialization. Send
+`{"schema_version":1,"request_id":"local-query"}`; public `ClaudeDiscoveryRequest`
+and `ClaudeDiscoveryResponse` define the plugin-owned renderer-neutral wire DTOs.
+Unknown schema versions, operations and request fields fail closed. Requests are
+limited to 1 KiB, responses to 64 KiB, and snapshots to 16 candidates with canonical
+UTF-8 paths of at most 1,024 bytes each (oversized/control-bearing paths are omitted,
+not truncated). `truncated` reports response omissions; underlying PATH discovery
+inspects at most 128 entries, so absence is not a complete installation inventory.
+Compatibility and readiness are always `unknown`; `required_setup` names explicit
+consent, exact-installation compatibility, and native-managed harness preparation.
+The query has no status/version/login/launch operation and grants no auth authority.
+
 ## Integration
 
 The coordinator must register workspace membership/dependencies for

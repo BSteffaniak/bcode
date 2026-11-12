@@ -103,7 +103,11 @@ fn configured_fixture(with_open: bool) -> std::pin::Pin<Box<dyn Future<Output = 
             authentication: capability,
         };
         if with_open {
-            let opening = native_observation::opening_request(session.id, &instance, root.path());
+            let directory = sessions
+                .session_working_directory(session.id)
+                .await
+                .unwrap();
+            let opening = native_observation::opening_request(session.id, &instance, &directory);
             Box::pin(sessions.prepare_external_harness_open(
                 &durable,
                 &opening,

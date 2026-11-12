@@ -1,6 +1,6 @@
 //! Provider-owned startup discovery. No source grants authentication or consent.
 
-use crate::discovery::{CredentialSourceStatus, read_selected};
+use crate::discovery::CredentialSourceStatus;
 pub use bcode_provider_auth_models::startup::{
     StartupAuthCandidate, StartupCredentialAvailability, StartupCredentialSource,
 };
@@ -34,6 +34,115 @@ pub fn set_enabled_providers<'a>(
         .write()
         .map_err(|_| "enabled authentication declarations unavailable")? = enabled;
     Ok(())
+}
+
+/// Resolve an explicit external binding with execution-owned registry and destination evidence.
+///
+/// `provider_choices` must be obtained from the selected enabled plugin's offline startup
+/// operation, not from persisted state, frontend input, or the selection being validated.
+#[derive(Clone, Copy)]
+pub struct ExternalExecutionContext<'a> {
+    /// Explicit authorized credential home.
+    pub home: &'a Path,
+    /// Serving daemon's state location.
+    pub store: &'a crate::external_auth::ExternalAuthStore,
+    /// Current authenticated enabled-plugin declarations.
+    pub enabled: crate::external_auth::EnabledDeclarations<'a>,
+    /// Verified application identity, or `None` when this boundary cannot authenticate one.
+    /// Never substitute a frontend label or an empty string for missing identity.
+    pub application_id: Option<&'a str>,
+    /// Fresh provider-owned destination/model recommendations.
+    pub provider_choices: &'a [bcode_model::StartupRecommendation],
+}
+
+/// Resolve explicit external auth with no ambient registry or profile/billing fallback.
+///
+/// # Errors
+/// Rejects conflicting profiles/pools, unapproved destinations, disabled/drifted declarations,
+/// revoked consent, and application scope mismatch before acquiring credential bytes.
+pub fn resolve_external_execution(
+    selection: &bcode_config::ResolvedModelSelection,
+    execution: ExternalExecutionContext<'_>,
+) -> Result<Option<bcode_model::ProviderRequestContext>, bcode_config::ConfigError> {
+    let Some(binding_id) = selection.settings.get("external_auth_binding") else {
+        return Ok(None);
+    };
+    if selection.auth_profile.is_some()
+        || selection.auth_pool.is_some()
+        || !selection.request.is_empty()
+    {
+        return Err(startup_error(
+            "external authentication cannot combine profiles, pools or request overrides",
+        ));
+    }
+    let mut settings = selection.settings.clone();
+    settings.remove("external_auth_binding");
+    if !execution.provider_choices.iter().any(|choice| {
+        Some(choice.provider_plugin_id.as_str()) == selection.provider_plugin_id.as_deref()
+            && Some(choice.model_id.as_str()) == selection.model_id.as_deref()
+            && choice.settings == settings
+    }) {
+        return Err(startup_error(
+            "external authentication destination is not approved by the enabled provider",
+        ));
+    }
+    let candidate = execution
+        .store
+        .list()
+        .map_err(|_| startup_error("external authentication consent unavailable"))?
+        .into_iter()
+        .find(|grant| {
+            grant.binding_id == *binding_id && match &grant.scope {
+                bcode_provider_auth_models::external::ExternalAuthScope::AllLocalApplications => {
+                    true
+                }
+                bcode_provider_auth_models::external::ExternalAuthScope::Application {
+                    application_id,
+                } => Some(application_id.as_str()) == execution.application_id,
+            }
+        })
+        .map(
+            |grant| bcode_provider_auth_models::external::ExternalAuthCandidate {
+                source: grant.source,
+                binding_id: grant.binding_id,
+                target: grant.target,
+                label: String::new(),
+                available: false,
+            },
+        )
+        .ok_or_else(|| {
+            startup_error("external authentication requires approval for this application")
+        })?;
+    if Some(candidate.target.plugin_id.as_str()) != selection.provider_plugin_id.as_deref() {
+        return Err(startup_error(
+            "external authentication plugin ownership mismatch",
+        ));
+    }
+    let mut context = execution
+        .store
+        .resolve(
+            execution.home,
+            execution.enabled,
+            &candidate,
+            execution.application_id,
+        )
+        .map_err(|_| startup_error("external authentication unavailable; no fallback permitted"))?;
+    context.settings = settings;
+    context.model_profile.clone_from(&selection.model_profile);
+    Ok(Some(context))
+}
+
+/// Reject external acquisition without execution-owned consent and destination evidence.
+/// Generic context resolution must not consult default state or infer caller identity.
+pub(crate) fn resolve_selected_external(
+    selection: &bcode_config::ResolvedModelSelection,
+) -> Result<Option<bcode_model::ProviderRequestContext>, bcode_config::ConfigError> {
+    if selection.settings.contains_key("external_auth_binding") {
+        return Err(startup_error(
+            "external authentication requires execution-owned destination-validated resolution; no fallback permitted",
+        ));
+    }
+    Ok(None)
 }
 
 fn validated_enabled_providers<'a>(
@@ -243,15 +352,28 @@ pub fn discover_candidates<'a>(
                             }
                             (name.clone(), environment_status(environment(name), field))
                         }
-                        AuthCredentialSource::JsonFile { application, .. } => {
-                            let status = match read_selected(home, field, source_index) {
-                                Ok(Some(_)) => StartupCredentialAvailability::Available,
-                                Ok(None) => StartupCredentialAvailability::Missing,
-                                Err(CredentialSourceStatus::Missing) => {
-                                    StartupCredentialAvailability::Missing
-                                }
-                                Err(_) => StartupCredentialAvailability::Unavailable,
-                            };
+                        AuthCredentialSource::JsonFile {
+                            application,
+                            relative_path,
+                            ..
+                        }
+                        | AuthCredentialSource::JsonFileValidated {
+                            application,
+                            relative_path,
+                            ..
+                        } => {
+                            let status =
+                                match crate::discovery::source_presence(home, relative_path) {
+                                    CredentialSourceStatus::Available => {
+                                        StartupCredentialAvailability::Available
+                                    }
+                                    CredentialSourceStatus::Missing => {
+                                        StartupCredentialAvailability::Missing
+                                    }
+                                    CredentialSourceStatus::Unavailable => {
+                                        StartupCredentialAvailability::Unavailable
+                                    }
+                                };
                             (application.clone(), status)
                         }
                     };
@@ -493,6 +615,7 @@ mod tests {
             catalog_provider_id: None,
             auth_profile: None,
             context: None,
+            external_binding_id: None,
             environment_auth_provider: Some("fake".to_owned()),
             environment_method: Some("key".to_owned()),
             environment_credential: Some("api_key".to_owned()),

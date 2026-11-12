@@ -4,24 +4,30 @@ use bcode_claude_code::{
     SettlementSupport,
 };
 use bcode_harness_models::{HarnessAuthCustody, HarnessFailure, HarnessInstance};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
-#[derive(Default, Deserialize)]
+/// Resolved plugin configuration; contains selections and attestations, not secrets.
+#[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Configured harness instances keyed by stable instance identity.
     #[serde(default)]
     pub instances: BTreeMap<String, InstanceConfig>,
 }
-#[derive(Deserialize)]
+/// Explicit configuration for the existing managed-harness execution path.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceConfig {
     /// Native is the compatibility default. API mode requires an exact host credential grant.
     #[serde(default)]
     pub billing: ApiBilling,
 
+    /// Absolute native executable path.
     pub executable: PathBuf,
+    /// Absolute native credential/configuration namespace.
     pub config_directory: PathBuf,
+    /// Expected exact trimmed native version output; not capability evidence.
     pub exact_version: String,
     /// Operator attestation for this exact executable/version, not a version-number guess.
     #[serde(default)]
@@ -35,14 +41,20 @@ pub struct InstanceConfig {
     /// Explicit inherited settings sources; None preserves native defaults and managed policy.
     pub setting_sources: Option<Vec<String>>,
 }
-#[derive(Default, Deserialize)]
+/// Billing selection; never implicitly falls back between native and API credentials.
+#[derive(Default, Deserialize, Serialize)]
 #[serde(tag = "route", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApiBilling {
+    /// Existing native credential custody, with no token export.
     #[default]
     Native,
+    /// Explicit host-owned API credential selection.
     ApiKey {
+        /// Declared provider identity.
         provider_id: String,
+        /// Selected credential profile.
         profile: String,
+        /// Host credential namespace.
         credential_namespace: String,
     },
 }
@@ -136,6 +148,8 @@ impl InstanceConfig {
         Ok(())
     }
 
+    /// Exact-version native auth capability selected by explicit attestation.
+    #[must_use]
     pub const fn native_auth_support(&self) -> NativeAuthSupport {
         if self.verified_native_auth {
             NativeAuthSupport::VerifiedStatusAndLogin
@@ -146,6 +160,9 @@ impl InstanceConfig {
         }
     }
 
+    /// Resolve a native-account launch without requesting host API credentials.
+    /// # Errors
+    /// Rejects API billing, mismatched instance identity, invalid paths or ambient auth routes.
     pub fn options(
         &self,
         instance: &HarnessInstance,

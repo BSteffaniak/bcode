@@ -31,6 +31,10 @@ pub struct StartupSelection {
     /// Optional named authentication profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_profile: Option<String>,
+    /// Exact approved external credential binding, never credential material.
+    /// Cannot be combined with a named profile or an environment source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_binding_id: Option<String>,
     /// Optional environment source name, never its value. Authentication remains provider-owned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_variable: Option<String>,
@@ -155,7 +159,13 @@ fn validate(selection: &StartupSelection) -> Result<(), StartupStateError> {
     ];
     let source_complete = source.iter().all(Option::is_some);
     let source_absent = source.iter().all(Option::is_none);
-    if (!source_complete && !source_absent)
+    if selection
+        .external_binding_id
+        .as_deref()
+        .is_some_and(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || (selection.external_binding_id.is_some()
+            && (selection.auth_profile.is_some() || !source_absent))
+        || (!source_complete && !source_absent)
         || source.iter().flatten().any(|value| !reference(value))
         || selection
             .auth_mode
@@ -339,6 +349,12 @@ pub fn apply_fallback(
             config.model.settings.insert(key.to_owned(), value.clone());
         }
     }
+    if let Some(binding_id) = &selection.external_binding_id {
+        config
+            .model
+            .settings
+            .insert("external_auth_binding".to_owned(), binding_id.clone());
+    }
     config.startup_selection_applied = true;
     true
 }
@@ -359,6 +375,7 @@ mod tests {
             auth_mode: Some("api_key".to_owned()),
             catalog_provider_id: Some("example.catalog".to_owned()),
             auth_profile: Some("chosen-account".to_owned()),
+            external_binding_id: None,
             environment_variable: Some("EXAMPLE_API_KEY".to_owned()),
             environment_auth_provider: Some("example.auth".to_owned()),
             environment_method: Some("api_key".to_owned()),
@@ -372,6 +389,40 @@ mod tests {
             BTreeMap::from([("BCODE_STATE_DIR".to_owned(), OsString::from(root))]),
             root.to_path_buf(),
         )
+    }
+
+    #[test]
+    fn external_binding_is_nonsecret_explicit_and_exclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("startup.toml");
+        let mut choice = selection();
+        choice.auth_profile = None;
+        choice.environment_variable = None;
+        choice.environment_auth_provider = None;
+        choice.environment_method = None;
+        choice.environment_credential = None;
+        choice.external_binding_id = Some("a".repeat(64));
+        save_to(&path, &choice).unwrap();
+        assert_eq!(load_from(&path).unwrap(), Some(choice.clone()));
+        let mut config = BcodeConfig::default();
+        assert!(apply_fallback(
+            &mut config,
+            &choice,
+            &environment(temp.path())
+        ));
+        assert_eq!(
+            config.model.settings.get("external_auth_binding"),
+            choice.external_binding_id.as_ref()
+        );
+        choice.auth_profile = Some("other-account".to_owned());
+        assert!(save_to(&path, &choice).is_err());
+        choice.auth_profile = None;
+        choice.external_binding_id = Some("not-a-binding".to_owned());
+        assert!(save_to(&path, &choice).is_err());
+        assert_eq!(
+            load_from(&path).unwrap().unwrap().external_binding_id,
+            Some("a".repeat(64))
+        );
     }
 
     #[test]

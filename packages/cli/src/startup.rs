@@ -12,6 +12,190 @@ const fn interactive_startup(terminal: bool, ci: bool, opted_out: bool) -> bool 
     terminal && !ci && !opted_out
 }
 
+/// Review an external source and consent scope using the existing terminal choice UI.
+/// The caller must honor discovery opt-outs before supplying candidates and persist
+/// the returned binding through provider-auth. No model or backend is selected here.
+pub async fn external_consent_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
+    candidates: &[bcode_provider_auth_models::external::ExternalAuthCandidate],
+    scope: &bcode_provider_auth_models::external::ExternalAuthScope,
+) -> Result<Option<bcode_provider_auth_models::external::ExternalAuthCandidate>, CliError> {
+    use bcode_provider_auth_models::external::ExternalAuthScope;
+    let scope_label = match scope {
+        ExternalAuthScope::AllLocalApplications => "all local Bcode applications".to_owned(),
+        ExternalAuthScope::Application { application_id }
+            if !application_id.trim().is_empty()
+                && application_id.len() <= 256
+                && !application_id.chars().any(char::is_control) =>
+        {
+            format!("local application {application_id}")
+        }
+        ExternalAuthScope::Application { .. } => {
+            return Err(CliError::InvalidArguments(
+                "External connection scope is invalid".into(),
+            ));
+        }
+    };
+    let available: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .collect();
+    if available.is_empty() {
+        return Ok(None);
+    }
+    let mut choices = vec![bcode_tui::QuickConnectionChoice {
+        label: "Do not connect an external source".into(),
+        detail: "Keep your current execution and model selection. Explicit vault import remains available in Advanced settings.".into(),
+    }];
+    choices.extend(available.iter().map(|candidate| bcode_tui::QuickConnectionChoice {
+        label: format!("Reuse {} in place — {}", candidate.source.as_str(), candidate.target.provider_id),
+        detail: format!("No vault or credential copy. Consent scope: {scope_label}. Bcode-native execution only when safely supported; native harness use requires its own explicit selection."),
+    }));
+    let outcome = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
+        choices,
+        recovery: Some("External connections require your approval. No account verification or native agent launch occurs during this choice.".into()),
+    }).await?;
+    let selected = match outcome {
+        bcode_tui::QuickOnboardingOutcome::Selected(0)
+        | bcode_tui::QuickOnboardingOutcome::Close
+        | bcode_tui::QuickOnboardingOutcome::Advanced => return Ok(None),
+        bcode_tui::QuickOnboardingOutcome::Selected(index) => {
+            available.get(index - 1).copied().ok_or_else(|| {
+                CliError::InvalidArguments("Selected external connection is unavailable".into())
+            })?
+        }
+        bcode_tui::QuickOnboardingOutcome::Connected { .. } => {
+            return Err(CliError::InvalidArguments(
+                "External source consent cannot enroll a vault connection".into(),
+            ));
+        }
+    };
+    let confirmation = bcode_tui::run_backend_selection_in_shell(shell, bcode_tui::QuickOnboardingInput {
+        choices: vec![
+            bcode_tui::QuickConnectionChoice { label: "Cancel — do not approve".into(), detail: "No connection or execution selection will be changed.".into() },
+            bcode_tui::QuickConnectionChoice { label: format!("Approve {} for {scope_label}", selected.source.as_str()), detail: format!("Allow {} / {} to acquire this credential in place. Disconnect removes Bcode consent without logging out or modifying the original application.", selected.target.provider_id, selected.target.method_id) },
+        ],
+        recovery: Some("Approval is separate from selecting a model or starting a session.".into()),
+    }).await?;
+    match confirmation {
+        bcode_tui::QuickOnboardingOutcome::Selected(1) => Ok(Some(selected.clone())),
+        bcode_tui::QuickOnboardingOutcome::Selected(0)
+        | bcode_tui::QuickOnboardingOutcome::Close
+        | bcode_tui::QuickOnboardingOutcome::Advanced => Ok(None),
+        _ => Err(CliError::InvalidArguments(
+            "Unexpected external connection confirmation; no approval was granted".into(),
+        )),
+    }
+}
+
+/// Offer safe native-provider recommendations for external keys, without replacing
+/// an explicit provider/model/auth selection. The caller supplies configured scope.
+pub async fn external_onboarding_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
+    no_discovery: bool,
+    scope: bcode_provider_auth_models::external::ExternalAuthScope,
+) -> Result<bool, CliError> {
+    use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+    let config = bcode_config::load_config()?;
+    if has_explicit_selection(&config)
+        || !config
+            .onboarding
+            .credential_discovery_enabled(no_discovery, &bcode_config::ProcessConfigEnvironment)
+    {
+        return Ok(false);
+    }
+    let client = bcode_client::BcodeClient::default_endpoint();
+    // Optional discovery is not authority and must not disable unrelated setup.
+    // Do not catch errors after approval or session start: those can have effects.
+    let Ok(candidates) = client.discover_external_auth().await else {
+        return Ok(false);
+    };
+    let mut host = load_cli_plugin_host()?;
+    let supported: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.available
+                && host
+                    .auth_provider(&candidate.target.provider_id)
+                    .is_some_and(|provider| provider.plugin_id == candidate.target.plugin_id)
+                && !model_choices(
+                    &host,
+                    &config,
+                    &candidate.target.provider_id,
+                    &candidate.target.method_id,
+                    None,
+                    None,
+                )
+                .is_empty()
+        })
+        .collect();
+    host.deactivate_all()?;
+    let Some(candidate) = external_consent_in_shell(shell, &supported, &scope).await? else {
+        return Ok(false);
+    };
+    client.approve_external_auth(candidate.clone(), Some(scope)).await.map_err(|_| CliError::LoginProfile("External approval did not complete safely. Inspect auth connections before retrying; no execution fallback was selected.".into()))?;
+    if !Box::pin(select_external_model_in_shell(shell, &candidate)).await? {
+        // Approval was a separate explicit decision and remains available to list/revoke.
+        return Ok(true);
+    }
+    Box::pin(super::run_new_session_tui_in_shell(
+        shell,
+        None,
+        bcode_tui::TuiLaunchOptions::default(),
+    ))
+    .await?;
+    Ok(true)
+}
+
+/// Save a separately selected exact model and approved source reference, never
+/// credential material. Explicit configuration or launch selection takes precedence.
+/// Returns false when no model was selected or an explicit selection already exists.
+pub async fn select_external_model_in_shell(
+    shell: &mut bcode_tui::TerminalShell,
+    candidate: &bcode_provider_auth_models::external::ExternalAuthCandidate,
+) -> Result<bool, CliError> {
+    let config = bcode_config::load_config()?;
+    if has_explicit_selection(&config) {
+        return Ok(false);
+    }
+    let mut host = load_cli_plugin_host()?;
+    let mut selections = if host
+        .auth_provider(&candidate.target.provider_id)
+        .is_some_and(|provider| provider.plugin_id == candidate.target.plugin_id)
+    {
+        model_choices(
+            &host,
+            &config,
+            &candidate.target.provider_id,
+            &candidate.target.method_id,
+            None,
+            None,
+        )
+    } else {
+        Vec::new()
+    };
+    host.deactivate_all()?;
+    for selection in &mut selections {
+        selection.external_binding_id = Some(candidate.binding_id.clone());
+    }
+    if selections.is_empty() {
+        return Ok(false);
+    }
+    let outcome = bcode_tui::run_backend_selection_in_shell(
+        shell,
+        bcode_tui::QuickOnboardingInput {
+            choices: selections.iter().map(|selection| bcode_tui::QuickConnectionChoice {
+                label: format!("Use {} in Bcode — {}", candidate.source.as_str(), selection.model_id),
+                detail: "Explicitly select this exact approved external binding and model for future startup. API billing may apply. No credentials are copied or verified; no session starts from this selection alone.".into(),
+            }).collect(),
+            recovery: Some("External approval alone does not select an account or model. Choose a model to use this binding, or close to keep only consent.".into()),
+        },
+    ).await?;
+    consent_enrolled_selection(&outcome, &selections, |selection| {
+        bcode_config::startup::save(selection).map(|_| ()).map_err(|_| "External connection approved, but startup choice could not be saved. Inspect connections before retrying.")
+    }).map_err(|message| CliError::InvalidArguments(message.into()))
+}
+
 pub async fn advanced(no_discovery: bool) -> Result<(), CliError> {
     let mut shell = bcode_tui::TerminalShell::enter()?;
     let result = advanced_in_shell(&mut shell, no_discovery).await;
@@ -96,6 +280,30 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
         Vec::new()
     };
     host.deactivate_all()?;
+    if offer_external_onboarding(route, matches!(&remembered, Ok(None)), discovery_enabled) {
+        let external = Box::pin(external_onboarding_in_shell(
+            &mut shell,
+            no_discovery,
+            bcode_provider_auth_models::external::ExternalAuthScope::AllLocalApplications,
+        ))
+        .await;
+        match external {
+            Ok(false) => {}
+            Ok(true) => {
+                shell.finish()?;
+                return Ok(true);
+            }
+            Err(error) => {
+                // Consent/start may have committed; never reopen legacy setup as
+                // an implicit retry or billing fallback after this point.
+                let _ = shell
+                    .show_error_without_retry(&launch_recovery_message(Some(&error)))
+                    .await;
+                shell.finish()?;
+                return Err(error);
+            }
+        }
+    }
     let input = quick_input(remembered.is_ok(), readiness, &candidates, &choices);
     let result = run_startup_journey(
         &mut shell,
@@ -284,7 +492,7 @@ async fn route_backend_selection(
                 client.discover_execution_catalog(selected_request).await.map_err(bcode_tui::TuiError::from)
             })).await?;
             if let Some(inventory) = inventory {
-                Box::pin(launch_execution_choice(host, shell, &catalog, &inventory.models, selection, false)).await?;
+                Box::pin(launch_execution_choice(shell, &catalog, &inventory.models, selection, false)).await?;
             }
             return Ok(true);
         }
@@ -1163,6 +1371,7 @@ fn recommended_selection(
         auth_mode: recommended.settings.get("auth_mode").cloned(),
         catalog_provider_id: recommended.settings.get("catalog_provider_id").cloned(),
         auth_profile: profile,
+        external_binding_id: None,
         environment_auth_provider: environment.as_ref().map(|_| provider_id.to_owned()),
         environment_method: environment.as_ref().map(|_| method_id.to_owned()),
         environment_credential: candidate
@@ -1203,6 +1412,20 @@ fn has_explicit_selection_with_environment(
 enum StartupRoute {
     Continue,
     Recover { allow_choices: bool },
+}
+
+const fn offer_external_onboarding(
+    route: StartupRoute,
+    fresh: bool,
+    discovery_enabled: bool,
+) -> bool {
+    matches!(
+        route,
+        StartupRoute::Recover {
+            allow_choices: true
+        }
+    ) && fresh
+        && discovery_enabled
 }
 
 const fn startup_route(ready: bool, explicit: bool, state_valid: bool) -> StartupRoute {
@@ -1368,6 +1591,11 @@ fn local_readiness_with_policy(
     if headless && selection.settings.get("auth_mode").map(String::as_str) == Some("none") {
         return Ok(());
     }
+    if selection.settings.contains_key("external_auth_binding") {
+        // The daemon revalidates consent and acquires the source at dispatch. Startup
+        // must not read a credential or transport it as client configuration.
+        return Ok(());
+    }
     bcode_provider_auth::inspect_auth_selection(&bcode_provider_auth::ProviderRequestContextResolution {
         config,
         selection: selection.clone(),
@@ -1426,6 +1654,132 @@ mod tests {
         // Explicit native intent never falls back to an otherwise usable provider.
         assert!(super::should_route_backends(&config, true));
         assert!(super::should_route_backends(&config, false));
+    }
+
+    #[test]
+    fn managed_configuration_disabled_only_skips_catalog() {
+        let response = bcode_ipc::PluginServiceResponse {
+            payload: Vec::new(),
+            error: Some(bcode_ipc::PluginServiceError {
+                code: "configuration_disabled".into(),
+                message: "managed instance configuration is disabled".into(),
+            }),
+        };
+        assert!(
+            super::decode_managed_configuration::<super::BackendCatalog>("catalog", &response)
+                .unwrap()
+                .is_none()
+        );
+        let error =
+            super::decode_managed_configuration::<super::PreparedBackend>("prepare", &response)
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("configuration_disabled"));
+        assert!(error.contains("managed instance configuration is disabled"));
+        assert!(error.contains("no fallback was selected"));
+    }
+
+    #[test]
+    fn managed_configuration_preserves_errors_and_rejects_invalid_payloads() {
+        let mut response = bcode_ipc::PluginServiceResponse {
+            payload: Vec::new(),
+            error: Some(bcode_ipc::PluginServiceError {
+                code: "invalid_configuration".into(),
+                message: "invalid managed instance configuration".into(),
+            }),
+        };
+        let error =
+            super::decode_managed_configuration::<super::BackendCatalog>("catalog", &response)
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("invalid_configuration"));
+        assert!(error.contains("invalid managed instance configuration"));
+        response.error = None;
+        assert!(
+            super::decode_managed_configuration::<super::BackendCatalog>("catalog", &response)
+                .is_err()
+        );
+        response.payload = vec![b' '; bcode_harness_models::MAX_HARNESS_WIRE_BYTES + 1];
+        assert!(
+            super::decode_managed_configuration::<super::BackendCatalog>("catalog", &response)
+                .is_err()
+        );
+        response.payload = br#"{"default_instance":null,"instances":{}}"#.to_vec();
+        assert!(
+            super::decode_managed_configuration::<super::BackendCatalog>("catalog", &response)
+                .unwrap()
+                .unwrap()
+                .instances
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn external_onboarding_is_fresh_opted_in_recovery_only() {
+        use super::StartupRoute;
+        let recovery = StartupRoute::Recover {
+            allow_choices: true,
+        };
+        assert!(super::offer_external_onboarding(recovery, true, true));
+        assert!(!super::offer_external_onboarding(recovery, true, false));
+        assert!(!super::offer_external_onboarding(recovery, false, true));
+        assert!(!super::offer_external_onboarding(
+            StartupRoute::Continue,
+            true,
+            true
+        ));
+        assert!(!super::offer_external_onboarding(
+            StartupRoute::Recover {
+                allow_choices: false
+            },
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn external_binding_is_saved_only_with_the_exact_model_choice() {
+        let mut selection = choices()[0].0.clone();
+        selection.environment_variable = None;
+        selection.environment_auth_provider = None;
+        selection.environment_method = None;
+        selection.environment_credential = None;
+        selection.external_binding_id = Some("a".repeat(64));
+        let selections = vec![selection.clone()];
+        for outcome in [
+            bcode_tui::QuickOnboardingOutcome::Close,
+            bcode_tui::QuickOnboardingOutcome::Advanced,
+        ] {
+            assert!(
+                !super::consent_enrolled_selection(&outcome, &selections, |_| panic!(
+                    "approval must not select a model"
+                ))
+                .unwrap()
+            );
+        }
+        let mut saved = None;
+        assert!(
+            super::consent_enrolled_selection(
+                &bcode_tui::QuickOnboardingOutcome::Selected(0),
+                &selections,
+                |value| {
+                    saved = Some(value.clone());
+                    Ok(())
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(saved, Some(selection));
+        assert!(
+            super::consent_enrolled_selection(
+                &bcode_tui::QuickOnboardingOutcome::Selected(1),
+                &selections,
+                |_| panic!("invalid choice must not fall back")
+            )
+            .is_err()
+        );
     }
 
     fn backend_instance() -> bcode_harness_models::HarnessInstance {
@@ -1737,6 +2091,7 @@ mod tests {
             auth_mode: Some("api_key".to_owned()),
             catalog_provider_id: Some("fake".to_owned()),
             auth_profile: None,
+            external_binding_id: None,
             environment_variable: Some("FAKE_SELECTED".to_owned()),
             environment_auth_provider: Some("fake".to_owned()),
             environment_method: Some("key".to_owned()),

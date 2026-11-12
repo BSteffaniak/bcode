@@ -556,4 +556,31 @@ fn validate_route(interface: &str, operation: &str, payload: &[u8]) -> Result<()
 }
 
 #[cfg(test)]
+mod native_connection_route_tests {
+    use super::*;
+    #[test]
+    fn native_application_route_does_not_enable_direct_plugin_preparation() {
+        use bcode_harness_models::native_connections::NATIVE_CONNECTION_APPLICATION_INTERFACE;
+        assert!(
+            validate_route(
+                NATIVE_CONNECTION_APPLICATION_INTERFACE,
+                "execute",
+                br#"{"kind":"list"}"#
+            )
+            .is_ok()
+        );
+        assert!(validate_route(NATIVE_CONNECTION_APPLICATION_INTERFACE, "execute", br#"{"kind":"prepare","candidate_id":"fixture","expected_revision":1,"mutation_id":"prepare"}"#).is_ok());
+        assert!(validate_route(NATIVE_CONNECTION_APPLICATION_INTERFACE, "execute", br#"{"kind":"prepare","candidate_id":"fixture","expected_revision":1,"mutation_id":""}"#).is_err());
+        assert!(
+            validate_route(
+                bcode_harness_models::native_connections::NATIVE_PREPARATION_INTERFACE,
+                "prepare",
+                b"{}"
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests;

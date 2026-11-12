@@ -158,9 +158,18 @@ impl LaunchOptions {
         command
             .env_clear()
             .envs(&self.environment.0)
-            .env("CLAUDE_CONFIG_DIR", &self.config_directory)
             .current_dir(&self.cwd)
             .kill_on_drop(true);
+        // The native default and an explicit override to the same directory can select
+        // different OS credential-store identities. Preserve native custody for HOME/.claude.
+        let native_default = self.environment.0.get("HOME").is_some_and(|home| {
+            let default = PathBuf::from(home).join(".claude");
+            default == self.config_directory
+                || default.canonicalize().ok().as_ref() == Some(&self.config_directory)
+        });
+        if !native_default {
+            command.env("CLAUDE_CONFIG_DIR", &self.config_directory);
+        }
         command
     }
     /// Probe the executable and return its actual native version.
@@ -249,6 +258,32 @@ pub fn validate_id(id: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_namespace_preserves_native_credential_store_selection() {
+        let mut options = options();
+        options
+            .environment
+            .0
+            .insert("HOME".into(), "/synthetic/home".into());
+        options.config_directory = "/synthetic/home/.claude".into();
+        let command = options.command();
+        assert!(
+            !command
+                .as_std()
+                .get_envs()
+                .any(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        );
+        options.config_directory = "/synthetic/isolated".into();
+        let command = options.command();
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "CLAUDE_CONFIG_DIR"
+                    && value == Some(std::ffi::OsStr::new("/synthetic/isolated")))
+        );
+    }
 
     fn options() -> LaunchOptions {
         LaunchOptions {

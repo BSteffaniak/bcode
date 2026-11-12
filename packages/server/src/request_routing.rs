@@ -993,6 +993,18 @@ pub enum CoreRuntimeRequest {
     ExecuteAccountLifecycle {
         plan_id: String,
     },
+    NativeConnection {
+        request: bcode_harness_models::native_connections::NativeConnectionRequest,
+    },
+    DiscoverExternalAuth,
+    ApproveExternalAuth {
+        candidate: bcode_provider_auth_models::external::ExternalAuthCandidate,
+        scope: Option<bcode_provider_auth_models::external::ExternalAuthScope>,
+    },
+    ListExternalAuth,
+    RevokeExternalAuth {
+        grant: bcode_provider_auth_models::external::ExternalAuthGrant,
+    },
     AuthPoolList,
     /// Read account-first next-turn routing in the session configuration.
     AccountRouting {
@@ -2628,6 +2640,24 @@ impl RoutedRequest {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::ExecuteAccountLifecycle {
                     plan_id,
                 }))
+            }
+            Request::NativeConnection { request } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::NativeConnection { request }))
+            }
+            Request::DiscoverExternalAuth => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::DiscoverExternalAuth))
+            }
+            Request::ApproveExternalAuth { candidate, scope } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ApproveExternalAuth {
+                    candidate,
+                    scope,
+                }))
+            }
+            Request::ListExternalAuth => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListExternalAuth))
+            }
+            Request::RevokeExternalAuth { grant } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::RevokeExternalAuth { grant }))
             }
             Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),
             Request::SetAuthPoolPreference { pool, profile } => {
