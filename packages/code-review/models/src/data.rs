@@ -718,10 +718,15 @@ pub struct ReviewPatchIdsRequest {
 /// Response payload for `review.patch_ids.get`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReviewPatchIdsResponse {
-    /// Patch id per requested path that has a textual difference (the same identity
+    /// Diff fingerprint per requested path that has a textual difference (the same identity
     /// `review.file.hunks.get` reports). Paths without a difference, and binary files, are
     /// absent.
     pub patch_ids: std::collections::BTreeMap<String, String>,
+    /// When the head is the working tree: the object id each requested regular file's working
+    /// copy would have if added (`git hash-object`), so its content can be identified without
+    /// reading hunks. Missing files and symbolic links are absent.
+    #[serde(default)]
+    pub content_ids: std::collections::BTreeMap<String, String>,
 }
 
 /// Whether a source kind is resolved by a review-source provider plugin.

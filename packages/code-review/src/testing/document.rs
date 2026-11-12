@@ -125,7 +125,9 @@ impl SynthFile {
             path: path.to_string(),
             old_path: None,
             status: ReviewFileStatus::Modified,
-            patch_id: Some(format!("patch:{path}:{edits:?}")),
+            patch_id: Some(crate::viewed::versioned_fingerprint(&format!(
+                "patch:{path}:{edits:?}"
+            ))),
             old: Some(old),
             new: Some(new),
             hunks,
@@ -145,7 +147,9 @@ impl SynthFile {
             old: None,
             new: Some(new),
             binary: false,
-            patch_id: Some(format!("patch:{path}")),
+            patch_id: Some(crate::viewed::versioned_fingerprint(&format!(
+                "patch:{path}"
+            ))),
             truncated: None,
         }
     }
@@ -161,7 +165,9 @@ impl SynthFile {
             old: Some(old),
             new: None,
             binary: false,
-            patch_id: Some(format!("patch:{path}")),
+            patch_id: Some(crate::viewed::versioned_fingerprint(&format!(
+                "patch:{path}"
+            ))),
             truncated: None,
         }
     }

@@ -4,13 +4,16 @@
 //!
 //! Both are bounded: the comparison is one `cat-file -e` per commit, one `merge-base
 //! --is-ancestor`, and one capped `rev-list --count`; patch ids are one `git diff` limited to at
-//! most [`REVIEW_PATCH_IDS_MAX_PATHS`] paths.
+//! most [`REVIEW_PATCH_IDS_MAX_PATHS`] paths (and, for the working tree, one `git hash-object`
+//! of the same paths). The review also uses patch ids to show viewed files correctly as soon
+//! as it opens.
 
 use super::index::{DIFF_COMMON, revision_args};
 use super::{DataError, git, hunks};
 use bcode_code_review_models::{
     REVIEW_PATCH_IDS_MAX_PATHS, REVIEW_REVISIONS_MAX_AHEAD, ReviewPatchIdsRequest,
     ReviewPatchIdsResponse, ReviewRevisionsCompareRequest, ReviewRevisionsCompareResponse,
+    RevisionRef,
 };
 use std::path::Path;
 
@@ -131,5 +134,36 @@ pub fn patch_ids(
         }
         response.patch_ids.entry(path).or_insert(id);
     }
+    if request.head == RevisionRef::WorkingTree {
+        response.content_ids = content_ids(root, &request.paths)?;
+    }
     Ok(response)
+}
+
+/// The object ids the working copies of `paths` would have if added, for regular files.
+fn content_ids(
+    root: &Path,
+    paths: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, DataError> {
+    let files: Vec<&str> = paths
+        .iter()
+        .filter(|path| {
+            root.join(path)
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file())
+        })
+        .map(String::as_str)
+        .collect();
+    if files.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let mut args = vec!["hash-object", "--"];
+    args.extend(files.iter().copied());
+    let output = git::output(root, &args)?;
+    let output = String::from_utf8_lossy(&output);
+    Ok(files
+        .into_iter()
+        .zip(output.lines())
+        .map(|(path, oid)| (path.to_owned(), oid.trim().to_owned()))
+        .collect())
 }

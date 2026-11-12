@@ -642,6 +642,33 @@ mark rather than being judged by a stale identity.
 file's index blob identities and, once its hunks were loaded, its patch id (which is kept after
 eviction), reports files whose marks should be re-recorded, and counts viewed files for progress.
 
+**Reset policy, fingerprint version, renames, first frame.** `viewed_reset` (the review's
+plugin table) chooses what keeps a file viewed. `diff` (the default) is the order above. `file`
+replaces steps 3 and later with "unviewed" whenever both blob sides are known on the mark and the
+file, so any change to the file resets it; working-tree content whose object id is not known
+yet is still matched by patch id.
+
+The patch id is the diff fingerprint, version 2 (`2:<hex>`): computed from a diff without
+context lines, it hashes any mode change and, per hunk, a separator, the hunk's section heading
+(git's `@@ … @@ heading`), and the changed lines. Edits away from the changes keep it; a change
+that moves to another function, or splits into hunks differently, does not.
+`review.file.hunks.get` computes it from a context-free diff of the file whatever context it
+shows, and `review.patch_ids.get` from the same diff, so both report one identity. Marks
+recorded with the version 1 fingerprint (changed lines only, bare hex) are not compared by patch
+id: they stay viewed while both blobs are unchanged and are then re-recorded with the version 2
+fingerprint; otherwise they read as unviewed. Recomputing a version 2 fingerprint for the marked
+revisions would need a diff of each marked blob pair outside the review's sources, so it is not
+attempted.
+
+A mark made at the path a renamed file had matches the file (it is re-recorded under the new
+path). Working-tree content is identified by the object id it would have if added
+(`content_ids` of `review.patch_ids.get`). When a review opens, the files with marks (at most
+2,000, in requests of at most 500 paths) get their fingerprints and content ids before the
+document is shown, so viewed state is right on the first frame; other files get their
+fingerprint with their hunks. An unsaved review stores its viewed files and marks under its
+transient scope id (`scope::annotation_workspace_id`), which review listings skip, and merges
+them in when the same target opens again; saving the review moves them.
+
 ## 6. Review screen (`tui/`)
 
 ### 6.1 Layout
@@ -3260,7 +3287,7 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 
 | ID | Status |
 | --- | --- |
-| INV-VIEW-01 | Replaced by `v` (mark viewed and advance) with identity-keyed marks (5.4). |
+| INV-VIEW-01 | Replaced by `v` (mark viewed and advance) with identity-keyed marks (5.4), kept for unsaved reviews per target. |
 | INV-VIEW-02 | Done: `view_all`, `unview_all`. |
 | INV-VIEW-03 | Replaced by the header progress bar, checklist, home table, and preview. |
 | INV-VIEW-04 | Done: `v` always advances to the next unviewed file. |

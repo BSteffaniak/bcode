@@ -82,6 +82,14 @@ under the editor. `up`/`down` (or `ctrl+p`/`ctrl+n`) move, `tab` or `enter` acce
 the suggestions, and a click accepts one. Accepting replaces the `@word` under the cursor with
 `@<path>` as one undoable edit; while suggestions are open, `enter` never submits the comment.
 
+### Viewed files
+
+Viewed marks record a file's blob identities and its diff fingerprint, so a file stays viewed
+across rebases and renames as `viewed_reset` allows. When a review opens, the fingerprints of
+its marked files are loaded with the file list, so viewed files show as viewed on the first
+frame. An unsaved review keeps its viewed files per target, like its comments: reopening the same
+target shows them again, and saving the review takes them along.
+
 ### Review list
 
 Home's "Updated" column, its order, and `resume` follow when a review last changed: its title,
@@ -121,6 +129,11 @@ bcode's own (`--print-config-paths` lists them in order):
 * `[plugins.config."bcode.code_review"]`: where review state is stored, and presentation
   settings under its `review_v2` table (`diff_layout`, `side_by_side_breakpoint`, `tab_width`,
   `icons`).
+* `[plugins.config."bcode.code_review"] viewed_reset`: when a viewed file stops counting as
+  viewed. `"diff"` (the default) keeps it viewed while its changes are the same: the same `+`/`-`
+  lines in the same sections (functions), even when the rest of the file changes, for example
+  after a rebase. `"file"` resets it when either side of the file changes at all. Any other
+  value is reported and the default is used.
 * `[tui.keybindings.scopes."code-review*"]`: keybinding overrides of the review scopes
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads` and `code-review-composer`. `none` or `unbind` removes a default.

@@ -458,6 +458,77 @@ fn composer_completes_at_paths_by_key_and_click() {
     assert_eq!(drafts(&setup), [] as [DraftComment; 0]);
 }
 
+/// A file whose blobs changed since it was marked but whose changes did not, and a renamed
+/// file marked under its old path, show as viewed on the first frame of the review, before any
+/// hunk is loaded.
+#[test]
+fn viewed_state_is_right_on_the_first_frame() {
+    let fixture = fixture();
+    // Learn the files' identities from a first opening.
+    let first = setup(&fixture, 100, 40);
+    let doc = first.scenario.surface().document().unwrap();
+    let mut marks = Vec::new();
+    let mut modified = false;
+    for file in doc.file_keys() {
+        let (identity, patch) = doc.viewed_identity(file).unwrap();
+        if let Some(old_path) = &identity.old_path {
+            // Marked before the rename, at the same content.
+            marks.push(bcode_code_review_models::ViewedMark {
+                path: old_path.clone(),
+                old_oid: identity.old_oid.clone(),
+                new_oid: identity.new_oid.clone(),
+                patch_id: patch.clone(),
+            });
+        } else if !modified && patch.is_some() && identity.old_oid != identity.new_oid {
+            modified = true;
+            // Marked at other blobs with the same changes (before a rebase).
+            marks.push(bcode_code_review_models::ViewedMark {
+                path: identity.path.clone(),
+                old_oid: Some("0".repeat(40)),
+                new_oid: Some("1".repeat(40)),
+                patch_id: patch.clone(),
+            });
+        }
+    }
+    assert_eq!(
+        marks.len(),
+        2,
+        "a renamed file and a modified file: {marks:?}"
+    );
+    let mut workspace = first.workspace.clone();
+    workspace.viewed_files = marks.iter().map(|mark| mark.path.clone()).collect();
+    workspace.viewed_marks = marks;
+    let _ = first.backend.call_now(UpdateReviewWorkspaceRequest {
+        repo_path: workspace.repo_root.clone(),
+        workspace: workspace.clone(),
+    });
+
+    let mut scenario = Scenario::new(build(&first.backend, &workspace, Duration::ZERO), 100, 40);
+    while scenario.surface().document().is_none() {
+        scenario.step_async();
+    }
+    let doc = scenario.surface().document().unwrap();
+    assert_eq!(doc.viewed_progress().viewed, 2);
+
+    // Resetting on any change to the file, only the renamed file (same blobs) stays viewed.
+    let surface = ReviewSurface::new(
+        first.backend.services(),
+        workspace.repo_root.clone(),
+        workspace.sources.clone(),
+        workspace.title.clone(),
+        ReviewViewConfig {
+            viewed_reset: bcode_code_review::viewed::ViewedReset::File,
+            ..ReviewViewConfig::default()
+        },
+    )
+    .with_scroll_motion(Duration::ZERO)
+    .with_workspace(workspace);
+    let mut scenario = Scenario::new(surface, 100, 40);
+    let screen = stable(&mut scenario);
+    let doc = scenario.surface().document().unwrap();
+    assert_eq!(doc.viewed_progress().viewed, 1, "{}", screen.text());
+}
+
 #[test]
 fn drag_across_lines_selects_a_range_and_opens_a_range_composer() {
     let fixture = fixture();

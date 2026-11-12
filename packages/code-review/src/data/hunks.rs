@@ -1,4 +1,4 @@
-//! Per-file hunks (`review.file.hunks.get`) and patch identity.
+//! Per-file hunks (`review.file.hunks.get`) and the diff fingerprint (patch id).
 
 use super::index::{DIFF_COMMON, revision_args};
 use super::{DataError, git};
@@ -34,6 +34,51 @@ pub fn file_hunks(
         .unwrap_or(REVIEW_HUNKS_DEFAULT_MAX_LINES)
         .clamp(1, REVIEW_HUNKS_MAX_LINES);
 
+    let file = file_diff(root, request, context)?;
+
+    let mut response = ReviewFileHunksResponse {
+        source_id: request.source.source_id.clone(),
+        path: request.path.clone(),
+        hunks: Vec::new(),
+        binary: false,
+        truncated: None,
+        patch_id: None,
+    };
+    let Some(file) = file else {
+        // No textual difference (for example only whitespace changed under `-w`).
+        if !request.ignore_whitespace {
+            response.patch_id = Some(patch_id(None, &[]));
+        }
+        return Ok(response);
+    };
+    if file.is_binary {
+        response.binary = true;
+        return Ok(response);
+    }
+    if !request.ignore_whitespace {
+        // The fingerprint is defined over a diff without context lines.
+        response.patch_id = Some(if context == 0 {
+            patch_id(Some(&file), &file.hunks)
+        } else {
+            let bare = file_diff(root, request, 0)?;
+            bare.map_or_else(
+                || patch_id(None, &[]),
+                |bare| patch_id(Some(&bare), &bare.hunks),
+            )
+        });
+    }
+    let (hunks, truncated) = truncate(&file.hunks, max_lines);
+    response.hunks = hunks;
+    response.truncated = truncated;
+    Ok(response)
+}
+
+/// The diff of the requested file with `context` lines of context.
+fn file_diff(
+    root: &Path,
+    request: &ReviewFileHunksRequest,
+    context: u32,
+) -> Result<Option<DiffFile>, DataError> {
     let mut args: Vec<String> = ["diff", "--src-prefix=a/", "--dst-prefix=b/"]
         .into_iter()
         .chain(DIFF_COMMON)
@@ -61,34 +106,7 @@ pub fn file_hunks(
     let output = git::output(root, &args)?;
     let files = bcode_git::diff::parse_unified_diff(&String::from_utf8_lossy(&output))
         .map_err(|error| DataError::Git(format!("failed to parse diff: {error}")))?;
-    let file = select_file(files, &request.path);
-
-    let mut response = ReviewFileHunksResponse {
-        source_id: request.source.source_id.clone(),
-        path: request.path.clone(),
-        hunks: Vec::new(),
-        binary: false,
-        truncated: None,
-        patch_id: None,
-    };
-    let Some(file) = file else {
-        // No textual difference (for example only whitespace changed under `-w`).
-        if !request.ignore_whitespace {
-            response.patch_id = Some(patch_id(None, &[]));
-        }
-        return Ok(response);
-    };
-    if file.is_binary {
-        response.binary = true;
-        return Ok(response);
-    }
-    if !request.ignore_whitespace {
-        response.patch_id = Some(patch_id(Some(&file), &file.hunks));
-    }
-    let (hunks, truncated) = truncate(&file.hunks, max_lines);
-    response.hunks = hunks;
-    response.truncated = truncated;
-    Ok(response)
+    Ok(select_file(files, &request.path))
 }
 
 /// The diff entry for `path`. A type change (for example a file replaced by a symbolic link)
@@ -121,9 +139,11 @@ fn select_file(files: Vec<DiffFile>, path: &str) -> Option<DiffFile> {
     Some(merged)
 }
 
-/// SHA-256 over the changed lines in order (marker plus raw text, no line numbers, no context)
-/// and any mode change. Rebasing a patch onto a different base keeps this identity as long as
-/// its changed lines are the same.
+/// The diff fingerprint ([`crate::viewed::FINGERPRINT_VERSION`]) of hunks from a diff without
+/// context lines: SHA-256 over any mode change, then per hunk a separator and its section
+/// heading, then its changed lines in order (marker plus raw text, no line numbers). Rebasing a
+/// patch onto a different base, or editing lines away from it, keeps this identity as long as its
+/// changed lines and the sections they are in are the same.
 pub(super) fn patch_id(file: Option<&DiffFile>, hunks: &[DiffHunk]) -> String {
     let mut hasher = Sha256::new();
     if let Some(file) = file
@@ -132,7 +152,17 @@ pub(super) fn patch_id(file: Option<&DiffFile>, hunks: &[DiffHunk]) -> String {
     {
         hasher.update(format!("mode {old} {new}\n").as_bytes());
     }
-    for line in hunks.iter().flat_map(|hunk| &hunk.lines) {
+    for hunk in hunks {
+        hasher.update(b"@@");
+        hasher.update(hunk.heading.as_deref().unwrap_or_default().as_bytes());
+        hasher.update(b"\n");
+        hunk_lines(&mut hasher, hunk);
+    }
+    crate::viewed::versioned_fingerprint(&hex::encode(hasher.finalize()))
+}
+
+fn hunk_lines(hasher: &mut Sha256, hunk: &DiffHunk) {
+    for line in &hunk.lines {
         let marker: &[u8] = match line.kind {
             DiffLineKind::Added => b"+",
             DiffLineKind::Removed => b"-",
@@ -146,7 +176,6 @@ pub(super) fn patch_id(file: Option<&DiffFile>, hunks: &[DiffHunk]) -> String {
             &b"\n"[..]
         });
     }
-    hex::encode(hasher.finalize())
 }
 
 fn review_line(line: &bcode_git::models::DiffLine) -> ReviewLine {

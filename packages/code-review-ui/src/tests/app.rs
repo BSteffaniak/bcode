@@ -738,6 +738,64 @@ fn unsaved_reviews_keep_their_comments_per_target() {
     assert!(screen.contains("about the branch"), "{}", screen.text());
 }
 
+/// Unsaved reviews keep their viewed files per target across exit and reopen, like their
+/// comments, and saving the review takes them along.
+#[test]
+fn unsaved_reviews_keep_their_viewed_files_per_target() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let last_commit = || Entry::Sources {
+        title: None,
+        sources: vec![ReviewSourceKind::LastCommit],
+    };
+    let viewed = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .and_then(|review| review.document())
+            .map_or(0, |doc| doc.viewed_progress().viewed)
+    };
+    let (mut scenario, _) = open(&fixture, &backend, last_commit(), 140, 40);
+    assert!(scenario.surface().review().unwrap().is_transient());
+    assert_eq!(viewed(&scenario), 0);
+    scenario.key("v");
+    settled(&mut scenario);
+    assert_eq!(viewed(&scenario), 1);
+    scenario.key("q");
+    settled(&mut scenario);
+
+    // Reopened: still viewed, and home lists no extra review for the stored state.
+    let (mut scenario, _) = open(&fixture, &backend, last_commit(), 140, 40);
+    assert_eq!(viewed(&scenario), 1);
+    assert_eq!(listed(&backend, &fixture), Vec::new());
+    // Another target's unsaved review does not see it.
+    let branch = Entry::Sources {
+        title: None,
+        sources: vec![ReviewSourceKind::BranchCompare {
+            base_branch: BASE_BRANCH.to_owned(),
+            head_branch: HEAD_BRANCH.to_owned(),
+            merge_base: true,
+        }],
+    };
+    let (other, _) = open(&fixture, &backend, branch, 140, 40);
+    assert_eq!(viewed(&other), 0);
+
+    // Saving moves the viewed file into the saved review.
+    scenario.key("ctrl+s");
+    settled(&mut scenario);
+    let saved = scenario
+        .surface()
+        .review()
+        .unwrap()
+        .workspace()
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(stored(&backend, &fixture, &saved).viewed_files.len(), 1);
+    let (scenario, _) = open(&fixture, &backend, last_commit(), 140, 40);
+    assert_eq!(viewed(&scenario), 0, "the unsaved scope no longer has it");
+}
+
 #[test]
 fn home_clicks_start_suggestions_and_open_reviews_where_painted() {
     let fixture = fixture();

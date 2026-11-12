@@ -586,13 +586,23 @@ impl ReviewSurface {
         self.request_save();
     }
 
-    /// Mark the workspace for saving when it is durable.
+    /// Mark the workspace for saving: a durable review whenever it changed, an unsaved one when
+    /// its viewed state did (the only state it keeps; see `save`).
     pub(super) fn request_save(&mut self) {
-        let durable = self
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace.id != super::TRANSIENT_WORKSPACE_ID);
-        if durable {
+        let wanted = match &self.workspace {
+            None => false,
+            Some(workspace) if workspace.id == super::TRANSIENT_WORKSPACE_ID => {
+                let viewed = (
+                    workspace.viewed_files.clone(),
+                    workspace.viewed_marks.clone(),
+                );
+                let changed = self.transient_viewed.as_ref() != Some(&viewed);
+                self.transient_viewed = Some(viewed);
+                changed
+            }
+            Some(_) => true,
+        };
+        if wanted {
             self.save = match self.save {
                 super::SaveState::Idle | super::SaveState::Pending => super::SaveState::Pending,
                 super::SaveState::Running | super::SaveState::RunningThenPending => {

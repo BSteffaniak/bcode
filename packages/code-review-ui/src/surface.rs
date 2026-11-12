@@ -351,6 +351,7 @@ impl Review {
             diagnostics,
             token,
             working_tree,
+            ..
         } = opened;
         let totals = inputs.iter().fold((0, 0), |totals, input| {
             input.entries.iter().fold(totals, |(add, del), entry| {
@@ -589,6 +590,11 @@ pub struct ReviewSurface {
     notes_requested: bool,
     /// Whether a transient review is being saved as a durable one.
     saving_as: bool,
+    /// Viewed files and marks of an unsaved review as last stored for its target.
+    transient_viewed: Option<(
+        std::collections::BTreeSet<String>,
+        Vec<bcode_code_review_models::ViewedMark>,
+    )>,
     /// The open publish or import flow.
     modal: Option<Modal>,
     /// Stack rail tab state, and the rail's area and layout in the last frame.
@@ -657,7 +663,10 @@ impl ReviewSurface {
             sources,
             title,
             config,
-            document_config: DocumentConfig::default(),
+            document_config: DocumentConfig {
+                viewed_reset: config.viewed_reset,
+                ..DocumentConfig::default()
+            },
             inbox: Inbox::default(),
             phase: Phase::Idle,
             started: None,
@@ -711,6 +720,7 @@ impl ReviewSurface {
             next_exchange: 0,
             notes_requested: false,
             saving_as: false,
+            transient_viewed: None,
             modal: None,
             rail_state: RefCell::new(bmux_tui_components::tab_bar::TabBarState::new(None)),
             rail: None,
@@ -1072,13 +1082,38 @@ impl ReviewSurface {
         let repo = self.repo_path.clone();
         let sources = self.sources.clone();
         let inbox = self.inbox.clone();
+        let viewed = loader::ViewedInputs {
+            transient_scope: self
+                .is_transient()
+                .then_some(self.workspace.as_ref())
+                .flatten()
+                .map(bcode_code_review::scope::annotation_workspace_id),
+            ..self.viewed_inputs()
+        };
         host.spawn(Box::pin(async move {
-            let message = match loader::open(services, repo, sources, inbox.clone()).await {
+            let message = match loader::open(services, repo, sources, inbox.clone(), viewed).await {
                 Ok(opened) => Message::Opened(Box::new(opened)),
                 Err(error) => Message::OpenFailed(error),
             };
             inbox.push(message);
         }));
+    }
+
+    /// The paths the workspace's viewed marks name, for loading their fingerprints on open.
+    fn viewed_inputs(&self) -> loader::ViewedInputs {
+        loader::ViewedInputs {
+            marked: self
+                .workspace
+                .as_ref()
+                .map(|workspace| {
+                    bcode_code_review::viewed::effective_marks(workspace)
+                        .into_iter()
+                        .map(|mark| mark.path)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            transient_scope: None,
+        }
     }
 
     fn request_token(&mut self, host: &UiContext, manual: bool) {
@@ -1197,10 +1232,14 @@ impl ReviewSurface {
         if self.save != SaveState::Pending {
             return;
         }
-        let Some(workspace) = self.workspace.clone() else {
+        let Some(mut workspace) = self.workspace.clone() else {
             self.save = SaveState::Idle;
             return;
         };
+        // An unsaved review keeps only its viewed state, under its target's scope.
+        if workspace.id == TRANSIENT_WORKSPACE_ID {
+            workspace = loader::transient_viewed_record(&workspace);
+        }
         self.save = SaveState::Running;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -1662,10 +1701,27 @@ impl ReviewSurface {
         review.note_splices();
     }
 
-    fn apply_opened(&mut self, opened: Opened) {
+    fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
         self.refreshing = false;
         self.generation += 1;
+        let fingerprints = std::mem::take(&mut opened.fingerprints);
+        // An unsaved review picks up the viewed state stored for its target when it first opens.
+        let stored = opened.stored_viewed.take();
+        if self.review.is_none() && self.is_transient() {
+            let workspace = self.workspace_mut();
+            if let Some(stored) = stored {
+                workspace.viewed_files.extend(stored.viewed_files);
+                workspace.viewed_marks.extend(stored.viewed_marks);
+                workspace.viewed_marks.sort();
+                workspace.viewed_marks.dedup();
+            }
+            let viewed = (
+                workspace.viewed_files.clone(),
+                workspace.viewed_marks.clone(),
+            );
+            self.transient_viewed = Some(viewed);
+        }
         let mut review = Review::new(
             self.repo_path.clone(),
             opened,
@@ -1724,6 +1780,9 @@ impl ReviewSurface {
             self.toasts
                 .push(ToastSeverity::Warning, "Some sources failed", Some(body));
         }
+        for (source_id, answer) in &fingerprints {
+            review.doc.accept_fingerprints(source_id, answer);
+        }
         let workspace = self.workspace_mut().clone();
         review.doc.set_viewed_marks(&workspace);
         review.doc.set_carried_over(&self.carried);
@@ -1772,11 +1831,13 @@ impl ReviewSurface {
         let repo = self.repo_path.clone();
         let sources = self.sources.clone();
         let inbox = self.inbox.clone();
+        let viewed = self.viewed_inputs();
         host.spawn(Box::pin(async move {
-            let message = match loader::open(services, repo, sources, Inbox::default()).await {
-                Ok(opened) => Message::Opened(Box::new(opened)),
-                Err(error) => Message::OpenFailed(error),
-            };
+            let message =
+                match loader::open(services, repo, sources, Inbox::default(), viewed).await {
+                    Ok(opened) => Message::Opened(Box::new(opened)),
+                    Err(error) => Message::OpenFailed(error),
+                };
             inbox.push(message);
         }));
     }

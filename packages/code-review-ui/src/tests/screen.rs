@@ -710,9 +710,7 @@ fn host_and_plugin_configuration_choose_the_layout() {
             ScriptedHost::new().with_diff_layout(DiffLayout::Unified),
             ReviewViewConfig {
                 diff_layout: Some(ConfiguredLayout::SideBySide),
-                side_by_side_breakpoint: None,
-                icons: None,
-                tab_width: None,
+                ..ReviewViewConfig::default()
             },
             80
         ),

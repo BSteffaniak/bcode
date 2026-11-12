@@ -8,12 +8,14 @@ use crate::services::ReviewServices;
 use bcode_code_review::document::{DocumentNeed, SourceInput, SourceStack, Ticket};
 use bcode_code_review::provider::resolve_request_with_providers;
 use bcode_code_review_models::{
-    REVIEW_BLOB_LINES_MAX_COUNT, ResolveReviewSourcesResponse, ResolvedSource,
-    ReviewBlobLinesRequest, ReviewBlobLinesResponse, ReviewBlobSelector, ReviewFileHunksResponse,
-    ReviewIndexRequest, ReviewIndexResponse, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceKind, ReviewSourcesTokenRequest, ReviewSourcesTokenResponse,
-    ReviewStackAttributionResponse, RevisionRef,
+    GetReviewWorkspaceRequest, REVIEW_BLOB_LINES_MAX_COUNT, REVIEW_PATCH_IDS_MAX_PATHS,
+    ResolveReviewSourcesResponse, ResolvedSource, ResolvedSourceMode, ReviewBlobLinesRequest,
+    ReviewBlobLinesResponse, ReviewBlobSelector, ReviewFileHunksResponse, ReviewIndexFlag,
+    ReviewIndexRequest, ReviewIndexResponse, ReviewPatchIdsRequest, ReviewPatchIdsResponse,
+    ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind, ReviewSourcesTokenRequest,
+    ReviewSourcesTokenResponse, ReviewStackAttributionResponse, ReviewWorkspace, RevisionRef,
 };
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -154,10 +156,33 @@ pub struct Opened {
     pub token: Option<String>,
     /// Whether any source reads the working tree (the token must cover it).
     pub working_tree: bool,
+    /// Diff fingerprints and working-tree content ids of marked files, per source id, so viewed
+    /// files show as viewed on the first frame.
+    pub fingerprints: Vec<(String, ReviewPatchIdsResponse)>,
+    /// The viewed state stored for an unsaved review's target, when asked for.
+    pub stored_viewed: Option<ReviewWorkspace>,
 }
 
-/// Open a review: route provider-backed sources, resolve every source, take a change token, and
-/// list every source's index (paged), reporting progress.
+/// Viewed state an opening review loads before its first frame.
+#[derive(Debug, Clone, Default)]
+pub struct ViewedInputs {
+    /// Paths the review's viewed marks name; files at (or renamed from) them get their
+    /// fingerprints.
+    pub marked: BTreeSet<String>,
+    /// For an unsaved review: the scope id its viewed state is stored under
+    /// ([`bcode_code_review::scope::annotation_workspace_id`]).
+    pub transient_scope: Option<String>,
+}
+
+/// Fingerprints loaded while opening a review at most; files beyond get theirs with their hunks.
+const MAX_OPEN_FINGERPRINTS: usize = 2_000;
+
+/// Open a review and load what its first frame needs.
+///
+/// Routes provider-backed sources, resolves every source, takes a change token, and lists every
+/// source's index (paged), reporting progress. Then loads what the first frame's viewed state
+/// needs: an unsaved review's stored viewed state, and the fingerprints of files with viewed
+/// marks (bounded; failures leave them to their hunks).
 ///
 /// # Errors
 ///
@@ -167,6 +192,7 @@ pub async fn open(
     repo_path: PathBuf,
     sources: Vec<ReviewSource>,
     inbox: Inbox,
+    viewed: ViewedInputs,
 ) -> Result<Opened, String> {
     let labels: Vec<(String, String, bool)> = sources
         .iter()
@@ -218,12 +244,99 @@ pub async fn open(
             stack,
         });
     }
+    let stored_viewed = match viewed.transient_scope {
+        Some(workspace_id) => services
+            .call(GetReviewWorkspaceRequest {
+                repo_path: repo_path.clone(),
+                workspace_id,
+            })
+            .await
+            .ok()
+            .and_then(|response| response.workspace),
+        None => None,
+    };
+    let mut marked = viewed.marked;
+    if let Some(stored) = &stored_viewed {
+        marked.extend(
+            bcode_code_review::viewed::effective_marks(stored)
+                .into_iter()
+                .map(|mark| mark.path),
+        );
+    }
+    let fingerprints = fingerprints(&services, &repo_path, &inputs, &marked).await;
     Ok(Opened {
         inputs,
         diagnostics: resolved.diagnostics,
         token,
         working_tree,
+        fingerprints,
+        stored_viewed,
     })
+}
+
+/// Fingerprints of the files of `inputs` at or renamed from `marked` paths, at most
+/// [`MAX_OPEN_FINGERPRINTS`], in requests of at most [`REVIEW_PATCH_IDS_MAX_PATHS`] paths. A
+/// renamed file is asked for by both of its paths in one request.
+async fn fingerprints(
+    services: &ReviewServices,
+    repo_path: &std::path::Path,
+    inputs: &[SourceInput],
+    marked: &BTreeSet<String>,
+) -> Vec<(String, ReviewPatchIdsResponse)> {
+    let mut answers = Vec::new();
+    if marked.is_empty() {
+        return answers;
+    }
+    let mut budget = MAX_OPEN_FINGERPRINTS;
+    for input in inputs {
+        if input.source.mode == ResolvedSourceMode::Browse || budget == 0 {
+            continue;
+        }
+        let mut chunks: Vec<Vec<String>> = vec![Vec::new()];
+        for entry in &input.entries {
+            if budget == 0 {
+                break;
+            }
+            let old = entry.old_path.as_ref().filter(|old| **old != entry.path);
+            let named = marked.contains(&entry.path) || old.is_some_and(|old| marked.contains(old));
+            if !named || entry.has(ReviewIndexFlag::Binary) {
+                continue;
+            }
+            let paths: Vec<String> = std::iter::once(entry.path.clone())
+                .chain(old.cloned())
+                .collect();
+            if chunks
+                .last()
+                .is_some_and(|chunk| chunk.len() + paths.len() > REVIEW_PATCH_IDS_MAX_PATHS)
+            {
+                chunks.push(Vec::new());
+            }
+            if let Some(chunk) = chunks.last_mut() {
+                chunk.extend(paths);
+            }
+            budget -= 1;
+        }
+        let mut merged = ReviewPatchIdsResponse::default();
+        for paths in chunks.into_iter().filter(|paths| !paths.is_empty()) {
+            let Ok(answer) = services
+                .call(ReviewPatchIdsRequest {
+                    repo_path: repo_path.to_path_buf(),
+                    base: input.source.base.clone(),
+                    head: input.source.head.clone(),
+                    paths,
+                })
+                .await
+            else {
+                continue;
+            };
+            merged.patch_ids.extend(answer.patch_ids);
+            merged.content_ids.extend(answer.content_ids);
+        }
+        if !merged.patch_ids.is_empty() || !merged.content_ids.is_empty() {
+            answers.push((input.source.source_id.clone(), merged));
+        }
+    }
+    answers
 }
 
 async fn index_entries(
@@ -308,6 +421,27 @@ pub async fn save_workspace(
     Ok(())
 }
 
+/// The record an unsaved review's viewed state is stored in: its viewed files and marks under
+/// its transient scope id, without presentation or review-pass state.
+#[must_use]
+pub fn transient_viewed_record(
+    transient: &bcode_code_review_models::ReviewWorkspace,
+) -> bcode_code_review_models::ReviewWorkspace {
+    bcode_code_review_models::ReviewWorkspace {
+        id: bcode_code_review::scope::annotation_workspace_id(transient),
+        title: transient.title.clone(),
+        repo_root: transient.repo_root.clone(),
+        sources: transient.sources.clone(),
+        created_at_ms: None,
+        updated_at_ms: None,
+        viewed_files: transient.viewed_files.clone(),
+        archived_at_ms: None,
+        viewed_marks: transient.viewed_marks.clone(),
+        reviewed_revisions: std::collections::BTreeMap::new(),
+        presentation: None,
+    }
+}
+
 /// Save a transient review as a durable workspace and return it.
 ///
 /// The workspace is created with the same title and sources, gets the viewed, presentation, and
@@ -337,6 +471,11 @@ pub async fn save_as(
         .clone_from(&transient.reviewed_revisions);
     workspace.presentation.clone_from(&transient.presentation);
     save_workspace(services.clone(), workspace.clone()).await?;
+    // The viewed state moves with the review, like its notes.
+    let mut left = transient_viewed_record(&transient);
+    left.viewed_files.clear();
+    left.viewed_marks.clear();
+    save_workspace(services.clone(), left).await?;
     let (from, to) = (
         super::notes::NoteScope::for_workspace(&transient),
         super::notes::NoteScope::for_workspace(&workspace),

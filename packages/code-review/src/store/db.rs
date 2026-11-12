@@ -44,7 +44,13 @@ impl<'a> CodeReviewDb<'a> {
             if archived_at_ms.is_some() && !include_archived {
                 continue;
             }
-            workspaces.push(workspace_from_row(&row)?);
+            let workspace = workspace_from_row(&row)?;
+            // The viewed state of unsaved reviews is kept under their transient scope id; it is
+            // not a review of its own.
+            if crate::scope::is_transient_scope_id(&workspace.id) {
+                continue;
+            }
+            workspaces.push(workspace);
         }
         workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at_ms));
         Ok(workspaces)

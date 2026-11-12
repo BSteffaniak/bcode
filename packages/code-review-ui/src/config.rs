@@ -4,7 +4,8 @@
 //! standalone `bcode-review` binary read identical values:
 //!
 //! * `[plugins.config."bcode.code_review"]` — the review's plugin table: where review state is
-//!   stored ([`CodeReviewConfig`]) and presentation settings.
+//!   stored ([`CodeReviewConfig`]), when viewed files reset (`viewed_reset`), and presentation
+//!   settings.
 //! * `[tui.keybindings.scopes."code-review*"]` — keybinding overrides of the review scopes.
 //! * `[tui.theme]` — theme selection shared with the rest of bcode.
 //! * `[tui.diff_viewer]` — bcode's diff layout preference, which the review follows unless its
@@ -108,6 +109,16 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
             Some(table) => {
                 loaded.plugin = table.clone();
                 loaded.view = ReviewViewConfig::from_plugin_table(table);
+                if let Some(reset) = table.get("viewed_reset")
+                    && reset
+                        .clone()
+                        .try_into::<bcode_code_review::viewed::ViewedReset>()
+                        .is_err()
+                {
+                    loaded.diagnostics.push(format!(
+                        "plugins.config.\"{PLUGIN_ID}\".viewed_reset must be \"diff\" or \"file\""
+                    ));
+                }
                 match toml::Value::Table(table.clone()).try_into::<CodeReviewConfig>() {
                     Ok(store) => loaded.store = store,
                     Err(error) => loaded.diagnostics.push(format!(
@@ -222,6 +233,28 @@ mod tests {
 
     fn table(text: &str) -> toml::Table {
         toml::from_str(text).expect("valid TOML")
+    }
+
+    #[test]
+    fn viewed_reset_reads_diff_or_file_and_reports_anything_else() {
+        use bcode_code_review::viewed::ViewedReset;
+        let reset = |text: &str| {
+            let loaded = from_table(&table(text), PathBuf::from("/config"));
+            (loaded.view.viewed_reset, loaded.diagnostics)
+        };
+        assert_eq!(reset(""), (ViewedReset::Diff, Vec::new()));
+        assert_eq!(
+            reset("[plugins.config.\"bcode.code_review\"]\nviewed_reset = \"file\""),
+            (ViewedReset::File, Vec::new())
+        );
+        assert_eq!(
+            reset("[plugins.config.\"bcode.code_review\"]\nviewed_reset = \"diff\""),
+            (ViewedReset::Diff, Vec::new())
+        );
+        let (fallback, diagnostics) =
+            reset("[plugins.config.\"bcode.code_review\"]\nviewed_reset = \"lines\"");
+        assert_eq!(fallback, ViewedReset::Diff);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     }
 
     #[test]

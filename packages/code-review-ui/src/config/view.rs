@@ -4,6 +4,10 @@
 //! (`[plugins.config."bcode.code_review".review_v2]`) overrides it, and the in-review toggle
 //! overrides both for the session without writing configuration. The same table selects the
 //! review's glyph set (`icons = "ascii"` for terminals without the Unicode symbols).
+//!
+//! `viewed_reset` in the plugin table itself (`[plugins.config."bcode.code_review"]`) chooses
+//! when a viewed file stops counting as viewed: `"diff"` (the default) while its changes stay
+//! the same, `"file"` when either side of the file changes.
 
 use bcode_code_review::document::LayoutMode;
 use serde::Deserialize;
@@ -47,6 +51,9 @@ pub struct ReviewViewConfig {
     /// Tab stop interval of diff text, in cells (default [`DEFAULT_TAB_WIDTH`]).
     #[serde(default)]
     pub tab_width: Option<u16>,
+    /// What makes a viewed file stale (`viewed_reset` in the plugin table, not `review_v2`).
+    #[serde(skip)]
+    pub viewed_reset: bcode_code_review::viewed::ViewedReset,
 }
 
 /// Configured layout choice.
@@ -62,22 +69,28 @@ pub enum ConfiguredLayout {
 }
 
 impl ReviewViewConfig {
-    /// Read the `review_v2` table of the plugin's configuration value.
+    /// Read the `review_v2` table and `viewed_reset` of the plugin's configuration value.
     #[must_use]
     pub fn from_plugin_config(value: Option<&toml::Value>) -> Self {
         value
-            .and_then(|value| value.get("review_v2"))
-            .and_then(|table| table.clone().try_into().ok())
+            .and_then(toml::Value::as_table)
+            .map(Self::from_plugin_table)
             .unwrap_or_default()
     }
 
-    /// Read the `review_v2` table of the review's plugin configuration table.
+    /// Read the `review_v2` table and `viewed_reset` of the review's plugin configuration
+    /// table. Unreadable values fall back to their defaults.
     #[must_use]
     pub fn from_plugin_table(table: &toml::Table) -> Self {
-        table
+        let mut config: Self = table
             .get("review_v2")
             .and_then(|table| table.clone().try_into().ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        config.viewed_reset = table
+            .get("viewed_reset")
+            .and_then(|value| value.clone().try_into().ok())
+            .unwrap_or_default();
+        config
     }
 
     /// Tab stop interval of diff text: the configured width clamped to `1..=16`, else

@@ -6,7 +6,7 @@ use super::gaps::{self, HunkRange, Region, RegionInput};
 use super::interval::IntervalSet;
 use super::items::{FileLoad, LayoutMode, ReviewItem};
 use super::keys::{FileKey, FileRef, ItemKey};
-use crate::viewed::{EntryIdentity, ViewedState, match_mark};
+use crate::viewed::{EntryIdentity, ViewedReset, ViewedState, best_state};
 use bcode_code_review_models::{
     REVIEW_BLOB_LINES_MAX_COUNT, REVIEW_HUNKS_DEFAULT_CONTEXT, ResolvedReviewStack, ResolvedSource,
     ResolvedSourceMode, ReviewBlobLinesRequest, ReviewBlobLinesResponse, ReviewBlobRef,
@@ -42,6 +42,8 @@ pub struct DocumentConfig {
     pub max_inflight_blobs: usize,
     /// Lines per blob-line request (at most the service maximum).
     pub blob_chunk_lines: u32,
+    /// What makes a viewed file stale.
+    pub viewed_reset: ViewedReset,
 }
 
 impl Default for DocumentConfig {
@@ -54,6 +56,7 @@ impl Default for DocumentConfig {
             max_inflight_hunks: 8,
             max_inflight_blobs: 16,
             blob_chunk_lines: REVIEW_BLOB_LINES_MAX_COUNT,
+            viewed_reset: ViewedReset::Diff,
         }
     }
 }
@@ -286,6 +289,8 @@ pub(super) struct FileState {
     pub revealed: IntervalSet,
     pub line_count: Option<u32>,
     pub patch_id: Option<String>,
+    /// Object id of working-tree content on the new side, once identified.
+    pub content_oid: Option<String>,
     pub viewed: ViewedState,
     pub attribution: AttributionState,
     pub last_used: u64,
@@ -647,6 +652,7 @@ impl ReviewDocument {
                 revealed,
                 line_count: None,
                 patch_id: None,
+                content_oid: None,
                 viewed: ViewedState::Unviewed,
                 attribution,
                 last_used: 0,
@@ -1736,22 +1742,13 @@ impl ReviewDocument {
     /// rebuilds the group's source header when this returns `true`.
     fn refresh_viewed(&mut self, file: usize) -> bool {
         let state = &self.files[file];
-        let identity = EntryIdentity::from_entry(&state.entry);
+        let identity = Self::identity(state);
         let viewed_identity = identity.with_patch(state.patch_id.as_deref());
-        let viewed = self
-            .marks
-            .get(&state.entry.path)
-            .map_or(ViewedState::Unviewed, |marks| {
-                marks
-                    .iter()
-                    .map(|mark| match_mark(mark, &viewed_identity))
-                    .max_by_key(|state| match state {
-                        ViewedState::Viewed => 2,
-                        ViewedState::ViewedNeedsUpdate => 1,
-                        ViewedState::Unviewed => 0,
-                    })
-                    .unwrap_or(ViewedState::Unviewed)
-            });
+        let marks = std::iter::once(viewed_identity.path)
+            .chain(viewed_identity.old_path)
+            .filter_map(|path| self.marks.get(path))
+            .flatten();
+        let viewed = best_state(marks, &viewed_identity, self.config.viewed_reset);
         let state = &mut self.files[file];
         if state.viewed == viewed {
             return false;
@@ -1786,10 +1783,43 @@ impl ReviewDocument {
     #[must_use]
     pub fn viewed_identity(&self, file: &FileKey) -> Option<(EntryIdentity, Option<String>)> {
         let state = &self.files[*self.file_index.get(file)?];
-        Some((
-            EntryIdentity::from_entry(&state.entry),
-            state.patch_id.clone(),
-        ))
+        Some((Self::identity(state), state.patch_id.clone()))
+    }
+
+    fn identity(state: &FileState) -> EntryIdentity {
+        EntryIdentity::from_entry(&state.entry).with_content(state.content_oid.as_deref())
+    }
+
+    /// Accept the diff fingerprints and working-tree content ids of files of `source_id`
+    /// answered by `review.patch_ids.get`, and update their viewed state. Fingerprints of files
+    /// whose hunks were loaded already are kept (they are the same identity).
+    pub fn accept_fingerprints(
+        &mut self,
+        source_id: &str,
+        response: &bcode_code_review_models::ReviewPatchIdsResponse,
+    ) {
+        let mut changed_groups = BTreeSet::new();
+        for file in 0..self.files.len() {
+            let state = &mut self.files[file];
+            if state.key.source_id != source_id {
+                continue;
+            }
+            let path = state.entry.path.as_str();
+            if let Some(patch) = response.patch_ids.get(path)
+                && state.patch_id.is_none()
+            {
+                state.patch_id = Some(patch.clone());
+            }
+            if let Some(content) = response.content_ids.get(path) {
+                state.content_oid = Some(content.clone());
+            }
+            if self.refresh_viewed(file) {
+                changed_groups.insert(self.files[file].group);
+            }
+        }
+        for group in changed_groups {
+            self.rebuild_block(self.groups[group].header_block);
+        }
     }
 
     /// Files whose stored mark should be re-recorded with their current identity.

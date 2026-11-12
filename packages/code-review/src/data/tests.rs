@@ -7,7 +7,8 @@ use crate::testing::fixture::{
     SYMLINK_FILE, SYMLINK_TARGET, UNICODE_FILE, UNTRACKED_FILE,
 };
 use crate::viewed::{
-    EntryIdentity, ViewedIdentity, ViewedState, effective_marks, mark_viewed, viewed_state,
+    EntryIdentity, ViewedIdentity, ViewedReset, ViewedState, effective_marks, mark_viewed,
+    viewed_state,
 };
 use bcode_code_review_models::{
     REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED, REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION,
@@ -1027,13 +1028,18 @@ fn patch_identity_survives_a_rebase_like_rewrite_and_keeps_the_file_viewed() {
     );
     let rewritten_identity = EntryIdentity::from_entry(&rewritten_entry);
     assert_eq!(
-        viewed_state(&workspace, &rewritten_identity.with_patch(None)),
+        viewed_state(
+            &workspace,
+            &rewritten_identity.with_patch(None),
+            ViewedReset::Diff
+        ),
         ViewedState::Unviewed
     );
     assert_eq!(
         viewed_state(
             &workspace,
-            &rewritten_identity.with_patch(rewritten_hunks.patch_id.as_deref())
+            &rewritten_identity.with_patch(rewritten_hunks.patch_id.as_deref()),
+            ViewedReset::Diff
         ),
         ViewedState::ViewedNeedsUpdate
     );
@@ -1041,10 +1047,194 @@ fn patch_identity_survives_a_rebase_like_rewrite_and_keeps_the_file_viewed() {
     assert_eq!(
         viewed_state(
             &workspace,
-            &EntryIdentity::from_entry(&layer3_entry).with_patch(layer3_hunks.patch_id.as_deref())
+            &EntryIdentity::from_entry(&layer3_entry).with_patch(layer3_hunks.patch_id.as_deref()),
+            ViewedReset::Diff
         ),
         ViewedState::Unviewed
     );
+}
+
+/// A repository with two functions, for diff fingerprint tests: `a` and `b`, each with a body
+/// of numbered lines.
+struct FunctionsRepo {
+    dir: tempfile::TempDir,
+}
+
+impl FunctionsRepo {
+    const PATH: &'static str = "lib.rs";
+
+    fn new() -> Self {
+        let repo = Self {
+            dir: tempfile::tempdir().expect("temp dir"),
+        };
+        repo.git(&["init", "--quiet", "--initial-branch=main"]);
+        repo
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .current_dir(self.root())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// The file with `top` (if not empty) inserted at the top of `a`'s body and `change` (if
+    /// any) replacing a numbered line of one function: `(function, line, text)`.
+    fn content(top: &str, change: Option<(&str, usize, &str)>) -> String {
+        let mut lines = Vec::new();
+        for name in ["a", "b"] {
+            lines.push(format!("fn {name}() {{"));
+            if name == "a" && !top.is_empty() {
+                lines.push(format!("    {top}"));
+            }
+            for line in 0..20 {
+                let replaced = change
+                    .filter(|(in_fn, at, _)| *in_fn == name && *at == line)
+                    .map(|(_, _, text)| text.to_owned());
+                lines.push(format!(
+                    "    {}",
+                    replaced.unwrap_or_else(|| format!("let {name}{line} = {line};"))
+                ));
+            }
+            lines.push("}".to_owned());
+            lines.push(String::new());
+        }
+        lines.join("\n") + "\n"
+    }
+
+    /// Commit `content` on branch `branch`, started at `from` (or at the current commit), and
+    /// return the commit id.
+    fn commit(&self, branch: &str, from: Option<&str>, content: &str) -> String {
+        let mut checkout = vec!["checkout", "--quiet", "-B", branch];
+        checkout.extend(from);
+        self.git(&checkout);
+        std::fs::write(self.root().join(Self::PATH), content).expect("write");
+        self.git(&["add", Self::PATH]);
+        self.git(&["commit", "--quiet", "--allow-empty", "-m", branch]);
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    /// The fingerprint and blob identity of the file between two commits.
+    fn identity(&self, base: &str, head: &str) -> (EntryIdentity, String) {
+        let mut service = ReviewData::default();
+        let source = resolve_one(&mut service, self.root(), compare(base, head));
+        let entry = entry(&full_index(&mut service, self.root(), &source), Self::PATH).clone();
+        let hunks = hunks(
+            &mut service,
+            &hunks_request(self.root(), &source, Self::PATH),
+        );
+        let batch = service
+            .patch_ids_get(&bcode_code_review_models::ReviewPatchIdsRequest {
+                repo_path: self.root().to_path_buf(),
+                base: source.base.clone(),
+                head: source.head.clone(),
+                paths: vec![Self::PATH.to_owned()],
+            })
+            .expect("batch fingerprints");
+        let patch = hunks.patch_id.expect("fingerprint");
+        assert_eq!(
+            batch.patch_ids.get(Self::PATH),
+            Some(&patch),
+            "the batch reports the hunks' fingerprint"
+        );
+        (EntryIdentity::from_entry(&entry), patch)
+    }
+}
+
+/// The diff fingerprint follows a file's changes and the sections they are in, not the rest of
+/// the file, and the reset setting chooses which of the two keeps a file viewed.
+#[test]
+fn viewed_files_follow_their_changes_under_both_reset_settings() {
+    let repo = FunctionsRepo::new();
+    let change = Some(("b", 10, "let b10 = 99;"));
+    let base = repo.commit("start", None, &FunctionsRepo::content("", None));
+    let head = repo.commit("change", Some(&base), &FunctionsRepo::content("", change));
+    let (marked, patch) = repo.identity(&base, &head);
+    assert_eq!(crate::viewed::fingerprint_version(&patch), 2);
+    let mut workspace = bcode_code_review_models::ReviewWorkspace::from_target(
+        repo.root().to_path_buf(),
+        bcode_code_review_models::ReviewTarget::Repository,
+    );
+    mark_viewed(&mut workspace, &marked.with_patch(Some(&patch)));
+    let state = |identity: &(EntryIdentity, String), reset| {
+        viewed_state(&workspace, &identity.0.with_patch(Some(&identity.1)), reset)
+    };
+
+    // A line far from the change differs on both sides: the file changed, its changes did not.
+    let moved_base = repo.commit(
+        "moved-base",
+        None,
+        &FunctionsRepo::content("let top = 0;", None),
+    );
+    let moved_head = repo.commit(
+        "moved-head",
+        Some(&moved_base),
+        &FunctionsRepo::content("let top = 0;", change),
+    );
+    let elsewhere = repo.identity(&moved_base, &moved_head);
+    assert_ne!(elsewhere.0.new_oid, marked.new_oid);
+    assert_eq!(elsewhere.1, patch);
+    assert!(state(&elsewhere, ViewedReset::Diff).is_viewed());
+    assert_eq!(state(&elsewhere, ViewedReset::File), ViewedState::Unviewed);
+
+    // A different change in the same place.
+    let edited = repo.commit(
+        "edited",
+        Some(&base),
+        &FunctionsRepo::content("", Some(("b", 10, "let b10 = 100;"))),
+    );
+    let edited = repo.identity(&base, &edited);
+    assert_eq!(state(&edited, ViewedReset::Diff), ViewedState::Unviewed);
+
+    // The same changed lines, in the other function.
+    let other_base_text =
+        FunctionsRepo::content("", None).replace("let a10 = 10;", "let b10 = 10;");
+    let other_base = repo.commit("other-base", None, &other_base_text);
+    let other_head = repo.commit(
+        "other-head",
+        Some(&other_base),
+        &other_base_text.replace(
+            "    let b10 = 10;\n    let a11",
+            "    let b10 = 99;\n    let a11",
+        ),
+    );
+    let moved = repo.identity(&other_base, &other_head);
+    assert_eq!(state(&moved, ViewedReset::Diff), ViewedState::Unviewed);
+}
+
+/// Working-tree content is identified by the object id it would have if added.
+#[test]
+fn working_tree_fingerprints_carry_content_ids() {
+    let repo = FunctionsRepo::new();
+    repo.commit("main", None, &FunctionsRepo::content("", None));
+    let edited = FunctionsRepo::content("", Some(("b", 3, "let b3 = 7;")));
+    std::fs::write(repo.root().join(FunctionsRepo::PATH), &edited).expect("write");
+    let mut service = ReviewData::default();
+    let response = service
+        .patch_ids_get(&bcode_code_review_models::ReviewPatchIdsRequest {
+            repo_path: repo.root().to_path_buf(),
+            base: RevisionRef::Index,
+            head: RevisionRef::WorkingTree,
+            paths: vec![FunctionsRepo::PATH.to_owned(), "missing.rs".to_owned()],
+        })
+        .expect("batch fingerprints");
+    let expected = repo.git(&["hash-object", FunctionsRepo::PATH]);
+    assert_eq!(
+        response.content_ids.get(FunctionsRepo::PATH),
+        Some(&expected)
+    );
+    assert!(!response.content_ids.contains_key("missing.rs"));
+    assert!(response.patch_ids.contains_key(FunctionsRepo::PATH));
 }
 
 // Blob lines and cat-file -----------------------------------------------------------------------
@@ -1535,6 +1725,7 @@ fn stateful_workspace(repo: &Path) -> bcode_code_review_models::ReviewWorkspace 
         &mut workspace,
         &ViewedIdentity {
             path: "src/a.rs",
+            old_path: None,
             old_oid: Some("o"),
             new_oid: Some("n"),
             patch_id: Some("p"),
