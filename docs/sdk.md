@@ -87,7 +87,11 @@ See:
 
 SDK sessions live in the application's own store and are not Bcode sessions: `bcode tui` and
 other consumers cannot list or resume them. For conversations that should be canonical Bcode
-sessions, see [Embedded sessions](embedded-sessions.md).
+sessions, see [Embedded sessions](embedded-sessions.md): with `daemon-client`, an application
+creates sessions tagged with its origin (`BcodeClient::create_session_with_origin`), provides
+tools that run in its own process (`bcode_client::client_tools::ClientToolProvider`), and imports
+existing SDK JSON conversations (`BcodeClient::import_session_file` with source `sdk-json`). The
+[`embedded_session`](../packages/bcode/examples/embedded_session.rs) example does all three.
 
 ## Middleware, reliability, and observability
 

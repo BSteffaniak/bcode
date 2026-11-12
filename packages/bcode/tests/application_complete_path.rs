@@ -219,6 +219,7 @@ async fn independent_session_path(
     let session = SessionApplication::create_session(
         client,
         CreateSessionRequest {
+            origin: None,
             name: Some("independent consumer".into()),
             working_directory: directory.clone(),
         },
@@ -805,6 +806,7 @@ async fn consumer(client: bcode_client::BcodeClient, effective_config: String) {
     let parent = SessionApplication::create_session(
         &client,
         CreateSessionRequest {
+            origin: None,
             name: Some("persistent IPC parent".into()),
             working_directory: directory.clone(),
         },
@@ -824,6 +826,7 @@ async fn consumer(client: bcode_client::BcodeClient, effective_config: String) {
     .await
     .unwrap();
     let request = bcode_session_models::SessionSpawnRequest {
+        managed: None,
         version: 1,
         creation: bcode_session_models::SessionChildCreateRequest {
             parent_id: parent.id,
@@ -1220,6 +1223,7 @@ async fn restricted_controller_consumer(
     let session = SessionApplication::create_session(
         &client,
         CreateSessionRequest {
+            origin: None,
             name: Some(format!("{mode} controller fixture")),
             working_directory: std::env::current_dir().unwrap(),
         },
@@ -1661,6 +1665,7 @@ async fn assert_replaced_target_and_shutdown(
         SessionApplication::create_session(
             client,
             CreateSessionRequest {
+                origin: None,
                 name: Some("must not be admitted".into()),
                 working_directory: directory,
             }
@@ -1835,6 +1840,7 @@ async fn independent_cancel_and_spawn(
     let child = SessionApplication::spawn_session(
         client,
         bcode_session_models::SessionSpawnRequest {
+            managed: None,
             version: 1,
             creation: bcode_session_models::SessionChildCreateRequest {
                 parent_id: session_id,

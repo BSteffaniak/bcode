@@ -45,6 +45,7 @@ async fn run_session(
         CreateSessionRequest {
             name: Some("Rust application consumer".into()),
             working_directory: directory.clone(),
+            origin: None,
         },
     )
     .await
@@ -96,6 +97,7 @@ async fn run_session(
         input: "Reply with one short greeting. Do not use tools.".into(),
         admission: TurnAdmissionMetadata::default(),
         auth_profile: None,
+        managed: None,
     };
     println!("child request identity: {child_id}");
     let result = SessionApplication::spawn_session(client, request).await;
@@ -377,8 +379,8 @@ async fn handle_pending_interactions(
 }
 
 fn load_controller_inputs(path: &str) -> Result<Vec<InteractionInput>, String> {
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
     file.take(65_537)
         .read_to_end(&mut bytes)

@@ -27,6 +27,10 @@ required-features = ["daemon-client"]
 name              = "application_session"
 required-features = ["daemon-client"]
 
+[[example]]
+name              = "embedded_session"
+required-features = ["daemon-client"]
+
 [[bin]]
 name              = "bcode-sdk-simulation"
 path              = "src/bin/sdk_simulation.rs"

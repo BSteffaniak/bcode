@@ -97,6 +97,7 @@ where
 {
     let invalid = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: None,
             working_directory: "relative".into(),
         })
@@ -105,6 +106,7 @@ where
     assert_eq!(invalid.code, "session_working_directory_must_be_absolute");
     let session = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("external consumer".to_owned()),
             working_directory: directory.to_path_buf(),
         })
@@ -262,6 +264,7 @@ where
 {
     let session = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("offline execution".to_owned()),
             working_directory: directory.to_path_buf(),
         })
@@ -485,6 +488,7 @@ async fn host_fixture(fake_provider: bool) {
                 use bcode_plugin_sdk::interaction_application::InteractionControllerError;
                 let probe = session
                     .create_session(CreateSessionRequest {
+                        origin: None,
                         name: Some("explicit interaction consumer".into()),
                         working_directory: directory.clone(),
                     })
@@ -565,6 +569,7 @@ where
     use bcode_session_models::{SessionChildCreateRequest, SessionSpawnRequest, SessionSpawnStage};
     let parent = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("complete spawning parent".into()),
             working_directory: directory.into(),
         })
@@ -583,6 +588,7 @@ where
         .await
         .unwrap();
     let mut request = SessionSpawnRequest {
+        managed: None,
         version: 1,
         creation: SessionChildCreateRequest {
             child_id: SessionId::new(),
@@ -681,6 +687,7 @@ where
     use bcode_plugin_sdk::interaction_application::InteractionControllerInput;
     let child = session
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("direct real question".into()),
             working_directory: directory.into(),
         })

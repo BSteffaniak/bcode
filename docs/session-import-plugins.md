@@ -1,6 +1,6 @@
 # Session import plugins
 
-Bcode can discover conversations created by other coding agents and import a selected conversation into a native Bcode session. The bundled distribution currently includes importers for Pi and OpenCode.
+Bcode can discover conversations created by other coding agents and import a selected conversation into a native Bcode session. The bundled distribution currently includes importers for Pi and OpenCode, and an importer for conversation files written by the Bcode SDK (`sdk-json`).
 
 Import is a one-time copy, not synchronization. After import, continuation uses Bcode's selected provider, agent, tools, and permissions. External tool calls become inert history and are never replayed.
 
@@ -41,6 +41,24 @@ Import one external session:
 bcode session import open --source pi <external-session-id>
 bcode session import open --source opencode <external-session-id>
 ```
+
+## Import SDK JSON conversation files
+
+Applications that embed the Bcode SDK keep conversations as `PersistedSession` JSON files (for
+example through `LocalSessionStore`). The `sdk-json` source imports files you name; it has no
+default roots and never scans directories:
+
+```sh
+bcode session import file --origin bdata --origin-name bdata conversations/*.json
+```
+
+* Each file becomes its own canonical session with import provenance and, when given, the
+  application origin. Failures are reported per file and the other files continue.
+* Files are only read. Importing the same content again returns the existing session; a file
+  with the same session id but different content is reported as a conflict and nothing is merged.
+* Text turns become messages, tool calls and results become inert history, images become a note,
+  and persisted memories are imported as their messages, each with a warning.
+* Disable it like any bundled plugin (`bcode.sdk-session-import`).
 
 ## Configuration
 

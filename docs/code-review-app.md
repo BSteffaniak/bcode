@@ -60,6 +60,14 @@ handling `Action::OpenSession` itself, without changing the UI.
 The app starts without a daemon. It reaches one only to ask Bcode about the code, to follow
 linked sessions, for plugin services, and for `publish-github`.
 
+Every session the review creates records its origin (see
+[Embedded sessions](embedded-sessions.md)): app id `bcode.code-review`, the label `Code review`,
+and the context entries `purpose` (`question` for an inline question, `assistant` for the dock)
+and `workspace` (the review workspace id). `bcode tui` shows the label as a chip, and
+`bcode session list --origin bcode.code-review` lists them. The origin is a label only; the
+review's own `review_assistant_sessions` table still records which revisions a session was
+bound to.
+
 * Inside `bcode review` the client starts the daemon when needed, and opening a linked session
   (`o`) runs `bcode tui <session>` with the same executable.
 * The standalone `bcode-review` is not the Bcode executable, so its own artifact names no daemon.

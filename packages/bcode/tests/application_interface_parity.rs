@@ -243,6 +243,7 @@ async fn direct_consumer<A: SessionApplication>(
 ) -> DirectEvidence {
     let created = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("direct → IPC 🦀".to_owned()),
             working_directory: directory.to_path_buf(),
         })
@@ -252,6 +253,7 @@ async fn direct_consumer<A: SessionApplication>(
     // fixture below subsequently appends rename and directory selection events.
     let compaction_session = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("empty compaction parity".to_owned()),
             working_directory: directory.to_path_buf(),
         })
@@ -302,6 +304,7 @@ async fn direct_consumer<A: SessionApplication>(
     assert!(page.compatibility_issues.is_empty());
     let create_error = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: None,
             working_directory: "relative".into(),
         })
@@ -318,6 +321,7 @@ async fn direct_consumer<A: SessionApplication>(
         .unwrap_err();
     let note_session = application
         .create_session(CreateSessionRequest {
+            origin: None,
             name: Some("presentation fixture".to_owned()),
             working_directory: directory.to_path_buf(),
         })
@@ -393,6 +397,7 @@ async fn direct_consumer<A: SessionApplication>(
             .any(|session| session.id == note_session.id)
     );
     let spawn_request = bcode_session_models::SessionSpawnRequest {
+        managed: None,
         version: 99,
         creation: bcode_session_models::SessionChildCreateRequest {
             child_id: bcode_session_models::SessionId::new(),
@@ -579,6 +584,7 @@ async fn ipc_consumer(ipc: bcode_client::BcodeClient, direct: DirectEvidence, di
     let created = SessionApplication::create_session(
         &ipc,
         CreateSessionRequest {
+            origin: None,
             name: Some("direct → IPC 🦀".to_owned()),
             working_directory: directory,
         },
@@ -610,6 +616,7 @@ async fn ipc_consumer(ipc: bcode_client::BcodeClient, direct: DirectEvidence, di
     let create_error = SessionApplication::create_session(
         &ipc,
         CreateSessionRequest {
+            origin: None,
             name: None,
             working_directory: "relative".into(),
         },

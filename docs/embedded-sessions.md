@@ -4,14 +4,117 @@ Applications that embed Bcode, such as bdata's SQL assistant, the standalone rev
 (`bcode-review`), or a future desktop or web host, should be able to create real Bcode
 sessions. Those sessions should be listable, resumable and observable from `bcode tui` and from
 any other Bcode consumer, whether that consumer embeds Bcode or not. This document specifies how
-that works. It is a design that needs sign-off before implementation. **Status:** specified, not
-built. The decisions that need sign-off are listed at the end.
+that works.
+
+**Status.** Session origin, app-provided tools for apps built in the Bcode workspace, and the SDK
+JSON importer are built; [What is built](#what-is-built) lists the contracts and where they differ
+from the specification below. The session bridge for apps built outside the workspace, app
+profiles, turn context blocks and the app-hosted runtime are not built yet. The decisions at the
+end still need sign-off for the parts that are not built.
 
 Related contracts: [session persistence](session-persistence-architecture.md),
 [state locations](state-locations.md), [daemon lifecycle](daemon-lifecycle-architecture.md),
 [application operation boundary](application-operation-boundary.md), [Rust SDK](sdk.md),
 [SDK session persistence](sdk-session-persistence.md), [permissions](permissions.md),
 [session import plugins](session-import-plugins.md).
+
+## What is built
+
+### Session origin
+
+* `SessionOrigin` (`bcode_session_models::origin`) holds the contract version, the app id
+  (1-64 bytes of `[a-z0-9._-]`), an optional display name (64 bytes), at most 16 context entries
+  (64-byte keys, 256-byte values) and the picker visibility. Out-of-bounds origins are rejected
+  with `session_origin_invalid` before anything is persisted; nothing is truncated.
+* The origin is a field of the canonical `SessionCreated` event, not a separate
+  `SessionOriginRecorded` event. Being inside the creation event makes it immutable and part of
+  the bounded creation prefix by construction. The field is optional and omitted from the
+  durable JSON when absent, so sessions without an origin are stored exactly as before, the event
+  schema and writer epoch are unchanged, no store migration runs, and older builds read newer
+  sessions and ignore the field.
+* `SessionSummary.origin` is a display cache carried by `manifest.json`. Opening a session reads
+  the origin, and import provenance, from at most the first three canonical events; listing
+  never replays history. A session whose manifest is lost is listed as native and gets its
+  origin back when it is opened. Origin is never backfilled.
+* `SessionCatalogQuery.origin` filters bounded catalog pages by app id and context entries.
+  Candidates whose summary cannot be read do not match and are counted in
+  `SessionCatalogPage.unclassified_origin_count`.
+* `Background` origin sessions are hidden from pickers (`SessionSummary::is_picker_visible`) and
+  open directly.
+* Clients create sessions with `CreateSessionRequest.origin`,
+  `BcodeClient::create_session_with_origin`, or `ClientToolProvider::create_session`.
+* `bcode session list --origin <app_id>` filters listings and prints `origin=<app_id>`. The TUI
+  picker shows the origin label as a chip and accepts `origin:<app_id>` in its filter.
+* The review app records `bcode.code-review` with the context entries `purpose` (`question` or
+  `assistant`) and `workspace` (the review workspace id).
+
+### App-provided tools
+
+* `bcode_tool::client_tool` defines `ClientToolDescriptor` (name, description, JSON Schema input,
+  `ClientToolPolicy::ReadOnly | Mutating`, deadline), `ClientToolInvocation` and
+  `ClientToolOutcome`. Registrations are checked whole: names must be `<provider_id>.<tool>`, at
+  most 128 tools, 4 KiB descriptions, 64 KiB schemas, deadlines up to ten minutes, and no name may
+  collide with a plugin tool.
+* IPC: `RegisterClientTools`, `ClaimClientToolSession`, `ReleaseClientToolSession` and
+  `ClientToolResult` requests; `ClientToolInvocation`, `ClientToolCancelled` and
+  `ClientToolClaimLost` events.
+* `bcode_client::client_tools::ClientToolProvider` owns one connection: it registers, claims,
+  creates sessions (claimed when their origin names the provider), receives requests and answers
+  them; `serve` runs a handler loop.
+* The daemon keeps registrations, claims and pending invocations in memory per connection. When a
+  turn starts, the claimant's tools are pinned in the turn's tool catalog next to plugin tools.
+  The agent-profile contract carries them as `claimed_tools` and `claimed`; the default agents
+  plugin treats a claim as exposure, like its default build tools, so a read-only tool runs and a
+  mutating tool asks. `[tools] disabled`, an agent tool map entry of `false`, and the `none` tool
+  default still hide a claimed tool. A claim never grants permission.
+* Calls go through the ordinary authorization coordinator, so exact-name rules and remembered
+  decisions apply and any client may answer the prompt. After approval the daemon records the
+  durable dispatch marker and sends the invocation to the claimant.
+* Results are bounded (1 MiB of text) and then pass the runtime's tool-result policy. Identical
+  repeated answers are accepted; conflicting ones are rejected; answers after the call ended are
+  accepted and dropped.
+* Failures: `client_tool_unavailable` (no live claimant), `client_tool_disconnected` (the
+  connection closed during the call; effects unknown), `client_tool_timeout` (deadline). Calls are
+  never re-sent. The durable dispatch marker is recorded before delivery, the boundary plugin
+  tools use for daemon-restart recovery; a restart test specific to client tools does not exist
+  yet.
+* Tool events record no producer plugin for client tools; the namespaced tool name identifies the
+  app. The `producer_client_id` field and `ToolSource::Client` presentation hints proposed below
+  were not added.
+
+### Importing SDK JSON conversations
+
+* The bundled, disableable `bcode.sdk-session-import` plugin implements the session-import
+  contract for source `sdk-json`. It has no default roots: discovery is always empty, and it reads
+  exactly the file the caller names (at most 64 MiB, schema 1 or unversioned).
+* Text turns become messages, tool calls and results become inert history, images become a note,
+  and persisted memories are imported as their messages; each loss is reported as a warning.
+* `bcode session import file [--origin APP [--origin-name NAME]] [--cwd DIR] FILE...` imports
+  each file separately and continues after a failure. Applications call
+  `BcodeClient::import_session_file`.
+* Each import records provenance (`sdk-json`, the file's session id) and a digest of the
+  normalized content. Importing the same content again returns the existing session; different
+  content under the same session id fails with `session_import_conflict` and nothing is merged.
+  Source files are only read.
+
+### Protocol and compatibility
+
+* The daemon IPC protocol moved from 62 to 65 (origin, client tools, file import). It stays
+  exact-match.
+* `SessionImportSummary` and `SessionImported` gained an optional `content_digest`, stored the same
+  way as the origin: omitted when absent, ignored by older builds, no schema change.
+* `BcodeClient::for_installed_bcode` sends the configuration sources it loaded, so the daemon can
+  verify an app's configuration when it creates sessions.
+* Example: `packages/bcode/examples/embedded_session.rs` registers a tool, creates an origin
+  session, imports an SDK JSON conversation and lists both with `bcode session list --origin`.
+
+### Not built
+
+* The session bridge (`bcode session-bridge --stdio`, `bcode_session_bridge`). Apps built outside
+  the Bcode workspace still need an exact build match with the installed daemon.
+* App-contributed agent profiles, `agent_profile_unavailable`, and turn context blocks.
+* The app-hosted runtime (deferred by design).
+* bdata's adoption; see [Adopting this in bdata](#adopting-this-in-bdata).
 
 ## Goals
 
@@ -491,6 +594,38 @@ Each step is independently useful, keeps the worktree green and lands with behav
 
 The app-hosted runtime (D2) is not scheduled. Revisit it if an app needs Bcode sessions on
 machines without Bcode installed.
+
+## Adopting this in bdata
+
+bdata builds against a sibling Bcode checkout through path dependencies, so until the bridge
+exists it can use the in-tree client contracts when it is built from the same Bcode revision as
+the installed daemon. The changes, in `packages/assistant` and `packages/app/src/assistant`:
+
+1. **Attach.** Replace the SDK-local `Assistant::load` / `run_turn` path with
+   `BcodeClient::for_installed_bcode(InstalledDaemonStart::IfNeeded)`. Report `NotInstalled` and
+   `Unverified` to the user and offer SDK-local mode only as an explicit choice.
+2. **Sessions.** Create conversations with `ClientToolProvider::create_session` and
+   `SessionOrigin::new("bdata").with_display_name("bdata").with_context("connection", <label>)`,
+   using the directory bdata was launched from. Replace `list_conversations` and
+   `load_transcript` with catalog pages filtered by `SessionOriginFilter::app("bdata")` (plus the
+   connection entry) and bounded history or observation reads. Submitting stays a turn submission
+   on the chosen session.
+3. **Tools.** Register the database tools (`list_workspace`, `read_results`, `read_selection`,
+   `list_schemas`, `list_relations`, `describe_relation`, `list_functions`, `validate_sql`,
+   `explain_query`, `run_query`, `propose_edit`) as `bdata.<tool>` descriptors on one
+   `ClientToolProvider`, with `ReadOnly` for inspection tools and `Mutating` for `run_query` and
+   `propose_edit`. Answer invocations from the existing `HostQuery` channel handlers. Keep the
+   domain approvals (sharing result rows) inside the handlers.
+4. **Permissions.** Delete `permissions.rs`'s `ToolPolicy` and the writes through
+   `bcode_config::upsert_agent_permission_rule`; Bcode's permission prompts arrive as ordinary
+   pending permissions on the session and are answered with `resolve_permission`.
+5. **Migration.** On first attached start, import `assistant/conversations/*.json` with
+   `BcodeClient::import_session_file("sdk-json", ..., Some(origin))`, move each imported file to
+   `assistant/migrated/<stamp>/`, skip `assistant/deleted/`, and show per-file failures.
+6. **Inline edits** stay SDK-local (decision D8).
+7. **Validation** in bdata: its own checks, plus a test that a bdata session is listed by
+   `bcode session list --origin bdata` and that a denied `bdata.run_query` never reaches the
+   handler.
 
 ## Decisions for sign-off
 

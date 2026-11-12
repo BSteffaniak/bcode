@@ -5,6 +5,20 @@ See [Child sessions](child-sessions.md) for immutable recursive session relation
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Session origin and import provenance
+
+The application that created a session (`SessionOrigin`) is an optional field of the canonical
+`SessionCreated` event, and an import's content digest is an optional field of
+`SessionImported`. Both are omitted from the durable JSON when absent, so existing sessions are
+byte-for-byte unchanged and the event schema and writer epoch stay the same; older builds decode
+newer sessions and ignore the fields.
+
+`manifest.json` caches the origin and import summary for listing. Opening a session reads them
+from at most the first three canonical events (the creation prefix); this is a bounded point read,
+never a replay. Listing never reads events, so a session whose manifest is missing is listed
+without an origin and regains it when opened. Nothing backfills older sessions. Origin is display
+and filter data only: it selects no storage, routes no execution and grants no authority.
+
 ## Managed harness notification-gate storage upgrade
 
 Writer epoch 21 retains event schema 55 and requires immutable `NotificationGateV1`

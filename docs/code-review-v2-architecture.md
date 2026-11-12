@@ -2267,8 +2267,30 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
 
 This phase changes Bcode beyond the review. The goal: bdata and any other consumer, embedded or
 not, create real bcode sessions that are visible, resumable and observable everywhere. The full
-design is [`embedded-sessions.md`](embedded-sessions.md). It is **specified and awaiting
-sign-off** on its decisions D1–D8; nothing is built yet.
+design is [`embedded-sessions.md`](embedded-sessions.md); its section "What is built" is the
+reference for the shipped contracts. Session origin, app-provided tools for in-tree apps and the
+SDK JSON importer are built. The session bridge, app profiles, turn context and the app-hosted
+runtime are not, and decisions D1–D8 still need sign-off for those parts.
+
+* **Built.**
+  * Origin is a field of the canonical `SessionCreated` event, so it is immutable and in the
+    creation prefix without an event-schema or writer-epoch change. Manifests cache it; opening
+    a session restores it (and import provenance) from the first canonical events. Catalog pages
+    filter on it and count unclassified candidates; `bcode session list --origin`, the picker chip
+    and `origin:<app>` filter use it.
+  * The review app tags its question and assistant sessions with `bcode.code-review`, the
+    purpose and the review workspace.
+  * Apps register namespaced tools on a daemon connection (`ClientToolProvider`), claim sessions
+    (creating a session with a matching origin claims it), and answer invocations after the
+    shared permission policy approved them. Claimed tools are pinned per turn; the default agents
+    plugin exposes them without granting permission. Disconnects, deadlines and cancellation fail
+    the call without replay.
+  * The bundled `sdk-json` importer and `bcode session import file` turn SDK JSON conversations
+    into canonical sessions with provenance, an origin and a content digest; identical re-imports
+    are idempotent and different content is a reported conflict.
+  * `packages/bcode/examples/embedded_session.rs` shows all three against the installed daemon.
+  * bdata's adoption is specified step by step in the design and has not been started in the
+    bdata repository.
 
 * **Modes.** *Attached* (the default): the app is a client of the installed Bcode's daemon, and
   sessions live in the user's canonical store. *SDK-local* is unchanged and remains for
