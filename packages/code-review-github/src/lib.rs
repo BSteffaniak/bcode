@@ -281,8 +281,35 @@ fn parse_repository(identifier: &str) -> Option<RepositoryRef> {
     })
 }
 
-/// Local remotes and their fetch URLs, `origin` first.
+/// Each repository path's remotes, as [`read_remotes`] answered.
+type RemotesByRepo = BTreeMap<std::path::PathBuf, Vec<(String, String)>>;
+
+/// Local remotes and their fetch URLs, `origin` first. Read once per repository path for the
+/// process's lifetime: every provider call needs them, and they are two git processes.
 fn remotes(repo_path: &Path) -> Vec<(String, String)> {
+    static REMOTES: std::sync::OnceLock<std::sync::Mutex<RemotesByRepo>> =
+        std::sync::OnceLock::new();
+    let cache = REMOTES.get_or_init(std::sync::Mutex::default);
+    let known = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(repo_path)
+        .cloned();
+    if let Some(known) = known {
+        return known;
+    }
+    let read = read_remotes(repo_path);
+    if !read.is_empty() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(repo_path.to_path_buf(), read.clone());
+    }
+    read
+}
+
+/// [`remotes`], read from git.
+fn read_remotes(repo_path: &Path) -> Vec<(String, String)> {
     let Ok(names) = git(repo_path, &["remote"]) else {
         return Vec::new();
     };

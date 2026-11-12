@@ -8,7 +8,7 @@ use bcode_code_review_models::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Immutable (commit-to-commit) listings kept for paging.
 const MAX_CACHED_LISTINGS: usize = 8;
@@ -51,7 +51,7 @@ impl IndexCache {
 
 /// Return one page of the source's index.
 pub fn index_page(
-    cache: &mut IndexCache,
+    cache: &Mutex<IndexCache>,
     root: &Path,
     request: &ReviewIndexRequest,
 ) -> Result<ReviewIndexResponse, DataError> {
@@ -62,7 +62,13 @@ pub fn index_page(
         REVIEW_INDEX_DEFAULT_PAGE_SIZE,
         REVIEW_INDEX_MAX_PAGE_SIZE,
     );
-    let (entries, next_cursor) = page(&listing.entries, offset, size, &listing.fingerprint)?;
+    let (mut entries, next_cursor) = page(&listing.entries, offset, size, &listing.fingerprint)?;
+    // Listings are shared by every source with the same revisions; entries name the asking one.
+    for entry in &mut entries {
+        if entry.source_id != request.source.source_id {
+            entry.source_id.clone_from(&request.source.source_id);
+        }
+    }
     Ok(ReviewIndexResponse {
         source_id: request.source.source_id.clone(),
         entries,
@@ -74,7 +80,7 @@ pub fn index_page(
 }
 
 fn listing(
-    cache: &mut IndexCache,
+    cache: &Mutex<IndexCache>,
     root: &Path,
     source: &ResolvedSource,
 ) -> Result<Arc<IndexListing>, DataError> {
@@ -90,7 +96,8 @@ fn listing(
         &source.paths,
     ))
     .map_err(|error| DataError::InvalidRequest(error.to_string()))?;
-    if immutable && let Some(listing) = cache.get(&key) {
+    // The cache lock is held only to look up and to store, never while git runs.
+    if immutable && let Some(listing) = lock(cache).get(&key) {
         return Ok(listing);
     }
     let (output, entries) = match source.mode {
@@ -122,7 +129,7 @@ fn listing(
         deletions,
     });
     if immutable {
-        cache.insert(key, Arc::clone(&listing));
+        lock(cache).insert(key, Arc::clone(&listing));
     }
     Ok(listing)
 }
@@ -381,6 +388,12 @@ fn parse_ls_files_stage(source_id: &str, output: &[u8]) -> Vec<ReviewIndexEntry>
 
 /// Number of cached listings, for tests that inspect the cache.
 #[cfg(test)]
-pub fn cached_listing_count(cache: &IndexCache) -> usize {
-    cache.entries.len()
+pub fn cached_listing_count(cache: &Mutex<IndexCache>) -> usize {
+    lock(cache).entries.len()
+}
+
+fn lock(cache: &Mutex<IndexCache>) -> std::sync::MutexGuard<'_, IndexCache> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

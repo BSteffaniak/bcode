@@ -133,7 +133,7 @@ impl Harness {
 
     /// The first added line of `path` in the last commit.
     fn added_line(&self, path: &str) -> u32 {
-        let mut data = ReviewData::default();
+        let data = ReviewData::default();
         let resolved = data
             .resolve_sources(&ResolveReviewSourcesRequest {
                 repo_path: self.fixture.root().to_path_buf(),

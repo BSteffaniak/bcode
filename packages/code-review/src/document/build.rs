@@ -172,6 +172,7 @@ impl ReviewDocument {
             layer,
             file_count: group.files.len(),
             viewed_count: group.viewed,
+            loading: group.loading,
         });
         Built {
             items: vec![item],

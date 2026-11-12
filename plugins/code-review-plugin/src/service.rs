@@ -20,7 +20,7 @@ pub fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 }
 
 /// Serve a repository read operation, or return `None` when `request` is not one.
-pub fn dispatch_data(data: &mut ReviewData, request: &ServiceRequest) -> Option<ServiceResponse> {
+pub fn dispatch_data(data: &ReviewData, request: &ServiceRequest) -> Option<ServiceResponse> {
     fn serve<Req: DeserializeOwned, Resp: Serialize>(
         request: &ServiceRequest,
         operation: impl FnOnce(Req) -> Result<Resp, DataError>,
@@ -41,6 +41,7 @@ pub fn dispatch_data(data: &mut ReviewData, request: &ServiceRequest) -> Option<
         models::OP_REVIEW_SOURCES_RESOLVE => serve(request, |req| data.resolve_sources(&req)),
         models::OP_REVIEW_SOURCES_TOKEN => serve(request, |req| data.sources_token(&req)),
         models::OP_REVIEW_INDEX_GET => serve(request, |req| data.index_get(&req)),
+        models::OP_REVIEW_INDEX_GET_MANY => serve(request, |req| data.index_get_many(&req)),
         models::OP_REVIEW_FILE_HUNKS_GET => serve(request, |req| data.file_hunks_get(&req)),
         models::OP_REVIEW_BLOB_LINES_GET => serve(request, |req| data.blob_lines_get(&req)),
         models::OP_REVIEW_REFS_SEARCH => serve(request, |req| data.refs_search(&req)),

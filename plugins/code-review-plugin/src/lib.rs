@@ -98,7 +98,7 @@ impl RustPlugin for CodeReviewPlugin {
                 "unsupported code review plugin service interface",
             );
         }
-        if let Some(response) = service::dispatch_data(&mut self.data, &context.request) {
+        if let Some(response) = service::dispatch_data(&self.data, &context.request) {
             return response;
         }
         service::dispatch_store(&context.request, || context.config_or_default()).unwrap_or_else(

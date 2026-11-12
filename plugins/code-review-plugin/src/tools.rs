@@ -449,7 +449,7 @@ impl Arguments {
 
 /// Run one invocation.
 fn invoke(
-    data: &mut ReviewData,
+    data: &ReviewData,
     store: &ReviewStore,
     reset: ViewedReset,
     invocation: &ToolInvocationRequest,
@@ -484,7 +484,7 @@ fn invoke(
 }
 
 fn run(
-    data: &mut ReviewData,
+    data: &ReviewData,
     store: &ReviewStore,
     reset: ViewedReset,
     name: &str,

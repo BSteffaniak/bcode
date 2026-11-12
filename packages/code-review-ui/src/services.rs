@@ -46,7 +46,7 @@ pub trait Operation: Send + 'static {
     /// # Errors
     ///
     /// * The data layer's failure, with its stable error code.
-    fn run(self, data: &Mutex<ReviewData>, store: &ReviewStore) -> ServiceResult<Self::Response>;
+    fn run(self, data: &ReviewData, store: &ReviewStore) -> ServiceResult<Self::Response>;
 }
 
 /// Preview a client-built bundle with a built-in publisher.
@@ -72,18 +72,12 @@ fn store_error(error: &StoreError) -> ProviderCallError {
 }
 
 fn with_data<T>(
-    data: &Mutex<ReviewData>,
-    call: impl FnOnce(&mut ReviewData) -> Result<T, DataError>,
+    data: &ReviewData,
+    call: impl FnOnce(&ReviewData) -> Result<T, DataError>,
 ) -> ServiceResult<T> {
-    let mut data = data.lock().map_err(|_| ProviderCallError {
-        code: models::REVIEW_SOURCE_ERROR_FAILED.to_owned(),
-        message: "repository reader is unavailable after a failed read".to_owned(),
-    })?;
     // There is no background timer; idle `cat-file` processes stop on the next call.
     data.evict_idle();
-    let result = call(&mut data);
-    drop(data);
-    result.map_err(|error| data_error(&error))
+    call(data).map_err(|error| data_error(&error))
 }
 
 /// Implements [`Operation`] for repository reads.
@@ -96,7 +90,7 @@ macro_rules! data_operations {
 
                 fn run(
                     self,
-                    data: &Mutex<ReviewData>,
+                    data: &ReviewData,
                     _store: &ReviewStore,
                 ) -> ServiceResult<Self::Response> {
                     with_data(data, |data| data.$method(&self))
@@ -116,7 +110,7 @@ macro_rules! store_operations {
 
                 fn run(
                     self,
-                    _data: &Mutex<ReviewData>,
+                    _data: &ReviewData,
                     $store: &ReviewStore,
                 ) -> ServiceResult<Self::Response> {
                     let $req = self;
@@ -134,6 +128,8 @@ data_operations! {
         models::OP_REVIEW_SOURCES_TOKEN, sources_token;
     models::ReviewIndexRequest => models::ReviewIndexResponse,
         models::OP_REVIEW_INDEX_GET, index_get;
+    models::ReviewIndexManyRequest => models::ReviewIndexManyResponse,
+        models::OP_REVIEW_INDEX_GET_MANY, index_get_many;
     models::ReviewFileHunksRequest => models::ReviewFileHunksResponse,
         models::OP_REVIEW_FILE_HUNKS_GET, file_hunks_get;
     models::ReviewBlobLinesRequest => models::ReviewBlobLinesResponse,
@@ -227,7 +223,8 @@ enum Execution {
 /// The UI's handle on review data; cheap to clone, shared by every task.
 #[derive(Clone)]
 pub struct ReviewServices {
-    data: Arc<Mutex<ReviewData>>,
+    /// Repository reads: internally synchronized, shared by every task without a lock.
+    data: Arc<ReviewData>,
     store: ReviewStore,
     host: Arc<dyn ReviewHost>,
     execution: Execution,
@@ -313,7 +310,7 @@ impl ReviewServices {
     /// Add the providers and contributors a running Bcode's plugins offer that are not built in.
     /// Their calls block on the host from the blocking threads provider work runs on.
     async fn add_plugin_providers(&self) {
-        let Ok((sources, contributors)) = plugin_manifests(&self.transport()).await else {
+        let Ok(found) = plugin_manifests(&self.transport()).await else {
             return;
         };
         let handle = tokio::runtime::Handle::current();
@@ -331,13 +328,13 @@ impl ReviewServices {
             })
         };
         let mut registry = lock(&self.providers);
-        for (plugin_id, manifest) in sources {
+        for (plugin_id, manifest) in found.sources {
             if registry.source(&manifest.id).is_none() {
                 let invoke = call(plugin_id, models::REVIEW_SOURCE_INTERFACE_ID);
                 registry.add_source(Arc::new(JsonReviewSource::new(manifest, invoke)));
             }
         }
-        for (plugin_id, manifest) in contributors {
+        for (plugin_id, manifest) in found.contributors {
             let invoke = call(plugin_id, models::REVIEW_DISCOVERY_INTERFACE_ID);
             registry.add_contributor(Arc::new(JsonDiscovery::new(manifest, invoke)));
         }
@@ -363,6 +360,12 @@ impl ReviewServices {
             #[cfg(test)]
             Execution::Inline => work(),
         }
+    }
+
+    /// The repository reads, for blocking work that drives them directly (opening a review).
+    #[must_use]
+    pub fn data(&self) -> Arc<ReviewData> {
+        Arc::clone(&self.data)
     }
 
     /// The configured stack layer limit.

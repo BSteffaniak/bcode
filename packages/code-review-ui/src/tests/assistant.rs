@@ -281,8 +281,8 @@ fn the_review_follows_what_the_sessions_review_tools_change() {
 
     // The tools write through the store the review reads, as the plugin does.
     let services = setup.backend.services();
-    let mut data = bcode_code_review::ReviewData::default();
-    let mut tools = ReviewTools::new(&mut data, services.store());
+    let data = bcode_code_review::ReviewData::default();
+    let mut tools = ReviewTools::new(&data, services.store());
     let review = tools
         .open(
             &setup.workspace.repo_root,

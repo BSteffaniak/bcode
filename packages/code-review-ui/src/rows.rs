@@ -1167,19 +1167,26 @@ fn layer_banner(
         ));
         meta.push(Span::styled(separator, theme.muted));
     }
-    meta.push(Span::styled(
-        format!(
-            "{} file{}",
-            item.file_count,
-            if item.file_count == 1 { "" } else { "s" }
-        ),
-        theme.muted,
-    ));
-    meta.push(Span::styled(separator, theme.muted));
-    meta.push(Span::styled(
-        format!("{} {} viewed", theme.icons.viewed, item.viewed_count),
-        theme.viewed,
-    ));
+    if item.loading {
+        meta.push(Span::styled(
+            format!("{} loading files", theme.icons.ellipsis),
+            theme.notice,
+        ));
+    } else {
+        meta.push(Span::styled(
+            format!(
+                "{} file{}",
+                item.file_count,
+                if item.file_count == 1 { "" } else { "s" }
+            ),
+            theme.muted,
+        ));
+        meta.push(Span::styled(separator, theme.muted));
+        meta.push(Span::styled(
+            format!("{} {} viewed", theme.icons.viewed, item.viewed_count),
+            theme.viewed,
+        ));
+    }
     vec![
         Line::from_spans(spans).truncate(width),
         title,

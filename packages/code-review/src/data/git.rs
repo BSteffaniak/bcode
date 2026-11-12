@@ -13,6 +13,61 @@ use std::process::{Command, Stdio};
 /// refreshed stat information back to the index, so later calls do not re-hash every file.
 const GLOBAL_ARGS: [&str; 3] = ["-c", "core.quotepath=false", "--literal-pathspecs"];
 
+/// Git processes running at once from this process: enough to keep every core busy, few enough
+/// that a burst of background work (indexing every layer of a stack) cannot starve the machine or
+/// the interactive request queued behind it for long.
+fn process_slots() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(2, 16)
+}
+
+/// A counting semaphore bounding concurrent git processes.
+struct Slots {
+    used: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// One running git process's slot; freed on drop.
+struct Slot;
+
+static SLOTS: Slots = Slots {
+    used: std::sync::Mutex::new(0),
+    freed: std::sync::Condvar::new(),
+};
+
+impl Slot {
+    /// Wait for a free slot.
+    fn acquire() -> Self {
+        let max = process_slots();
+        let mut used = SLOTS
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *used >= max {
+            used = SLOTS
+                .freed
+                .wait(used)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *used += 1;
+        Self
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        {
+            let mut used = SLOTS
+                .used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *used = used.saturating_sub(1);
+        }
+        SLOTS.freed.notify_one();
+    }
+}
+
 /// Build a git command for `repo_root` with the service's global options.
 pub fn command(repo_root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
@@ -34,6 +89,7 @@ pub fn command(repo_root: &Path, args: &[&str]) -> Command {
 /// * [`DataError::Io`] when git cannot be started.
 /// * [`DataError::Git`] when git exits unsuccessfully.
 pub fn output(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>, DataError> {
+    let _slot = Slot::acquire();
     let output = command(repo_root, args).output()?;
     if output.status.success() {
         return Ok(output.stdout);
@@ -55,6 +111,7 @@ pub fn output_with_input(
     input: &str,
 ) -> Result<Vec<u8>, DataError> {
     use std::io::Write as _;
+    let _slot = Slot::acquire();
     let mut child = command(repo_root, args).stdin(Stdio::piped()).spawn()?;
     let mut stdin = child
         .stdin
@@ -83,6 +140,7 @@ pub fn output_with_input(
 /// * [`DataError::Io`] when git cannot be started.
 /// * [`DataError::Git`] when git fails with an error message.
 pub fn optional_output(repo_root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, DataError> {
+    let _slot = Slot::acquire();
     let output = command(repo_root, args).output()?;
     if output.status.success() {
         return Ok(Some(output.stdout));

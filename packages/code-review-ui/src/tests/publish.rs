@@ -169,6 +169,81 @@ fn stack_rail_steps_between_layers_keeping_each_layers_position() {
 }
 
 #[test]
+fn opening_shows_the_first_layer_before_the_rest_with_the_others_loading() {
+    use crate::loader::{Inbox, Message, ViewedInputs, open};
+    use bcode_code_review_models::ReviewSource;
+    let fixture = fixture();
+    let backend = TestBackend::default().with_provider(FakeProvider::new(fixture.root()));
+    let sources: Vec<ReviewSource> = [100, 101, 102, 103]
+        .into_iter()
+        .map(|number| ReviewSource {
+            id: format!("layer-{number}"),
+            kind: layer(number),
+            label: format!("#{number}"),
+            included: true,
+        })
+        .collect();
+    let inbox = Inbox::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let complete = runtime
+        .block_on(open(
+            backend.services(),
+            fixture.root().to_path_buf(),
+            sources,
+            inbox.clone(),
+            ViewedInputs::default(),
+            Some("layer-102".into()),
+        ))
+        .expect("open");
+    // First an incomplete review: #102 listed, every other layer a loading group, in order.
+    let messages = inbox.drain();
+    let partial = messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Opened(opened) => Some(opened),
+            _ => None,
+        })
+        .expect("an early review");
+    assert!(!partial.complete);
+    let states: Vec<(&str, bool, usize)> = partial
+        .inputs
+        .iter()
+        .map(|input| {
+            (
+                input.source.source_id.as_str(),
+                input.loading,
+                input.entries.len(),
+            )
+        })
+        .collect();
+    assert_eq!(states.len(), 4);
+    assert!(
+        states[2].0 == "layer-102" && !states[2].1 && states[2].2 > 0,
+        "{states:?}"
+    );
+    for (index, (_, loading, entries)) in states.iter().enumerate() {
+        assert!(index == 2 || (*loading && *entries == 0), "{states:?}");
+    }
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, Message::Stage(stage) if stage.contains("of 3"))),
+        "{messages:?}"
+    );
+    // Then the whole review.
+    assert!(complete.complete);
+    assert!(
+        complete
+            .inputs
+            .iter()
+            .all(|input| !input.loading && !input.entries.is_empty())
+    );
+}
+
+#[test]
 fn step_through_reviews_show_one_pull_request_at_a_time_or_every_one() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));

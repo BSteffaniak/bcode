@@ -51,7 +51,7 @@ fn report(rows: &mut Vec<(String, String)>, label: impl Into<String>, value: imp
     rows.push((label, value));
 }
 
-fn resolve(service: &mut ReviewData, repo: &Path, kind: ReviewSourceKind) -> ResolvedSource {
+fn resolve(service: &ReviewData, repo: &Path, kind: ReviewSourceKind) -> ResolvedSource {
     service
         .resolve_sources(&ResolveReviewSourcesRequest {
             repo_path: repo.to_path_buf(),
@@ -70,7 +70,7 @@ fn resolve(service: &mut ReviewData, repo: &Path, kind: ReviewSourceKind) -> Res
 
 /// Load every page of the index; return entries, total wall time, and total JSON payload size.
 fn full_index(
-    service: &mut ReviewData,
+    service: &ReviewData,
     repo: &Path,
     source: &ResolvedSource,
     limit: u32,
@@ -108,7 +108,7 @@ fn full_index(
 fn measure_index(
     rows: &mut Vec<(String, String)>,
     label: &str,
-    service: &mut ReviewData,
+    service: &ReviewData,
     repo: &Path,
     source: &ResolvedSource,
 ) -> Vec<ReviewIndexEntry> {
@@ -141,7 +141,7 @@ fn measure_index(
 /// Per-file hunk loads for ordinary files and the 40k-line file.
 fn measure_hunks(
     rows: &mut Vec<(String, String)>,
-    service: &mut ReviewData,
+    service: &ReviewData,
     repo: &Path,
     branch: &ResolvedSource,
     entries: &[ReviewIndexEntry],
@@ -209,7 +209,7 @@ fn measure_hunks(
 /// Context expansion reads (20 lines) by revision and by object id.
 fn measure_blob_lines(
     rows: &mut Vec<(String, String)>,
-    service: &mut ReviewData,
+    service: &ReviewData,
     repo: &Path,
     branch: &ResolvedSource,
     entries: &[ReviewIndexEntry],
@@ -268,11 +268,11 @@ fn data_layer_benchmark() {
     let fixture = GitFixture::generate(FixtureSpec::benchmark());
     report(&mut rows, "fixture generation", ms(started.elapsed()));
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
 
     let started = Instant::now();
     let branch = resolve(
-        &mut service,
+        &service,
         repo,
         crate::testing::fixture_branch_compare().into(),
     );
@@ -281,19 +281,13 @@ fn data_layer_benchmark() {
         "branch compare: review.sources.resolve",
         ms(started.elapsed()),
     );
-    let entries = measure_index(&mut rows, "branch compare", &mut service, repo, &branch);
+    let entries = measure_index(&mut rows, "branch compare", &service, repo, &branch);
 
-    measure_hunks(&mut rows, &mut service, repo, &branch, &entries);
-    measure_blob_lines(&mut rows, &mut service, repo, &branch, &entries);
+    measure_hunks(&mut rows, &service, repo, &branch, &entries);
+    measure_blob_lines(&mut rows, &service, repo, &branch, &entries);
 
-    let worktree = resolve(&mut service, repo, ReviewSourceKind::WorkingTreeAndIndex);
-    measure_index(
-        &mut rows,
-        "working tree + index",
-        &mut service,
-        repo,
-        &worktree,
-    );
+    let worktree = resolve(&service, repo, ReviewSourceKind::WorkingTreeAndIndex);
+    measure_index(&mut rows, "working tree + index", &service, repo, &worktree);
     let started = Instant::now();
     service
         .sources_token(&bcode_code_review_models::ReviewSourcesTokenRequest {

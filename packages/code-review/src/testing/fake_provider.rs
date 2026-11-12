@@ -78,7 +78,7 @@ impl FakeProvider {
         }
         let request: ReviewSourcePullsListRequest =
             serde_json::from_slice(payload).expect("pulls request");
-        let mut pulls = Self::summaries();
+        let mut pulls = self.summaries();
         match request.query.as_deref() {
             Some(query) => {
                 record(format!("{operation} {query}"));
@@ -106,7 +106,9 @@ impl FakeProvider {
         self.calls.lock().expect("calls lock").clone()
     }
 
-    fn summaries() -> Vec<PullRequestSummary> {
+    /// The fixture's pull requests, with the commits their branches point at, as a forge reports
+    /// them.
+    fn summaries(&self) -> Vec<PullRequestSummary> {
         let branches = [
             (BASE_BRANCH, HEAD_BRANCH),
             (HEAD_BRANCH, STACK_BRANCHES[0]),
@@ -122,8 +124,8 @@ impl FakeProvider {
                 author: Some("octocat".to_owned()),
                 base_branch: base.to_owned(),
                 head_branch: head.to_owned(),
-                head_oid: String::new(),
-                base_oid: None,
+                head_oid: self.rev_parse(head),
+                base_oid: Some(self.rev_parse(base)),
                 review_requested_from_me: *number == FAKE_REQUESTED,
                 draft: false,
                 updated: None,
@@ -183,7 +185,8 @@ impl FakeProvider {
                         message: format!("no pull request #{}", request.number),
                     });
                 }
-                let layers = Self::summaries()
+                let layers = self
+                    .summaries()
                     .into_iter()
                     .enumerate()
                     .map(|(index, pull)| ReviewStackLayer {
@@ -210,7 +213,8 @@ impl FakeProvider {
                 let request: ReviewSourcePullFetchRequest =
                     serde_json::from_slice(payload).expect("fetch request");
                 record(format!("{operation} #{}", request.number));
-                let pull = Self::summaries()
+                let pull = self
+                    .summaries()
                     .into_iter()
                     .find(|pull| pull.number == request.number)
                     .ok_or_else(|| ProviderCallError {

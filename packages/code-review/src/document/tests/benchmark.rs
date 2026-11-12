@@ -113,7 +113,7 @@ fn branch_compare_index(
     bcode_code_review_models::ResolvedSource,
     Vec<ReviewIndexEntry>,
 ) {
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let kind: bcode_code_review_models::ReviewSourceKind =
         crate::testing::fixture_branch_compare().into();
     let source = service
@@ -166,6 +166,7 @@ fn document_benchmark() {
             label: "branch compare".into(),
             entries,
             stack: None,
+            loading: false,
         }],
         DocumentConfig::default(),
     );

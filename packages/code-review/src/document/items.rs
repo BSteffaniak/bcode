@@ -93,6 +93,8 @@ pub struct SourceHeaderItem {
     pub file_count: usize,
     /// Number of viewed files in the group.
     pub viewed_count: usize,
+    /// Whether the group's files are still being listed.
+    pub loading: bool,
 }
 
 /// Position of a reviewed stack layer.

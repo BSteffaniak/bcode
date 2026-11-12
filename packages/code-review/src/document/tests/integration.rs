@@ -14,7 +14,7 @@ use bcode_code_review_models::{
 use std::collections::BTreeMap;
 use std::path::Path;
 
-fn serve(service: &mut ReviewData, doc: &mut ReviewDocument) {
+fn serve(service: &ReviewData, doc: &mut ReviewDocument) {
     for _ in 0..1_000 {
         let needs = doc.take_needs();
         if needs.is_empty() {
@@ -59,11 +59,7 @@ fn lines_at(fixture: &GitFixture, revision: &RevisionRef, path: &str) -> Vec<Str
         .collect()
 }
 
-fn resolve(
-    service: &mut ReviewData,
-    repo: &Path,
-    sources: Vec<ReviewSource>,
-) -> Vec<ResolvedSource> {
+fn resolve(service: &ReviewData, repo: &Path, sources: Vec<ReviewSource>) -> Vec<ResolvedSource> {
     service
         .resolve_sources(&ResolveReviewSourcesRequest {
             repo_path: repo.to_path_buf(),
@@ -74,11 +70,7 @@ fn resolve(
         .sources
 }
 
-fn inputs(
-    service: &mut ReviewData,
-    repo: &Path,
-    resolved: Vec<ResolvedSource>,
-) -> Vec<SourceInput> {
+fn inputs(service: &ReviewData, repo: &Path, resolved: Vec<ResolvedSource>) -> Vec<SourceInput> {
     resolved
         .into_iter()
         .map(|source| {
@@ -96,6 +88,7 @@ fn inputs(
                 source,
                 entries,
                 stack: None,
+                loading: false,
             }
         })
         .collect()
@@ -105,7 +98,7 @@ fn inputs(
 fn expanded_context_matches_the_reviewed_revision_for_every_source_kind() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let source = |id: &str, kind: ReviewSourceKind| ReviewSource {
         id: id.to_string(),
         label: kind.label(),
@@ -113,7 +106,7 @@ fn expanded_context_matches_the_reviewed_revision_for_every_source_kind() {
         included: true,
     };
     let resolved = resolve(
-        &mut service,
+        &service,
         repo,
         vec![
             source(
@@ -133,7 +126,7 @@ fn expanded_context_matches_the_reviewed_revision_for_every_source_kind() {
         .iter()
         .map(|source| (source.source_id.clone(), source.clone()))
         .collect();
-    let inputs = inputs(&mut service, repo, resolved);
+    let inputs = inputs(&service, repo, resolved);
     let mut doc = ReviewDocument::new(repo.to_path_buf(), inputs, DocumentConfig::default());
     let files: Vec<_> = doc.file_keys().cloned().collect();
     for file in &files {
@@ -142,7 +135,7 @@ fn expanded_context_matches_the_reviewed_revision_for_every_source_kind() {
     for _ in 0..20 {
         let len = doc.len();
         doc.set_viewport(0, len - 1);
-        serve(&mut service, &mut doc);
+        serve(&service, &mut doc);
         if doc.len() == len {
             break;
         }
@@ -330,7 +323,7 @@ fn shown(doc: &ReviewDocument, file: &FileRef) -> Vec<(Option<u32>, Option<u32>,
     out
 }
 
-fn settle(service: &mut ReviewData, doc: &mut ReviewDocument) {
+fn settle(service: &ReviewData, doc: &mut ReviewDocument) {
     for _ in 0..20 {
         let len = doc.len();
         doc.set_viewport(0, len - 1);
@@ -347,7 +340,7 @@ fn settle(service: &mut ReviewData, doc: &mut ReviewDocument) {
 fn gaps_and_revealed_context_agree_with_a_whole_file_git_diff() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let source = |id: &str, kind: ReviewSourceKind| ReviewSource {
         id: id.to_string(),
         label: kind.label(),
@@ -355,7 +348,7 @@ fn gaps_and_revealed_context_agree_with_a_whole_file_git_diff() {
         included: true,
     };
     let resolved = resolve(
-        &mut service,
+        &service,
         repo,
         vec![
             source(
@@ -374,9 +367,9 @@ fn gaps_and_revealed_context_agree_with_a_whole_file_git_diff() {
         .iter()
         .map(|source| (source.source_id.clone(), source.clone()))
         .collect();
-    let inputs = inputs(&mut service, repo, resolved);
+    let inputs = inputs(&service, repo, resolved);
     let mut doc = ReviewDocument::new(repo.to_path_buf(), inputs, DocumentConfig::default());
-    settle(&mut service, &mut doc);
+    settle(&service, &mut doc);
 
     let files: Vec<FileRef> = doc
         .file_keys()
@@ -425,7 +418,7 @@ fn gaps_and_revealed_context_agree_with_a_whole_file_git_diff() {
     for file in &files {
         doc.reveal_file(file);
     }
-    settle(&mut service, &mut doc);
+    settle(&service, &mut doc);
     let mut lines = 0;
     for file in &files {
         let shown: Vec<OracleLine> = shown(&doc, file)

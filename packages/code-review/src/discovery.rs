@@ -181,9 +181,11 @@ pub fn discover(
 
 /// Resolve the stack containing pull request `number` through `route` with discovery.
 ///
-/// The contributors are asked about its head branch (`head_branch`, else looked up by number when
-/// any contributor is registered); their hints go with the resolution and their warnings onto the
-/// stack. Without contributors this is [`resolve_stack`].
+/// A stack `registry` resolved within [`STACK_REUSE`](crate::provider::STACK_REUSE) that has
+/// `number` as a layer is returned as it is. Otherwise the contributors are asked about its head
+/// branch (`head_branch`, else looked up by number when any contributor is registered); their
+/// hints go with the resolution and their warnings onto the stack, which is remembered. Without
+/// contributors this is [`resolve_stack`].
 ///
 /// # Errors
 ///
@@ -197,6 +199,16 @@ pub fn resolve_stack_with_discovery(
     max_layers: Option<usize>,
     head_branch: Option<String>,
 ) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
+    // A stack resolved within `STACK_REUSE` (by the home screen, the wizard, or another open) is
+    // reused as it was, warnings included.
+    if let Some(repository) = repository.as_deref()
+        && let Some(stack) = registry.known_stack(&route.manifest.id, repository, number)
+    {
+        return Ok(ReviewSourceStackResolveResponse {
+            repository: repository.to_owned(),
+            stack,
+        });
+    }
     let mut discovery = Discovery::default();
     let mut hints = Vec::new();
     if !registry.contributors().is_empty() {
@@ -213,6 +225,7 @@ pub fn resolve_stack_with_discovery(
     }
     let mut response = resolve_stack(route, repo_path, repository, number, max_layers, hints)?;
     discovery.annotate(&mut response.stack);
+    registry.remember_stack(&route.manifest.id, &response.repository, &response.stack);
     Ok(response)
 }
 

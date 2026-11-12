@@ -32,7 +32,7 @@ fn source(id: &str, kind: ReviewSourceKind) -> ReviewSource {
     }
 }
 
-fn resolve_one(service: &mut ReviewData, repo: &Path, kind: ReviewSourceKind) -> ResolvedSource {
+fn resolve_one(service: &ReviewData, repo: &Path, kind: ReviewSourceKind) -> ResolvedSource {
     let response = service
         .resolve_sources(&ResolveReviewSourcesRequest {
             repo_path: repo.to_path_buf(),
@@ -65,11 +65,7 @@ fn compare(base: &str, head: &str) -> ReviewSourceKind {
     }
 }
 
-fn full_index(
-    service: &mut ReviewData,
-    repo: &Path,
-    source: &ResolvedSource,
-) -> Vec<ReviewIndexEntry> {
+fn full_index(service: &ReviewData, repo: &Path, source: &ResolvedSource) -> Vec<ReviewIndexEntry> {
     service
         .index_get(&ReviewIndexRequest {
             repo_path: repo.to_path_buf(),
@@ -104,12 +100,12 @@ fn hunks_request(repo: &Path, source: &ResolvedSource, path: &str) -> ReviewFile
     }
 }
 
-fn hunks(service: &mut ReviewData, request: &ReviewFileHunksRequest) -> ReviewFileHunksResponse {
+fn hunks(service: &ReviewData, request: &ReviewFileHunksRequest) -> ReviewFileHunksResponse {
     service.file_hunks_get(request).expect("hunks")
 }
 
 fn blob_lines(
-    service: &mut ReviewData,
+    service: &ReviewData,
     repo: &Path,
     blob: ReviewBlobSelector,
     start_line: u32,
@@ -152,20 +148,20 @@ fn added_lines(response: &ReviewFileHunksResponse) -> Vec<String> {
 fn working_tree_and_index_sources_resolve_to_live_sides() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let head = RevisionRef::commit(rev_parse(&fixture, "HEAD"));
 
-    let unstaged = resolve_one(&mut service, repo, ReviewSourceKind::WorkingTreeUnstaged);
+    let unstaged = resolve_one(&service, repo, ReviewSourceKind::WorkingTreeUnstaged);
     assert_eq!(
         (unstaged.base, unstaged.head),
         (RevisionRef::Index, RevisionRef::WorkingTree)
     );
-    let staged = resolve_one(&mut service, repo, ReviewSourceKind::IndexStaged);
+    let staged = resolve_one(&service, repo, ReviewSourceKind::IndexStaged);
     assert_eq!(
         (staged.base, staged.head),
         (head.clone(), RevisionRef::Index)
     );
-    let both = resolve_one(&mut service, repo, ReviewSourceKind::WorkingTreeAndIndex);
+    let both = resolve_one(&service, repo, ReviewSourceKind::WorkingTreeAndIndex);
     assert_eq!((both.base, both.head), (head, RevisionRef::WorkingTree));
 }
 
@@ -173,16 +169,16 @@ fn working_tree_and_index_sources_resolve_to_live_sides() {
 fn commit_sources_resolve_to_pinned_oids() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let base = rev_parse(&fixture, BASE_BRANCH);
     let head = rev_parse(&fixture, HEAD_BRANCH);
 
-    let last = resolve_one(&mut service, repo, ReviewSourceKind::LastCommit);
+    let last = resolve_one(&service, repo, ReviewSourceKind::LastCommit);
     assert_eq!(last.base, RevisionRef::commit(base.clone()));
     assert_eq!(last.head, RevisionRef::commit(head.clone()));
 
     let root_commit = resolve_one(
-        &mut service,
+        &service,
         repo,
         ReviewSourceKind::Commit {
             rev: BASE_BRANCH.to_string(),
@@ -194,7 +190,7 @@ fn commit_sources_resolve_to_pinned_oids() {
         "root commit diffs the empty tree"
     );
 
-    let range = resolve_one(&mut service, repo, compare(BASE_BRANCH, STACK_BRANCHES[2]));
+    let range = resolve_one(&service, repo, compare(BASE_BRANCH, STACK_BRANCHES[2]));
     assert_eq!(range.base, RevisionRef::commit(base.clone()));
     assert_eq!(
         range.head,
@@ -203,7 +199,7 @@ fn commit_sources_resolve_to_pinned_oids() {
 
     // Merge-base semantics: extra-0 sits at the base commit, so main...extra-0 starts there.
     let branch = resolve_one(
-        &mut service,
+        &service,
         repo,
         ReviewSourceKind::BranchCompare {
             base_branch: HEAD_BRANCH.to_string(),
@@ -215,7 +211,7 @@ fn commit_sources_resolve_to_pinned_oids() {
     assert_eq!(branch.head, RevisionRef::commit(base));
 
     let current = resolve_one(
-        &mut service,
+        &service,
         repo,
         ReviewSourceKind::CurrentBranch {
             base: Some(BASE_BRANCH.to_string()),
@@ -228,7 +224,7 @@ fn commit_sources_resolve_to_pinned_oids() {
 fn current_branch_detects_origin_head_as_base() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     fixture.run(&["update-ref", "refs/remotes/origin/main", BASE_BRANCH]);
     fixture.run(&[
         "symbolic-ref",
@@ -236,7 +232,7 @@ fn current_branch_detects_origin_head_as_base() {
         "refs/remotes/origin/main",
     ]);
     let current = resolve_one(
-        &mut service,
+        &service,
         repo,
         ReviewSourceKind::CurrentBranch { base: None },
     );
@@ -254,7 +250,7 @@ fn current_branch_detects_origin_head_as_base() {
 fn repo_state_reports_branch_base_ahead_and_change_counts() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     fixture.run(&["update-ref", "refs/remotes/origin/main", BASE_BRANCH]);
     fixture.run(&[
         "symbolic-ref",
@@ -295,10 +291,10 @@ fn repo_state_reports_branch_base_ahead_and_change_counts() {
 fn commit_selection_resolves_to_one_range_or_parts() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
 
     let contiguous = resolve_one(
-        &mut service,
+        &service,
         repo,
         ReviewSourceKind::Commits {
             revs: vec![STACK_BRANCHES[1].to_string(), STACK_BRANCHES[0].to_string()],
@@ -365,7 +361,7 @@ fn commit_selection_resolves_to_one_range_or_parts() {
 fn provider_unsupported_and_missing_sources_produce_diagnostics_without_failing_others() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let unsupported: ReviewSourceKind =
         serde_json::from_str(r#"{"kind":"from_the_future","x":1}"#).expect("unknown kind");
     let mut excluded = source("excluded", ReviewSourceKind::LastCommit);
@@ -456,16 +452,16 @@ fn provider_unsupported_and_missing_sources_produce_diagnostics_without_failing_
 fn browse_sources_list_tracked_files() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
-    let repository = resolve_one(&mut service, repo, ReviewSourceKind::Repository);
+    let service = ReviewData::default();
+    let repository = resolve_one(&service, repo, ReviewSourceKind::Repository);
     assert_eq!(repository.mode, ResolvedSourceMode::Browse);
-    let entries = full_index(&mut service, repo, &repository);
+    let entries = full_index(&service, repo, &repository);
     assert!(entries.iter().any(|entry| entry.path == LARGE_FILE));
     assert!(entry(&entries, SYMLINK_FILE).has(ReviewIndexFlag::Symlink));
     assert!(entry(&entries, SUBMODULE_PATH).has(ReviewIndexFlag::Submodule));
 
     let file = resolve_one(
-        &mut service,
+        &service,
         repo,
         ReviewSourceKind::FileRange {
             path: UNICODE_FILE.to_string(),
@@ -477,7 +473,7 @@ fn browse_sources_list_tracked_files() {
         file.line_range.map(|range| (range.start, range.end)),
         Some((2, 9))
     );
-    let entries = full_index(&mut service, repo, &file);
+    let entries = full_index(&service, repo, &file);
     assert_eq!(entries.len(), 1);
     assert!(
         service
@@ -492,9 +488,9 @@ fn browse_sources_list_tracked_files() {
 fn branch_compare_index_reports_every_change_kind() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
-    let source = resolve_one(&mut service, repo, branch_compare());
-    let entries = full_index(&mut service, repo, &source);
+    let service = ReviewData::default();
+    let source = resolve_one(&service, repo, branch_compare());
+    let entries = full_index(&service, repo, &source);
 
     let modified = entry(&entries, &GitFixture::modified_path(0));
     assert_eq!(modified.status, ReviewFileStatus::Modified);
@@ -586,14 +582,14 @@ fn branch_compare_index_reports_every_change_kind() {
 fn staged_unstaged_and_combined_indexes_use_index_and_working_tree_blobs() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let mixed = GitFixture::modified_path(0);
     let unstaged_only = GitFixture::modified_path(1);
     let index_oid = |path: &str| rev_parse(&fixture, &format!(":{path}"));
     let head_oid = |path: &str| rev_parse(&fixture, &format!("HEAD:{path}"));
 
-    let unstaged = resolve_one(&mut service, repo, ReviewSourceKind::WorkingTreeUnstaged);
-    let entries = full_index(&mut service, repo, &unstaged);
+    let unstaged = resolve_one(&service, repo, ReviewSourceKind::WorkingTreeUnstaged);
+    let entries = full_index(&service, repo, &unstaged);
     let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(paths, vec![mixed.as_str(), unstaged_only.as_str()]);
     assert_eq!(
@@ -604,8 +600,8 @@ fn staged_unstaged_and_combined_indexes_use_index_and_working_tree_blobs() {
     );
     assert_eq!(entries[0].new_blob, ReviewBlobRef::WorkingTree);
 
-    let staged = resolve_one(&mut service, repo, ReviewSourceKind::IndexStaged);
-    let entries = full_index(&mut service, repo, &staged);
+    let staged = resolve_one(&service, repo, ReviewSourceKind::IndexStaged);
+    let entries = full_index(&service, repo, &staged);
     assert_eq!(entries.len(), 1);
     assert_eq!(
         (&entries[0].old_blob, &entries[0].new_blob),
@@ -619,8 +615,8 @@ fn staged_unstaged_and_combined_indexes_use_index_and_working_tree_blobs() {
         )
     );
 
-    let both = resolve_one(&mut service, repo, ReviewSourceKind::WorkingTreeAndIndex);
-    let entries = full_index(&mut service, repo, &both);
+    let both = resolve_one(&service, repo, ReviewSourceKind::WorkingTreeAndIndex);
+    let entries = full_index(&service, repo, &both);
     assert_eq!(entries.len(), 2);
     assert_eq!(
         entries[0].old_blob,
@@ -636,12 +632,62 @@ fn staged_unstaged_and_combined_indexes_use_index_and_working_tree_blobs() {
 }
 
 #[test]
+fn many_indexes_list_in_parallel_with_each_sources_own_answer() {
+    use bcode_code_review_models::ReviewIndexManyRequest;
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    let service = ReviewData::default();
+    let first = resolve_one(&service, repo, branch_compare());
+    let expected = full_index(&service, repo, &first);
+    // Same revisions under another id: they share the cached listing, yet every entry names the
+    // source that asked. A source with an invalid path fails alone.
+    let mut second = first.clone();
+    second.source_id = "other".into();
+    let mut broken = first.clone();
+    broken.source_id = "broken".into();
+    broken.paths = vec!["../outside".into()];
+    let response = service
+        .index_get_many(&ReviewIndexManyRequest {
+            repo_path: repo.to_path_buf(),
+            sources: vec![first.clone(), second, broken],
+            limit: Some(5_000),
+        })
+        .expect("many");
+    let ids: Vec<&str> = response
+        .indexes
+        .iter()
+        .map(|outcome| outcome.source_id.as_str())
+        .collect();
+    assert_eq!(ids, ["s", "other", "broken"]);
+    let listed = |index: usize| response.indexes[index].index.as_ref().expect("listed");
+    assert_eq!(listed(0).entries, expected);
+    assert_eq!(listed(1).entries.len(), expected.len());
+    assert!(
+        listed(1)
+            .entries
+            .iter()
+            .all(|entry| entry.source_id == "other")
+    );
+    assert!(response.indexes[2].index.is_none());
+    assert!(response.indexes[2].error_code.is_some());
+    // The data is shared by threads without a lock around it.
+    std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| full_index(&service, repo, &first)))
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().expect("reader"), expected);
+        }
+    });
+}
+
+#[test]
 fn index_pages_concatenate_to_the_full_listing_and_reject_stale_cursors() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
-    let source = resolve_one(&mut service, repo, branch_compare());
-    let all = full_index(&mut service, repo, &source);
+    let service = ReviewData::default();
+    let source = resolve_one(&service, repo, branch_compare());
+    let all = full_index(&service, repo, &source);
     assert!(all.len() > 6);
 
     let mut paged = Vec::new();
@@ -673,7 +719,7 @@ fn index_pages_concatenate_to_the_full_listing_and_reject_stale_cursors() {
     );
 
     // A live source whose content changes between pages invalidates its cursor.
-    let unstaged = resolve_one(&mut service, repo, ReviewSourceKind::WorkingTreeUnstaged);
+    let unstaged = resolve_one(&service, repo, ReviewSourceKind::WorkingTreeUnstaged);
     let first = service
         .index_get(&ReviewIndexRequest {
             repo_path: repo.to_path_buf(),
@@ -705,18 +751,18 @@ fn index_pages_concatenate_to_the_full_listing_and_reject_stale_cursors() {
 fn modified_file_hunks_match_both_blob_sides() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
-    let source = resolve_one(&mut service, repo, branch_compare());
-    let entries = full_index(&mut service, repo, &source);
+    let service = ReviewData::default();
+    let source = resolve_one(&service, repo, branch_compare());
+    let entries = full_index(&service, repo, &source);
     let file = entry(&entries, &GitFixture::modified_path(0)).clone();
-    let response = hunks(&mut service, &hunks_request(repo, &source, &file.path));
+    let response = hunks(&service, &hunks_request(repo, &source, &file.path));
     assert!(!response.hunks.is_empty() && response.truncated.is_none());
     assert!(response.patch_id.is_some());
 
     let old_oid = file.old_blob.oid().expect("old oid");
     let new_oid = file.new_blob.oid().expect("new oid");
-    let old = blob_lines(&mut service, repo, object(old_oid), 1, 5_000).expect("old blob");
-    let new = blob_lines(&mut service, repo, object(new_oid), 1, 5_000).expect("new blob");
+    let old = blob_lines(&service, repo, object(old_oid), 1, 5_000).expect("old blob");
+    let new = blob_lines(&service, repo, object(new_oid), 1, 5_000).expect("new blob");
     let mut added = 0;
     let mut removed = 0;
     for line in response.hunks.iter().flat_map(|hunk| &hunk.lines) {
@@ -735,7 +781,7 @@ fn modified_file_hunks_match_both_blob_sides() {
     assert_eq!((added, removed), (file.additions, file.deletions));
 
     let no_context = hunks(
-        &mut service,
+        &service,
         &ReviewFileHunksRequest {
             context_lines: Some(0),
             ..hunks_request(repo, &source, &file.path)
@@ -758,12 +804,12 @@ fn modified_file_hunks_match_both_blob_sides() {
 fn renamed_deleted_binary_unicode_crlf_and_mode_hunks() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
-    let source = resolve_one(&mut service, repo, branch_compare());
+    let service = ReviewData::default();
+    let source = resolve_one(&service, repo, branch_compare());
 
     let (old, new) = GitFixture::renamed_paths(0);
     let renamed = hunks(
-        &mut service,
+        &service,
         &ReviewFileHunksRequest {
             old_path: Some(old),
             ..hunks_request(repo, &source, &new)
@@ -772,7 +818,7 @@ fn renamed_deleted_binary_unicode_crlf_and_mode_hunks() {
     assert_eq!(renamed.hunks.len(), 1);
 
     let deleted = hunks(
-        &mut service,
+        &service,
         &hunks_request(repo, &source, &GitFixture::deleted_path(0)),
     );
     assert_ne!(deleted.hunks, Vec::new());
@@ -784,17 +830,17 @@ fn renamed_deleted_binary_unicode_crlf_and_mode_hunks() {
             .all(|line| line.kind == ReviewLineKind::Removed && line.new_line.is_none())
     );
 
-    let binary = hunks(&mut service, &hunks_request(repo, &source, BINARY_FILE));
+    let binary = hunks(&service, &hunks_request(repo, &source, BINARY_FILE));
     assert!(binary.binary && binary.hunks.is_empty() && binary.patch_id.is_none());
 
-    let unicode = hunks(&mut service, &hunks_request(repo, &source, UNICODE_FILE));
+    let unicode = hunks(&service, &hunks_request(repo, &source, UNICODE_FILE));
     assert!(
         added_lines(&unicode)
             .iter()
             .any(|line| line.contains("🦀") && line.contains("改訂"))
     );
 
-    let crlf = hunks(&mut service, &hunks_request(repo, &source, CRLF_FILE));
+    let crlf = hunks(&service, &hunks_request(repo, &source, CRLF_FILE));
     assert!(
         crlf.hunks
             .iter()
@@ -803,21 +849,15 @@ fn renamed_deleted_binary_unicode_crlf_and_mode_hunks() {
     );
     assert_eq!(added_lines(&crlf), vec!["middle edited line"]);
 
-    let mode = hunks(
-        &mut service,
-        &hunks_request(repo, &source, MODE_CHANGE_FILE),
-    );
+    let mode = hunks(&service, &hunks_request(repo, &source, MODE_CHANGE_FILE));
     assert_eq!(mode.hunks, Vec::new());
-    let unchanged = hunks(
-        &mut service,
-        &hunks_request(repo, &source, "no/such/file.rs"),
-    );
+    let unchanged = hunks(&service, &hunks_request(repo, &source, "no/such/file.rs"));
     assert_ne!(
         mode.patch_id, unchanged.patch_id,
         "a mode change has its own identity"
     );
 
-    let symlink = hunks(&mut service, &hunks_request(repo, &source, SYMLINK_FILE));
+    let symlink = hunks(&service, &hunks_request(repo, &source, SYMLINK_FILE));
     assert_eq!(added_lines(&symlink), vec![SYMLINK_TARGET]);
 }
 
@@ -825,12 +865,12 @@ fn renamed_deleted_binary_unicode_crlf_and_mode_hunks() {
 fn huge_file_hunks_truncate_at_the_line_budget_with_a_stable_identity() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
-    let source = resolve_one(&mut service, repo, branch_compare());
-    let full = hunks(&mut service, &hunks_request(repo, &source, LARGE_FILE));
+    let service = ReviewData::default();
+    let source = resolve_one(&service, repo, branch_compare());
+    let full = hunks(&service, &hunks_request(repo, &source, LARGE_FILE));
     let total: usize = full.hunks.iter().map(|hunk| hunk.lines.len()).sum();
     let truncated = hunks(
-        &mut service,
+        &service,
         &ReviewFileHunksRequest {
             max_lines: Some(50),
             ..hunks_request(repo, &source, LARGE_FILE)
@@ -859,12 +899,12 @@ fn huge_file_hunks_truncate_at_the_line_budget_with_a_stable_identity() {
 fn staged_and_unstaged_hunks_differ_for_a_mixed_file_and_whitespace_mode_drops_identity() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let path = GitFixture::modified_path(0);
-    let staged = resolve_one(&mut service, repo, ReviewSourceKind::IndexStaged);
-    let unstaged = resolve_one(&mut service, repo, ReviewSourceKind::WorkingTreeUnstaged);
-    let staged_hunks = hunks(&mut service, &hunks_request(repo, &staged, &path));
-    let unstaged_hunks = hunks(&mut service, &hunks_request(repo, &unstaged, &path));
+    let staged = resolve_one(&service, repo, ReviewSourceKind::IndexStaged);
+    let unstaged = resolve_one(&service, repo, ReviewSourceKind::WorkingTreeUnstaged);
+    let staged_hunks = hunks(&service, &hunks_request(repo, &staged, &path));
+    let unstaged_hunks = hunks(&service, &hunks_request(repo, &unstaged, &path));
     assert_ne!(added_lines(&staged_hunks), Vec::<String>::new());
     assert!(
         added_lines(&staged_hunks)
@@ -879,7 +919,7 @@ fn staged_and_unstaged_hunks_differ_for_a_mixed_file_and_whitespace_mode_drops_i
     assert_ne!(staged_hunks.patch_id, unstaged_hunks.patch_id);
 
     let ignoring = hunks(
-        &mut service,
+        &service,
         &ReviewFileHunksRequest {
             ignore_whitespace: true,
             ..hunks_request(repo, &staged, &path)
@@ -972,48 +1012,34 @@ fn rebased_layer_two(fixture: &GitFixture) -> String {
 fn patch_identity_survives_a_rebase_like_rewrite_and_keeps_the_file_viewed() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let rebased = rebased_layer_two(&fixture);
 
     let original = resolve_one(
-        &mut service,
+        &service,
         repo,
         compare(STACK_BRANCHES[0], STACK_BRANCHES[1]),
     );
-    let rewritten = resolve_one(&mut service, repo, compare(HEAD_BRANCH, &rebased));
-    let original_entry = entry(
-        &full_index(&mut service, repo, &original),
-        STACK_SHARED_FILE,
-    )
-    .clone();
-    let rewritten_entry = entry(
-        &full_index(&mut service, repo, &rewritten),
-        STACK_SHARED_FILE,
-    )
-    .clone();
+    let rewritten = resolve_one(&service, repo, compare(HEAD_BRANCH, &rebased));
+    let original_entry = entry(&full_index(&service, repo, &original), STACK_SHARED_FILE).clone();
+    let rewritten_entry = entry(&full_index(&service, repo, &rewritten), STACK_SHARED_FILE).clone();
     assert_ne!(original_entry.old_blob, rewritten_entry.old_blob);
     assert_ne!(original_entry.new_blob, rewritten_entry.new_blob);
 
-    let original_hunks = hunks(
-        &mut service,
-        &hunks_request(repo, &original, STACK_SHARED_FILE),
-    );
+    let original_hunks = hunks(&service, &hunks_request(repo, &original, STACK_SHARED_FILE));
     let rewritten_hunks = hunks(
-        &mut service,
+        &service,
         &hunks_request(repo, &rewritten, STACK_SHARED_FILE),
     );
     assert!(original_hunks.patch_id.is_some());
     assert_eq!(original_hunks.patch_id, rewritten_hunks.patch_id);
     // Layer 3's change to the same file is a different patch.
     let layer3 = resolve_one(
-        &mut service,
+        &service,
         repo,
         compare(STACK_BRANCHES[1], STACK_BRANCHES[2]),
     );
-    let layer3_hunks = hunks(
-        &mut service,
-        &hunks_request(repo, &layer3, STACK_SHARED_FILE),
-    );
+    let layer3_hunks = hunks(&service, &hunks_request(repo, &layer3, STACK_SHARED_FILE));
     assert_ne!(layer3_hunks.patch_id, original_hunks.patch_id);
 
     // Marked on the original: the rewrite is unknown until hunks load, then viewed.
@@ -1043,7 +1069,7 @@ fn patch_identity_survives_a_rebase_like_rewrite_and_keeps_the_file_viewed() {
         ),
         ViewedState::ViewedNeedsUpdate
     );
-    let layer3_entry = entry(&full_index(&mut service, repo, &layer3), STACK_SHARED_FILE).clone();
+    let layer3_entry = entry(&full_index(&service, repo, &layer3), STACK_SHARED_FILE).clone();
     assert_eq!(
         viewed_state(
             &workspace,
@@ -1126,18 +1152,15 @@ impl FunctionsRepo {
 
     /// The fingerprint and blob identity of the file between two commits.
     fn identity(&self, base: &str, head: &str) -> (EntryIdentity, String) {
-        let mut service = ReviewData::default();
-        let source = resolve_one(&mut service, self.root(), compare(base, head));
-        let entry = entry(&full_index(&mut service, self.root(), &source), Self::PATH).clone();
-        let hunks = hunks(
-            &mut service,
-            &hunks_request(self.root(), &source, Self::PATH),
-        );
+        let service = ReviewData::default();
+        let source = resolve_one(&service, self.root(), compare(base, head));
+        let entry = entry(&full_index(&service, self.root(), &source), Self::PATH).clone();
+        let hunks = hunks(&service, &hunks_request(self.root(), &source, Self::PATH));
         let batch = service
             .patch_ids_get(&bcode_code_review_models::ReviewPatchIdsRequest {
                 repo_path: self.root().to_path_buf(),
                 base: source.base.clone(),
-                head: source.head.clone(),
+                head: source.head,
                 paths: vec![Self::PATH.to_owned()],
             })
             .expect("batch fingerprints");
@@ -1219,7 +1242,7 @@ fn working_tree_fingerprints_carry_content_ids() {
     repo.commit("main", None, &FunctionsRepo::content("", None));
     let edited = FunctionsRepo::content("", Some(("b", 3, "let b3 = 7;")));
     std::fs::write(repo.root().join(FunctionsRepo::PATH), &edited).expect("write");
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let response = service
         .patch_ids_get(&bcode_code_review_models::ReviewPatchIdsRequest {
             repo_path: repo.root().to_path_buf(),
@@ -1243,7 +1266,7 @@ fn working_tree_fingerprints_carry_content_ids() {
 fn blob_lines_read_each_revision_side_with_ranges() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let base = RevisionRef::commit(rev_parse(&fixture, BASE_BRANCH));
     let head = RevisionRef::commit(rev_parse(&fixture, HEAD_BRANCH));
     let path = GitFixture::modified_path(0);
@@ -1251,41 +1274,29 @@ fn blob_lines_read_each_revision_side_with_ranges() {
     let head_text = fixture.git(&["show", &format!("{HEAD_BRANCH}:{LARGE_FILE}")]);
     let head_lines: Vec<&str> = head_text.lines().collect();
     let large_oid = rev_parse(&fixture, &format!("{HEAD_BRANCH}:{LARGE_FILE}"));
-    let range = blob_lines(&mut service, repo, object(&large_oid), 100, 10).expect("range");
+    let range = blob_lines(&service, repo, object(&large_oid), 100, 10).expect("range");
     assert_eq!(range.start_line, 100);
     assert_eq!(range.total_lines as usize, head_lines.len());
     assert_eq!(range.lines, head_lines[99..109]);
 
-    let past_end = blob_lines(
-        &mut service,
-        repo,
-        at(base.clone(), LARGE_FILE),
-        1_000_000,
-        10,
-    )
-    .expect("end");
+    let past_end =
+        blob_lines(&service, repo, at(base.clone(), LARGE_FILE), 1_000_000, 10).expect("end");
     assert!(past_end.lines.is_empty() && past_end.total_lines > 0);
 
-    let clamped = blob_lines(
-        &mut service,
-        repo,
-        at(base.clone(), LARGE_FILE),
-        1,
-        u32::MAX,
-    )
-    .expect("clamp");
+    let clamped =
+        blob_lines(&service, repo, at(base.clone(), LARGE_FILE), 1, u32::MAX).expect("clamp");
     assert_eq!(clamped.lines.len(), clamped.total_lines as usize);
 
-    let old = blob_lines(&mut service, repo, at(base.clone(), &path), 1, 3).expect("base side");
+    let old = blob_lines(&service, repo, at(base.clone(), &path), 1, 3).expect("base side");
     assert!(old.lines[0].contains("original line 0"));
 
-    let staged = blob_lines(&mut service, repo, at(RevisionRef::Index, &path), 1, 1_000)
-        .expect("index side");
+    let staged =
+        blob_lines(&service, repo, at(RevisionRef::Index, &path), 1, 1_000).expect("index side");
     let staged_text = fixture.git(&["show", &format!(":{path}")]);
     assert_eq!(staged.lines, staged_text.lines().collect::<Vec<_>>());
 
     let disk = blob_lines(
-        &mut service,
+        &service,
         repo,
         at(RevisionRef::WorkingTree, &path),
         1,
@@ -1301,9 +1312,9 @@ fn blob_lines_read_each_revision_side_with_ranges() {
 
     let deleted_path = GitFixture::deleted_path(0);
     let deleted =
-        blob_lines(&mut service, repo, at(base, &deleted_path), 1, 1).expect("deleted old side");
+        blob_lines(&service, repo, at(base, &deleted_path), 1, 1).expect("deleted old side");
     assert_eq!(deleted.lines.len(), 1);
-    let gone = blob_lines(&mut service, repo, at(head, &deleted_path), 1, 1);
+    let gone = blob_lines(&service, repo, at(head, &deleted_path), 1, 1);
     assert!(matches!(gone, Err(DataError::NotFound(_))), "{gone:?}");
 }
 
@@ -1311,9 +1322,9 @@ fn blob_lines_read_each_revision_side_with_ranges() {
 fn blob_lines_handle_crlf_binary_symlink_and_unicode_content() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let crlf = blob_lines(
-        &mut service,
+        &service,
         repo,
         at(RevisionRef::WorkingTree, CRLF_FILE),
         1,
@@ -1325,18 +1336,12 @@ fn blob_lines_handle_crlf_binary_symlink_and_unicode_content() {
         vec!["first line", "middle edited line", "last line"]
     );
 
-    let binary = blob_lines(
-        &mut service,
-        repo,
-        at(RevisionRef::Index, BINARY_FILE),
-        1,
-        10,
-    )
-    .expect("binary");
+    let binary =
+        blob_lines(&service, repo, at(RevisionRef::Index, BINARY_FILE), 1, 10).expect("binary");
     assert!(binary.binary && binary.lines.is_empty());
 
     let link = blob_lines(
-        &mut service,
+        &service,
         repo,
         at(RevisionRef::WorkingTree, SYMLINK_FILE),
         1,
@@ -1344,33 +1349,15 @@ fn blob_lines_handle_crlf_binary_symlink_and_unicode_content() {
     )
     .expect("symlink");
     assert_eq!(link.lines, vec![SYMLINK_TARGET]);
-    let committed_link = blob_lines(
-        &mut service,
-        repo,
-        at(RevisionRef::Index, SYMLINK_FILE),
-        1,
-        1,
-    )
-    .expect("committed symlink");
+    let committed_link = blob_lines(&service, repo, at(RevisionRef::Index, SYMLINK_FILE), 1, 1)
+        .expect("committed symlink");
     assert_eq!(committed_link.lines, link.lines);
 
-    let unicode = blob_lines(
-        &mut service,
-        repo,
-        at(RevisionRef::Index, UNICODE_FILE),
-        3,
-        1,
-    )
-    .expect("unicode");
+    let unicode =
+        blob_lines(&service, repo, at(RevisionRef::Index, UNICODE_FILE), 3, 1).expect("unicode");
     assert!(unicode.lines[0].contains("👩\u{200d}💻"));
 
-    let empty = blob_lines(
-        &mut service,
-        repo,
-        at(RevisionRef::EmptyTree, LARGE_FILE),
-        1,
-        1,
-    );
+    let empty = blob_lines(&service, repo, at(RevisionRef::EmptyTree, LARGE_FILE), 1, 1);
     assert!(matches!(empty, Err(DataError::NotFound(_))));
 }
 
@@ -1379,36 +1366,41 @@ fn cat_file_process_is_reused_restarted_evicted_and_bounded() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let other = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let head = RevisionRef::commit(rev_parse(&fixture, HEAD_BRANCH));
 
     for line in 1..=3 {
-        blob_lines(&mut service, repo, at(head.clone(), LARGE_FILE), line, 1).expect("read");
+        blob_lines(&service, repo, at(head.clone(), LARGE_FILE), line, 1).expect("read");
     }
-    let registry = service.blobs_mut().registry();
-    assert_eq!(registry.spawned(), 1, "one process serves every read");
-    let pid = registry.pid(repo).expect("running process");
+    // One statement per read: each takes the reader's lock and releases it at its end.
+    let spawned = service.blobs_mut().registry().spawned();
+    assert_eq!(spawned, 1, "one process serves every read");
+    let pid = service.blobs_mut().registry().pid(repo);
+    let pid = pid.expect("running process");
 
     service.blobs_mut().registry_mut().kill_for_test(repo);
-    let after_crash = blob_lines(&mut service, repo, at(head.clone(), UNICODE_FILE), 1, 1)
-        .expect("read after crash");
+    let after_crash =
+        blob_lines(&service, repo, at(head.clone(), UNICODE_FILE), 1, 1).expect("read after crash");
     assert_eq!(after_crash.lines.len(), 1);
-    let registry = service.blobs_mut().registry();
-    assert_eq!(registry.spawned(), 2, "crashed process restarted once");
-    assert_ne!(registry.pid(repo), Some(pid));
+    let spawned = service.blobs_mut().registry().spawned();
+    assert_eq!(spawned, 2, "crashed process restarted once");
+    let restarted = service.blobs_mut().registry().pid(repo);
+    assert_ne!(restarted, Some(pid));
 
     // Bounded: a one-process registry evicts the least recently used repository.
     *service.blobs_mut().registry_mut() = CatFileRegistry::new(1, Duration::from_secs(300));
-    blob_lines(&mut service, repo, at(head.clone(), LARGE_FILE), 1, 1).expect("first repo");
+    blob_lines(&service, repo, at(head.clone(), LARGE_FILE), 1, 1).expect("first repo");
     let other_head = RevisionRef::commit(rev_parse(&other, HEAD_BRANCH));
-    blob_lines(&mut service, other.root(), at(other_head, LARGE_FILE), 1, 1).expect("second");
-    let registry = service.blobs_mut().registry();
-    assert_eq!(registry.len(), 1);
-    assert!(registry.pid(repo).is_none() && registry.pid(other.root()).is_some());
+    blob_lines(&service, other.root(), at(other_head, LARGE_FILE), 1, 1).expect("second");
+    let processes = service.blobs_mut().registry().len();
+    assert_eq!(processes, 1);
+    let first = service.blobs_mut().registry().pid(repo);
+    let second = service.blobs_mut().registry().pid(other.root());
+    assert!(first.is_none() && second.is_some());
 
     // Idle eviction.
     *service.blobs_mut().registry_mut() = CatFileRegistry::new(4, Duration::ZERO);
-    blob_lines(&mut service, repo, at(head, LARGE_FILE), 1, 1).expect("read");
+    blob_lines(&service, repo, at(head, LARGE_FILE), 1, 1).expect("read");
     std::thread::sleep(Duration::from_millis(5));
     service.blobs_mut().registry_mut().evict_idle();
     assert!(service.blobs_mut().registry().is_empty());
@@ -1418,19 +1410,19 @@ fn cat_file_process_is_reused_restarted_evicted_and_bounded() {
 fn object_reads_are_served_from_the_blob_cache() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let oid = rev_parse(&fixture, &format!("{HEAD_BRANCH}:{LARGE_FILE}"));
-    blob_lines(&mut service, repo, object(&oid), 1, 1).expect("read");
+    blob_lines(&service, repo, object(&oid), 1, 1).expect("read");
     let pid = service.blobs_mut().registry().pid(repo);
     service.blobs_mut().registry_mut().kill_for_test(repo);
-    blob_lines(&mut service, repo, object(&oid), 2, 1).expect("cached read");
+    blob_lines(&service, repo, object(&oid), 2, 1).expect("cached read");
     assert_eq!(
         service.blobs_mut().registry().spawned(),
         1,
         "no object read was needed"
     );
     service.blobs_mut().clear_cache();
-    blob_lines(&mut service, repo, object(&oid), 2, 1).expect("uncached read");
+    blob_lines(&service, repo, object(&oid), 2, 1).expect("uncached read");
     assert_ne!(service.blobs_mut().registry().pid(repo), pid);
 }
 
@@ -1438,7 +1430,7 @@ fn object_reads_are_served_from_the_blob_cache() {
 fn unconfined_paths_are_rejected() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let outside = tempfile::tempdir().expect("outside");
     std::fs::write(outside.path().join("secret.txt"), "secret\n").expect("write");
     std::os::unix::fs::symlink(outside.path(), repo.join("escape")).expect("symlink");
@@ -1450,16 +1442,16 @@ fn unconfined_paths_are_rejected() {
         "a/../../secret.txt",
         ".git/config",
     ] {
-        let result = blob_lines(&mut service, repo, at(RevisionRef::WorkingTree, path), 1, 1);
+        let result = blob_lines(&service, repo, at(RevisionRef::WorkingTree, path), 1, 1);
         assert!(
             matches!(result, Err(DataError::PathRejected(_))),
             "{path}: {result:?}"
         );
     }
-    let index_side = blob_lines(&mut service, repo, at(RevisionRef::Index, "../x"), 1, 1);
+    let index_side = blob_lines(&service, repo, at(RevisionRef::Index, "../x"), 1, 1);
     assert!(matches!(index_side, Err(DataError::PathRejected(_))));
 
-    let source = resolve_one(&mut service, repo, branch_compare());
+    let source = resolve_one(&service, repo, branch_compare());
     let hunks = service.file_hunks_get(&hunks_request(repo, &source, "../x"));
     assert!(matches!(hunks, Err(DataError::PathRejected(_))));
     let index = service.index_get(&ReviewIndexRequest {
@@ -1472,7 +1464,7 @@ fn unconfined_paths_are_rejected() {
         limit: None,
     });
     assert!(matches!(index, Err(DataError::PathRejected(_))));
-    let injected = blob_lines(&mut service, repo, object("--batch-all-objects"), 1, 1);
+    let injected = blob_lines(&service, repo, object("--batch-all-objects"), 1, 1);
     assert!(matches!(injected, Err(DataError::InvalidRequest(_))));
 }
 
@@ -1491,14 +1483,14 @@ fn index_reads_stage_like_paths_and_type_changes_cover_both_sides() {
     std::os::unix::fs::symlink("x", repo.join("kind.txt")).expect("symlink");
     git(&["add", "--all"]);
     git(&["commit", "--quiet", "-m", "type change"]);
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
 
-    let staged = blob_lines(&mut service, repo, at(RevisionRef::Index, "1:x"), 1, 1)
-        .expect("stage-like path");
+    let staged =
+        blob_lines(&service, repo, at(RevisionRef::Index, "1:x"), 1, 1).expect("stage-like path");
     assert_eq!(staged.lines, vec!["stage-like name"]);
 
-    let source = resolve_one(&mut service, repo, ReviewSourceKind::LastCommit);
-    let response = hunks(&mut service, &hunks_request(repo, &source, "kind.txt"));
+    let source = resolve_one(&service, repo, ReviewSourceKind::LastCommit);
+    let response = hunks(&service, &hunks_request(repo, &source, "kind.txt"));
     let lines: Vec<(ReviewLineKind, &str)> = response
         .hunks
         .iter()
@@ -1521,7 +1513,7 @@ fn index_reads_stage_like_paths_and_type_changes_cover_both_sides() {
 fn refs_search_ranks_filters_and_pages() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     fixture.run(&["tag", "v1.0", BASE_BRANCH]);
     let request = |query: &str, cursor: Option<String>| ReviewRefsSearchRequest {
         repo_path: repo.to_path_buf(),
@@ -1567,7 +1559,7 @@ fn refs_search_ranks_filters_and_pages() {
 fn commit_pages_stay_anchored_when_the_branch_moves() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let page_request =
         |rev: Option<&str>, query: Option<&str>, cursor: Option<String>| ReviewCommitsPageRequest {
             repo_path: repo.to_path_buf(),
@@ -1628,7 +1620,7 @@ fn commit_pages_stay_anchored_when_the_branch_moves() {
 fn files_search_ranks_paths_per_revision_and_pages() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
-    let mut service = ReviewData::default();
+    let service = ReviewData::default();
     let request = |query: &str, revision: Option<RevisionRef>| ReviewFilesSearchRequest {
         repo_path: repo.to_path_buf(),
         query: query.to_string(),

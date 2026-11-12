@@ -379,6 +379,7 @@ impl Fake {
                 .map(|file| file.entry(source_id))
                 .collect(),
             stack: None,
+            loading: false,
         }
     }
 

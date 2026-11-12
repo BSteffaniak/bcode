@@ -25,6 +25,8 @@ pub const OP_REVIEW_SOURCES_RESOLVE: &str = "review.sources.resolve";
 pub const OP_REVIEW_SOURCES_TOKEN: &str = "review.sources.token";
 /// Operation that returns one page of a resolved source's file index.
 pub const OP_REVIEW_INDEX_GET: &str = "review.index.get";
+/// Operation returning the first page of many resolved sources' file indexes at once.
+pub const OP_REVIEW_INDEX_GET_MANY: &str = "review.index.get_many";
 /// Operation that returns the parsed hunks of one file of one resolved source.
 pub const OP_REVIEW_FILE_HUNKS_GET: &str = "review.file.hunks.get";
 /// Operation that returns a line range of one blob.
@@ -387,6 +389,44 @@ impl ReviewIndexEntry {
     pub fn has(&self, flag: ReviewIndexFlag) -> bool {
         self.flags.contains(&flag)
     }
+}
+
+/// Request payload for `review.index.get_many`: the first page of each source's file index,
+/// computed in parallel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewIndexManyRequest {
+    /// Absolute repository path.
+    pub repo_path: PathBuf,
+    /// Resolved sources to list, in the order to answer them.
+    pub sources: Vec<ResolvedSource>,
+    /// Page size of each first page; clamped to [`REVIEW_INDEX_MAX_PAGE_SIZE`].
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// One source's answer in a [`ReviewIndexManyResponse`]: its first page or why it failed. One
+/// failing source never fails the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewIndexOutcome {
+    /// The source asked about.
+    pub source_id: String,
+    /// The first page, when listing succeeded (`next_cursor` continues with `review.index.get`).
+    #[serde(default)]
+    pub index: Option<ReviewIndexResponse>,
+    /// Stable error code, when listing failed.
+    #[serde(default)]
+    pub error_code: Option<String>,
+    /// Error message, when listing failed.
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+/// Response payload for `review.index.get_many`: one outcome per requested source, in request
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewIndexManyResponse {
+    /// Outcomes.
+    pub indexes: Vec<ReviewIndexOutcome>,
 }
 
 /// Response payload for `review.index.get`.

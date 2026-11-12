@@ -544,6 +544,29 @@ fn pull_requests_missing_from_the_recent_list_are_looked_up() {
 }
 
 #[test]
+fn a_stack_chosen_in_the_wizard_opens_without_resolving_it_again() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 5);
+    scenario.key("enter");
+    settled(&mut scenario);
+    // "Step through every layer", then create and open the review.
+    scenario.key("down");
+    scenario.key("enter");
+    settled(&mut scenario);
+    create(&mut scenario, &backend, &fixture);
+    let resolves = backend
+        .provider()
+        .unwrap()
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with(bcode_code_review_models::OP_REVIEW_SOURCE_STACK_RESOLVE))
+        .count();
+    assert_eq!(resolves, 1, "{:?}", backend.provider().unwrap().calls());
+}
+
+#[test]
 fn missing_or_failing_providers_are_explained_and_other_types_still_work() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default());

@@ -141,8 +141,8 @@ use super::entry::TRANSIENT_WORKSPACE_ID;
 enum Phase {
     /// Nothing started yet.
     Idle,
-    /// The open task is running.
-    Opening { files: usize, total: usize },
+    /// The open task is running, at `stage`.
+    Opening { stage: String },
     /// Opening failed.
     Failed(String),
     /// The document is shown.
@@ -649,6 +649,8 @@ pub struct ReviewSurface {
     hide_viewed_files: bool,
     /// How a step-through stack review is shown (persisted).
     stack_view: stack::StackView,
+    /// The review shown has sources still loading; a complete open follows.
+    filling: bool,
     /// Text to copy once the host is at hand, and what it is.
     clipboard: Option<(String, &'static str)>,
     /// Exiting an unsaved review with annotations was asked once (the next exit leaves).
@@ -767,6 +769,7 @@ impl ReviewSurface {
             hide_resolved: false,
             hide_viewed_files: false,
             stack_view: stack::StackView::default(),
+            filling: false,
             clipboard: None,
             exit_armed: false,
             edit_requested: false,
@@ -1133,7 +1136,9 @@ impl ReviewSurface {
     // ----------------------------------------------------------------------------------------
 
     fn start_open(&mut self, host: &UiContext) {
-        self.phase = Phase::Opening { files: 0, total: 0 };
+        self.phase = Phase::Opening {
+            stage: "opening".to_owned(),
+        };
         self.started = Some(Instant::now());
         let services = self.services.clone();
         let repo = self.repo_path.clone();
@@ -1147,13 +1152,38 @@ impl ReviewSurface {
                 .map(bcode_code_review::scope::annotation_workspace_id),
             ..self.viewed_inputs()
         };
+        let first = self.first_source();
         host.spawn(Box::pin(async move {
-            let message = match loader::open(services, repo, sources, inbox.clone(), viewed).await {
-                Ok(opened) => Message::Opened(Box::new(opened)),
-                Err(error) => Message::OpenFailed(error),
-            };
+            let message =
+                match loader::open(services, repo, sources, inbox.clone(), viewed, first).await {
+                    Ok(opened) => Message::Opened(Box::new(opened)),
+                    Err(error) => Message::OpenFailed(error),
+                };
             inbox.push(message);
         }));
+    }
+
+    /// The source to make ready first when opening: the layer last entered, else the source of the
+    /// saved scroll position.
+    fn first_source(&self) -> Option<String> {
+        use bcode_code_review_models::ReviewItemKey;
+        if let Some(layer) = &self.rail_layer {
+            return Some(layer.clone());
+        }
+        let anchor = self
+            .workspace
+            .as_ref()?
+            .presentation
+            .as_ref()?
+            .scroll_anchor
+            .as_ref()?;
+        match &anchor.item {
+            ReviewItemKey::SourceHeader { source_id, .. }
+            | ReviewItemKey::FileHeader { source_id, .. }
+            | ReviewItemKey::HunkHeader { source_id, .. }
+            | ReviewItemKey::Line { source_id, .. } => Some(source_id.clone()),
+            ReviewItemKey::Thread { .. } => None,
+        }
     }
 
     /// The paths the workspace's viewed marks name, for loading their fingerprints on open.
@@ -1652,14 +1682,9 @@ impl ReviewSurface {
     /// Apply one finished piece of work.
     fn apply_message(&mut self, message: Message, host: &UiContext) {
         match message {
-            Message::Progress { files, total } => {
-                if let Phase::Opening {
-                    files: shown,
-                    total: expected,
-                } = &mut self.phase
-                {
-                    *shown = files;
-                    *expected = total;
+            Message::Stage(text) => {
+                if let Phase::Opening { stage } = &mut self.phase {
+                    *stage = text;
                 }
             }
             Message::Opened(opened) => self.apply_opened(*opened),
@@ -1762,6 +1787,7 @@ impl ReviewSurface {
 
     fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
+        let was_filling = std::mem::replace(&mut self.filling, !opened.complete);
         let (first_open, deepest_stack) = (self.review.is_none(), deepest_stack(&opened));
         self.refreshing = false;
         self.generation += 1;
@@ -1821,7 +1847,8 @@ impl ReviewSurface {
             carry_tree(previous, &mut review, &self.theme);
             self.queue.clear();
             self.syntax.next_generation();
-            if !std::mem::take(&mut self.switching) {
+            // Filling in sources that were still loading is not a refresh.
+            if !std::mem::take(&mut self.switching) && !was_filling {
                 self.status = None;
                 self.toasts
                     .push(ToastSeverity::Success, "Review refreshed", None);
@@ -1897,12 +1924,23 @@ impl ReviewSurface {
         let sources = self.sources.clone();
         let inbox = self.inbox.clone();
         let viewed = self.viewed_inputs();
+        let first = self.first_source();
+        // A refresh keeps showing the review until every source is listed again: early,
+        // incomplete answers go to a throwaway inbox.
         host.spawn(Box::pin(async move {
-            let message =
-                match loader::open(services, repo, sources, Inbox::default(), viewed).await {
-                    Ok(opened) => Message::Opened(Box::new(opened)),
-                    Err(error) => Message::OpenFailed(error),
-                };
+            let message = match loader::open(
+                services,
+                repo,
+                sources,
+                Inbox::default(),
+                viewed,
+                first,
+            )
+            .await
+            {
+                Ok(opened) => Message::Opened(Box::new(opened)),
+                Err(error) => Message::OpenFailed(error),
+            };
             inbox.push(message);
         }));
     }
@@ -3080,11 +3118,8 @@ impl ReviewSurface {
             .map_or(Duration::ZERO, |started| started.elapsed());
         let (title, body) = match &self.phase {
             Phase::Failed(error) => ("Could not open the review", error.clone()),
-            Phase::Opening { files, total } if *total > 0 => (
-                "Opening review…",
-                format!("indexed {files} of {total} files"),
-            ),
-            _ => ("Opening review…", "resolving sources".to_owned()),
+            Phase::Opening { stage } => ("Opening review…", stage.clone()),
+            _ => ("Opening review…", "opening".to_owned()),
         };
         let spinner = if self.theme.icons.ellipsis.is_ascii() {
             Spinner::ascii()

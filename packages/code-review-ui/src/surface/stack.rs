@@ -237,11 +237,8 @@ impl ReviewSurface {
                     .last()
                     .map_or_else(String::new, |layer| format!("#{}", layer.number))
             };
-            let total = group.file_count;
-            let viewed = format!("{}/{}", group.viewed, total);
-            let complete = total > 0 && group.viewed == total;
-            let viewed_style = if complete { theme.viewed } else { theme.muted };
-            let cells = progress_cells(group.viewed, total, theme);
+            let (viewed, viewed_style, cells) =
+                tab_progress(group.loading, group.viewed, group.file_count, theme);
             let mut full = vec![
                 Span::styled(name, theme.text),
                 Span::raw(" "),
@@ -513,6 +510,24 @@ impl ReviewSurface {
 
 const fn rail_policy() -> TabBarPolicy {
     TabBarPolicy::interactive().separator(" │ ")
+}
+
+/// A tab's viewed progress: its label (`viewed/files`, or an ellipsis while the layer's files are
+/// still loading), the label's style, and its progress cells.
+fn tab_progress(
+    loading: bool,
+    viewed: usize,
+    total: usize,
+    theme: &super::ReviewTheme,
+) -> (String, bmux_tui::style::Style, Vec<Span>) {
+    let label = if loading {
+        theme.icons.ellipsis.to_owned()
+    } else {
+        format!("{viewed}/{total}")
+    };
+    let complete = total > 0 && viewed == total;
+    let style = if complete { theme.viewed } else { theme.muted };
+    (label, style, progress_cells(viewed, total, theme))
 }
 
 /// Five viewed-progress cells.

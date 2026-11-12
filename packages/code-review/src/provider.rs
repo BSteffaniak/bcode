@@ -94,11 +94,74 @@ impl std::fmt::Debug for ContributorRoute {
     }
 }
 
-/// The providers and contributors a review asks, in preference order.
+/// How long a resolved stack is reused without asking its provider again.
+pub const STACK_REUSE: std::time::Duration = std::time::Duration::from_mins(10);
+
+/// Stacks resolved recently, by provider and repository, so a review opened right after the
+/// stack was resolved (from the wizard, the home screen, or another open) does not resolve it
+/// again. Shared by every clone of a registry.
+#[derive(Debug, Default)]
+struct KnownStacks(std::sync::Mutex<BTreeMap<StackScope, Vec<KnownStack>>>);
+
+/// The provider and repository stacks are remembered under.
+type StackScope = (String, String);
+
+/// A stack and when it was resolved.
+#[derive(Debug)]
+struct KnownStack {
+    resolved: std::time::Instant,
+    stack: ReviewStack,
+}
+
+impl KnownStacks {
+    fn remember(&self, provider: &str, repository: &str, stack: &ReviewStack) {
+        let numbers: BTreeSet<u64> = stack.layers.iter().map(|layer| layer.pull.number).collect();
+        let entry = KnownStack {
+            resolved: std::time::Instant::now(),
+            stack: stack.clone(),
+        };
+        let mut known = self.lock();
+        let stacks = known
+            .entry((provider.to_owned(), repository.to_owned()))
+            .or_default();
+        // A newer resolution of any of its layers replaces an older stack.
+        stacks.retain(|old| {
+            !old.stack
+                .layers
+                .iter()
+                .any(|layer| numbers.contains(&layer.pull.number))
+        });
+        stacks.push(entry);
+        drop(known);
+    }
+
+    fn containing(&self, provider: &str, repository: &str, number: u64) -> Option<ReviewStack> {
+        let mut known = self.lock();
+        let stacks = known.get_mut(&(provider.to_owned(), repository.to_owned()))?;
+        stacks.retain(|known| known.resolved.elapsed() < STACK_REUSE);
+        let found = stacks
+            .iter()
+            .rev()
+            .find(|known| known.stack.layer(number).is_some())
+            .map(|known| known.stack.clone());
+        drop(known);
+        found
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<StackScope, Vec<KnownStack>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The providers and contributors a review asks, in preference order, and the stacks they
+/// resolved recently.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderRegistry {
     sources: Vec<ProviderRoute>,
     contributors: Vec<ContributorRoute>,
+    known_stacks: Arc<KnownStacks>,
 }
 
 impl ProviderRegistry {
@@ -168,24 +231,42 @@ impl ProviderRegistry {
     pub fn source(&self, id: &str) -> Option<&ProviderRoute> {
         self.sources.iter().find(|route| route.manifest.id == id)
     }
+
+    /// Remember `stack`, resolved by provider `provider` in `repository`, for [`STACK_REUSE`].
+    pub fn remember_stack(&self, provider: &str, repository: &str, stack: &ReviewStack) {
+        self.known_stacks.remember(provider, repository, stack);
+    }
+
+    /// A stack resolved within [`STACK_REUSE`] that has pull request `number` as a layer.
+    #[must_use]
+    pub fn known_stack(
+        &self,
+        provider: &str,
+        repository: &str,
+        number: u64,
+    ) -> Option<ReviewStack> {
+        self.known_stacks.containing(provider, repository, number)
+    }
+}
+
+/// The providers and contributors a running Bcode's plugins offer, by plugin id.
+#[derive(Debug, Clone, Default)]
+pub struct PluginManifests {
+    /// Review-source providers: plugin id and manifest.
+    pub sources: Vec<(String, ReviewSourceProviderManifest)>,
+    /// Discovery contributors: plugin id and manifest.
+    pub contributors: Vec<(String, ReviewDiscoveryManifest)>,
 }
 
 /// Manifests of the review-source providers and discovery contributors a running Bcode's plugins
-/// offer, by plugin id. A plugin whose manifest cannot be read is skipped.
+/// offer. A plugin whose manifest cannot be read is skipped.
 ///
 /// # Errors
 ///
 /// * The transport's error when the plugin services cannot be listed.
-#[allow(clippy::type_complexity)]
 pub async fn plugin_manifests<T: ProviderTransport + Sync>(
     transport: &T,
-) -> Result<
-    (
-        Vec<(String, ReviewSourceProviderManifest)>,
-        Vec<(String, ReviewDiscoveryManifest)>,
-    ),
-    ProviderCallError,
-> {
+) -> Result<PluginManifests, ProviderCallError> {
     let mut sources = Vec::new();
     for plugin_id in transport
         .plugins_serving(REVIEW_SOURCE_INTERFACE_ID)
@@ -222,7 +303,10 @@ pub async fn plugin_manifests<T: ProviderTransport + Sync>(
             contributors.push((plugin_id, manifest));
         }
     }
-    Ok((sources, contributors))
+    Ok(PluginManifests {
+        sources,
+        contributors,
+    })
 }
 
 /// Ask the matching providers about every included provider-backed source.
@@ -445,7 +529,12 @@ impl Target<'_> {
             .stacks
             .iter()
             .find(|stack| stack.layer(number).is_some())
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                self.registry
+                    .known_stack(&self.route.manifest.id, self.repository, number)
+            });
+        let reused = known.is_some();
         let stack = if let Some(stack) = known {
             stack
         } else {
@@ -469,9 +558,24 @@ impl Target<'_> {
                     },
                 );
             }
-            asked.stacks.push(response.stack.clone());
             response.stack
         };
+        if reused {
+            for layer in &stack.layers {
+                asked
+                    .layers
+                    .entry(layer.pull.number)
+                    .or_insert_with(|| ReviewPullFetchTarget {
+                        number: layer.pull.number,
+                        base_branch: layer.pull.base_branch.clone(),
+                        head_oid: Some(layer.pull.head_oid.clone()).filter(|oid| !oid.is_empty()),
+                        base_oid: layer.pull.base_oid.clone(),
+                    });
+            }
+        }
+        if !asked.stacks.iter().any(|known| known == &stack) {
+            asked.stacks.push(stack.clone());
+        }
         let layers = stack.layers_through(number).ok_or_else(|| {
             ProviderCallError::new(
                 REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,

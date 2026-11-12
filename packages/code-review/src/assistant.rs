@@ -336,13 +336,13 @@ pub struct Written {
 
 /// Review operations over the repository reads and the stored state of one configuration.
 pub struct ReviewTools<'a> {
-    data: &'a mut ReviewData,
+    data: &'a ReviewData,
     store: &'a ReviewStore,
 }
 
 impl<'a> ReviewTools<'a> {
     /// Operations reading with `data` and storing with `store`.
-    pub const fn new(data: &'a mut ReviewData, store: &'a ReviewStore) -> Self {
+    pub const fn new(data: &'a ReviewData, store: &'a ReviewStore) -> Self {
         Self { data, store }
     }
 
@@ -456,7 +456,7 @@ impl<'a> ReviewTools<'a> {
     }
 
     fn resolve_sources(
-        &mut self,
+        &self,
         workspace: &ReviewWorkspace,
     ) -> Result<(Vec<ResolvedSource>, Vec<ResolvedReviewStack>), AssistantError> {
         if workspace.sources.iter().any(|source| {
@@ -486,7 +486,7 @@ impl<'a> ReviewTools<'a> {
 
     /// Index entries of every source, in review order, with their source.
     fn entries(
-        &mut self,
+        &self,
         review: &OpenReview,
     ) -> Result<Vec<(usize, ReviewIndexEntry)>, AssistantError> {
         let mut entries = Vec::new();
@@ -623,7 +623,7 @@ impl<'a> ReviewTools<'a> {
     /// Diff fingerprints and working-tree content ids of the files that have viewed marks. Files
     /// whose fingerprints cannot be computed are left out (blob identities decide for them).
     fn fingerprints(
-        &mut self,
+        &self,
         review: &OpenReview,
         entries: &[(usize, ReviewIndexEntry)],
     ) -> Fingerprints {
@@ -670,7 +670,7 @@ impl<'a> ReviewTools<'a> {
 
     /// The entry of `path` (or a file renamed from it) and its source index.
     fn find_file(
-        &mut self,
+        &self,
         review: &OpenReview,
         path: &str,
         source: Option<&str>,
@@ -1034,7 +1034,7 @@ impl<'a> ReviewTools<'a> {
 
     /// Line numbers of one file on both sides, from its hunks.
     fn line_map(
-        &mut self,
+        &self,
         review: &OpenReview,
         index: usize,
         entry: &ReviewIndexEntry,
@@ -1253,7 +1253,7 @@ impl<'a> ReviewTools<'a> {
     }
 
     fn fingerprints_of(
-        &mut self,
+        &self,
         review: &OpenReview,
         files: &[(usize, ReviewIndexEntry)],
     ) -> Result<Fingerprints, AssistantError> {

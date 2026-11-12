@@ -30,6 +30,7 @@ pub mod document;
 pub mod provider;
 pub mod publish_plan;
 pub mod scope;
+pub mod session;
 pub mod store;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

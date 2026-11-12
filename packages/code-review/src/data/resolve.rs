@@ -45,9 +45,17 @@ pub fn resolve_sources(
     root: &Path,
     sources: &[ReviewSource],
     provider_resolutions: &[ReviewSourceProviderResolution],
+    merge_bases: &MergeBases,
 ) -> Result<ResolveReviewSourcesResponse, DataError> {
-    let head = git::resolve_commit(root, "HEAD")?;
-    let mut memo = GitMemo::default();
+    // Only local sources are relative to HEAD; a review of pull requests never reads it.
+    let head = if sources.iter().any(|source| {
+        source.included && !bcode_code_review_models::source_kind_requires_provider(&source.kind)
+    }) {
+        git::resolve_commit(root, "HEAD")?
+    } else {
+        None
+    };
+    let mut memo = GitMemo::new(merge_bases);
     memo.prime(root, provider_resolutions);
     let mut response = ResolveReviewSourcesResponse {
         sources: Vec::new(),
@@ -138,7 +146,7 @@ fn resolve_source(
     head: Option<&str>,
     source: &ReviewSource,
     provided: Option<&ReviewSourceProviderResolution>,
-    memo: &mut GitMemo,
+    memo: &mut GitMemo<'_>,
 ) -> Result<Resolution, DataError> {
     Ok(match &source.kind {
         ReviewSourceKind::WorkingTreeUnstaged => {
@@ -232,7 +240,7 @@ fn provider_source(
     source: &ReviewSource,
     stack: Option<&ReviewStack>,
     fetched: &[ReviewPullFetchResult],
-    memo: &mut GitMemo,
+    memo: &mut GitMemo<'_>,
 ) -> Result<Resolution, DataError> {
     match &source.kind {
         ReviewSourceKind::PullRequest { number, .. } => {
@@ -253,7 +261,7 @@ fn pull_request_source(
     source: &ReviewSource,
     number: u64,
     fetched: &[ReviewPullFetchResult],
-    memo: &mut GitMemo,
+    memo: &mut GitMemo<'_>,
 ) -> Result<Resolution, DataError> {
     let Some(fetch) = fetched_pull(fetched, number) else {
         return Ok(unresolved(format!(
@@ -289,7 +297,7 @@ fn stack_source(
     fetched: &[ReviewPullFetchResult],
     number: u64,
     whole_stack: bool,
-    memo: &mut GitMemo,
+    memo: &mut GitMemo<'_>,
 ) -> Result<Resolution, DataError> {
     let Some(stack) = stack else {
         return Ok(unresolved(format!(
@@ -376,19 +384,79 @@ fn fetched_pull(fetched: &[ReviewPullFetchResult], number: u64) -> Option<&Revie
     fetched.iter().find(|fetch| fetch.number == number)
 }
 
-/// Git answers one resolve request reuses. The sources of one stack (one per layer when stepping
-/// through it) all walk the same layers, so without this a stack of `n` layers cost about `n²`
-/// git processes.
+/// Most merge bases [`MergeBases`] keeps before it starts over.
+const MAX_MERGE_BASES: usize = 50_000;
+
+/// Merge bases between commits, shared by every request: a merge base of two commit ids never
+/// changes, so it is computed once per process. Bounded by [`MAX_MERGE_BASES`].
 #[derive(Debug, Default)]
-struct GitMemo {
+pub struct MergeBases(std::sync::Mutex<BTreeMap<(String, String), MergeBase>>);
+
+/// A known merge base of two commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergeBase {
+    /// Their merge base.
+    Found(String),
+    /// They share no history.
+    Unrelated,
+}
+
+impl MergeBase {
+    fn of(base: Option<String>) -> Self {
+        base.map_or(Self::Unrelated, Self::Found)
+    }
+
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Found(base) => Some(base),
+            Self::Unrelated => None,
+        }
+    }
+}
+
+impl MergeBases {
+    fn get(&self, key: &(String, String)) -> Option<MergeBase> {
+        self.lock().get(key).cloned()
+    }
+
+    fn insert_all(&self, answers: impl IntoIterator<Item = ((String, String), Option<String>)>) {
+        let mut cache = self.lock();
+        for (key, base) in answers {
+            if cache.len() >= MAX_MERGE_BASES {
+                cache.clear();
+            }
+            cache.insert(key, MergeBase::of(base));
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), MergeBase>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Git answers one resolve request reuses: commits checked once per request, merge bases from
+/// the shared [`MergeBases`]. The sources of one stack (one per layer when stepping through it)
+/// all walk the same layers, so without this a stack of `n` layers cost about `n²` git
+/// processes.
+#[derive(Debug)]
+struct GitMemo<'a> {
     commits: BTreeMap<String, Option<String>>,
-    merge_bases: BTreeMap<(String, String), Option<String>>,
+    merge_bases: &'a MergeBases,
 }
 
 /// Merge bases computed at once while priming a [`GitMemo`].
 const PRIME_WORKERS: usize = 8;
 
-impl GitMemo {
+impl<'a> GitMemo<'a> {
+    const fn new(merge_bases: &'a MergeBases) -> Self {
+        Self {
+            commits: BTreeMap::new(),
+            merge_bases,
+        }
+    }
+
     /// Answer up front what the provider-backed sources will ask: whether every fetched commit
     /// exists (one `git cat-file --batch-check`), and each layer's merge bases with the layer
     /// below and with the trunk (computed in parallel). Anything left out is asked on demand,
@@ -454,7 +522,7 @@ impl GitMemo {
         }
         let pairs: Vec<(String, String)> = pairs
             .into_iter()
-            .filter(|pair| !self.merge_bases.contains_key(pair))
+            .filter(|pair| self.merge_bases.get(pair).is_none())
             .collect();
         let chunk = pairs.len().div_ceil(PRIME_WORKERS).max(1);
         let answers: Vec<((String, String), Option<String>)> = std::thread::scope(|scope| {
@@ -478,7 +546,7 @@ impl GitMemo {
                 .flatten()
                 .collect()
         });
-        self.merge_bases.extend(answers);
+        self.merge_bases.insert_all(answers);
     }
 
     /// [`local_commit`], once per commit.
@@ -493,17 +561,17 @@ impl GitMemo {
 
     /// [`git::merge_base`], once per pair.
     fn merge_base(
-        &mut self,
+        &self,
         root: &Path,
         left: &str,
         right: &str,
     ) -> Result<Option<String>, DataError> {
         let key = (left.to_owned(), right.to_owned());
         if let Some(known) = self.merge_bases.get(&key) {
-            return Ok(known.clone());
+            return Ok(known.into_option());
         }
         let found = git::merge_base(root, left, right)?;
-        self.merge_bases.insert(key, found.clone());
+        self.merge_bases.insert_all([(key, found.clone())]);
         Ok(found)
     }
 }

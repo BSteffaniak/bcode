@@ -83,6 +83,9 @@ pub struct SourceInput {
     pub entries: Vec<ReviewIndexEntry>,
     /// Stack structure, for stack and stack-layer sources.
     pub stack: Option<SourceStack>,
+    /// The source's files are still being listed: the group shows its header (saying so) and no
+    /// files until the source is opened again with them.
+    pub loading: bool,
 }
 
 /// Identifies one outstanding request.
@@ -107,6 +110,8 @@ pub struct GroupInfo<'a> {
     pub header: Option<ItemKey>,
     /// Whether [`ReviewDocument::set_focus`] hides the group.
     pub hidden: bool,
+    /// Whether the group's files are still being listed.
+    pub loading: bool,
 }
 
 /// A request the client should issue on the document's behalf.
@@ -398,6 +403,8 @@ pub(super) struct Group {
     pub show_header: bool,
     /// Whether the group is hidden by [`ReviewDocument::set_focus`]: its blocks build no items.
     pub hidden: bool,
+    /// Whether the group's files are still being listed (see [`SourceInput::loading`]).
+    pub loading: bool,
     /// Files of the group shown as viewed.
     pub viewed: usize,
 }
@@ -672,8 +679,9 @@ impl ReviewDocument {
             stack: input.stack,
             header_block,
             files: first_file..self.files.len(),
-            show_header: show_headers,
+            show_header: show_headers || input.loading,
             hidden: false,
+            loading: input.loading,
             viewed: 0,
         });
     }
@@ -1882,6 +1890,7 @@ impl ReviewDocument {
                     part: group.source.part.as_ref().map(|part| part.index),
                 }),
                 hidden: group.hidden,
+                loading: group.loading,
             })
     }
 

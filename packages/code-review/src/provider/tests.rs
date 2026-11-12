@@ -721,7 +721,7 @@ fn whole_stack(repo: &Path) -> ResolvedReviewStack {
 }
 
 fn attribute(
-    service: &mut ReviewData,
+    service: &ReviewData,
     repo: &Path,
     stack: &ResolvedReviewStack,
     path: &str,
@@ -742,8 +742,8 @@ fn whole_stack_attribution_labels_each_layers_region_of_the_shared_file() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();
     let stack = whole_stack(repo);
-    let mut service = ReviewData::default();
-    let attribution = attribute(&mut service, repo, &stack, STACK_SHARED_FILE, None);
+    let service = ReviewData::default();
+    let attribution = attribute(&service, repo, &stack, STACK_SHARED_FILE, None);
     assert!(!attribution.binary);
 
     // New side: each line tagged by a layer belongs to that layer; original lines to none.
@@ -819,7 +819,7 @@ fn whole_stack_attribution_labels_each_layers_region_of_the_shared_file() {
 
     // A file added by one layer is entirely that layer's.
     let added = attribute(
-        &mut service,
+        &service,
         repo,
         &stack,
         &GitFixture::stack_layer_path(2),
@@ -837,13 +837,7 @@ fn whole_stack_attribution_labels_each_layers_region_of_the_shared_file() {
     assert_eq!(added.old_ranges.len(), 0);
 
     // A file the stack does not touch has no attribution.
-    let untouched = attribute(
-        &mut service,
-        repo,
-        &stack,
-        &GitFixture::modified_path(0),
-        None,
-    );
+    let untouched = attribute(&service, repo, &stack, &GitFixture::modified_path(0), None);
     assert!(untouched.new_ranges.is_empty() && untouched.old_ranges.is_empty());
 }
 
@@ -951,13 +945,7 @@ fn attribution_follows_renames_and_maps_lines_through_later_layers() {
             },
         ],
     };
-    let attribution = attribute(
-        &mut ReviewData::default(),
-        &repo,
-        &stack,
-        "g.rs",
-        Some("f.rs"),
-    );
+    let attribution = attribute(&ReviewData::default(), &repo, &stack, "g.rs", Some("f.rs"));
     let range = |start, end, layer, layer_line| ReviewStackLineAttribution {
         start,
         end,

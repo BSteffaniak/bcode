@@ -6,14 +6,15 @@
 
 use crate::services::ReviewServices;
 use bcode_code_review::document::{DocumentNeed, SourceInput, SourceStack, Ticket};
-use bcode_code_review::provider::resolve_request_with_providers;
+use bcode_code_review::provider::ProviderCallError;
+use bcode_code_review::session;
 use bcode_code_review_models::{
     GetReviewWorkspaceRequest, REVIEW_BLOB_LINES_MAX_COUNT, REVIEW_PATCH_IDS_MAX_PATHS,
-    ResolveReviewSourcesResponse, ResolvedSource, ResolvedSourceMode, ReviewBlobLinesRequest,
-    ReviewBlobLinesResponse, ReviewBlobSelector, ReviewFileHunksResponse, ReviewIndexFlag,
-    ReviewIndexRequest, ReviewIndexResponse, ReviewPatchIdsRequest, ReviewPatchIdsResponse,
-    ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind, ReviewSourcesTokenRequest,
-    ReviewSourcesTokenResponse, ReviewStackAttributionResponse, ReviewWorkspace, RevisionRef,
+    ResolvedSource, ResolvedSourceMode, ReviewBlobLinesRequest, ReviewBlobLinesResponse,
+    ReviewBlobSelector, ReviewFileHunksResponse, ReviewIndexFlag, ReviewPatchIdsRequest,
+    ReviewPatchIdsResponse, ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind,
+    ReviewSourcesTokenRequest, ReviewSourcesTokenResponse, ReviewStackAttributionResponse,
+    ReviewWorkspace, RevisionRef,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -22,14 +23,9 @@ use std::sync::{Arc, Mutex};
 /// Results delivered from spawned work to the surface.
 #[derive(Debug)]
 pub enum Message {
-    /// Index listing progress while opening.
-    Progress {
-        /// Index entries received so far.
-        files: usize,
-        /// Entries expected across every source, once known.
-        total: usize,
-    },
-    /// The review opened.
+    /// What opening is doing, for the loading screen.
+    Stage(String),
+    /// The review opened (possibly with sources still loading; see [`Opened::complete`]).
     Opened(Box<Opened>),
     /// The review could not be opened.
     OpenFailed(String),
@@ -165,6 +161,9 @@ pub struct Opened {
     pub fingerprints: Vec<(String, ReviewPatchIdsResponse)>,
     /// The viewed state stored for an unsaved review's target, when asked for.
     pub stored_viewed: Option<ReviewWorkspace>,
+    /// Every source is listed; when `false`, some inputs are loading groups and a complete
+    /// [`Opened`] follows.
+    pub complete: bool,
 }
 
 /// Viewed state an opening review loads before its first frame.
@@ -181,22 +180,25 @@ pub struct ViewedInputs {
 /// Fingerprints loaded while opening a review at most; files beyond get theirs with their hunks.
 const MAX_OPEN_FINGERPRINTS: usize = 2_000;
 
-/// Open a review and load what its first frame needs.
+/// Open a review progressively ([`bcode_code_review::session::open`]).
 ///
-/// Routes provider-backed sources, resolves every source, takes a change token, and lists every
-/// source's index (paged), reporting progress. Then loads what the first frame's viewed state
-/// needs: an unsaved review's stored viewed state, and the fingerprints of files with viewed
-/// marks (bounded; failures leave them to their hunks).
+/// The session runs on a blocking thread and reports through a channel: stages become
+/// [`Message::Stage`]; when the first source is ready while others still load, an incomplete
+/// [`Opened`] (the others as loading groups) is pushed at once, so the screen draws without
+/// waiting. The returned [`Opened`] has every source. Each [`Opened`] also carries what its first
+/// frame's viewed state needs: an unsaved review's stored viewed state and the fingerprints of
+/// files with viewed marks (bounded; failures leave them to their hunks).
 ///
 /// # Errors
 ///
-/// Returns a message when resolution fails as a whole; per-source failures are diagnostics.
+/// Returns a message when opening fails as a whole; per-source failures are diagnostics.
 pub async fn open(
     services: ReviewServices,
     repo_path: PathBuf,
     sources: Vec<ReviewSource>,
     inbox: Inbox,
     viewed: ViewedInputs,
+    first: Option<String>,
 ) -> Result<Opened, String> {
     let labels: Vec<(String, String, bool)> = sources
         .iter()
@@ -208,57 +210,99 @@ pub async fn open(
             )
         })
         .collect();
-    let (registry, path) = (services.providers(), repo_path.clone());
-    let max_layers = services.stack_limit().resolve_limit();
-    let request = services
-        .blocking(move || {
-            Ok(resolve_request_with_providers(
-                &registry, &path, sources, max_layers,
-            ))
+    let request = session::OpenRequest {
+        repo_path: repo_path.clone(),
+        sources,
+        first,
+        max_layers: services.stack_limit().resolve_limit(),
+    };
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let (data, registry) = (services.data(), services.providers());
+    let work = services.blocking(move || {
+        session::open(&data, &registry, &request, |event| {
+            let _ = sender.send(event);
         })
-        .await
-        .map_err(|error| error.message)?;
-    let resolved: ResolveReviewSourcesResponse = services
-        .call(request)
-        .await
-        .map_err(|error| error.message)?;
-    let working_tree = resolved.sources.iter().any(reads_working_tree);
-    let token = token(&services, &repo_path, working_tree).await.ok();
-    let mut inputs = Vec::with_capacity(resolved.sources.len());
-    let mut files = 0;
-    let mut total = 0;
-    for source in resolved.sources {
-        let entries = index_entries(
-            &services, &repo_path, &source, &inbox, &mut files, &mut total,
-        )
-        .await
-        .map_err(|error| format!("{}: {error}", source.source_id))?;
+        .map_err(|error| ProviderCallError::new(error.code(), error.to_string()))
+    });
+    let consume = async {
+        let mut last = None;
+        while let Some(event) = events.recv().await {
+            match event {
+                session::OpenEvent::Stage(stage) => inbox.push(Message::Stage(stage_text(&stage))),
+                session::OpenEvent::Ready(opened) if !opened.pending.is_empty() => {
+                    let partial = finish(&services, &repo_path, &labels, opened, &viewed).await;
+                    inbox.push(Message::Opened(Box::new(partial)));
+                }
+                session::OpenEvent::Ready(opened) | session::OpenEvent::Rest(opened) => {
+                    last = Some(opened);
+                }
+            }
+        }
+        last
+    };
+    let (result, last) = tokio::join!(work, consume);
+    result.map_err(|error| error.message)?;
+    let opened = last.ok_or_else(|| "the review opened no sources".to_owned())?;
+    Ok(finish(&services, &repo_path, &labels, opened, &viewed).await)
+}
+
+/// What the loading screen says for `stage`.
+fn stage_text(stage: &session::OpenStage) -> String {
+    match stage {
+        session::OpenStage::AskingProviders => "finding pull requests and stacks".to_owned(),
+        session::OpenStage::OpeningFirst => "listing files".to_owned(),
+        session::OpenStage::Listing { done, total } => {
+            format!("listing files of every layer: {done} of {total}")
+        }
+    }
+}
+
+/// Turn opened sources into document inputs (pending ones as loading groups) with the change
+/// token and the viewed state the first frame needs.
+async fn finish(
+    services: &ReviewServices,
+    repo_path: &std::path::Path,
+    labels: &[(String, String, bool)],
+    opened: session::OpenedSources,
+    viewed: &ViewedInputs,
+) -> Opened {
+    let complete = opened.pending.is_empty();
+    let input = |source: session::OpenedSource, loading: bool| {
         let (label, whole) = labels
             .iter()
-            .find(|(id, _, _)| *id == source.source_id)
+            .find(|(id, _, _)| *id == source.source.source_id)
             .map_or_else(
-                || (source.source_id.clone(), false),
+                || (source.source.source_id.clone(), false),
                 |(_, label, whole)| (label.clone(), *whole),
             );
-        let stack = resolved
-            .stacks
-            .iter()
-            .find(|stack| stack.source_id == source.source_id)
-            .map(|stack| SourceStack {
-                stack: stack.clone(),
-                whole,
-            });
-        inputs.push(SourceInput {
-            source,
+        SourceInput {
+            stack: source.stack.map(|stack| SourceStack { stack, whole }),
+            source: source.source,
             label,
-            entries,
-            stack,
-        });
-    }
-    let stored_viewed = match viewed.transient_scope {
+            entries: source.entries,
+            loading,
+        }
+    };
+    // Ready and pending sources in workspace order.
+    let order: Vec<&str> = labels.iter().map(|(id, _, _)| id.as_str()).collect();
+    let mut inputs: Vec<SourceInput> = opened
+        .ready
+        .into_iter()
+        .map(|source| input(source, false))
+        .chain(opened.pending.into_iter().map(|source| input(source, true)))
+        .collect();
+    inputs.sort_by_key(|input| {
+        order
+            .iter()
+            .position(|id| *id == input.source.source_id)
+            .unwrap_or(usize::MAX)
+    });
+    let working_tree = inputs.iter().any(|input| reads_working_tree(&input.source));
+    let token = token(services, repo_path, working_tree).await.ok();
+    let stored_viewed = match viewed.transient_scope.clone() {
         Some(workspace_id) => services
             .call(GetReviewWorkspaceRequest {
-                repo_path: repo_path.clone(),
+                repo_path: repo_path.to_path_buf(),
                 workspace_id,
             })
             .await
@@ -266,7 +310,7 @@ pub async fn open(
             .and_then(|response| response.workspace),
         None => None,
     };
-    let mut marked = viewed.marked;
+    let mut marked = viewed.marked.clone();
     if let Some(stored) = &stored_viewed {
         marked.extend(
             bcode_code_review::viewed::effective_marks(stored)
@@ -274,15 +318,16 @@ pub async fn open(
                 .map(|mark| mark.path),
         );
     }
-    let fingerprints = fingerprints(&services, &repo_path, &inputs, &marked).await;
-    Ok(Opened {
+    let fingerprints = fingerprints(services, repo_path, &inputs, &marked).await;
+    Opened {
         inputs,
-        diagnostics: resolved.diagnostics,
+        diagnostics: opened.diagnostics,
         token,
         working_tree,
         fingerprints,
         stored_viewed,
-    })
+        complete,
+    }
 }
 
 /// Fingerprints of the files of `inputs` at or renamed from `marked` paths, at most
@@ -348,44 +393,6 @@ async fn fingerprints(
         }
     }
     answers
-}
-
-async fn index_entries(
-    services: &ReviewServices,
-    repo_path: &std::path::Path,
-    source: &ResolvedSource,
-    inbox: &Inbox,
-    files: &mut usize,
-    total: &mut usize,
-) -> Result<Vec<bcode_code_review_models::ReviewIndexEntry>, String> {
-    let mut entries = Vec::new();
-    let mut cursor = None;
-    let mut counted = false;
-    loop {
-        let page: ReviewIndexResponse = services
-            .call(ReviewIndexRequest {
-                repo_path: repo_path.to_path_buf(),
-                source: source.clone(),
-                cursor: cursor.take(),
-                limit: None,
-            })
-            .await
-            .map_err(|error| error.message)?;
-        if !counted {
-            counted = true;
-            *total += page.total_entries as usize;
-        }
-        *files += page.entries.len();
-        entries.extend(page.entries);
-        inbox.push(Message::Progress {
-            files: *files,
-            total: *total,
-        });
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(entries),
-        }
-    }
 }
 
 const fn reads_working_tree(source: &ResolvedSource) -> bool {
