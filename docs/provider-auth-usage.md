@@ -47,9 +47,20 @@ with explicit consent. Nothing is imported into sshenv, copied, refreshed, or re
   delivers the values for that request only. Requests carrying a binding get no credential custody
   bridge, so providers cannot write credentials back. There is never a fallback to another account
   or billing route.
-* **ChatGPT tokens** from Codex are delivered without the refresh token. The provider derives the
-  expiry from the access token; when it has expired, the request fails with
-  `external_token_expired`, asking the user to open Codex to renew the sign-in. Codex installs that
+* **Status.** `bcode auth connections` and the `/model` picker show each connection as ready,
+  expired, signed in to a different account, not found, or no longer offered, with the one action
+  that fixes it. Sources may declare an expiry (for example the JWT `exp` of Codex's access token),
+  checked locally so an expired sign-in is reported before a request (`Expired`).
+* **Choosing a connection in a session.** The `/model` picker lists, after the provider's own
+  models, one row per model each approved connection can use ("model · via Codex"). Selecting a
+  ready row sets the session's model and connection together, applied from the next turn like a
+  model change. Selecting a row whose source changed accounts approves it again and reloads the
+  picker. The choice is recorded on the session's `model_changed` event and survives daemon
+  restarts; if the connection later becomes unusable, the session keeps it and requests fail with
+  the reason rather than switching to another account.
+* **ChatGPT tokens** from Codex are delivered without the refresh token. The source declares the
+  access token's `exp` as its expiry; once it passes, the request fails before reaching the
+  provider, asking the user to open Codex to renew the sign-in. Codex installs that
   keep credentials in the OS keyring instead of `auth.json` are not discovered.
 * **Unsupported operations.** `bcode model capabilities`, `auth usage`, and image-upload
   verification route through generic daemon plugin calls, not dispatch, and reject external

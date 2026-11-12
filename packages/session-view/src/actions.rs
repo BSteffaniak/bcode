@@ -165,7 +165,17 @@ pub async fn execute_session_view_action(
             session_id,
             provider_plugin_id,
             model_id,
-        } => execute_set_model(client, session_id, provider_plugin_id, model_id).await,
+            external_auth_binding,
+        } => {
+            execute_set_model(
+                client,
+                session_id,
+                provider_plugin_id,
+                model_id,
+                external_auth_binding,
+            )
+            .await
+        }
         SessionViewAction::SetReasoning {
             session_id,
             effort,
@@ -256,9 +266,15 @@ async fn execute_set_model(
     session_id: SessionId,
     provider_plugin_id: Option<String>,
     model_id: String,
+    external_auth_binding: Option<String>,
 ) -> Result<SessionViewActionOutcome, ClientError> {
     client
-        .set_session_model(session_id, provider_plugin_id, model_id)
+        .set_session_model_with_connection(
+            session_id,
+            provider_plugin_id,
+            model_id,
+            external_auth_binding,
+        )
         .await?;
     Ok(SessionViewActionOutcome::None)
 }

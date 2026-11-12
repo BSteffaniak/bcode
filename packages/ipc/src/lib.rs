@@ -4683,6 +4683,7 @@ mod tests {
                     status: bcode_provider_auth_models::external::ExternalConnectionStatus::Ready {
                         expires_at_unix: Some(2),
                     },
+                    recommended_models: vec!["model".into()],
                 }],
                 },
                 ResponsePayload::ExternalAuthFailed {

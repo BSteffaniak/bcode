@@ -327,6 +327,9 @@ pub struct ExternalAuthConnection {
     pub grant: ExternalAuthGrant,
     /// Its current local status.
     pub status: ExternalConnectionStatus,
+    /// Models the provider recommends for the approved method, when known.
+    #[serde(default)]
+    pub recommended_models: Vec<String>,
 }
 
 /// Durable, versioned non-secret consent state.

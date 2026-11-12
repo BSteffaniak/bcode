@@ -66,6 +66,62 @@ pub struct ModelPickerApp {
     sort_key: ModelSortKey,
     sort_direction: ModelSortDirection,
     mode: ModelPickerMode,
+    /// Rows that use an approved external credential connection, by source index.
+    connections: BTreeMap<usize, bcode_provider_auth_models::external::ExternalAuthConnection>,
+}
+
+/// What submitting the highlighted connection row means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionChoice {
+    /// Use the model with this connection.
+    Use {
+        /// Model to select.
+        model_id: String,
+        /// Connection binding to select with it.
+        binding_id: String,
+    },
+    /// The source now belongs to another account; approve it again.
+    Reapprove(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
+    /// Not usable now; the message names the fix.
+    Unavailable(String),
+}
+
+/// Short state and the one fix for a connection's status.
+fn connection_state(
+    connection: &bcode_provider_auth_models::external::ExternalAuthConnection,
+) -> (String, Option<String>) {
+    use bcode_provider_auth_models::external::ExternalConnectionStatus;
+    let application = &connection.grant.application;
+    match connection.status {
+        ExternalConnectionStatus::Ready { .. } => ("Ready".into(), None),
+        ExternalConnectionStatus::Expired => (
+            "Expired".into(),
+            Some(format!(
+                "{application} sign-in expired — open {application} to renew it"
+            )),
+        ),
+        ExternalConnectionStatus::AccountChanged => (
+            "Different account".into(),
+            Some(format!(
+                "{application} is signed in to a different account — press Enter to approve it"
+            )),
+        ),
+        ExternalConnectionStatus::SourceUnavailable => (
+            "Not found".into(),
+            Some(format!(
+                "{application} credentials not found — sign in to {application}"
+            )),
+        ),
+        ExternalConnectionStatus::DeclarationChanged => (
+            "No longer offered".into(),
+            Some("This connection is no longer offered — run `bcode auth disconnect`".into()),
+        ),
+    }
+}
+
+/// Metadata for a recommended model the provider listing did not include.
+fn recommended_model(model_id: &str) -> Option<ModelInfo> {
+    serde_json::from_value(serde_json::json!({"model_id": model_id, "display_name": model_id})).ok()
 }
 
 impl ModelPickerApp {
@@ -87,9 +143,59 @@ impl ModelPickerApp {
             sort_key: ModelSortKey::Default,
             sort_direction: ModelSortDirection::Desc,
             mode: ModelPickerMode::Actions,
+            connections: BTreeMap::new(),
         };
         app.refresh_filter();
         app
+    }
+
+    /// Add a row per model each approved connection can use, after the provider's models.
+    pub fn add_connections(
+        &mut self,
+        connections: Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
+    ) {
+        for connection in connections {
+            for model_id in &connection.recommended_models {
+                let listed = self
+                    .models
+                    .iter()
+                    .enumerate()
+                    .find(|(index, model)| {
+                        model.model_id == *model_id && !self.connections.contains_key(index)
+                    })
+                    .map(|(_, model)| model.clone());
+                let Some(model) = listed.or_else(|| recommended_model(model_id)) else {
+                    continue;
+                };
+                self.models.push(model);
+                self.connections
+                    .insert(self.models.len() - 1, connection.clone());
+            }
+        }
+        self.refresh_filter();
+    }
+
+    /// What submitting the highlighted row means, when it uses a connection.
+    #[must_use]
+    pub fn selected_connection(&self) -> Option<ConnectionChoice> {
+        use bcode_provider_auth_models::external::ExternalConnectionStatus;
+        let index = self.list.selected_source_index()?;
+        let connection = self.connections.get(&index)?;
+        Some(match connection.status {
+            ExternalConnectionStatus::Ready { .. } => ConnectionChoice::Use {
+                model_id: self.models[index].model_id.clone(),
+                binding_id: connection.grant.binding_id.clone(),
+            },
+            ExternalConnectionStatus::AccountChanged => ConnectionChoice::Reapprove(Box::new(
+                bcode_provider_auth_models::external::ExternalAuthCandidate {
+                    binding_id: connection.grant.binding_id.clone(),
+                    target: connection.grant.target.clone(),
+                    application: connection.grant.application.clone(),
+                    available: true,
+                },
+            )),
+            _ => ConnectionChoice::Unavailable(connection_state(connection).1.unwrap_or_default()),
+        })
     }
 
     /// Present exact execution members without collapsing duplicate model identities.
@@ -582,6 +688,12 @@ impl ModelPickerApp {
             .map(|index| {
                 let model = &self.models[*index];
                 let mut row = ModelPickerRow::from_model(model);
+                if let Some(connection) = self.connections.get(index) {
+                    row.model_id =
+                        format!("{} · via {}", row.model_id, connection.grant.application);
+                    row.state = connection_state(connection).0;
+                    return row;
+                }
                 if let Some(entry) = self
                     .execution_models
                     .as_ref()
@@ -1521,5 +1633,108 @@ mod tests {
         let rows = app.row_strings_for_test(64);
 
         assert!(rows[0].contains('…'));
+    }
+}
+
+#[cfg(test)]
+pub mod connection_tests {
+    use super::*;
+    use bcode_provider_auth_models::external::{
+        ExternalAuthConnection, ExternalAuthGrant, ExternalAuthTarget, ExternalConnectionStatus,
+    };
+
+    pub fn connection(binding: &str, status: ExternalConnectionStatus) -> ExternalAuthConnection {
+        ExternalAuthConnection {
+            grant: ExternalAuthGrant {
+                binding_id: binding.into(),
+                target: ExternalAuthTarget {
+                    plugin_id: "provider.plugin".into(),
+                    provider_id: "provider".into(),
+                    method_id: "chatgpt".into(),
+                    source_id: "codex-chatgpt".into(),
+                },
+                application: "Codex".into(),
+                account_fingerprint: None,
+                approved_at_unix: 1,
+            },
+            status,
+            recommended_models: vec!["listed".into(), "unlisted".into()],
+        }
+    }
+
+    pub fn picker(models: &[&str]) -> ModelPickerApp {
+        ModelPickerApp::from_model_list(
+            ModelList {
+                models: models
+                    .iter()
+                    .map(|model_id| recommended_model(model_id).unwrap())
+                    .collect(),
+                catalog: bcode_model::ModelCatalogHints::default(),
+            },
+            "Select",
+        )
+    }
+
+    fn select_row_containing(app: &mut ModelPickerApp, text: &str) {
+        let row = app
+            .row_strings_for_test(160)
+            .iter()
+            .position(|row| row.contains(text))
+            .unwrap();
+        assert!(app.select_visible(row));
+    }
+
+    #[test]
+    fn ready_connection_rows_select_the_model_with_their_binding() {
+        let mut app = picker(&["listed", "other"]);
+        app.add_connections(vec![connection(
+            "binding-ready",
+            ExternalConnectionStatus::Ready {
+                expires_at_unix: None,
+            },
+        )]);
+        let rows = app.row_strings_for_test(160);
+        assert_eq!(
+            rows.len(),
+            4,
+            "provider rows stay; connection rows are added"
+        );
+        assert!(rows.iter().any(|row| row.contains("listed · via Codex")));
+        // A recommended model missing from the provider listing still gets a row.
+        assert!(rows.iter().any(|row| row.contains("unlisted · via Codex")));
+        select_row_containing(&mut app, "unlisted · via Codex");
+        assert_eq!(
+            app.selected_connection(),
+            Some(ConnectionChoice::Use {
+                model_id: "unlisted".into(),
+                binding_id: "binding-ready".into(),
+            })
+        );
+        select_row_containing(&mut app, "other");
+        assert_eq!(app.selected_connection(), None);
+    }
+
+    #[test]
+    fn unusable_connections_explain_the_fix_and_account_changes_reapprove() {
+        let mut app = picker(&[]);
+        app.add_connections(vec![connection(
+            "binding-expired",
+            ExternalConnectionStatus::Expired,
+        )]);
+        select_row_containing(&mut app, "listed · via Codex");
+        assert!(matches!(
+            app.selected_connection(),
+            Some(ConnectionChoice::Unavailable(message)) if message.contains("open Codex to renew")
+        ));
+        let mut app = picker(&[]);
+        app.add_connections(vec![connection(
+            "binding-changed",
+            ExternalConnectionStatus::AccountChanged,
+        )]);
+        select_row_containing(&mut app, "listed · via Codex");
+        assert!(matches!(
+            app.selected_connection(),
+            Some(ConnectionChoice::Reapprove(candidate)) if candidate.binding_id == "binding-changed"
+        ));
     }
 }

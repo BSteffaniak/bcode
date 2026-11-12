@@ -10,7 +10,37 @@ pub enum ModelPickerAction {
     Continue,
     Cancel,
     Select(String),
+    /// Select a model together with an approved external credential connection.
+    SelectWithConnection {
+        model_id: String,
+        binding_id: String,
+    },
+    /// Approve a connection again after its source changed accounts, then reload.
+    Reapprove(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
     Check(String),
+}
+
+/// Submit the highlighted row, honoring connection rows.
+pub fn submit(picker: &mut model_picker::ModelPickerApp) -> ModelPickerAction {
+    match picker.selected_connection() {
+        Some(model_picker::ConnectionChoice::Use {
+            model_id,
+            binding_id,
+        }) => ModelPickerAction::SelectWithConnection {
+            model_id,
+            binding_id,
+        },
+        Some(model_picker::ConnectionChoice::Reapprove(candidate)) => {
+            ModelPickerAction::Reapprove(candidate)
+        }
+        Some(model_picker::ConnectionChoice::Unavailable(message)) => {
+            picker.set_status(message);
+            ModelPickerAction::Continue
+        }
+        None => picker
+            .selected_model_id()
+            .map_or(ModelPickerAction::Continue, ModelPickerAction::Select),
+    }
 }
 
 pub fn handle_model_picker_key(
@@ -19,6 +49,17 @@ pub fn handle_model_picker_key(
     provider_plugin_id: Option<&str>,
     stroke: KeyStroke,
 ) -> ModelPickerAction {
+    if picker.selected_connection().is_some()
+        && matches!(
+            keymap.action("model_picker_actions", stroke),
+            Some("tui.model.check" | "tui.model.ignore" | "tui.model.unignore")
+        )
+    {
+        picker.set_status(
+            "Connection rows use the provider's recommended models; check and ignore apply to the provider's own rows",
+        );
+        return ModelPickerAction::Continue;
+    }
     if picker.is_execution_picker()
         && matches!(
             keymap.action("model_picker_actions", stroke),
@@ -94,9 +135,7 @@ fn handle_model_picker_action_key(
             unignore_selected_model(picker, provider_plugin_id);
             ModelPickerAction::Continue
         }
-        Some("tui.control.submit") => picker
-            .selected_model_id()
-            .map_or(ModelPickerAction::Continue, ModelPickerAction::Select),
+        Some("tui.control.submit") => submit(picker),
         Some("tui.control.up") => {
             picker.select_previous();
             ModelPickerAction::Continue
@@ -119,9 +158,7 @@ fn handle_model_picker_filter_key(
             picker.focus_actions();
             ModelPickerAction::Continue
         }
-        Some("tui.control.submit") => picker
-            .selected_model_id()
-            .map_or(ModelPickerAction::Continue, ModelPickerAction::Select),
+        Some("tui.control.submit") => submit(picker),
         Some("tui.control.up") => {
             picker.select_previous();
             ModelPickerAction::Continue
@@ -180,5 +217,34 @@ fn unignore_selected_model(
             }
             Err(error) => picker.set_status(format!("Failed to unignore {model_id}: {error}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_provider_auth_models::external::ExternalConnectionStatus;
+    use model_picker::connection_tests::{connection, picker};
+
+    #[test]
+    fn submitting_a_connection_row_selects_with_its_binding_or_explains_the_fix() {
+        let mut app = picker(&[]);
+        app.add_connections(vec![connection(
+            "binding-ready",
+            ExternalConnectionStatus::Ready {
+                expires_at_unix: None,
+            },
+        )]);
+        assert!(matches!(
+            submit(&mut app),
+            ModelPickerAction::SelectWithConnection { binding_id, .. } if binding_id == "binding-ready"
+        ));
+        let mut app = picker(&[]);
+        app.add_connections(vec![connection(
+            "binding-missing",
+            ExternalConnectionStatus::SourceUnavailable,
+        )]);
+        assert!(matches!(submit(&mut app), ModelPickerAction::Continue));
+        assert!(app.status().contains("sign in to Codex"));
     }
 }

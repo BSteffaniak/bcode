@@ -5,6 +5,17 @@ See [Child sessions](child-sessions.md) for immutable recursive session relation
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## External credential connection selection
+
+`model_changed` carries an optional `external_auth_binding`: the approved external credential
+connection selected with the model, never credential material. It is omitted from the durable JSON
+when absent, so existing history is unchanged and the event schema and writer epoch stay the same.
+Migration `081_session_state_external_auth_binding_column` adds the matching nullable
+`session_state` projection column, written by the `model_changed` projection. Existing sessions read
+`NULL`, which correctly means no connection, so no backfill or replay is needed; a reindex rebuilds
+the column from events. Restoring a session's selection reads it from the projection like the model
+itself, and dispatch revalidates the approval on every request.
+
 ## Session origin and import provenance
 
 The application that created a session (`SessionOrigin`) is an optional field of the canonical

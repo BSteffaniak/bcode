@@ -2291,6 +2291,9 @@ pub enum SessionViewAction {
         provider_plugin_id: Option<String>,
         /// Model id.
         model_id: String,
+        /// Approved external credential connection to use with the model, if any.
+        #[serde(default)]
+        external_auth_binding: Option<String>,
     },
     /// Set reasoning selections for a session.
     SetReasoning {

@@ -85,7 +85,10 @@ impl Program for ExecutionPicker {
                             }
                         }
                         ModelPickerAction::Cancel => lifecycle = Lifecycle::Exit,
-                        ModelPickerAction::Check(_) | ModelPickerAction::Continue => {}
+                        ModelPickerAction::Check(_)
+                        | ModelPickerAction::Continue
+                        | ModelPickerAction::SelectWithConnection { .. }
+                        | ModelPickerAction::Reapprove(_) => {}
                     }
                 }
             }

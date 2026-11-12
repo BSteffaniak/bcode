@@ -1950,12 +1950,13 @@ impl ChatLoopState {
                 model.provider_plugin_id.as_deref(),
                 *stroke,
             ),
-            Event::Mouse(mouse) => model
-                .picker
-                .select_mouse_row(*mouse)
-                .map_or(super::model_flow::ModelPickerAction::Continue, |model_id| {
-                    super::model_flow::ModelPickerAction::Select(model_id)
-                }),
+            Event::Mouse(mouse) => {
+                if model.picker.select_mouse_row(*mouse).is_some() {
+                    super::model_flow::submit(&mut model.picker)
+                } else {
+                    super::model_flow::ModelPickerAction::Continue
+                }
+            }
             Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {
                 super::model_flow::ModelPickerAction::Continue
             }
@@ -1965,6 +1966,8 @@ impl ChatLoopState {
             action,
             super::model_flow::ModelPickerAction::Cancel
                 | super::model_flow::ModelPickerAction::Select(_)
+                | super::model_flow::ModelPickerAction::SelectWithConnection { .. }
+                | super::model_flow::ModelPickerAction::Reapprove(_)
         ) {
             self.model_picker = None;
         }
@@ -3922,7 +3925,10 @@ pub fn apply_effect_result(
             Ok(providers) => {
                 let provider_plugin_id =
                     providers.first().map(|provider| provider.plugin_id.clone());
-                chat.replace_effect(TuiEffect::LoadModelPicker { provider_plugin_id });
+                chat.replace_effect(TuiEffect::LoadModelPicker {
+                    provider_plugin_id,
+                    reapprove: None,
+                });
                 chat.app.set_status("loading models…".to_owned());
             }
             Err(error) => report_nonfatal_client_error(chat, "Model providers unavailable", &error),
@@ -4011,23 +4017,44 @@ pub fn apply_effect_result(
         TuiEffectResult::ModelPickerLoaded {
             provider_plugin_id,
             result,
-        } => match result {
-            Ok(models) => {
-                let status = provider_plugin_id.as_ref().map_or_else(
-                    || "Select a model".to_owned(),
-                    |provider| format!("Select a model from {provider}"),
-                );
+            connections,
+            reapproval,
+        } => {
+            // A connection can supply models even when the provider's own listing fails,
+            // for example with only another agent's sign-in and no API key.
+            let models = match result {
+                Ok(models) => Some(models),
+                Err(_) if !connections.is_empty() => Some(bcode_model::ModelList {
+                    models: Vec::new(),
+                    catalog: bcode_model::ModelCatalogHints::default(),
+                }),
+                Err(error) => {
+                    report_nonfatal_client_error(chat, "Model list unavailable", &error);
+                    None
+                }
+            };
+            if let Some(models) = models {
+                let status = match &reapproval {
+                    Some(Ok(())) => "Connection approved".to_owned(),
+                    Some(Err(error)) => format!("Connection not approved: {error}"),
+                    None => provider_plugin_id.as_ref().map_or_else(
+                        || "Select a model".to_owned(),
+                        |provider| format!("Select a model from {provider}"),
+                    ),
+                };
+                let mut picker =
+                    super::model_picker::ModelPickerApp::from_model_list(models, status);
+                picker.add_connections(connections);
                 loop_state.model_picker_generation =
                     loop_state.model_picker_generation.wrapping_add(1);
                 loop_state.model_picker = Some(RootModelPicker {
                     generation: loop_state.model_picker_generation,
                     provider_plugin_id,
-                    picker: super::model_picker::ModelPickerApp::from_model_list(models, status),
+                    picker,
                 });
                 chat.app.set_status("select a model".to_owned());
             }
-            Err(error) => report_nonfatal_client_error(chat, "Model list unavailable", &error),
-        },
+        }
         TuiEffectResult::SkillPickerLoaded { result } => match result {
             Ok(skills) if skills.skills.is_empty() => {
                 chat.app.set_status("no skills available".to_owned());
@@ -4867,6 +4894,7 @@ fn apply_root_slash_command_outcome(
             session_id,
             provider_plugin_id,
             model_id,
+            external_auth_binding: None,
         }),
         SlashCommandOutcome::SetSessionReasoning {
             session_id,

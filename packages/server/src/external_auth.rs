@@ -80,10 +80,43 @@ pub async fn status(
     state: &ServerState,
 ) -> Result<Vec<bcode_provider_auth_models::external::ExternalAuthConnection>, ExternalAuthError> {
     let store = ExternalAuthStore::new(&state.state_root);
-    with_roots(declarations(state), None, move |roots, enabled| {
+    let mut connections = with_roots(declarations(state), None, move |roots, enabled| {
         store.status(roots, enabled)
     })
-    .await
+    .await?;
+    for connection in &mut connections {
+        connection.recommended_models = recommended_models(state, &connection.grant.target).await;
+    }
+    Ok(connections)
+}
+
+/// Models the provider recommends for an approved method; empty when the provider is
+/// unavailable or offers none.
+async fn recommended_models(
+    state: &ServerState,
+    target: &bcode_provider_auth_models::external::ExternalAuthTarget,
+) -> Vec<String> {
+    state
+        .plugins
+        .invoke_service_json::<_, bcode_model::StartupModelChoicesResponse>(
+            &target.plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_STARTUP_MODEL_CHOICES,
+            &bcode_model::StartupRecommendationRequest {
+                auth_provider_id: target.provider_id.clone(),
+                method_id: target.method_id.clone(),
+            },
+        )
+        .await
+        .map(|response| {
+            response
+                .choices
+                .into_iter()
+                .filter(|choice| choice.provider_plugin_id == target.plugin_id)
+                .map(|choice| choice.model_id)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub async fn revoke(state: &ServerState, binding_id: String) -> Result<bool, ExternalAuthError> {

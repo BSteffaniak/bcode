@@ -1416,9 +1416,46 @@ impl BcodeRuntimeModel {
                         self.chat
                             .replace_effect(super::effects::TuiEffect::LoadModelPicker {
                                 provider_plugin_id,
+                                reapprove: None,
                             });
                         self.chat.app.set_status("loading models…".to_owned());
                     }
+                    super::model_flow::ModelPickerAction::Reapprove(candidate) => {
+                        self.chat
+                            .replace_effect(super::effects::TuiEffect::LoadModelPicker {
+                                provider_plugin_id,
+                                reapprove: Some(candidate),
+                            });
+                        self.chat.app.set_status("approving connection…".to_owned());
+                    }
+                    super::model_flow::ModelPickerAction::SelectWithConnection {
+                        model_id,
+                        binding_id,
+                    } => match self.chat.attached_session_id() {
+                        // A native harness runs under its own account, so connections apply to
+                        // Bcode's own agent only.
+                        Some(_) if self.chat.app.managed_execution_session().is_some() => {
+                            self.chat.app.set_status(
+                                "Connections apply to Bcode's agent, not native harness sessions"
+                                    .to_owned(),
+                            );
+                        }
+                        Some(session_id) => {
+                            self.chat
+                                .start_effect(super::effects::TuiEffect::SetSessionModel {
+                                    session_id,
+                                    provider_plugin_id,
+                                    model_id,
+                                    external_auth_binding: Some(binding_id),
+                                });
+                            self.chat.app.set_status("applying model…".to_owned());
+                        }
+                        None => {
+                            self.chat.app.set_status(
+                                "Start or open a session to use this connection".to_owned(),
+                            );
+                        }
+                    },
                     super::model_flow::ModelPickerAction::Cancel => {
                         self.chat.app.set_status("model picker closed".to_owned());
                     }
@@ -1453,6 +1490,7 @@ impl BcodeRuntimeModel {
                                     session_id,
                                     provider_plugin_id,
                                     model_id,
+                                    external_auth_binding: None,
                                 });
                             self.chat.app.set_status("applying model…".to_owned());
                         } else {

@@ -565,7 +565,11 @@ impl ExternalAuthStore {
                         expires_at_unix: acquired.expires_at_unix,
                     },
                 };
-                ExternalAuthConnection { grant, status }
+                ExternalAuthConnection {
+                    grant,
+                    status,
+                    recommended_models: Vec::new(),
+                }
             })
             .collect())
     }

@@ -696,6 +696,7 @@ mod managed_model_filter_tests {
             TuiEffect::LoadModelProviders,
             TuiEffect::LoadModelPicker {
                 provider_plugin_id: None,
+                reapprove: None,
             },
             TuiEffect::ResolvePermission {
                 permission_id: "p".into(),
@@ -1013,6 +1014,8 @@ pub enum TuiEffect {
     LoadModelPicker {
         /// Selected provider plugin, or the default provider.
         provider_plugin_id: Option<String>,
+        /// Approve this connection again before loading, after the user confirmed it.
+        reapprove: Option<Box<bcode_provider_auth_models::external::ExternalAuthCandidate>>,
     },
     /// Load skills before opening the root skill picker.
     LoadSkillPicker,
@@ -1063,6 +1066,8 @@ pub enum TuiEffect {
         provider_plugin_id: Option<String>,
         /// Model id to set.
         model_id: String,
+        /// Approved external credential connection to use with the model, if any.
+        external_auth_binding: Option<String>,
     },
     /// Set session reasoning preferences.
     SetSessionReasoning {
@@ -1483,6 +1488,10 @@ pub enum TuiEffectResult {
         provider_plugin_id: Option<String>,
         /// Loaded normalized model list.
         result: Result<bcode_model::ModelList, ClientError>,
+        /// Approved connections for this provider; empty when unavailable.
+        connections: Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
+        /// Outcome of a requested re-approval, if one was requested.
+        reapproval: Option<Result<(), String>>,
     },
     /// Skills for the root skill picker loaded.
     SkillPickerLoaded {
@@ -2009,6 +2018,7 @@ impl TuiEffect {
                 session_id,
                 provider_plugin_id,
                 model_id,
+                ..
             } => TuiEffectResult::SetSessionModel {
                 session_id,
                 provider_plugin_id,
@@ -2197,9 +2207,13 @@ impl TuiEffect {
                 models: Err(ClientError::Protocol(client_error.to_string())),
                 result: Err(client_error),
             },
-            Self::LoadModelPicker { provider_plugin_id } => TuiEffectResult::ModelPickerLoaded {
+            Self::LoadModelPicker {
+                provider_plugin_id, ..
+            } => TuiEffectResult::ModelPickerLoaded {
                 provider_plugin_id,
                 result: Err(client_error),
+                connections: Vec::new(),
+                reapproval: None,
             },
             Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
                 result: Err(client_error),
@@ -3409,10 +3423,41 @@ impl TuiEffect {
                     models,
                 }
             }
-            Self::LoadModelPicker { provider_plugin_id } => TuiEffectResult::ModelPickerLoaded {
-                result: client.session_model_list(provider_plugin_id.clone()).await,
+            Self::LoadModelPicker {
                 provider_plugin_id,
-            },
+                reapprove,
+            } => {
+                use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+                let reapproval = match reapprove {
+                    Some(candidate) => Some(
+                        client
+                            .approve_external_auth(*candidate)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                    ),
+                    None => None,
+                };
+                let connections = match &provider_plugin_id {
+                    Some(provider) => client
+                        .external_auth_status()
+                        .await
+                        .map(|connections| {
+                            connections
+                                .into_iter()
+                                .filter(|connection| connection.grant.target.plugin_id == *provider)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                TuiEffectResult::ModelPickerLoaded {
+                    result: client.session_model_list(provider_plugin_id.clone()).await,
+                    provider_plugin_id,
+                    connections,
+                    reapproval,
+                }
+            }
             Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
                 result: client.list_skills().await,
             },
@@ -3469,6 +3514,7 @@ impl TuiEffect {
                 session_id,
                 provider_plugin_id,
                 model_id,
+                external_auth_binding,
             } => TuiEffectResult::SetSessionModel {
                 session_id,
                 provider_plugin_id: provider_plugin_id.clone(),
@@ -3479,6 +3525,7 @@ impl TuiEffect {
                         session_id,
                         provider_plugin_id,
                         model_id,
+                        external_auth_binding,
                     },
                 )
                 .await
@@ -3839,6 +3886,7 @@ pub async fn apply_submit_runtime_selections(
                 session_id,
                 provider_plugin_id,
                 model_id,
+                external_auth_binding: None,
             },
         )
         .await?;
