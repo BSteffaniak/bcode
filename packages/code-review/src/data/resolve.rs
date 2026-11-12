@@ -47,6 +47,8 @@ pub fn resolve_sources(
     provider_resolutions: &[ReviewSourceProviderResolution],
 ) -> Result<ResolveReviewSourcesResponse, DataError> {
     let head = git::resolve_commit(root, "HEAD")?;
+    let mut memo = GitMemo::default();
+    memo.prime(root, provider_resolutions);
     let mut response = ResolveReviewSourcesResponse {
         sources: Vec::new(),
         diagnostics: Vec::new(),
@@ -56,7 +58,7 @@ pub fn resolve_sources(
         let provided = provider_resolutions
             .iter()
             .find(|resolution| resolution.source_id == source.id);
-        let resolution = match resolve_source(root, head.as_deref(), source, provided) {
+        let resolution = match resolve_source(root, head.as_deref(), source, provided, &mut memo) {
             Ok(resolution) => resolution,
             // Invalid user-provided revisions and paths are a per-source problem, not a request
             // failure: a failing source never fails the others.
@@ -136,6 +138,7 @@ fn resolve_source(
     head: Option<&str>,
     source: &ReviewSource,
     provided: Option<&ReviewSourceProviderResolution>,
+    memo: &mut GitMemo,
 ) -> Result<Resolution, DataError> {
     Ok(match &source.kind {
         ReviewSourceKind::WorkingTreeUnstaged => {
@@ -204,7 +207,7 @@ fn resolve_source(
                     }
                 }
                 Some(ReviewSourceProviderOutcome::Resolved { stack, fetched }) => {
-                    provider_source(root, source, stack.as_ref(), fetched)?
+                    provider_source(root, source, stack.as_ref(), fetched, memo)?
                 }
             }
         }
@@ -229,16 +232,17 @@ fn provider_source(
     source: &ReviewSource,
     stack: Option<&ReviewStack>,
     fetched: &[ReviewPullFetchResult],
+    memo: &mut GitMemo,
 ) -> Result<Resolution, DataError> {
     match &source.kind {
         ReviewSourceKind::PullRequest { number, .. } => {
-            pull_request_source(root, source, *number, fetched)
+            pull_request_source(root, source, *number, fetched, memo)
         }
         ReviewSourceKind::StackLayer { number, .. } => {
-            stack_source(root, source, stack, fetched, *number, false)
+            stack_source(root, source, stack, fetched, *number, false, memo)
         }
         ReviewSourceKind::Stack { top, .. } => {
-            stack_source(root, source, stack, fetched, *top, true)
+            stack_source(root, source, stack, fetched, *top, true, memo)
         }
         _ => Ok(unresolved("not a provider-backed source")),
     }
@@ -249,6 +253,7 @@ fn pull_request_source(
     source: &ReviewSource,
     number: u64,
     fetched: &[ReviewPullFetchResult],
+    memo: &mut GitMemo,
 ) -> Result<Resolution, DataError> {
     let Some(fetch) = fetched_pull(fetched, number) else {
         return Ok(unresolved(format!(
@@ -256,14 +261,14 @@ fn pull_request_source(
         )));
     };
     let (Some(base), Some(head)) = (
-        local_commit(root, &fetch.base_oid)?,
-        local_commit(root, &fetch.head_oid)?,
+        memo.local_commit(root, &fetch.base_oid)?,
+        memo.local_commit(root, &fetch.head_oid)?,
     ) else {
         return Ok(unresolved(format!(
             "the commits of pull request #{number} are not in the local repository"
         )));
     };
-    let Some(base) = git::merge_base(root, &base, &head)? else {
+    let Some(base) = memo.merge_base(root, &base, &head)? else {
         return Ok(unresolved(format!(
             "pull request #{number} shares no history with {}",
             fetch.base_branch
@@ -284,6 +289,7 @@ fn stack_source(
     fetched: &[ReviewPullFetchResult],
     number: u64,
     whole_stack: bool,
+    memo: &mut GitMemo,
 ) -> Result<Resolution, DataError> {
     let Some(stack) = stack else {
         return Ok(unresolved(format!(
@@ -301,7 +307,7 @@ fn stack_source(
             layers[0].pull.number
         )));
     };
-    let Some(trunk_oid) = local_commit(root, &bottom.base_oid)? else {
+    let Some(trunk_oid) = memo.local_commit(root, &bottom.base_oid)? else {
         return Ok(unresolved(format!(
             "the trunk commit of {} is not in the local repository",
             stack.trunk
@@ -312,7 +318,7 @@ fn stack_source(
     for layer in layers {
         let layer_number = layer.pull.number;
         let Some(head) = fetched_pull(fetched, layer_number)
-            .map(|fetch| local_commit(root, &fetch.head_oid))
+            .map(|fetch| memo.local_commit(root, &fetch.head_oid))
             .transpose()?
             .flatten()
         else {
@@ -320,7 +326,7 @@ fn stack_source(
                 "the head of stack layer #{layer_number} is not in the local repository"
             )));
         };
-        let Some(base) = git::merge_base(root, &below, &head)? else {
+        let Some(base) = memo.merge_base(root, &below, &head)? else {
             return Ok(unresolved(format!(
                 "stack layer #{layer_number} shares no history with the layer below it"
             )));
@@ -333,7 +339,7 @@ fn stack_source(
         });
         below = head;
     }
-    let Some(stack_base) = git::merge_base(root, &trunk_oid, &below)? else {
+    let Some(stack_base) = memo.merge_base(root, &trunk_oid, &below)? else {
         return Ok(unresolved(format!(
             "the stack shares no history with {}",
             stack.trunk
@@ -366,6 +372,138 @@ fn stack_source(
 
 fn fetched_pull(fetched: &[ReviewPullFetchResult], number: u64) -> Option<&ReviewPullFetchResult> {
     fetched.iter().find(|fetch| fetch.number == number)
+}
+
+/// Git answers one resolve request reuses. The sources of one stack (one per layer when stepping
+/// through it) all walk the same layers, so without this a stack of `n` layers cost about `n²`
+/// git processes.
+#[derive(Debug, Default)]
+struct GitMemo {
+    commits: BTreeMap<String, Option<String>>,
+    merge_bases: BTreeMap<(String, String), Option<String>>,
+}
+
+/// Merge bases computed at once while priming a [`GitMemo`].
+const PRIME_WORKERS: usize = 8;
+
+impl GitMemo {
+    /// Answer up front what the provider-backed sources will ask: whether every fetched commit
+    /// exists (one `git cat-file --batch-check`), and each layer's merge bases with the layer
+    /// below and with the trunk (computed in parallel). Anything left out is asked on demand,
+    /// and a failure here only leaves it to be asked again.
+    fn prime(&mut self, root: &Path, resolutions: &[ReviewSourceProviderResolution]) {
+        let mut oids: BTreeSet<&str> = BTreeSet::new();
+        let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+        for resolution in resolutions {
+            let ReviewSourceProviderOutcome::Resolved { stack, fetched } = &resolution.outcome
+            else {
+                continue;
+            };
+            oids.extend(
+                fetched
+                    .iter()
+                    .flat_map(|fetch| [fetch.head_oid.as_str(), fetch.base_oid.as_str()]),
+            );
+            let Some(stack) = stack else {
+                continue;
+            };
+            let heads: Vec<&str> = stack
+                .layers
+                .iter()
+                .filter_map(|layer| fetched_pull(fetched, layer.pull.number))
+                .map(|fetch| fetch.head_oid.as_str())
+                .collect();
+            let Some(trunk) = stack
+                .layers
+                .first()
+                .and_then(|bottom| fetched_pull(fetched, bottom.pull.number))
+                .map(|fetch| fetch.base_oid.as_str())
+            else {
+                continue;
+            };
+            let mut below = trunk;
+            for head in heads {
+                pairs.insert((below.to_owned(), head.to_owned()));
+                pairs.insert((trunk.to_owned(), head.to_owned()));
+                below = head;
+            }
+        }
+        let oids: Vec<&str> = oids
+            .into_iter()
+            .filter(|oid| git::validate_oid(oid).is_ok() && !self.commits.contains_key(*oid))
+            .collect();
+        if !oids.is_empty() {
+            let input = oids.join("\n") + "\n";
+            if let Ok(output) = git::output_with_input(
+                root,
+                &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                &input,
+            ) {
+                let output = String::from_utf8_lossy(&output);
+                let commits: BTreeSet<&str> = output
+                    .lines()
+                    .filter_map(|line| line.strip_suffix(" commit"))
+                    .collect();
+                for oid in oids {
+                    let found = commits.contains(oid).then(|| oid.to_owned());
+                    self.commits.insert(oid.to_owned(), found);
+                }
+            }
+        }
+        let pairs: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|pair| !self.merge_bases.contains_key(pair))
+            .collect();
+        let chunk = pairs.len().div_ceil(PRIME_WORKERS).max(1);
+        let answers: Vec<((String, String), Option<String>)> = std::thread::scope(|scope| {
+            // Every worker starts before any is joined, so they run at once.
+            let mut workers = Vec::new();
+            for pairs in pairs.chunks(chunk) {
+                workers.push(scope.spawn(move || {
+                    pairs
+                        .iter()
+                        .filter_map(|(left, right)| {
+                            git::merge_base(root, left, right)
+                                .ok()
+                                .map(|base| ((left.clone(), right.clone()), base))
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().ok())
+                .flatten()
+                .collect()
+        });
+        self.merge_bases.extend(answers);
+    }
+
+    /// [`local_commit`], once per commit.
+    fn local_commit(&mut self, root: &Path, oid: &str) -> Result<Option<String>, DataError> {
+        if let Some(known) = self.commits.get(oid) {
+            return Ok(known.clone());
+        }
+        let found = local_commit(root, oid)?;
+        self.commits.insert(oid.to_owned(), found.clone());
+        Ok(found)
+    }
+
+    /// [`git::merge_base`], once per pair.
+    fn merge_base(
+        &mut self,
+        root: &Path,
+        left: &str,
+        right: &str,
+    ) -> Result<Option<String>, DataError> {
+        let key = (left.to_owned(), right.to_owned());
+        if let Some(known) = self.merge_bases.get(&key) {
+            return Ok(known.clone());
+        }
+        let found = git::merge_base(root, left, right)?;
+        self.merge_bases.insert(key, found.clone());
+        Ok(found)
+    }
 }
 
 /// The full id of commit `oid` when it exists locally.

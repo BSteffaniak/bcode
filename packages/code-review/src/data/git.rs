@@ -43,6 +43,38 @@ pub fn output(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>, DataError> {
     ))
 }
 
+/// Run git with `input` on its standard input and return its standard output.
+///
+/// # Errors
+///
+/// * [`DataError::Io`] when git cannot be started or written to.
+/// * [`DataError::Git`] when git exits unsuccessfully.
+pub fn output_with_input(
+    repo_root: &Path,
+    args: &[&str],
+    input: &str,
+) -> Result<Vec<u8>, DataError> {
+    use std::io::Write as _;
+    let mut child = command(repo_root, args).stdin(Stdio::piped()).spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| DataError::Git("git stdin unavailable".to_owned()))?;
+    let input = input.to_owned();
+    // Written on another thread so a large input cannot fill both pipes and stall.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| DataError::Git("git stdin writer panicked".to_owned()))??;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    Err(DataError::Git(
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
 /// Run git and return its standard output, or `None` when it exits unsuccessfully without
 /// writing to standard error (for example `rev-parse --verify --quiet` on a missing revision).
 ///
