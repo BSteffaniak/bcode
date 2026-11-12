@@ -1,31 +1,71 @@
-//! Explicit in-place reuse of provider-declared static external credentials.
+//! Explicit, in-place reuse of credential documents owned by other local applications.
 //!
-//! No vault, native process, provider request, refresh, or import is performed. The caller
-//! supplies a fresh enabled-plugin snapshot from its authenticated registry on every operation.
+//! Providers declare [`AuthExternalSource`]s. Discovery inspects document presence only.
+//! Approval and dispatch read the document after consent, deliver its values to the owning
+//! provider for that request, and never copy, refresh, rewrite, or import it. The caller
+//! supplies a fresh enabled-plugin snapshot from its authenticated registry on every call.
+use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use bcode_provider_auth_models::AuthProviderContribution;
 pub use bcode_provider_auth_models::external::*;
-use bcode_provider_auth_models::{
-    AuthCredentialSource, AuthMethodContribution, AuthProviderContribution, AuthSecretField,
-};
 use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
 
 #[cfg(test)]
 mod tests;
 
 /// Enabled declarations supplied by the authenticated application plugin registry.
 pub type EnabledDeclarations<'a> = &'a [(&'a str, &'a AuthProviderContribution)];
+
 const MAX_STATE_BYTES: u64 = 1_048_576;
+const MAX_GRANTS: usize = 1024;
+
+/// Directories external documents resolve against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRoots {
+    /// The user's home directory.
+    pub home: PathBuf,
+    /// Declared root-override environment variables that hold absolute directories.
+    pub overrides: BTreeMap<String, PathBuf>,
+}
+
+impl SourceRoots {
+    /// Capture the current process's home and the declared root-override variables.
+    #[must_use]
+    pub fn from_process(home: PathBuf, enabled: EnabledDeclarations<'_>) -> Self {
+        let overrides = enabled
+            .iter()
+            .flat_map(|(_, provider)| &provider.external_sources)
+            .filter_map(|source| source.location.root_override.as_ref())
+            .filter_map(|root| {
+                let value = PathBuf::from(std::env::var_os(&root.env)?);
+                value.is_absolute().then(|| (root.env.clone(), value))
+            })
+            .collect();
+        Self { home, overrides }
+    }
+
+    fn document(&self, source: &AuthExternalSource) -> (PathBuf, String) {
+        if let Some(root) = &source.location.root_override
+            && let Some(directory) = self.overrides.get(&root.env)
+        {
+            return (directory.clone(), root.relative_path.clone());
+        }
+        (self.home.clone(), source.location.relative_path.clone())
+    }
+}
 
 struct Binding<'a> {
     candidate: ExternalAuthCandidate,
-    field: &'a AuthSecretField,
-    index: usize,
+    source: &'a AuthExternalSource,
+    root: PathBuf,
+    relative_path: String,
 }
 
 fn bindings<'a>(
-    home: &Path,
+    roots: &SourceRoots,
     enabled: EnabledDeclarations<'a>,
 ) -> Result<Vec<Binding<'a>>, ExternalAuthError> {
     let mut providers = std::collections::BTreeSet::new();
@@ -37,99 +77,202 @@ fn bindings<'a>(
         {
             return Err(ExternalAuthError::DeclarationChanged);
         }
-        for method in &provider.methods {
-            let AuthMethodContribution::SecretFields { fields, .. } = method else {
-                continue;
+        for source in &provider.external_sources {
+            let target = ExternalAuthTarget {
+                plugin_id: (*plugin).to_owned(),
+                provider_id: provider.provider_id.clone(),
+                method_id: source.method_id.clone(),
+                source_id: source.source_id.clone(),
             };
-            for field in fields {
-                // A single static field must be sufficient; never guess missing enrollment data.
-                if fields
-                    .iter()
-                    .any(|other| !other.optional && other.credential_id != field.credential_id)
-                {
-                    continue;
-                }
-                for (index, source) in field.discovery_sources.iter().enumerate() {
-                    let (AuthCredentialSource::JsonFile {
-                        application,
-                        relative_path,
-                        ..
-                    }
-                    | AuthCredentialSource::JsonFileValidated {
-                        application,
-                        relative_path,
-                        ..
-                    }) = source
-                    else {
-                        continue;
-                    };
-                    let kind = ExternalAuthSourceKind::Declared {
-                        application: application.clone(),
-                    };
-                    let target = ExternalAuthTarget {
-                        plugin_id: (*plugin).to_owned(),
-                        provider_id: provider.provider_id.clone(),
-                        method_id: method.method_id().to_owned(),
-                        credential_id: field.credential_id.clone(),
-                    };
-                    // No indices are persisted. Pin full declaration, exact source and home boundary.
-                    let bytes = serde_json::to_vec(&(home, &target, provider, source))
-                        .map_err(|_| ExternalAuthError::DeclarationChanged)?;
-                    let binding_id = hex::encode(Sha256::digest(bytes));
-                    let available = crate::discovery::open_confined(home, relative_path)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|file| {
-                            file.metadata()
-                                .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_STATE_BYTES)
-                        });
-                    result.push(Binding {
-                        candidate: ExternalAuthCandidate {
-                            source: kind,
-                            binding_id,
-                            target,
-                            label: application.clone(),
-                            available,
-                        },
-                        field,
-                        index,
-                    });
-                }
-            }
+            let (root, relative_path) = roots.document(source);
+            // Stable across cosmetic declaration edits and credential rotation; changes when
+            // the target or the resolved document location changes.
+            let bytes = serde_json::to_vec(&(&target, root.join(&relative_path)))
+                .map_err(|_| ExternalAuthError::DeclarationChanged)?;
+            let available = crate::discovery::open_confined(&root, &relative_path)
+                .ok()
+                .flatten()
+                .is_some_and(|file| {
+                    file.metadata().is_ok_and(|meta| {
+                        meta.is_file() && meta.len() <= crate::discovery::MAX_SOURCE_BYTES
+                    })
+                });
+            result.push(Binding {
+                candidate: ExternalAuthCandidate {
+                    binding_id: hex::encode(Sha256::digest(bytes)),
+                    target,
+                    application: source.application.clone(),
+                    available,
+                },
+                source,
+                root,
+                relative_path,
+            });
         }
     }
     Ok(result)
 }
 
-/// Discover source metadata without reading any credential bytes or environment values.
+fn find_binding<'a>(
+    roots: &SourceRoots,
+    enabled: EnabledDeclarations<'a>,
+    binding_id: &str,
+    target: &ExternalAuthTarget,
+) -> Result<Binding<'a>, ExternalAuthError> {
+    bindings(roots, enabled)?
+        .into_iter()
+        .find(|binding| {
+            binding.candidate.binding_id == binding_id && binding.candidate.target == *target
+        })
+        .ok_or(ExternalAuthError::DeclarationChanged)
+}
+
+/// Discover declared documents by presence, without reading their contents.
 ///
 /// # Errors
 /// Rejects invalid or duplicate enabled provider declarations.
 pub fn discover(
-    home: &Path,
+    roots: &SourceRoots,
     enabled: EnabledDeclarations<'_>,
 ) -> Result<Vec<ExternalAuthCandidate>, ExternalAuthError> {
-    Ok(bindings(home, enabled)?
+    Ok(bindings(roots, enabled)?
         .into_iter()
         .map(|binding| binding.candidate)
         .collect())
 }
 
-/// Resolve a single user-approved use without remembering consent.
-/// The caller must obtain explicit consent for this exact candidate before calling.
-/// No durable approval or credential is written.
-///
-/// # Errors
-/// Rejects changed declarations or unsafe/invalid source material; never falls back.
-pub fn resolve_once(
-    home: &Path,
-    enabled: EnabledDeclarations<'_>,
-    candidate: &ExternalAuthCandidate,
-) -> Result<bcode_model::ProviderRequestContext, ExternalAuthError> {
-    materialize(home, &find_binding(home, enabled, candidate)?)
+/// Credentials read from one document, plus its account fingerprint.
+struct Acquired {
+    context: bcode_model::ProviderRequestContext,
+    account_fingerprint: Option<String>,
 }
 
-/// Durable non-secret approvals. All updates use an OS lock and atomic publication.
+fn acquire(binding: &Binding<'_>) -> Result<Acquired, ExternalAuthError> {
+    let unavailable = |_: std::io::Error| ExternalAuthError::SourceUnavailable;
+    let file = crate::discovery::open_confined(&binding.root, &binding.relative_path)
+        .map_err(|_| ExternalAuthError::SourceUnavailable)?
+        .ok_or(ExternalAuthError::SourceUnavailable)?;
+    let metadata = file.metadata().map_err(unavailable)?;
+    if !metadata.is_file() || metadata.len() > crate::discovery::MAX_SOURCE_BYTES {
+        return Err(ExternalAuthError::SourceUnavailable);
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(crate::discovery::MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ExternalAuthError::SourceUnavailable)?;
+    let result = interpret(binding, &document);
+    crate::discovery::clear_json_strings(&mut document);
+    result
+}
+
+fn interpret(
+    binding: &Binding<'_>,
+    document: &serde_json::Value,
+) -> Result<Acquired, ExternalAuthError> {
+    let source = binding.source;
+    let present = |pointer: &str| {
+        document
+            .pointer(pointer)
+            .is_some_and(|value| !value.is_null())
+    };
+    if source
+        .required_absent_pointers
+        .iter()
+        .any(|pointer| present(pointer))
+        || source
+            .discriminator
+            .as_ref()
+            .is_some_and(|(pointer, expected)| {
+                document
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected)
+            })
+    {
+        return Err(ExternalAuthError::SourceUnavailable);
+    }
+    let mut credentials = BTreeMap::new();
+    for credential in &source.credentials {
+        match document
+            .pointer(&credential.pointer)
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(value) if source.literal_policy.permits(value) => {
+                credentials.insert(
+                    credential.credential_id.clone(),
+                    bcode_model::ProviderAuthCredential {
+                        value: value.to_owned(),
+                        source: Some(format!("external:{}", source.source_id)),
+                    },
+                );
+            }
+            None if credential.optional && !present(&credential.pointer) => {}
+            _ => return Err(ExternalAuthError::SourceUnavailable),
+        }
+    }
+    let account_fingerprint = match &source.account_pointer {
+        None => None,
+        Some(pointer) => {
+            let account = document
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .filter(|account| !account.trim().is_empty())
+                .ok_or(ExternalAuthError::SourceUnavailable)?;
+            Some(hex::encode(&Sha256::digest(account.as_bytes())[..8]))
+        }
+    };
+    Ok(Acquired {
+        context: bcode_model::ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                backend: Some("external".to_owned()),
+                scheme: Some(source.method_id.clone()),
+                credentials,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        account_fingerprint,
+    })
+}
+
+/// Selection recipe carried until dispatch: routing only, never credentials.
+#[must_use]
+pub fn recipe(
+    selection: &bcode_config::ResolvedModelSelection,
+) -> bcode_model::ProviderRequestContext {
+    bcode_model::ProviderRequestContext {
+        model_profile: selection.model_profile.clone(),
+        auth_profile: selection.auth_profile.clone(),
+        auth_pool: selection.auth_pool.clone(),
+        settings: selection.settings.clone(),
+        request: selection.request.clone(),
+        external_auth_binding: selection.external_auth_binding.clone(),
+        ..Default::default()
+    }
+}
+
+/// Inputs for acquiring an external connection at the authoritative dispatch boundary.
+#[derive(Clone, Copy)]
+pub struct DispatchResolution<'a> {
+    /// The unmaterialized recipe selected for this request.
+    pub recipe: &'a bcode_model::ProviderRequestContext,
+    /// Provider plugin the request dispatches to.
+    pub provider_plugin_id: &'a str,
+    /// Provider-native model the request dispatches to.
+    pub model_id: &'a str,
+    /// Document roots of the serving process.
+    pub roots: &'a SourceRoots,
+    /// Current authenticated enabled-plugin declarations.
+    pub enabled: EnabledDeclarations<'a>,
+    /// Fresh offline destinations the provider recommends for the approved method. The
+    /// request's settings must match one exactly, so configuration cannot redirect an
+    /// external credential to another endpoint.
+    pub provider_choices: &'a [bcode_model::StartupRecommendation],
+}
+
+/// Durable non-secret approvals, guarded by an OS file lock with atomic publication.
 #[derive(Debug, Clone)]
 pub struct ExternalAuthStore {
     path: PathBuf,
@@ -140,7 +283,7 @@ impl ExternalAuthStore {
     #[must_use]
     pub fn new(state_root: &Path) -> Self {
         Self {
-            path: state_root.join("auth/external-auth.json"),
+            path: state_root.join("auth/external-connections.json"),
         }
     }
 
@@ -165,7 +308,7 @@ impl ExternalAuthStore {
         let state: ExternalAuthState =
             serde_json::from_slice(&bytes).map_err(|_| ExternalAuthError::UnsupportedState)?;
         if state.schema_version != EXTERNAL_AUTH_SCHEMA_VERSION
-            || state.grants.len() > 1024
+            || state.grants.len() > MAX_GRANTS
             || state.grants.iter().any(|grant| !valid_grant(grant))
         {
             return Err(ExternalAuthError::UnsupportedState);
@@ -173,7 +316,9 @@ impl ExternalAuthStore {
         Ok(state)
     }
 
-    fn lock(&self) -> Result<std::fs::File, ExternalAuthError> {
+    /// Block until this process holds the consent lock. Readers share it so concurrent
+    /// dispatches proceed together; approval and revocation exclude them.
+    fn lock(&self, exclusive: bool) -> Result<std::fs::File, ExternalAuthError> {
         let parent = self
             .path
             .parent()
@@ -195,8 +340,12 @@ impl ExternalAuthStore {
                 .creation(bcode_confined_fs::Creation::IfMissing),
         )
         .map_err(|_| ExternalAuthError::StateUnavailable)?;
-        file.try_lock()
-            .map_err(|_| ExternalAuthError::StateUnavailable)?;
+        if exclusive {
+            file.lock()
+        } else {
+            file.lock_shared()
+        }
+        .map_err(|_| ExternalAuthError::StateUnavailable)?;
         Ok(file)
     }
 
@@ -206,7 +355,7 @@ impl ExternalAuthStore {
             .parent()
             .ok_or(ExternalAuthError::StateUnavailable)?;
         let bytes = serde_json::to_vec(state).map_err(|_| ExternalAuthError::StateUnavailable)?;
-        if bytes.len() as u64 > MAX_STATE_BYTES || state.grants.len() > 1024 {
+        if bytes.len() as u64 > MAX_STATE_BYTES || state.grants.len() > MAX_GRANTS {
             return Err(ExternalAuthError::StateUnavailable);
         }
         let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -224,57 +373,57 @@ impl ExternalAuthStore {
             .map_err(|_| ExternalAuthError::StateUnavailable)
     }
 
-    /// List explicit approvals without reading any source. Stale entries remain visible for revocation.
+    /// List approvals without reading any source. Stale entries remain visible for revocation.
     ///
     /// # Errors
     /// Fails closed on unsupported, damaged, or unreadable state.
     pub fn list(&self) -> Result<Vec<ExternalAuthGrant>, ExternalAuthError> {
+        let _lock = self.lock(false)?;
         Ok(self.read()?.grants)
     }
 
-    /// Persist an explicit first-use approval. Call only after user confirmation of candidate and scope.
-    /// `None` scope means all local Bcode applications. No credential is read by approval.
+    /// Persist an approval. Call only after the user confirmed this exact candidate.
+    ///
+    /// Approval reads the document once, so an unsupported format is reported now instead
+    /// of on the first request, and records the declared account fingerprint.
     ///
     /// # Errors
-    /// Rejects stale candidates, invalid scope, unavailable locking or unsupported state.
+    /// Rejects stale candidates, unreadable or unsupported documents, and unavailable state.
     pub fn approve(
         &self,
-        home: &Path,
+        roots: &SourceRoots,
         enabled: EnabledDeclarations<'_>,
         candidate: &ExternalAuthCandidate,
-        scope: Option<ExternalAuthScope>,
         approved_at_unix: u64,
     ) -> Result<ExternalAuthGrant, ExternalAuthError> {
-        let binding = find_binding(home, enabled, candidate)?;
+        let binding = find_binding(roots, enabled, &candidate.binding_id, &candidate.target)?;
+        let acquired = acquire(&binding)?;
         let grant = ExternalAuthGrant {
-            source: binding.candidate.source,
             binding_id: binding.candidate.binding_id,
             target: binding.candidate.target,
-            scope: scope.unwrap_or(ExternalAuthScope::AllLocalApplications),
+            application: binding.candidate.application,
+            account_fingerprint: acquired.account_fingerprint,
             approved_at_unix,
         };
-        if !valid_grant(&grant) {
-            return Err(ExternalAuthError::InvalidRequest);
-        }
-        let _lock = self.lock()?;
+        let _lock = self.lock(true)?;
         let mut state = self.read()?;
-        state.grants.retain(|existing| {
-            existing.binding_id != grant.binding_id || existing.scope != grant.scope
-        });
+        state
+            .grants
+            .retain(|existing| existing.binding_id != grant.binding_id);
         state.grants.push(grant.clone());
         self.write(&state)?;
         Ok(grant)
     }
 
-    /// Revoke an exact approval, including stale declarations, without reading any source.
+    /// Revoke an approval, including stale declarations, without reading any source.
     ///
     /// # Errors
-    /// Fails closed on unavailable ownership or invalid durable state.
-    pub fn revoke(&self, grant: &ExternalAuthGrant) -> Result<bool, ExternalAuthError> {
-        let _lock = self.lock()?;
+    /// Fails closed on unavailable or damaged state.
+    pub fn revoke(&self, binding_id: &str) -> Result<bool, ExternalAuthError> {
+        let _lock = self.lock(true)?;
         let mut state = self.read()?;
         let previous = state.grants.len();
-        state.grants.retain(|entry| entry != grant);
+        state.grants.retain(|grant| grant.binding_id != binding_id);
         let removed = previous != state.grants.len();
         if removed {
             self.write(&state)?;
@@ -282,55 +431,83 @@ impl ExternalAuthStore {
         Ok(removed)
     }
 
-    /// Resolve one explicitly approved source in place, with fresh enabled declarations.
-    /// No fallback, refresh, native launch, environment import or vault access is attempted.
-    /// The consent lock is held through acquisition, serializing revocation with reads.
-    /// `application_id` must be verified by the caller. `None` authorizes broad grants
-    /// only; an application-scoped grant never authorizes an unidentified caller.
+    /// Acquire an approved connection for one request at the dispatch boundary.
+    ///
+    /// The shared consent lock is held through acquisition, so a concurrent revocation
+    /// either completes first or waits. Rotation inside the same account is picked up; an
+    /// account change or a non-recommended destination is rejected. Never falls back.
     ///
     /// # Errors
-    /// Rejects missing consent, scope mismatch, declaration drift, or unsafe/invalid source data.
-    pub fn resolve(
+    /// Rejects conflicting profile/pool/request selections, missing approval, declaration
+    /// drift, rejected destinations, account changes, and missing or invalid documents.
+    pub fn resolve_dispatch(
         &self,
-        home: &Path,
-        enabled: EnabledDeclarations<'_>,
-        candidate: &ExternalAuthCandidate,
-        application_id: Option<&str>,
+        request: DispatchResolution<'_>,
     ) -> Result<bcode_model::ProviderRequestContext, ExternalAuthError> {
-        if application_id.is_some_and(|identity| !valid_id(identity)) {
+        let recipe = request.recipe;
+        let binding_id = recipe
+            .external_auth_binding
+            .as_deref()
+            .ok_or(ExternalAuthError::InvalidRequest)?;
+        if recipe.auth.is_some()
+            || !recipe.auth_candidates.is_empty()
+            || !recipe.env.is_empty()
+            || recipe.auth_profile.is_some()
+            || recipe.auth_pool.is_some()
+            || !recipe.request.is_empty()
+        {
             return Err(ExternalAuthError::InvalidRequest);
         }
-        // Read existing consent before any source access, including discovery metadata.
-        let _lock = self.lock()?;
-        let state = self.read()?;
-        let grants = state
-            .grants
-            .iter()
-            .filter(|grant| {
-                grant.binding_id == candidate.binding_id
-                    && grant.target == candidate.target
-                    && grant.source == candidate.source
-            })
-            .collect::<Vec<_>>();
-        if grants.is_empty() {
-            return Err(ExternalAuthError::NotApproved);
-        }
-        if !grants.iter().any(|grant| match &grant.scope {
-            ExternalAuthScope::AllLocalApplications => true,
-            ExternalAuthScope::Application {
-                application_id: approved,
-            } => Some(approved.as_str()) == application_id,
+        if !request.provider_choices.iter().any(|choice| {
+            choice.provider_plugin_id == request.provider_plugin_id
+                && choice.model_id == request.model_id
+                && choice.settings == recipe.settings
         }) {
-            return Err(ExternalAuthError::ScopeDenied);
+            return Err(ExternalAuthError::DestinationRejected);
         }
-        let binding = find_binding(home, enabled, candidate)?;
-        materialize(home, &binding)
+        let _lock = self.lock(false)?;
+        let grant = self
+            .read()?
+            .grants
+            .into_iter()
+            .find(|grant| grant.binding_id == binding_id)
+            .ok_or(ExternalAuthError::NotApproved)?;
+        if grant.target.plugin_id != request.provider_plugin_id {
+            return Err(ExternalAuthError::DeclarationChanged);
+        }
+        let binding = find_binding(request.roots, request.enabled, binding_id, &grant.target)?;
+        let acquired = acquire(&binding)?;
+        if acquired.account_fingerprint != grant.account_fingerprint {
+            return Err(ExternalAuthError::AccountChanged);
+        }
+        let mut context = acquired.context;
+        context.settings.clone_from(&recipe.settings);
+        context.model_profile.clone_from(&recipe.model_profile);
+        context.api_surface = recipe.api_surface;
+        context.external_auth_binding = Some(grant.binding_id);
+        Ok(context)
+    }
+
+    /// The approved method for a binding, used to fetch the provider's destinations.
+    ///
+    /// # Errors
+    /// Fails when the binding is not approved or state is unavailable.
+    pub fn approved_target(
+        &self,
+        binding_id: &str,
+    ) -> Result<ExternalAuthTarget, ExternalAuthError> {
+        self.list()?
+            .into_iter()
+            .find(|grant| grant.binding_id == binding_id)
+            .map(|grant| grant.target)
+            .ok_or(ExternalAuthError::NotApproved)
     }
 }
 
 fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
+
 fn valid_grant(grant: &ExternalAuthGrant) -> bool {
     grant.binding_id.len() == 64
         && grant
@@ -341,53 +518,9 @@ fn valid_grant(grant: &ExternalAuthGrant) -> bool {
             &grant.target.plugin_id,
             &grant.target.provider_id,
             &grant.target.method_id,
-            &grant.target.credential_id,
+            &grant.target.source_id,
+            &grant.application,
         ]
         .into_iter()
         .all(|id| valid_id(id))
-        && match &grant.scope {
-            ExternalAuthScope::AllLocalApplications => true,
-            ExternalAuthScope::Application { application_id } => valid_id(application_id),
-        }
-}
-fn find_binding<'a>(
-    home: &Path,
-    enabled: EnabledDeclarations<'a>,
-    candidate: &ExternalAuthCandidate,
-) -> Result<Binding<'a>, ExternalAuthError> {
-    bindings(home, enabled)?
-        .into_iter()
-        .find(|binding| {
-            binding.candidate.binding_id == candidate.binding_id
-                && binding.candidate.target == candidate.target
-                && binding.candidate.source == candidate.source
-        })
-        .ok_or(ExternalAuthError::DeclarationChanged)
-}
-fn materialize(
-    home: &Path,
-    binding: &Binding<'_>,
-) -> Result<bcode_model::ProviderRequestContext, ExternalAuthError> {
-    let value = crate::discovery::read_selected(home, binding.field, binding.index)
-        .map_err(|_| ExternalAuthError::SourceUnavailable)?
-        .ok_or(ExternalAuthError::SourceUnavailable)?;
-    if value.trim().is_empty() {
-        return Err(ExternalAuthError::SourceUnavailable);
-    }
-    let source = format!("external:{}", binding.candidate.source.as_str());
-    Ok(bcode_model::ProviderRequestContext {
-        auth: Some(bcode_model::ProviderAuthContext {
-            backend: Some("external".to_owned()),
-            scheme: Some(binding.candidate.target.method_id.clone()),
-            credentials: std::collections::BTreeMap::from([(
-                binding.candidate.target.credential_id.clone(),
-                bcode_model::ProviderAuthCredential {
-                    value: value.to_string(),
-                    source: Some(source),
-                },
-            )]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
 }

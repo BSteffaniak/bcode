@@ -8,12 +8,12 @@ use std::io::Read as _;
 use std::path::{Component, Path};
 use zeroize::Zeroizing;
 
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 
 /// Sanitized source availability, not proof of remote authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSourceStatus {
-    /// Source metadata is available; credential validity is not checked by discovery.
+    /// A locally valid static credential is available.
     Available,
     /// Source or supported credential is absent.
     Missing,
@@ -37,38 +37,14 @@ pub fn discover(
         .iter()
         .enumerate()
         .map(|(index, _)| {
-            let status = match &field.discovery_sources[index] {
-                AuthCredentialSource::Environment { .. } => CredentialSourceStatus::Unavailable,
-                AuthCredentialSource::JsonFile { relative_path, .. }
-                | AuthCredentialSource::JsonFileValidated { relative_path, .. } => {
-                    source_presence(home, relative_path)
-                }
+            let status = match read_selected(home, field, index) {
+                Ok(Some(_)) => CredentialSourceStatus::Available,
+                Ok(None) => CredentialSourceStatus::Missing,
+                Err(error) => error,
             };
             (index, status)
         })
         .collect()
-}
-
-/// Inspect a source's bounded metadata without opening or parsing its contents.
-/// Presence is not authentication validity; acquisition still requires consent.
-#[must_use]
-pub fn source_presence(home: &Path, relative_path: &str) -> CredentialSourceStatus {
-    let Ok(root) = home.canonicalize() else {
-        return CredentialSourceStatus::Unavailable;
-    };
-    let path = match root.join(relative_path).canonicalize() {
-        Ok(path) if path.starts_with(&root) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return CredentialSourceStatus::Missing;
-        }
-        _ => return CredentialSourceStatus::Unavailable,
-    };
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_SOURCE_BYTES => {
-            CredentialSourceStatus::Available
-        }
-        _ => CredentialSourceStatus::Unavailable,
-    }
 }
 
 /// Read exactly one explicitly selected, provider-declared source.
@@ -101,30 +77,7 @@ pub fn read_selected(
             pointer,
             discriminator,
             ..
-        } => read_json_source(home, relative_path, pointer, discriminator.as_ref(), &[])?,
-        AuthCredentialSource::JsonFileValidated {
-            relative_path,
-            pointer,
-            discriminator,
-            literal_policy,
-            required_absent_pointers,
-            ..
-        } => {
-            let value = read_json_source(
-                home,
-                relative_path,
-                pointer,
-                discriminator.as_ref(),
-                required_absent_pointers,
-            )?;
-            if value
-                .as_ref()
-                .is_some_and(|value| !literal_policy.permits(value))
-            {
-                return Err(CredentialSourceStatus::Unavailable);
-            }
-            value
-        }
+        } => read_json_source(home, relative_path, pointer, discriminator.as_ref())?,
     };
     if let Some(value) = &value {
         if value.is_empty() {
@@ -143,7 +96,6 @@ fn read_json_source(
     relative_path: &str,
     pointer: &str,
     discriminator: Option<&(String, String)>,
-    required_absent_pointers: &[String],
 ) -> Result<Option<Zeroizing<String>>, CredentialSourceStatus> {
     let unavailable = |_| CredentialSourceStatus::Unavailable;
     let file = open_confined(home, relative_path)?;
@@ -163,12 +115,9 @@ fn read_json_source(
     }
     let mut document: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| CredentialSourceStatus::Unavailable)?;
-    let matches = required_absent_pointers
-        .iter()
-        .all(|pointer| document.pointer(pointer).is_none())
-        && discriminator.is_none_or(|(key, expected)| {
-            document.pointer(key).and_then(serde_json::Value::as_str) == Some(expected.as_str())
-        });
+    let matches = discriminator.is_none_or(|(key, expected)| {
+        document.pointer(key).and_then(serde_json::Value::as_str) == Some(expected.as_str())
+    });
     let value = if matches {
         document
             .pointer(pointer)
@@ -221,7 +170,7 @@ pub(crate) fn open_confined(
     }
 }
 
-fn clear_json_strings(value: &mut serde_json::Value) {
+pub(crate) fn clear_json_strings(value: &mut serde_json::Value) {
     use zeroize::Zeroize as _;
     match value {
         serde_json::Value::String(text) => text.zeroize(),
@@ -283,21 +232,16 @@ mod tests {
     }
 
     #[test]
-    fn discovery_does_not_parse_and_acquisition_rejects_corrupt_or_oversized_documents() {
+    fn rejects_corrupt_and_oversized_documents() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("auth.json");
         std::fs::write(&path, "{").unwrap();
         assert_eq!(
             discover(true, home.path(), &field()),
-            vec![(0, CredentialSourceStatus::Available)]
-        );
-        assert!(read_selected(home.path(), &field(), 0).is_err());
-        let file = std::fs::File::create(path).unwrap();
-        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
-        assert_eq!(
-            discover(true, home.path(), &field()),
             vec![(0, CredentialSourceStatus::Unavailable)]
         );
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
         assert!(read_selected(home.path(), &field(), 0).is_err());
     }
 

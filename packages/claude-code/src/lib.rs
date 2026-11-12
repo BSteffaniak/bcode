@@ -21,7 +21,7 @@ pub use auth::{
 };
 pub use launch::{
     BillingRoute, LaunchOptions, Limits, NativeEnvironment, SettingsInheritance,
-    validate_session_uuid,
+    is_default_config_directory, validate_session_uuid,
 };
 pub use protocol::{
     CallbackRequest, CallbackResponse, ControlRequest, Event, HookMatcher, NativeMessage,

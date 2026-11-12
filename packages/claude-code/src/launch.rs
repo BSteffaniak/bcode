@@ -1,5 +1,10 @@
 use crate::{Error, NativeAuthSupport, SettlementSupport};
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use tokio::process::Command;
 
 /// Explicit billing selection; no fallback between native subscription and API credentials.
@@ -160,14 +165,10 @@ impl LaunchOptions {
             .envs(&self.environment.0)
             .current_dir(&self.cwd)
             .kill_on_drop(true);
-        // The native default and an explicit override to the same directory can select
-        // different OS credential-store identities. Preserve native custody for HOME/.claude.
-        let native_default = self.environment.0.get("HOME").is_some_and(|home| {
-            let default = PathBuf::from(home).join(".claude");
-            default == self.config_directory
-                || default.canonicalize().ok().as_ref() == Some(&self.config_directory)
-        });
-        if !native_default {
+        if !is_default_config_directory(
+            self.environment.0.get("HOME").map(String::as_str),
+            &self.config_directory,
+        ) {
             command.env("CLAUDE_CONFIG_DIR", &self.config_directory);
         }
         command
@@ -243,6 +244,20 @@ pub fn validate_session_uuid(id: &str) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Whether `config_directory` is Claude Code's default namespace (`$HOME/.claude`).
+///
+/// Claude Code selects a different OS credential-store entry whenever `CLAUDE_CONFIG_DIR` is
+/// set, even to the default path. Launches and login handoffs omit the variable for the default
+/// namespace so they use the account the user already signed in with.
+#[must_use]
+pub fn is_default_config_directory(home: Option<&str>, config_directory: &Path) -> bool {
+    home.is_some_and(|home| {
+        let default = PathBuf::from(home).join(".claude");
+        default == config_directory
+            || default.canonicalize().ok().as_deref() == Some(config_directory)
+    })
+}
+
 pub fn validate_id(id: &str) -> Result<(), Error> {
     if id.is_empty()
         || id.len() > 256

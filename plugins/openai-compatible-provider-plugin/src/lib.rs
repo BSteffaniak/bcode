@@ -9,9 +9,8 @@
 //! the host to decide whether the item may be replayed. Unknown item fields must survive an exact
 //! deserialize/persist/replay round trip.
 
-/// Provider-owned external credential formats and bounded source declarations.
+/// Credential documents owned by other coding agents, usable in place after consent.
 pub mod external_auth;
-pub use external_auth::api_key_discovery_sources;
 
 mod diagnostics;
 mod discovery;
@@ -477,6 +476,7 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
 fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> {
     for contribution in [
         AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "opencode-go".to_owned(),
             display_name: "OpenCode Go".to_owned(),
@@ -486,6 +486,7 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
             )],
         },
         AuthProviderContribution {
+            external_sources: external_auth::external_sources("openai"),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "openai".to_owned(),
             display_name: "OpenAI".to_owned(),
@@ -496,6 +497,7 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
             ],
         },
         AuthProviderContribution {
+            external_sources: external_auth::external_sources("openrouter"),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "openrouter".to_owned(),
             display_name: "OpenRouter".to_owned(),
@@ -505,6 +507,7 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
             )],
         },
         AuthProviderContribution {
+            external_sources: external_auth::external_sources("xai"),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "xai".to_owned(),
             display_name: "xAI".to_owned(),
@@ -8739,6 +8742,16 @@ fn semantic_chatgpt_auth_settings(
         .map(|credential| credential.value.clone())
         .or_else(|| id_token.and_then(chatgpt_account_id_from_access_token))
         .or_else(|| chatgpt_account_id_from_access_token(&access_token));
+    // External documents deliver no expiry; the access token's own claim is authoritative.
+    let expires_at = auth
+        .credentials
+        .get("expires_at")
+        .and_then(|credential| credential.value.parse().ok())
+        .or_else(|| {
+            (auth.backend.as_deref() == Some("external"))
+                .then(|| jwt_expiry(&access_token))
+                .flatten()
+        });
     (
         AuthSettings::ChatGpt {
             access_token,
@@ -8746,15 +8759,16 @@ fn semantic_chatgpt_auth_settings(
                 .credentials
                 .get("refresh_token")
                 .map(|credential| credential.value.clone()),
-            expires_at: auth
-                .credentials
-                .get("expires_at")
-                .and_then(|credential| credential.value.parse().ok()),
+            expires_at,
             account_id,
             profile: profile.clone(),
         },
         AuthDiagnostics {
-            source: "runtime_auth".to_string(),
+            source: if auth.backend.as_deref() == Some("external") {
+                "external".to_string()
+            } else {
+                "runtime_auth".to_string()
+            },
             mode: "chatgpt".to_string(),
             detail: profile.as_ref().map_or_else(
                 || "runtime semantic ChatGPT/Codex auth".to_owned(),
@@ -8930,6 +8944,19 @@ impl OpenAiCompatibleProviderPlugin {
                 let now = unix_timestamp();
                 if *expires_at > now + 60 {
                     return Ok(format!("not_needed_expires_in_{}s", expires_at - now));
+                }
+                if refresh_token.is_none() && settings.auth_diagnostics.source == "external" {
+                    let mut error = provider_error(
+                        "external_token_expired",
+                        ProviderErrorCategory::Auth,
+                        "the Codex ChatGPT sign-in Bcode is using has expired; open Codex to renew it, then retry",
+                    );
+                    error.failure = Some(Box::new(openai_failure_context(
+                        settings,
+                        bcode_model::ProviderFailureCapability::TokenRefresh,
+                        "run `codex` (or `codex login`) to renew the shared sign-in; Bcode never refreshes it",
+                    )));
+                    return Err(error);
                 }
                 if refresh_token.is_none() {
                     let mut error = provider_error(
@@ -9368,6 +9395,15 @@ fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|account| !account.trim().is_empty())
         .map(ToString::to_string)
+}
+
+fn jwt_expiry(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_u64()
 }
 
 fn unix_timestamp() -> u64 {

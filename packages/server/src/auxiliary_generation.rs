@@ -37,7 +37,7 @@ pub async fn generate(
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<AuxiliaryGenerationResult, String> {
     let session_id = input.session_id;
-    match generate_inner(state, input, cancellation).await {
+    match Box::pin(generate_inner(state, input, cancellation)).await {
         Ok(result) => Ok(result),
         Err(error) => {
             let diagnostic = error.diagnostic().to_string();

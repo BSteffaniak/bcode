@@ -527,6 +527,7 @@ mod tests {
                 .register(
                     owner,
                     bcode_plugin::AuthProviderContribution {
+                        external_sources: Vec::new(),
                         schema_version:
                             bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
                         provider_id: provider.into(),

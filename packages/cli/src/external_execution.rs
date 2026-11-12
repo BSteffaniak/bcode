@@ -1,25 +1,15 @@
 //! Dispatch-time external authentication for direct CLI model probes.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bcode_model::ProviderRequestContext;
+use bcode_provider_auth::external_auth::{DispatchResolution, ExternalAuthStore, SourceRoots};
 
-/// A selection recipe, deliberately without credential materialization or readiness state.
-pub fn recipe(selection: bcode_config::ResolvedModelSelection) -> ProviderRequestContext {
-    ProviderRequestContext {
-        model_profile: selection.model_profile,
-        auth_profile: selection.auth_profile,
-        auth_pool: selection.auth_pool,
-        settings: selection.settings,
-        request: selection.request,
-        ..Default::default()
-    }
-}
-
+/// Reject diagnostics that route through the daemon's generic plugin call instead of dispatch.
 pub fn reject_unsupported(context: &ProviderRequestContext, operation: &str) -> Result<(), String> {
-    if context.settings.contains_key("external_auth_binding") {
+    if context.external_auth_binding.is_some() {
         return Err(format!(
-            "external authentication is not supported for CLI {operation}; use a configured auth profile for this operation"
+            "external connections are not supported for CLI {operation}; use a configured auth profile for this operation"
         ));
     }
     Ok(())
@@ -39,20 +29,41 @@ impl ExecutionLocation {
     }
 }
 
+/// Acquire an approved connection for a direct CLI probe, exactly as daemon dispatch does.
+/// Returns `None` when the context does not select an external connection.
 pub fn resolve(
     host: &bcode_plugin::PluginHost,
     provider_plugin_id: Option<&str>,
     context: &ProviderRequestContext,
     model_id: &str,
-    state_root: &Path,
-    home: Option<&Path>,
+    location: &ExecutionLocation,
 ) -> Result<Option<ProviderRequestContext>, String> {
-    let Some(binding) = context.settings.get("external_auth_binding") else {
+    let Some(binding) = &context.external_auth_binding else {
         return Ok(None);
     };
     let plugin_id =
         provider_plugin_id.ok_or("external authentication requires an explicit provider")?;
-    let home = home.ok_or("external authentication requires an authorized credential home")?;
+    let home = location
+        .home
+        .clone()
+        .ok_or("external authentication requires a home directory")?;
+    let store = ExternalAuthStore::new(&location.state_root);
+    let target = store
+        .approved_target(binding)
+        .map_err(|error| error.to_string())?;
+    let choices: bcode_model::StartupModelChoicesResponse = host
+        .invoke_service_json(
+            plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_STARTUP_MODEL_CHOICES,
+            &bcode_model::StartupRecommendationRequest {
+                auth_provider_id: target.provider_id,
+                method_id: target.method_id,
+            },
+        )
+        .map_err(|_| {
+            bcode_provider_auth::external_auth::ExternalAuthError::DestinationRejected.to_string()
+        })?;
     let registered = host
         .auth_provider_registry()
         .providers()
@@ -63,44 +74,17 @@ pub fn resolve(
         .iter()
         .map(|entry| (entry.plugin_id.as_str(), &entry.contribution))
         .collect::<Vec<_>>();
-    let store = bcode_provider_auth::external_auth::ExternalAuthStore::new(state_root);
-    // Consent metadata identifies the provider-owned recommendation operation, not its output.
-    let grant = store
-        .list()
-        .map_err(|_| "external authentication consent unavailable")?
-        .into_iter()
-        .find(|grant| grant.binding_id == *binding && grant.target.plugin_id == plugin_id)
-        .ok_or("external authentication requires approval; review external connections")?;
-    let choices: bcode_model::StartupModelChoicesResponse = host.invoke_service_json(
-        plugin_id,
-        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
-        bcode_model::OP_STARTUP_MODEL_CHOICES,
-        &bcode_model::StartupRecommendationRequest {
-            auth_provider_id: grant.target.provider_id,
-            method_id: grant.target.method_id,
-        },
-    ).map_err(|_| "external authentication requires provider-owned offline model choices; reconnect or update the provider")?;
-    let selection = bcode_config::ResolvedModelSelection {
-        provider_plugin_id: Some(plugin_id.to_owned()),
-        model_id: Some(model_id.to_owned()),
-        model_profile: context.model_profile.clone(),
-        auth_profile: context.auth_profile.clone(),
-        auth_pool: context.auth_pool.clone(),
-        settings: context.settings.clone(),
-        request: context.request.clone(),
-        ..Default::default()
-    };
-    bcode_provider_auth::startup::resolve_external_execution(
-        &selection,
-        bcode_provider_auth::startup::ExternalExecutionContext {
-            home,
-            store: &store,
+    store
+        .resolve_dispatch(DispatchResolution {
+            recipe: context,
+            provider_plugin_id: plugin_id,
+            model_id,
+            roots: &SourceRoots::from_process(home, &enabled),
             enabled: &enabled,
-            application_id: None,
             provider_choices: &choices.choices,
-        },
-    )
-    .map_err(|error| error.to_string())
+        })
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -109,9 +93,12 @@ mod tests {
     use crate::{CliPluginTurnInvoker, configured_provider_context};
     use bcode_model_provider_runtime::BlockingModelProviderInvoker as _;
     use bcode_plugin_sdk::{NativeServiceContext, RustPlugin, ServiceResponse};
-    use bcode_provider_auth::external_auth::{ExternalAuthStore, discover};
+    use bcode_provider_auth::external_auth::discover;
+    use bcode_provider_auth_models::external::{
+        AuthExternalCredential, AuthExternalLocation, AuthExternalSource, AuthLiteralTokenPolicy,
+    };
     use bcode_provider_auth_models::{
-        AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthCredentialSource, AuthMethodContribution,
+        AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution,
         AuthProviderContribution, AuthSecretField, AuthSecretValidation,
     };
     use std::collections::BTreeMap;
@@ -133,14 +120,39 @@ mod tests {
                     optional: false,
                     invocation_env: vec![],
                     validation: AuthSecretValidation::default(),
-                    discovery_sources: vec![AuthCredentialSource::JsonFile {
-                        application: "Codex".into(),
-                        relative_path: ".codex/auth.json".into(),
-                        pointer: "/key".into(),
-                        discriminator: Some(("/type".into(), "api".into())),
-                    }],
+                    discovery_sources: vec![],
                 }],
             }],
+            external_sources: vec![AuthExternalSource {
+                source_id: "codex".into(),
+                application: "Codex".into(),
+                method_id: "api_key".into(),
+                location: AuthExternalLocation {
+                    relative_path: ".codex/auth.json".into(),
+                    root_override: None,
+                },
+                discriminator: Some(("/type".into(), "api".into())),
+                required_absent_pointers: vec![],
+                credentials: vec![AuthExternalCredential {
+                    credential_id: "api_key".into(),
+                    pointer: "/key".into(),
+                    optional: false,
+                }],
+                account_pointer: None,
+                literal_policy: AuthLiteralTokenPolicy {
+                    reject_command_prefix: false,
+                    reject_dollar_expansions: false,
+                    reject_whitespace_or_control: true,
+                    reject_environment_identifier: false,
+                },
+            }],
+        }
+    }
+
+    fn roots(home: &std::path::Path) -> SourceRoots {
+        SourceRoots {
+            home: home.to_owned(),
+            overrides: BTreeMap::new(),
         }
     }
 
@@ -215,12 +227,11 @@ library = "unused.dylib"
     }
 
     fn request(binding: &str) -> bcode_model::ModelTurnRequest {
-        let mut settings = settings();
-        settings.insert("external_auth_binding".into(), binding.into());
-        let context = recipe(bcode_config::ResolvedModelSelection {
-            settings,
+        let context = ProviderRequestContext {
+            settings: settings(),
+            external_auth_binding: Some(binding.into()),
             ..Default::default()
-        });
+        };
         serde_json::from_value(serde_json::json!({
             "session_id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
             "turn_id": "fixture-turn",
@@ -241,7 +252,7 @@ library = "unused.dylib"
         std::fs::write(&file, r#"{"type":"api","key":"synthetic-first"}"#).unwrap();
         let provider = contribution();
         let enabled = [("fixture.cli", &provider)];
-        let candidate = discover(home.path(), &enabled).unwrap().remove(0);
+        let candidate = discover(&roots(home.path()), &enabled).unwrap().remove(0);
         let store = ExternalAuthStore::new(state.path());
         let request = request(&candidate.binding_id);
         let mut host = host();
@@ -254,7 +265,7 @@ library = "unused.dylib"
         };
         assert!(invoker.start_turn(Some("fixture.cli"), &request).is_err());
         let grant = store
-            .approve(home.path(), &enabled, &candidate, None, 1)
+            .approve(&roots(home.path()), &enabled, &candidate, 1)
             .unwrap();
         assert_eq!(
             invoker
@@ -277,21 +288,7 @@ library = "unused.dylib"
         invoker.location.state_root = other_state.path().into();
         assert!(invoker.start_turn(Some("fixture.cli"), &request).is_err());
         invoker.location.state_root = state.path().into();
-        store.revoke(&grant).unwrap();
-        assert!(invoker.start_turn(Some("fixture.cli"), &request).is_err());
-        store
-            .approve(
-                home.path(),
-                &enabled,
-                &candidate,
-                Some(
-                    bcode_provider_auth_models::external::ExternalAuthScope::Application {
-                        application_id: "unverified-cli".into(),
-                    },
-                ),
-                2,
-            )
-            .unwrap();
+        assert!(store.revoke(&grant.binding_id).unwrap());
         assert!(invoker.start_turn(Some("fixture.cli"), &request).is_err());
         assert!(request.provider_context.auth.is_none());
     }
@@ -301,14 +298,16 @@ library = "unused.dylib"
         let home = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join(".codex")).unwrap();
-        // Intentionally unreadable source: destination/conflict checks must not need secrets.
-        std::fs::write(home.path().join(".codex/auth.json"), "not-json").unwrap();
+        let file = home.path().join(".codex/auth.json");
+        std::fs::write(&file, r#"{"type":"api","key":"synthetic"}"#).unwrap();
         let provider = contribution();
         let enabled = [("fixture.cli", &provider)];
-        let candidate = discover(home.path(), &enabled).unwrap().remove(0);
+        let candidate = discover(&roots(home.path()), &enabled).unwrap().remove(0);
         ExternalAuthStore::new(state.path())
-            .approve(home.path(), &enabled, &candidate, None, 1)
+            .approve(&roots(home.path()), &enabled, &candidate, 1)
             .unwrap();
+        // Unreadable source: destination/conflict checks must not need the secret.
+        std::fs::write(&file, "not-json").unwrap();
         let request = request(&candidate.binding_id);
         let mut host = host();
         let mut invoker = CliPluginTurnInvoker {
@@ -327,7 +326,7 @@ library = "unused.dylib"
             invoker
                 .start_turn(Some("fixture.cli"), &changed)
                 .unwrap_err()
-                .contains("destination")
+                .contains("not approved for this external connection")
         );
         changed = request.clone();
         changed.model_id = "unapproved-model".into();
@@ -335,7 +334,7 @@ library = "unused.dylib"
             invoker
                 .start_turn(Some("fixture.cli"), &changed)
                 .unwrap_err()
-                .contains("destination")
+                .contains("not approved for this external connection")
         );
         for pool in [false, true] {
             changed = request.clone();
@@ -348,7 +347,7 @@ library = "unused.dylib"
                 invoker
                     .start_turn(Some("fixture.cli"), &changed)
                     .unwrap_err()
-                    .contains("cannot combine")
+                    .contains("invalid external connection request")
             );
         }
         changed = request.clone();
@@ -360,14 +359,14 @@ library = "unused.dylib"
             invoker
                 .start_turn(Some("fixture.cli"), &changed)
                 .unwrap_err()
-                .contains("cannot combine")
+                .contains("invalid external connection request")
         );
         invoker.location.home = None;
         assert!(
             invoker
                 .start_turn(Some("fixture.cli"), &request)
                 .unwrap_err()
-                .contains("authorized credential home")
+                .contains("home directory")
         );
         let mut disabled = bcode_plugin::PluginHost::default();
         invoker.host = &mut disabled;
@@ -378,14 +377,11 @@ library = "unused.dylib"
     #[test]
     fn configured_external_selection_is_a_nonsecret_recipe_and_other_operations_are_explicit() {
         let mut config = bcode_config::BcodeConfig::default();
-        config
-            .model
-            .settings
-            .insert("external_auth_binding".into(), "synthetic-binding".into());
+        config.model.external_auth_binding = Some("synthetic-binding".into());
         let context = configured_provider_context(&config);
         assert_eq!(
-            context.settings["external_auth_binding"],
-            "synthetic-binding"
+            context.external_auth_binding.as_deref(),
+            Some("synthetic-binding")
         );
         assert!(context.auth.is_none());
         assert_eq!(context.auth_candidates, []);

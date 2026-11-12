@@ -19,7 +19,6 @@ pub mod interactive;
 pub mod lifecycle;
 pub mod managed;
 pub mod managed_pool;
-pub mod native_connections;
 #[cfg(target_os = "macos")]
 pub mod native_device;
 pub mod operations;
@@ -213,31 +212,10 @@ pub struct ProviderRequestContextResolution<'a> {
 pub fn resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> bcode_model::ProviderRequestContext {
-    if request
-        .selection
-        .settings
-        .contains_key("external_auth_binding")
-    {
-        return try_resolve_provider_request_context(request).unwrap_or_else(|_| {
-            bcode_model::ProviderRequestContext {
-                auth_profile: Some("external-unavailable".to_owned()),
-                auth: Some(bcode_model::ProviderAuthContext {
-                    backend: Some("external".to_owned()),
-                    diagnostics: vec![bcode_model::ProviderAuthDiagnostic {
-                        severity: "error".to_owned(),
-                        code: "external_auth_unavailable".to_owned(),
-                        remediation: Some(
-                            "Review and reconnect the explicitly selected external source"
-                                .to_owned(),
-                        ),
-                        message: "External authentication unavailable; no fallback source selected"
-                            .to_owned(),
-                    }],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }
-        });
+    if request.selection.external_auth_binding.is_some() {
+        // Carry the routing recipe only; the serving daemon acquires the approved document
+        // at dispatch. Never fall back to profile, pool, or ambient authentication.
+        return external_auth::recipe(&request.selection);
     }
     match startup::resolve_remembered_environment(request.config, &request.selection) {
         Ok(Some(context)) => return context,
@@ -271,15 +249,14 @@ pub fn resolve_provider_request_context(
 ///
 /// # Errors
 /// Returns a configuration error before credential materialization if required runtime
-/// metadata is unreadable, oversized, malformed, or unsupported. External selections
-/// require [`startup::resolve_external_execution`] with execution-owned consent,
-/// authenticated declarations, verified optional caller identity, and destination evidence;
-/// this generic resolver never acquires them through ambient/default state.
+/// metadata is unreadable, oversized, malformed, or unsupported. External selections return
+/// their credential-free recipe; [`external_auth::ExternalAuthStore::resolve_dispatch`]
+/// acquires them at dispatch.
 pub fn try_resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> Result<bcode_model::ProviderRequestContext, bcode_config::ConfigError> {
-    if let Some(context) = startup::resolve_selected_external(&request.selection)? {
-        return Ok(context);
+    if request.selection.external_auth_binding.is_some() {
+        return Ok(external_auth::recipe(&request.selection));
     }
     if let Some(context) =
         startup::resolve_remembered_environment(request.config, &request.selection)?
@@ -721,6 +698,7 @@ fn resolve_request_context_from_registry(
         auth_candidates: Vec::new(),
         request: request.selection.request,
         env: BTreeMap::new(),
+        external_auth_binding: None,
         api_surface: None,
     };
 
@@ -1847,6 +1825,7 @@ mod tests {
             AuthProviderContribution, AuthSecretField, AuthSecretValidation,
         };
         let contribution = AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "test-provider".into(),
             display_name: "Test provider".into(),

@@ -537,6 +537,7 @@ mod tests {
             },
         );
         let provider = AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: 1,
             provider_id: "test-provider".into(),
             display_name: "Test provider".into(),

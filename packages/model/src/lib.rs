@@ -2764,6 +2764,12 @@ pub struct ProviderRequestContext {
     /// historical default.
     #[serde(default)]
     pub api_surface: Option<ModelApiSurface>,
+    /// Approved external credential connection selected for this request, never its credential.
+    ///
+    /// The serving daemon acquires the credential in place at dispatch. Contexts carrying a
+    /// binding never fall back to profile, pool, or ambient authentication.
+    #[serde(default)]
+    pub external_auth_binding: Option<String>,
 }
 
 impl ProviderRequestContext {

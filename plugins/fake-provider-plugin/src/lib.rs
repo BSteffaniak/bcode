@@ -253,6 +253,7 @@ fn register_fake_auth_provider(registrar: &AuthRegistrar) -> Result<(), PluginEr
 
     registrar
         .register(&AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: FAKE_AUTH_PROVIDER_ID.to_owned(),
             display_name: "Fake provider".to_owned(),

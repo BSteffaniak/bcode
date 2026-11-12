@@ -651,6 +651,69 @@ impl bcode_provider_auth_models::application::AuthPoolApplication for BcodeClien
     }
 }
 
+impl bcode_provider_auth_models::external::ExternalAuthApplication for BcodeClient {
+    async fn discover_external_auth(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::external::ExternalAuthCandidate>,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        use bcode_provider_auth_models::external::ExternalAuthError;
+        match self.send_request(Request::DiscoverExternalAuth).await {
+            Ok(ResponsePayload::ExternalAuthDiscovered { candidates }) => Ok(candidates),
+            Ok(ResponsePayload::ExternalAuthFailed { error }) => Err(error),
+            _ => Err(ExternalAuthError::StateUnavailable),
+        }
+    }
+
+    async fn approve_external_auth(
+        &self,
+        candidate: bcode_provider_auth_models::external::ExternalAuthCandidate,
+    ) -> Result<
+        bcode_provider_auth_models::external::ExternalAuthGrant,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        use bcode_provider_auth_models::external::ExternalAuthError;
+        match self
+            .send_request(Request::ApproveExternalAuth { candidate })
+            .await
+        {
+            Ok(ResponsePayload::ExternalAuthApproved { grant }) => Ok(grant),
+            Ok(ResponsePayload::ExternalAuthFailed { error }) => Err(error),
+            _ => Err(ExternalAuthError::StateUnavailable),
+        }
+    }
+
+    async fn list_external_auth(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::external::ExternalAuthGrant>,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        use bcode_provider_auth_models::external::ExternalAuthError;
+        match self.send_request(Request::ListExternalAuth).await {
+            Ok(ResponsePayload::ExternalAuthListed { grants }) => Ok(grants),
+            Ok(ResponsePayload::ExternalAuthFailed { error }) => Err(error),
+            _ => Err(ExternalAuthError::StateUnavailable),
+        }
+    }
+
+    async fn revoke_external_auth(
+        &self,
+        binding_id: String,
+    ) -> Result<bool, bcode_provider_auth_models::external::ExternalAuthError> {
+        use bcode_provider_auth_models::external::ExternalAuthError;
+        match self
+            .send_request(Request::RevokeExternalAuth { binding_id })
+            .await
+        {
+            Ok(ResponsePayload::ExternalAuthRevoked { removed }) => Ok(removed),
+            Ok(ResponsePayload::ExternalAuthFailed { error }) => Err(error),
+            _ => Err(ExternalAuthError::StateUnavailable),
+        }
+    }
+}
+
 impl bcode_provider_auth_models::application::AccountLifecycleApplication
     for AccountLifecycleClient
 {
@@ -2661,17 +2724,10 @@ fn configured_runtime_context_with_auth(
             )
         })?);
     let resolved = config.resolved_model_selection();
-    if resolved.settings.contains_key("external_auth_binding") {
+    if resolved.external_auth_binding.is_some() {
         // Transport the selected recipe only. The serving daemon validates its fresh
         // registry/destination and consent before acquiring anything at dispatch.
-        let provider_context = bcode_model::ProviderRequestContext {
-            model_profile: resolved.model_profile.clone(),
-            auth_profile: resolved.auth_profile.clone(),
-            auth_pool: resolved.auth_pool.clone(),
-            settings: resolved.settings.clone(),
-            request: resolved.request.clone(),
-            ..Default::default()
-        };
+        let provider_context = bcode_provider_auth::external_auth::recipe(&resolved);
         return Ok(runtime_context_from_selection(
             working_directory,
             effective_config_toml,
@@ -2749,10 +2805,7 @@ mod runtime_context_auth_tests {
         let mut config = bcode_config::BcodeConfig::default();
         config.model.provider_plugin_id = Some("synthetic.provider".into());
         config.model.model_id = Some("synthetic-model".into());
-        config
-            .model
-            .settings
-            .insert("external_auth_binding".into(), "ab".repeat(32));
+        config.model.external_auth_binding = Some("ab".repeat(32));
         config
             .model
             .settings
@@ -2768,6 +2821,10 @@ mod runtime_context_auth_tests {
         )
         .unwrap();
         assert_eq!(context.provider_context.settings, config.model.settings);
+        assert_eq!(
+            context.provider_context.external_auth_binding,
+            config.model.external_auth_binding
+        );
         assert_eq!(
             context.selected_provider_plugin_id.as_deref(),
             Some("synthetic.provider")
@@ -9731,28 +9788,6 @@ impl BcodeClient {
         }
     }
 
-    /// Discover, approve, prepare, list, or revoke a native connection.
-    ///
-    /// This bootstrap operation does not resolve or acquire provider-profile credentials.
-    /// Native preparation remains consent-gated by the owning application.
-    ///
-    /// # Errors
-    /// Returns transport, daemon, or unexpected-response failures. Application failures
-    /// remain typed in `NativeConnectionResponse::Failed`.
-    pub async fn native_connection(
-        &self,
-        request: bcode_harness_models::native_connections::NativeConnectionRequest,
-    ) -> Result<bcode_harness_models::native_connections::NativeConnectionResponse, ClientError>
-    {
-        match self
-            .send_request(Request::NativeConnection { request })
-            .await?
-        {
-            ResponsePayload::NativeConnection { response } => Ok(response),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
     async fn send_request(&self, request: Request) -> Result<ResponsePayload, ClientError> {
         // Keep transport state machines out of every application caller's future.
         // This is owned, inline dispatch: dropping the box still cancels the lane
@@ -12441,87 +12476,6 @@ mod client_timeout_tests {
             .await
             .unwrap();
         assert_eq!(refreshed.catalog_revision, 2);
-        server.await.unwrap();
-        std::fs::remove_dir_all(socket_dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_connection_bootstrap_uses_portable_transport_without_profile_auth() {
-        use bcode_harness_models::native_connections::{
-            NativeConnectionError, NativeConnectionRequest, NativeConnectionResponse,
-        };
-        use bcode_ipc::{Request, ResponsePayload};
-        let socket_dir =
-            std::path::PathBuf::from(format!("/tmp/bcs-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("native.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
-        let server = tokio::spawn(async move {
-            for expected_response in [
-                ResponsePayload::NativeConnection {
-                    response: NativeConnectionResponse::Records { records: vec![] },
-                },
-                ResponsePayload::NativeConnection {
-                    response: NativeConnectionResponse::Failed {
-                        error: NativeConnectionError::StateUnavailable,
-                    },
-                },
-                ResponsePayload::Pong,
-            ] {
-                let mut stream = listener.accept().await.unwrap();
-                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
-                let response = bcode_ipc::Response::Ok(ResponsePayload::Hello {
-                    protocol_version: bcode_ipc::ProtocolVersion::current(),
-                    client_id: bcode_session_models::ClientId::new(),
-                    daemon: matching_daemon_status(),
-                });
-                bcode_ipc::send_envelope(
-                    &mut stream,
-                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
-                )
-                .await
-                .unwrap();
-                let envelope = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
-                assert!(matches!(
-                    bcode_ipc::decode_request(&envelope.payload).unwrap(),
-                    Request::NativeConnection {
-                        request: NativeConnectionRequest::List {}
-                    }
-                ));
-                let response = bcode_ipc::Response::Ok(expected_response);
-                bcode_ipc::send_envelope(
-                    &mut stream,
-                    &bcode_ipc::response_envelope(envelope.request_id, &response).unwrap(),
-                )
-                .await
-                .unwrap();
-            }
-        });
-        // No model, auth pool, or auth profile is selected for this bootstrap client.
-        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(5));
-        assert_eq!(
-            client
-                .native_connection(NativeConnectionRequest::List {})
-                .await
-                .unwrap(),
-            NativeConnectionResponse::Records { records: vec![] }
-        );
-        assert_eq!(
-            client
-                .native_connection(NativeConnectionRequest::List {})
-                .await
-                .unwrap(),
-            NativeConnectionResponse::Failed {
-                error: NativeConnectionError::StateUnavailable
-            }
-        );
-        assert!(matches!(
-            client
-                .native_connection(NativeConnectionRequest::List {})
-                .await,
-            Err(ClientError::UnexpectedResponse)
-        ));
         server.await.unwrap();
         std::fs::remove_dir_all(socket_dir).unwrap();
     }

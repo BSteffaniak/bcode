@@ -527,6 +527,39 @@ impl BcodeConfig {
         )
     }
 
+    fn apply_model_profile(
+        selection: &mut ResolvedModelSelection,
+        profile_name: &str,
+        profile: &ModelProfileConfig,
+        reasoning: &ReasoningConfig,
+    ) {
+        if profile.auth_profile.is_some() || profile.auth_pool.is_some() {
+            // A profile with its own authentication does not inherit the default connection.
+            selection.external_auth_binding = None;
+        }
+        selection.provider_plugin_id = Some(profile.provider_plugin_id.clone());
+        selection.provider_source = Some(ModelSelectionSource::Profile {
+            name: profile_name.to_owned(),
+        });
+        if profile.model_id.is_some() {
+            selection.model_id.clone_from(&profile.model_id);
+            selection.model_source = Some(ModelSelectionSource::Profile {
+                name: profile_name.to_owned(),
+            });
+        }
+        if profile.auth_profile.is_some() {
+            selection.auth_profile.clone_from(&profile.auth_profile);
+        }
+        if profile.auth_pool.is_some() {
+            selection.auth_pool.clone_from(&profile.auth_pool);
+        }
+        selection
+            .settings
+            .extend(profile.settings.iter().map(|(k, v)| (k.clone(), v.clone())));
+        selection.request = provider_request_values_from_json(&profile.request);
+        selection.reasoning = merge_reasoning_config(reasoning, &profile.reasoning);
+    }
+
     /// Resolve effective model/provider selection using an explicit environment.
     #[must_use]
     pub fn resolved_model_selection_with_environment(
@@ -564,31 +597,12 @@ impl BcodeConfig {
             settings: self.model.settings.clone(),
             request: BTreeMap::new(),
             reasoning: self.model.reasoning.clone(),
+            external_auth_binding: self.model.external_auth_binding.clone(),
         };
         if let Some(profile_name) = &self.model.profile
             && let Some(profile) = self.model.profiles.get(profile_name)
         {
-            selection.provider_plugin_id = Some(profile.provider_plugin_id.clone());
-            selection.provider_source = Some(ModelSelectionSource::Profile {
-                name: profile_name.clone(),
-            });
-            if profile.model_id.is_some() {
-                selection.model_id.clone_from(&profile.model_id);
-                selection.model_source = Some(ModelSelectionSource::Profile {
-                    name: profile_name.clone(),
-                });
-            }
-            if profile.auth_profile.is_some() {
-                selection.auth_profile.clone_from(&profile.auth_profile);
-            }
-            if profile.auth_pool.is_some() {
-                selection.auth_pool.clone_from(&profile.auth_pool);
-            }
-            selection
-                .settings
-                .extend(profile.settings.iter().map(|(k, v)| (k.clone(), v.clone())));
-            selection.request = provider_request_values_from_json(&profile.request);
-            selection.reasoning = merge_reasoning_config(&self.model.reasoning, &profile.reasoning);
+            Self::apply_model_profile(&mut selection, profile_name, profile, &self.model.reasoning);
         }
         self.apply_model_alias(&mut selection);
         if selection.provider_plugin_id.is_none()
@@ -620,6 +634,7 @@ impl BcodeConfig {
                 selection.auth_profile = None;
                 selection.auth_pool = None;
                 selection.settings.clear();
+                selection.external_auth_binding = None;
             }
         }
         if let Some(provider_plugin_id) = &selection.provider_plugin_id
@@ -3818,6 +3833,10 @@ pub struct ModelConfig {
     #[config_doc(map_key = "<setting>")]
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Approved external credential connection to authenticate with, set by startup selection.
+    /// Holds a connection binding digest, never a credential. See `bcode auth connections`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_auth_binding: Option<String>,
     /// Default provider reasoning effort/thinking level.
     #[config_doc(values("low", "medium", "high"))]
     #[serde(default)]
@@ -4527,6 +4546,8 @@ pub struct ResolvedModelSelection {
     pub settings: BTreeMap<String, String>,
     pub request: BTreeMap<String, bcode_model::ProviderRequestValue>,
     pub reasoning: ReasoningConfig,
+    /// Approved external credential connection, never credential material.
+    pub external_auth_binding: Option<String>,
 }
 
 /// Missing configuration required to select a model. This is not a remote readiness check.

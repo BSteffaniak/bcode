@@ -363,6 +363,7 @@ mod tests {
         )
         .unwrap();
         let provider = AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "example".to_owned(),
             display_name: "Example".to_owned(),
@@ -479,6 +480,7 @@ mod tests {
     #[test]
     fn existing_account_method_is_checked_before_interactive_effects() {
         let provider = AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "example".to_owned(),
             display_name: "Example".to_owned(),

@@ -415,25 +415,21 @@ impl HarnessPluginTransport {
         decode_readonly_auth(&request, &payload)
     }
 
-    fn credential_bridge(&self, request: &HarnessRequest) -> bcode_plugin::PluginInvocationBridge {
-        // Native publication lookup is independent of vault/auth-provider registration.
-        let native_bridge = crate::native_connections::bridge_for_instance(
-            Arc::clone(&self.state),
-            request.instance.clone(),
-        );
+    fn credential_bridge(
+        &self,
+        request: &HarnessRequest,
+    ) -> Option<bcode_plugin::PluginInvocationBridge> {
         // Only an owning auth declaration opts into exact semantic credential delivery.
-        let Some(registered) = self
+        // Existing harnesses without such a declaration retain their legacy delivery contract.
+        let registered = self
             .state
             .plugins
-            .auth_provider(&request.instance.auth.provider_id)
-        else {
-            return native_bridge;
-        };
+            .auth_provider(&request.instance.auth.provider_id)?;
         if registered.plugin_id != request.instance.plugin_id {
-            return native_bridge;
+            return None;
         }
         let admitted = CREDENTIAL_CALLER.try_with(Clone::clone).ok();
-        if let Some((caller, owner, call)) = admitted {
+        Some(if let Some((caller, owner, call)) = admitted {
             let state = Arc::clone(&self.state);
             let runtime = tokio::runtime::Handle::current();
             let resolver: bcode_plugin::SensitiveCredentialResolver =
@@ -467,11 +463,15 @@ impl HarnessPluginTransport {
                     }
                     Ok(secret)
                 });
-            native_bridge.with_credentials(resolver)
+            bcode_plugin::PluginInvocationBridge::new(|_, _| {
+                Err("unsupported bridge operation".into())
+            })
+            .with_credentials(resolver)
         } else {
-            // Suppress legacy serialized secret maps even when no credential admission exists.
-            native_bridge.with_credentials(Arc::new(|_, _| Err(())))
-        }
+            // Suppress legacy serialized secret maps even when no admission exists.
+            bcode_plugin::PluginInvocationBridge::new(|_, _| Err("unadmitted bridge".into()))
+                .with_credentials(Arc::new(|_, _| Err(())))
+        })
     }
 
     async fn auth_payload(&self, request: &HarnessRequest) -> Result<Vec<u8>, ManagedHarnessError> {
@@ -788,7 +788,7 @@ impl HarnessPluginTransport {
         }
         // Error payloads may contain native diagnostics or secret-bearing protocol material.
         // Never forward them to public errors, logs or canonical events.
-        let bridge = Some(self.credential_bridge(request));
+        let bridge = self.credential_bridge(request);
         let response = tokio::time::timeout(
             CALL_TIMEOUT,
             self.configuration_view()

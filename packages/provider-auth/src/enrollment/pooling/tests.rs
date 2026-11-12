@@ -9,6 +9,7 @@ use bcode_provider_auth_models::AuthMethodContribution;
 
 fn provider() -> AuthProviderContribution {
     AuthProviderContribution {
+        external_sources: Vec::new(),
         schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
         provider_id: "example".to_owned(),
         display_name: "Example".to_owned(),

@@ -1160,6 +1160,7 @@ mod tests {
             auth_mode: None,
             catalog_provider_id: None,
             auth_profile: None,
+            external_auth_binding: None,
             environment_variable: None,
             environment_auth_provider: None,
             environment_method: None,

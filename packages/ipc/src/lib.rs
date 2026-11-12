@@ -151,7 +151,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 63 adds session origin at creation and origin catalog filters.
 /// Version 64 adds client-provided tools, session claims and their invocation events.
 /// Version 65 adds importing a named source file with an origin.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 65;
+/// Version 66 adds explicit external credential connection operations.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 66;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1559,23 +1560,19 @@ pub enum Request {
         /// Validated-at-ingress metric observations.
         batch: bcode_metrics::ClientMetricBatch,
     },
-    /// Discover metadata from enabled plugin-owned external credential declarations.
-    /// Execute a portable native-account discovery or consent operation.
-    NativeConnection {
-        request: bcode_harness_models::native_connections::NativeConnectionRequest,
-    },
+    /// Discover external credential documents declared by enabled providers, by presence only.
     DiscoverExternalAuth,
-    /// Explicitly approve a discovered binding; omitted scope means all local applications.
+    /// Approve a discovered connection after explicit user confirmation.
     ApproveExternalAuth {
         candidate: bcode_provider_auth_models::external::ExternalAuthCandidate,
-        scope: Option<bcode_provider_auth_models::external::ExternalAuthScope>,
     },
-    /// List persisted non-secret approvals, including stale bindings.
+    /// List approved connections, including ones whose provider is no longer enabled.
     ListExternalAuth,
-    /// Revoke one exact approval without touching the native credential store.
+    /// Revoke one approval without touching the owning application's credentials.
     RevokeExternalAuth {
-        grant: bcode_provider_auth_models::external::ExternalAuthGrant,
+        binding_id: String,
     },
+    /// List portable auth-pool status.
     /// Registered providers and explicitly owned lifecycle accounts.
     AccountLifecycleCatalog,
     /// Review local effects before any mutation or optional remote revocation.
@@ -3197,31 +3194,27 @@ pub enum ResponsePayload {
         /// Number of observations merged into the daemon registry.
         accepted: usize,
     },
-    /// Registered providers and owned declared/runtime profiles.
-    /// Secret-free external source metadata.
-    /// Portable native-account operation result, without native credentials.
-    NativeConnection {
-        response: bcode_harness_models::native_connections::NativeConnectionResponse,
-    },
+    /// Discovered external connections; never credential values.
     ExternalAuthDiscovered {
         candidates: Vec<bcode_provider_auth_models::external::ExternalAuthCandidate>,
     },
-    /// Explicit consent was persisted; no credential was imported.
+    /// Approval was persisted; no credential was imported.
     ExternalAuthApproved {
         grant: bcode_provider_auth_models::external::ExternalAuthGrant,
     },
-    /// Persisted approvals, including declarations that are no longer enabled.
+    /// Persisted approvals.
     ExternalAuthListed {
         grants: Vec<bcode_provider_auth_models::external::ExternalAuthGrant>,
     },
-    /// Whether the exact approval was removed.
-    /// Normalized domain failure; contains no native diagnostics or paths.
-    ExternalAuthFailed {
-        error: bcode_provider_auth_models::external::ExternalAuthError,
-    },
+    /// Whether an approval was removed.
     ExternalAuthRevoked {
         removed: bool,
     },
+    /// Normalized external connection failure.
+    ExternalAuthFailed {
+        error: bcode_provider_auth_models::external::ExternalAuthError,
+    },
+    /// Registered providers and owned declared/runtime profiles.
     AccountLifecycleCatalog {
         catalog: bcode_provider_auth_models::application::AccountLifecycleCatalog,
     },
@@ -4626,43 +4619,34 @@ mod tests {
             encode_response,
         };
         use bcode_provider_auth_models::external::{
-            ExternalAuthCandidate, ExternalAuthError, ExternalAuthGrant, ExternalAuthScope,
-            ExternalAuthSourceKind, ExternalAuthTarget,
+            ExternalAuthCandidate, ExternalAuthError, ExternalAuthGrant, ExternalAuthTarget,
         };
         let candidate = ExternalAuthCandidate {
-            source: ExternalAuthSourceKind::Codex,
             binding_id: "ab".repeat(32),
             target: ExternalAuthTarget {
                 plugin_id: "plugin".into(),
                 provider_id: "provider".into(),
                 method_id: "method".into(),
-                credential_id: "credential".into(),
+                source_id: "source".into(),
             },
-            label: "Codex".into(),
+            application: "Codex".into(),
             available: true,
         };
         let grant = ExternalAuthGrant {
-            source: candidate.source.clone(),
             binding_id: candidate.binding_id.clone(),
             target: candidate.target.clone(),
-            scope: ExternalAuthScope::AllLocalApplications,
+            application: candidate.application.clone(),
+            account_fingerprint: Some("0123456789abcdef".into()),
             approved_at_unix: 1,
         };
         for request in [
             Request::DiscoverExternalAuth,
             Request::ApproveExternalAuth {
                 candidate: candidate.clone(),
-                scope: None,
-            },
-            Request::ApproveExternalAuth {
-                candidate: candidate.clone(),
-                scope: Some(ExternalAuthScope::Application {
-                    application_id: "cli".into(),
-                }),
             },
             Request::ListExternalAuth,
             Request::RevokeExternalAuth {
-                grant: grant.clone(),
+                binding_id: grant.binding_id.clone(),
             },
         ] {
             let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -4683,73 +4667,10 @@ mod tests {
             },
             ResponsePayload::ExternalAuthRevoked { removed: true },
             ResponsePayload::ExternalAuthFailed {
-                error: ExternalAuthError::DeclarationChanged,
+                error: ExternalAuthError::AccountChanged,
             },
         ] {
             let response = Response::Ok(payload);
-            let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-            assert_eq!(
-                serde_json::to_value(decoded).unwrap(),
-                serde_json::to_value(response).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn native_connection_operations_round_trip_through_actual_codec() {
-        use super::{
-            Request, Response, ResponsePayload, decode_request, decode_response, encode_request,
-            encode_response,
-        };
-        use bcode_harness_models::native_connections::{
-            NativeCandidate, NativeConnectionError, NativeConnectionRequest,
-            NativeConnectionResponse,
-        };
-        let candidate = NativeCandidate {
-            candidate_id: "synthetic-native".into(),
-            plugin_id: "synthetic-plugin".into(),
-            executable: "/synthetic/bin/native".into(),
-            config_namespace: "/synthetic/config".into(),
-            installation_id: "synthetic-installation".into(),
-        };
-        for request in [
-            NativeConnectionRequest::Discover {
-                plugin_id: candidate.plugin_id.clone(),
-            },
-            NativeConnectionRequest::Approve {
-                candidate: candidate.clone(),
-                expected_revision: 0,
-                mutation_id: "approve-synthetic".into(),
-            },
-            NativeConnectionRequest::Prepare {
-                candidate_id: candidate.candidate_id.clone(),
-                expected_revision: 1,
-                mutation_id: "prepare-synthetic".into(),
-            },
-            NativeConnectionRequest::List {},
-            NativeConnectionRequest::Revoke {
-                candidate_id: candidate.candidate_id.clone(),
-                expected_revision: 2,
-                mutation_id: "revoke-synthetic".into(),
-            },
-        ] {
-            let request = Request::NativeConnection { request };
-            let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
-            assert_eq!(
-                serde_json::to_value(decoded).unwrap(),
-                serde_json::to_value(request).unwrap()
-            );
-        }
-        for response in [
-            NativeConnectionResponse::Candidates {
-                candidates: vec![candidate],
-            },
-            NativeConnectionResponse::Records { records: vec![] },
-            NativeConnectionResponse::Failed {
-                error: NativeConnectionError::StateUnavailable,
-            },
-        ] {
-            let response = Response::Ok(ResponsePayload::NativeConnection { response });
             let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
             assert_eq!(
                 serde_json::to_value(decoded).unwrap(),
@@ -5002,7 +4923,8 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 65);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 66);
+        assert_ne!(ProtocolVersion(65), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(59), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(57), ProtocolVersion::current());

@@ -13,67 +13,55 @@ for provider-owned fallback; preparation neither retries turns nor interprets pr
 CLI verification applies this at each typed `BlockingModelProviderInvoker::start_turn`, including
 all prompt-cache scenario rounds, rather than relying only on the configured profile.
 
-## External connections without credential import
+## Using credentials from other coding agents
 
-`bcode auth connect` offers supported external API-key sources for explicit approval.
-`bcode auth connections` lists approvals; `bcode auth disconnect` revokes one.
-Approval stores a source binding and consent, not a credential copy in sshenv.
-The source application remains responsible for its credential file. Normal model
-execution acquires the selected credential at daemon dispatch, so source rotation
-and revocation are observed on subsequent dispatches. Explicit external selection
-fails closed rather than falling back to another account or billing route.
+Bcode can use credentials that another coding agent already keeps on the machine, in place and
+with explicit consent. Nothing is imported into sshenv, copied, refreshed, or rewritten.
 
-Discovery inspects bounded source metadata, not credential contents. Presence is
-not remote validity. Acquisition validates the provider-declared file format after
-consent. Supported static-key declarations cover Codex API-key mode, OpenCode API
-entries, and Pi literal API-key entries. Dynamic Pi commands, environment references,
-OAuth entries, and mixed/unsupported Codex authentication documents are rejected.
-Automatic discovery respects the onboarding discovery opt-out. Headless operation
-never implicitly approves a source.
+* **Declarations.** Provider plugins declare `AuthExternalSource`s on their
+  `AuthProviderContribution`: the owning application, the method the document satisfies, a
+  home-relative path with an optional root override variable (for example `CODEX_HOME` or
+  `XDG_DATA_HOME`), an optional discriminator, pointers that must be absent, the credential
+  pointers, an optional account pointer, and a literal-value policy. The bundled OpenAI-compatible
+  provider declares Codex (API-key mode and ChatGPT sign-in), OpenCode API keys, and Pi literal
+  API keys.
+* **Discovery** reports document presence only and never parses a document.
+* **Approval** (`bcode auth connect`, or the first-run Setup picker) reads the document once to
+  reject unsupported formats immediately, and records a truncated SHA-256 of the declared account
+  identity. Consent covers every local Bcode application using the same state location; caller
+  labels are not trusted as application identity. Approvals live in
+  `<state>/auth/external-connections.json`. `bcode auth connections` lists them;
+  `bcode auth disconnect` removes one without signing out the owning application.
+* **Binding identity** is a digest of the plugin, provider, method, source ID, and resolved
+  document path. Cosmetic declaration edits and credential rotation keep it; a different source
+  ID or document location produce a new binding.
+* **Selection.** Choosing a model saves `external_auth_binding` in the startup selection, which
+  becomes `model.external_auth_binding` and the typed `ProviderRequestContext::external_auth_binding`.
+  Clients and the daemon carry only this credential-free recipe.
+* **Dispatch.** The daemon (or a direct CLI probe) calls
+  `ExternalAuthStore::resolve_dispatch`, which rejects recipes that also carry a profile, pool,
+  request overrides, environment values, or materialized credentials; requires the request's
+  model and settings to exactly match a destination the provider recommends for the approved
+  method, so configuration cannot redirect the credential; then reads the document under a shared
+  lock (revocation takes it exclusively), rejects an account change with `AccountChanged`, and
+  delivers the values for that request only. Requests carrying a binding get no credential custody
+  bridge, so providers cannot write credentials back. There is never a fallback to another account
+  or billing route.
+* **ChatGPT tokens** from Codex are delivered without the refresh token. The provider derives the
+  expiry from the access token; when it has expired, the request fails with
+  `external_token_expired`, asking the user to open Codex to renew the sign-in. Codex installs that
+  keep credentials in the OS keyring instead of `auth.json` are not discovered.
+* **Unsupported operations.** `bcode model capabilities`, `auth usage`, and image-upload
+  verification route through generic daemon plugin calls, not dispatch, and reject external
+  connections explicitly.
 
-Consent currently covers local Bcode applications. Application-specific approval
-is rejected until the application boundary supplies an authenticated application
-identity; caller-provided labels are not authority. Explicit provider/model/profile
-selection remains authoritative. Import remains a separate, optional operation.
-
-### Native subscriptions and harnesses
-
-Native Claude Code and Codex accounts remain native-managed; discovery is not
-permission to extract or refresh their OAuth tokens. Enabled plugins expose bounded
-passive installation discovery and consent-gated preparation through
-`bcode.harness.native-connection/v1`. `auth native-connect`, `auth native-connections`,
-and `auth native-disconnect` use the application boundary for approval, inspection,
-and revocation. Startup also offers native setup through the existing backend picker.
-Approval records the exact installation/namespace binding in durable Bcode user state;
-no native credentials, declarative configuration, or plugin cache become consent authority.
-
-Preparation publication rechecks the consent revision. Approved prepared records are
-merged into the managed harness catalog, and native plugins resolve only their own
-host-published instance through an invocation-bound lookup. Revocation blocks new use
-without logging out the source account or claiming ongoing work was cancelled.
-Provider-independent bootstrap does not require a model provider or vault login.
-
-Claude has a narrowly pinned `2.1.308` wrapper/payload profile for isolated optional
-settings, native-account status, and stream initialization. Preparation requires a
-logged-in native Claude account and rechecks artifact/namespace identity. This profile
-retains **unknown settlement** and does not claim successful generation, tool execution,
-authentication mutation, or durable recovery. A bounded installed-account generation
-attempt returned an error with limit/reset indicators; it did not establish live success.
-Codex preparation remains `CompatibilityUnavailable`: empty CLI table overlays merge
-rather than remove inherited MCP/provider settings, and no verified public settings-layer
-exclusion retaining native credentials has been established. See the plugin READMEs for
-exact compatibility scope and the required upstream capability.
-
-Do not auto-enable verified flags or describe installation/login status as successful
-execution. Existing explicitly configured harnesses retain their admission requirements.
-Synthetic tests cover canonical admission, approval denial, interrupt retention, and
-stale-owner fencing—not installed protocol settlement or successful restart recovery.
-
-Native application consent and publication filesystem operations run on blocking tasks;
-the global catalog lookup also moves durable reads off executor threads. Synchronous
-instance-bound lookup remains on the native plugin's blocking invocation thread. Dropping
-an application request does not prove an already-admitted blocking mutation had no effects;
-revision/mutation checks remain the authority for retries.
+Native Claude Code and Codex accounts are handled by the native harness setup in the same
+first-run picker; their credentials stay with the native agent. Bcode does not set
+`CLAUDE_CONFIG_DIR` for the default `~/.claude` namespace, because Claude Code selects a different
+OS credential-store entry when the variable is set, even to the default path. Automatic Codex
+native setup still requires an app-server mode that excludes user, project, and managed settings
+layers while keeping native credential custody; empty CLI table overrides merge instead of
+replacing inherited MCP and provider settings.
 
 ## Operation
 

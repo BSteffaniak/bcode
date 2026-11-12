@@ -16,6 +16,7 @@ fn provider() -> RegisteredAuthProvider {
     RegisteredAuthProvider {
         plugin_id: "bcode.test".to_owned(),
         contribution: bcode_provider_auth_models::AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: 1,
             provider_id: "test".to_owned(),
             display_name: "Test Provider".to_owned(),

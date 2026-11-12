@@ -1,4 +1,5 @@
-//! Reviewed native-instance setup at the CLI boundary; native protocols stay plugin-owned.
+//! Reviewed first-run setup: native installations and other agents' credentials side by
+//! side. Native protocols and credential formats stay plugin-owned.
 
 use crate::TuiError as CliError;
 use bcode_config::BcodeConfig;
@@ -28,6 +29,63 @@ struct NativeSetup {
     native: HarnessPreparedCandidate,
     adapter_configuration: serde_json::Value,
     harness: InstanceSetup,
+}
+
+/// Result of one setup journey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeSetupOutcome {
+    /// Nothing changed.
+    Unchanged,
+    /// Configuration changed; re-read execution choices.
+    Refresh,
+    /// The user approved another agent's credentials; the caller chooses a model for them.
+    ExternalApproved(bcode_provider_auth_models::external::ExternalAuthCandidate),
+}
+
+/// Present credentials of other coding agents; discovery problems never block setup.
+async fn external_candidates() -> Vec<bcode_provider_auth_models::external::ExternalAuthCandidate> {
+    use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+    bcode_client::BcodeClient::default_endpoint()
+        .discover_external_auth()
+        .await
+        .map(|candidates| {
+            candidates
+                .into_iter()
+                .filter(|candidate| candidate.available)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Confirm and persist approval for one discovered connection.
+async fn approve_external(
+    shell: &mut crate::TerminalShell,
+    candidate: &bcode_provider_auth_models::external::ExternalAuthCandidate,
+) -> Result<bool, CliError> {
+    use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+    let outcome = crate::run_execution_confirmation_in_shell(shell, crate::QuickOnboardingInput {
+        choices: vec![crate::QuickConnectionChoice {
+            label: format!("Allow Bcode to use {} credentials", candidate.application),
+            detail: format!(
+                "Every local Bcode application may use them for {}. Requests use that account's quota or billing. Disconnecting later (`bcode auth disconnect`) does not sign you out of {}.",
+                candidate.target.provider_id, candidate.application
+            ),
+        }],
+        recovery: Some("Nothing is approved until you confirm. Close to leave everything unchanged.".into()),
+    })
+    .await?;
+    if !matches!(outcome, crate::QuickOnboardingOutcome::Selected(0)) {
+        return Ok(false);
+    }
+    bcode_client::BcodeClient::default_endpoint()
+        .approve_external_auth(candidate.clone())
+        .await
+        .map_err(|error| {
+            CliError::Io(std::io::Error::other(format!(
+                "External connection failed: {error}."
+            )))
+        })?;
+    Ok(true)
 }
 
 /// Setup refusal naming the failed step; reasons are fixed text, never native output.
@@ -62,9 +120,12 @@ async fn candidates() -> Result<(Vec<HarnessInstallationCandidate>, bool), CliEr
 }
 
 /// One explicit setup journey; closing never falls through to a provider connection.
-pub async fn run(shell: &mut crate::TerminalShell, no_discovery: bool) -> Result<bool, CliError> {
+pub async fn run(
+    shell: &mut crate::TerminalShell,
+    no_discovery: bool,
+) -> Result<NativeSetupOutcome, CliError> {
     if no_discovery {
-        return Ok(false);
+        return Ok(NativeSetupOutcome::Unchanged);
     }
     let Some((observed, complete)) =
         Box::pin(shell.wait("Inspecting native installations", async {
@@ -72,8 +133,9 @@ pub async fn run(shell: &mut crate::TerminalShell, no_discovery: bool) -> Result
         }))
         .await?
     else {
-        return Ok(true);
+        return Ok(NativeSetupOutcome::Refresh);
     };
+    let external = external_candidates().await;
     let mut choices: Vec<_> = observed
         .iter()
         .map(|candidate| crate::QuickConnectionChoice {
@@ -92,10 +154,17 @@ pub async fn run(shell: &mut crate::TerminalShell, no_discovery: bool) -> Result
             ),
         })
         .collect();
+    choices.extend(external.iter().map(|candidate| crate::QuickConnectionChoice {
+        label: format!("Use {} credentials in Bcode", candidate.application),
+        detail: format!(
+            "{} ({}) · read in place when Bcode makes requests; never copied, refreshed, or modified",
+            candidate.target.provider_id, candidate.target.method_id
+        ),
+    }));
     let provider_index = choices.len();
     choices.push(crate::QuickConnectionChoice {
         label: "Provider connections and advanced settings".into(),
-        detail: "Optional alternative; native execution does not require a provider API key".into(),
+        detail: "Optional alternative; native execution and existing agent credentials do not require a provider API key".into(),
     });
     let outcome = crate::run_backend_selection_in_shell(shell, crate::QuickOnboardingInput {
         choices,
@@ -103,17 +172,30 @@ pub async fn run(shell: &mut crate::TerminalShell, no_discovery: bool) -> Result
     }).await?;
     match outcome {
         crate::QuickOnboardingOutcome::Selected(index) if index < observed.len() => {
-            Box::pin(configure(shell, observed[index].clone())).await
+            let refresh = Box::pin(configure(shell, observed[index].clone())).await?;
+            Ok(if refresh {
+                NativeSetupOutcome::Refresh
+            } else {
+                NativeSetupOutcome::Unchanged
+            })
+        }
+        crate::QuickOnboardingOutcome::Selected(index) if index < provider_index => {
+            let candidate = &external[index - observed.len()];
+            Ok(if Box::pin(approve_external(shell, candidate)).await? {
+                NativeSetupOutcome::ExternalApproved(candidate.clone())
+            } else {
+                NativeSetupOutcome::Unchanged
+            })
         }
         crate::QuickOnboardingOutcome::Selected(index) if index == provider_index => {
             shell.run_setup(!no_discovery).await?;
-            Ok(true)
+            Ok(NativeSetupOutcome::Refresh)
         }
         crate::QuickOnboardingOutcome::Advanced => {
             shell.run_setup(!no_discovery).await?;
-            Ok(true)
+            Ok(NativeSetupOutcome::Refresh)
         }
-        _ => Ok(false),
+        _ => Ok(NativeSetupOutcome::Unchanged),
     }
 }
 

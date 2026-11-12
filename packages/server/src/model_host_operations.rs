@@ -545,14 +545,14 @@ impl ModelHostOperations {
         state: &ServerState,
         selection: &bcode_config::ResolvedModelSelection,
     ) -> Result<PreparedAuth, &'static str> {
-        if selection.settings.contains_key("external_auth_binding") {
+        if selection.external_auth_binding.is_some() {
             if self.admission.custody.is_some() {
                 return Err("auth_unavailable");
             }
             // Carry only the recipe through model discovery; dispatch revalidates consent,
             // destination and fresh credential bytes after authoritative model resolution.
             return Ok(PreparedAuth {
-                context: external_auth_recipe(selection),
+                context: bcode_provider_auth::external_auth::recipe(selection),
                 request_custody: None,
                 credential_custody: None,
             });
@@ -1279,10 +1279,18 @@ mod tests {
     fn fake_host(
         settings: BTreeMap<String, String>,
     ) -> (Arc<ModelHostOperations>, Arc<ServerState>) {
+        fake_host_with_binding(settings, None)
+    }
+
+    fn fake_host_with_binding(
+        settings: BTreeMap<String, String>,
+        external_auth_binding: Option<String>,
+    ) -> (Arc<ModelHostOperations>, Arc<ServerState>) {
         let state = Arc::new(crate::tests::test_server_state_with_fake_provider(
             bcode_session::SessionManager::default(),
         ));
         let mut config = bcode_config::BcodeConfig::default();
+        config.model.external_auth_binding = external_auth_binding;
         config.model.profiles.insert(
             "fixed".into(),
             bcode_config::ModelProfileConfig {
@@ -1380,11 +1388,8 @@ mod tests {
 
     #[tokio::test]
     async fn external_dispatch_direct_host_preserves_recipe_through_model_resolution() {
-        let settings = BTreeMap::from([
-            ("external_auth_binding".into(), "ab".repeat(32)),
-            ("transport".into(), "synthetic".into()),
-        ]);
-        let (host, state) = fake_host(settings.clone());
+        let settings = BTreeMap::from([("transport".into(), "synthetic".into())]);
+        let (host, state) = fake_host_with_binding(settings.clone(), Some("ab".repeat(32)));
         let turn = retained_test_turn();
         let prepared = host
             .prepare_turn(&state, "external-recipe", &turn)
@@ -1393,6 +1398,10 @@ mod tests {
         assert_eq!(prepared.route, "bcode.fake-provider");
         assert_eq!(prepared.request.model_id, "fake-echo");
         assert_eq!(prepared.request.provider_context.settings, settings);
+        assert_eq!(
+            prepared.request.provider_context.external_auth_binding,
+            Some("ab".repeat(32))
+        );
         assert!(prepared.request.provider_context.auth.is_none());
         assert_eq!(
             prepared.request.provider_context.auth_candidates,

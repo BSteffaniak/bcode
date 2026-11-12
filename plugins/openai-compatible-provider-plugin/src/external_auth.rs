@@ -1,334 +1,270 @@
-//! Static external credential declarations; no native settings, commands, or refresh.
+//! Credential documents owned by other coding agents that this provider can use in place.
 //!
-//! Format references: Codex `codex-rs/login/src/auth/storage.rs` (`AuthDotJson`),
-//! OpenCode v1.2.27 `packages/opencode/src/auth/index.ts`, and Pi
-//! `packages/coding-agent/src/core/auth-storage.ts` / `resolve-config-value.ts`.
-//! Roots are fixed home-relative declarations. Custom `CODEX_HOME`, `XDG_DATA_HOME`,
-//! and `PI_CODING_AGENT_DIR` require separately authorized roots, not ambient expansion.
+//! These declarations only describe locations and formats. The host reads a document only
+//! after the user approves the connection, and never refreshes or rewrites it. ChatGPT tokens
+//! are delivered without their refresh token, so an expired Codex sign-in asks the user to
+//! renew it in Codex instead of rotating Codex's credentials behind its back.
 
-use bcode_provider_auth_models::{AuthCredentialSource, AuthLiteralTokenPolicy};
+use bcode_provider_auth_models::external::{
+    AuthExternalCredential, AuthExternalLocation, AuthExternalRootOverride, AuthExternalSource,
+    AuthLiteralTokenPolicy,
+};
 
-fn provider(storage_key: &str) -> Option<(&'static str, &'static str)> {
-    match storage_key {
-        "BCODE_OPENAI_API_KEY" => Some(("OPENAI_API_KEY", "openai")),
-        "BCODE_OPENROUTER_API_KEY" => Some(("OPENROUTER_API_KEY", "openrouter")),
-        "BCODE_XAI_API_KEY" => Some(("XAI_API_KEY", "xai")),
-        _ => None,
+const TOKEN_POLICY: AuthLiteralTokenPolicy = AuthLiteralTokenPolicy {
+    reject_command_prefix: false,
+    reject_dollar_expansions: false,
+    reject_whitespace_or_control: true,
+    reject_environment_identifier: false,
+};
+
+fn location(relative_path: &str, env: &str, root_relative_path: &str) -> AuthExternalLocation {
+    AuthExternalLocation {
+        relative_path: relative_path.to_owned(),
+        root_override: Some(AuthExternalRootOverride {
+            env: env.to_owned(),
+            relative_path: root_relative_path.to_owned(),
+        }),
     }
 }
 
-/// Existing import declarations, also usable by consent-gated in-place resolution.
-///
-/// This function only describes locations; it neither reads nor authorizes them.
-/// Dynamic Pi expressions are rejected by the source-local host-enforced policy.
+fn credential(credential_id: &str, pointer: &str, optional: bool) -> AuthExternalCredential {
+    AuthExternalCredential {
+        credential_id: credential_id.to_owned(),
+        pointer: pointer.to_owned(),
+        optional,
+    }
+}
+
+/// External documents usable by the given registered provider ID.
 #[must_use]
-pub fn api_key_discovery_sources(storage_key: &str) -> Vec<AuthCredentialSource> {
-    let Some((name, provider)) = provider(storage_key) else {
+pub fn external_sources(provider_id: &str) -> Vec<AuthExternalSource> {
+    if !matches!(provider_id, "openai" | "openrouter" | "xai") {
         return Vec::new();
-    };
+    }
     let mut sources = vec![
-        AuthCredentialSource::Environment {
-            name: name.to_owned(),
-        },
-        AuthCredentialSource::JsonFileValidated {
+        AuthExternalSource {
+            source_id: "opencode-api-key".to_owned(),
             application: "OpenCode".to_owned(),
-            relative_path: ".local/share/opencode/auth.json".to_owned(),
-            pointer: format!("/{provider}/key"),
-            discriminator: Some((format!("/{provider}/type"), "api".to_owned())),
+            method_id: "api_key".to_owned(),
+            location: location(
+                ".local/share/opencode/auth.json",
+                "XDG_DATA_HOME",
+                "opencode/auth.json",
+            ),
+            discriminator: Some((format!("/{provider_id}/type"), "api".to_owned())),
             required_absent_pointers: Vec::new(),
+            credentials: vec![credential("api_key", &format!("/{provider_id}/key"), false)],
+            account_pointer: None,
+            literal_policy: TOKEN_POLICY,
+        },
+        AuthExternalSource {
+            source_id: "pi-api-key".to_owned(),
+            application: "Pi".to_owned(),
+            method_id: "api_key".to_owned(),
+            location: location(".pi/agent/auth.json", "PI_CODING_AGENT_DIR", "auth.json"),
+            discriminator: Some((format!("/{provider_id}/type"), "api_key".to_owned())),
+            // Pi can resolve keys from commands or environment references; only literals apply.
+            required_absent_pointers: vec![format!("/{provider_id}/env")],
+            credentials: vec![credential("api_key", &format!("/{provider_id}/key"), false)],
+            account_pointer: None,
             literal_policy: AuthLiteralTokenPolicy {
-                reject_command_prefix: false,
-                reject_dollar_expansions: false,
+                reject_command_prefix: true,
+                reject_dollar_expansions: true,
                 reject_whitespace_or_control: true,
-                reject_environment_identifier: false,
+                reject_environment_identifier: true,
             },
         },
     ];
-    if provider == "openai" {
-        // Never reinterpret a legacy, subscription, or mixed store as API-key billing.
-        // Even a null tokens field is rejected conservatively as an ambiguous store.
-        sources.push(AuthCredentialSource::JsonFileValidated {
-            application: "Codex (API key only)".to_owned(),
-            relative_path: ".codex/auth.json".to_owned(),
-            pointer: "/OPENAI_API_KEY".to_owned(),
+    if provider_id == "openai" {
+        sources.push(AuthExternalSource {
+            source_id: "codex-api-key".to_owned(),
+            application: "Codex (API key)".to_owned(),
+            method_id: "api_key".to_owned(),
+            location: location(".codex/auth.json", "CODEX_HOME", "auth.json"),
             discriminator: Some(("/auth_mode".to_owned(), "apikey".to_owned())),
+            // Never reinterpret a subscription or mixed document as API-key billing.
             required_absent_pointers: vec!["/tokens".to_owned()],
-            literal_policy: AuthLiteralTokenPolicy {
-                reject_command_prefix: false,
-                reject_dollar_expansions: false,
-                reject_whitespace_or_control: true,
-                reject_environment_identifier: false,
-            },
+            credentials: vec![credential("api_key", "/OPENAI_API_KEY", false)],
+            account_pointer: None,
+            literal_policy: TOKEN_POLICY,
+        });
+        sources.push(AuthExternalSource {
+            source_id: "codex-chatgpt".to_owned(),
+            application: "Codex (ChatGPT sign-in)".to_owned(),
+            method_id: "chatgpt".to_owned(),
+            location: location(".codex/auth.json", "CODEX_HOME", "auth.json"),
+            discriminator: None,
+            // Read-only: the refresh token stays with Codex.
+            required_absent_pointers: Vec::new(),
+            credentials: vec![
+                credential("access_token", "/tokens/access_token", false),
+                credential("account_id", "/tokens/account_id", true),
+                credential("id_token", "/tokens/id_token", true),
+            ],
+            account_pointer: Some("/tokens/account_id".to_owned()),
+            literal_policy: TOKEN_POLICY,
         });
     }
-    sources.push(AuthCredentialSource::JsonFileValidated {
-        required_absent_pointers: vec![format!("/{provider}/env")],
-        literal_policy: AuthLiteralTokenPolicy {
-            reject_command_prefix: true,
-            reject_dollar_expansions: true,
-            reject_whitespace_or_control: true,
-            reject_environment_identifier: true,
-        },
-        application: "Pi (API key only)".to_owned(),
-        relative_path: ".pi/agent/auth.json".to_owned(),
-        pointer: format!("/{provider}/key"),
-        discriminator: Some((format!("/{provider}/type"), "api_key".to_owned())),
-    });
     sources
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_provider_auth::discovery::read_selected;
-    use bcode_provider_auth_models::{AuthMethodContribution, AuthSecretField};
+    use bcode_provider_auth::external_auth::{
+        DispatchResolution, ExternalAuthError, ExternalAuthStore, SourceRoots, discover,
+    };
+    use bcode_provider_auth_models::AuthProviderContribution;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
-    const PROVIDERS: [(&str, &str, &str); 3] = [
-        ("BCODE_OPENAI_API_KEY", "OPENAI_API_KEY", "openai"),
-        (
-            "BCODE_OPENROUTER_API_KEY",
-            "OPENROUTER_API_KEY",
-            "openrouter",
-        ),
-        ("BCODE_XAI_API_KEY", "XAI_API_KEY", "xai"),
-    ];
-
-    fn field(storage: &str) -> AuthSecretField {
-        let AuthMethodContribution::SecretFields { mut fields, .. } =
-            crate::api_key_auth_method(storage, "Synthetic key")
-        else {
-            panic!("expected API-key secret fields");
+    fn contribution(provider: &str) -> AuthProviderContribution {
+        let contribution = AuthProviderContribution {
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            methods: vec![
+                crate::api_key_auth_method("BCODE_OPENAI_API_KEY", "Key"),
+                crate::openai_browser_auth_method(),
+            ],
+            external_sources: external_sources(provider),
         };
-        assert_eq!(fields.len(), 1);
-        let field = fields.remove(0);
-        field.validate().unwrap();
-        field
+        contribution.validate().unwrap();
+        contribution
     }
 
-    fn selected_source(field: &AuthSecretField, app: &str) -> (usize, String) {
-        field
-            .discovery_sources
-            .iter()
-            .enumerate()
-            .find_map(|(index, source)| match source {
-                AuthCredentialSource::JsonFile {
-                    application,
-                    relative_path,
-                    ..
-                }
-                | AuthCredentialSource::JsonFileValidated {
-                    application,
-                    relative_path,
-                    ..
-                } if application == app => Some((index, relative_path.clone())),
-                _ => None,
-            })
-            .unwrap()
-    }
-
-    // Exercise the production field and host acquisition path, never ambient sources.
-    fn assert_acquisition(storage: &str, app: &str, fixture: &Value, accepted: bool) {
-        let field = field(storage);
-        let (index, relative_path) = selected_source(&field, app);
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join(relative_path);
+    fn write(root: &Path, relative: &str, document: &Value) {
+        let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, serde_json::to_vec(fixture).unwrap()).unwrap();
-        let result = read_selected(home.path(), &field, index);
-        if accepted {
-            assert_eq!(
-                result.unwrap().as_deref().map(String::as_str),
-                Some("synthetic-key")
-            );
-        } else {
-            assert!(
-                !matches!(result, Ok(Some(_))),
-                "unsupported fixture was acquired"
-            );
+        std::fs::write(path, serde_json::to_vec(document).unwrap()).unwrap();
+    }
+
+    fn roots(home: &Path) -> SourceRoots {
+        SourceRoots {
+            home: home.to_owned(),
+            overrides: BTreeMap::new(),
         }
     }
 
-    #[test]
-    fn production_declarations_map_providers_and_fixed_roots() {
-        assert_eq!(api_key_discovery_sources("unknown"), Vec::new());
-        for (storage, env, provider) in PROVIDERS {
-            let field = field(storage);
-            assert_eq!(field.discovery_sources, api_key_discovery_sources(storage));
-            assert_eq!(
-                field.discovery_sources[0],
-                AuthCredentialSource::Environment {
-                    name: env.to_owned()
-                }
-            );
-            assert_eq!(
-                field.discovery_sources.len(),
-                if provider == "openai" { 4 } else { 3 }
-            );
-            for (app, path, kind) in [
-                ("OpenCode", ".local/share/opencode/auth.json", "api"),
-                ("Pi (API key only)", ".pi/agent/auth.json", "api_key"),
-            ] {
-                let (index, relative_path) = selected_source(&field, app);
-                assert_eq!(relative_path, path);
-                match &field.discovery_sources[index] {
-                    AuthCredentialSource::JsonFile {
-                        pointer,
-                        discriminator,
-                        ..
-                    }
-                    | AuthCredentialSource::JsonFileValidated {
-                        pointer,
-                        discriminator,
-                        ..
-                    } => {
-                        assert_eq!(pointer, &format!("/{provider}/key"));
-                        assert_eq!(
-                            discriminator,
-                            &Some((format!("/{provider}/type"), kind.to_owned()))
-                        );
-                    }
-                    AuthCredentialSource::Environment { .. } => unreachable!(),
-                }
-                assert_acquisition(
-                    storage,
-                    app,
-                    &json!({provider: {"type": kind, "key": "synthetic-key"}}),
-                    true,
-                );
-            }
-        }
+    /// Approve and dispatch through the production host path; return delivered credentials.
+    fn connect(
+        roots: &SourceRoots,
+        provider: &str,
+        source_id: &str,
+    ) -> Result<BTreeMap<String, String>, ExternalAuthError> {
+        let contribution = contribution(provider);
+        let enabled = [("openai-compatible", &contribution)];
+        let candidate = discover(roots, &enabled)?
+            .into_iter()
+            .find(|candidate| candidate.target.source_id == source_id)
+            .unwrap();
+        assert!(candidate.available);
+        let state = tempfile::tempdir().unwrap();
+        let store = ExternalAuthStore::new(state.path());
+        let grant = store.approve(roots, &enabled, &candidate, 1)?;
+        let recipe = bcode_model::ProviderRequestContext {
+            external_auth_binding: Some(grant.binding_id),
+            ..Default::default()
+        };
+        let choice = bcode_model::StartupRecommendation {
+            provider_plugin_id: "openai-compatible".into(),
+            model_id: "model".into(),
+            settings: BTreeMap::new(),
+        };
+        let context = store.resolve_dispatch(DispatchResolution {
+            recipe: &recipe,
+            provider_plugin_id: "openai-compatible",
+            model_id: "model",
+            roots,
+            enabled: &enabled,
+            provider_choices: &[choice],
+        })?;
+        Ok(context
+            .auth
+            .unwrap()
+            .credentials
+            .into_iter()
+            .map(|(id, credential)| (id, credential.value))
+            .collect())
     }
 
     #[test]
-    fn codex_acquisition_requires_apikey_and_rejects_mixed_subscription_tokens() {
-        let storage = "BCODE_OPENAI_API_KEY";
-        let app = "Codex (API key only)";
-        assert_eq!(selected_source(&field(storage), app).1, ".codex/auth.json");
-        assert_acquisition(
-            storage,
-            app,
-            &json!({"auth_mode":"apikey", "OPENAI_API_KEY":"synthetic-key"}),
-            true,
+    fn codex_chatgpt_delivers_tokens_without_the_refresh_token() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".codex/auth.json",
+            &json!({"OPENAI_API_KEY": null, "tokens": {
+                "access_token": "access", "refresh_token": "refresh",
+                "id_token": "id", "account_id": "account"}}),
         );
-        for fixture in [
-            json!({"OPENAI_API_KEY":"synthetic-key"}),
-            json!({"auth_mode":null,"OPENAI_API_KEY":"synthetic-key"}),
-            json!({"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-key","tokens":{"access_token":"synthetic-token"}}),
-            json!({"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-key","tokens":{"access_token":"synthetic-token"}}),
-            json!({"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-key","tokens":{"refresh_token":"synthetic-refresh"}}),
-            json!({"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-key","tokens":{}}),
-            json!({"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-key","tokens":null}),
-            json!({"auth_mode":"apikey","tokens":{"access_token":"synthetic-token"}}),
-            json!({"auth_mode":"apikey","OPENAI_API_KEY":"has whitespace"}),
-        ] {
-            assert_acquisition(storage, app, &fixture, false);
-        }
+        let credentials = connect(&roots(home.path()), "openai", "codex-chatgpt").unwrap();
+        assert_eq!(
+            credentials,
+            BTreeMap::from([
+                ("access_token".into(), "access".into()),
+                ("account_id".into(), "account".into()),
+                ("id_token".into(), "id".into()),
+            ])
+        );
+        // A subscription document is never API-key billing.
+        assert_eq!(
+            connect(&roots(home.path()), "openai", "codex-api-key"),
+            Err(ExternalAuthError::SourceUnavailable)
+        );
     }
 
     #[test]
-    fn pi_acquisition_accepts_only_unambiguous_literal_keys() {
-        for (storage, _, provider) in PROVIDERS {
-            let app = "Pi (API key only)";
-            for key in [
-                "!echo-synthetic",
-                "${SYNTHETIC_KEY}",
-                "$SYNTHETIC_KEY",
-                "SYNTHETIC_KEY",
-                "synthetic_key",
-                "_synthetic",
-                "",
-                "has whitespace",
-                "synthetic\nkey",
-                "synthetic\u{0000}key",
-            ] {
-                assert_acquisition(
-                    storage,
-                    app,
-                    &json!({provider: {"type":"api_key", "key":key}}),
-                    false,
-                );
-            }
-            for env in [
-                json!(null),
-                json!({}),
-                json!("SYNTHETIC_KEY"),
-                json!({"NAME":"synthetic-other"}),
-            ] {
-                assert_acquisition(
-                    storage,
-                    app,
-                    &json!({provider: {"type":"api_key", "key":"synthetic-key", "env":env}}),
-                    false,
-                );
-            }
-            for kind in [json!("oauth"), json!("api"), json!(null)] {
-                assert_acquisition(
-                    storage,
-                    app,
-                    &json!({provider: {"type":kind, "key":"synthetic-key", "access":"synthetic-token"}}),
-                    false,
-                );
-            }
-            assert_acquisition(
-                storage,
-                app,
-                &json!({provider: {"key":"synthetic-key"}}),
-                false,
+    fn codex_api_key_mode_accepts_null_tokens_and_honors_codex_home() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = tempfile::tempdir().unwrap();
+        write(
+            codex_home.path(),
+            "auth.json",
+            &json!({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-key", "tokens": null}),
+        );
+        let mut roots = roots(home.path());
+        roots
+            .overrides
+            .insert("CODEX_HOME".into(), codex_home.path().to_owned());
+        assert_eq!(
+            connect(&roots, "openai", "codex-api-key").unwrap()["api_key"],
+            "sk-key"
+        );
+    }
+
+    #[test]
+    fn pi_accepts_only_literal_keys_and_opencode_rejects_oauth_entries() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".pi/agent/auth.json",
+            &json!({"xai": {"type": "api_key", "key": "xai-literal"}}),
+        );
+        assert_eq!(
+            connect(&roots(home.path()), "xai", "pi-api-key").unwrap()["api_key"],
+            "xai-literal"
+        );
+        for key in ["!op read key", "$XAI_KEY", "XAI_KEY"] {
+            write(
+                home.path(),
+                ".pi/agent/auth.json",
+                &json!({"xai": {"type": "api_key", "key": key}}),
+            );
+            assert_eq!(
+                connect(&roots(home.path()), "xai", "pi-api-key"),
+                Err(ExternalAuthError::SourceUnavailable)
             );
         }
-    }
-
-    #[test]
-    fn opencode_acquisition_rejects_oauth_even_with_a_key() {
-        for (storage, _, provider) in PROVIDERS {
-            for fixture in [
-                json!({provider: {"type":"oauth", "key":"synthetic-key", "access":"synthetic-token", "refresh":"synthetic-refresh"}}),
-                json!({provider: {"type":"oauth", "access":"synthetic-token"}}),
-                json!({provider: {"key":"synthetic-key"}}),
-                json!({provider: {"type":"api_key", "key":"synthetic-key"}}),
-                json!({provider: {"type":null, "key":"synthetic-key"}}),
-            ] {
-                assert_acquisition(storage, "OpenCode", &fixture, false);
-            }
-        }
-    }
-
-    #[test]
-    fn acquisition_rejects_invalid_documents_and_field_values() {
-        for (storage, _, provider) in PROVIDERS {
-            for (app, kind) in [("OpenCode", "api"), ("Pi (API key only)", "api_key")] {
-                for key in [
-                    json!(null),
-                    json!(42),
-                    json!(""),
-                    json!("s".repeat(513)),
-                    json!("has whitespace"),
-                    json!("synthetic\u{0000}key"),
-                ] {
-                    assert_acquisition(
-                        storage,
-                        app,
-                        &json!({provider: {"type":kind, "key":key}}),
-                        false,
-                    );
-                }
-            }
-        }
-        let field = field("BCODE_OPENAI_API_KEY");
-        for app in ["OpenCode", "Pi (API key only)", "Codex (API key only)"] {
-            let (index, relative_path) = selected_source(&field, app);
-            let home = tempfile::tempdir().unwrap();
-            let path = home.path().join(relative_path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            assert!(matches!(
-                read_selected(home.path(), &field, index),
-                Ok(None)
-            ));
-            for bytes in [b"not-json".to_vec(), vec![b' '; 1024 * 1024 + 1]] {
-                std::fs::write(&path, bytes).unwrap();
-                assert!(read_selected(home.path(), &field, index).is_err());
-            }
-        }
+        write(
+            home.path(),
+            ".local/share/opencode/auth.json",
+            &json!({"openrouter": {"type": "oauth", "key": "k", "access": "a"}}),
+        );
+        assert_eq!(
+            connect(&roots(home.path()), "openrouter", "opencode-api-key"),
+            Err(ExternalAuthError::SourceUnavailable)
+        );
     }
 }

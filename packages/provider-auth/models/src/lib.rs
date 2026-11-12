@@ -295,6 +295,9 @@ pub struct AuthProviderContribution {
     pub display_name: String,
     /// Provider-owned authentication methods.
     pub methods: Vec<AuthMethodContribution>,
+    /// Credential documents owned by other local applications that a method can use in place.
+    #[serde(default)]
+    pub external_sources: Vec<external::AuthExternalSource>,
 }
 
 impl AuthProviderContribution {
@@ -323,6 +326,26 @@ impl AuthProviderContribution {
                 return Err(AuthContractError::DuplicateId {
                     field: "methods",
                     id: method.method_id().to_owned(),
+                });
+            }
+        }
+        validate_count(
+            "external_sources",
+            self.external_sources.len(),
+            MAX_AUTH_SECRET_FIELDS,
+        )?;
+        let mut sources = std::collections::BTreeSet::new();
+        for source in &self.external_sources {
+            source.validate()?;
+            if !ids.contains(source.method_id.as_str()) {
+                return Err(AuthContractError::InvalidFlowShape(
+                    "external source must name a declared method",
+                ));
+            }
+            if !sources.insert(source.source_id.as_str()) {
+                return Err(AuthContractError::DuplicateId {
+                    field: "external_sources",
+                    id: source.source_id.clone(),
                 });
             }
         }
@@ -516,25 +539,6 @@ impl AuthSecretField {
             MAX_AUTH_SECRET_FIELDS,
         )?;
         for source in &self.discovery_sources {
-            if let AuthCredentialSource::JsonFileValidated {
-                required_absent_pointers,
-                ..
-            } = source
-            {
-                validate_count(
-                    "required_absent_pointers",
-                    required_absent_pointers.len(),
-                    MAX_AUTH_SECRET_FIELDS,
-                )?;
-                for pointer in required_absent_pointers {
-                    validate_text("required_absent_pointer", pointer, MAX_AUTH_TEXT_BYTES)?;
-                    if !pointer.starts_with('/') {
-                        return Err(AuthContractError::InvalidFlowShape(
-                            "absent pointer must be an absolute JSON pointer",
-                        ));
-                    }
-                }
-            }
             match source {
                 AuthCredentialSource::Environment { name } => validate_storage_key(name)?,
                 AuthCredentialSource::JsonFile {
@@ -542,13 +546,6 @@ impl AuthSecretField {
                     relative_path,
                     pointer,
                     discriminator,
-                }
-                | AuthCredentialSource::JsonFileValidated {
-                    application,
-                    relative_path,
-                    pointer,
-                    discriminator,
-                    ..
                 } => {
                     validate_text("application", application, MAX_AUTH_LABEL_BYTES)?;
                     validate_text("relative_path", relative_path, MAX_AUTH_TEXT_BYTES)?;
@@ -612,61 +609,6 @@ pub enum AuthCredentialSource {
         /// Optional exact discriminator required before interpreting the credential.
         discriminator: Option<(String, String)>,
     },
-    /// Confined JSON static credential with source-local literal constraints.
-    /// Unknown variants fail deserialization on older hosts; never downgrade to `JsonFile`.
-    JsonFileValidated {
-        /// Provider-owned source application identity.
-        application: String,
-        /// Relative path beneath the authorized home.
-        relative_path: String,
-        /// Exact JSON pointer to the credential.
-        pointer: String,
-        /// Required exact document discriminator, if present.
-        discriminator: Option<(String, String)>,
-        /// Mandatory provider-selected policy; never defaulted away.
-        literal_policy: AuthLiteralTokenPolicy,
-        /// JSON pointers that must be absent (including explicit null); rejects alternate dynamic sources.
-        required_absent_pointers: Vec<String>,
-    },
-}
-
-/// Provider-selected constraints for a JSON source that may contain dynamic references.
-/// This policy only rejects values; it never expands variables or executes commands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent additive source-local rejection constraints, not mutually exclusive states"
-)]
-pub struct AuthLiteralTokenPolicy {
-    /// Reject values starting with the command marker `!`.
-    pub reject_command_prefix: bool,
-    /// Reject any dollar sign, including shell/environment expansions.
-    pub reject_dollar_expansions: bool,
-    /// Reject Unicode whitespace or control characters anywhere in the token.
-    pub reject_whitespace_or_control: bool,
-    /// Reject bare ASCII environment identifiers (`[A-Za-z_][A-Za-z0-9_]*`).
-    pub reject_environment_identifier: bool,
-}
-
-impl AuthLiteralTokenPolicy {
-    /// Whether the value is a literal permitted by every declared constraint.
-    #[must_use]
-    pub fn permits(&self, value: &str) -> bool {
-        let mut bytes = value.bytes();
-        let environment_identifier = bytes
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-        !(value.is_empty()
-            || (self.reject_command_prefix && value.starts_with('!'))
-            || (self.reject_dollar_expansions && value.contains('$'))
-            || (self.reject_whitespace_or_control
-                && value
-                    .chars()
-                    .any(|character| character.is_whitespace() || character.is_control()))
-            || (self.reject_environment_identifier && environment_identifier))
-    }
 }
 
 /// Local secret validation performed by the host before storage.
@@ -1297,6 +1239,7 @@ mod tests {
 
     fn exa_contribution() -> AuthProviderContribution {
         AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "exa".to_owned(),
             display_name: "Exa".to_owned(),

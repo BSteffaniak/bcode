@@ -157,6 +157,7 @@ fn web_auth_provider_contributions() -> Vec<AuthProviderContribution> {
     let mut providers = vec![exa_auth_provider_contribution()];
     for &(provider_id, display_name, names) in WEB_API_KEY_PROVIDERS {
         providers.push(AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: provider_id.to_owned(),
             display_name: display_name.to_owned(),
@@ -193,6 +194,7 @@ fn web_auth_provider_contributions() -> Vec<AuthProviderContribution> {
 
 fn exa_auth_provider_contribution() -> AuthProviderContribution {
     AuthProviderContribution {
+        external_sources: Vec::new(),
         schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
         provider_id: EXA_PROVIDER_ID.to_owned(),
         display_name: "Exa".to_owned(),

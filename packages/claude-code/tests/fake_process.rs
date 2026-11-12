@@ -54,20 +54,6 @@ impl Fake {
         session
     }
 }
-#[tokio::test(flavor = "current_thread")]
-async fn exact_version_mismatch_rejects_native_status_and_stream_launch() {
-    let mut fake = Fake::new("ordinary");
-    fake.options.expected_version = "fake-claude 2".into();
-    assert!(matches!(
-        auth_status(&fake.options).await,
-        Err(Error::VersionMismatch)
-    ));
-    assert!(matches!(
-        ClaudeSession::spawn(fake.options).await,
-        Err(Error::VersionMismatch)
-    ));
-}
-
 async fn receive(session: &mut ClaudeSession) -> Result<Event, Error> {
     tokio::time::timeout(Duration::from_secs(4), session.next_event())
         .await

@@ -7824,21 +7824,11 @@ enum AuthCommand {
         #[arg(long)]
         recipient: Option<String>,
     },
-    /// Discover and approve native coding-agent account reuse without token import.
-    NativeConnect,
-    /// List native account approvals and preparation state.
-    NativeConnections,
-    /// Revoke native connection consent without logging out the source agent.
-    NativeDisconnect,
-    /// Review and approve in-place use of an existing external credential source.
-    Connect {
-        /// Restrict approval to this application instead of all local Bcode applications.
-        #[arg(long)]
-        application: Option<String>,
-    },
-    /// List remembered external connection approvals without exposing credentials.
+    /// Use credentials another coding agent keeps on this computer, in place and with consent.
+    Connect,
+    /// List approved external connections without exposing credentials.
     Connections,
-    /// Forget an external connection approval without logging out its source application.
+    /// Remove an external connection approval without signing out its source application.
     Disconnect,
     /// Discover provider-declared external API keys without displaying their values.
     Discover,
@@ -10777,21 +10767,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
         AccountLifecycleAction::Logout
     };
     match command {
-        AuthCommand::NativeConnect => {
-            Box::pin(startup::native_connections::connect_command(false)).await
-        }
-        AuthCommand::NativeConnections => startup::native_connections::list_command().await,
-        AuthCommand::NativeDisconnect => startup::native_connections::revoke_command().await,
-        AuthCommand::Connect { application } => {
-            Box::pin(external_connections::connect_command(application.map(
-                |application_id| {
-                    bcode_provider_auth_models::external::ExternalAuthScope::Application {
-                        application_id,
-                    }
-                },
-            )))
-            .await
-        }
+        AuthCommand::Connect => Box::pin(external_connections::connect_command()).await,
         AuthCommand::Connections => external_connections::list_command().await,
         AuthCommand::Disconnect => external_connections::disconnect_command().await,
         AuthCommand::Discover | AuthCommand::Import { .. } => {
@@ -15617,14 +15593,12 @@ async fn verify_cache_candidates(
     selected_model_id: Option<&str>,
     args: &VerifyCacheArgs,
 ) -> Result<Vec<bcode_model::ModelInfo>, CliError> {
-    let location = external_execution::ExecutionLocation::current();
     let resolved_context = external_execution::resolve(
         host,
         Some(provider_plugin_id),
         context,
         selected_model_id.unwrap_or_default(),
-        &location.state_root,
-        location.home.as_deref(),
+        &external_execution::ExecutionLocation::current(),
     )
     .map_err(CliError::PluginCli)?;
     let models: bcode_model::ModelList = host
@@ -16117,8 +16091,7 @@ impl BlockingModelProviderInvoker for CliPluginTurnInvoker<'_> {
             provider_plugin_id,
             &request.provider_context,
             &request.model_id,
-            &self.location.state_root,
-            self.location.home.as_deref(),
+            &self.location,
         )? {
             request.provider_context = context;
             return self.invoke_json(provider_plugin_id, bcode_model::OP_START_TURN, &request);
@@ -16307,9 +16280,6 @@ fn configured_provider_context(
     config: &bcode_config::BcodeConfig,
 ) -> bcode_model::ProviderRequestContext {
     let selection = config.resolved_model_selection();
-    if selection.settings.contains_key("external_auth_binding") {
-        return external_execution::recipe(selection);
-    }
     bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution { config, selection },
     )
@@ -23886,6 +23856,7 @@ mod auth_cli_tests {
         bcode_plugin::RegisteredAuthProvider {
             plugin_id: plugin_id.to_owned(),
             contribution: bcode_provider_auth_models::AuthProviderContribution {
+                external_sources: Vec::new(),
                 schema_version:
                     bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
                 provider_id: provider_id.to_owned(),
@@ -25081,6 +25052,7 @@ auth_profile = "openai"
     #[test]
     fn duplicate_provider_registration_is_rejected_before_cli_dispatch() {
         let contribution = bcode_provider_auth_models::AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "test".to_owned(),
             display_name: "Test".to_owned(),

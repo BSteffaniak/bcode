@@ -230,6 +230,7 @@ fn bridge_tool_response(context: &NativeServiceContext, invocation_id: &str) -> 
 
 fn hello_auth_provider() -> bcode_provider_auth_models::AuthProviderContribution {
     bcode_provider_auth_models::AuthProviderContribution {
+        external_sources: Vec::new(),
         schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
         provider_id: "example-hello".to_owned(),
         display_name: "Example Hello".to_owned(),

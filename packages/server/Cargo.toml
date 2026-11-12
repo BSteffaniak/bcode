@@ -93,7 +93,6 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 bcode_bundled_plugins = { workspace = true, features = [
-    "static-bundled-harness-plugin",
     "static-bundled-default-agents-plugin",
     "static-bundled-git-plugin",
     "static-bundled-loop-plugin",

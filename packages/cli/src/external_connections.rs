@@ -1,22 +1,16 @@
-//! Secret-free CLI consent adapters for provider-owned external authentication.
+//! CLI consent adapters for external credential connections.
 //!
-//! Discovery, source reads and durable grant mutation belong to provider-auth. These
-//! adapters only present supplied metadata and return an explicit user decision.
+//! Discovery, source reads and durable approval belong to provider-auth behind the daemon.
+//! These adapters only present secret-free metadata and return an explicit user decision.
 
 use super::CliError;
 use bcode_provider_auth_models::external::{
-    ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthGrant, ExternalAuthScope,
+    ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthGrant,
 };
 use std::io::{BufRead as _, IsTerminal as _, Read as _};
 
-/// Discover and approve through the authenticated application boundary.
-/// An omitted scope grants all local Bcode applications, after explicit review.
-pub async fn connect_command(scope: Option<ExternalAuthScope>) -> Result<(), CliError> {
-    if matches!(scope, Some(ExternalAuthScope::Application { .. })) {
-        return Err(CliError::InvalidArguments(
-            "Application-specific consent is unavailable until caller identity is authenticated; omit --application for explicitly reviewed local Bcode consent.".into(),
-        ));
-    }
+/// Discover, review and approve a connection through the daemon, then offer model selection.
+pub async fn connect_command() -> Result<(), CliError> {
     require_terminal()?;
     let config = bcode_config::load_config()?;
     if !config
@@ -31,20 +25,14 @@ pub async fn connect_command(scope: Option<ExternalAuthScope>) -> Result<(), Cli
         .discover_external_auth()
         .await
         .map_err(external_error)?;
-    let Some((candidate, scope)) = connect(
-        &candidates,
-        scope.unwrap_or(ExternalAuthScope::AllLocalApplications),
-    )?
-    else {
+    let Some(candidate) = connect(&candidates)? else {
         return Ok(());
     };
     client
-        .approve_external_auth(candidate.clone(), Some(scope))
+        .approve_external_auth(candidate.clone())
         .await
         .map_err(external_error)?;
-    println!(
-        "External connection approved in place. No credential was copied or account verified. Model selection is a separate optional step."
-    );
+    println!("Connection approved. Bcode will read it in place; nothing was copied.");
     let mut shell = bcode_tui::TerminalShell::enter()?;
     let result = Box::pin(super::startup::select_external_model_in_shell(
         &mut shell, &candidate,
@@ -52,16 +40,16 @@ pub async fn connect_command(scope: Option<ExternalAuthScope>) -> Result<(), Cli
     .await;
     shell.finish()?;
     if result? {
-        println!("Exact external binding and model saved for startup. No session was started.");
+        println!("Connection and model saved for startup.");
     } else {
         println!(
-            "No model selection changed. The approval remains available to list or disconnect; explicit provider/model selections still take precedence."
+            "No model selection changed. The approval remains available; explicit provider/model selections take precedence."
         );
     }
     Ok(())
 }
 
-/// List non-secret approvals without discovering or reading external sources.
+/// List approvals without discovering or reading external sources.
 pub async fn list_command() -> Result<(), CliError> {
     list(
         &bcode_client::BcodeClient::default_endpoint()
@@ -78,72 +66,64 @@ pub async fn disconnect_command() -> Result<(), CliError> {
     let grants = client.list_external_auth().await.map_err(external_error)?;
     if let Some(grant) = disconnect(&grants)? {
         let removed = client
-            .revoke_external_auth(grant)
+            .revoke_external_auth(grant.binding_id)
             .await
             .map_err(external_error)?;
         println!(
-            "{} The source application was not modified.",
+            "{} {} itself was not modified or signed out.",
             if removed {
                 "Bcode approval removed."
             } else {
                 "Approval was already absent."
-            }
+            },
+            grant.application
         );
     }
     Ok(())
 }
 
 fn external_error(error: bcode_provider_auth_models::external::ExternalAuthError) -> CliError {
-    CliError::LoginProfile(format!(
-        "External connection operation failed ({error:?}). Existing state was preserved where possible; inspect connections before retrying. No source logout or provider fallback was attempted."
-    ))
+    CliError::LoginProfile(format!("External connection failed: {error}."))
 }
 
-/// Review one exact source binding before the caller persists consent.
-/// No source is read and no execution or model selection is changed here.
+fn describe(target: &bcode_provider_auth_models::external::ExternalAuthTarget) -> String {
+    format!("{} ({})", target.provider_id, target.method_id)
+}
+
+/// Review one discovered connection before the caller persists consent.
 pub fn connect(
     candidates: &[ExternalAuthCandidate],
-    scope: ExternalAuthScope,
-) -> Result<Option<(ExternalAuthCandidate, ExternalAuthScope)>, CliError> {
+) -> Result<Option<ExternalAuthCandidate>, CliError> {
     require_terminal()?;
     let mut output = std::io::stdout().lock();
     let mut input = std::io::stdin().lock();
-    connect_with_io(candidates, scope, &mut input, &mut output)
+    connect_with_io(candidates, &mut input, &mut output)
 }
 
 fn connect_with_io(
     candidates: &[ExternalAuthCandidate],
-    scope: ExternalAuthScope,
     input: &mut impl std::io::BufRead,
     output: &mut impl std::io::Write,
-) -> Result<Option<(ExternalAuthCandidate, ExternalAuthScope)>, CliError> {
-    let scope_label = scope_label(&scope)?;
+) -> Result<Option<ExternalAuthCandidate>, CliError> {
     let available: Vec<_> = candidates.iter().filter(|item| item.available).collect();
     if available.is_empty() {
         writeln!(
             output,
-            "No compatible external connections are available. Nothing was changed."
+            "No credentials from other coding agents were found. Nothing was changed."
         )?;
         return Ok(None);
     }
     writeln!(
         output,
-        "Reuse an external credential in place (no vault or credential copy)."
-    )?;
-    writeln!(output, "Consent scope: {scope_label}")?;
-    writeln!(
-        output,
-        "Bcode-native execution is preferred only when supported safely. This does not launch a native agent, verify an account, or change your selected model."
+        "Use credentials another coding agent already keeps on this computer. Bcode reads them in place when it makes requests; it never copies, refreshes, or modifies them."
     )?;
     for (index, item) in available.iter().enumerate() {
         writeln!(
             output,
-            "{}. {} -> {} / {} / {}",
+            "{}. {} -> {}",
             index + 1,
-            item.source.as_str(),
-            item.target.provider_id,
-            item.target.method_id,
-            item.target.credential_id
+            item.application,
+            describe(&item.target)
         )?;
     }
     write!(output, "Choose a connection number (blank cancels): ")?;
@@ -154,16 +134,16 @@ fn connect_with_io(
     let candidate = available[index];
     writeln!(
         output,
-        "Approve {} for {} ({scope_label}). The original application retains its credentials. Disconnecting only removes Bcode consent; it does not log out the source application.",
-        candidate.source.as_str(),
-        candidate.target.provider_id
+        "Allow every local Bcode application to use {} credentials for {}? Requests use that account's quota or billing. Disconnecting later only removes Bcode's approval.",
+        candidate.application,
+        describe(&candidate.target)
     )?;
-    write!(output, "Type connect to consent: ")?;
+    write!(output, "Type connect to approve: ")?;
     output.flush()?;
     if !confirmed(input, "connect")? {
         return Ok(None);
     }
-    Ok(Some((candidate.clone(), scope)))
+    Ok(Some(candidate.clone()))
 }
 
 /// Print approved bindings, not credential values or private source paths.
@@ -181,13 +161,10 @@ fn list_with_io(
     for (index, grant) in grants.iter().enumerate() {
         writeln!(
             output,
-            "{}. {} -> {} / {} / {} [{}]",
+            "{}. {} -> {}",
             index + 1,
-            grant.source.as_str(),
-            grant.target.provider_id,
-            grant.target.method_id,
-            grant.target.credential_id,
-            scope_label(&grant.scope)?
+            grant.application,
+            describe(&grant.target)
         )?;
     }
     Ok(())
@@ -220,7 +197,8 @@ fn disconnect_with_io(
     };
     writeln!(
         output,
-        "Only Bcode's approval will be removed. The source application is not modified or logged out."
+        "Only Bcode's approval will be removed. {} is not modified or signed out.",
+        grants[index].application
     )?;
     write!(output, "Type disconnect to confirm: ")?;
     output.flush()?;
@@ -232,22 +210,6 @@ fn require_terminal() -> Result<(), CliError> {
         Ok(())
     } else {
         Err(CliError::InvalidArguments("External connection consent requires an interactive terminal; no approval was changed.".into()))
-    }
-}
-
-fn scope_label(scope: &ExternalAuthScope) -> Result<String, CliError> {
-    match scope {
-        ExternalAuthScope::AllLocalApplications => Ok("all local Bcode applications".into()),
-        ExternalAuthScope::Application { application_id }
-            if !application_id.trim().is_empty()
-                && application_id.len() <= 256
-                && !application_id.chars().any(char::is_control) =>
-        {
-            Ok(format!("local application {application_id}"))
-        }
-        ExternalAuthScope::Application { .. } => Err(CliError::InvalidArguments(
-            "External connection application scope is invalid.".into(),
-        )),
     }
 }
 
@@ -289,19 +251,18 @@ fn read_index(input: &mut impl std::io::BufRead, count: usize) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_provider_auth_models::external::{ExternalAuthSourceKind, ExternalAuthTarget};
+    use bcode_provider_auth_models::external::ExternalAuthTarget;
 
     fn candidate(available: bool) -> ExternalAuthCandidate {
         ExternalAuthCandidate {
-            source: ExternalAuthSourceKind::Codex,
             binding_id: "fixture-binding".into(),
             target: ExternalAuthTarget {
                 plugin_id: "fixture.plugin".into(),
                 provider_id: "fixture.provider".into(),
                 method_id: "api_key".into(),
-                credential_id: "api_key".into(),
+                source_id: "fixture-source".into(),
             },
-            label: "fixture".into(),
+            application: "Fixture".into(),
             available,
         }
     }
@@ -310,76 +271,39 @@ mod tests {
     fn consent_is_exact_and_unavailable_sources_cannot_be_selected() {
         let candidates = [candidate(false), candidate(true)];
         let mut output = Vec::new();
-        let result = connect_with_io(
-            &candidates,
-            ExternalAuthScope::AllLocalApplications,
-            &mut &b"1\nconnect\n"[..],
-            &mut output,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(result.0, candidates[1]);
-        assert_eq!(result.1, ExternalAuthScope::AllLocalApplications);
-        let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("no vault"));
-        assert!(text.contains("all local Bcode applications"));
-        assert!(
-            connect_with_io(
-                &candidates,
-                result.1,
-                &mut &b"1\nyes\n"[..],
-                &mut Vec::new()
-            )
+        let result = connect_with_io(&candidates, &mut &b"1\nconnect\n"[..], &mut output)
             .unwrap()
-            .is_none()
+            .unwrap();
+        assert_eq!(result, candidates[1]);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("never copies"));
+        assert!(text.contains("every local Bcode application"));
+        assert!(
+            connect_with_io(&candidates, &mut &b"1\nyes\n"[..], &mut Vec::new())
+                .unwrap()
+                .is_none()
         );
     }
 
     #[test]
-    fn cancel_invalid_selection_and_invalid_scope_never_approve() {
+    fn cancel_and_invalid_selection_never_approve() {
         let candidates = [candidate(true)];
         assert!(
-            connect_with_io(
-                &candidates,
-                ExternalAuthScope::AllLocalApplications,
-                &mut &b"\n"[..],
-                &mut Vec::new()
-            )
-            .unwrap()
-            .is_none()
+            connect_with_io(&candidates, &mut &b"\n"[..], &mut Vec::new())
+                .unwrap()
+                .is_none()
         );
-        assert!(
-            connect_with_io(
-                &candidates,
-                ExternalAuthScope::AllLocalApplications,
-                &mut &b"0\nconnect\n"[..],
-                &mut Vec::new()
-            )
-            .is_err()
-        );
-        assert!(
-            connect_with_io(
-                &candidates,
-                ExternalAuthScope::Application {
-                    application_id: "\n".into()
-                },
-                &mut &b"1\nconnect\n"[..],
-                &mut Vec::new()
-            )
-            .is_err()
-        );
+        assert!(connect_with_io(&candidates, &mut &b"0\nconnect\n"[..], &mut Vec::new()).is_err());
     }
 
     #[test]
-    fn disconnect_returns_only_the_selected_scope_and_requires_confirmation() {
+    fn disconnect_returns_only_the_selected_grant_and_requires_confirmation() {
         let candidate = candidate(true);
         let grant = ExternalAuthGrant {
-            source: candidate.source,
             binding_id: candidate.binding_id,
             target: candidate.target,
-            scope: ExternalAuthScope::Application {
-                application_id: "fixture-app".into(),
-            },
+            application: candidate.application,
+            account_fingerprint: None,
             approved_at_unix: 1,
         };
         let grants = [grant.clone()];

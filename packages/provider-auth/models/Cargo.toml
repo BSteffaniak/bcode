@@ -11,8 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde   = { workspace = true, features = ["derive", "std"] }
-zeroize = { workspace = true }
+serde     = { workspace = true, features = ["derive", "std"] }
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

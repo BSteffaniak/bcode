@@ -125,9 +125,6 @@ pub fn discover_auth_credentials() -> Result<(), CliError> {
         println!("Automatic credential discovery is disabled.");
         return Ok(());
     }
-    println!(
-        "Discovery does not grant consent. Use `auth connect` to reuse supported keys in place without a vault; `auth import` remains an optional explicit copy."
-    );
     let home = authorized_home()?;
     let mut host = load_cli_plugin_host()?;
     for provider in host.auth_provider_registry().providers() {
@@ -152,66 +149,10 @@ pub fn discover_auth_credentials() -> Result<(), CliError> {
             }
         }
     }
-    discover_native_harnesses(&host)?;
     host.deactivate_all()?;
     println!(
-        "Use bcode auth connect to approve in-place API-key use, or auth import PROVIDER --source INDEX for an explicit vault copy. Native accounts stay with their harness; compatibility admission is required before execution."
+        "Use bcode auth connect to use another agent's credentials in place, or bcode auth import PROVIDER --source INDEX to review a copy into sshenv. OAuth tokens are never copied."
     );
-    Ok(())
-}
-
-/// Query enabled native discovery services without launching agent executables.
-fn discover_native_harnesses(host: &bcode_plugin::PluginHost) -> Result<(), CliError> {
-    const INTERFACE: &str = "bcode.harness.discovery/v1";
-    let registry = host.service_registry();
-    let Some(providers) = registry.providers_for(INTERFACE) else {
-        return Ok(());
-    };
-    for plugin in providers.iter().take(16) {
-        let response: serde_json::Value = host
-            .invoke_service_json(
-                plugin,
-                INTERFACE,
-                "discover",
-                &serde_json::json!({"schema_version": 1, "request_id": "auth-discover"}),
-            )
-            .map_err(|_| {
-                CliError::LoginProfile(
-                    "Native connection discovery is unavailable; no executable was launched."
-                        .to_owned(),
-                )
-            })?;
-        if response
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(1)
-            || response
-                .get("request_id")
-                .and_then(serde_json::Value::as_str)
-                != Some("auth-discover")
-            || response
-                .get("plugin_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(plugin.as_str())
-        {
-            return Err(CliError::LoginProfile(
-                "Native discovery returned an unsupported response.".to_owned(),
-            ));
-        }
-        let candidates = response
-            .get("candidates")
-            .and_then(serde_json::Value::as_array)
-            .filter(|items| items.len() <= 16)
-            .ok_or_else(|| {
-                CliError::LoginProfile("Native discovery exceeded its response bounds.".to_owned())
-            })?;
-        if !candidates.is_empty() {
-            println!(
-                "Native connection: {plugin} — {} installation candidate(s). Authentication and compatibility are not verified; configure an admitted native-managed harness before use. No credentials were read.",
-                candidates.len()
-            );
-        }
-    }
     Ok(())
 }
 
@@ -219,11 +160,6 @@ fn source_label(source: &AuthCredentialSource) -> String {
     match source {
         AuthCredentialSource::Environment { name } => format!("environment {name}"),
         AuthCredentialSource::JsonFile {
-            application,
-            relative_path,
-            ..
-        }
-        | AuthCredentialSource::JsonFileValidated {
             application,
             relative_path,
             ..

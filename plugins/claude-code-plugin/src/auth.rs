@@ -139,10 +139,16 @@ pub fn native_login_handoff_data(
     {
         return Err(HarnessFailure::InvalidRequest);
     }
-    environment.insert(
-        "CLAUDE_CONFIG_DIR".into(),
-        instance.config_namespace.clone(),
-    );
+    // Sign in to the same credential-store entry the launched session reads.
+    if !bcode_claude_code::is_default_config_directory(
+        environment.get("HOME").map(String::as_str),
+        std::path::Path::new(&instance.config_namespace),
+    ) {
+        environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            instance.config_namespace.clone(),
+        );
+    }
     Ok(NativeLoginHandoffData {
         schema_version: 1,
         namespace: namespace(instance),

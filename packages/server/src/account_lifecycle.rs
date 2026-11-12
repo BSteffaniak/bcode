@@ -771,6 +771,7 @@ mod tests {
         bcode_plugin::RegisteredAuthProvider {
             plugin_id: "test.plugin".into(),
             contribution: AuthProviderContribution {
+                external_sources: Vec::new(),
                 schema_version: 1,
                 provider_id: "test".into(),
                 display_name: "Test".into(),

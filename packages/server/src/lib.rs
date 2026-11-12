@@ -14,8 +14,6 @@ pub(crate) mod account_routing;
 pub(crate) mod artifact_operations;
 mod auxiliary_generation;
 mod external_auth;
-mod external_dispatch;
-mod native_connections;
 #[cfg(test)]
 use bcode_plugin_config::{
     redact_plugin_config_value, resolve_invocation_secrets,
@@ -5289,19 +5287,12 @@ async fn run_with_services(
     );
     skills_phase.finish();
     let auth_phase = bcode_metrics::startup::phase("server.auth_materialization");
-    let selected_provider_context = if resolved_model
-        .settings
-        .contains_key("external_auth_binding")
-    {
-        external_auth_recipe(&resolved_model)
-    } else {
-        bcode_provider_auth::resolve_provider_request_context(
-            bcode_provider_auth::ProviderRequestContextResolution {
-                config: &config,
-                selection: resolved_model.clone(),
-            },
-        )
-    };
+    let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution {
+            config: &config,
+            selection: resolved_model.clone(),
+        },
+    );
     auth_phase.finish();
     let workflow_store = bcode_workflow_store::WorkflowStore::unavailable_placeholder()?;
     let workflow_store_unavailable = Some(WorkflowInitializationFailure {
@@ -7013,7 +7004,6 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SetAccountRouting { .. } => "set_account_routing",
         Request::SetAccountPause { .. } => "set_account_pause",
         Request::RenameAccount { .. } => "rename_account",
-        Request::NativeConnection { .. } => "native_connection",
         Request::DiscoverExternalAuth => "discover_external_auth",
         Request::ApproveExternalAuth { .. } => "approve_external_auth",
         Request::ListExternalAuth => "list_external_auth",
@@ -11248,17 +11238,6 @@ async fn handle_core_runtime_request(
             };
             send_response(writer, request_id, response).await
         }
-        CoreRuntimeRequest::NativeConnection { request } => {
-            let response = ServicesApplicationHandle::new(state, client_id)
-                .native_connection(request)
-                .await;
-            send_response(
-                writer,
-                request_id,
-                Response::Ok(ResponsePayload::NativeConnection { response }),
-            )
-            .await
-        }
         CoreRuntimeRequest::DiscoverExternalAuth => {
             use bcode_provider_auth_models::external::ExternalAuthApplication as _;
             let result = ServicesApplicationHandle::new(state, client_id)
@@ -11270,10 +11249,10 @@ async fn handle_core_runtime_request(
             );
             send_response(writer, request_id, Response::Ok(payload)).await
         }
-        CoreRuntimeRequest::ApproveExternalAuth { candidate, scope } => {
+        CoreRuntimeRequest::ApproveExternalAuth { candidate } => {
             use bcode_provider_auth_models::external::ExternalAuthApplication as _;
             let result = ServicesApplicationHandle::new(state, client_id)
-                .approve_external_auth(candidate, scope)
+                .approve_external_auth(candidate)
                 .await;
             let payload = result.map_or_else(
                 |error| ResponsePayload::ExternalAuthFailed { error },
@@ -11292,10 +11271,10 @@ async fn handle_core_runtime_request(
             );
             send_response(writer, request_id, Response::Ok(payload)).await
         }
-        CoreRuntimeRequest::RevokeExternalAuth { grant } => {
+        CoreRuntimeRequest::RevokeExternalAuth { binding_id } => {
             use bcode_provider_auth_models::external::ExternalAuthApplication as _;
             let result = ServicesApplicationHandle::new(state, client_id)
-                .revoke_external_auth(grant)
+                .revoke_external_auth(binding_id)
                 .await;
             let payload = result.map_or_else(
                 |error| ResponsePayload::ExternalAuthFailed { error },
@@ -25338,30 +25317,24 @@ async fn run_model_turn_round(
                 ));
             }
         };
-        let invocation = Box::pin(
-            state.plugins.invoke_service_with_events_and_bridge_scoped(
-                &push_plugin_id,
-                push_interface_id,
-                OP_RUN_TURN,
-                payload,
-                scope,
-                if request
-                    .provider_context
-                    .settings
-                    .contains_key("external_auth_binding")
-                {
-                    None
-                } else {
-                    Some(server_model_provider_bridge(
-                        state.plugins.clone(),
-                        config.clone(),
-                        state.optional_judgement.invalidation_handle(),
-                        &request.turn_id,
-                        &push_plugin_id,
-                    ))
-                },
-            ),
-        )
+        let invocation = Box::pin(state.plugins.invoke_service_with_events_and_bridge_scoped(
+            &push_plugin_id,
+            push_interface_id,
+            OP_RUN_TURN,
+            payload,
+            scope,
+            if request.provider_context.external_auth_binding.is_some() {
+                None
+            } else {
+                Some(server_model_provider_bridge(
+                    state.plugins.clone(),
+                    config.clone(),
+                    state.optional_judgement.invalidation_handle(),
+                    &request.turn_id,
+                    &push_plugin_id,
+                ))
+            },
+        ))
         .await;
         state.metrics.record_histogram_with_labels(
             "model.provider.run_turn_start_duration_ms",
@@ -25552,14 +25525,14 @@ async fn run_model_turn_round(
             Ok(summary) => {
                 let mut snapshot = compaction.snapshot.clone();
                 snapshot.portable_summary.clone_from(&summary);
-                context_compaction::validate_provider_summary_publication(
+                Box::pin(context_compaction::validate_provider_summary_publication(
                     state,
                     session_id,
                     &selection,
                     compaction.compacted_through_sequence,
                     &snapshot,
                     &cancel_state,
-                )
+                ))
                 .await
                 .map(|()| summary)
             }
@@ -28876,8 +28849,6 @@ async fn attached_client_runtime_context(
         .then_some(first)
 }
 
-use external_dispatch::recipe as external_auth_recipe;
-
 /// Acquire external credentials at the authoritative dispatch boundary only.
 async fn external_context_for_dispatch(
     state: &ServerState,
@@ -28885,22 +28856,13 @@ async fn external_context_for_dispatch(
     request: &ModelTurnRequest,
     home: Option<&Path>,
 ) -> Result<Option<bcode_model::ProviderRequestContext>, String> {
-    if !request
-        .provider_context
-        .settings
-        .contains_key("external_auth_binding")
-    {
+    if request.provider_context.external_auth_binding.is_none() {
         return Ok(None);
     }
-    let default_home;
-    let home = if let Some(home) = home {
-        home
-    } else {
-        default_home = std::env::home_dir()
-            .ok_or("external authentication unavailable; no fallback permitted")?;
-        &default_home
-    };
-    external_dispatch::context_for_dispatch(state, provider, request, home).await
+    let provider = provider.ok_or("external authentication requires an explicit provider")?;
+    external_auth::context_for_dispatch(state, provider, request, home)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Resolve the provider context a session should use for an explicitly selected provider/model.
@@ -28939,9 +28901,6 @@ fn provider_context_for_selection(
     let Some(selection) = config.resolved_model_profile(profile_name) else {
         return bcode_model::ProviderRequestContext::default();
     };
-    if selection.settings.contains_key("external_auth_binding") {
-        return external_auth_recipe(&selection);
-    }
     bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution { config, selection },
     )
@@ -28955,18 +28914,20 @@ fn overlay_transient_provider_context(
     selection: &mut bcode_model::ProviderRequestContext,
     runtime: bcode_model::ProviderRequestContext,
 ) {
-    if runtime.settings.contains_key("external_auth_binding") {
+    // An external connection replaces profile authentication wholesale and never merges.
+    if runtime.external_auth_binding.is_some() {
         *selection = bcode_model::ProviderRequestContext {
             model_profile: runtime.model_profile,
             auth_profile: runtime.auth_profile,
             auth_pool: runtime.auth_pool,
             settings: runtime.settings,
             request: runtime.request,
+            external_auth_binding: runtime.external_auth_binding,
             ..Default::default()
         };
         return;
     }
-    if selection.settings.contains_key("external_auth_binding") {
+    if selection.external_auth_binding.is_some() {
         return;
     }
     if runtime.auth_profile.is_some() {
@@ -29409,11 +29370,8 @@ async fn invoke_model_provider_start_turn_at_home(
     }
     let request = &dispatch_request;
     let payload = serde_json::to_vec(request).map_err(|error| error.to_string())?;
-    let bridge = if request
-        .provider_context
-        .settings
-        .contains_key("external_auth_binding")
-    {
+    // External connections are read-only: no credential custody bridge, so no writeback.
+    let bridge = if request.provider_context.external_auth_binding.is_some() {
         None
     } else {
         Some(server_model_provider_bridge_with_custody(
@@ -70753,10 +70711,10 @@ library = "test"
     #[test]
     fn external_recipe_overlay_discards_client_credential_payloads() {
         let mut selection = bcode_model::ProviderRequestContext::default();
-        let mut runtime = bcode_model::ProviderRequestContext::default();
-        runtime
-            .settings
-            .insert("external_auth_binding".into(), "ab".repeat(32));
+        let mut runtime = bcode_model::ProviderRequestContext {
+            external_auth_binding: Some("ab".repeat(32)),
+            ..Default::default()
+        };
         runtime
             .env
             .insert("SYNTHETIC_SECRET".into(), "fixture-only".into());
@@ -70765,7 +70723,7 @@ library = "test"
             .auth_candidates
             .push(bcode_model::ProviderAuthCandidate::default());
         overlay_transient_provider_context(&mut selection, runtime);
-        assert!(selection.settings.contains_key("external_auth_binding"));
+        assert_eq!(selection.external_auth_binding, Some("ab".repeat(32)));
         assert!(selection.env.is_empty());
         assert!(selection.auth.is_none());
         assert_eq!(selection.auth_candidates, []);

@@ -35,6 +35,7 @@ mod execution_flow;
 mod execution_picker;
 mod native_setup;
 pub use execution_flow::{ExecutionPickerRequest, run_native_setup_in_shell};
+pub use native_setup::NativeSetupOutcome;
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
 pub(crate) mod foreground;

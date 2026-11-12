@@ -1186,6 +1186,18 @@ fn handoff_is_explicit_namespace_specific_and_nonexecuting() {
     assert_eq!(handoff.environment["CLAUDE_CONFIG_DIR"], "/isolated/claude");
     assert_eq!(handoff.namespace.credential_namespace, "/isolated/claude");
     assert_eq!(handoff.executable, options.executable);
+    // The default namespace signs in to the same credential-store entry launches read.
+    let mut default_instance = instance.clone();
+    default_instance.config_namespace = "/synthetic/home/.claude".into();
+    default_instance.auth.credential_namespace = "/synthetic/home/.claude".into();
+    let mut default_options = options.clone();
+    default_options.config_directory = "/synthetic/home/.claude".into();
+    default_options
+        .environment
+        .0
+        .insert("HOME".into(), "/synthetic/home".into());
+    let handoff = native_login_handoff_data(&default_instance, &default_options).unwrap();
+    assert!(!handoff.environment.contains_key("CLAUDE_CONFIG_DIR"));
     options
         .environment
         .0

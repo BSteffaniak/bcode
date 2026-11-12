@@ -95,7 +95,7 @@ pub fn managed_started_session(
 pub async fn run_native_setup_in_shell(
     shell: &mut TerminalShell,
     no_discovery: bool,
-) -> Result<bool, TuiError> {
+) -> Result<crate::native_setup::NativeSetupOutcome, TuiError> {
     crate::native_setup::run(shell, no_discovery).await
 }
 

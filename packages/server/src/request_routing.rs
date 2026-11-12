@@ -993,17 +993,13 @@ pub enum CoreRuntimeRequest {
     ExecuteAccountLifecycle {
         plan_id: String,
     },
-    NativeConnection {
-        request: bcode_harness_models::native_connections::NativeConnectionRequest,
-    },
     DiscoverExternalAuth,
     ApproveExternalAuth {
         candidate: bcode_provider_auth_models::external::ExternalAuthCandidate,
-        scope: Option<bcode_provider_auth_models::external::ExternalAuthScope>,
     },
     ListExternalAuth,
     RevokeExternalAuth {
-        grant: bcode_provider_auth_models::external::ExternalAuthGrant,
+        binding_id: String,
     },
     AuthPoolList,
     /// Read account-first next-turn routing in the session configuration.
@@ -2641,23 +2637,21 @@ impl RoutedRequest {
                     plan_id,
                 }))
             }
-            Request::NativeConnection { request } => {
-                Self::CoreRuntime(Box::new(CoreRuntimeRequest::NativeConnection { request }))
-            }
             Request::DiscoverExternalAuth => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::DiscoverExternalAuth))
             }
-            Request::ApproveExternalAuth { candidate, scope } => {
+            Request::ApproveExternalAuth { candidate } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::ApproveExternalAuth {
                     candidate,
-                    scope,
                 }))
             }
             Request::ListExternalAuth => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListExternalAuth))
             }
-            Request::RevokeExternalAuth { grant } => {
-                Self::CoreRuntime(Box::new(CoreRuntimeRequest::RevokeExternalAuth { grant }))
+            Request::RevokeExternalAuth { binding_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::RevokeExternalAuth {
+                    binding_id,
+                }))
             }
             Request::AuthPoolList => Self::CoreRuntime(Box::new(CoreRuntimeRequest::AuthPoolList)),
             Request::SetAuthPoolPreference { pool, profile } => {

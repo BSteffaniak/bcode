@@ -7599,6 +7599,7 @@ invocation_operations = ["invoke"]
             user_data: *mut std::ffi::c_void,
         ) -> i32 {
             let contribution = AuthProviderContribution {
+                external_sources: Vec::new(),
                 schema_version:
                     bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
                 provider_id: "exa".to_owned(),
@@ -7669,6 +7670,7 @@ library = "libweb_search.dylib"
     #[test]
     fn auth_provider_registry_rejects_duplicates_and_invalid_contributions() {
         let contribution = AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "exa".to_owned(),
             display_name: "Exa".to_owned(),
@@ -7696,6 +7698,7 @@ library = "libweb_search.dylib"
         ));
 
         let mut invalid = AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: "valid".to_owned(),
             display_name: "Valid".to_owned(),

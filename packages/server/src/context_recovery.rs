@@ -168,7 +168,7 @@ async fn rebuild_inner(
                 "no canonical evidence available to reconstruct summary".into(),
             )
         })?;
-    context_compaction::validate_summary_publication(
+    Box::pin(context_compaction::validate_summary_publication(
         state,
         request.session_id,
         selection,
@@ -176,7 +176,7 @@ async fn rebuild_inner(
         &summary,
         0,
         cancel_state,
-    )
+    ))
     .await?;
     let marker = commit_rebuilt_summary(
         state,

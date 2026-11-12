@@ -59,6 +59,7 @@ fn jev_auth_contribution() -> bcode_provider_auth_models::AuthProviderContributi
         AuthSecretField, AuthSecretValidation,
     };
     let mut contribution = bcode_provider_auth_models::AuthProviderContribution {
+        external_sources: Vec::new(),
         schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
         provider_id: "jev".into(),
         display_name: "TypeSafe Jev".into(),

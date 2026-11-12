@@ -150,6 +150,7 @@ fn register_auth_providers(registrar: &AuthRegistrar) -> Result<(), PluginError>
     // Native custody is handled by managed auth, not an empty vault enrollment.
     registrar
         .register(&AuthProviderContribution {
+            external_sources: Vec::new(),
             schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
             provider_id: AUTH_PROVIDER_ID.to_owned(),
             display_name: "Codex".to_owned(),
@@ -584,7 +585,7 @@ impl PluginState {
                 return Err(CodexError::Bounds);
             }
         }
-        let launch = launch(instance, &open.working_directory, context)?;
+        let launch = launch(instance, &open.working_directory)?;
         let binding = open
             .resume
             .clone()

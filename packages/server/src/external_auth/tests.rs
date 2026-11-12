@@ -1,14 +1,16 @@
-use super::*;
-use crate::{external_context_for_dispatch, invoke_model_provider_start_turn_at_home};
-use bcode_model::{OP_START_TURN, StartTurnResponse};
+use crate::{ServerState, external_context_for_dispatch, invoke_model_provider_start_turn_at_home};
+use bcode_model::{ModelTurnRequest, OP_START_TURN, StartTurnResponse};
 use bcode_plugin::PluginInvocationScope;
 use bcode_plugin_sdk::{
     AuthRegistrar, NativeServiceContext, PluginError, RustPlugin, ServiceResponse,
 };
-use bcode_provider_auth::external_auth::{ExternalAuthStore, discover};
+use bcode_provider_auth::external_auth::{ExternalAuthStore, SourceRoots, discover};
+use bcode_provider_auth_models::external::{
+    AuthExternalCredential, AuthExternalLocation, AuthExternalSource, AuthLiteralTokenPolicy,
+};
 use bcode_provider_auth_models::{
-    AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthCredentialSource, AuthMethodContribution,
-    AuthProviderContribution, AuthSecretField, AuthSecretValidation,
+    AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution, AuthProviderContribution,
+    AuthSecretField, AuthSecretValidation,
 };
 use bcode_session::SessionManager;
 use bcode_session_models::SessionId;
@@ -47,13 +49,31 @@ fn declaration() -> AuthProviderContribution {
                 optional: false,
                 invocation_env: vec![],
                 validation: AuthSecretValidation::default(),
-                discovery_sources: vec![AuthCredentialSource::JsonFile {
-                    application: "Synthetic".into(),
-                    relative_path: ".synthetic/auth.json".into(),
-                    pointer: "/key".into(),
-                    discriminator: Some(("/type".into(), "api".into())),
-                }],
+                discovery_sources: vec![],
             }],
+        }],
+        external_sources: vec![AuthExternalSource {
+            source_id: "synthetic".into(),
+            application: "Synthetic".into(),
+            method_id: "api_key".into(),
+            location: AuthExternalLocation {
+                relative_path: ".synthetic/auth.json".into(),
+                root_override: None,
+            },
+            discriminator: Some(("/type".into(), "api".into())),
+            required_absent_pointers: vec![],
+            credentials: vec![AuthExternalCredential {
+                credential_id: "api_key".into(),
+                pointer: "/key".into(),
+                optional: false,
+            }],
+            account_pointer: None,
+            literal_policy: AuthLiteralTokenPolicy {
+                reject_command_prefix: false,
+                reject_dollar_expansions: false,
+                reject_whitespace_or_control: true,
+                reject_environment_identifier: false,
+            },
         }],
     }
 }
@@ -91,6 +111,13 @@ impl RustPlugin for SyntheticProvider {
             }
             _ => ServiceResponse::error("unsupported", "unsupported"),
         }
+    }
+}
+
+fn roots(home: &std::path::Path) -> SourceRoots {
+    SourceRoots {
+        home: home.to_owned(),
+        overrides: BTreeMap::new(),
     }
 }
 
@@ -140,14 +167,14 @@ impl Fixture {
             .iter()
             .map(|entry| (entry.plugin_id.as_str(), &entry.contribution))
             .collect::<Vec<_>>();
-        let candidate = discover(home.path(), &enabled).unwrap().remove(0);
+        let candidate = discover(&roots(home.path()), &enabled).unwrap().remove(0);
         let store = ExternalAuthStore::new(state.path());
         let request = serde_json::from_value(serde_json::json!({
             "session_id": SessionId::new(), "turn_id": "synthetic", "model_id": "synthetic-model",
-            "messages": [], "provider_context": { "settings": {
-                "external_auth_binding": candidate.binding_id,
-                "transport": "synthetic"
-            }}
+            "messages": [], "provider_context": {
+                "settings": { "transport": "synthetic" },
+                "external_auth_binding": candidate.binding_id
+            }
         }))
         .unwrap();
         Self {
@@ -160,21 +187,13 @@ impl Fixture {
         }
     }
 
-    fn approve(
-        &self,
-        application: Option<&str>,
-    ) -> bcode_provider_auth_models::external::ExternalAuthGrant {
+    fn approve(&self) -> bcode_provider_auth_models::external::ExternalAuthGrant {
         let declaration = declaration();
         self.store
             .approve(
-                self.home.path(),
+                &roots(self.home.path()),
                 &[(PLUGIN, &declaration)],
                 &self.candidate,
-                application.map(|application_id| {
-                    bcode_provider_auth_models::external::ExternalAuthScope::Application {
-                        application_id: application_id.into(),
-                    }
-                }),
                 1,
             )
             .unwrap()
@@ -198,7 +217,7 @@ impl Fixture {
 async fn approval_rotation_revocation_reach_real_dispatch_without_retaining_credentials() {
     let fixture = Fixture::new();
     assert!(fixture.dispatch(&fixture.request).await.is_err());
-    let grant = fixture.approve(None);
+    let grant = fixture.approve();
     assert_eq!(
         fixture
             .dispatch(&fixture.request)
@@ -222,32 +241,15 @@ async fn approval_rotation_revocation_reach_real_dispatch_without_retaining_cred
     );
     assert!(fixture.request.provider_context.auth.is_none());
     assert!(fixture.request.provider_context.env.is_empty());
-    fixture.store.revoke(&grant).unwrap();
+    assert!(fixture.store.revoke(&grant.binding_id).unwrap());
     assert!(fixture.dispatch(&fixture.request).await.is_err());
-    drop(fixture);
-}
-
-#[tokio::test]
-async fn no_identity_requires_broad_consent_even_when_narrow_grant_precedes_it() {
-    let fixture = Fixture::new();
-    fixture.approve(Some("bcode"));
-    assert!(fixture.dispatch(&fixture.request).await.is_err());
-    fixture.approve(None);
-    assert_eq!(
-        fixture
-            .dispatch(&fixture.request)
-            .await
-            .unwrap()
-            .provider_turn_id,
-        "synthetic-first"
-    );
     drop(fixture);
 }
 
 #[tokio::test]
 async fn injected_credentials_overrides_and_custom_destinations_never_fall_back() {
     let fixture = Fixture::new();
-    fixture.approve(None);
+    fixture.approve();
     for key in ["base_url", "endpoint", "api_key"] {
         let mut request = fixture.request.clone();
         request

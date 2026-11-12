@@ -2219,6 +2219,28 @@ async fn resolve_summary_budget(
     minimum_reclaim: u64,
     cancel: &TurnCancelState,
 ) -> Result<budget::ResolvedSummaryPolicy, CompactionError> {
+    // Boxed once here so callers' futures stay small.
+    Box::pin(resolve_summary_budget_inner(
+        state,
+        session_id,
+        selection,
+        history,
+        boundary,
+        minimum_reclaim,
+        cancel,
+    ))
+    .await
+}
+
+async fn resolve_summary_budget_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    history: &[bcode_session_models::SessionEvent],
+    boundary: u64,
+    minimum_reclaim: u64,
+    cancel: &TurnCancelState,
+) -> Result<budget::ResolvedSummaryPolicy, CompactionError> {
     let before_request =
         context_compaction_request_budget::project(state, session_id, selection, history, cancel)
             .await?;
@@ -2288,7 +2310,7 @@ pub async fn collect_compaction_summary(
                     None,
                 ))
                 .await?;
-                validate_summary_publication(
+                Box::pin(validate_summary_publication(
                     state,
                     session_id,
                     selection,
@@ -2296,7 +2318,7 @@ pub async fn collect_compaction_summary(
                     &summary,
                     0,
                     cancel_state,
-                )
+                ))
                 .await?;
                 Ok(summary)
             })
