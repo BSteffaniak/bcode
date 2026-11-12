@@ -69,6 +69,31 @@ linked sessions, for plugin services, and for `publish-github`.
 Opening a session hands the terminal to `bcode tui` and resumes the review where it was when
 that exits.
 
+### Rendering and terminal output
+
+Every frame repaints the whole screen from the app's state; BMUX diffs it against the previous
+frame and writes only the changed cells. Large terminals stay cheap because:
+
+* **Rows are built while idle.** After each frame the review builds the rows of the viewport and
+  of the pages above and below it, and has the list lay them out
+  (`VirtualListComponent::prepare_around`), so paging and scrolling reveal rows that are already
+  built. Built rows are cached by item, width, presentation revisions, and the highlights their
+  file's blobs have, so a highlight landing for one file leaves other files' rows cached.
+* **Scrolls move rows instead of rewriting them.** The list reports how far its rows scrolled
+  (`PaintCx::hint_scroll`) and the terminal is presented with scroll-region acceleration, so a
+  scroll writes the rows it reveals plus what changed beside them. Full rows are scrolled when
+  that saves cells (with the file panel shown, its rows are rewritten), and only the list's
+  columns, with left/right margins, on terminals known to support them (iTerm2, Ghostty, xterm,
+  outside multiplexers).
+* **Writing never blocks input.** On Unix, frames go to the terminal from an output thread over a
+  separate nonblocking open of the terminal device. While a frame is being written the app keeps
+  handling input; the next frame shows the latest state, so frames superseded meanwhile are never
+  written. Elsewhere, or when stdout is not a terminal, frames are written to stdout directly.
+* **Highlighting is bounded to the screen.** Blobs are highlighted only for files on screen, at
+  most two at a time, in steps of 2,000 lines: the first step's lines are shown at once, and a job
+  whose file leaves the screen stops at its next step. Highlights for files off screen land without
+  a frame; completions that arrive together are drawn by one frame.
+
 ## Configuration
 
 Both entry points read the ordinary bcode configuration files, discovered and layered like

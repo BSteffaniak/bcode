@@ -248,6 +248,23 @@ fn paging_reaches_the_end_of_the_review() {
     assert_eq!(cursor_index(&scenario), doc.len() - 1);
 }
 
+#[test]
+fn rows_of_the_next_page_are_built_while_idle_not_in_the_paging_frame() {
+    let fixture = fixture();
+    let (mut scenario, _) = open(&fixture, fixture_branch_compare(), 100, 30);
+    for _ in 0..3 {
+        let before = stable(&mut scenario).text();
+        let built = scenario.surface().rows_built();
+        scenario.key("pagedown");
+        assert_ne!(scenario.render().text(), before, "the page moved");
+        assert_eq!(
+            scenario.surface().rows_built(),
+            built,
+            "the revealed rows were built before the key arrived"
+        );
+    }
+}
+
 fn expand_in_order(fixture: &GitFixture, order: &[&str]) -> (Screen, Vec<(u32, u32)>) {
     let (mut scenario, _) = open(fixture, fixture_branch_compare(), 100, 40);
     let gap = find_item(

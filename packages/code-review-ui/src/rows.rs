@@ -372,7 +372,8 @@ struct CacheKey {
     width: u16,
     layout_revision: u64,
     paint_revision: u64,
-    syntax_epoch: u64,
+    /// Highlights available for the row's blobs (see [`SyntaxStore::stamp`]).
+    syntax: u64,
     annotation_revision: u64,
     content: ContentStamp,
 }
@@ -507,8 +508,8 @@ impl RowContext<'_> {
             width,
             layout_revision: self.params.layout_revision,
             paint_revision: self.params.paint_revision,
-            syntax_epoch: if is_diff_row(item) {
-                self.syntax.epoch()
+            syntax: if is_diff_row(item) {
+                self.syntax_stamp(item)
             } else {
                 0
             },
@@ -527,6 +528,20 @@ impl RowContext<'_> {
             rows.selection = selection_runs(item, &rows, self.params.layout_revision);
             rows
         })
+    }
+
+    /// Stamp of the highlights both blob sides of a diff row's file have, so its cached rows
+    /// are rebuilt only when a highlight for that file lands.
+    fn syntax_stamp(&self, item: &ReviewItem) -> u64 {
+        let Some(entry) = item.file().and_then(|file| self.doc.entry(file)) else {
+            return 0;
+        };
+        let old = self.syntax.stamp(
+            &entry.old_blob,
+            entry.old_path.as_deref().unwrap_or(&entry.path),
+        );
+        let new = self.syntax.stamp(&entry.new_blob, &entry.path);
+        old.rotate_left(32) ^ new
     }
 
     /// Height of the item at `index` at `width` without building its rows: exactly the

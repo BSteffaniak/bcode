@@ -89,7 +89,6 @@ use bmux_tui_components::virtual_list::{
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Keymap scope of the review screen.
@@ -326,6 +325,9 @@ struct Review {
     visible: (usize, usize),
     marks: Vec<ScrollbarMark<RowKey>>,
     marks_revision: Option<(u64, Option<ItemKey>)>,
+    /// Viewport, measurement generation, and revisions the rows around the viewport were last
+    /// measured for (see [`ReviewSurface::prepare_ahead`]).
+    prepared_ahead: Option<[u64; 5]>,
     totals: (u64, u64),
     files: FileTree,
     tree: RefCell<TreeViewState>,
@@ -406,6 +408,7 @@ impl Review {
             visible: (0, 0),
             marks: Vec::new(),
             marks_revision: None,
+            prepared_ahead: None,
             totals,
             files,
             tree: RefCell::new(tree),
@@ -1327,53 +1330,23 @@ impl ReviewSurface {
         }
     }
 
-    /// Start reading and highlighting both sides of visible resident text files.
+    /// Start reading and highlighting both sides of visible resident text files, and cancel jobs
+    /// for blobs whose files left the screen.
     fn schedule_syntax(&mut self, host: &UiContext) {
         let Some(review) = &self.review else {
             return;
         };
-        let (first, last) = review.visible;
-        let mut wanted = Vec::new();
-        let mut seen: Option<FileRef> = None;
-        for index in first..=last {
-            let Some(file) = review.doc.item(index).and_then(ReviewItem::file) else {
-                continue;
-            };
-            if seen.as_ref() == Some(file) {
-                continue;
-            }
-            seen = Some(file.clone());
-            if review.doc.load_state(file) != Some(bcode_code_review::document::FileLoad::Loaded) {
-                continue;
-            }
-            let Some(entry) = review.doc.entry(file) else {
-                continue;
-            };
-            if entry.has(ReviewIndexFlag::Binary) || entry.has(ReviewIndexFlag::Submodule) {
-                continue;
-            }
-            for (blob, path) in [
-                (
-                    &entry.old_blob,
-                    entry.old_path.as_deref().unwrap_or(&entry.path),
-                ),
-                (&entry.new_blob, entry.path.as_str()),
-            ] {
-                if let Some(key) = self.syntax.key(blob, path)
-                    && !self.syntax.known(&key)
-                    && !wanted
-                        .iter()
-                        .any(|(wanted, _): &(_, String)| *wanted == key)
-                {
-                    wanted.push((key, path.to_owned()));
-                }
-            }
-        }
+        let wanted = visible_blobs(review, &self.syntax);
+        let wanted_keys: BTreeSet<_> = wanted.iter().map(|(key, _)| key.clone()).collect();
+        self.syntax.cancel_unwanted(&wanted_keys);
         for (key, path) in wanted {
             if !self.syntax.has_capacity() {
                 break;
             }
-            self.syntax.start(key.clone());
+            if self.syntax.known(&key) {
+                continue;
+            }
+            let token = self.syntax.start(key.clone());
             let services = self.services.clone();
             let repo = self.repo_path.clone();
             let inbox = self.inbox.clone();
@@ -1386,8 +1359,134 @@ impl ReviewSurface {
                     MAX_HIGHLIGHT_BYTES,
                 )
                 .await;
-                inbox.push(Message::BlobText { key, path, text });
+                inbox.push(Message::BlobText {
+                    key,
+                    token,
+                    path,
+                    text,
+                });
             }));
+        }
+    }
+
+    /// Apply one highlighting message. Returns whether it changes what is on screen.
+    fn apply_syntax(&mut self, message: Message, host: &UiContext) -> bool {
+        match message {
+            Message::BlobText {
+                key,
+                token,
+                path,
+                text,
+            } => {
+                // A read that finishes after its file left the screen is dropped.
+                if !self.syntax.is_current(&key, &token) {
+                    return false;
+                }
+                let Some(text) = text else {
+                    let shown = self.blob_on_screen(&key);
+                    self.syntax.finish(key, None);
+                    return shown;
+                };
+                let highlighter = self.syntax.highlighter();
+                let inbox = self.inbox.clone();
+                host.spawn_blocking(Box::new(move || {
+                    super::syntax::highlight_steps(
+                        &highlighter,
+                        &path,
+                        &text,
+                        &token,
+                        |highlighted, complete| {
+                            inbox.push(Message::Highlighted {
+                                key: key.clone(),
+                                text: Some(highlighted),
+                                complete,
+                                token: token.clone(),
+                            });
+                        },
+                    );
+                }));
+                false
+            }
+            Message::Highlighted {
+                key,
+                text,
+                complete,
+                token,
+            } => {
+                let shown = self.blob_on_screen(&key);
+                self.syntax.land(key, text, complete, Some(&token));
+                shown
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a blob side of a file on screen has `key`.
+    fn blob_on_screen(&self, key: &super::syntax::SyntaxKey) -> bool {
+        self.review.as_ref().is_some_and(|review| {
+            visible_blobs(review, &self.syntax)
+                .iter()
+                .any(|(wanted, _)| wanted == key)
+        })
+    }
+
+    /// While idle, build the rows of the viewport and of the pages above and below it, and give
+    /// the list exact layouts for them, so paging, scrolling, and highlights that just landed
+    /// show rows already built instead of building them in the frame. Runs once per viewport,
+    /// measurement generation, and presentation revision.
+    fn prepare_ahead(&mut self) {
+        let Some(review) = &self.review else {
+            return;
+        };
+        let (resolved, generation, items, width) = {
+            let list = review.list.borrow();
+            let Some(resolved) = list.resolved() else {
+                return;
+            };
+            let page = resolved.viewport_height;
+            let items = list.index().visible_range(
+                resolved.top_offset.saturating_sub(page),
+                page.saturating_mul(3),
+            );
+            let width = list
+                .index()
+                .item(items.start)
+                .and_then(|item| u16::try_from(item.width).ok());
+            (
+                resolved,
+                list.measurement_generation(),
+                items.start..items.end,
+                width,
+            )
+        };
+        let params = self.params(review);
+        let stamp = [
+            resolved.top_offset,
+            resolved.viewport_height,
+            generation,
+            params.layout_revision ^ params.annotation_revision.rotate_left(17),
+            self.syntax.epoch() ^ params.paint_revision.rotate_left(31),
+        ];
+        if review.prepared_ahead == Some(stamp) {
+            return;
+        }
+        let extras = self.extras();
+        let context = row_context(review, &params, &self.syntax, extras);
+        if let Some(width) = width {
+            for index in items {
+                let _built = context.rows(index, width);
+            }
+        }
+        let source =
+            DocumentSource::new(&context, &review.interaction, decor(review, extras.search));
+        let page = resolved.viewport_height;
+        list_component(&source, &review.list, &params, &review.marks).prepare_around(
+            page,
+            page,
+            &mut LayoutCx::new(),
+        );
+        if let Some(review) = &mut self.review {
+            review.prepared_ahead = Some(stamp);
         }
     }
 
@@ -1395,8 +1494,17 @@ impl ReviewSurface {
     fn drain(&mut self, host: &UiContext) -> bool {
         let mut changed = false;
         for message in self.inbox.drain() {
-            changed = true;
-            self.apply_message(message, host);
+            // Highlights for files off screen land without a frame; every other result (and a
+            // highlight on screen) is drawn by the one frame that follows this drain.
+            changed |= match message {
+                Message::BlobText { .. } | Message::Highlighted { .. } => {
+                    self.apply_syntax(message, host)
+                }
+                message => {
+                    self.apply_message(message, host);
+                    true
+                }
+            };
         }
         if let Some(review) = &mut self.review
             && let Some((key, row)) = review.pending_restore.clone()
@@ -1475,21 +1583,9 @@ impl ReviewSurface {
                 ticket,
                 result,
             } => self.apply_need(generation, ticket, result),
-            Message::BlobText { key, path, text } => match text {
-                Some(text) => {
-                    let syntax = self.syntax.highlighter();
-                    let inbox = self.inbox.clone();
-                    host.spawn_blocking(Box::new(move || {
-                        let tokens = super::syntax::highlight(&syntax, &path, &text);
-                        inbox.push(Message::Highlighted {
-                            key,
-                            text: Some(Arc::new(tokens)),
-                        });
-                    }));
-                }
-                None => self.syntax.finish(key, None),
-            },
-            Message::Highlighted { key, text } => self.syntax.finish(key, text),
+            message @ (Message::BlobText { .. } | Message::Highlighted { .. }) => {
+                self.apply_syntax(message, host);
+            }
             Message::Token { result, manual } => self.apply_token(host, result, manual),
             Message::Saved(result) => {
                 // Changes made while saving are saved next.
@@ -3631,6 +3727,46 @@ impl Component for ListSlot<'_> {
     }
 }
 
+/// Highlight keys (with grammar paths) of both sides of every resident text file intersecting
+/// the viewport, in viewport order.
+fn visible_blobs(review: &Review, syntax: &SyntaxStore) -> Vec<(super::syntax::SyntaxKey, String)> {
+    let (first, last) = review.visible;
+    let mut wanted: Vec<(super::syntax::SyntaxKey, String)> = Vec::new();
+    let mut seen: Option<&FileRef> = None;
+    for index in first..=last {
+        let Some(file) = review.doc.item(index).and_then(ReviewItem::file) else {
+            continue;
+        };
+        if seen == Some(file) {
+            continue;
+        }
+        seen = Some(file);
+        if review.doc.load_state(file) != Some(bcode_code_review::document::FileLoad::Loaded) {
+            continue;
+        }
+        let Some(entry) = review.doc.entry(file) else {
+            continue;
+        };
+        if entry.has(ReviewIndexFlag::Binary) || entry.has(ReviewIndexFlag::Submodule) {
+            continue;
+        }
+        for (blob, path) in [
+            (
+                &entry.old_blob,
+                entry.old_path.as_deref().unwrap_or(&entry.path),
+            ),
+            (&entry.new_blob, entry.path.as_str()),
+        ] {
+            if let Some(key) = syntax.key(blob, path)
+                && !wanted.iter().any(|(wanted, _)| *wanted == key)
+            {
+                wanted.push((key, path.to_owned()));
+            }
+        }
+    }
+    wanted
+}
+
 /// Carry the tree's collapsed directories, selection, and filter into a re-opened review.
 fn carry_tree(previous: &Review, review: &mut Review, theme: &ReviewTheme) {
     let old = previous.tree.borrow();
@@ -4117,6 +4253,7 @@ impl View for ReviewSurface {
         let before = self.outstanding_requests();
         self.pump(host);
         self.schedule_syntax(host);
+        self.prepare_ahead();
         self.save(host);
         changed |= self.outstanding_requests() != before || self.notes.pending() != notes_before;
         changed |= self.toasts.expire(Instant::now());

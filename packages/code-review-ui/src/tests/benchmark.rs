@@ -26,7 +26,7 @@ use crate::theme::{IconStyle, ReviewTheme};
 use bcode_code_review::document::ReviewItem;
 use bmux_tui::event::MouseEventKind;
 use bmux_tui::geometry::Rect;
-use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal::{ScrollRegionAcceleration, Terminal};
 use std::time::{Duration, Instant};
 
 const WIDTH: u16 = 200;
@@ -297,6 +297,17 @@ fn wheel_down(scenario: &mut Scenario<ReviewSurface>) {
     scenario.mouse(MouseEventKind::ScrollDown, list.x + 10, list.y + 10);
 }
 
+/// Scroll-region acceleration of the presenting terminal: `BCODE_BENCH_SCROLL` = `off`,
+/// `auto` (the default, as the app presents on most terminals), or `margins` (terminals with
+/// left/right margin support).
+fn scroll_acceleration() -> ScrollRegionAcceleration {
+    match std::env::var("BCODE_BENCH_SCROLL").as_deref() {
+        Ok("off") => ScrollRegionAcceleration::Off,
+        Ok("margins") => ScrollRegionAcceleration::AutoWithMargins,
+        _ => ScrollRegionAcceleration::Auto,
+    }
+}
+
 /// One terminal size and diff layout of the large-terminal benchmark.
 #[allow(clippy::too_many_lines, reason = "one sequential benchmark script")]
 fn sized_case(fixture: &GitFixture, width: u16, height: u16, layout: ConfiguredLayout) {
@@ -314,6 +325,7 @@ fn sized_case(fixture: &GitFixture, width: u16, height: u16, layout: ConfiguredL
     );
     scenario.set_theme(Some(&host_theme(rgb(190, 120, 250))));
     let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, width, height));
+    terminal.set_scroll_region_acceleration(scroll_acceleration());
 
     // First frame with content after the index (paint only, as in `screen_benchmark`).
     scenario.render();
@@ -441,7 +453,8 @@ fn sized_case(fixture: &GitFixture, width: u16, height: u16, layout: ConfiguredL
 /// cargo test --release -p bcode_code_review_ui screen_benchmark_sizes -- --ignored --nocapture
 /// ```
 ///
-/// Set `BCODE_BENCH_SIZES` (for example `400x120,200x60`) to choose sizes.
+/// Set `BCODE_BENCH_SIZES` (for example `400x120,200x60`) to choose sizes, and
+/// `BCODE_BENCH_SCROLL` (`off`, `auto`, `margins`) to choose scroll-region acceleration.
 #[test]
 #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
 fn screen_benchmark_sizes() {

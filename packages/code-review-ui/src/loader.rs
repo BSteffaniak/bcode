@@ -44,17 +44,23 @@ pub enum Message {
     BlobText {
         /// Cache key of the highlight to produce.
         key: super::syntax::SyntaxKey,
+        /// Cancellation flag of the job.
+        token: super::syntax::JobToken,
         /// Path used to pick the grammar.
         path: String,
         /// Text, or `None` when the blob is binary, too large, or unreadable.
         text: Option<String>,
     },
-    /// A finished highlight.
+    /// Highlighted lines of one blob side: the lines done so far, or the finished highlight.
     Highlighted {
         /// Cache key of the highlight.
         key: super::syntax::SyntaxKey,
         /// Tokens, or `None` when highlighting was skipped.
         text: Option<Arc<bcode_syntax_render::HighlightedText>>,
+        /// Whether `text` covers the whole blob.
+        complete: bool,
+        /// Cancellation flag of the job that produced it.
+        token: super::syntax::JobToken,
     },
     /// A change token for refresh detection.
     Token {

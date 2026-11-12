@@ -1805,6 +1805,77 @@ Measured at 400×120 with the same `debug-release` setup (tmux plus `script(1)`,
 | Catch-up after held PageDown | 47 ms | 6 ms |
 | Burst of 100 `j` (and 300 `k`) | closes the review | stays open, last frame after 23 ms |
 
+**Surface and terminal-output costs (after phase 9).** The costs phase 8 attributed to the
+surface and to BMUX, which leaving the chat host does not remove, are fixed in the standalone app
+and in BMUX:
+
+* **Row measurement.** BMUX already retained item layouts by key, width, and layout revision;
+  paging was slow because every page shows rows never built before. While idle after each frame
+  the review now builds the rows of the viewport and the pages above and below it and has the list
+  lay them out (`VirtualSourceList::prepare_rows`, `VirtualListComponent::prepare_around`), so the
+  frame that reveals them only paints. Rows were also rebuilt whenever any highlight landed (one
+  global epoch in the row cache key); the key now holds a per-blob stamp
+  (`SyntaxStore::stamp`), so only the rows of the file whose highlight landed are rebuilt (in idle
+  time too). BMUX fills and writes printable ASCII a row slice at a time.
+* **Syntax highlighting.** Highlighting uses BMUX's incremental `TextHighlight` in steps of 2,000
+  lines on the blocking pool: the first step's lines show at once, and each job carries a cancel
+  token that `schedule_syntax` sets when its file leaves the screen (a blob read arriving after
+  that is dropped). Highlights of files off screen land without a frame; the run loop coalesces
+  wakes, so completions arriving together are drawn by one frame. On the 5k-file fixture the
+  highlighting CPU while paging is unchanged (about 20% of one core in both runs below): its files
+  are small, so jobs finish before their files leave the screen. Cancellation bounds the large
+  files.
+* **Scroll damage.** Virtual lists report how far their rows scrolled while painting
+  (`PaintCx::hint_scroll`), keeping full-repaint semantics. The app presents with
+  `ScrollRegionAcceleration::Auto`: BMUX counts the cells left to rewrite with and without the
+  scroll and scrolls full rows when that saves cells, also when the list is narrower than the
+  screen (the file panel's rows are then rewritten), or, under `AutoWithMargins`, only the list's
+  columns with left/right margins (DECLRMM). Margins are selected only for terminals detected by
+  `TerminalCapabilities::left_right_margins` (iTerm2, Ghostty, xterm, never inside tmux or screen).
+* **Terminal output.** BMUX's `TtyOutput` (Linux-only before) reopens stdout's terminal device on
+  every Unix, and the app presents through `AsyncTerminalPresenter`: frames are written by an
+  output thread and the runtime prepares no frame while one is in flight, then draws the latest
+  state, so superseded frames are never written. `Terminal::stage` moves the retained cells into
+  the staged frame instead of copying them.
+* **Wheel animation.** Wheel notches extend the running 90 ms motion. A notch now costs about
+  three frames of 0.8–1.0 ms of UI-thread work (paint, encode, idle preparation) at 400×120, with
+  the write on the output thread, so the animation was kept.
+
+Optimized `screen_benchmark_sizes` (paint p95 / average, bytes per frame; side-by-side in
+parentheses where different; `Auto` acceleration after):
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| 200×60 5k-file scroll paint p95 | 0.92 (1.05) ms | 0.52 (0.45) ms |
+| 200×60 held PageDown paint p95 | 0.87 (0.72) ms | 0.33 (0.30) ms |
+| 300×90 5k-file scroll paint p95 | 1.45 (1.59) ms | 0.83 (0.83) ms |
+| 300×90 held PageDown paint p95 | 1.33 (1.72) ms | 0.54 (0.91) ms |
+| 400×120 5k-file scroll paint p95 / avg | 2.20 / 1.51 (2.16 / 1.31) ms | 1.14 / 0.83 (1.16 / 0.83) ms |
+| 400×120 40k-line scroll paint p95 | 1.82 (2.01) ms | 0.85 (0.85) ms |
+| 400×120 held `j` paint p95 | 1.21 (1.22) ms | 0.88 (0.87) ms |
+| 400×120 held PageDown paint p95 / avg | 2.44 / 1.94 (2.48 / 2.18) ms | 1.18 / 0.83 (1.23 / 0.93) ms |
+| 400×120 10 queued `j` paint p95 | 2.11 (2.44) ms | 1.17 (1.27) ms |
+| 400×120 encode average | 0.42–0.50 ms | 0.38–0.58 ms (includes the scroll evaluation) |
+| 400×120 bytes, 5k-file scroll | 42 (54) KB | 28 (36) KB; 19 (28) KB with margins |
+| 400×120 bytes, 40k-line scroll | 56 (76) KB | 28 (34) KB; 20 (25) KB with margins |
+| 400×120 bytes, held `j` | 19 (32) KB | 6.3 (9.8) KB; 3.1 (6.8) KB with margins |
+| 400×120 bytes, held PageDown | 59 (69) KB | unchanged (a page moves every row) |
+
+Real app (`bcode-review range fixture/base main` on the exported 5k-file fixture, `debug-release`
+build with `codegen-units=16`, 400×120 tmux pane under `script(1)`, 15 s of input, `sample`;
+before is the same app without these changes; per presented frame):
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| PageDown: render / encode | 1.64 / 0.37 ms | 0.76 / 0.40 ms |
+| PageDown: blocking write on the UI thread | 1.52 ms | none (1.48 ms on the output thread) |
+| PageDown: idle preparation after the frame | none | 1.08 ms |
+| `j`: render / encode / write on the UI thread | 1.09 / 0.28 / 1.04 ms | 0.70 / 0.27 / none |
+| `j`: bytes per frame | 38 KB | 18 KB (scroll regions in 171 of 375 frames) |
+| Wheel: render / encode / write on the UI thread | 0.93 / 0.22 / 0.94 ms | 0.48 / 0.37 / none |
+| Wheel: bytes per frame | 40 KB | 19 KB (scroll regions in 288 of 671 frames) |
+| Highlighting CPU while paging | 3.2 s of 15 s | 3.0 s of 15 s |
+
 ### 13.3 Phase 9: standalone app
 
 * **Crates.** `packages/code-review-ui` (the review UI, moved from `src/v2/tui/`) and

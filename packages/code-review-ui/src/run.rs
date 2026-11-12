@@ -20,11 +20,16 @@ use std::sync::{Arc, Mutex};
 use bcode_code_review::ReviewStore;
 use bcode_session_models::SessionId;
 use bcode_tui_theme::components::ComponentStyles;
+use bmux_tui::capabilities::TerminalCapabilities;
 use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::event::EventOutcome;
+use bmux_tui::focus::FocusTrap;
 use bmux_tui::geometry::Rect;
+use bmux_tui::hit::HitMap;
 use bmux_tui::paint::PaintCx;
-use bmux_tui::terminal::Terminal;
+#[cfg(unix)]
+use bmux_tui::terminal::TtyOutput;
+use bmux_tui::terminal::{ScrollRegionAcceleration, Terminal};
 use bmux_tui_runtime::{Program, RuntimeEvent, RuntimeHandle, Update};
 
 use crate::action::Action;
@@ -257,8 +262,122 @@ fn paint(app: &mut App, cx: &mut PaintCx<'_, '_>) {
     app.paint(cx);
 }
 
-type Presenter =
-    bmux_tui_runtime::TerminalPresenter<std::io::Stdout, fn(&mut App, &mut PaintCx<'_, '_>)>;
+/// The app paints from its own state and routes input with its own hit testing, so committed
+/// interaction scenes need no observer.
+const fn committed(_app: &mut App, _hits: &HitMap, _focus: &FocusTrap) {}
+
+type Render = fn(&mut App, &mut PaintCx<'_, '_>);
+type Commit = fn(&mut App, &HitMap, &FocusTrap);
+
+/// Presents frames to the terminal: through an output thread over a separate nonblocking
+/// descriptor of the terminal where the platform allows it, so a slow terminal never blocks
+/// input handling (the runtime draws the latest state once the previous frame is delivered,
+/// so frames superseded meanwhile are never written), else directly to stdout.
+///
+/// Both move rows with terminal scroll regions when the review list scrolls, with left/right
+/// margins on terminals known to support them, so a scroll writes only the rows it reveals.
+enum AppPresenter {
+    #[cfg(unix)]
+    Async(Box<bmux_tui_runtime::AsyncTerminalPresenter<TtyOutput, Render, Commit>>),
+    Blocking(Box<bmux_tui_runtime::TerminalPresenter<std::io::Stdout, Render>>),
+}
+
+impl AppPresenter {
+    fn new(area: Rect) -> Self {
+        let acceleration = if TerminalCapabilities::left_right_margins() {
+            ScrollRegionAcceleration::AutoWithMargins
+        } else {
+            ScrollRegionAcceleration::Auto
+        };
+        #[cfg(unix)]
+        if let Ok(output) = TtyOutput::open() {
+            let mut terminal = Terminal::new(Vec::new(), area);
+            terminal.set_scroll_region_acceleration(acceleration);
+            return Self::Async(Box::new(bmux_tui_runtime::AsyncTerminalPresenter::new(
+                terminal,
+                output,
+                paint as Render,
+                committed as Commit,
+            )));
+        }
+        let mut terminal = Terminal::new(std::io::stdout(), area);
+        terminal.set_scroll_region_acceleration(acceleration);
+        Self::Blocking(Box::new(bmux_tui_runtime::TerminalPresenter::new(
+            terminal,
+            paint as Render,
+        )))
+    }
+}
+
+/// Forward a presenter call to whichever presenter is active.
+macro_rules! forward {
+    ($self:ident, $presenter:ident => $call:expr) => {
+        match $self {
+            #[cfg(unix)]
+            Self::Async($presenter) => $call,
+            Self::Blocking($presenter) => $call,
+        }
+    };
+}
+
+impl bmux_tui_runtime::Presenter<App> for AppPresenter {
+    type Error = std::io::Error;
+
+    fn resize(&mut self, size: bmux_tui::geometry::Size) {
+        forward!(self, presenter => bmux_tui_runtime::Presenter::<App>::resize(presenter.as_mut(), size));
+    }
+
+    fn reset(&mut self, reason: bmux_tui_runtime::ResetReason) {
+        forward!(self, presenter => bmux_tui_runtime::Presenter::<App>::reset(presenter.as_mut(), reason));
+    }
+
+    fn present(&mut self, program: &mut App) -> std::io::Result<bmux_tui_runtime::PresentReport> {
+        forward!(self, presenter => presenter.present(program))
+    }
+
+    fn start_present(
+        &mut self,
+        program: &mut App,
+    ) -> std::io::Result<Option<bmux_tui_runtime::PresentReport>> {
+        forward!(self, presenter => presenter.start_present(program))
+    }
+
+    fn poll_present(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        program: &mut App,
+    ) -> std::task::Poll<std::io::Result<bmux_tui_runtime::PresentReport>> {
+        forward!(self, presenter => presenter.poll_present(cx, program))
+    }
+
+    fn cancel_present(&mut self) {
+        forward!(self, presenter => bmux_tui_runtime::Presenter::<App>::cancel_present(presenter.as_mut()));
+    }
+
+    fn observe_terminal_event(&mut self, event: &bmux_tui::event::Event) -> bool {
+        forward!(self, presenter => bmux_tui_runtime::Presenter::<App>::observe_terminal_event(presenter.as_mut(), event))
+    }
+
+    fn set_pointer_context(&mut self, context: bmux_tui::terminal::PointerContext) {
+        forward!(self, presenter => bmux_tui_runtime::Presenter::<App>::set_pointer_context(presenter.as_mut(), context));
+    }
+
+    fn set_presentation_clock(&mut self, clock: bmux_tui::clock::PresentationClock) {
+        forward!(self, presenter => bmux_tui_runtime::Presenter::<App>::set_presentation_clock(presenter.as_mut(), clock));
+    }
+
+    async fn restore(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Async(presenter) => {
+                bmux_tui_runtime::Presenter::<App>::restore(presenter.as_mut()).await
+            }
+            Self::Blocking(presenter) => {
+                bmux_tui_runtime::Presenter::<App>::restore(presenter.as_mut()).await
+            }
+        }
+    }
+}
 
 /// The runtime of the current terminal session, which host redraw requests wake.
 type WakeTarget = Arc<Mutex<Option<RuntimeHandle<Msg>>>>;
@@ -300,8 +419,7 @@ async fn session(app: App, target: &WakeTarget) -> Result<App, RunError> {
     let terminal_error = |error: std::io::Error| RunError::Terminal(error.to_string());
     let guard = CrosstermTerminalGuard::enter(std::io::stdout()).map_err(terminal_error)?;
     let size = terminal_size().map_err(terminal_error)?;
-    let terminal = Terminal::new(std::io::stdout(), Rect::new(0, 0, size.width, size.height));
-    let presenter: Presenter = bmux_tui_runtime::TerminalPresenter::new(terminal, paint);
+    let presenter = AppPresenter::new(Rect::new(0, 0, size.width, size.height));
     app.wake_pending.store(false, Ordering::Release);
     let (runtime, handle) =
         bmux_tui_runtime::Runtime::new(app, presenter, bmux_tui_runtime::RuntimeConfig::default());
