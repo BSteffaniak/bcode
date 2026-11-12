@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bcode_client::BcodeClient;
-use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
     PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest, PluginSessionViewUpdate,
     PluginStructuredGenerationFuture, PluginStructuredGenerationRequest, PluginTask, PluginTuiHost,
@@ -27,9 +26,6 @@ use bcode_plugin_sdk::tui::{
     PluginWorkflowTemplateStartRequest,
 };
 use bcode_session_models::SessionId;
-use bcode_session_view::SessionView;
-use bcode_session_view_models::PermissionView;
-use bcode_session_view_models::SessionConnectionViewStatus;
 use bmux_tui_runtime::InvalidationSignal;
 use tokio::sync::mpsc;
 
@@ -956,215 +952,56 @@ fn workflow_inspection(
     })
 }
 
+/// Delivers a followed session's updates to a plugin surface and requests a redraw for each.
+struct PluginSessionViewSink {
+    sender: mpsc::Sender<PluginSessionViewUpdate>,
+    redraw: InvalidationSignal,
+}
+
+impl bcode_session_view::follow::SessionViewSink for PluginSessionViewSink {
+    async fn deliver(
+        &mut self,
+        update: bcode_session_view::follow::SessionViewFollowUpdate,
+    ) -> bool {
+        use bcode_session_view::follow::SessionViewFollowUpdate;
+        let update = match update {
+            SessionViewFollowUpdate::Snapshot(snapshot) => {
+                PluginSessionViewUpdate::Snapshot(snapshot)
+            }
+            SessionViewFollowUpdate::Disconnected { message } => {
+                PluginSessionViewUpdate::Disconnected { message }
+            }
+        };
+        if self.sender.send(update).await.is_err() {
+            return false;
+        }
+        self.redraw.request();
+        true
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
 async fn stream_plugin_session_view(
     client: BcodeClient,
     request: PluginSessionViewSubscriptionRequest,
     sender: mpsc::Sender<PluginSessionViewUpdate>,
     redraw: InvalidationSignal,
 ) {
-    if let Err(error) = Box::pin(stream_plugin_session_view_inner(
-        client,
-        request,
-        sender.clone(),
-        redraw.clone(),
+    let follow = bcode_session_view::follow::SessionViewFollow {
+        session_id: request.session_id,
+        projection: request.projection,
+        reasoning_policy: request.reasoning_policy,
+        client_name: "bcode-plugin-tui-session-view".to_owned(),
+        interaction_kind: Some(super::effects::interaction_kind_resolver()),
+    };
+    let mut sink = PluginSessionViewSink { sender, redraw };
+    Box::pin(bcode_session_view::follow::follow_session_view(
+        client, follow, &mut sink,
     ))
-    .await
-    {
-        let _ = sender
-            .send(PluginSessionViewUpdate::Disconnected {
-                message: error.to_string(),
-            })
-            .await;
-        redraw.request();
-    }
-}
-
-async fn attach_plugin_session_view(
-    client: &BcodeClient,
-    connection: &mut bcode_client::ClientConnection,
-    request: &PluginSessionViewSubscriptionRequest,
-) -> Result<SessionView, bcode_client::ClientError> {
-    let attached = connection
-        .attach_session_projection_window_with_input_history(
-            request.session_id,
-            request.projection.clone(),
-        )
-        .await?;
-    let runtime = attached.runtime_selection;
-    let mut view = SessionView::new();
-    view.set_session_summary(attached.session);
-    view.set_runtime_selection(
-        runtime.provider_plugin_id,
-        runtime.requested_model_id.or(runtime.model_id),
-        runtime.effective_model_id,
-        runtime.reasoning_effort,
-        runtime.reasoning_summary,
-        None,
-    );
-    view.set_agent_id(runtime.agent_id);
-    view.set_reasoning_presentation_policy(request.reasoning_policy);
-    if let Some(window) = attached.projection_window.as_ref() {
-        view.set_history_window_metadata(
-            window.source_range.map(|range| range.start_sequence),
-            window.source_range.map(|range| range.end_sequence),
-            window.has_older,
-            window.has_newer,
-        );
-    }
-    view.apply_history(&attached.history);
-    for record in &attached.submissions {
-        view.apply_submission_record(record);
-    }
-    let permissions = client_permission_views(
-        client.list_permissions().await.unwrap_or_default(),
-        request.session_id,
-    );
-    view.set_pending_permissions(permissions);
-    if let Ok(runtime_work) = client.list_runtime_work(request.session_id).await {
-        view.set_runtime_work_snapshots(&runtime_work);
-    }
-    if let Ok(interactions) =
-        super::effects::load_pending_interactions(client, request.session_id).await
-    {
-        view.set_pending_interactions(interactions);
-    }
-    view.set_connection_status(SessionConnectionViewStatus::Attached);
-    Ok(view)
-}
-
-fn client_permission_views(
-    permissions: Vec<bcode_ipc::PermissionSummary>,
-    session_id: SessionId,
-) -> Vec<PermissionView> {
-    permissions
-        .into_iter()
-        .filter(|permission| permission.is_addressed_to(session_id))
-        .map(|permission| PermissionView {
-            permission_id: permission.permission_id,
-            session_id: Some(permission.session_id),
-            tool_call_id: permission.tool_call_id,
-            tool_name: permission.tool_name,
-            producer_plugin_id: None,
-            arguments_json: permission.arguments_json,
-            batch: permission
-                .batch
-                .map(|batch| bcode_session_view_models::PermissionBatchView {
-                    batch_id: batch.batch_id,
-                    call_index: batch.call_index,
-                    call_count: batch.call_count,
-                }),
-            agent_id: permission.agent_id,
-            title: Some("Permission requested".to_string()),
-            policy_source: permission.policy_source,
-            detail: permission.policy_reason,
-            resolved: false,
-            approved: None,
-            can_remember: permission.can_remember_policy,
-        })
-        .collect()
-}
-
-async fn send_plugin_session_snapshot(
-    sender: &mpsc::Sender<PluginSessionViewUpdate>,
-    redraw: &InvalidationSignal,
-    view: &SessionView,
-) -> bool {
-    if sender
-        .send(PluginSessionViewUpdate::Snapshot(Box::new(
-            view.snapshot().clone(),
-        )))
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    redraw.request();
-    true
-}
-
-async fn stream_plugin_session_view_inner(
-    client: BcodeClient,
-    request: PluginSessionViewSubscriptionRequest,
-    sender: mpsc::Sender<PluginSessionViewUpdate>,
-    redraw: InvalidationSignal,
-) -> Result<(), bcode_client::ClientError> {
-    let session_id = request.session_id;
-    let mut connection = client.connect("bcode-plugin-tui-session-view").await?;
-    let mut view = attach_plugin_session_view(&client, &mut connection, &request).await?;
-    if !send_plugin_session_snapshot(&sender, &redraw, &view).await {
-        return Ok(());
-    }
-
-    let mut reconnect_delay = std::time::Duration::from_millis(100);
-    loop {
-        let needs_resync = match match tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            connection.recv_event(),
-        )
-        .await
-        {
-            Ok(event) => event,
-            Err(_) if sender.is_closed() => return Ok(()),
-            Err(_) => continue,
-        } {
-            Ok(BcodeEvent::SessionViewResyncRequired {
-                session_id: required,
-            }) if required == session_id => true,
-            Ok(event) => {
-                let changed = match event {
-                    BcodeEvent::Session(event) | BcodeEvent::RuntimeWork(event)
-                        if event.session_id == session_id =>
-                    {
-                        view.apply_event(&event);
-                        true
-                    }
-                    BcodeEvent::SessionLive(event) if event.session_id == session_id => {
-                        view.apply_live_event(&event);
-                        true
-                    }
-                    BcodeEvent::Session(_)
-                    | BcodeEvent::SessionLive(_)
-                    | BcodeEvent::RuntimeWork(_)
-                    | BcodeEvent::Workflow(_)
-                    | BcodeEvent::SessionViewResyncRequired { .. }
-                    | BcodeEvent::SessionCatalogUpdated { .. } => false,
-                };
-                if changed && !send_plugin_session_snapshot(&sender, &redraw, &view).await {
-                    return Ok(());
-                }
-                false
-            }
-            Err(_error) => true,
-        };
-        if !needs_resync {
-            continue;
-        }
-
-        view.set_connection_status(SessionConnectionViewStatus::Reconnecting);
-        if !send_plugin_session_snapshot(&sender, &redraw, &view).await {
-            return Ok(());
-        }
-        drop(connection);
-        loop {
-            if sender.is_closed() {
-                return Ok(());
-            }
-            if let Ok(mut next_connection) = client.connect("bcode-plugin-tui-session-view").await
-                && let Ok(next_view) =
-                    attach_plugin_session_view(&client, &mut next_connection, &request).await
-            {
-                view = next_view;
-                if !send_plugin_session_snapshot(&sender, &redraw, &view).await {
-                    return Ok(());
-                }
-                connection = next_connection;
-                reconnect_delay = std::time::Duration::from_millis(100);
-                break;
-            }
-            tokio::time::sleep(reconnect_delay).await;
-            reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
-        }
-    }
+    .await;
 }
 
 fn workflow_event_refreshes_selected_detail(

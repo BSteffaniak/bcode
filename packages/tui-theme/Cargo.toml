@@ -11,9 +11,15 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_markdown_render            = { workspace = true, optional = true }
+bcode_syntax_render              = { workspace = true, optional = true }
 bcode_presentation_policy_models = { workspace = true }
 bmux_color                       = { workspace = true, features = ["serde"] }
 bmux_tui                         = { workspace = true, features = ["serde"] }
+bmux_tui_components = { workspace = true, optional = true, features = [
+    "diff-viewer",
+    "source-viewer",
+] }
 serde                            = { workspace = true, features = ["derive", "std"] }
 thiserror                        = { workspace = true }
 toml                             = { workspace = true }
@@ -23,6 +29,12 @@ serde_json = { workspace = true, features = ["std"] }
 tempfile   = { workspace = true }
 
 [features]
+# Component styles (component theme, source, diff, markdown, and syntax) from resolved themes.
+components = [
+    "dep:bcode_markdown_render",
+    "dep:bcode_syntax_render",
+    "dep:bmux_tui_components",
+]
 default = []
 fail-on-warnings = [
     "bcode_presentation_policy_models/fail-on-warnings",

@@ -3746,9 +3746,12 @@ dependencies = [
 name = "bcode_tui_theme"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_markdown_render",
  "bcode_presentation_policy_models",
+ "bcode_syntax_render",
  "bmux_color",
  "bmux_tui",
+ "bmux_tui_components",
  "serde",
  "serde_json",
  "tempfile",

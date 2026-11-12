@@ -10,6 +10,8 @@
 pub mod bundled;
 pub mod check;
 pub mod chrome;
+#[cfg(feature = "components")]
+pub mod components;
 pub mod contrast;
 pub mod definition;
 pub mod discovery;

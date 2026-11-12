@@ -19,6 +19,8 @@ pub mod execution;
 pub mod external;
 pub mod external_projection;
 mod external_reducer;
+#[cfg(feature = "client")]
+pub mod follow;
 pub mod navigation;
 pub mod presentation;
 mod queue_refresh;

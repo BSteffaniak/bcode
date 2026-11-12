@@ -4259,51 +4259,25 @@ const fn interaction_adapter_for_exchange(
     None
 }
 
+/// Interaction kinds of pending tool exchanges from the bundled plugins' interaction adapters.
+pub fn interaction_kind_resolver() -> bcode_session_view::follow::InteractionKindResolver {
+    std::sync::Arc::new(|producer_id: &str, schema: &str, schema_version: u32| {
+        interaction_adapter_for_exchange(producer_id, schema, schema_version, "tui")
+            .map(|adapter| adapter.interaction_kind)
+    })
+}
+
 pub async fn load_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
 ) -> Result<Vec<bcode_session_view_models::InteractionViewSummary>, ClientError> {
-    let mut interactions = Vec::new();
-    for request in client
-        .list_pending_tool_exchanges()
-        .await?
-        .into_iter()
-        .filter(|request| request.is_addressed_to(session_id))
-    {
-        let exchange = request.request;
-        let interaction_id = exchange.exchange_id.clone();
-        let producer_id = exchange.producer_id.clone();
-        let exchange_schema = exchange.schema.clone();
-        let exchange_schema_version = exchange.schema_version;
-        let snapshot = exchange.payload;
-        let adapter = interaction_adapter_for_exchange(
-            &exchange.producer_id,
-            &exchange.schema,
-            exchange.schema_version,
-            "tui",
-        );
-        let kind = adapter.as_ref().map_or_else(
-            || exchange.schema.clone(),
-            |adapter| adapter.interaction_kind.clone(),
-        );
-        interactions.push(bcode_session_view_models::InteractionViewSummary {
-            interaction_id,
-            producer_id: Some(producer_id),
-            exchange_schema: Some(exchange_schema),
-            exchange_schema_version: Some(exchange_schema_version),
-            kind,
-            tool_call_id: Some(exchange.invocation_id),
-            title: Some(exchange.producer_id),
-            required: exchange.response_policy
-                == bcode_session_models::ToolExchangeResponsePolicy::Required,
-            snapshot: Some(snapshot),
-            state: bcode_session_view_models::InteractionViewState::Pending,
-            status_detail: None,
-            resolved: false,
-            resolution: None,
-        });
-    }
-    Ok(interactions)
+    let resolver = interaction_kind_resolver();
+    bcode_session_view::follow::load_pending_interactions(
+        client,
+        session_id,
+        Some(resolver.as_ref()),
+    )
+    .await
 }
 
 const fn active_turn_cancel_action(session_id: SessionId) -> SessionViewAction {

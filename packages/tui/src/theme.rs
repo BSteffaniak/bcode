@@ -6,9 +6,7 @@ use std::num::ParseIntError;
 
 use bcode_config::{TuiAgentAccentPolicy, TuiThemeVariant};
 use bmux_tui::style::{Color, Modifier};
-use bmux_tui_components::theme::{
-    ComponentChrome, ComponentStateSurfaces, ComponentSurfaces, ComponentTheme,
-};
+use bmux_tui_components::theme::{ComponentChrome, ComponentSurfaces, ComponentTheme};
 
 use super::app::BmuxApp;
 
@@ -668,91 +666,28 @@ pub(crate) fn resolved_definition_theme(
     accent: Color,
 ) -> ResolvedTheme {
     let style = |role: &str| theme.and_then(|theme| theme.style(role));
-    let color = |name: &str| theme.and_then(|theme| theme.color(name));
-    let text = style("text.primary").unwrap_or_else(|| {
-        color("text").map_or_else(bmux_tui::style::Style::new, |color| {
-            bmux_tui::style::Style::new().fg(color)
-        })
-    });
-    let muted = style("text.muted").unwrap_or_else(|| {
-        color("muted").map_or_else(
-            || bmux_tui::style::Style::new().add_modifier(Modifier::DIM),
-            |color| bmux_tui::style::Style::new().fg(color),
-        )
-    });
-    let border = style("border.default").unwrap_or(muted);
-    let focused =
-        style("border.focused").unwrap_or_else(|| bmux_tui::style::Style::new().fg(accent));
-    let canvas = style("canvas")
-        .unwrap_or_else(bmux_tui::style::Style::new)
-        .patch(text);
+    let shared = bcode_tui_theme::components::component_styles(theme, accent);
+    let component_theme = shared.component;
+    let text = component_theme.text;
+    let muted = component_theme.muted;
+    let border = component_theme.border;
+    let focused = component_theme.focused;
+    let canvas = component_theme.canvas;
     let surfaces = SurfaceTheme {
-        raised: style("surface.raised").unwrap_or(canvas).patch(text),
-        overlay: style("surface.overlay").unwrap_or(canvas).patch(text),
-        control_focused: style("control.focused").unwrap_or(focused),
-        scrim: style("surface.scrim"),
+        raised: component_theme.surfaces.raised,
+        overlay: component_theme.surfaces.overlay,
+        control_focused: shared.control_focused,
+        scrim: component_theme.surfaces.scrim,
     };
-    let selection = style("selection.active")
-        .unwrap_or_else(|| bmux_tui::style::Style::new().add_modifier(Modifier::REVERSED));
-    let info = style("state.info").unwrap_or_else(|| bmux_tui::style::Style::new().fg(accent));
-    let success = style("state.success").unwrap_or(text);
-    let warning = style("state.warning").unwrap_or(text);
-    let error = style("state.error").unwrap_or(text);
-    let markdown = markdown_theme(theme, text, muted);
-    let syntax = syntax_palette(theme, text, muted, info, success, warning);
-    let title = style("title").unwrap_or_else(|| info.add_modifier(Modifier::BOLD));
-    let link = style("link")
-        .or_else(|| style("markdown.link"))
-        .unwrap_or_else(|| info.add_modifier(Modifier::UNDERLINE));
-    let component_theme = ComponentTheme {
-        canvas,
-        surfaces: ComponentSurfaces {
-            normal: canvas,
-            raised: surfaces.raised,
-            overlay: surfaces.overlay,
-            scrim: surfaces.scrim,
-        },
-        text,
-        accent: style("accent").unwrap_or(info),
-        title,
-        focused,
-        hover: style("control.hover").unwrap_or(info),
-        selected: selection,
-        selected_inactive: style("selection.inactive").unwrap_or(selection),
-        disabled: muted.add_modifier(Modifier::DIM),
-        muted,
-        link,
-        info,
-        success,
-        warning,
-        error,
-        state_surfaces: ComponentStateSurfaces {
-            info: style("state.info.surface").unwrap_or_default(),
-            success: style("state.success.surface").unwrap_or_default(),
-            warning: style("state.warning.surface").unwrap_or_default(),
-            error: style("state.error.surface").unwrap_or_default(),
-        },
-        border,
-        border_focused: style("border.focused.panel").unwrap_or(focused),
-        chrome: theme.map_or(ComponentChrome::DEFAULT, chrome::component_chrome),
-    };
-    let mut source = bcode_tui_components::source_viewer::source_viewer_style(component_theme);
-    source.source = style("source.text").unwrap_or(source.source);
-    source.border = style("source.border").unwrap_or(source.border);
-    source.gutter = style("source.gutter").unwrap_or(source.gutter);
-    source.truncated = style("source.truncated").unwrap_or(source.truncated);
-    let mut diff = bcode_tui_components::diff_viewer::diff_viewer_style(component_theme);
-    diff.text = style("diff.text").unwrap_or(diff.text);
-    diff.muted = style("diff.muted").unwrap_or(diff.muted);
-    diff.title = style("diff.title").unwrap_or(diff.title);
-    diff.label = style("diff.label").unwrap_or(diff.label);
-    diff.added = style("diff.added").unwrap_or(diff.added);
-    diff.removed = style("diff.removed").unwrap_or(diff.removed);
-    diff.hunk = style("diff.hunk").unwrap_or(diff.hunk);
-    diff.added_row = style("diff.added_row").unwrap_or(diff.added_row);
-    diff.removed_row = style("diff.removed_row").unwrap_or(diff.removed_row);
-    diff.added_emphasis = style("diff.added_emphasis").unwrap_or(diff.added_emphasis);
-    diff.removed_emphasis = style("diff.removed_emphasis").unwrap_or(diff.removed_emphasis);
+    let selection = component_theme.selected;
+    let info = component_theme.info;
+    let success = component_theme.success;
+    let warning = component_theme.warning;
+    let error = component_theme.error;
+    let markdown = shared.markdown;
+    let syntax = shared.syntax;
+    let source = shared.source;
+    let diff = shared.diff;
     let default_container = definition::ContainerRecipe {
         layout: definition::ContainerLayout::Plain,
         width: definition::ContainerWidth::Content,
@@ -842,90 +777,11 @@ pub(crate) fn resolved_definition_theme(
         diff,
         containers,
         transcript,
-        dialog_chrome: theme.map_or(ComponentChrome::DEFAULT, chrome::dialog_chrome),
+        dialog_chrome: shared.dialog_chrome,
         unit_chrome,
         effects,
         component: component_theme,
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
-    }
-}
-
-fn syntax_palette(
-    theme: Option<&definition::ResolvedThemeDefinition>,
-    text: bmux_tui::style::Style,
-    muted: bmux_tui::style::Style,
-    info: bmux_tui::style::Style,
-    success: bmux_tui::style::Style,
-    warning: bmux_tui::style::Style,
-) -> bcode_syntax_render::SyntaxPalette {
-    use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
-
-    let style_color = |style: bmux_tui::style::Style, fallback: SyntaxColor| {
-        style.fg.map_or(fallback, tui_color_to_syntax)
-    };
-    let text_color = style_color(text, SyntaxColor::Default);
-    let muted_color = style_color(muted, text_color);
-    let info_color = style_color(info, text_color);
-    let success_color = style_color(success, text_color);
-    let warning_color = style_color(warning, text_color);
-    let color = |role: &str, fallback: SyntaxColor| {
-        theme
-            .and_then(|theme| theme.style(role).and_then(|style| style.fg))
-            .map_or(fallback, tui_color_to_syntax)
-    };
-    SyntaxPalette {
-        text: color("syntax.text", text_color),
-        comment: color("syntax.comment", muted_color),
-        keyword: color("syntax.keyword", info_color),
-        function: color("syntax.function", info_color),
-        variable: color("syntax.variable", text_color),
-        string: color("syntax.string", success_color),
-        number: color("syntax.number", warning_color),
-        type_name: color("syntax.type", info_color),
-        operator: color("syntax.operator", text_color),
-        punctuation: color("syntax.punctuation", text_color),
-        heading: color("syntax.heading", info_color),
-        link: color("syntax.link", info_color),
-        raw: color("syntax.raw", success_color),
-    }
-}
-
-const fn tui_color_to_syntax(color: Color) -> bcode_syntax_render::SyntaxColor {
-    bcode_syntax_render::SyntaxColor::from_tui(color)
-}
-
-fn markdown_theme(
-    theme: Option<&definition::ResolvedThemeDefinition>,
-    text: bmux_tui::style::Style,
-    muted: bmux_tui::style::Style,
-) -> bcode_markdown_render::MarkdownTheme {
-    let defaults = bcode_markdown_render::MarkdownTheme::default();
-    let role = |name: &str, fallback: bmux_tui::style::Style| {
-        theme
-            .and_then(|theme| theme.style(name))
-            .unwrap_or(fallback)
-    };
-    bcode_markdown_render::MarkdownTheme {
-        text: role("markdown.text", text),
-        heading: role("markdown.heading", defaults.heading),
-        link: role("markdown.link", defaults.link),
-        strong: role("markdown.strong", defaults.strong),
-        emphasis: role("markdown.emphasis", defaults.emphasis),
-        strikethrough: role("markdown.strikethrough", defaults.strikethrough),
-        inline_code: role("markdown.inline_code", defaults.inline_code),
-        code_block_text: role("markdown.code_block_text", defaults.code_block_text),
-        code_block_border: role("markdown.code_block_border", muted),
-        blockquote_bar: role("markdown.blockquote_bar", muted),
-        alert_note: role("markdown.alert_note", defaults.alert_note),
-        alert_tip: role("markdown.alert_tip", defaults.alert_tip),
-        alert_important: role("markdown.alert_important", defaults.alert_important),
-        alert_warning: role("markdown.alert_warning", defaults.alert_warning),
-        alert_caution: role("markdown.alert_caution", defaults.alert_caution),
-        list_marker: role("markdown.list_marker", muted),
-        task_checked: role("markdown.task_checked", muted),
-        task_unchecked: role("markdown.task_unchecked", muted),
-        table_border: role("markdown.table_border", muted),
-        horizontal_rule: role("markdown.horizontal_rule", muted),
     }
 }
 
