@@ -37,6 +37,9 @@ pub enum InstalledBcodeError {
     /// No Bcode executable was found.
     #[error("Bcode is not installed: no `bcode` executable on PATH (set BCODE_BIN to choose one)")]
     NotInstalled,
+    /// `BCODE_BIN` is set but does not name an executable file.
+    #[error("BCODE_BIN does not name an executable file: {0}")]
+    InvalidOverride(PathBuf),
     /// The installed Bcode has no running daemon, and starting one was not allowed.
     #[error("Bcode is not running; start bcode and try again")]
     NotRunning,
@@ -97,6 +100,8 @@ impl BcodeClient {
     ///
     /// # Errors
     ///
+    /// * [`InstalledBcodeError::InvalidOverride`] when `BCODE_BIN` is set to something that is
+    ///   not an executable file.
     /// * [`InstalledBcodeError::NotInstalled`] when no executable is found.
     /// * [`InstalledBcodeError::NotRunning`] when no daemon is running and `start` is
     ///   [`InstalledDaemonStart::Never`].
@@ -108,13 +113,24 @@ impl BcodeClient {
     pub async fn for_installed_bcode(
         start: InstalledDaemonStart,
     ) -> Result<InstalledBcode, InstalledBcodeError> {
-        let executable = bcode_daemon_lifecycle::installed_bcode_executable()
-            .ok_or(InstalledBcodeError::NotInstalled)?;
+        let executable = bcode_daemon_lifecycle::installed_bcode_executable().ok_or_else(|| {
+            not_found(std::env::var_os(bcode_daemon_lifecycle::BCODE_BIN_ENV).as_deref())
+        })?;
         let target = verified_target(&executable, start).await?;
         let (config, _) = crate::load_current_client_config()?;
         let client = Self::for_daemon(target, &config, crate::current_working_directory())?;
         Ok(InstalledBcode { client, executable })
     }
+}
+
+/// Why no executable was found: the `BCODE_BIN` override (when set) names none, else there is
+/// no `bcode` on `PATH`.
+fn not_found(bcode_bin: Option<&std::ffi::OsStr>) -> InstalledBcodeError {
+    bcode_bin
+        .filter(|value| !value.is_empty())
+        .map_or(InstalledBcodeError::NotInstalled, |value| {
+            InstalledBcodeError::InvalidOverride(PathBuf::from(value))
+        })
 }
 
 async fn verified_target(
@@ -166,5 +182,24 @@ async fn verified_target(
             }
             Err(error) => return Err(unverified(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broken_override_is_reported_as_such() {
+        assert!(matches!(not_found(None), InstalledBcodeError::NotInstalled));
+        assert!(matches!(
+            not_found(Some(std::ffi::OsStr::new(""))),
+            InstalledBcodeError::NotInstalled
+        ));
+        let error = not_found(Some(std::ffi::OsStr::new("/opt/bcode-typo")));
+        assert_eq!(
+            error.to_string(),
+            "BCODE_BIN does not name an executable file: /opt/bcode-typo"
+        );
     }
 }

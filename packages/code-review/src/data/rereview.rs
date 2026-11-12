@@ -135,7 +135,9 @@ pub fn patch_ids(
         response.patch_ids.entry(path).or_insert(id);
     }
     if request.head == RevisionRef::WorkingTree {
-        response.content_ids = content_ids(root, &request.paths)?;
+        // Content ids only refine viewed state; a file that changed or vanished between the
+        // diff and hashing must not fail the fingerprints themselves.
+        response.content_ids = content_ids(root, &request.paths).unwrap_or_default();
     }
     Ok(response)
 }

@@ -64,7 +64,8 @@ linked sessions, for plugin services, and for `publish-github`.
   (`o`) runs `bcode tui <session>` with the same executable.
 * The standalone `bcode-review` is not the Bcode executable, so its own artifact names no daemon.
   On first use it reaches the user's installed Bcode with
-  `BcodeClient::for_installed_bcode`: the executable is `BCODE_BIN` when set, else the first
+  `BcodeClient::for_installed_bcode`: the executable is `BCODE_BIN` when set (a value that is
+  not an executable file is reported as such, never replaced by another Bcode), else the first
   `bcode` on `PATH`; its daemon for the current state and configuration scope is verified
   (`DaemonTarget::verify`) and, when none is running, started with `bcode server start` the way
   Bcode starts its own. Linked sessions open with that same executable. A missing executable or a
