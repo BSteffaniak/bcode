@@ -149,7 +149,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 61 combines upstream contracts with managed execution lifecycle observations.
 /// Older positional payloads are rejected.
 /// Version 63 adds session origin at creation and origin catalog filters.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 63;
+/// Version 64 adds client-provided tools, session claims and their invocation events.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 64;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1815,6 +1816,25 @@ pub enum Request {
     PrepareSessionCompactionRecovery {
         request: bcode_session_models::SessionCompactionRecoveryDiscoveryRequest,
     },
+    /// Register the tools this connection implements, replacing its previous registration.
+    /// Rejected whole when any name collides with a plugin tool or another live provider.
+    RegisterClientTools {
+        provider_id: String,
+        tools: Vec<bcode_tool::client_tool::ClientToolDescriptor>,
+    },
+    /// Offer this connection's registered tools in a session; the most recent claim routes.
+    ClaimClientToolSession {
+        session_id: SessionId,
+    },
+    /// Stop offering this connection's tools in a session.
+    ReleaseClientToolSession {
+        session_id: SessionId,
+    },
+    /// Answer one client tool invocation sent to this connection.
+    ClientToolResult {
+        invocation_id: String,
+        outcome: bcode_tool::client_tool::ClientToolOutcome,
+    },
 }
 
 /// Server stop request policy.
@@ -3322,6 +3342,23 @@ pub enum ResponsePayload {
     SessionCompactionRecoveryPrepared {
         preparation: bcode_session_models::SessionCompactionRecoveryPreparation,
     },
+    /// The connection's client tools are registered.
+    ClientToolsRegistered {
+        provider_id: String,
+        tool_count: usize,
+    },
+    /// The connection now routes its tools for the session.
+    ClientToolSessionClaimed {
+        session_id: SessionId,
+    },
+    /// The connection no longer offers its tools in the session.
+    ClientToolSessionReleased {
+        session_id: SessionId,
+    },
+    /// The result was recorded, or was identical to one already recorded.
+    ClientToolResultAccepted {
+        invocation_id: String,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -3602,6 +3639,18 @@ pub enum Event {
     SessionCatalogUpdated {
         #[serde(default)]
         revision: u64,
+    },
+    /// An authorized call to a tool this connection registered; answer with
+    /// [`Request::ClientToolResult`].
+    ClientToolInvocation(bcode_tool::client_tool::ClientToolInvocation),
+    /// The turn that made the call was cancelled or the call timed out; any later result is
+    /// dropped.
+    ClientToolCancelled {
+        invocation_id: String,
+    },
+    /// Another connection of the same provider claimed the session.
+    ClientToolClaimLost {
+        session_id: SessionId,
     },
 }
 
@@ -4761,7 +4810,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 63);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 64);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(59), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(57), ProtocolVersion::current());

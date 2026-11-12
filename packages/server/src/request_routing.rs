@@ -1063,6 +1063,20 @@ pub enum PermissionInteractionRequest {
         exchange_id: String,
         resolution_json: serde_json::Value,
     },
+    RegisterClientTools {
+        provider_id: String,
+        tools: Vec<bcode_tool::client_tool::ClientToolDescriptor>,
+    },
+    ClaimClientToolSession {
+        session_id: SessionId,
+    },
+    ReleaseClientToolSession {
+        session_id: SessionId,
+    },
+    ClientToolResult {
+        invocation_id: String,
+        outcome: bcode_tool::client_tool::ClientToolOutcome,
+    },
 }
 
 /// Requests owned by the `AgentSkillPlugin` dispatcher (14 variants).
@@ -2440,6 +2454,27 @@ impl RoutedRequest {
             } => Self::PermissionInteraction(PermissionInteractionRequest::ResolveToolExchange {
                 exchange_id,
                 resolution_json,
+            }),
+            Request::RegisterClientTools { provider_id, tools } => {
+                Self::PermissionInteraction(PermissionInteractionRequest::RegisterClientTools {
+                    provider_id,
+                    tools,
+                })
+            }
+            Request::ClaimClientToolSession { session_id } => {
+                Self::PermissionInteraction(PermissionInteractionRequest::ClaimClientToolSession {
+                    session_id,
+                })
+            }
+            Request::ReleaseClientToolSession { session_id } => Self::PermissionInteraction(
+                PermissionInteractionRequest::ReleaseClientToolSession { session_id },
+            ),
+            Request::ClientToolResult {
+                invocation_id,
+                outcome,
+            } => Self::PermissionInteraction(PermissionInteractionRequest::ClientToolResult {
+                invocation_id,
+                outcome,
             }),
             Request::RuntimeStatus => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RuntimeStatus))

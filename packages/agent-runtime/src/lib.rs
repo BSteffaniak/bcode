@@ -978,6 +978,11 @@ pub enum ToolSource {
         /// Plugin ID that owns the tool implementation.
         plugin_id: String,
     },
+    /// Tool is implemented by a connected client application, which a daemon routes calls to.
+    Client {
+        /// Provider id under which the client registered the tool.
+        provider_id: String,
+    },
 }
 
 /// Model-callable tool with routing metadata attached.
@@ -1006,6 +1011,17 @@ impl RegisteredTool {
             definition,
             source: ToolSource::Plugin {
                 plugin_id: plugin_id.into(),
+            },
+        }
+    }
+
+    /// Create a registration for a tool a connected client application implements.
+    #[must_use]
+    pub fn client(definition: ToolDefinition, provider_id: impl Into<String>) -> Self {
+        Self {
+            definition,
+            source: ToolSource::Client {
+                provider_id: provider_id.into(),
             },
         }
     }

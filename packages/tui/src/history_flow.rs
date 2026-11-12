@@ -465,7 +465,10 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
         BcodeEvent::RuntimeWork(_)
         | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
-        | BcodeEvent::SessionCatalogUpdated { .. } => None,
+        | BcodeEvent::SessionCatalogUpdated { .. }
+        | BcodeEvent::ClientToolInvocation(_)
+        | BcodeEvent::ClientToolCancelled { .. }
+        | BcodeEvent::ClientToolClaimLost { .. } => None,
     }
 }
 
@@ -479,7 +482,10 @@ async fn flush_superseded_progress(
         BcodeEvent::SessionLive(_)
         | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
-        | BcodeEvent::SessionCatalogUpdated { .. } => 0,
+        | BcodeEvent::SessionCatalogUpdated { .. }
+        | BcodeEvent::ClientToolInvocation(_)
+        | BcodeEvent::ClientToolCancelled { .. }
+        | BcodeEvent::ClientToolClaimLost { .. } => 0,
     });
     for event in events {
         if event_sender

@@ -6853,7 +6853,10 @@ fn absorb_bcode_event(
         | BcodeEvent::RuntimeWork(_)
         | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
-        | BcodeEvent::SessionCatalogUpdated { .. } => false,
+        | BcodeEvent::SessionCatalogUpdated { .. }
+        | BcodeEvent::ClientToolInvocation(_)
+        | BcodeEvent::ClientToolCancelled { .. }
+        | BcodeEvent::ClientToolClaimLost { .. } => false,
     }
 }
 

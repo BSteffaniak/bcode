@@ -32,6 +32,8 @@ pub struct Snapshot {
     runtime: Option<bcode_plugin::PluginRuntimeGeneration>,
     pub(super) lists: BTreeMap<String, ToolList>,
     pub(super) failures: BTreeMap<String, PreparationFailure>,
+    /// Client-provided tools pinned for one turn of one session, by tool name.
+    client_tools: BTreeMap<String, super::client_tools::OfferedClientTool>,
 }
 
 impl Snapshot {
@@ -40,6 +42,26 @@ impl Snapshot {
             runtime: Some(runtime.runtime_generation()),
             ..Self::default()
         }
+    }
+
+    /// This snapshot plus client-provided tools offered for one turn. Plugin tools keep their
+    /// names; a client tool never shadows one.
+    pub(super) fn with_client_tools(
+        &self,
+        offered: Vec<super::client_tools::OfferedClientTool>,
+    ) -> Self {
+        let plugin_names = self
+            .lists
+            .values()
+            .flat_map(|list| list.tools.iter().map(|tool| tool.name.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut snapshot = self.clone();
+        snapshot.client_tools = offered
+            .into_iter()
+            .filter(|tool| !plugin_names.contains(&tool.definition.name))
+            .map(|tool| (tool.definition.name.clone(), tool))
+            .collect();
+        snapshot
     }
 
     pub(super) fn failure(&self) -> Option<PreparationFailure> {
@@ -115,6 +137,14 @@ impl Snapshot {
                 }
             }
         }
+        for tool in self.client_tools.values() {
+            if names.insert(tool.definition.name.clone()) {
+                catalog.insert(super::RegisteredTool::client(
+                    tool.definition.clone(),
+                    tool.provider_id.clone(),
+                ));
+            }
+        }
         Ok(catalog)
     }
 
@@ -141,7 +171,8 @@ impl Snapshot {
         Option<bcode_tool::ToolDiscoveryPolicy>,
     )> {
         let mut names = std::collections::BTreeSet::new();
-        self.lists
+        let mut discovered = self
+            .lists
             .values()
             .flat_map(|list| {
                 list.tools
@@ -150,7 +181,19 @@ impl Snapshot {
                     .map(|tool| (tool.clone(), list.discovery.get(&tool.name).cloned()))
                     .collect::<Vec<_>>()
             })
-            .collect()
+            .collect::<Vec<_>>();
+        discovered.extend(
+            self.client_tools
+                .values()
+                .filter(|tool| names.insert(tool.definition.name.clone()))
+                .map(|tool| {
+                    (
+                        tool.definition.clone(),
+                        Some(bcode_tool::ToolDiscoveryPolicy::new(tool.read_only)),
+                    )
+                }),
+        );
+        discovered
     }
 }
 

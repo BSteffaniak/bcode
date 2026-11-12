@@ -85,6 +85,9 @@ mod xray_projection;
 mod xray_tools;
 mod xray_workflow;
 pub use session_observation::{SessionObservation, SessionObservationDelivery};
+mod client_tools;
+#[cfg(all(test, unix))]
+mod client_tools_tests;
 mod session_operations;
 mod session_search_operations;
 mod settled_turn_observers;
@@ -476,6 +479,7 @@ pub struct ServerState {
         StdMutex<BTreeMap<SessionId, bcode_session_models::SessionCategorization>>,
     contextual_plugin_invocations: StdMutex<plugin_context::InvocationRegistry>,
     tool_catalog: tool_catalog::ToolCatalogCache,
+    client_tools: client_tools::ClientToolRegistry,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
     session_search_enabled: bool,
@@ -749,6 +753,9 @@ const fn client_event_kind(event: &Event) -> &'static str {
         Event::Workflow(_) => "workflow",
         Event::SessionViewResyncRequired { .. } => "session_view_resync_required",
         Event::SessionCatalogUpdated { .. } => "session_catalog_updated",
+        Event::ClientToolInvocation(_) => "client_tool_invocation",
+        Event::ClientToolCancelled { .. } => "client_tool_cancelled",
+        Event::ClientToolClaimLost { .. } => "client_tool_claim_lost",
     }
 }
 
@@ -2662,6 +2669,7 @@ impl ServerState {
             optional_context: StdMutex::new(BTreeMap::new()),
             advisory_categorizations: StdMutex::new(BTreeMap::new()),
             tool_catalog: tool_catalog::ToolCatalogCache::default(),
+            client_tools: client_tools::ClientToolRegistry::default(),
             startup_plugin_selection: init.startup_plugin_selection,
             default_plugin_ids: init.default_plugin_ids,
             session_search_enabled: init.session_search_enabled,
@@ -2873,6 +2881,7 @@ impl ServerState {
             .remove(&client_id);
         self.unregister_catalog_event_client(client_id).await;
         self.workflow_event_clients.lock().await.remove(&client_id);
+        self.client_tools.disconnect(client_id);
     }
 
     async fn attach_client_session(&self, client_id: ClientId, session_id: SessionId) {
@@ -6869,6 +6878,10 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::AttachSessionProjectionWindow { .. } => "attach_session_projection_window",
         Request::ListPendingToolExchanges => "list_pending_tool_exchanges",
         Request::ResolveToolExchange { .. } => "resolve_tool_exchange",
+        Request::RegisterClientTools { .. } => "register_client_tools",
+        Request::ClaimClientToolSession { .. } => "claim_client_tool_session",
+        Request::ReleaseClientToolSession { .. } => "release_client_tool_session",
+        Request::ClientToolResult { .. } => "client_tool_result",
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::RuntimeWorkObservations { .. } => "runtime_work_observations",
         Request::RuntimeWorkPage { .. } => "runtime_work_page",
@@ -11722,6 +11735,7 @@ async fn handle_durable_interaction_request(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_permission_interaction_request(
     request: PermissionInteractionRequest,
     request_id: u64,
@@ -11806,6 +11820,15 @@ async fn handle_permission_interaction_request(
                 request_id,
                 Response::Ok(ResponsePayload::PendingToolExchangeList { exchanges }),
             )
+            .await
+        }
+        request @ (PermissionInteractionRequest::RegisterClientTools { .. }
+        | PermissionInteractionRequest::ClaimClientToolSession { .. }
+        | PermissionInteractionRequest::ReleaseClientToolSession { .. }
+        | PermissionInteractionRequest::ClientToolResult { .. }) => {
+            Box::pin(client_tools::handle_request(
+                request, request_id, client_id, state, writer,
+            ))
             .await
         }
         PermissionInteractionRequest::ResolveToolExchange {
@@ -29862,16 +29885,20 @@ async fn prepare_static_model_turn_context_inner(
     {
         Arc::new(tool_catalog::Snapshot::empty(&state.plugins))
     } else if let Some(snapshot) = prepared_catalog {
-        snapshot
+        client_tools::pin_offered_tools(state, session_id, snapshot)
     } else {
-        state
-            .tool_catalog
-            .get(
-                &state.plugins,
-                true,
-                Duration::from_millis(config.tools.execution.preparation_timeout_ms.max(1)),
-            )
-            .await
+        client_tools::pin_offered_tools(
+            state,
+            session_id,
+            state
+                .tool_catalog
+                .get(
+                    &state.plugins,
+                    true,
+                    Duration::from_millis(config.tools.execution.preparation_timeout_ms.max(1)),
+                )
+                .await,
+        )
     };
     if tool_catalog.lists.is_empty() && !tool_catalog.failures.is_empty() {
         return Err(bcode_session::SessionError::EventSerialization(
@@ -33013,6 +33040,58 @@ impl<'a> ServerToolInvoker<'a> {
         self.persist_lifecycle = false;
         self
     }
+
+    /// Prepare a client-provided tool from its declared policy class. A provider that is no
+    /// longer connected yields a preparation that fails at invocation as unavailable, so the
+    /// call is still authorized and recorded like any other.
+    async fn prepare_client_tool(
+        &self,
+        provider_id: &str,
+        request: &ToolPreparationRequest,
+        scope: &PreparationScope,
+    ) -> Result<ToolPreparationResponse, RuntimeError> {
+        if !scope.accepts_work() || self.cancel_state.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
+        }
+        let tool_name = &request.invocation.tool_name;
+        let descriptor = self
+            .state
+            .client_tools
+            .descriptor(self.session_id, provider_id, tool_name)
+            .unwrap_or_else(|| bcode_tool::client_tool::ClientToolDescriptor {
+                name: tool_name.clone(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+                policy: bcode_tool::client_tool::ClientToolPolicy::Mutating,
+                max_duration_ms: 1,
+            });
+        let preparation = client_tools::preparation(request, &descriptor).map_err(|message| {
+            RuntimeError::ToolPreparation {
+                tool_name: tool_name.clone(),
+                message,
+            }
+        })?;
+        if self.persist_requests {
+            append_tool_request_event(
+                self.state,
+                self.session_id,
+                self.output_positions.and_then(|positions| {
+                    positions.get(&request.invocation.invocation_id).cloned()
+                }),
+                AppendToolCallRequestedInput {
+                    tool_call_id: request.invocation.invocation_id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments_json: serde_json::to_string(&request.invocation.arguments)
+                        .unwrap_or_default(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                },
+                self.working_directory,
+            )
+            .await;
+        }
+        Ok(preparation)
+    }
 }
 
 impl ToolInvoker for ServerToolInvoker<'_> {
@@ -33023,6 +33102,9 @@ impl ToolInvoker for ServerToolInvoker<'_> {
         scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
         Box::pin(async move {
+            if let ToolSource::Client { provider_id } = &tool.source {
+                return self.prepare_client_tool(provider_id, request, scope).await;
+            }
             let ToolSource::Plugin { plugin_id } = &tool.source else {
                 return Err(RuntimeError::ToolPreparation {
                     tool_name: request.invocation.tool_name.clone(),
@@ -33098,6 +33180,9 @@ async fn invoke_server_registered_tool(
     invocation: &PreparedToolInvocation,
     scope: &InvocationScope,
 ) -> Result<ToolInvocationResponse, RuntimeError> {
+    if let ToolSource::Client { provider_id } = &tool.source {
+        return invoke_client_tool(invoker, provider_id, invocation, scope).await;
+    }
     let ToolSource::Plugin { plugin_id } = &tool.source else {
         return Err(RuntimeError::ToolExecution {
             tool_name: invocation.invocation.tool_name.clone(),
@@ -33185,6 +33270,98 @@ async fn invoke_server_registered_tool(
         tool_span.finish_err();
         // Preserve settled side-effect accounting without changing the cancelled lifecycle.
         // The runtime owns the turn's terminal outcome independently of this response.
+        return Ok(result);
+    }
+    finish_server_registered_tool(invoker, call, result, tool_labels, tool_span, tool_start).await
+}
+
+/// Send an authorized call to the client that provides the tool and record its result.
+///
+/// The durable dispatch marker precedes delivery, so a replacement daemon recovers an
+/// unfinished call as interrupted rather than replaying it.
+async fn invoke_client_tool(
+    invoker: &ServerToolInvoker<'_>,
+    provider_id: &str,
+    invocation: &PreparedToolInvocation,
+    scope: &InvocationScope,
+) -> Result<ToolInvocationResponse, RuntimeError> {
+    let call = bcode_model::ToolCall {
+        id: invocation.invocation.invocation_id.clone(),
+        name: invocation.invocation.tool_name.clone(),
+        arguments: invocation.invocation.arguments.clone(),
+    };
+    let tool_labels = tool_invocation_metric_labels(invoker.session_id, &call.name, None);
+    let tool_span = invoker
+        .state
+        .metrics
+        .span("tool.invocation")
+        .labels(tool_labels.clone());
+    let tool_start = Instant::now();
+    if invoker.cancel_state.is_cancelled() || !scope.accepts_work() {
+        tool_span.finish_err();
+        return Ok(tool_error("tool cancelled before invocation"));
+    }
+    if invoker.record_dispatch_start {
+        let started = invoker
+            .state
+            .sessions
+            .append_event(
+                invoker.session_id,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: call.id.clone(),
+                        sequence: 0,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                        message: None,
+                        metadata: serde_json::json!({"dispatch_boundary_version": 1}),
+                    },
+                },
+            )
+            .await
+            .map_err(|_| RuntimeError::ToolExecution {
+                tool_name: call.name.clone(),
+                message: "tool dispatch could not be recorded; tool was not executed".into(),
+            })?;
+        publish_session_event(invoker.state, &started).await;
+    }
+    let deadline_ms = invoker
+        .state
+        .client_tools
+        .descriptor(invoker.session_id, provider_id, &call.name)
+        .map_or(1, |descriptor| descriptor.max_duration_ms);
+    let delivery = bcode_tool::client_tool::ClientToolInvocation {
+        invocation_id: uuid::Uuid::new_v4().to_string(),
+        session_id: invoker.session_id.to_string(),
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
+        deadline_ms,
+    };
+    let turn_token = invoker.cancel_state.token.clone();
+    let scope_token = scope.cancellation();
+    let end = invoker
+        .state
+        .client_tools
+        .invoke(delivery, invoker.session_id, provider_id, async move {
+            tokio::select! {
+                () = turn_token.cancelled() => {}
+                () = scope_token.cancelled() => {}
+            }
+        })
+        .await;
+    let result = client_tools::tool_response(end);
+    if invoker.cancel_state.is_cancelled() || !scope.accepts_work() {
+        let _ = scope.turn().control().begin_cancellation();
+        if invoker.persist_lifecycle {
+            append_tool_invocation_terminal_event(
+                invoker.state,
+                invoker.session_id,
+                &call.id,
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+            )
+            .await;
+        }
+        tool_span.finish_err();
         return Ok(result);
     }
     finish_server_registered_tool(invoker, call, result, tool_labels, tool_span, tool_start).await
@@ -34612,10 +34789,14 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                 "tool denied by read-only inspection policy".to_string(),
             );
         }
-        let ToolSource::Plugin { plugin_id } = &request.tool.source else {
-            return ToolAuthorizationDecision::Deny(
-                "server cannot authorize a non-plugin tool".to_string(),
-            );
+        let producer_plugin_id = match &request.tool.source {
+            ToolSource::Plugin { plugin_id } => Some(plugin_id.as_str()),
+            ToolSource::Client { .. } => None,
+            ToolSource::Inline => {
+                return ToolAuthorizationDecision::Deny(
+                    "server cannot authorize an inline tool".to_string(),
+                );
+            }
         };
         if self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass {
             append_trace_event(
@@ -34766,12 +34947,12 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             return ToolAuthorizationDecision::Allow;
         }
         policy_context.batch = batch;
-        if request_tool_permission(
+        if request_tool_permission_from(
             self.state,
             self.session_id,
             &request.call,
             &request.call.name,
-            plugin_id,
+            producer_plugin_id,
             self.cancel_state,
             policy_context,
         )
@@ -38576,13 +38757,35 @@ struct PermissionPolicyContext {
     batch: Option<PermissionBatchCorrelation>,
 }
 
-#[allow(clippy::too_many_lines)]
 async fn request_tool_permission(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
     tool_name: &str,
     producer_plugin_id: &str,
+    cancel_state: &TurnCancelState,
+    policy_context: PermissionPolicyContext,
+) -> bool {
+    request_tool_permission_from(
+        state,
+        session_id,
+        call,
+        tool_name,
+        Some(producer_plugin_id),
+        cancel_state,
+        policy_context,
+    )
+    .await
+}
+
+/// Ask for permission for one call; `producer_plugin_id` is `None` for client-provided tools.
+#[allow(clippy::too_many_lines)]
+async fn request_tool_permission_from(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    tool_name: &str,
+    producer_plugin_id: Option<&str>,
     cancel_state: &TurnCancelState,
     policy_context: PermissionPolicyContext,
 ) -> bool {
@@ -38617,7 +38820,7 @@ async fn request_tool_permission(
     let event = SessionEventKind::PermissionRequested {
         permission_id: permission_id.clone(),
         tool_call_id: call.id.clone(),
-        producer_plugin_id: Some(producer_plugin_id.to_owned()),
+        producer_plugin_id: producer_plugin_id.map(str::to_owned),
         tool_name: tool_name.to_string(),
         arguments_json,
         batch: policy_context.batch.clone(),

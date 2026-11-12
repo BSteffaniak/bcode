@@ -4,6 +4,8 @@
 
 //! Serializable leaf-model types for neutral tool runtime contracts.
 
+/// Tools implemented by connected client applications.
+pub mod client_tool;
 pub mod interaction;
 
 use serde::{Deserialize, Serialize};

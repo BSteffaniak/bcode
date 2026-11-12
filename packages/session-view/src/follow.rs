@@ -158,7 +158,10 @@ async fn follow_attached(
                     | BcodeEvent::RuntimeWork(_)
                     | BcodeEvent::Workflow(_)
                     | BcodeEvent::SessionViewResyncRequired { .. }
-                    | BcodeEvent::SessionCatalogUpdated { .. } => false,
+                    | BcodeEvent::SessionCatalogUpdated { .. }
+                    | BcodeEvent::ClientToolInvocation(_)
+                    | BcodeEvent::ClientToolCancelled { .. }
+                    | BcodeEvent::ClientToolClaimLost { .. } => false,
                 };
                 if changed && !deliver_snapshot(sink, &view).await {
                     return Ok(());

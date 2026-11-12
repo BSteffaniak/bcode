@@ -1156,6 +1156,7 @@ impl SessionApplication for SessionApplicationHandle<'_> {
             .expect("reserved parent capacity")
             .commit(session.id);
         drop(reservation);
+        crate::client_tools::claim_created_session(self.state, self.client_id, &session).await;
         let runtime = self.state.client_runtime_context(self.client_id).await;
         self.state
             .set_session_config_from_runtime_context(session.id, runtime.as_ref())

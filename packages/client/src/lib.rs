@@ -2945,6 +2945,8 @@ fn decode_scoped_session_list(response: ResponsePayload) -> Result<SessionList, 
 
 mod account_lifecycle;
 mod activity_watch;
+/// Tools that run in this application's process and are offered to daemon sessions.
+pub mod client_tools;
 pub mod lifecycle;
 mod request_lanes;
 pub use account_lifecycle::AccountLifecycleClient;
@@ -3038,7 +3040,10 @@ impl SessionCatalogWatcher {
                 | Event::SessionLive(_)
                 | Event::RuntimeWork(_)
                 | Event::Workflow(_)
-                | Event::SessionViewResyncRequired { .. } => {}
+                | Event::SessionViewResyncRequired { .. }
+                | Event::ClientToolInvocation(_)
+                | Event::ClientToolCancelled { .. }
+                | Event::ClientToolClaimLost { .. } => {}
             }
         }
     }
@@ -3187,7 +3192,10 @@ impl SessionWatcher {
                 }
                 Event::SessionCatalogUpdated { .. }
                 | Event::Workflow(_)
-                | Event::SessionViewResyncRequired { .. } => {}
+                | Event::SessionViewResyncRequired { .. }
+                | Event::ClientToolInvocation(_)
+                | Event::ClientToolCancelled { .. }
+                | Event::ClientToolClaimLost { .. } => {}
             }
         }
     }
@@ -3225,7 +3233,10 @@ impl RuntimeWorkWatcher {
                 | Event::SessionLive(_)
                 | Event::Workflow(_)
                 | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. } => {}
+                | Event::SessionCatalogUpdated { .. }
+                | Event::ClientToolInvocation(_)
+                | Event::ClientToolCancelled { .. }
+                | Event::ClientToolClaimLost { .. } => {}
             }
         }
     }
@@ -3293,7 +3304,10 @@ impl WorkflowRunWatcher {
                 | Event::SessionLive(_)
                 | Event::RuntimeWork(_)
                 | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. } => continue,
+                | Event::SessionCatalogUpdated { .. }
+                | Event::ClientToolInvocation(_)
+                | Event::ClientToolCancelled { .. }
+                | Event::ClientToolClaimLost { .. } => continue,
             };
             match self.sequence.observe(&event) {
                 bcode_workflow_view_models::WorkflowLiveEventDisposition::Refetch => {

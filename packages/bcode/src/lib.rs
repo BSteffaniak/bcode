@@ -4375,6 +4375,14 @@ impl ToolInvoker for SdkToolInvoker {
                     })
                 }
             }
+            ToolSource::Client { provider_id } => Box::pin(async move {
+                Err(RuntimeError::ToolPreparation {
+                    tool_name: request.invocation.tool_name.clone(),
+                    message: format!(
+                        "client tools of '{provider_id}' run only in daemon sessions; register an inline tool instead"
+                    ),
+                })
+            }),
         }
     }
 
@@ -4435,6 +4443,12 @@ impl ToolInvoker for SdkToolInvoker {
                         })
                     }
                 }
+                ToolSource::Client { provider_id } => Err(RuntimeError::ToolExecution {
+                    tool_name: descriptor.tool_name.clone(),
+                    message: format!(
+                        "client tools of '{provider_id}' run only in daemon sessions; register an inline tool instead"
+                    ),
+                }),
             }
         })
     }

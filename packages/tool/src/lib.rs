@@ -7,6 +7,7 @@
 pub mod contracts;
 pub mod interaction;
 
+pub use bcode_tool_models::client_tool;
 pub use bcode_tool_models::{
     ToolContributionArtifact, ToolContributionEnvelope, ToolContributionEvent,
     ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,

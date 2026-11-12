@@ -212,7 +212,10 @@ pub fn live_input(session: SessionId, event: &BcodeEvent) -> Option<LiveInput> {
         | BcodeEvent::RuntimeWork(_)
         | BcodeEvent::Workflow(_)
         | BcodeEvent::SessionViewResyncRequired { .. }
-        | BcodeEvent::SessionCatalogUpdated { .. } => None,
+        | BcodeEvent::SessionCatalogUpdated { .. }
+        | BcodeEvent::ClientToolInvocation(_)
+        | BcodeEvent::ClientToolCancelled { .. }
+        | BcodeEvent::ClientToolClaimLost { .. } => None,
     }
 }
 

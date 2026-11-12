@@ -110,7 +110,11 @@ fn event_matches(session_id: SessionId, event: &Event) -> bool {
         Event::Session(event) | Event::RuntimeWork(event) => event.session_id == session_id,
         Event::SessionLive(event) => event.session_id == session_id,
         Event::SessionViewResyncRequired { session_id: owner } => *owner == session_id,
-        Event::Workflow(_) | Event::SessionCatalogUpdated { .. } => false,
+        Event::Workflow(_)
+        | Event::SessionCatalogUpdated { .. }
+        | Event::ClientToolInvocation(_)
+        | Event::ClientToolCancelled { .. }
+        | Event::ClientToolClaimLost { .. } => false,
     }
 }
 
