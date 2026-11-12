@@ -145,6 +145,45 @@ pub fn discover(
 struct Acquired {
     context: bcode_model::ProviderRequestContext,
     account_fingerprint: Option<String>,
+    expires_at_unix: Option<u64>,
+}
+
+impl Acquired {
+    fn expired(&self, now_unix: u64) -> bool {
+        self.expires_at_unix
+            .is_some_and(|expiry| expiry <= now_unix)
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Read a declared expiry; an unreadable declared expiry is an unsupported document.
+fn expiry(
+    document: &serde_json::Value,
+    expiry: &AuthExternalExpiry,
+) -> Result<u64, ExternalAuthError> {
+    use base64::Engine as _;
+    let value = document
+        .pointer(&expiry.pointer)
+        .ok_or(ExternalAuthError::SourceUnavailable)?;
+    match expiry.format {
+        AuthExternalExpiryFormat::UnixSeconds => value.as_u64(),
+        AuthExternalExpiryFormat::JwtExp => value
+            .as_str()
+            .and_then(|token| token.split('.').nth(1))
+            .and_then(|payload| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload.trim_end_matches('='))
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|claims| claims.get("exp")?.as_u64()),
+    }
+    .ok_or(ExternalAuthError::SourceUnavailable)
 }
 
 fn acquire(binding: &Binding<'_>) -> Result<Acquired, ExternalAuthError> {
@@ -223,6 +262,11 @@ fn interpret(
             Some(hex::encode(&Sha256::digest(account.as_bytes())[..8]))
         }
     };
+    let expires_at_unix = source
+        .expiry
+        .as_ref()
+        .map(|declared| expiry(document, declared))
+        .transpose()?;
     Ok(Acquired {
         context: bcode_model::ProviderRequestContext {
             auth: Some(bcode_model::ProviderAuthContext {
@@ -234,6 +278,7 @@ fn interpret(
             ..Default::default()
         },
         account_fingerprint,
+        expires_at_unix,
     })
 }
 
@@ -480,12 +525,49 @@ impl ExternalAuthStore {
         if acquired.account_fingerprint != grant.account_fingerprint {
             return Err(ExternalAuthError::AccountChanged);
         }
+        if acquired.expired(now_unix()) {
+            return Err(ExternalAuthError::Expired);
+        }
         let mut context = acquired.context;
         context.settings.clone_from(&recipe.settings);
         context.model_profile.clone_from(&recipe.model_profile);
         context.api_surface = recipe.api_surface;
         context.external_auth_binding = Some(grant.binding_id);
         Ok(context)
+    }
+
+    /// Local status of every approval, reading each approved source once.
+    ///
+    /// # Errors
+    /// Fails only when consent state is unavailable; per-connection problems are statuses.
+    pub fn status(
+        &self,
+        roots: &SourceRoots,
+        enabled: EnabledDeclarations<'_>,
+    ) -> Result<Vec<ExternalAuthConnection>, ExternalAuthError> {
+        let now = now_unix();
+        Ok(self
+            .list()?
+            .into_iter()
+            .map(|grant| {
+                let status = match find_binding(roots, enabled, &grant.binding_id, &grant.target)
+                    .and_then(|binding| acquire(&binding))
+                {
+                    Err(ExternalAuthError::DeclarationChanged) => {
+                        ExternalConnectionStatus::DeclarationChanged
+                    }
+                    Err(_) => ExternalConnectionStatus::SourceUnavailable,
+                    Ok(acquired) if acquired.account_fingerprint != grant.account_fingerprint => {
+                        ExternalConnectionStatus::AccountChanged
+                    }
+                    Ok(acquired) if acquired.expired(now) => ExternalConnectionStatus::Expired,
+                    Ok(acquired) => ExternalConnectionStatus::Ready {
+                        expires_at_unix: acquired.expires_at_unix,
+                    },
+                };
+                ExternalAuthConnection { grant, status }
+            })
+            .collect())
     }
 
     /// The approved method for a binding, used to fetch the provider's destinations.

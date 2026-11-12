@@ -1841,17 +1841,22 @@ pub enum SetModelError {
     /// An active skill requires retaining its model selection.
     #[error("skill {0} declares a required model; deactivate it before changing the session model")]
     SkillRequiredModelActive(String),
+    /// The selected external credential connection cannot be used with this model.
+    #[error("{0}")]
+    ExternalConnection(bcode_provider_auth_models::external::ExternalAuthError),
     /// Canonical session mutation failed.
     #[error(transparent)]
     Session(#[from] bcode_session::SessionError),
 }
 
-/// Persist one explicit session model selection.
+/// Persist one explicit session model selection, optionally with an approved external
+/// credential connection. The connection applies from the next turn, like the model.
 pub async fn set_model(
     state: &ServerState,
     session_id: bcode_session_models::SessionId,
     provider_plugin_id: Option<String>,
     model_id: String,
+    external_auth_binding: Option<String>,
 ) -> Result<(), SetModelError> {
     if let Some(blocking_skill_id) = super::required_model_active_skill(state, session_id).await
         && super::required_model_override_behavior(
@@ -1864,25 +1869,43 @@ pub async fn set_model(
         ));
     }
     let provider = provider_plugin_id.unwrap_or_else(|| "<auto>".to_owned());
+    let selected_provider = super::provider_to_selection(&provider);
+    let selected_model = super::model_to_selection(&model_id);
+    // Validate the connection before recording anything, so a rejected selection changes nothing.
+    let connection_context = match (&external_auth_binding, &selected_provider, &selected_model) {
+        (Some(binding), Some(provider), Some(model)) => Some(
+            crate::external_auth::session_context(state, provider, model, binding)
+                .await
+                .map_err(SetModelError::ExternalConnection)?,
+        ),
+        (Some(_), _, _) => {
+            return Err(SetModelError::ExternalConnection(
+                bcode_provider_auth_models::external::ExternalAuthError::InvalidRequest,
+            ));
+        }
+        (None, _, _) => None,
+    };
     let event = state
         .sessions
-        .append_model_changed(
+        .append_model_changed_with_connection(
             session_id,
             provider.clone(),
             model_id.clone(),
             bcode_session_models::ModelSelectionSource::UserExplicit,
+            external_auth_binding,
         )
         .await?;
-    let selected_provider = super::provider_to_selection(&provider);
-    let selected_model = super::model_to_selection(&model_id);
     // Provider auth is provider-scoped: resolve the context for the provider the user picked
     // rather than inheriting whatever the daemon's default model profile authenticated against.
-    let provider_context = super::provider_context_for_selection(
-        state,
-        &state.session_config(session_id).await,
-        selected_provider.as_deref(),
-        selected_model.as_deref(),
-    );
+    let provider_context = match connection_context {
+        Some(context) => context,
+        None => super::provider_context_for_selection(
+            state,
+            &state.session_config(session_id).await,
+            selected_provider.as_deref(),
+            selected_model.as_deref(),
+        ),
+    };
     let selection = super::SessionModelSelection {
         provider_plugin_id: selected_provider,
         requested_model_id: None,

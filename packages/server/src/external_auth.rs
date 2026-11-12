@@ -76,12 +76,72 @@ pub async fn list(state: &ServerState) -> Result<Vec<ExternalAuthGrant>, Externa
         .map_err(|_| ExternalAuthError::StateUnavailable)?
 }
 
+pub async fn status(
+    state: &ServerState,
+) -> Result<Vec<bcode_provider_auth_models::external::ExternalAuthConnection>, ExternalAuthError> {
+    let store = ExternalAuthStore::new(&state.state_root);
+    with_roots(declarations(state), None, move |roots, enabled| {
+        store.status(roots, enabled)
+    })
+    .await
+}
+
 pub async fn revoke(state: &ServerState, binding_id: String) -> Result<bool, ExternalAuthError> {
     // Listing and revoking stale grants must remain possible after a plugin is disabled.
     let store = ExternalAuthStore::new(&state.state_root);
     tokio::task::spawn_blocking(move || store.revoke(&binding_id))
         .await
         .map_err(|_| ExternalAuthError::StateUnavailable)?
+}
+
+/// Provider routing for a session that selects an approved connection with `model_id`.
+///
+/// The settings come from the provider's recommendation for the approved method, so the
+/// connection is used only at a destination the provider vouches for. Credentials are not read;
+/// dispatch revalidates approval, account, and expiry.
+///
+/// # Errors
+/// Rejects unapproved connections, another provider's connection, and models the provider does
+/// not recommend for the approved method.
+pub async fn session_context(
+    state: &ServerState,
+    provider_plugin_id: &str,
+    model_id: &str,
+    binding_id: &str,
+) -> Result<bcode_model::ProviderRequestContext, ExternalAuthError> {
+    let store = ExternalAuthStore::new(&state.state_root);
+    let binding = binding_id.to_owned();
+    let target = tokio::task::spawn_blocking(move || store.approved_target(&binding))
+        .await
+        .map_err(|_| ExternalAuthError::StateUnavailable)??;
+    if target.plugin_id != provider_plugin_id {
+        return Err(ExternalAuthError::DeclarationChanged);
+    }
+    let choices: bcode_model::StartupModelChoicesResponse = state
+        .plugins
+        .invoke_service_json(
+            provider_plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_STARTUP_MODEL_CHOICES,
+            &bcode_model::StartupRecommendationRequest {
+                auth_provider_id: target.provider_id,
+                method_id: target.method_id,
+            },
+        )
+        .await
+        .map_err(|_| ExternalAuthError::DestinationRejected)?;
+    let choice = choices
+        .choices
+        .into_iter()
+        .find(|choice| {
+            choice.provider_plugin_id == provider_plugin_id && choice.model_id == model_id
+        })
+        .ok_or(ExternalAuthError::DestinationRejected)?;
+    Ok(bcode_model::ProviderRequestContext {
+        settings: choice.settings,
+        external_auth_binding: Some(binding_id.to_owned()),
+        ..Default::default()
+    })
 }
 
 /// Acquire an approved connection for one model turn at the authoritative dispatch boundary.

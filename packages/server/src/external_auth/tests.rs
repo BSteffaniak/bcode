@@ -74,6 +74,7 @@ fn declaration() -> AuthProviderContribution {
                 reject_whitespace_or_control: true,
                 reject_environment_identifier: false,
             },
+            expiry: None,
         }],
     }
 }
@@ -292,5 +293,76 @@ async fn injected_credentials_overrides_and_custom_destinations_never_fall_back(
         .await
         .is_err()
     );
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn session_connection_selection_persists_restores_and_fails_closed() {
+    let fixture = Fixture::new();
+    let binding = fixture.approve().binding_id;
+    let session = fixture
+        .server
+        .sessions
+        .create_session(None, fixture.home.path().to_path_buf())
+        .await
+        .unwrap();
+    // A model the provider does not recommend for the approved method changes nothing.
+    assert!(matches!(
+        crate::session_operations::set_model(
+            &fixture.server,
+            session.id,
+            Some(PLUGIN.into()),
+            "unapproved-model".into(),
+            Some(binding.clone()),
+        )
+        .await,
+        Err(
+            crate::session_operations::SetModelError::ExternalConnection(
+                bcode_provider_auth_models::external::ExternalAuthError::DestinationRejected
+            )
+        )
+    ));
+    assert_eq!(
+        fixture
+            .server
+            .sessions
+            .current_runtime_selection(session.id)
+            .await
+            .unwrap()
+            .external_auth_binding,
+        None
+    );
+    crate::session_operations::set_model(
+        &fixture.server,
+        session.id,
+        Some(PLUGIN.into()),
+        "synthetic-model".into(),
+        Some(binding.clone()),
+    )
+    .await
+    .unwrap();
+    let expected_settings = BTreeMap::from([("transport".into(), "synthetic".into())]);
+    let selected = crate::session_model_selection(&fixture.server, session.id).await;
+    assert_eq!(
+        selected.provider_context.external_auth_binding.as_deref(),
+        Some(binding.as_str())
+    );
+    assert_eq!(selected.provider_context.settings, expected_settings);
+    assert!(!selected.native_default);
+    // Restoring from the persisted selection, as after a daemon restart, rebuilds the context.
+    fixture.server.session_model_selections.lock().await.clear();
+    let restored = crate::session_model_selection(&fixture.server, session.id).await;
+    assert_eq!(restored.provider_context, selected.provider_context);
+    // After revocation the session keeps the connection without routing, so dispatch refuses
+    // it instead of switching to another account.
+    assert!(fixture.store.revoke(&binding).unwrap());
+    fixture.server.session_model_selections.lock().await.clear();
+    let revoked = crate::session_model_selection(&fixture.server, session.id).await;
+    assert_eq!(
+        revoked.provider_context.external_auth_binding.as_deref(),
+        Some(binding.as_str())
+    );
+    assert!(revoked.provider_context.settings.is_empty());
+    assert!(revoked.provider_context.auth.is_none());
     drop(fixture);
 }

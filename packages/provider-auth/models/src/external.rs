@@ -32,6 +32,10 @@ pub trait ExternalAuthApplication {
         &self,
         binding_id: String,
     ) -> impl std::future::Future<Output = Result<bool, ExternalAuthError>> + Send;
+    /// Approved connections with their current local status. Reads approved sources only.
+    fn external_auth_status(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ExternalAuthConnection>, ExternalAuthError>> + Send;
 }
 
 /// Version of the durable external-connection consent document.
@@ -67,6 +71,29 @@ pub struct AuthExternalSource {
     pub account_pointer: Option<String>,
     /// Constraints every credential value must satisfy.
     pub literal_policy: AuthLiteralTokenPolicy,
+    /// Optional expiry, checked locally so an expired sign-in is reported before a request.
+    #[serde(default)]
+    pub expiry: Option<AuthExternalExpiry>,
+}
+
+/// Where a document records when its credentials stop working.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthExternalExpiry {
+    /// JSON pointer to the value.
+    pub pointer: String,
+    /// How to read the value.
+    pub format: AuthExternalExpiryFormat,
+}
+
+/// Encoding of an [`AuthExternalExpiry`] value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthExternalExpiryFormat {
+    /// A JWT string whose payload `exp` claim is the expiry in Unix seconds.
+    JwtExp,
+    /// A number of Unix seconds.
+    UnixSeconds,
 }
 
 /// Where an external document lives.
@@ -200,6 +227,9 @@ impl AuthExternalSource {
         if let Some(pointer) = &self.account_pointer {
             validate_pointer("account_pointer", pointer)?;
         }
+        if let Some(expiry) = &self.expiry {
+            validate_pointer("expiry_pointer", &expiry.pointer)?;
+        }
         if !self
             .credentials
             .iter()
@@ -271,6 +301,34 @@ pub struct ExternalAuthGrant {
     pub approved_at_unix: u64,
 }
 
+/// Local status of one approved connection; never remote validity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExternalConnectionStatus {
+    /// The document is present, matches the approved account, and has not expired.
+    Ready {
+        /// Declared expiry in Unix seconds, when the source declares one.
+        expires_at_unix: Option<u64>,
+    },
+    /// The declared expiry has passed; the owning application must renew it.
+    Expired,
+    /// The document belongs to a different account than the one approved.
+    AccountChanged,
+    /// The document is missing or no longer in a supported format.
+    SourceUnavailable,
+    /// The provider no longer declares this connection.
+    DeclarationChanged,
+}
+
+/// One approval with its current status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalAuthConnection {
+    /// The approval.
+    pub grant: ExternalAuthGrant,
+    /// Its current local status.
+    pub status: ExternalConnectionStatus,
+}
+
 /// Durable, versioned non-secret consent state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,6 +363,11 @@ pub enum ExternalAuthError {
         "the external credential document is missing or in an unsupported format; sign in again in the owning application"
     )]
     SourceUnavailable,
+    /// The declared expiry has passed.
+    #[error(
+        "the sign-in Bcode is using from the owning application has expired; open that application to renew it, then retry"
+    )]
+    Expired,
     /// The source now belongs to a different account than the one approved.
     #[error(
         "the external credential document now belongs to a different account; approve it again with `bcode auth connect`"

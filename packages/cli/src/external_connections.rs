@@ -5,7 +5,8 @@
 
 use super::CliError;
 use bcode_provider_auth_models::external::{
-    ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthGrant,
+    ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthConnection, ExternalAuthGrant,
+    ExternalConnectionStatus,
 };
 use std::io::{BufRead as _, IsTerminal as _, Read as _};
 
@@ -49,14 +50,57 @@ pub async fn connect_command() -> Result<(), CliError> {
     Ok(())
 }
 
-/// List approvals without discovering or reading external sources.
+/// List approvals with their current local status.
 pub async fn list_command() -> Result<(), CliError> {
-    list(
-        &bcode_client::BcodeClient::default_endpoint()
-            .list_external_auth()
-            .await
-            .map_err(external_error)?,
-    )
+    let connections = bcode_client::BcodeClient::default_endpoint()
+        .external_auth_status()
+        .await
+        .map_err(external_error)?;
+    status_with_io(&connections, &mut std::io::stdout().lock())
+}
+
+/// What a status means for the user, with the one action that fixes it.
+#[must_use]
+pub fn status_label(connection: &ExternalAuthConnection) -> String {
+    let application = &connection.grant.application;
+    match connection.status {
+        ExternalConnectionStatus::Ready { .. } => "ready".into(),
+        ExternalConnectionStatus::Expired => format!("expired — open {application} to renew it"),
+        ExternalConnectionStatus::AccountChanged => {
+            format!(
+                "{application} is signed in to a different account — run `bcode auth connect` to approve it"
+            )
+        }
+        ExternalConnectionStatus::SourceUnavailable => {
+            format!("not found — sign in to {application} again")
+        }
+        ExternalConnectionStatus::DeclarationChanged => {
+            "no longer offered by an enabled provider — run `bcode auth disconnect`".into()
+        }
+    }
+}
+
+fn status_with_io(
+    connections: &[ExternalAuthConnection],
+    output: &mut impl std::io::Write,
+) -> Result<(), CliError> {
+    if connections.is_empty() {
+        writeln!(
+            output,
+            "No external connections approved. Run `bcode auth connect` to add one."
+        )?;
+    }
+    for (index, connection) in connections.iter().enumerate() {
+        writeln!(
+            output,
+            "{}. {} -> {} · {}",
+            index + 1,
+            connection.grant.application,
+            describe(&connection.grant.target),
+            status_label(connection)
+        )?;
+    }
+    Ok(())
 }
 
 /// Revoke one reviewed approval without reading or modifying its source.
@@ -144,11 +188,6 @@ fn connect_with_io(
         return Ok(None);
     }
     Ok(Some(candidate.clone()))
-}
-
-/// Print approved bindings, not credential values or private source paths.
-pub fn list(grants: &[ExternalAuthGrant]) -> Result<(), CliError> {
-    list_with_io(grants, &mut std::io::stdout().lock())
 }
 
 fn list_with_io(

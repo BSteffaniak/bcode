@@ -927,6 +927,18 @@ impl bcode_provider_auth_models::external::ExternalAuthApplication
         })?;
         crate::external_auth::revoke(self.state, binding_id).await
     }
+
+    async fn external_auth_status(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        self.require_running().map_err(|_| {
+            bcode_provider_auth_models::external::ExternalAuthError::StateUnavailable
+        })?;
+        crate::external_auth::status(self.state).await
+    }
 }
 
 impl bcode_provider_auth_models::application::AccountLifecycleApplication

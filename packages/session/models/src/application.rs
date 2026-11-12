@@ -765,15 +765,18 @@ pub trait SessionApplication: Sync {
         admission: crate::TurnAdmissionMetadata,
     ) -> impl Future<Output = Result<crate::TurnAdmission, SessionApplicationFailure>> + Send;
 
-    /// Persist an explicit model selection using the existing provider/model selection path.
+    /// Persist an explicit model selection using the existing provider/model selection path,
+    /// optionally with an approved external credential connection for that provider.
     ///
     /// # Errors
-    /// Rejects required-model skill conflicts or failed canonical selection mutation.
+    /// Rejects required-model skill conflicts, an unapproved or unusable connection, or failed
+    /// canonical selection mutation.
     fn set_session_model(
         &self,
         session_id: SessionId,
         provider_plugin_id: Option<String>,
         model_id: String,
+        external_auth_binding: Option<String>,
     ) -> impl Future<Output = Result<(), SessionApplicationFailure>> + Send;
 
     /// Resolve and persist an existing agent profile selection.

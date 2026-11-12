@@ -4993,6 +4993,10 @@ pub enum SessionEventKind {
         /// as a non-sticky default.
         #[serde(default)]
         selection_source: ModelSelectionSource,
+        /// Approved external credential connection the session authenticates with, if any.
+        /// Never credential material; dispatch revalidates the approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_auth_binding: Option<String>,
     },
     SystemMessage {
         text: String,

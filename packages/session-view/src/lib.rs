@@ -23733,6 +23733,7 @@ mod tests {
                 provider: "<auto>".to_owned(),
                 model: "<default>".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
         ));
 
@@ -23748,6 +23749,7 @@ mod tests {
                 provider: "provider".to_owned(),
                 model: "model".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
         ));
 

@@ -347,6 +347,8 @@ pub struct SessionRuntimeSelection {
     /// [`bcode_session_models::ModelSelectionSource::UserExplicit`] as a resolved default that
     /// should be re-resolved rather than pinned when the session is resumed.
     pub model_selection_source: bcode_session_models::ModelSelectionSource,
+    /// Approved external credential connection selected with the current model, if any.
+    pub external_auth_binding: Option<String>,
     /// Session-specific reasoning effort, when explicitly selected.
     pub reasoning_effort: Option<String>,
     /// Session-specific reasoning summary, when explicitly selected.
@@ -1721,6 +1723,7 @@ impl SessionManager {
             current_provider: None,
             current_model: None,
             model_selection_source: bcode_session_models::ModelSelectionSource::default(),
+            external_auth_binding: None,
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_by_model: BTreeMap::new(),
@@ -4114,6 +4117,58 @@ mod tests {
             bcode_session_models::ModelSelectionSource::UserExplicit
         );
         assert!(selection.model_selection_source.is_sticky());
+        restored.shutdown_catalog_updates().await;
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn external_connection_selection_persists_and_clears_across_manager_restart() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("connection".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        let binding = "ab".repeat(32);
+        manager
+            .append_model_changed_with_connection(
+                session.id,
+                "provider-a".to_owned(),
+                "model-a".to_owned(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+                Some(binding.clone()),
+            )
+            .await
+            .expect("connection selection appends");
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("manager restores");
+        let selection = restored
+            .current_runtime_selection(session.id)
+            .await
+            .expect("runtime selection reads");
+        assert_eq!(selection.external_auth_binding, Some(binding));
+        assert_eq!(selection.model_id.as_deref(), Some("model-a"));
+        // A later model change without a connection clears it.
+        restored
+            .append_model_changed(
+                session.id,
+                "provider-a".to_owned(),
+                "model-b".to_owned(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
+            .await
+            .expect("plain selection appends");
+        restored.shutdown_catalog_updates().await;
+        drop(restored);
+
+        let restored = SessionManager::persistent(&root).expect("manager restores again");
+        let selection = restored
+            .current_runtime_selection(session.id)
+            .await
+            .expect("runtime selection reads");
+        assert_eq!(selection.external_auth_binding, None);
         restored.shutdown_catalog_updates().await;
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
@@ -10511,6 +10566,7 @@ mod tests {
                     provider: "provider".to_string(),
                     model: "model".to_string(),
                     selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                    external_auth_binding: None,
                 },
             ),
             (

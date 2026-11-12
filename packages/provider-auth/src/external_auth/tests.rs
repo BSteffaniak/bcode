@@ -5,6 +5,7 @@ use bcode_provider_auth_models::{
 };
 
 const PLUGIN: &str = "fixture.plugin";
+const FUTURE: u64 = 4_102_444_800;
 
 fn source() -> AuthExternalSource {
     AuthExternalSource {
@@ -39,6 +40,10 @@ fn source() -> AuthExternalSource {
             reject_whitespace_or_control: true,
             reject_environment_identifier: false,
         },
+        expiry: Some(AuthExternalExpiry {
+            pointer: "/tokens/expires".into(),
+            format: AuthExternalExpiryFormat::UnixSeconds,
+        }),
     }
 }
 
@@ -83,7 +88,8 @@ impl Fixture {
             provider: provider("Fixture"),
         };
         fixture.write(&serde_json::json!({
-            "mode": "tokens", "tokens": {"access": "first", "account": "acct-1", "refresh": "r"}
+            "mode": "tokens",
+            "tokens": {"access": "first", "account": "acct-1", "refresh": "r", "expires": FUTURE}
         }));
         fixture
     }
@@ -171,10 +177,10 @@ fn discovery_reports_presence_without_parsing_and_binding_survives_cosmetic_edit
 #[test]
 fn approval_reads_once_to_reject_unsupported_documents_and_records_the_account() {
     let fixture = Fixture::new();
-    fixture.write(&serde_json::json!({"mode": "tokens", "api_key": "k", "tokens": {"access": "a", "account": "x"}}));
+    fixture.write(&serde_json::json!({"mode": "tokens", "api_key": "k", "tokens": {"access": "a", "account": "x", "expires": FUTURE}}));
     assert_eq!(fixture.approve(), Err(ExternalAuthError::SourceUnavailable));
     assert_eq!(fixture.store.list().unwrap(), []);
-    fixture.write(&serde_json::json!({"mode": "tokens", "api_key": null, "tokens": {"access": "a", "account": "x"}}));
+    fixture.write(&serde_json::json!({"mode": "tokens", "api_key": null, "tokens": {"access": "a", "account": "x", "expires": FUTURE}}));
     let grant = fixture.approve().unwrap();
     assert_eq!(
         grant.account_fingerprint.as_ref().map(String::len),
@@ -193,10 +199,10 @@ fn dispatch_follows_rotation_and_rejects_account_changes_and_revocation() {
     );
     fixture.approve().unwrap();
     assert_eq!(fixture.access_token(&binding).unwrap(), "first");
-    fixture.write(&serde_json::json!({"mode": "tokens", "tokens": {"access": "rotated", "account": "acct-1"}}));
+    fixture.write(&serde_json::json!({"mode": "tokens", "tokens": {"access": "rotated", "account": "acct-1", "expires": FUTURE}}));
     assert_eq!(fixture.access_token(&binding).unwrap(), "rotated");
     fixture.write(
-        &serde_json::json!({"mode": "tokens", "tokens": {"access": "other", "account": "acct-2"}}),
+        &serde_json::json!({"mode": "tokens", "tokens": {"access": "other", "account": "acct-2", "expires": FUTURE}}),
     );
     assert_eq!(
         fixture.access_token(&binding),
@@ -260,7 +266,7 @@ fn source_identity_changes_and_root_overrides_are_distinct_bindings() {
     let alternate = tempfile::tempdir().unwrap();
     std::fs::write(
         alternate.path().join("auth.json"),
-        r#"{"mode":"tokens","tokens":{"access":"alt","account":"acct-1"}}"#,
+        r#"{"mode":"tokens","tokens":{"access":"alt","account":"acct-1","expires":4102444800}}"#,
     )
     .unwrap();
     let mut roots = fixture.roots();
@@ -315,5 +321,97 @@ fn damaged_state_fails_closed() {
     assert_eq!(
         fixture.access_token(&fixture.candidate().binding_id),
         Err(ExternalAuthError::UnsupportedState)
+    );
+}
+
+#[test]
+fn expiry_is_checked_locally_before_dispatch() {
+    let fixture = Fixture::new();
+    let binding = fixture.approve().unwrap().binding_id;
+    fixture.write(&serde_json::json!({
+        "mode": "tokens", "tokens": {"access": "stale", "account": "acct-1", "expires": 1}
+    }));
+    assert_eq!(
+        fixture.access_token(&binding),
+        Err(ExternalAuthError::Expired)
+    );
+    fixture.write(&serde_json::json!({
+        "mode": "tokens", "tokens": {"access": "stale", "account": "acct-1"}
+    }));
+    assert_eq!(
+        fixture.access_token(&binding),
+        Err(ExternalAuthError::SourceUnavailable),
+        "a declared expiry that cannot be read is an unsupported document"
+    );
+}
+
+#[test]
+fn jwt_expiry_reads_the_payload_exp_claim() {
+    use base64::Engine as _;
+    let encode = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    let token = format!(
+        "{}.{}.sig",
+        encode(serde_json::json!({"alg": "none"})),
+        encode(serde_json::json!({"exp": 42}))
+    );
+    let declared = AuthExternalExpiry {
+        pointer: "/token".into(),
+        format: AuthExternalExpiryFormat::JwtExp,
+    };
+    assert_eq!(
+        expiry(&serde_json::json!({"token": token}), &declared),
+        Ok(42)
+    );
+    assert_eq!(
+        expiry(&serde_json::json!({"token": "not-a-jwt"}), &declared),
+        Err(ExternalAuthError::SourceUnavailable)
+    );
+}
+
+#[test]
+fn status_reports_each_connection_without_failing_the_list() {
+    let fixture = Fixture::new();
+    fixture.approve().unwrap();
+    let status = |fixture: &Fixture| {
+        fixture
+            .store
+            .status(&fixture.roots(), &[(PLUGIN, &fixture.provider)])
+            .unwrap()
+            .remove(0)
+            .status
+    };
+    assert_eq!(
+        status(&fixture),
+        ExternalConnectionStatus::Ready {
+            expires_at_unix: Some(FUTURE)
+        }
+    );
+    fixture.write(&serde_json::json!({
+        "mode": "tokens", "tokens": {"access": "a", "account": "acct-1", "expires": 1}
+    }));
+    assert_eq!(status(&fixture), ExternalConnectionStatus::Expired);
+    fixture.write(&serde_json::json!({
+        "mode": "tokens", "tokens": {"access": "a", "account": "acct-2", "expires": FUTURE}
+    }));
+    assert_eq!(status(&fixture), ExternalConnectionStatus::AccountChanged);
+    std::fs::remove_file(fixture.home.path().join(".fixture/auth.json")).unwrap();
+    assert_eq!(
+        status(&fixture),
+        ExternalConnectionStatus::SourceUnavailable
+    );
+    let without_source = AuthProviderContribution {
+        external_sources: Vec::new(),
+        ..fixture.provider.clone()
+    };
+    assert_eq!(
+        fixture
+            .store
+            .status(&fixture.roots(), &[(PLUGIN, &without_source)])
+            .unwrap()
+            .remove(0)
+            .status,
+        ExternalConnectionStatus::DeclarationChanged
     );
 }

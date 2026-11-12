@@ -8742,16 +8742,6 @@ fn semantic_chatgpt_auth_settings(
         .map(|credential| credential.value.clone())
         .or_else(|| id_token.and_then(chatgpt_account_id_from_access_token))
         .or_else(|| chatgpt_account_id_from_access_token(&access_token));
-    // External documents deliver no expiry; the access token's own claim is authoritative.
-    let expires_at = auth
-        .credentials
-        .get("expires_at")
-        .and_then(|credential| credential.value.parse().ok())
-        .or_else(|| {
-            (auth.backend.as_deref() == Some("external"))
-                .then(|| jwt_expiry(&access_token))
-                .flatten()
-        });
     (
         AuthSettings::ChatGpt {
             access_token,
@@ -8759,7 +8749,10 @@ fn semantic_chatgpt_auth_settings(
                 .credentials
                 .get("refresh_token")
                 .map(|credential| credential.value.clone()),
-            expires_at,
+            expires_at: auth
+                .credentials
+                .get("expires_at")
+                .and_then(|credential| credential.value.parse().ok()),
             account_id,
             profile: profile.clone(),
         },
@@ -8944,19 +8937,6 @@ impl OpenAiCompatibleProviderPlugin {
                 let now = unix_timestamp();
                 if *expires_at > now + 60 {
                     return Ok(format!("not_needed_expires_in_{}s", expires_at - now));
-                }
-                if refresh_token.is_none() && settings.auth_diagnostics.source == "external" {
-                    let mut error = provider_error(
-                        "external_token_expired",
-                        ProviderErrorCategory::Auth,
-                        "the Codex ChatGPT sign-in Bcode is using has expired; open Codex to renew it, then retry",
-                    );
-                    error.failure = Some(Box::new(openai_failure_context(
-                        settings,
-                        bcode_model::ProviderFailureCapability::TokenRefresh,
-                        "run `codex` (or `codex login`) to renew the shared sign-in; Bcode never refreshes it",
-                    )));
-                    return Err(error);
                 }
                 if refresh_token.is_none() {
                     let mut error = provider_error(
@@ -9395,15 +9375,6 @@ fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|account| !account.trim().is_empty())
         .map(ToString::to_string)
-}
-
-fn jwt_expiry(token: &str) -> Option<u64> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()?
-        .get("exp")?
-        .as_u64()
 }
 
 fn unix_timestamp() -> u64 {

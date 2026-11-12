@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+base64                     = { workspace = true }
 bcode_config               = { workspace = true }
 bcode_confined_fs          = { workspace = true }
 bcode_model                = { workspace = true }

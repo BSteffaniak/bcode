@@ -409,6 +409,8 @@ pub struct SessionDbState {
     pub current_model: Option<String>,
     /// Why the current model became active.
     pub model_selection_source: bcode_session_models::ModelSelectionSource,
+    /// Approved external credential connection selected with the current model, if any.
+    pub external_auth_binding: Option<String>,
     /// Current reasoning effort selection, if any.
     pub reasoning_effort: Option<String>,
     /// Current reasoning summary selection, if any.
@@ -2025,6 +2027,7 @@ impl SessionDb {
                 "reasoning_effort",
                 "reasoning_summary",
                 "model_selection_source",
+                "external_auth_binding",
                 "reasoning_by_model",
                 "updated_at_ms",
                 "visibility",
@@ -2089,6 +2092,7 @@ impl SessionDb {
                 .as_deref()
                 .and_then(decode_model_selection_source)
                 .unwrap_or_default(),
+            external_auth_binding: optional_string(&row, "external_auth_binding"),
             reasoning_by_model,
             reasoning_by_model_order,
             updated_at_ms: row
@@ -7269,6 +7273,7 @@ async fn project_event(
             provider,
             model,
             selection_source,
+            external_auth_binding,
         } => {
             // Restore the reasoning selection remembered for the incoming provider/model pair so
             // the projection matches in-memory state without replaying history.
@@ -7284,6 +7289,7 @@ async fn project_event(
                     "model_selection_source",
                     encode_model_selection_source(*selection_source),
                 )
+                .value("external_auth_binding", external_auth_binding.clone())
                 .value("reasoning_effort", remembered.effort)
                 .value("reasoning_summary", remembered.summary)
                 .where_eq("session_id", event.session_id.to_string())
@@ -12193,6 +12199,11 @@ mod tests {
     }
 
     async fn remove_milestone_projection_fixture(db: &SessionDb) {
+        switchy::database::schema::alter_table("session_state")
+            .drop_column("external_auth_binding".into())
+            .execute(db.database())
+            .await
+            .unwrap();
         switchy::database::schema::drop_index("idx_events_managed_tool_key", "events")
             .execute(db.database())
             .await
@@ -14559,6 +14570,7 @@ mod tests {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
         ))
         .await
@@ -14603,6 +14615,7 @@ mod tests {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
         ))
         .await

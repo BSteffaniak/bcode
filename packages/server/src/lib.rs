@@ -7007,6 +7007,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DiscoverExternalAuth => "discover_external_auth",
         Request::ApproveExternalAuth { .. } => "approve_external_auth",
         Request::ListExternalAuth => "list_external_auth",
+        Request::ExternalAuthStatus => "external_auth_status",
         Request::RevokeExternalAuth { .. } => "revoke_external_auth",
         Request::AccountLifecycleCatalog => "account_lifecycle_catalog",
         Request::PreviewAccountLifecycle { .. } => "preview_account_lifecycle",
@@ -10834,6 +10835,7 @@ async fn handle_core_runtime_request(
             session_id,
             provider_plugin_id,
             model_id,
+            external_auth_binding,
         } => {
             use bcode_session_models::SessionApplication as _;
             let result = Box::pin(
@@ -10841,6 +10843,7 @@ async fn handle_core_runtime_request(
                     session_id,
                     provider_plugin_id,
                     model_id,
+                    external_auth_binding,
                 ),
             )
             .await;
@@ -11257,6 +11260,17 @@ async fn handle_core_runtime_request(
             let payload = result.map_or_else(
                 |error| ResponsePayload::ExternalAuthFailed { error },
                 |grant| ResponsePayload::ExternalAuthApproved { grant },
+            );
+            send_response(writer, request_id, Response::Ok(payload)).await
+        }
+        CoreRuntimeRequest::ExternalAuthStatus => {
+            use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+            let result = ServicesApplicationHandle::new(state, client_id)
+                .external_auth_status()
+                .await;
+            let payload = result.map_or_else(
+                |error| ResponsePayload::ExternalAuthFailed { error },
+                |connections| ResponsePayload::ExternalAuthStatus { connections },
             );
             send_response(writer, request_id, Response::Ok(payload)).await
         }
@@ -29001,6 +29015,54 @@ fn model_selection_from_runtime_context(
     }
 }
 
+/// Reasoning remembered for an exact provider/model pair in this session, if any.
+async fn remembered_reasoning(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&str>,
+    model_id: Option<&str>,
+) -> Option<bcode_session::RememberedReasoning> {
+    let (provider, model) = provider_plugin_id.zip(model_id)?;
+    state
+        .sessions
+        .remembered_reasoning_for_model(
+            session_id,
+            bcode_session_models::ModelScopeKey::new(provider, model),
+        )
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Provider context for a restored session selection.
+///
+/// `connection` is present only when the persisted selection is honored. A persisted connection
+/// never falls back to another account: if it is no longer usable the session keeps its binding
+/// without routing settings, so dispatch reports why instead.
+async fn restored_provider_context(
+    state: &ServerState,
+    session_id: SessionId,
+    connection: Option<&str>,
+    provider_plugin_id: Option<&str>,
+    model_id: Option<&str>,
+) -> bcode_model::ProviderRequestContext {
+    if let (Some(binding), Some(provider), Some(model)) = (connection, provider_plugin_id, model_id)
+    {
+        return external_auth::session_context(state, provider, model, binding)
+            .await
+            .unwrap_or_else(|_| bcode_model::ProviderRequestContext {
+                external_auth_binding: Some(binding.to_owned()),
+                ..Default::default()
+            });
+    }
+    provider_context_for_selection(
+        state,
+        &state.session_config(session_id).await,
+        provider_plugin_id,
+        model_id,
+    )
+}
+
 /// Resolve the effective model selection for a session.
 ///
 /// A persisted model is honored only when it was explicitly selected in-session. Sessions whose
@@ -29019,6 +29081,7 @@ async fn session_model_selection(
         provider_plugin_id: state.selected_provider_plugin_id.clone(),
         model_id: state.selected_model_id.clone(),
         model_selection_source: bcode_session_models::ModelSelectionSource::ConfigDefault,
+        external_auth_binding: None,
         reasoning_effort: state.selected_reasoning.effort.clone(),
         reasoning_summary: state.selected_reasoning.summary.clone(),
     };
@@ -29050,18 +29113,13 @@ async fn session_model_selection(
     // Reasoning effort follows the model that is actually being used. Prefer the effort remembered
     // for this exact provider/model pair, then the session's live value when the persisted model is
     // still in effect, and finally the configured default for the resolved model.
-    let remembered = match provider_plugin_id.as_deref().zip(model_id.as_deref()) {
-        Some((provider, model)) => state
-            .sessions
-            .remembered_reasoning_for_model(
-                session_id,
-                bcode_session_models::ModelScopeKey::new(provider, model),
-            )
-            .await
-            .ok()
-            .flatten(),
-        None => None,
-    };
+    let remembered = remembered_reasoning(
+        state,
+        session_id,
+        provider_plugin_id.as_deref(),
+        model_id.as_deref(),
+    )
+    .await;
     let (reasoning_effort, reasoning_summary) = match remembered {
         Some(remembered) => (remembered.effort, remembered.summary),
         None if honor_persisted_model => (
@@ -29077,13 +29135,18 @@ async fn session_model_selection(
             state.selected_reasoning.summary.clone(),
         ),
     };
-    let provider_context = provider_context_for_selection(
+    let provider_context = restored_provider_context(
         state,
-        &state.session_config(session_id).await,
+        session_id,
+        persisted_provider
+            .as_ref()
+            .and(runtime_selection.external_auth_binding.as_deref()),
         provider_plugin_id.as_deref(),
         model_id.as_deref(),
-    );
+    )
+    .await;
     let native_default = provider_plugin_id == state.selected_provider_plugin_id
+        && provider_context.external_auth_binding.is_none()
         && !state
             .session_external_configs
             .lock()
@@ -71169,6 +71232,7 @@ library = "test"
             session.id,
             Some("provider.test".to_owned()),
             "model-test".to_owned(),
+            None,
         )
         .await
         .expect("set model");
@@ -84872,7 +84936,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             let model = model.to_owned();
             let state = &state;
             async move {
-                session_operations::set_model(state, session_id, Some(provider), model)
+                session_operations::set_model(state, session_id, Some(provider), model, None)
                     .await
                     .expect("set model");
                 state

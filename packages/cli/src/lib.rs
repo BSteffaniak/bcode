@@ -23144,11 +23144,16 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             provider,
             model,
             selection_source,
+            external_auth_binding,
         } => {
             println!(
-                "#{} model changed: {provider}/{model} (source={})",
+                "#{} model changed: {provider}/{model} (source={}{})",
                 event.sequence,
-                model_selection_source_label(*selection_source)
+                model_selection_source_label(*selection_source),
+                external_auth_binding
+                    .as_deref()
+                    .map(|binding| format!(", connection={}", &binding[..binding.len().min(12)]))
+                    .unwrap_or_default()
             );
         }
         SessionEventKind::ReasoningChanged {

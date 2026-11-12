@@ -5945,6 +5945,7 @@ mod tests {
                 provider: "provider-2".to_owned(),
                 model: "model-2".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
         ));
 
@@ -5977,6 +5978,7 @@ mod tests {
                 provider: "<auto>".to_owned(),
                 model: "<default>".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
         ));
         assert_eq!(app.selected_provider_plugin_id(), None);

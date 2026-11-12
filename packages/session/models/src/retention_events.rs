@@ -1070,10 +1070,14 @@ pub fn inspect_durable(
             i.nodes(2, 3)?;
         }
         SessionEventKind::ModelChanged {
-            provider, model, ..
+            provider,
+            model,
+            external_auth_binding,
+            ..
         } => {
             i.text(provider, 3)?;
             i.text(model, 3)?;
+            i.optional_text(external_auth_binding.as_ref(), 3)?;
             i.nodes(1, 3)?;
         }
         SessionEventKind::PermissionResolved { permission_id, .. } => {

@@ -2,12 +2,13 @@
 //!
 //! These declarations only describe locations and formats. The host reads a document only
 //! after the user approves the connection, and never refreshes or rewrites it. ChatGPT tokens
-//! are delivered without their refresh token, so an expired Codex sign-in asks the user to
-//! renew it in Codex instead of rotating Codex's credentials behind its back.
+//! are delivered without their refresh token and declare the access token's expiry, so an
+//! expired Codex sign-in asks the user to renew it in Codex instead of being rotated behind
+//! Codex's back.
 
 use bcode_provider_auth_models::external::{
-    AuthExternalCredential, AuthExternalLocation, AuthExternalRootOverride, AuthExternalSource,
-    AuthLiteralTokenPolicy,
+    AuthExternalCredential, AuthExternalExpiry, AuthExternalExpiryFormat, AuthExternalLocation,
+    AuthExternalRootOverride, AuthExternalSource, AuthLiteralTokenPolicy,
 };
 
 const TOKEN_POLICY: AuthLiteralTokenPolicy = AuthLiteralTokenPolicy {
@@ -56,6 +57,7 @@ pub fn external_sources(provider_id: &str) -> Vec<AuthExternalSource> {
             credentials: vec![credential("api_key", &format!("/{provider_id}/key"), false)],
             account_pointer: None,
             literal_policy: TOKEN_POLICY,
+            expiry: None,
         },
         AuthExternalSource {
             source_id: "pi-api-key".to_owned(),
@@ -73,6 +75,7 @@ pub fn external_sources(provider_id: &str) -> Vec<AuthExternalSource> {
                 reject_whitespace_or_control: true,
                 reject_environment_identifier: true,
             },
+            expiry: None,
         },
     ];
     if provider_id == "openai" {
@@ -87,6 +90,7 @@ pub fn external_sources(provider_id: &str) -> Vec<AuthExternalSource> {
             credentials: vec![credential("api_key", "/OPENAI_API_KEY", false)],
             account_pointer: None,
             literal_policy: TOKEN_POLICY,
+            expiry: None,
         });
         sources.push(AuthExternalSource {
             source_id: "codex-chatgpt".to_owned(),
@@ -103,6 +107,10 @@ pub fn external_sources(provider_id: &str) -> Vec<AuthExternalSource> {
             ],
             account_pointer: Some("/tokens/account_id".to_owned()),
             literal_policy: TOKEN_POLICY,
+            expiry: Some(AuthExternalExpiry {
+                pointer: "/tokens/access_token".to_owned(),
+                format: AuthExternalExpiryFormat::JwtExp,
+            }),
         });
     }
     sources
@@ -189,21 +197,34 @@ mod tests {
             .collect())
     }
 
+    fn jwt(exp: u64) -> String {
+        use base64::Engine as _;
+        let encode = |value: Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        format!(
+            "{}.{}.signature",
+            encode(json!({"alg": "none"})),
+            encode(json!({"exp": exp}))
+        )
+    }
+
+    fn codex_chatgpt(access_token: &str) -> Value {
+        json!({"OPENAI_API_KEY": null, "tokens": {
+            "access_token": access_token, "refresh_token": "refresh",
+            "id_token": "id", "account_id": "account"}})
+    }
+
     #[test]
     fn codex_chatgpt_delivers_tokens_without_the_refresh_token() {
         let home = tempfile::tempdir().unwrap();
-        write(
-            home.path(),
-            ".codex/auth.json",
-            &json!({"OPENAI_API_KEY": null, "tokens": {
-                "access_token": "access", "refresh_token": "refresh",
-                "id_token": "id", "account_id": "account"}}),
-        );
+        let access = jwt(4_102_444_800);
+        write(home.path(), ".codex/auth.json", &codex_chatgpt(&access));
         let credentials = connect(&roots(home.path()), "openai", "codex-chatgpt").unwrap();
         assert_eq!(
             credentials,
             BTreeMap::from([
-                ("access_token".into(), "access".into()),
+                ("access_token".into(), access),
                 ("account_id".into(), "account".into()),
                 ("id_token".into(), "id".into()),
             ])
@@ -212,6 +233,16 @@ mod tests {
         assert_eq!(
             connect(&roots(home.path()), "openai", "codex-api-key"),
             Err(ExternalAuthError::SourceUnavailable)
+        );
+    }
+
+    #[test]
+    fn expired_codex_chatgpt_sign_in_is_reported_before_any_request() {
+        let home = tempfile::tempdir().unwrap();
+        write(home.path(), ".codex/auth.json", &codex_chatgpt(&jwt(1)));
+        assert_eq!(
+            connect(&roots(home.path()), "openai", "codex-chatgpt"),
+            Err(ExternalAuthError::Expired)
         );
     }
 

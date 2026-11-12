@@ -1278,11 +1278,21 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
         model_id: String,
+        external_auth_binding: Option<String>,
     ) -> Result<(), SessionApplicationFailure> {
         self.selected_location(session_id).await?;
-        session_operations::set_model(self.state, session_id, provider_plugin_id, model_id)
-            .await
-            .map_err(|error| match error {
+        session_operations::set_model(
+            self.state,
+            session_id,
+            provider_plugin_id,
+            model_id,
+            external_auth_binding,
+        )
+        .await
+        .map_err(|error| match error {
+                session_operations::SetModelError::ExternalConnection(error) => {
+                    failure("external_connection_unavailable", &error.to_string())
+                }
                 session_operations::SetModelError::SkillRequiredModelActive(_) => failure(
                     "skill_required_model_active",
                     "an active skill declares a required model; deactivate it before changing the session model",
@@ -1692,6 +1702,7 @@ mod tests {
                     summary.id,
                     Some("test.provider".to_owned()),
                     "test.model".to_owned(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2171,7 +2182,7 @@ mod tests {
                     .await
                     .unwrap_err(),
                 application(&state)
-                    .set_session_model(id, None, "ignored".to_owned())
+                    .set_session_model(id, None, "ignored".to_owned(), None)
                     .await
                     .unwrap_err(),
                 application(&state)

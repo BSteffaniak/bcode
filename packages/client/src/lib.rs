@@ -712,6 +712,20 @@ impl bcode_provider_auth_models::external::ExternalAuthApplication for BcodeClie
             _ => Err(ExternalAuthError::StateUnavailable),
         }
     }
+
+    async fn external_auth_status(
+        &self,
+    ) -> Result<
+        Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
+        bcode_provider_auth_models::external::ExternalAuthError,
+    > {
+        use bcode_provider_auth_models::external::ExternalAuthError;
+        match self.send_request(Request::ExternalAuthStatus).await {
+            Ok(ResponsePayload::ExternalAuthStatus { connections }) => Ok(connections),
+            Ok(ResponsePayload::ExternalAuthFailed { error }) => Err(error),
+            _ => Err(ExternalAuthError::StateUnavailable),
+        }
+    }
 }
 
 impl bcode_provider_auth_models::application::AccountLifecycleApplication
@@ -1750,10 +1764,17 @@ impl bcode_session_models::SessionApplication for BcodeClient {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
         model_id: String,
+        external_auth_binding: Option<String>,
     ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
-        Self::set_session_model(self, session_id, provider_plugin_id, model_id)
-            .await
-            .map_err(session_application_failure)
+        Self::set_session_model_with_connection(
+            self,
+            session_id,
+            provider_plugin_id,
+            model_id,
+            external_auth_binding,
+        )
+        .await
+        .map_err(session_application_failure)
     }
     async fn set_session_agent(
         &self,
@@ -6058,11 +6079,30 @@ impl BcodeClient {
         provider_plugin_id: Option<String>,
         model_id: String,
     ) -> Result<(), ClientError> {
+        self.set_session_model_with_connection(session_id, provider_plugin_id, model_id, None)
+            .await
+    }
+
+    /// Set a session-specific model selection that also selects an approved external
+    /// credential connection, or clears one when `external_auth_binding` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request, including an
+    /// unapproved connection or a model its provider does not recommend for it.
+    pub async fn set_session_model_with_connection(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        external_auth_binding: Option<String>,
+    ) -> Result<(), ClientError> {
         match self
             .send_request(Request::SetSessionModel {
                 session_id,
                 provider_plugin_id,
                 model_id,
+                external_auth_binding,
             })
             .await?
         {

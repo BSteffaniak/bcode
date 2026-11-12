@@ -145,6 +145,7 @@ mod tests {
                     reject_whitespace_or_control: true,
                     reject_environment_identifier: false,
                 },
+                expiry: None,
             }],
         }
     }

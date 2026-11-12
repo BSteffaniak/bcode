@@ -1160,6 +1160,8 @@ pub enum Request {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
         model_id: String,
+        /// Approved external credential connection to use with this model, if any.
+        external_auth_binding: Option<String>,
     },
     SetSessionReasoning {
         session_id: SessionId,
@@ -1572,6 +1574,8 @@ pub enum Request {
     RevokeExternalAuth {
         binding_id: String,
     },
+    /// Approved connections with their current local status.
+    ExternalAuthStatus,
     /// List portable auth-pool status.
     /// Registered providers and explicitly owned lifecycle accounts.
     AccountLifecycleCatalog,
@@ -3210,6 +3214,10 @@ pub enum ResponsePayload {
     ExternalAuthRevoked {
         removed: bool,
     },
+    /// Approved connections with their current local status.
+    ExternalAuthStatus {
+        connections: Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
+    },
     /// Normalized external connection failure.
     ExternalAuthFailed {
         error: bcode_provider_auth_models::external::ExternalAuthError,
@@ -4648,6 +4656,7 @@ mod tests {
             Request::RevokeExternalAuth {
                 binding_id: grant.binding_id.clone(),
             },
+            Request::ExternalAuthStatus,
         ] {
             let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
             assert_eq!(
@@ -4655,21 +4664,32 @@ mod tests {
                 serde_json::to_value(request).unwrap()
             );
         }
-        for payload in [
-            ResponsePayload::ExternalAuthDiscovered {
-                candidates: vec![candidate],
-            },
-            ResponsePayload::ExternalAuthApproved {
-                grant: grant.clone(),
-            },
-            ResponsePayload::ExternalAuthListed {
-                grants: vec![grant],
-            },
-            ResponsePayload::ExternalAuthRevoked { removed: true },
-            ResponsePayload::ExternalAuthFailed {
-                error: ExternalAuthError::AccountChanged,
-            },
-        ] {
+        for payload in
+            [
+                ResponsePayload::ExternalAuthDiscovered {
+                    candidates: vec![candidate],
+                },
+                ResponsePayload::ExternalAuthApproved {
+                    grant: grant.clone(),
+                },
+                ResponsePayload::ExternalAuthListed {
+                    grants: vec![grant.clone()],
+                },
+                ResponsePayload::ExternalAuthRevoked { removed: true },
+                ResponsePayload::ExternalAuthStatus {
+                    connections:
+                        vec![bcode_provider_auth_models::external::ExternalAuthConnection {
+                    grant,
+                    status: bcode_provider_auth_models::external::ExternalConnectionStatus::Ready {
+                        expires_at_unix: Some(2),
+                    },
+                }],
+                },
+                ResponsePayload::ExternalAuthFailed {
+                    error: ExternalAuthError::AccountChanged,
+                },
+            ]
+        {
             let response = Response::Ok(payload);
             let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
             assert_eq!(
@@ -7947,6 +7967,7 @@ mod tests {
                 provider: "provider".to_string(),
                 model: "model".to_string(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
             },
             SessionEventKind::SystemMessage {
                 text: "system".to_string(),

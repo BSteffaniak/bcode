@@ -919,6 +919,7 @@ pub enum CoreRuntimeRequest {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
         model_id: String,
+        external_auth_binding: Option<String>,
     },
     SetSessionReasoning {
         session_id: SessionId,
@@ -1001,6 +1002,7 @@ pub enum CoreRuntimeRequest {
     RevokeExternalAuth {
         binding_id: String,
     },
+    ExternalAuthStatus,
     AuthPoolList,
     /// Read account-first next-turn routing in the session configuration.
     AccountRouting {
@@ -2006,10 +2008,12 @@ impl RoutedRequest {
                 session_id,
                 provider_plugin_id,
                 model_id,
+                external_auth_binding,
             } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetSessionModel {
                 session_id,
                 provider_plugin_id,
                 model_id,
+                external_auth_binding,
             })),
             Request::SetSessionReasoning {
                 session_id,
@@ -2647,6 +2651,9 @@ impl RoutedRequest {
             }
             Request::ListExternalAuth => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::ListExternalAuth))
+            }
+            Request::ExternalAuthStatus => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ExternalAuthStatus))
             }
             Request::RevokeExternalAuth { binding_id } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::RevokeExternalAuth {

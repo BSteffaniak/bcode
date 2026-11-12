@@ -700,6 +700,8 @@ enum PersistedSessionEventKind {
         model: String,
         #[serde(default)]
         selection_source: bcode_session_models::ModelSelectionSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_auth_binding: Option<String>,
     },
     SystemMessage {
         text: String,
@@ -1240,10 +1242,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 provider,
                 model,
                 selection_source,
+                external_auth_binding,
             } => Self::ModelChanged {
                 provider: provider.clone(),
                 model: model.clone(),
                 selection_source: *selection_source,
+                external_auth_binding: external_auth_binding.clone(),
             },
             SessionEventKind::SystemMessage { text } => Self::SystemMessage { text: text.clone() },
             SessionEventKind::AgentChanged { agent_id } => Self::AgentChanged {
@@ -1765,10 +1769,12 @@ impl PersistedSessionEventKind {
                 provider,
                 model,
                 selection_source,
+                external_auth_binding,
             } => SessionEventKind::ModelChanged {
                 provider,
                 model,
                 selection_source,
+                external_auth_binding,
             },
             Self::SystemMessage { text } => SessionEventKind::SystemMessage { text },
             Self::AgentChanged { agent_id } => SessionEventKind::AgentChanged { agent_id },

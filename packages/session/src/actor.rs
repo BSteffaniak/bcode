@@ -3211,6 +3211,7 @@ impl SessionActor {
                     provider_plugin_id: self.state.current_provider.clone(),
                     model_id: self.state.current_model.clone(),
                     model_selection_source: self.state.model_selection_source,
+                    external_auth_binding: self.state.external_auth_binding.clone(),
                     reasoning_effort: self.state.reasoning_effort.clone(),
                     reasoning_summary: self.state.reasoning_summary.clone(),
                 });

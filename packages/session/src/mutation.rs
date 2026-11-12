@@ -376,12 +376,37 @@ impl SessionManager {
         model: String,
         selection_source: bcode_session_models::ModelSelectionSource,
     ) -> Result<SessionEvent, SessionError> {
+        self.append_model_changed_with_connection(
+            session_id,
+            provider,
+            model,
+            selection_source,
+            None,
+        )
+        .await
+    }
+
+    /// Append a model-changed event that also selects an approved external credential
+    /// connection, or clears one when `external_auth_binding` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_model_changed_with_connection(
+        &self,
+        session_id: SessionId,
+        provider: String,
+        model: String,
+        selection_source: bcode_session_models::ModelSelectionSource,
+        external_auth_binding: Option<String>,
+    ) -> Result<SessionEvent, SessionError> {
         self.append_event(
             session_id,
             SessionEventKind::ModelChanged {
                 provider,
                 model,
                 selection_source,
+                external_auth_binding,
             },
         )
         .await

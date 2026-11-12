@@ -191,6 +191,7 @@ pub fn session_migrations() -> CurrentMigrationSource {
     );
     add_milestone_migrations(&mut source);
     add_submission_recovery_migrations(&mut source);
+    add_external_connection_migrations(&mut source);
     if crate::durable_interaction::PUBLICATION_ENABLED {
         add_durable_interaction_migrations(&mut source);
     }
@@ -465,6 +466,22 @@ impl Executable for InitializeDurableInteractions {
         }
         Ok(())
     }
+}
+
+/// Session selections of approved external credential connections. Existing sessions read
+/// `NULL`, which correctly means no connection: no earlier event could carry one.
+fn add_external_connection_migrations(source: &mut CurrentMigrationSource) {
+    add_migration(
+        source,
+        "081_session_state_external_auth_binding_column",
+        alter_table("session_state").add_column(
+            "external_auth_binding".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("external_auth_binding".into()),
+    );
 }
 
 fn add_managed_tool_migrations(source: &mut CurrentMigrationSource) {
