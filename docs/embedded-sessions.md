@@ -35,7 +35,9 @@ Related contracts: [session persistence](session-persistence-architecture.md),
 * `SessionSummary.origin` is a display cache carried by `manifest.json`. Opening a session reads
   the origin, and import provenance, from at most the first three canonical events; listing
   never replays history. A session whose manifest is lost is listed as native and gets its
-  origin back when it is opened. Origin is never backfilled.
+  origin back when it is opened. Origin is never backfilled. A manifest rewritten by an older
+  build drops the origin field, so origin-filtered listings miss that session until a current
+  build opens it and rewrites the manifest.
 * `SessionCatalogQuery.origin` filters bounded catalog pages by app id and context entries.
   Candidates whose summary cannot be read do not match and are counted in
   `SessionCatalogPage.unclassified_origin_count`.
@@ -64,23 +66,35 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   `ClientToolProvider::into_concurrent` splits the connection into a cloneable
   `ClientToolHandle` and a `ClientToolRequests` stream, so invocations can be answered
   concurrently and claims or re-registrations do not wait for running calls.
-* The daemon keeps registrations, claims and pending invocations in memory per connection. When a
-  turn starts, the claimant's tools are pinned in the turn's tool catalog next to plugin tools.
-  The agent-profile contract carries them as `claimed_tools` and `claimed`; the default agents
-  plugin treats a claim as exposure, like its default build tools, so a read-only tool runs and a
-  mutating tool asks. `[tools] disabled`, an agent tool map entry of `false`, and the `none` tool
-  default still hide a claimed tool. A claim never grants permission.
+* The daemon keeps registrations, claims and pending invocations in memory per connection.
+  Claims are per provider: several applications can claim one session and each offers its own
+  tools there; a newer connection of the same provider replaces the older one, which receives
+  `ClientToolClaimLost`. When a turn starts, the claimants' tools are pinned in the turn's tool
+  catalog next to plugin tools, together with the policy class and deadline each declared, so
+  a re-registration during the turn never changes how its calls are authorized or bounded.
+* The agent-profile contract carries claimed tools as `claimed_tools` (with the mutating subset
+  in `claimed_mutating_tools`) and `claimed`; the default agents plugin treats a claim as
+  exposure, like its default build tools, so a read-only tool runs and a mutating tool asks.
+  The plan agent is never shown a claimed mutating tool, and such a call is denied there.
+  `[tools] disabled`, an agent tool map entry of `false`, and the `none` tool default still hide
+  a claimed tool. A claim never grants permission.
 * Calls go through the ordinary authorization coordinator, so exact-name rules and remembered
   decisions apply and any client may answer the prompt. After approval the daemon records the
   durable dispatch marker and sends the invocation to the claimant.
-* Results are bounded (1 MiB of text) and then pass the runtime's tool-result policy. Identical
-  repeated answers are accepted; conflicting ones are rejected; answers after the call ended are
-  accepted and dropped.
+* Results and failure messages are bounded (1 MiB of text) and then pass the runtime's
+  tool-result policy. Identical repeated answers are accepted; conflicting ones are rejected;
+  answers after the call ended are accepted and dropped.
 * Failures: `client_tool_unavailable` (no live claimant), `client_tool_disconnected` (the
-  connection closed during the call; effects unknown), `client_tool_timeout` (deadline). Calls are
+  connection closed before delivery, so the call did not run, or during the call, so its effects
+  are unknown), `client_tool_timeout` (deadline; effects unknown, and the application is told to
+  stop). When the turn is cancelled during a call the application is told to stop, the result
+  says the call's effects are unknown, and the turn ends as cancelled. Calls are
   never re-sent. The durable dispatch marker is recorded before delivery, the boundary plugin
   tools use for daemon-restart recovery; a restart test specific to client tools does not exist
   yet.
+* Any connected client may claim any session and answer any permission prompt: all clients of a
+  daemon run as the same local user, so a claim is routing, not a credential. It never grants
+  permission; a read-only client tool runs without asking in sessions its provider claimed.
 * Tool events record no producer plugin for client tools; the namespaced tool name identifies the
   app. The `producer_client_id` field and `ToolSource::Client` presentation hints proposed below
   were not added.
@@ -99,6 +113,12 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   normalized content. Importing the same content again returns the existing session; different
   content under the same session id fails with `session_import_conflict` and nothing is merged.
   Source files are only read.
+* File imports run one at a time and look for an earlier import in the fully loaded catalog, so
+  concurrent imports, or an import right after the daemon starts, never create a conversation
+  twice (`session_import_catalog_unavailable` when the catalog cannot be loaded). An earlier
+  import with the same digest whose last event is missing (it stopped partway) fails with
+  `session_import_incomplete`, naming the session to delete before importing again; the check is
+  two bounded reads, not a replay.
 
 ### Session bridge
 

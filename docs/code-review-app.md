@@ -133,8 +133,14 @@ beside a right threads panel) and under the document otherwise; drag its divider
 * When a `code_review.*` tool that changes the review finishes in the dock's session (or an AI
   card's), the review reloads its comments and viewed files as it does for the reviewer's own
   edits: a drafted comment appears at its line, a resolved thread resolves, a viewed file shows
-  as viewed. `code_review.navigate` moves the cursor to the place it names. Tool calls that had
-  already finished when a session is first observed are not replayed.
+  as viewed. `code_review.navigate` moves the cursor to the place it names. In a session the app
+  started (the dock's conversation, or a question's own session) every finished call is applied,
+  including calls that finished before the app first observed the session. In a session it
+  found (reopening a review continues its last assistant session), calls that had already
+  finished when the session is first observed are not replayed.
+* `ctrl+n` starts a new conversation at once: a lookup or a session start of the previous
+  conversation that finishes afterwards never replaces it, and messages written in the previous
+  conversation still go to its session.
 
 #### Review tools
 
@@ -150,14 +156,14 @@ with the revisions it shows; any other session passes `review` with a saved revi
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
 | `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). |
 | `code_review.list_threads` | read | Threads (location, kind, severity, resolved, comments) and pending suggestions. |
-| `code_review.pull_request` | read | The pull request behind the review (by its pull request sources, else its branch): title, state, branches, review decision, CI checks, via the GitHub CLI. |
+| `code_review.pull_request` | read, web | The pull request behind the review (by its pull request sources, else its branch): title, state, branches, review decision, CI checks, via the GitHub CLI with the user's credentials. |
 | `code_review.navigate` | read | Moves the reviewer's view to a file or line. |
 | `code_review.add_comment` | write | Drafts a comment on lines (`path`, `line`, `end_line`, `side`), a file, or the review, with an optional kind and severity. |
 | `code_review.reply` | write | Replies in a thread. |
 | `code_review.resolve_thread` | write | Resolves or reopens a thread. |
 | `code_review.mark_viewed` | write | Marks files viewed or not viewed at their current content. |
 | `code_review.suggest_change` | write | A suggested comment the reviewer accepts or rejects, optionally replacing the lines (a `suggestion` block). |
-| `code_review.publish` | publish | Previews, or with `submit` publishes, the comments with a built-in publisher (`local_markdown`, `markdown_file`, `json_file`). |
+| `code_review.publish` | publish | Previews, or with `submit` publishes, the comments with a built-in publisher (`local_markdown`, `markdown_file`, `json_file`). `output_path` is a path relative to the session's working directory that stays inside it; without it the file goes to `.bcode/reviews/` in the repository. |
 
 Reads are bounded (2,000 files, 2,000 diff or content lines per call, 200 threads, 4 KiB per
 comment, 128 KiB of output) and say when they were cut. Writes and publishing return what they
@@ -167,8 +173,18 @@ did. Publishing to a forge such as GitHub stays in the app (`P`), which reaches 
 
 The tools follow Bcode's permission rules like any other tool. Reads and `navigate` are
 read-only and allowed; writes and `publish` are mutating and ask, and the prompt appears in the
-dock (or the AI card) as above. The plan agent has the writes and `publish` turned off. Set each
-tool to `allow`, `ask`, or `deny` per agent with exact-name rules, or turn it off:
+dock (or the AI card) as above. The plan agent has the writes and `publish` turned off. Some
+calls also declare the resources they touch, so the path and web rules apply to them as well:
+
+* `file_diff` and `file_content` declare the file they read (resolved in the repository), so
+  read rules such as `[permission.read] "**/.env" = "deny"` deny them too.
+* `pull_request` declares the repository's web address (its `origin` on GitHub), so web rules
+  decide it; without a web rule that allows the address it asks. An exact-name `allow` alone
+  does not skip the prompt; allow the address with a web rule instead.
+* `publish` with an `output_path` declares the file it writes, so write rules apply and the
+  prompt names the file.
+
+Set each tool to `allow`, `ask`, or `deny` per agent with exact-name rules, or turn it off:
 
 ```toml
 [agent.build.permission.tools]
@@ -176,6 +192,9 @@ tool to `allow`, `ask`, or `deny` per agent with exact-name rules, or turn it of
 "code_review.mark_viewed" = "allow"
 "code_review.publish" = "deny"        # never publish from an agent
 "code_review.file_content" = "ask"    # ask before reading file contents
+
+[agent.build.permission.web]
+"https://github.com/**" = "allow"     # pull_request without asking
 
 [agent.build.tools]
 "code_review.pull_request" = false    # no GitHub calls

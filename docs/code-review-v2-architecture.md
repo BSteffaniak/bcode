@@ -2254,11 +2254,18 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
 * **Permissions.** The default agents enable the tools (the plan agent turns the writes and
   `publish` off). Exact-name rules under `[agent.<id>.permission.tools]` now also apply to
   read-only operations (`agent-policy`), so every review tool can be set to allow, ask, or deny;
-  `[agent.<id>.tools]` turns one off.
+  `[agent.<id>.tools]` turns one off. Calls also declare the resources they touch as compound
+  operations: `file_diff` and `file_content` the file they read (read rules apply),
+  `pull_request` the repository's web address (web rules apply; without one it asks), and
+  `publish` with `output_path` the file it writes. `output_path` must be relative to the
+  session's working directory and stay inside it.
 * **Live reflection.** After the follow streams drain, finished `code_review.*` writes in any
   followed session reload the annotations (and, for `mark_viewed`, the stored viewed state) and a
-  finished `navigate` moves the cursor; calls already finished when a session is first observed
-  are recorded, not replayed. The feed keeps each tool call's arguments (4 KiB) for this.
+  finished `navigate` moves the cursor. Calls already finished when a found session is first
+  observed are recorded, not replayed; sessions the app created (the dock's, a question's) apply
+  every call. Lookups and session starts carry the dock's conversation number, so one that
+  finishes after `ctrl+n` never replaces the new conversation. The feed keeps each tool call's
+  arguments (4 KiB) for this.
 * **Verification.** Plugin tests drive every tool through the plugin entry point (listing,
   preparation policies, a bound session's reads, writes landing in the app's scope, publishing).
   Screen tests cover opening and placing the dock, a bound session with the attached place,
@@ -2272,7 +2279,8 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
   other plugins' services, so GitHub publishing stays in the app); CI status beyond the pull
   request's aggregate checks state; reflecting writes made by sessions the review does not follow
   (an unrelated chat session's writes show on the next refresh or reopen); a persisted dock
-  open/size state.
+  open/size state; field-level viewed updates (the app saves its whole viewed state, so a save
+  that lands between a tool's `mark_viewed` and the app's reload can drop that mark).
 
 ### 13.7 Phase 13: embedded-session model (Bcode-wide)
 
@@ -2292,12 +2300,18 @@ decisions D1–D8 were written before the build and have not been signed off.
     purpose and the review workspace.
   * Apps register namespaced tools on a daemon connection (`ClientToolProvider`), claim sessions
     (creating a session with a matching origin claims it), and answer invocations after the
-    shared permission policy approved them. Claimed tools are pinned per turn; the default agents
-    plugin exposes them without granting permission. Disconnects, deadlines and cancellation fail
-    the call without replay.
+    shared permission policy approved them. Each provider claims a session independently, and a
+    newer connection of the same provider replaces the older one. Claimed tools, with the policy
+    class and deadline they declared, are pinned per turn, so a re-registration mid-turn never
+    changes how a call is authorized. The default agents plugin exposes claimed tools without
+    granting permission; the plan agent is never shown a claimed mutating tool. Disconnects,
+    deadlines and cancellation fail the call without replay, and every failure after delivery
+    tells the model the call's effects are unknown.
   * The bundled `sdk-json` importer and `bcode session import file` turn SDK JSON conversations
     into canonical sessions with provenance, an origin and a content digest; identical re-imports
-    are idempotent and different content is a reported conflict.
+    are idempotent and different content is a reported conflict. File imports are serialized and
+    check the fully loaded catalog, and an earlier import that stopped before all of its events
+    were written is reported (`session_import_incomplete`) instead of returned.
   * `packages/bcode/examples/embedded_session.rs` shows all three against the installed daemon.
   * The session bridge: `bcode session-bridge --stdio` serves a JSON-lines protocol (version 1,
     window of the current and two earlier versions) as an exact-match client of its own daemon.
