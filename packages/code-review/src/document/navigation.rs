@@ -396,6 +396,40 @@ impl ReviewDocument {
         from: usize,
         direction: Direction,
     ) -> Option<NavTarget> {
+        let indices = self.match_indices(results);
+        let found = match direction {
+            Direction::Forward => indices.into_iter().find(|(index, _)| *index > from),
+            Direction::Backward => indices.into_iter().rev().find(|(index, _)| *index < from),
+        }?;
+        Some(NavTarget {
+            index: found.0,
+            key: found.1,
+            needs_load: None,
+        })
+    }
+
+    /// Where stepping through matches in `direction` wraps to: the first match going forward,
+    /// the last going backward.
+    #[must_use]
+    pub fn wrapped_match(
+        &self,
+        results: &SearchResults,
+        direction: Direction,
+    ) -> Option<NavTarget> {
+        let indices = self.match_indices(results);
+        let found = match direction {
+            Direction::Forward => indices.into_iter().next(),
+            Direction::Backward => indices.into_iter().next_back(),
+        }?;
+        Some(NavTarget {
+            index: found.0,
+            key: found.1,
+            needs_load: None,
+        })
+    }
+
+    /// The items holding a match in the current layout, in order, one per item.
+    fn match_indices(&self, results: &SearchResults) -> Vec<(usize, ItemKey)> {
         let mut indices: Vec<(usize, ItemKey)> = results
             .matches
             .iter()
@@ -406,14 +440,6 @@ impl ReviewDocument {
             .collect();
         indices.sort_by_key(|(index, _)| *index);
         indices.dedup_by_key(|(index, _)| *index);
-        let found = match direction {
-            Direction::Forward => indices.into_iter().find(|(index, _)| *index > from),
-            Direction::Backward => indices.into_iter().rev().find(|(index, _)| *index < from),
-        }?;
-        Some(NavTarget {
-            index: found.0,
-            key: found.1,
-            needs_load: None,
-        })
+        indices
     }
 }

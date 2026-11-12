@@ -324,45 +324,5 @@ where
     })
 }
 
-impl ProviderTransport for bcode_client::BcodeClient {
-    async fn plugins_serving(&self, interface_id: &str) -> Result<Vec<String>, ProviderCallError> {
-        let services = self.plugin_services().await.map_err(|error| {
-            ProviderCallError::new(REVIEW_SOURCE_ERROR_FAILED, error.to_string())
-        })?;
-        Ok(services
-            .into_iter()
-            .filter(|service| service.interface_id == interface_id)
-            .map(|service| service.plugin_id)
-            .collect())
-    }
-
-    async fn invoke(
-        &self,
-        plugin_id: &str,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, ProviderCallError> {
-        let response = self
-            .invoke_plugin_service(
-                plugin_id.to_string(),
-                interface_id.to_string(),
-                operation.to_string(),
-                payload,
-            )
-            .await
-            .map_err(|error| {
-                ProviderCallError::new(REVIEW_SOURCE_ERROR_FAILED, error.to_string())
-            })?;
-        match response.error {
-            Some(error) => Err(ProviderCallError {
-                code: error.code,
-                message: error.message,
-            }),
-            None => Ok(response.payload),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;

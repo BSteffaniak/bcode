@@ -25,7 +25,7 @@ use crate::theme::HostTheme;
 pub const HOST_ERROR_FAILED: &str = "host_failed";
 
 /// Callback that asks the run loop for a frame.
-type Redraw = Arc<dyn Fn() + Send + Sync>;
+pub type Redraw = Arc<dyn Fn() + Send + Sync>;
 
 /// Updates buffered per followed session before the follower waits for the UI.
 const FOLLOW_BUFFER: usize = 16;
@@ -158,6 +158,14 @@ pub trait ReviewHost: Send + Sync {
 
     /// Ask for a new frame; repeated requests before the frame coalesce.
     fn request_redraw(&self);
+
+    /// Route [`Self::request_redraw`] (and the frames requested when spawned work finishes) to
+    /// `redraw`, the wake-up of the loop that drives the UI. The app's own run loop connects it
+    /// once it starts; a host that drives the UI from its own loop wakes that loop instead and
+    /// can ignore it.
+    fn connect_redraw(&self, redraw: Redraw) {
+        let _ = redraw;
+    }
 }
 
 /// [`ProviderTransport`] over a host's plugin services, for review-source provider routing.
@@ -230,12 +238,6 @@ impl StandaloneHost {
     pub fn with_bcode_program(mut self, program: impl Into<String>) -> Self {
         self.bcode_program = program.into();
         self
-    }
-
-    /// Route [`ReviewHost::request_redraw`] to `redraw`. Only the first call takes effect; the
-    /// run loop connects its runtime here once it starts.
-    pub fn connect_redraw(&self, redraw: Redraw) {
-        let _ = self.redraw.set(redraw);
     }
 
     /// Present `theme` from now on and request a redraw.
@@ -331,9 +333,15 @@ impl ReviewHost for StandaloneHost {
     fn plugins_serving(&self, interface_id: String) -> HostFuture<Vec<String>> {
         let client = self.client.clone();
         Box::pin(async move {
-            ProviderTransport::plugins_serving(&client, &interface_id)
+            let services = client
+                .plugin_services()
                 .await
-                .map_err(provider_error)
+                .map_err(|error| client_error(&error))?;
+            Ok(services
+                .into_iter()
+                .filter(|service| service.interface_id == interface_id)
+                .map(|service| service.plugin_id)
+                .collect())
         })
     }
 
@@ -346,9 +354,17 @@ impl ReviewHost for StandaloneHost {
     ) -> HostFuture<Vec<u8>> {
         let client = self.client.clone();
         Box::pin(async move {
-            ProviderTransport::invoke(&client, &plugin_id, &interface_id, &operation, payload)
+            let response = client
+                .invoke_plugin_service(plugin_id, interface_id, operation, payload)
                 .await
-                .map_err(provider_error)
+                .map_err(|error| client_error(&error))?;
+            match response.error {
+                Some(error) => Err(HostError {
+                    code: error.code,
+                    message: error.message,
+                }),
+                None => Ok(response.payload),
+            }
         })
     }
 
@@ -401,12 +417,10 @@ impl ReviewHost for StandaloneHost {
             redraw();
         }
     }
-}
 
-fn provider_error(error: ProviderCallError) -> HostError {
-    HostError {
-        code: error.code,
-        message: error.message,
+    /// Only the first call takes effect.
+    fn connect_redraw(&self, redraw: Redraw) {
+        let _ = self.redraw.set(redraw);
     }
 }
 

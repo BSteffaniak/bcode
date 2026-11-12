@@ -416,6 +416,23 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
             "bcode_agent_runtime",
         ],
     ),
+    (
+        // The review data layer and its document stay renderer-neutral and reach plugin
+        // services only through the transport its caller provides.
+        "bcode_code_review",
+        "packages/code-review",
+        "",
+        &["bcode_code_review_models"],
+        &[
+            "bmux_tui",
+            "bmux_tui_components",
+            "bmux_tui_runtime",
+            "crossterm",
+            "bcode_client",
+            "bcode_plugin",
+            "bcode_tui",
+        ],
+    ),
     ("bcode_cli", "packages/cli", "", &[], &["bcode_hyperchad"]),
     (
         "bcode_cli",

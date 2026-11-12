@@ -785,6 +785,51 @@ fn home_clicks_start_suggestions_and_open_reviews_where_painted() {
 }
 
 #[test]
+fn commits_that_are_not_a_chain_show_each_part_label_once() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let first = rev_parse(&fixture, crate::testing::fixture::STACK_BRANCHES[0]);
+    let last = rev_parse(&fixture, crate::testing::fixture::STACK_BRANCHES[2]);
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Two commits",
+        vec![ReviewSourceKind::Commits {
+            revs: vec![first, last],
+        }],
+    );
+    let (scenario, screen) = open(
+        &fixture,
+        &backend,
+        Entry::Resume {
+            workspace_id: Some(workspace.id),
+        },
+        200,
+        50,
+    );
+    let doc = scenario
+        .surface()
+        .review()
+        .expect("review")
+        .document()
+        .expect("document");
+    let headers: Vec<String> = doc
+        .groups()
+        .filter_map(|group| Some(group.source.part.as_ref()?.label.clone()))
+        .collect();
+    assert_eq!(headers.len(), 2, "{}", screen.text());
+    for part in headers {
+        let row = screen.find(&part).expect("part label painted");
+        assert_eq!(
+            screen.row_text(row.y).matches(part.as_str()).count(),
+            1,
+            "{}",
+            screen.text()
+        );
+    }
+}
+
+#[test]
 fn an_empty_home_invites_a_first_review() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default());

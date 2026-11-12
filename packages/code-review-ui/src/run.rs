@@ -184,7 +184,7 @@ impl Program for App {
 }
 
 /// Build application state without touching the terminal, with the theme and host the options
-/// select. The standalone host is connected to no runtime yet; [`run`] connects it.
+/// select. The host's redraws reach no runtime yet; [`run`] connects them.
 ///
 /// # Errors
 ///
@@ -193,14 +193,14 @@ impl Program for App {
 /// # Panics
 ///
 /// Panics when called outside a Tokio runtime without a host in `options`.
-pub fn build_app(options: RunOptions) -> Result<(App, Option<Arc<StandaloneHost>>), RunError> {
+pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let repo = bcode_code_review::scope::working_tree_root(&options.path);
     let loaded = options.config;
     let keymap = crate::keymap::registry(loaded.keybindings.clone())
         .map_err(|error| RunError::Keymap(format!("invalid review keybindings: {error}")))?;
     let mut diagnostics = loaded.diagnostics.clone();
-    let (host, standalone) = if let Some(host) = options.host {
-        (host, None)
+    let host = if let Some(host) = options.host {
+        host
     } else {
         let (theme, theme_error) = HostTheme::load(&loaded.theme, &loaded.config_dir, &repo);
         diagnostics.extend(theme_error);
@@ -215,28 +215,21 @@ pub fn build_app(options: RunOptions) -> Result<(App, Option<Arc<StandaloneHost>
         if let Some(program) = options.bcode_program {
             standalone = standalone.with_bcode_program(program.to_string_lossy().into_owned());
         }
-        let standalone = Arc::new(standalone);
-        (
-            Arc::clone(&standalone) as Arc<dyn ReviewHost>,
-            Some(standalone),
-        )
+        Arc::new(standalone) as Arc<dyn ReviewHost>
     };
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host));
     let ui = UiContext::new(host, Arc::new(keymap), loaded.diff_layout);
     let mut review = ReviewApp::new(services, repo, loaded.view, options.entry);
     review.prepare_keymap(&ui);
-    Ok((
-        App {
-            review,
-            ui,
-            styles: None,
-            wake_pending: Arc::new(AtomicBool::new(false)),
-            open_session: None,
-            quit: false,
-            diagnostics,
-        },
-        standalone,
-    ))
+    Ok(App {
+        review,
+        ui,
+        styles: None,
+        wake_pending: Arc::new(AtomicBool::new(false)),
+        open_session: None,
+        quit: false,
+        diagnostics,
+    })
 }
 
 /// Render the current state into plain text rows, without a terminal. Intended for tests and
@@ -276,11 +269,11 @@ type WakeTarget = Arc<Mutex<Option<RuntimeHandle<Msg>>>>;
 ///
 /// * [`RunError`] for keybinding, terminal, or runtime failures.
 pub async fn run(options: RunOptions) -> Result<(), RunError> {
-    let (mut app, standalone) = build_app(options)?;
+    let mut app = build_app(options)?;
     let target = WakeTarget::default();
-    if let Some(host) = &standalone {
-        host.connect_redraw(wake(Arc::clone(&target), Arc::clone(&app.wake_pending)));
-    }
+    app.ui
+        .host()
+        .connect_redraw(wake(Arc::clone(&target), Arc::clone(&app.wake_pending)));
     loop {
         app = Box::pin(session(app, &target)).await?;
         let Some(session_id) = app.open_session.take() else {
@@ -387,5 +380,98 @@ fn run_external(command: &ExternalCommand) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{} exited with {status}", command.program))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::harness::ScriptedHost;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+
+    fn options(
+        path: PathBuf,
+        config: LoadedConfig,
+        host: Option<Arc<dyn ReviewHost>>,
+    ) -> RunOptions {
+        RunOptions {
+            path,
+            config,
+            host,
+            entry: Entry::Home,
+            bcode_program: None,
+        }
+    }
+
+    #[test]
+    fn invalid_keybinding_overrides_fail_before_the_terminal_is_used() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = LoadedConfig {
+            keybindings: BTreeMap::from([(
+                crate::keymap::HOME_SCOPE.to_owned(),
+                BTreeMap::from([(
+                    "not a key stroke".to_owned(),
+                    "bcode.code_review.home_down".to_owned(),
+                )]),
+            )]),
+            ..LoadedConfig::default()
+        };
+        let host: Arc<dyn ReviewHost> = Arc::new(ScriptedHost::new());
+        let result = build_app(options(dir.path().to_path_buf(), config, Some(host)));
+        assert!(matches!(result, Err(RunError::Keymap(_))));
+    }
+
+    #[test]
+    fn a_built_app_paints_home_with_the_given_host_and_keeps_config_diagnostics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = LoadedConfig {
+            diagnostics: vec!["tui.diff_viewer: unknown layout".to_owned()],
+            ..LoadedConfig::default()
+        };
+        let host = Arc::new(ScriptedHost::new());
+        let mut app = build_app(options(
+            dir.path().to_path_buf(),
+            config,
+            Some(Arc::clone(&host) as Arc<dyn ReviewHost>),
+        ))
+        .expect("app builds");
+        assert_eq!(app.diagnostics(), ["tui.diff_viewer: unknown layout"]);
+        assert_eq!(app.review().route_name(), crate::RouteName::Home);
+        let rows = render_text(&mut app, 60, 12);
+        assert_eq!(rows.len(), 12);
+        assert!(rows.iter().any(|row| !row.is_empty()), "{rows:#?}");
+        // Starting the loop starts loading home through the given host.
+        let _ = app.poll();
+        assert!(host.spawned_tasks() > 0);
+    }
+
+    #[test]
+    fn standalone_host_requests_a_frame_from_the_connected_loop_when_work_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+        let host = StandaloneHost::new(
+            bcode_client::BcodeClient::default_endpoint(),
+            HostTheme::fallback(),
+        );
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&frames);
+        host.connect_redraw(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let (done, finished) = tokio::sync::oneshot::channel();
+        host.spawn(Box::pin(async move {
+            let _ = done.send(());
+        }));
+        runtime.block_on(async {
+            finished.await.expect("task ran");
+            tokio::task::yield_now().await;
+        });
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
+        host.request_redraw();
+        assert_eq!(frames.load(Ordering::SeqCst), 2);
     }
 }

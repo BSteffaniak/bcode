@@ -11,7 +11,6 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_client             = { workspace = true }
 bcode_code_review_models = { workspace = true }
 bcode_config             = { workspace = true }
 bcode_git                = { workspace = true }

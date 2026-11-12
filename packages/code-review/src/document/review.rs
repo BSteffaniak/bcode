@@ -73,7 +73,8 @@ pub struct SourceStack {
 pub struct SourceInput {
     /// The resolved source.
     pub source: ResolvedSource,
-    /// Display label (the part label is appended for multi-part sources).
+    /// Display label of the source; the document appends the part label for multi-part
+    /// sources.
     pub label: String,
     /// Every index entry of the source, in index order.
     pub entries: Vec<ReviewIndexEntry>,

@@ -9,7 +9,7 @@ bcode's chat TUI, plugin host, server, session store or agent runtime.
 ```sh
 bcode review                    # review home of the current repository
 bcode review staged             # open a transient review of the index
-bcode review branch --base main
+bcode review branch main
 bcode review pr 42              # needs a review-source provider plugin
 bcode review resume             # the most recently updated saved review
 bcode review publish-github --pr 42 --submit
@@ -48,9 +48,12 @@ The UI reaches everything outside the review through `ReviewHost`: the theme and
 sessions (create, send a message, follow a session's live view, the command that opens a session
 in Bcode), plugin services (publishers, importers and review-source providers), the clipboard,
 external URLs, background tasks, and redraw requests. `StandaloneHost` implements it for both
-entry points with the default daemon client and the platform clipboard and opener. Another host,
-for example one that embeds the review in the chat TUI, implements the same trait without
-changing the UI.
+entry points with the default daemon client and the platform clipboard and opener; it is the
+only part of the app that talks to the daemon for sessions and plugin services, so the data layer
+has no daemon client dependency. `run` connects any host's redraws to its loop
+(`ReviewHost::connect_redraw`). Another host, for example one that embeds the review in the chat
+TUI, implements the same trait and drives `ReviewApp` (a `view::View`) from its own loop,
+handling `Action::OpenSession` itself, without changing the UI.
 
 ### Sessions and the daemon
 

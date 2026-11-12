@@ -618,8 +618,6 @@ pub struct ReviewSurface {
     clipboard: Option<(String, &'static str)>,
     /// Exiting an unsaved review with annotations was asked once (the next exit leaves).
     exit_armed: bool,
-    /// Whether the terminal has focus (the composer offers completion only then).
-    terminal_focused: bool,
     /// Closing asks the app to edit the review's sources.
     edit_requested: bool,
     /// Questions sent as follow-ups in an existing session (their session is not opened).
@@ -726,7 +724,6 @@ impl ReviewSurface {
             hide_viewed_files: false,
             clipboard: None,
             exit_armed: false,
-            terminal_focused: true,
             edit_requested: false,
             follow_ups: BTreeSet::new(),
         }
@@ -4069,12 +4066,7 @@ impl View for ReviewSurface {
                 Action::Redraw
             }
             Event::Focus(FocusEvent::Gained) => {
-                self.terminal_focused = true;
                 self.request_token(host, false);
-                Action::None
-            }
-            Event::Focus(FocusEvent::Lost) => {
-                self.terminal_focused = false;
                 Action::None
             }
             _ => Action::None,

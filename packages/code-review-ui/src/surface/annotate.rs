@@ -17,7 +17,9 @@ use crate::context::UiContext;
 use crate::loader::Message;
 use crate::notes::{self, MutationResult, NoteScope};
 use crate::rows::{AgentAction, ThreadAction};
-use bcode_code_review::document::{AnchorTarget, DocAnchor, ItemKey, ReviewItem};
+use bcode_code_review::document::{
+    AnchorTarget, DocAnchor, ItemKey, LineKind, PairSide, ReviewItem,
+};
 use bcode_code_review_models::{
     REVIEW_AI_EXCHANGE_SCHEMA_VERSION, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
     ReviewLineSide, ReviewSuggestionStatus, ReviewWorkspace,
@@ -659,7 +661,15 @@ impl ReviewSurface {
         let Some(start) = review.doc.index_of(&ItemKey::FileHeader(file.clone())) else {
             return Vec::new();
         };
+        let marker = |kind: LineKind| match kind {
+            LineKind::Added => '+',
+            LineKind::Removed => '-',
+            _ => ' ',
+        };
         let mut out = Vec::new();
+        // Side-by-side rows pair removed with added lines; the added ones are held back until
+        // the change ends so the lines read in unified order whichever layout is shown.
+        let mut added = Vec::new();
         for index in start..start.saturating_add(20_000) {
             let Some(item) = review.doc.item(index) else {
                 break;
@@ -667,23 +677,59 @@ impl ReviewSurface {
             if item.file() != Some(file) {
                 break;
             }
-            if let ReviewItem::Line(line) = item
-                && (within(lines.old, line.old_line) || within(lines.new, line.new_line))
-            {
-                let marker = match line.kind {
-                    bcode_code_review::document::LineKind::Added => '+',
-                    bcode_code_review::document::LineKind::Removed => '-',
-                    _ => ' ',
-                };
-                out.push(format!(
-                    "{marker}{}",
-                    line.content.text().unwrap_or_default()
-                ));
-                if out.len() >= agent::MAX_PROMPT_LINES {
-                    break;
+            match item {
+                ReviewItem::Line(line)
+                    if within(lines.old, line.old_line) || within(lines.new, line.new_line) =>
+                {
+                    out.append(&mut added);
+                    out.push(format!(
+                        "{}{}",
+                        marker(line.kind),
+                        line.content.text().unwrap_or_default()
+                    ));
                 }
+                ReviewItem::LinePair(pair) => {
+                    let old = pair
+                        .old
+                        .as_ref()
+                        .filter(|side| within(lines.old, Some(side.line)));
+                    let new = pair
+                        .new
+                        .as_ref()
+                        .filter(|side| within(lines.new, Some(side.line)));
+                    let changed = |side: Option<&PairSide>| {
+                        side.is_some_and(|side| side.kind != LineKind::Context)
+                    };
+                    if !changed(pair.old.as_ref()) && !changed(pair.new.as_ref()) {
+                        if let Some(side) = old.or(new) {
+                            out.append(&mut added);
+                            out.push(format!(" {}", side.content.text().unwrap_or_default()));
+                        }
+                    } else {
+                        if let Some(side) = old {
+                            out.push(format!(
+                                "{}{}",
+                                marker(side.kind),
+                                side.content.text().unwrap_or_default()
+                            ));
+                        }
+                        if let Some(side) = new {
+                            added.push(format!(
+                                "{}{}",
+                                marker(side.kind),
+                                side.content.text().unwrap_or_default()
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if out.len() >= agent::MAX_PROMPT_LINES {
+                break;
             }
         }
+        out.append(&mut added);
+        out.truncate(agent::MAX_PROMPT_LINES);
         out
     }
 

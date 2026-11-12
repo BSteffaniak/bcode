@@ -725,6 +725,67 @@ fn thread_actions_are_clickable_where_they_are_painted() {
 }
 
 #[test]
+fn questions_quote_the_same_diff_lines_in_either_layout() {
+    let fixture = fixture();
+    let diff_block = |width: u16| {
+        let mut setup = setup(&fixture, width, 40);
+        let index = find(&setup.scenario, 0, added_line);
+        move_to(&mut setup.scenario, index);
+        // Select the changed line and the two rows after it.
+        setup.scenario.key("shift+v");
+        setup.scenario.keys(&["j", "j"]);
+        setup.scenario.key("a");
+        setup.scenario.paste("Why this change?");
+        setup.scenario.key("enter");
+        stable(&mut setup.scenario);
+        let messages = setup.backend.messages();
+        let prompt = &messages.first().expect("question sent").1;
+        let (_, rest) = prompt.split_once("```diff\n").expect("diff block");
+        let (block, _) = rest.split_once("```").expect("diff block end");
+        block.to_owned()
+    };
+    let unified = diff_block(100);
+    let side_by_side = diff_block(220);
+    assert!(
+        unified.lines().any(|line| line.starts_with('+')),
+        "{unified}"
+    );
+    assert_eq!(side_by_side, unified);
+
+    // A side-by-side row pairing a removed with an added line quotes both, removed first.
+    let mut setup = setup(&fixture, 220, 40);
+    let index = find(&setup.scenario, 0, |item| {
+        use bcode_code_review::document::LineKind;
+        matches!(item, ReviewItem::LinePair(pair)
+            if pair.old.as_ref().is_some_and(|side| side.kind == LineKind::Removed)
+                && pair.new.as_ref().is_some_and(|side| side.kind == LineKind::Added))
+    });
+    move_to(&mut setup.scenario, index);
+    setup.scenario.key("shift+v");
+    setup.scenario.keys(&["j"]);
+    setup.scenario.key("a");
+    setup.scenario.paste("Why?");
+    setup.scenario.key("enter");
+    stable(&mut setup.scenario);
+    let prompt = setup
+        .backend
+        .messages()
+        .first()
+        .expect("question sent")
+        .1
+        .clone();
+    let (_, rest) = prompt.split_once("```diff\n").expect("diff block");
+    let (block, _) = rest.split_once("```").expect("diff block end");
+    let lines: Vec<&str> = block.lines().collect();
+    let last_removed = lines.iter().rposition(|line| line.starts_with('-'));
+    let first_added = lines.iter().position(|line| line.starts_with('+'));
+    assert!(
+        matches!((last_removed, first_added), (Some(removed), Some(added)) if removed < added),
+        "{block}"
+    );
+}
+
+#[test]
 fn asking_bcode_links_a_session_shows_live_status_and_restores_position() {
     let fixture = fixture();
     let mut setup = setup(&fixture, 100, 40);
@@ -984,6 +1045,61 @@ fn search_is_incremental_reports_unloaded_files_and_steps_with_n() {
     stable(&mut scenario);
     let status = scenario.surface().search_status().unwrap();
     assert!(status.contains("unloaded file"), "{status}");
+}
+
+#[test]
+fn search_wraps_around_at_both_ends() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 100, 40);
+    let current = |scenario: &Scenario<ReviewSurface>| {
+        let status = scenario.surface().search_status().expect("search");
+        let (current, _) = status.split_once('/').expect("position");
+        current.parse::<usize>().expect("current")
+    };
+    setup.scenario.key("/");
+    setup.scenario.paste("compute");
+    stable(&mut setup.scenario);
+    setup.scenario.key("enter");
+    let first = cursor(&setup.scenario);
+    assert_eq!(current(&setup.scenario), 1);
+
+    // Stepping back from the first match lands below it, on the last.
+    setup.scenario.key("shift+n");
+    stable(&mut setup.scenario);
+    assert!(current(&setup.scenario) > 1);
+    assert!(
+        index_of(&setup.scenario, &cursor(&setup.scenario)) > index_of(&setup.scenario, &first)
+    );
+
+    // Stepping forward past the last match returns to the first.
+    let mut previous = index_of(&setup.scenario, &cursor(&setup.scenario));
+    let mut wrapped = false;
+    for _ in 0..2_000 {
+        setup.scenario.key("n");
+        stable(&mut setup.scenario);
+        let index = index_of(&setup.scenario, &cursor(&setup.scenario));
+        if index < previous {
+            wrapped = true;
+            break;
+        }
+        previous = index;
+    }
+    assert!(wrapped, "n never wrapped to the first match");
+    assert_eq!(cursor(&setup.scenario), first);
+    assert_eq!(current(&setup.scenario), 1);
+
+    // A search started below the last match finds the first one.
+    setup.scenario.key("esc");
+    setup.scenario.key("shift+g");
+    stable(&mut setup.scenario);
+    assert!(
+        index_of(&setup.scenario, &cursor(&setup.scenario)) > index_of(&setup.scenario, &first)
+    );
+    setup.scenario.key("/");
+    setup.scenario.paste("compute");
+    stable(&mut setup.scenario);
+    assert_eq!(current(&setup.scenario), 1);
+    assert_eq!(cursor(&setup.scenario), first);
 }
 
 #[test]

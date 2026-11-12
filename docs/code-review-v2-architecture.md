@@ -460,8 +460,8 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   then `review_source.manifest` to match the provider id), asks the matching provider to resolve
   stacks and fetch every needed layer, and sends the answers with `review.sources.resolve` as
   `provider_resolutions` (`Resolved { stack, fetched }` or `Failed { code, message }`). The
-  routing lives in `packages/code-review/src/provider.rs` behind a `ProviderTransport` trait (the daemon client in
-  production, fakes in tests). With the provider plugin disabled nothing answers, and only the
+  routing lives in `packages/code-review/src/provider.rs` behind a `ProviderTransport` trait (the review
+  app's host plugin services in production, fakes in tests). With the provider plugin disabled nothing answers, and only the
   provider-backed sources report `provider_required`.
 * **Stack detection** (GitHub implementation): from the open pull requests whose head branch is in
   the repository itself (forks are excluded), the chain extends down while some pull request's
@@ -1864,7 +1864,8 @@ Measured at 400×120 with the same `debug-release` setup (tmux plus `script(1)`,
 * **Host boundary.** `host::ReviewHost` covers the theme, sessions (create, send, follow,
   the command that opens one in Bcode), plugin services, clipboard, external URLs, task and
   blocking-task spawning, and redraw requests; a host requests a frame whenever a spawned task
-  finishes. `context::UiContext` pairs the host with the resolved keymap and the
+  finishes, through the wake-up the driving loop hands it (`connect_redraw`). Only the standalone
+  host talks to the daemon, so `bcode_code_review` has no daemon client dependency. `context::UiContext` pairs the host with the resolved keymap and the
   `[tui.diff_viewer]` layout preference. Host-provided completion of the comment composer
   (the chat host's focused-text-field protocol) has no standalone provider and was removed with
   the plugin surface.

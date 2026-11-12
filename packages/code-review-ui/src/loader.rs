@@ -190,10 +190,6 @@ pub async fn open(
                 || (source.source_id.clone(), false),
                 |(_, label, whole)| (label.clone(), *whole),
             );
-        let label = match &source.part {
-            Some(part) => format!("{label} · {}", part.label),
-            None => label,
-        };
         let stack = resolved
             .stacks
             .iter()

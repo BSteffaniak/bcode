@@ -284,16 +284,7 @@ impl ReviewSurface {
         let target = review
             .doc
             .navigate_matches(&search.results, from, direction)
-            .or_else(|| {
-                let wrap = match direction {
-                    Direction::Forward => 0,
-                    Direction::Backward => review.doc.len(),
-                };
-                review
-                    .doc
-                    .navigate_matches(&search.results, wrap.wrapping_sub(1), direction)
-                    .filter(|_| wrap > 0 || direction == Direction::Forward)
-            });
+            .or_else(|| review.doc.wrapped_match(&search.results, direction));
         if let Some(target) = target {
             review.set_cursor(target.index, AnchorPolicy::Center);
         }
