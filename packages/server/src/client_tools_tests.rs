@@ -408,3 +408,59 @@ async fn registrations_outside_the_namespace_or_bounds_are_rejected_whole() {
         "{collision:?}"
     );
 }
+
+#[tokio::test]
+async fn a_split_provider_claims_and_answers_while_other_requests_are_in_flight() {
+    let fixture = fixture();
+    let provider = provider(&fixture, ClientToolPolicy::ReadOnly).await;
+    let (handle, mut requests) = provider.into_concurrent();
+    let session_id = handle
+        .create_session(
+            None,
+            fixture.workspace.path().to_path_buf(),
+            Some(SessionOrigin::new("app")),
+        )
+        .await
+        .expect("create claimed session")
+        .id;
+    let other = fixture
+        .client
+        .create_session_in_working_directory(None, fixture.workspace.path().to_path_buf())
+        .await
+        .expect("ordinary session")
+        .id;
+    let completion = start_lookup_turn(&fixture.state, session_id).await;
+    let request = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("invocation arrives")
+        .expect("connection open");
+    let ClientToolRequest::Invoke(invocation) = request else {
+        panic!("expected an invocation, got {request:?}");
+    };
+    // The invocation is still unanswered while the same connection claims another session.
+    handle
+        .claim_session(other)
+        .await
+        .expect("claim while a call runs");
+    assert_eq!(fixture.state.client_tools.offered_tools(other).len(), 1);
+    handle
+        .respond(
+            invocation.invocation_id,
+            ClientToolOutcome::Completed {
+                content: "live value: 42".to_owned(),
+            },
+        )
+        .await
+        .expect("answer");
+    finish(completion).await;
+    let results = tool_results(&fixture.state, session_id).await;
+    assert_eq!(results[0].model_output, "live value: 42");
+
+    drop(handle);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .expect("the stream ends")
+            .is_none()
+    );
+}

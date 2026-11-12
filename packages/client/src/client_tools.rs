@@ -260,3 +260,315 @@ impl ClientToolProvider {
         }
     }
 }
+
+/// Daemon requests to a [`ClientToolHandle`]'s provider, in arrival order.
+///
+/// The stream ends when the provider's daemon connection closes; the daemon then fails the
+/// connection's running calls and drops its registrations and claims.
+#[derive(Debug)]
+pub struct ClientToolRequests {
+    receiver: tokio::sync::mpsc::Receiver<ClientToolRequest>,
+}
+
+impl ClientToolRequests {
+    /// The next request, or `None` once the connection closed.
+    pub async fn recv(&mut self) -> Option<ClientToolRequest> {
+        self.receiver.recv().await
+    }
+}
+
+type PendingResponses = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<bcode_ipc::Response>>,
+    >,
+>;
+
+/// Cloneable handle of a provider connection that serves invocations concurrently.
+///
+/// A plain [`ClientToolProvider`] answers one request at a time on its connection. The handle
+/// splits the connection: a reader task delivers daemon requests to [`ClientToolRequests`] and
+/// routes responses, so answering one invocation never waits for another to finish and claims
+/// or registrations can be sent while invocations run.
+#[derive(Debug, Clone)]
+pub struct ClientToolHandle {
+    provider_id: String,
+    writer: std::sync::Arc<tokio::sync::Mutex<tokio::io::WriteHalf<bcode_ipc::LocalIpcStream>>>,
+    pending: PendingResponses,
+    next_request_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    request_timeout: std::time::Duration,
+    reader: std::sync::Arc<ReaderTask>,
+}
+
+/// Stops the reader task when the last handle is dropped, which closes the connection.
+#[derive(Debug)]
+struct ReaderTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReaderTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl ClientToolProvider {
+    /// Split this provider into a cloneable handle and the stream of daemon requests, so
+    /// invocations can be answered concurrently.
+    ///
+    /// Must be called from a Tokio runtime: the reader runs as a task until the connection
+    /// closes or every handle is dropped.
+    #[must_use]
+    pub fn into_concurrent(self) -> (ClientToolHandle, ClientToolRequests) {
+        let ClientConnection {
+            stream,
+            next_request_id,
+            pending_events,
+            request_timeout,
+            ..
+        } = self.connection;
+        let (read, write) = tokio::io::split(stream);
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let pending = PendingResponses::default();
+        let routes = pending.clone();
+        let reader = tokio::spawn(read_provider_frames(read, pending_events, sender, routes));
+        (
+            ClientToolHandle {
+                provider_id: self.provider_id,
+                writer: std::sync::Arc::new(tokio::sync::Mutex::new(write)),
+                pending,
+                next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    next_request_id,
+                )),
+                request_timeout,
+                reader: std::sync::Arc::new(ReaderTask(reader)),
+            },
+            ClientToolRequests { receiver },
+        )
+    }
+}
+
+/// Deliver the provider's daemon requests and route responses to their waiting requests until
+/// the connection closes.
+async fn read_provider_frames(
+    mut read: tokio::io::ReadHalf<bcode_ipc::LocalIpcStream>,
+    pending_events: std::collections::VecDeque<Event>,
+    sender: tokio::sync::mpsc::Sender<ClientToolRequest>,
+    routes: PendingResponses,
+) {
+    for event in pending_events {
+        if let Some(request) = provider_request(event)
+            && sender.send(request).await.is_err()
+        {
+            return;
+        }
+    }
+    while let Ok(envelope) = bcode_ipc::recv_envelope(&mut read).await {
+        match envelope.kind {
+            bcode_ipc::EnvelopeKind::Event => {
+                if let Ok(event) = bcode_ipc::decode_event(&envelope.payload)
+                    && let Some(request) = provider_request(event)
+                    && sender.send(request).await.is_err()
+                {
+                    return;
+                }
+            }
+            bcode_ipc::EnvelopeKind::Response => {
+                let Ok(response) = bcode_ipc::decode_response(&envelope.payload) else {
+                    continue;
+                };
+                let route = routes
+                    .lock()
+                    .expect("client tool response routes poisoned")
+                    .remove(&envelope.request_id);
+                if let Some(route) = route {
+                    let _ = route.send(response);
+                }
+            }
+            _ => {}
+        }
+    }
+    // The connection closed: waiting requests fail with a dropped route.
+    routes
+        .lock()
+        .expect("client tool response routes poisoned")
+        .clear();
+}
+
+fn provider_request(event: Event) -> Option<ClientToolRequest> {
+    match event {
+        Event::ClientToolInvocation(invocation) => Some(ClientToolRequest::Invoke(invocation)),
+        Event::ClientToolCancelled { invocation_id } => {
+            Some(ClientToolRequest::Cancel { invocation_id })
+        }
+        Event::ClientToolClaimLost { session_id } => {
+            Some(ClientToolRequest::ClaimLost { session_id })
+        }
+        Event::Session(_)
+        | Event::SessionLive(_)
+        | Event::RuntimeWork(_)
+        | Event::Workflow(_)
+        | Event::SessionViewResyncRequired { .. }
+        | Event::SessionCatalogUpdated { .. } => None,
+    }
+}
+
+impl ClientToolHandle {
+    /// Provider id the tools are registered under.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    async fn send(&self, request: Request) -> Result<ResponsePayload, ClientError> {
+        if self.reader.0.is_finished() {
+            return Err(ClientError::Protocol(
+                "client tool provider connection closed".to_owned(),
+            ));
+        }
+        let request_id = self
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let envelope = bcode_ipc::request_envelope(request_id, &request)?;
+        let (route, response) = tokio::sync::oneshot::channel();
+        self.pending
+            .lock()
+            .expect("client tool response routes poisoned")
+            .insert(request_id, route);
+        let sent = bcode_ipc::send_envelope(&mut *self.writer.lock().await, &envelope).await;
+        if let Err(error) = sent {
+            self.pending
+                .lock()
+                .expect("client tool response routes poisoned")
+                .remove(&request_id);
+            return Err(error.into());
+        }
+        let response = tokio::time::timeout(self.request_timeout, response)
+            .await
+            .map_err(|_| {
+                self.pending
+                    .lock()
+                    .expect("client tool response routes poisoned")
+                    .remove(&request_id);
+                ClientError::RequestTimeout {
+                    timeout: self.request_timeout,
+                }
+            })?
+            .map_err(|_| {
+                ClientError::Protocol("client tool provider connection closed".to_owned())
+            })?;
+        match response {
+            bcode_ipc::Response::Ok(payload) => Ok(payload),
+            bcode_ipc::Response::Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Replace the registered tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection closed or the daemon rejects the registration.
+    pub async fn register(&self, tools: Vec<ClientToolDescriptor>) -> Result<(), ClientError> {
+        match self
+            .send(Request::RegisterClientTools {
+                provider_id: self.provider_id.clone(),
+                tools,
+            })
+            .await?
+        {
+            ResponsePayload::ClientToolsRegistered { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Contribute agent profiles; see [`ClientToolProvider::register_agent_profiles`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection closed or the daemon rejects the profiles.
+    pub async fn register_agent_profiles(
+        &self,
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    ) -> Result<(), ClientError> {
+        match self
+            .send(Request::RegisterClientAgentProfiles { profiles })
+            .await?
+        {
+            ResponsePayload::ClientAgentProfilesRegistered { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Offer this provider's tools in `session_id` from the next turn on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection closed or the session does not exist.
+    pub async fn claim_session(&self, session_id: SessionId) -> Result<(), ClientError> {
+        match self
+            .send(Request::ClaimClientToolSession { session_id })
+            .await?
+        {
+            ResponsePayload::ClientToolSessionClaimed { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Stop offering this provider's tools in `session_id` from the next turn on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection closed.
+    pub async fn release_session(&self, session_id: SessionId) -> Result<(), ClientError> {
+        match self
+            .send(Request::ReleaseClientToolSession { session_id })
+            .await?
+        {
+            ResponsePayload::ClientToolSessionReleased { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Create a session on this connection; it is claimed when `origin` names this provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection closed or the daemon rejects the session.
+    pub async fn create_session(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        origin: Option<SessionOrigin>,
+    ) -> Result<SessionSummary, ClientError> {
+        match self
+            .send(Request::CreateSession {
+                name,
+                working_directory,
+                origin,
+            })
+            .await?
+        {
+            ResponsePayload::SessionCreated { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Answer one invocation; see [`ClientToolProvider::respond`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection closed or the daemon rejects the answer.
+    pub async fn respond(
+        &self,
+        invocation_id: String,
+        outcome: ClientToolOutcome,
+    ) -> Result<(), ClientError> {
+        match self
+            .send(Request::ClientToolResult {
+                invocation_id,
+                outcome,
+            })
+            .await?
+        {
+            ResponsePayload::ClientToolResultAccepted { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+}

@@ -45,7 +45,7 @@ serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }
 sha2                       = { workspace = true }
 thiserror                  = { workspace = true }
-tokio                      = { workspace = true, features = ["sync", "time"] }
+tokio                      = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 tracing                    = { workspace = true }
 
 [dev-dependencies]
