@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Import plugin for Bcode SDK JSON conversation files"
+edition     = { workspace = true }
+keywords    = ["bcode", "sdk", "session", "import", "plugin"]
+license     = { workspace = true }
+name        = "bcode_sdk_session_import_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_model          = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_import = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

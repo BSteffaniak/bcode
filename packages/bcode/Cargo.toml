@@ -273,6 +273,10 @@ static-bundled-pi-session-import-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-pi-session-import-plugin",
 ]
+static-bundled-sdk-session-import-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-sdk-session-import-plugin",
+]
 static-bundled-plugins = [
     "static-bundled-claude-code-plugin",
     "static-bundled-codex-harness-plugin",

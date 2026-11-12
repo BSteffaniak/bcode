@@ -252,6 +252,8 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     plugins
 }
 
+// One feature-gated line per bundled plugin; splitting the list would only scatter it.
+#[allow(clippy::too_many_lines)]
 fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPlugin>) {
     #[cfg(feature = "static-bundled-claude-code-plugin")]
     plugins.push(claude_code_plugin());
@@ -323,6 +325,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(opencode_session_import_plugin());
     #[cfg(feature = "static-bundled-pi-session-import-plugin")]
     plugins.push(pi_session_import_plugin());
+    #[cfg(feature = "static-bundled-sdk-session-import-plugin")]
+    plugins.push(sdk_session_import_plugin());
     #[cfg(feature = "static-bundled-question-plugin")]
     plugins.push(question_plugin());
     #[cfg(feature = "static-bundled-loop-plugin")]
@@ -528,6 +532,14 @@ fn pi_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
         bcode_pi_session_import_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-sdk-session-import-plugin")]
+fn sdk_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
+        bcode_sdk_session_import_plugin::static_plugin(),
     )
 }
 

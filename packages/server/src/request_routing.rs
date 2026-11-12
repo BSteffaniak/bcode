@@ -420,6 +420,12 @@ pub enum SessionSearchAttachRequest {
         /// Client working directory used when the imported source has no cwd metadata.
         working_directory: Option<PathBuf>,
     },
+    ImportSessionFile {
+        source_id: String,
+        path: PathBuf,
+        working_directory: PathBuf,
+        origin: Option<bcode_session_models::SessionOrigin>,
+    },
     RefreshSessionCatalog {
         working_directory: Option<PathBuf>,
         sources: Option<Vec<String>>,
@@ -2290,6 +2296,17 @@ impl RoutedRequest {
                 source_id,
                 external_session_id,
                 working_directory,
+            }),
+            Request::ImportSessionFile {
+                source_id,
+                path,
+                working_directory,
+                origin,
+            } => Self::SessionSearchAttach(SessionSearchAttachRequest::ImportSessionFile {
+                source_id,
+                path,
+                working_directory,
+                origin,
             }),
             Request::GenerateSessionMilestone { session_id } => Self::SessionLifecycle(Box::new(
                 SessionLifecycleRequest::GenerateSessionMilestone { session_id },

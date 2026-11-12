@@ -4078,6 +4078,7 @@ pub(crate) mod tests {
             updated_at_ms: 20,
             working_directory: std::path::PathBuf::from("/workspace/imported"),
             import: Some(bcode_session_models::SessionImportSummary {
+                content_digest: None,
                 source_id: "opencode".to_owned(),
                 source_display_name: "OpenCode".to_owned(),
                 external_session_id: "source-native-id".to_owned(),
@@ -4163,6 +4164,7 @@ pub(crate) mod tests {
         summary.working_directory = std::path::PathBuf::from("/renamed/workspace");
         assert_eq!(canonical_generation_fingerprint(&summary), native);
         summary.import = Some(bcode_session_models::SessionImportSummary {
+            content_digest: None,
             source_id: "source".to_owned(),
             source_display_name: "Source".to_owned(),
             external_session_id: "external".to_owned(),

@@ -199,7 +199,7 @@ impl SessionState {
                 created_at_ms,
                 updated_at_ms,
                 working_directory: working_directory.clone(),
-                import: None,
+                import: state.import,
                 parent_id: state.parent_id,
                 execution: state.execution.map(|provenance| {
                     Box::new(bcode_session_models::ExecutionSessionSummary {
@@ -349,12 +349,14 @@ impl SessionState {
                 source_display_name,
                 external_session_id,
                 imported_at_ms,
+                content_digest,
             } => {
                 self.summary.import = Some(SessionImportSummary {
                     source_id: source_id.clone(),
                     source_display_name: source_display_name.clone(),
                     external_session_id: external_session_id.clone(),
                     imported_at_ms: *imported_at_ms,
+                    content_digest: content_digest.clone(),
                 });
                 if self.summary.explicit_name.is_none() && self.summary.derived_title.is_none() {
                     self.summary.derived_title = Some(external_session_id.clone());

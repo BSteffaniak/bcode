@@ -118,6 +118,7 @@ static-bundled-github-review-publisher-plugin = ["_static-bundled"]
 static-bundled-openai-compatible-provider-plugin = ["_static-bundled"]
 static-bundled-opencode-session-import-plugin = ["_static-bundled"]
 static-bundled-pi-session-import-plugin = ["_static-bundled"]
+static-bundled-sdk-session-import-plugin = ["_static-bundled"]
 static-bundled-plugins = [
     "_static-bundled",
     "static-bundled-bedrock-provider-plugin",
@@ -133,6 +134,7 @@ static-bundled-plugins = [
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
+    "static-bundled-sdk-session-import-plugin",
     "static-bundled-question-plugin",
     "static-bundled-recap-plugin",
     "static-bundled-read-plugin",

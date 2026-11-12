@@ -860,6 +860,8 @@ enum PersistedSessionEventKind {
         source_display_name: String,
         external_session_id: String,
         imported_at_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_digest: Option<String>,
     },
     SessionDerived {
         source_session_id: SessionId,
@@ -1510,11 +1512,13 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 source_display_name,
                 external_session_id,
                 imported_at_ms,
+                content_digest,
             } => Self::SessionImported {
                 source_id: source_id.clone(),
                 source_display_name: source_display_name.clone(),
                 external_session_id: external_session_id.clone(),
                 imported_at_ms: *imported_at_ms,
+                content_digest: content_digest.clone(),
             },
             SessionEventKind::SessionDerived {
                 source_session_id,
@@ -1971,11 +1975,13 @@ impl PersistedSessionEventKind {
                 source_display_name,
                 external_session_id,
                 imported_at_ms,
+                content_digest,
             } => SessionEventKind::SessionImported {
                 source_id,
                 source_display_name,
                 external_session_id,
                 imported_at_ms,
+                content_digest,
             },
             Self::SessionDerived {
                 source_session_id,

@@ -129,6 +129,9 @@ bcode_pi_session_import_plugin = { workspace = true, features = [
 bcode_prompt_profile_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
+bcode_sdk_session_import_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_session_derivation_plugin = { workspace = true, features = [
     "static-bundled",

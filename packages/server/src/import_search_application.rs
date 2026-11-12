@@ -171,6 +171,57 @@ impl ImportApplication for ImportSearchApplicationHandle<'_> {
         Ok(ApplicationImportResult { session, warnings })
     }
 }
+impl ImportSearchApplicationHandle<'_> {
+    /// Import one file the caller names through its source plugin, recording `origin`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable import failure codes of
+    /// [`crate::session_import::import_session_file`], `application_stopped` during shutdown,
+    /// and `invalid_working_directory` for a relative fallback directory.
+    pub async fn import_session_file(
+        &self,
+        source_id: &str,
+        path: &std::path::Path,
+        working_directory: &std::path::Path,
+        origin: Option<bcode_session_models::SessionOrigin>,
+    ) -> Result<ApplicationImportResult, ImportApplicationFailure> {
+        self.require_running()
+            .map_err(|(code, message)| import_failure(code, message))?;
+        if !working_directory.is_absolute() {
+            return Err(import_failure(
+                "invalid_working_directory",
+                "import working directory must be absolute",
+            ));
+        }
+        let (session_id, warnings, _created) = crate::session_import::import_session_file(
+            self.state,
+            source_id,
+            path,
+            working_directory,
+            origin,
+        )
+        .await
+        .map_err(|error| import_failure(error.code, &error.message))?;
+        let session = self
+            .state
+            .sessions
+            .session_summary(session_id)
+            .await
+            .map_err(|_| {
+                import_failure(
+                    "session_import_failed",
+                    "imported canonical summary is unavailable",
+                )
+            })?;
+        self.state
+            .session_catalog
+            .upsert_native_session(session.clone())
+            .await;
+        Ok(ApplicationImportResult { session, warnings })
+    }
+}
+
 impl SearchApplication for ImportSearchApplicationHandle<'_> {
     async fn search_providers(
         &self,

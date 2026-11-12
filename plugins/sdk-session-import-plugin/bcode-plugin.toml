@@ -1,0 +1,18 @@
+id      = "bcode.sdk-session-import"
+name    = "Bcode SDK Session Import Plugin"
+version = "0.0.1"
+
+[[services]]
+class        = "query"
+description  = "Load Bcode SDK JSON conversation files that the caller names for one-time import"
+interface_id = "bcode.session_import/v1"
+name         = "SDK Session Import"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version = 5
+library     = "libbcode_sdk_session_import_plugin.dylib"
+type        = "native"

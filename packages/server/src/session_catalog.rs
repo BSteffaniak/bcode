@@ -1376,6 +1376,7 @@ fn importable_to_summary(
         updated_at_ms: summary.updated_at_ms.or(summary.created_at_ms).unwrap_or(0),
         working_directory: summary.working_directory.unwrap_or_default(),
         import: Some(SessionImportSummary {
+            content_digest: None,
             source_id: summary.source_id,
             source_display_name: summary.source_display_name,
             external_session_id: summary.external_session_id,

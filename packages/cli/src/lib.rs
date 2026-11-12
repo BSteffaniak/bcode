@@ -128,6 +128,9 @@ pub enum CliError {
     /// Manual compression was cancelled or had unavailable/failed candidates.
     #[error("session compression incomplete; see reported outcomes")]
     SessionCompressionIncomplete,
+    /// Some named import files were not imported; each failure was reported.
+    #[error("{0} file(s) were not imported; see the reported failures")]
+    SessionFilesNotImported(usize),
     /// Derivation returned a non-success terminal outcome already printed as JSON.
     #[error("session derivation did not succeed; see JSON outcome")]
     SessionDerivationNotSucceeded,
@@ -361,6 +364,7 @@ impl CliError {
             | Self::InteractionResolutionNotApplied
             | Self::WorkflowApprovalContinuationFailed
             | Self::SessionCompressionIncomplete
+            | Self::SessionFilesNotImported(_)
             | Self::WorkflowApprovalDecisionNotApplied => 1,
             #[cfg(feature = "web-renderer")]
             Self::HyperChadRender(_) => 1,
@@ -7439,6 +7443,30 @@ enum SessionImportCommand {
         #[arg(long, default_value = "pi")]
         source: String,
         external_session_id: String,
+    },
+    /// Import files you name, such as SDK JSON conversations, one session per file.
+    ///
+    /// Each file is a separate import: a failure is reported for that file and the rest
+    /// continue. Files are only read. Importing identical content again returns the existing
+    /// session; different content under the same session id is reported as a conflict.
+    File {
+        /// Import source that reads the files.
+        #[arg(long, default_value = "sdk-json")]
+        source: String,
+        /// Application id recorded as the imported sessions' origin.
+        #[arg(long, value_name = "APP_ID")]
+        origin: Option<String>,
+        /// Picker label for the origin.
+        #[arg(long, requires = "origin")]
+        origin_name: Option<String>,
+        /// Working directory for imported sessions (defaults to the current directory).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Print one JSON result per file.
+        #[arg(long)]
+        json: bool,
+        #[arg(required = true, value_name = "FILE")]
+        paths: Vec<PathBuf>,
     },
 }
 
@@ -21300,6 +21328,78 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
                 }
             }
         }
+        command @ SessionImportCommand::File { .. } => {
+            Box::pin(import_session_files(&client, command)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Import each named file separately, reporting every failure and continuing with the rest.
+async fn import_session_files(
+    client: &BcodeClient,
+    command: SessionImportCommand,
+) -> Result<(), CliError> {
+    let SessionImportCommand::File {
+        source,
+        origin,
+        origin_name,
+        cwd,
+        json,
+        paths,
+    } = command
+    else {
+        return Ok(());
+    };
+    let origin = origin.map(|app_id| {
+        let origin = bcode_session_models::SessionOrigin::new(app_id);
+        match origin_name {
+            Some(name) => origin.with_display_name(name),
+            None => origin,
+        }
+    });
+    let working_directory = std::path::absolute(cwd.unwrap_or(std::env::current_dir()?))?;
+    let mut failed = 0;
+    for path in paths {
+        let path = std::path::absolute(&path)?;
+        let result = client
+            .import_session_file(
+                source.clone(),
+                path.clone(),
+                working_directory.clone(),
+                origin.clone(),
+            )
+            .await;
+        match result {
+            Ok((session, warnings)) => {
+                if json {
+                    print_json(&serde_json::json!({
+                        "file": path,
+                        "session": session,
+                        "warnings": warnings,
+                    }))?;
+                } else {
+                    println!("{}\t{}", session.id, path.display());
+                    for warning in warnings {
+                        println!("  {}: {}", warning.code, warning.message);
+                    }
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                if json {
+                    print_json(&serde_json::json!({
+                        "file": path,
+                        "error": error.to_string(),
+                    }))?;
+                } else {
+                    eprintln!("{}: {error}", path.display());
+                }
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(CliError::SessionFilesNotImported(failed));
     }
     Ok(())
 }
@@ -29712,6 +29812,45 @@ mod session_configuration_cli_tests {
                 clap::error::ErrorKind::UnknownArgument,
             );
         }
+    }
+
+    #[test]
+    fn session_import_file_names_files_and_defaults_to_sdk_json() {
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "import",
+            "file",
+            "--origin",
+            "bdata",
+            "--origin-name",
+            "bdata",
+            "a.json",
+            "b.json",
+        ])
+        .expect("file import parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::Import {
+                    command: crate::SessionImportCommand::File { source, origin: Some(origin), paths, .. }
+                }
+            }) if source == "sdk-json" && origin == "bdata" && paths.len() == 2
+        ));
+        assert!(Cli::try_parse_from(["bcode", "session", "import", "file"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "session",
+                "import",
+                "file",
+                "--origin-name",
+                "x",
+                "a"
+            ])
+            .is_err(),
+            "a display name needs an origin"
+        );
     }
 
     #[test]

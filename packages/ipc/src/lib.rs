@@ -150,7 +150,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Older positional payloads are rejected.
 /// Version 63 adds session origin at creation and origin catalog filters.
 /// Version 64 adds client-provided tools, session claims and their invocation events.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 64;
+/// Version 65 adds importing a named source file with an origin.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 65;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1834,6 +1835,18 @@ pub enum Request {
     ClientToolResult {
         invocation_id: String,
         outcome: bcode_tool::client_tool::ClientToolOutcome,
+    },
+    /// Import one source-owned file the caller names (for example an SDK JSON conversation).
+    /// Repeating an identical import returns the existing session; different content under the
+    /// same external session id is rejected as a conflict.
+    ImportSessionFile {
+        source_id: String,
+        path: PathBuf,
+        /// Working directory for imported history without its own.
+        working_directory: PathBuf,
+        /// Application recorded as the imported session's origin.
+        #[serde(default)]
+        origin: Option<bcode_session_models::SessionOrigin>,
     },
 }
 
@@ -4810,7 +4823,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 64);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 65);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(59), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(57), ProtocolVersion::current());
@@ -8001,6 +8014,7 @@ mod tests {
                 new_working_directory: "/tmp/new".into(),
             },
             SessionEventKind::SessionImported {
+                content_digest: None,
                 source_id: "source".to_string(),
                 source_display_name: "Source".to_string(),
                 external_session_id: "external".to_string(),

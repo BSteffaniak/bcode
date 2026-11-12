@@ -2402,7 +2402,27 @@ impl SessionManager {
         import: SessionImportSummary,
         events: Vec<(SessionEventKind, Option<SessionEventProvenance>)>,
     ) -> Result<SessionSummary, SessionError> {
-        let session = self.create_session(name, working_directory).await?;
+        self.import_session_with_origin(name, working_directory, import, events, None)
+            .await
+    }
+
+    /// Import a fully normalized external session and record the application it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::InvalidOrigin`] for an out-of-bounds origin before anything is
+    /// persisted, or an error if session creation or event persistence fails.
+    pub async fn import_session_with_origin(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        import: SessionImportSummary,
+        events: Vec<(SessionEventKind, Option<SessionEventProvenance>)>,
+        origin: Option<bcode_session_models::SessionOrigin>,
+    ) -> Result<SessionSummary, SessionError> {
+        let session = self
+            .create_session_with_origin(name, working_directory, origin)
+            .await?;
         let imported = self
             .append_event(
                 session.id,
@@ -2411,6 +2431,7 @@ impl SessionManager {
                     source_display_name: import.source_display_name,
                     external_session_id: import.external_session_id,
                     imported_at_ms: import.imported_at_ms,
+                    content_digest: import.content_digest,
                 },
             )
             .await?;
@@ -3677,6 +3698,7 @@ mod tests {
                 Some("checkpoint import".into()),
                 test_working_directory(),
                 bcode_session_models::SessionImportSummary {
+                    content_digest: None,
                     source_id: "test".into(),
                     source_display_name: "test".into(),
                     external_session_id: "checkpoint".into(),
@@ -10655,6 +10677,7 @@ mod tests {
                 32,
                 "SessionImported",
                 SessionEventKind::SessionImported {
+                    content_digest: None,
                     source_id: "pi".to_string(),
                     source_display_name: "Pi".to_string(),
                     external_session_id: "external".to_string(),

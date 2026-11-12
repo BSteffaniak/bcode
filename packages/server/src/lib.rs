@@ -6861,6 +6861,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RalphRunStatus(_) => "ralph_run_status",
         Request::RecordRalphLifecycle(_) => "record_ralph_lifecycle",
         Request::ImportExternalSession { .. } => "import_external_session",
+        Request::ImportSessionFile { .. } => "import_session_file",
         Request::GenerateSessionMilestone { .. } => "generate_session_milestone",
         Request::SessionMilestones { .. } => "session_milestones",
         Request::SessionDerivationSnapshot { .. } => "session_derivation_snapshot",
@@ -8752,6 +8753,32 @@ async fn handle_session_search_attach_request(
                 request,
             )
             .await
+        }
+        SessionSearchAttachRequest::ImportSessionFile {
+            source_id,
+            path,
+            working_directory,
+            origin,
+        } => {
+            let result = Box::pin(
+                ImportSearchApplicationHandle::new(state, client_id).import_session_file(
+                    &source_id,
+                    &path,
+                    &working_directory,
+                    origin,
+                ),
+            )
+            .await;
+            let response = result.map_or_else(
+                |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                |result| {
+                    Response::Ok(ResponsePayload::ExternalSessionImported {
+                        session: result.session,
+                        warnings: result.warnings,
+                    })
+                },
+            );
+            send_response(writer, request_id, response).await
         }
         SessionSearchAttachRequest::ImportExternalSession {
             source_id,

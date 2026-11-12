@@ -4458,6 +4458,40 @@ impl BcodeClient {
         }
     }
 
+    /// Import one source-owned file, such as an SDK JSON conversation, as a canonical session.
+    ///
+    /// The file is read by the source's import plugin and never changed. Importing identical
+    /// content again returns the existing session; different content under the same external
+    /// session id is rejected (`session_import_conflict`) and nothing is merged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the import: an unknown or
+    /// disabled source, an unreadable or invalid file, a conflict, or an out-of-bounds origin.
+    pub async fn import_session_file(
+        &self,
+        source_id: impl Into<String>,
+        path: std::path::PathBuf,
+        working_directory: std::path::PathBuf,
+        origin: Option<bcode_session_models::SessionOrigin>,
+    ) -> Result<(SessionSummary, Vec<SessionImportWarning>), ClientError> {
+        let current = current_working_directory();
+        match self
+            .send_request(Request::ImportSessionFile {
+                source_id: source_id.into(),
+                path: resolve_path_from(Some(path), &current),
+                working_directory: resolve_path_from(Some(working_directory), &current),
+                origin,
+            })
+            .await?
+        {
+            ResponsePayload::ExternalSessionImported { session, warnings } => {
+                Ok((session, warnings))
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Refresh the session catalog and return the refreshed snapshot.
     ///
     /// # Errors

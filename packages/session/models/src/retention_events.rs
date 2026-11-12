@@ -1636,12 +1636,14 @@ fn durable_content(
             source_id,
             source_display_name,
             external_session_id,
+            content_digest,
             ..
         } => {
             i.text(source_id, 3)?;
             i.text(source_display_name, 3)?;
             i.text(external_session_id, 3)?;
             i.nodes(1, 3)?;
+            i.optional_text(content_digest.as_ref(), 3)?;
         }
         SessionEventKind::SessionDerived {
             producer,

@@ -1642,6 +1642,7 @@ mod tests {
     fn filter_matches_only_portable_summary_metadata() {
         let mut session = summary("Visible title", "/workspace/project");
         session.import = Some(bcode_session_models::SessionImportSummary {
+            content_digest: None,
             source_id: "opencode".to_owned(),
             source_display_name: "OpenCode".to_owned(),
             external_session_id: "external".to_owned(),

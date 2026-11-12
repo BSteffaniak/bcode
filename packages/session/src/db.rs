@@ -437,6 +437,8 @@ pub struct SessionDbState {
     /// `None` when no origin was recorded or the creation event cannot be decoded; an
     /// unreadable origin never hides or fails the session.
     pub origin: Option<bcode_session_models::SessionOrigin>,
+    /// Import provenance, read from the creation prefix of an imported session.
+    pub import: Option<bcode_session_models::SessionImportSummary>,
 }
 
 /// Typed transcript projection row stored in a per-session database.
@@ -2064,7 +2066,7 @@ impl SessionDb {
             optional_string(&row, "reasoning_by_model")
                 .as_deref()
                 .map_or_else(Default::default, decode_reasoning_by_model);
-        let origin = self.creation_origin().await;
+        let (origin, import) = self.creation_prefix_metadata().await;
         Ok(Some(SessionDbState {
             session_id: row_session_id,
             last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
@@ -2104,6 +2106,7 @@ impl SessionDb {
                 })?,
             execution,
             origin,
+            import,
         }))
     }
 
@@ -5272,24 +5275,58 @@ impl SessionDb {
         Ok(items)
     }
 
-    /// Return the origin recorded in the session's creation event, if any.
+    /// Return the origin and import provenance recorded in the session's creation prefix.
     ///
-    /// This is one bounded point read of the first canonical event. It never replays history,
-    /// and a missing or undecodable creation event yields `None` rather than an error.
-    pub async fn creation_origin(&self) -> Option<bcode_session_models::SessionOrigin> {
-        let row = self
+    /// Creation records are written before any other event, so this reads at most the first
+    /// three canonical events. It never replays history, and rows that are missing or cannot be
+    /// decoded yield `None` rather than an error.
+    pub async fn creation_prefix_metadata(
+        &self,
+    ) -> (
+        Option<bcode_session_models::SessionOrigin>,
+        Option<bcode_session_models::SessionImportSummary>,
+    ) {
+        let Ok(rows) = self
             .db
             .select("events")
             .columns(&["event_seq", "payload"])
             .sort("event_seq", SortDirection::Asc)
-            .limit(1)
-            .execute_first(&**self.db)
+            .limit(3)
+            .execute(&**self.db)
             .await
-            .ok()??;
-        match strict_event_from_row(&row, self.session_id).ok()?.kind {
-            SessionEventKind::SessionCreated { origin, .. } => origin.map(|origin| *origin),
-            _ => None,
+        else {
+            return (None, None);
+        };
+        let mut origin = None;
+        let mut import = None;
+        for event in rows
+            .iter()
+            .filter_map(|row| strict_event_from_row(row, self.session_id).ok())
+        {
+            match event.kind {
+                SessionEventKind::SessionCreated {
+                    origin: Some(recorded),
+                    ..
+                } => origin = Some(*recorded),
+                SessionEventKind::SessionImported {
+                    source_id,
+                    source_display_name,
+                    external_session_id,
+                    imported_at_ms,
+                    content_digest,
+                } => {
+                    import = Some(bcode_session_models::SessionImportSummary {
+                        source_id,
+                        source_display_name,
+                        external_session_id,
+                        imported_at_ms,
+                        content_digest,
+                    });
+                }
+                _ => {}
+            }
         }
+        (origin, import)
     }
 
     /// Return the first canonical event sequence, if any.

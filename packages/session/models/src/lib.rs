@@ -2203,6 +2203,10 @@ pub struct SessionImportSummary {
     pub source_display_name: String,
     pub external_session_id: String,
     pub imported_at_ms: u64,
+    /// Digest of the imported source content, when the importer records one. Importing the
+    /// same external session again with a different digest is a conflict, never a merge.
+    #[serde(default)]
+    pub content_digest: Option<String>,
 }
 
 /// Current portable session-derivation contract version.
@@ -5139,6 +5143,9 @@ pub enum SessionEventKind {
         source_display_name: String,
         external_session_id: String,
         imported_at_ms: u64,
+        /// Digest of the imported source content, when recorded.
+        #[serde(default)]
+        content_digest: Option<String>,
     },
     /// Current generic provenance marker for a session derived from a stable source prefix.
     SessionDerived {

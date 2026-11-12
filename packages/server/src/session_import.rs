@@ -727,6 +727,7 @@ pub async fn import_external_session(
             name,
             working_directory,
             SessionImportSummary {
+                content_digest: None,
                 source_id: importable.summary.source_id,
                 source_display_name: importable.summary.source_display_name,
                 external_session_id: importable.summary.external_session_id,
@@ -737,6 +738,186 @@ pub async fn import_external_session(
         .await
         .map_err(|error| error.to_string())?;
     Ok((session.id, importable.warnings))
+}
+
+/// Why importing a named file failed. Codes are stable; nothing was imported on failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportFileError {
+    /// Stable failure code.
+    pub code: &'static str,
+    /// Secret-safe detail.
+    pub message: String,
+}
+
+impl ImportFileError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// Import one source-owned file the caller names, such as an SDK JSON conversation.
+///
+/// The source plugin reads the file without changing it. Importing the same external session
+/// again with identical content returns the existing canonical session; different content under
+/// the same external session id is a conflict and nothing is merged. Returns the session id,
+/// the source warnings and whether a new session was created.
+///
+/// # Errors
+///
+/// * `session_import_disabled` when import is turned off.
+/// * `unknown_import_source` when no enabled plugin advertises `source_id`.
+/// * `invalid_import_path` when `path` is not an absolute path to a file.
+/// * `session_import_load_failed` when the plugin cannot read or decode the file.
+/// * `session_import_invalid_source` when the plugin answers for another source or file.
+/// * `session_import_conflict` when the external session was imported with other content.
+/// * `session_origin_invalid` or `session_import_failed` when canonical creation fails.
+pub async fn import_session_file(
+    state: &ServerState,
+    source_id: &str,
+    path: &Path,
+    fallback_working_directory: &Path,
+    origin: Option<bcode_session_models::SessionOrigin>,
+) -> Result<(SessionId, Vec<bcode_session_import::ImportWarning>, bool), ImportFileError> {
+    if !state.startup_config.session_import.enabled {
+        return Err(ImportFileError::new(
+            "session_import_disabled",
+            "session import is disabled",
+        ));
+    }
+    if !path.is_absolute() || !path.is_file() {
+        return Err(ImportFileError::new(
+            "invalid_import_path",
+            "the import file must be an existing absolute path",
+        ));
+    }
+    let (importable, locator) = load_session_file(state, source_id, path).await?;
+    let digest = import_content_digest(&importable.events)?;
+    if let Some(existing) = all_cached_sessions(state)
+        .await
+        .into_iter()
+        .find(|session| {
+            session.import.as_ref().is_some_and(|import| {
+                import.source_id == source_id
+                    && import.external_session_id == importable.summary.external_session_id
+            })
+        })
+    {
+        let recorded = existing
+            .import
+            .as_ref()
+            .and_then(|import| import.content_digest.as_deref());
+        return if recorded == Some(digest.as_str()) {
+            Ok((existing.id, Vec::new(), false))
+        } else {
+            Err(ImportFileError::new(
+                "session_import_conflict",
+                format!(
+                    "session {} already holds external session {} with different content; nothing was merged",
+                    existing.id, importable.summary.external_session_id
+                ),
+            ))
+        };
+    }
+    let name = importable
+        .summary
+        .title
+        .clone()
+        .or_else(|| Some(importable.summary.external_session_id.clone()));
+    let working_directory = importable
+        .summary
+        .working_directory
+        .clone()
+        .unwrap_or_else(|| fallback_working_directory.to_path_buf());
+    let events = importable
+        .events
+        .into_iter()
+        .scan(0_u64, |compacted_through_sequence, event| {
+            let provenance = import_event_provenance(&event, &locator);
+            let kind = imported_session_event_kind(event.kind, compacted_through_sequence);
+            Some((kind, provenance))
+        })
+        .collect();
+    let import = SessionImportSummary {
+        source_id: importable.summary.source_id,
+        source_display_name: importable.summary.source_display_name,
+        external_session_id: importable.summary.external_session_id,
+        imported_at_ms: current_unix_millis(),
+        content_digest: Some(digest),
+    };
+    let session = state
+        .sessions
+        .import_session_with_origin(name, working_directory, import, events, origin)
+        .await
+        .map_err(|error| match error {
+            bcode_session::SessionError::InvalidOrigin(error) => {
+                ImportFileError::new("session_origin_invalid", error.to_string())
+            }
+            _ => ImportFileError::new(
+                "session_import_failed",
+                "session import failed; inspect canonical state before retrying",
+            ),
+        })?;
+    Ok((session.id, importable.warnings, true))
+}
+
+/// Ask the source's plugin to read one named file; returns the session and its locator.
+async fn load_session_file(
+    state: &ServerState,
+    source_id: &str,
+    path: &Path,
+) -> Result<(bcode_session_import::ImportableSession, String), ImportFileError> {
+    let routes = import_source_routes(state)
+        .await
+        .map_err(|error| ImportFileError::new(error.code, error.message))?;
+    let (plugin_id, _) = routes.get(source_id).ok_or_else(|| {
+        ImportFileError::new(
+            "unknown_import_source",
+            "no enabled importer for this source",
+        )
+    })?;
+    let locator = path.to_string_lossy().into_owned();
+    let importable = state
+        .plugins
+        .invoke_service_json::<_, bcode_session_import::ImportableSession>(
+            plugin_id,
+            SESSION_IMPORT_INTERFACE_ID,
+            OP_LOAD_IMPORTABLE_SESSION,
+            &LoadImportableSessionRequest {
+                source_id: source_id.to_owned(),
+                external_session_id: String::new(),
+                locator: locator.clone(),
+            },
+        )
+        .await
+        .map_err(|error| ImportFileError::new("session_import_load_failed", error.to_string()))?;
+    if importable.summary.source_id != source_id
+        || importable.summary.locator != locator
+        || importable.summary.external_session_id.is_empty()
+    {
+        return Err(ImportFileError::new(
+            "session_import_invalid_source",
+            "the importer answered for another source or file",
+        ));
+    }
+    Ok((importable, locator))
+}
+
+/// Digest of normalized import events, used to tell identical re-imports from conflicts.
+fn import_content_digest(
+    events: &[bcode_session_import::ImportableSessionEvent],
+) -> Result<String, ImportFileError> {
+    let encoded = serde_json::to_vec(events)
+        .map_err(|error| ImportFileError::new("session_import_load_failed", error.to_string()))?;
+    Ok(Sha256::digest(encoded)
+        .iter()
+        .fold(String::with_capacity(64), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        }))
 }
 
 fn import_event_provenance(
@@ -2202,5 +2383,130 @@ mod tests {
                 text: "imported tool output".to_owned(),
             })
         );
+    }
+
+    fn sdk_file(dir: &std::path::Path, name: &str, replies: &[&str]) -> std::path::PathBuf {
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "Which tables changed?"}]
+        })];
+        messages.extend(replies.iter().map(|reply| {
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": reply}]})
+        }));
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "session_id": "0e8a7a52-5b1f-4a7e-9a52-3f0d6d2c1b11",
+                "messages": messages,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_json_files_import_once_with_origin_and_report_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent(root.path().join("sessions")).unwrap(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::from(["bcode.sdk-session-import".into()]),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &[bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
+                    bcode_sdk_session_import_plugin::static_plugin(),
+                )],
+            )
+            .unwrap(),
+        );
+        let origin = bcode_session_models::SessionOrigin::new("bdata")
+            .with_context("connection", "prod-replica");
+        let file = sdk_file(root.path(), "1700000000000.json", &["orders and users"]);
+        let original = std::fs::read(&file).unwrap();
+
+        let (session_id, _, created) = super::import_session_file(
+            &state,
+            "sdk-json",
+            &file,
+            root.path(),
+            Some(origin.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(created);
+        let summary = state.sessions.session_summary(session_id).await.unwrap();
+        assert_eq!(summary.origin.as_ref(), Some(&origin));
+        let import = summary.import.expect("import provenance");
+        assert_eq!(import.source_id, "sdk-json");
+        assert_eq!(
+            import.external_session_id,
+            "0e8a7a52-5b1f-4a7e-9a52-3f0d6d2c1b11"
+        );
+        assert!(import.content_digest.is_some());
+        let texts = state
+            .sessions
+            .session_events_range(session_id, 0, u64::MAX, 64)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                bcode_session_models::SessionEventKind::UserMessage { text, .. }
+                | bcode_session_models::SessionEventKind::AssistantMessage { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["Which tables changed?", "orders and users"]);
+
+        let (again, _, created) = super::import_session_file(
+            &state,
+            "sdk-json",
+            &file,
+            root.path(),
+            Some(origin.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (again, created),
+            (session_id, false),
+            "identical import is idempotent"
+        );
+
+        let changed = sdk_file(
+            root.path(),
+            "changed.json",
+            &["orders and users", "and audit"],
+        );
+        let conflict = super::import_session_file(&state, "sdk-json", &changed, root.path(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, "session_import_conflict");
+
+        let corrupt = root.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{").unwrap();
+        let failure = super::import_session_file(&state, "sdk-json", &corrupt, root.path(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "session_import_load_failed");
+        assert_eq!(std::fs::read(&corrupt).unwrap(), b"{");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            original,
+            "sources are only read"
+        );
+        assert_eq!(
+            super::import_session_file(&state, "pi", &file, root.path(), None)
+                .await
+                .unwrap_err()
+                .code,
+            "unknown_import_source"
+        );
+        drop(state);
     }
 }

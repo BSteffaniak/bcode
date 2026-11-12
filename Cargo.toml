@@ -38,6 +38,7 @@ members = [
     "plugins/auth-broker-provider-plugin",
     "plugins/opencode-session-import-plugin",
     "plugins/pi-session-import-plugin",
+    "plugins/sdk-session-import-plugin",
     "plugins/shell-plugin",
     "plugins/web-search-plugin",
     "plugins/vim-edit-plugin",
@@ -298,6 +299,7 @@ bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-f
 bcode_openai_responses                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/openai-responses" }
 bcode_opencode_session_import_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/opencode-session-import-plugin" }
 bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/pi-session-import-plugin" }
+bcode_sdk_session_import_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sdk-session-import-plugin" }
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_config                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-config" }
 bcode_plugin_models                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin/models" }

@@ -36,6 +36,7 @@ bcode_ocr_plugin                        = { workspace = true, optional = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
+bcode_sdk_session_import_plugin         = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
 bcode_plugin_sdk                        = { workspace = true, features = ["tui"] }
 bcode_prompt_profile_plugin             = { workspace = true, optional = true }
@@ -186,6 +187,10 @@ static-bundled-pi-session-import-plugin = [
     "dep:bcode_pi_session_import_plugin",
     "bcode_pi_session_import_plugin/static-bundled",
 ]
+static-bundled-sdk-session-import-plugin = [
+    "dep:bcode_sdk_session_import_plugin",
+    "bcode_sdk_session_import_plugin/static-bundled",
+]
 static-bundled-plugins = [
     "static-bundled-claude-code-plugin",
     "static-bundled-codex-harness-plugin",
@@ -215,6 +220,7 @@ static-bundled-plugins = [
     "static-bundled-auth-broker-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
+    "static-bundled-sdk-session-import-plugin",
     "static-bundled-question-plugin",
     "static-bundled-loop-plugin",
     "static-bundled-read-plugin",
