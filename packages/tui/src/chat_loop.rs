@@ -3580,18 +3580,9 @@ pub fn apply_effect_result(
                 loop_state,
                 *config,
                 theme_selection,
+                profile_selection,
                 streaming_presentation,
             );
-            match profile_selection {
-                Ok(Some(profile)) if !chat.app.apply_profile(Some(&profile)) => {
-                    chat.app
-                        .set_status(format!("saved profile {profile} is unavailable"));
-                }
-                Ok(_) => {}
-                Err(error) => chat
-                    .app
-                    .set_status(format!("TUI profile state unavailable: {error}")),
-            }
         }
         TuiEffectResult::ProfileSelectionPersisted { name, result } => match result {
             Ok(path) => chat.app.set_status(name.map_or_else(
@@ -4327,6 +4318,7 @@ pub fn apply_config_result(
     loop_state: &mut ChatLoopState,
     config: Result<bcode_config::BcodeConfig, String>,
     theme_selection: Result<Option<String>, String>,
+    profile_selection: Result<Option<String>, String>,
     streaming_presentation: Result<
         Option<bcode_session_view_models::StreamingPresentationPolicy>,
         String,
@@ -4393,18 +4385,7 @@ pub fn apply_config_result(
                 loop_state.pinned_interaction_viewport = None;
                 loop_state.interactive_surface_geometry = None;
             }
-            match theme_selection {
-                Ok(Some(theme_id)) if !chat.app.apply_theme(&theme_id) => {
-                    chat.app.set_status(format!(
-                        "saved theme {theme_id} is unavailable; using configured default {}",
-                        config.tui.theme.name
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) => chat
-                    .app
-                    .set_status(format!("TUI state unavailable: {error}")),
-            }
+            apply_saved_appearance(chat, theme_selection, profile_selection);
             if let Some(surface) = loop_state.interactive_surface.as_mut() {
                 surface.update_keymap(&settings.keymap);
             }
@@ -4422,6 +4403,38 @@ pub fn apply_config_result(
             }
         }
         Err(error) => chat.app.set_status(format!("Config unavailable: {error}")),
+    }
+}
+
+/// Apply the theme and profile saved in user state over the configured ones, theme first
+/// (a profile layers over the theme). An unavailable saved choice keeps the configured one and
+/// says so.
+pub fn apply_saved_appearance(
+    chat: &mut ActiveChat,
+    theme_selection: Result<Option<String>, String>,
+    profile_selection: Result<Option<String>, String>,
+) {
+    match theme_selection {
+        Ok(Some(theme_id)) if !chat.app.apply_theme(&theme_id) => {
+            let configured = chat.app.tui_config().theme.name.clone();
+            chat.app.set_status(format!(
+                "saved theme {theme_id} is unavailable; using configured default {configured}"
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => chat
+            .app
+            .set_status(format!("TUI state unavailable: {error}")),
+    }
+    match profile_selection {
+        Ok(Some(profile)) if !chat.app.apply_profile(Some(&profile)) => {
+            chat.app
+                .set_status(format!("saved profile {profile} is unavailable"));
+        }
+        Ok(_) => {}
+        Err(error) => chat
+            .app
+            .set_status(format!("TUI profile state unavailable: {error}")),
     }
 }
 

@@ -200,6 +200,22 @@ pub struct PreparedPresentation {
     presentation: Result<super::plugin_tui::PluginTuiPresentation, bcode_plugin::PluginLoadError>,
     structure_rules:
         Result<Vec<bcode_presentation_policy::models::PresentationRule>, bcode_config::ConfigError>,
+    appearance: SavedAppearance,
+}
+
+/// Theme and profile chosen interactively and saved in user state.
+struct SavedAppearance {
+    theme: Result<Option<String>, String>,
+    profile: Result<Option<String>, String>,
+}
+
+impl SavedAppearance {
+    fn load() -> Self {
+        Self {
+            theme: bcode_config::load_tui_theme_selection().map_err(|error| error.to_string()),
+            profile: bcode_config::load_tui_profile_selection().map_err(|error| error.to_string()),
+        }
+    }
 }
 
 /// Prepare synchronous native-plugin/configuration loading on a blocking worker.
@@ -217,6 +233,7 @@ fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> Pr
     let config = bcode_config::load_config();
     let streaming_override = bcode_config::load_tui_streaming_presentation_override();
     let structure_rules = bcode_config::load_tui_presentation_rules();
+    let appearance = SavedAppearance::load();
     let presentation_config = config.as_ref().ok();
     let selection =
         presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
@@ -238,6 +255,7 @@ fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> Pr
         streaming_override,
         presentation,
         structure_rules,
+        appearance,
     }
 }
 
@@ -311,6 +329,7 @@ fn initialize_tui_with_presentation(
         streaming_override: streaming_presentation_override,
         presentation,
         structure_rules,
+        appearance,
     } = presentation;
     let client = config
         .as_ref()
@@ -361,6 +380,7 @@ fn initialize_tui_with_presentation(
     let (declarative_streaming_policy, effective_streaming_override) = apply_initial_config(
         config,
         streaming_presentation_override,
+        appearance,
         session_id,
         &launch_working_directory,
         &mut settings,
@@ -398,6 +418,7 @@ fn apply_initial_config(
         Option<bcode_session_view_models::StreamingPresentationPolicy>,
         bcode_config::ConfigError,
     >,
+    appearance: SavedAppearance,
     session_id: Option<SessionId>,
     launch_working_directory: &std::path::Path,
     settings: &mut chat_loop::TuiRuntimeSettings,
@@ -426,6 +447,7 @@ fn apply_initial_config(
         .set_effective_keymap(settings.keymap().shared_registry());
     settings.set_completion_settings(config.presentation.completion);
     chat.app.apply_tui_config(config.tui.clone());
+    chat_loop::apply_saved_appearance(chat, appearance.theme, appearance.profile);
     chat.app
         .apply_configured_structure_rules(config.presentation.rules.clone());
     let declarative = config.presentation.streaming.policy();
@@ -920,6 +942,7 @@ async fn run_managed_chat_bound<W: Write + Send>(
         streaming_override,
         presentation,
         structure_rules,
+        appearance,
     } = prepare_presentation(static_plugins).await?;
     let (event_sender, event_receiver) = history_flow::session_stream_channel();
     let agents = session_flow::AgentCatalog::default();
@@ -958,6 +981,7 @@ async fn run_managed_chat_bound<W: Write + Send>(
         let (declarative, streaming) = apply_initial_config(
             config,
             streaming_override,
+            appearance,
             Some(session_id),
             &cwd,
             &mut settings,
@@ -1882,5 +1906,74 @@ env = "BCODE_MANAGED_REATTACH_UNSET_KEY_71E9"
         let mut inconsistent = snapshot;
         inconsistent.instance.instance_id = "foreign".into();
         assert!(validate_reattach_binding(owner, "foreign", 1, owner, &inconsistent).is_err());
+    }
+}
+
+#[cfg(test)]
+mod saved_appearance_tests {
+    use super::{SavedAppearance, apply_initial_config, chat_loop, session_flow};
+
+    fn chat() -> session_flow::ActiveChat {
+        let (event_sender, event_receiver) = super::history_flow::session_stream_channel();
+        session_flow::ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(None, &[], &[]),
+            agents: session_flow::AgentCatalog::default(),
+            attachment: session_flow::ChatSessionAttachment::Draft,
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_progress: None,
+            pending_effects: super::TuiEffectQueue::default(),
+        }
+    }
+
+    fn start(appearance: SavedAppearance) -> session_flow::ActiveChat {
+        let mut chat = chat();
+        let cwd = std::path::PathBuf::from(".");
+        let mut settings = chat_loop::TuiRuntimeSettings::bootstrap(cwd.clone(), &[]);
+        let _ = apply_initial_config(
+            Ok(bcode_config::BcodeConfig::default()),
+            Ok(None),
+            appearance,
+            None,
+            &cwd,
+            &mut settings,
+            &mut chat,
+        );
+        chat
+    }
+
+    #[tokio::test]
+    async fn startup_applies_the_saved_theme_and_profile() {
+        let configured = start(SavedAppearance {
+            theme: Ok(None),
+            profile: Ok(None),
+        });
+        let chat = start(SavedAppearance {
+            theme: Ok(Some("bcode-light".to_owned())),
+            profile: Ok(Some("zen".to_owned())),
+        });
+        assert_eq!(chat.app.tui_config().theme.name, "bcode-light");
+        assert_eq!(chat.app.tui_config().theme.profile.as_deref(), Some("zen"));
+        assert_ne!(
+            chat.app.presented_theme().canvas,
+            configured.app.presented_theme().canvas
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_the_configured_theme_when_the_saved_one_is_unavailable() {
+        let configured = start(SavedAppearance {
+            theme: Ok(None),
+            profile: Ok(None),
+        });
+        let chat = start(SavedAppearance {
+            theme: Ok(Some("no-such-theme".to_owned())),
+            profile: Ok(None),
+        });
+        assert_eq!(
+            chat.app.tui_config().theme.name,
+            configured.app.tui_config().theme.name
+        );
     }
 }
