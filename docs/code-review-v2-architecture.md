@@ -124,8 +124,8 @@ criterion B targets a steady scroll frame of ≤ 2 ms p95.
 
 #### V2 data layer (phase 1)
 
-Measured by the ignored test `v2::testing::v2_data_benchmark::v2_data_layer_benchmark`
-(`cargo test -p bcode_code_review_plugin v2_data_layer_benchmark -- --ignored --nocapture`) on the
+Measured by the ignored test `data::benchmark::data_layer_benchmark` in `bcode_code_review`
+(`cargo test -p bcode_code_review data_layer_benchmark -- --ignored --nocapture`) on the
 same fixture, machine, and **debug** profile as the V1 table. Times include the service call and
 the JSON encode and decode of its response. Two runs were made; the commit-to-commit rows show
 the later run (the earlier one came within about 10%), and the working-tree rows show the range
@@ -152,8 +152,8 @@ changed is rejected with `cursor_stale`.
 
 #### V2 document (phase 2)
 
-Measured by the ignored test `v2::document::tests::benchmark::v2_document_benchmark`
-(`cargo test -p bcode_code_review_plugin v2_document_benchmark -- --ignored --nocapture`) on the
+Measured by the ignored test `document::tests::benchmark::document_benchmark` (`bcode_code_review`)
+(`cargo test --release -p bcode_code_review document_benchmark -- --ignored --nocapture`) on the
 same fixture, machine, and **debug** profile. The document is built from the real 5,063-entry
 branch-compare index; scrolling then pages through the whole review 60 items at a time, keeping
 the viewport anchored through splices as a virtual list does. Every hunk and blob request the
@@ -172,8 +172,8 @@ shows the first of two runs; the second came within 5%.
 
 #### V2 screen (phase 3a)
 
-Measured by the ignored test `v2::tui::tests::benchmark::v2_screen_benchmark`
-(`cargo test -p bcode_code_review_plugin v2_screen_benchmark -- --ignored --nocapture`) on the
+Measured by the ignored test `tests::benchmark::screen_benchmark` (`bcode_code_review_ui`)
+(`cargo test --release -p bcode_code_review_ui screen_benchmark -- --ignored --nocapture`) on the
 same fixture, machine, and **debug** profile, at 200×60 through the harness frame driver against
 the real V2 service in-process (branch compare, 5,063 files). Only `render` is timed; service calls
 and highlighting run between frames, as on the host. One run is shown; a second came within
@@ -274,7 +274,7 @@ are unverified):
 #### V2 screen, optimized build (performance pass)
 
 The same benchmark built with the release profile (`cargo test --release -p
-bcode_code_review_plugin v2_screen_benchmark -- --ignored --nocapture`), same machine and
+bcode_code_review_ui screen_benchmark -- --ignored --nocapture`), same machine and
 fixture. "Before" is the phase 3 close code measured at the start of this pass (two runs; the
 earlier 2.82 ms p95 recorded during phase 4 was not reproduced); "after" is two runs after the
 changes below. Timings include the harness's own per-frame work (a freshly allocated 200×60
@@ -311,7 +311,7 @@ Profile state (macOS `sample` over the 5k-file scroll, unstripped release build)
 
 #### V2 screen on large terminals (phase 8)
 
-Measured at 200×60, 300×90, and 400×120 with `v2_screen_benchmark_sizes`, and in the real app
+Measured at 200×60, 300×90, and 400×120 with `screen_benchmark_sizes`, and in the real app
 under the chat host; the tables and their attribution are in 13.2.
 
 ## 3. Layered architecture
@@ -460,7 +460,7 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   then `review_source.manifest` to match the provider id), asks the matching provider to resolve
   stacks and fetch every needed layer, and sends the answers with `review.sources.resolve` as
   `provider_resolutions` (`Resolved { stack, fetched }` or `Failed { code, message }`). The
-  routing lives in `src/v2/provider.rs` behind a `ProviderTransport` trait (the daemon client in
+  routing lives in `packages/code-review/src/provider.rs` behind a `ProviderTransport` trait (the daemon client in
   production, fakes in tests). With the provider plugin disabled nothing answers, and only the
   provider-backed sources report `provider_required`.
 * **Stack detection** (GitHub implementation): from the open pull requests whose head branch is in
@@ -516,7 +516,7 @@ path; lines keyed by side and line number; threads by id), never list indices. P
 (`ReviewItemKey`, `ReviewFileExpansion`) carry the optional part index for the same reason. Layout mode (unified/split) changes item
 construction but not item identity for threads and anchors.
 
-**Implementation (phase 2).** `src/v2/document/` implements this section with a renderer-neutral
+**Implementation (phase 2).** `packages/code-review/src/document/` implements this section with a renderer-neutral
 `ReviewDocument`:
 
 * Items are built per file block; a file whose content is not resident is its `FileHeader` plus
@@ -668,7 +668,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * Wrap toggle; hide-whitespace toggle (re-requests hunks with `-w`).
 * Scrollbar over the whole review, with markers for threads and the current file.
 
-**Implementation (phases 3b and 4).** `src/v2/tui/` (`chrome.rs`, `panels.rs`, `files.rs`):
+**Implementation (phases 3b and 4).** `packages/code-review-ui/src/` (`chrome.rs`, `panels.rs`, `files.rs`):
 
 * **Body.** A BMUX `panel_group` of bordered BMUX `pane`s: the file panel, the review document,
   and the threads panel. Dividers lie on the panes' shared borders and can be dragged; the focused
@@ -686,7 +686,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   4. Focus never stays on a hidden pane; it returns to the document.
 * **File panel.** A BMUX `text_input` filter row over a BMUX `tree_view` in a `scroll_view` (the
   pane border carries its scrollbar). One group per source (or part) when there is more than one;
-  directories in path order with single-directory chains compacted (`src/v2/tui/`); files in
+  directories in path order with single-directory chains compacted (`packages/code-review-ui/src/`); files in
   document order. File rows: status letter in its status color, the name (muted when viewed,
   crossed out when deleted), and right-aligned decorations, leftmost dropped first on narrow
   rows: stack layers, drafts, threads, a five-cell change bar (cells by size, split by
@@ -742,7 +742,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * AI questions keep using `PluginTuiAction::OpenSession`; returning restores the exact position.
 * All keys are declared in the plugin manifest keymap (configurable), as today.
 
-**Implementation (phase 3c).** `src/v2/tui/` (`notes.rs`, `composer.rs`, `agent.rs`,
+**Implementation (phase 3c).** `packages/code-review-ui/src/` (`notes.rs`, `composer.rs`, `agent.rs`,
 `palette.rs`, `surface/annotate.rs`, `surface/pointer.rs`, `surface/find.rs`):
 
 * **Annotations** (`notes.rs`). Drafts, AI exchanges, and suggestions load through the existing
@@ -830,7 +830,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
   annotation call is still running shows `saving…` and closes once they finish (at most 5 s;
   exiting again closes at once), because the host may end the process as soon as the surface
   closes.
-* **Implementation (phase 6, part 2: V1 parity).** `src/v2/tui/surface/assist.rs` and the
+* **Implementation (phase 6, part 2: V1 parity).** `packages/code-review-ui/src/surface/assist.rs` and the
   changes listed here close the remaining inventory items (Appendix B):
   * **Composer completion.** The composer's editor is offered to the host as a focused text
     field through the shared `FocusedTextFieldAdapter` (`PluginTuiSurface::focused_text_field`,
@@ -906,7 +906,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * Icons have ASCII fallbacks selected by presentation policy.
 * Home and review share one theme derivation.
 
-**Implementation (phase 4).** `src/v2/tui/theme.rs`:
+**Implementation (phase 4).** `packages/code-review-ui/src/theme.rs`:
 
 * `ReviewTheme::derive` takes the host's `PluginTuiTheme`: its `ComponentTheme` (when the
   contract version matches) and its diff styles. Without a host theme, the roles derive from a
@@ -946,7 +946,7 @@ eviction), reports files whose marks should be re-recorded, and counts viewed fi
 * Frames are pure: one snapshot per frame, no service calls, no recomputation of unchanged items,
   regional damage on scroll.
 
-**Implementation (phase 3a).** `src/v2/tui/` implements the review screen core:
+**Implementation (phase 3a).** `packages/code-review-ui/src/` implements the review screen core:
 
 * **Launch.** `bcode review <subcommand> --ui v2` (on every interactive review subcommand) or
   `BCODE_REVIEW_UI=v2` opens the `code-review-v2` surface kind; since phase 5 `bcode review`
@@ -1019,7 +1019,12 @@ startup request for `code-review` reaches V2 through the generic launcher. The s
 accepts the option shapes V1's host launcher sent (`workspace`, or a JSON `target`), so an older
 caller opening `code-review` gets the matching V2 review.
 
-**Implementation (phase 5).** `src/v2/tui/app.rs` is the `code-review-v2` surface (`code-review`
+**Implementation (phase 9).** The review no longer runs as a plugin surface (13.3), so the
+`code-review` surface declaration and the generic `plugin_surface_launcher` were removed: no
+other plugin used the launcher (eval and metrics startup surfaces have their own adapters). A
+startup surface kind without an adapter now fails with `unsupported_startup_surface`.
+
+**Implementation (phase 5).** `packages/code-review-ui/src/app.rs` is the `code-review-v2` surface (`code-review`
 since phase 7)
 (`ReviewAppV2`):
 
@@ -1054,7 +1059,7 @@ since phase 7)
 * Type-to-filter search, preview panel (file stats, sources, last publish), rename, archive,
   restore, and one-key continue-latest.
 
-**Implementation (phase 5).** `src/v2/tui/home.rs` (screen), `home/model.rs` (groups, filter,
+**Implementation (phase 5).** `packages/code-review-ui/src/home.rs` (screen), `home/model.rs` (groups, filter,
 rows, suggestions; pure and unit-tested), `home/load.rs` (service calls):
 
 * **Loading.** A refresh (first show, returning from a review, `ctrl+r`, terminal focus regain)
@@ -1130,7 +1135,7 @@ metadata is required.
   layer whose diff contains its anchor line; if none can be determined it falls back to the top
   PR's review summary.
 
-**Implementation (phase 5).** `src/v2/tui/wizard.rs` over `picker.rs` (a BMUX `picker_frame`
+**Implementation (phase 5).** `packages/code-review-ui/src/wizard.rs` over `picker.rs` (a BMUX `picker_frame`
 with an optional query input over a BMUX `menu`, or a BMUX `empty_state` for loading, empty, and
 error states), under a BMUX `stepper` (Source type, Details, Title & create):
 
@@ -1171,7 +1176,7 @@ error states), under a BMUX `stepper` (Source type, Details, Title & create):
   `source-N` ids; a durable review is saved with `review.workspace.update` and reopened, a
   transient one reopens with the new sources. `esc` returns to the review unchanged.
 
-**Implementation (phase 6, stacks in the review).** `src/v2/tui/surface/stack.rs`:
+**Implementation (phase 6, stacks in the review).** `packages/code-review-ui/src/surface/stack.rs`:
 
 * **Layer mode** is a `StackLayer` source: the merge base of the layer below's head and the
   layer's head → the layer's head (4.1), so exactly the pull request's own diff; its comments
@@ -1198,8 +1203,8 @@ fast-forward updates this is the diff between the previous and current head. Aft
 files are compared by patch-id: unchanged patches stay viewed and are de-emphasized, changed
 patches are shown.
 
-**Implementation (phase 6).** `src/v2/tui/rereview.rs`, `src/v2/tui/surface/flows.rs`, and
-`src/v2/service/rereview.rs`:
+**Implementation (phase 6).** `packages/code-review-ui/src/rereview.rs`, `packages/code-review-ui/src/surface/flows.rs`, and
+`packages/code-review/src/data/rereview.rs`:
 
 * **Passes.** A pass is recorded (`reviewed_revisions`, each source's first resolved part, from
   the whole review even while the changes-since view is shown) only when the reviewer marks it
@@ -1265,7 +1270,7 @@ environment variable is ignored. `publish-github` is unchanged.
   ctrl+s saves it with its comments; exit again to leave without saving" (any other key
   cancels the offer), and saving makes it a durable review on home. Without annotations, exit
   leaves at once.
-* **Transient annotation scope.** `src/v2/scope.rs` owns the scope id every annotation request
+* **Transient annotation scope.** `packages/code-review/src/scope.rs` owns the scope id every annotation request
   carries (`ReviewScope::Workspace { workspace_id, .. }`, stored under the review key
   `review-workspace-{workspace_id}`): drafts, threads (resolution, classification, linked
   sessions), AI exchanges, and suggestions all use it, from the client (`NoteScope::for_workspace`)
@@ -1299,9 +1304,9 @@ environment variable is ignored. `publish-github` is unchanged.
 
 ### 7.6 Publishing and import
 
-**Implementation (phase 6).** `src/v2/publish.rs` (renderer-neutral planning),
-`src/v2/tui/publish.rs`, `src/v2/tui/import.rs`, `src/v2/tui/options_form.rs`,
-`src/v2/tui/modal.rs`, and `src/v2/tui/surface/flows.rs`:
+**Implementation (phase 6).** `packages/code-review/src/publish_plan.rs` (renderer-neutral planning),
+`packages/code-review-ui/src/publish.rs`, `packages/code-review-ui/src/import.rs`, `packages/code-review-ui/src/options_form.rs`,
+`packages/code-review-ui/src/modal.rs`, and `packages/code-review-ui/src/surface/flows.rs`:
 
 * **Publish flow** (`shift+p`, `publish`, the palette, or the header's split button; V1's `x`
   expands context in V2). A modal over a BMUX `picker_frame`:
@@ -1325,7 +1330,7 @@ environment variable is ignored. `publish-github` is unchanged.
      A failure returns to the preview with the error; retrying skips the bundles already
      published. Success records the pass (7.4), reloads the records (threads show `published`),
      and toasts each provider message.
-* **Routing** (`src/v2/publish.rs`). For a publisher of the sources' provider: a pull-request or
+* **Routing** (`packages/code-review/src/publish_plan.rs`). For a publisher of the sources' provider: a pull-request or
   stack-layer source publishes its threads to its own pull request (layer mode: the layer's own
   diff); a whole-stack source maps each line comment with `review.stack.attribution` (fetched per
   anchored file when publishing) to the layer that introduced or removed its lines and re-anchors
@@ -1631,7 +1636,7 @@ any app embeds real bcode sessions.
   subcommand. It runs its own `bmux_tui_runtime` loop and loads themes itself through
   `bcode_tui_theme::discovery` (`default_theme_roots`, `discover_themes`), with unset fields
   falling back to `[tui.theme]` in `bcode.toml` (`packages/git-ui/src/config.rs`).
-* **AI cards show only the final answer.** `AgentState::from_snapshot` (`src/v2/tui/agent.rs`)
+* **AI cards show only the final answer.** `AgentState::from_snapshot` (`packages/code-review-ui/src/agent.rs`)
   reduces a linked session's `SessionViewSnapshot` to a phase and the last completed assistant
   message. The snapshot already carries what a live view needs: transcript items (user,
   reasoning, tool invocation, permission, assistant), text streams, pending `permissions`,
@@ -1651,7 +1656,7 @@ Measure before changing anything. Attribute each frame's time at narrow (80×24)
 * the review surface (layout, row building, paint);
 * terminal diff and flush (changed cells, bytes written, write time).
 
-Add a large-terminal case to `v2_screen_benchmark` (today 200×60) and record the numbers in 2.1
+Add a large-terminal case to `screen_benchmark` (today 200×60) and record the numbers in 2.1
 alongside the existing tables. The results decide which costs phase 9 removes by leaving the
 chat loop, which belong to the review surface, and which are generic terminal costs to fix in
 BMUX. Criterion B's steady scroll target (≤ 2 ms p95) applies at the large size too.
@@ -1660,8 +1665,8 @@ BMUX. Criterion B's steady scroll target (≤ 2 ms p95) applies at the large siz
 on a large terminal; the sluggishness comes from the chat-root host and its input pipeline, plus
 the bytes written for every frame.
 
-* **Benchmark.** `v2_screen_benchmark_sizes` (`src/v2/tui/tests/benchmark.rs`, ignored; run
-  with `cargo test --release -p bcode_code_review_plugin v2_screen_benchmark_sizes --
+* **Benchmark.** `screen_benchmark_sizes` (`packages/code-review-ui/src/tests/benchmark.rs`, ignored; run
+  with `cargo test --release -p bcode_code_review_ui screen_benchmark_sizes --
   --ignored --nocapture --test-threads 1`) runs 200×60, 300×90, and 400×120 in both layouts
   (`BCODE_BENCH_SIZES` chooses others) and reports paint, encode, and input time plus bytes per
   frame, presenting into an in-memory BMUX terminal with the themed host colors. The narrow
@@ -1837,6 +1842,72 @@ Measured at 400×120 with the same `debug-release` setup (tmux plus `script(1)`,
   change.
 * **Smoke.** The 11 cases in `scripts/smoke-continuous-tui-pty.py` that open `bcode review`
   (`completion-review` and the ten `review-*` cases) are rewritten for the app.
+
+**Implementation (phase 9).**
+
+* **Data crate.** `packages/code-review` (`bcode_code_review`) holds the repository reads
+  (`ReviewData`), the stored state (`ReviewStore`), provider routing, viewed marks, and scopes,
+  plus the renderer-neutral review document (`document`) and publish planning
+  (`publish_plan`). The document now lives in a crate with no terminal dependency, so its
+  portability is enforced by the compiler. The plugin's `src/service.rs` adapts the same
+  functions to `bcode.code_review/v1` JSON operations.
+* **UI crate.** `packages/code-review-ui` (`bcode_code_review_ui`) holds the routes (`app`,
+  `home`, `wizard`, `surface`) and every module that was under the plugin's review UI, at the
+  crate root. Screens implement `view::View` (`prepare_keymap`, `render`, `handle_event`,
+  `poll`) and return `action::Action` (`None`, `Redraw`, `Close { edit_sources }`,
+  `OpenSession`).
+* **Typed data access.** `services::ReviewServices` replaces the JSON backend: every request
+  type implements `services::Operation` (its response type, the operation name, and the call),
+  so a screen calls `services.call(request).await` and gets the typed response. Calls run on
+  the blocking pool against a shared `ReviewData` and the configured `ReviewStore`; providers,
+  publishers, and importers go through the host's plugin services.
+* **Host boundary.** `host::ReviewHost` covers the theme, sessions (create, send, follow,
+  the command that opens one in Bcode), plugin services, clipboard, external URLs, task and
+  blocking-task spawning, and redraw requests; a host requests a frame whenever a spawned task
+  finishes. `context::UiContext` pairs the host with the resolved keymap and the
+  `[tui.diff_viewer]` layout preference. Host-provided completion of the comment composer
+  (the chat host's focused-text-field protocol) has no standalone provider and was removed with
+  the plugin surface.
+* **Run loop.** `run.rs` drives the app with `bmux_tui_runtime`: input goes straight to the app;
+  host wakes (coalesced) poll it and present; every presented frame polls again, so animations
+  run at the runtime cadence and the loop idles when nothing changes. `o` on a linked session
+  ends the runtime, runs `bcode tui <session>` with the terminal handed over, and resumes the
+  app. Inside `bcode review` that command is the running Bcode executable and the client may
+  start the daemon; the standalone `bcode-review` uses `bcode` from the path and only attaches
+  to a running daemon (13.7's sanctioned daemon start is still missing).
+* **Entry points.** `cli.rs` is the shared command line: the plugin's `bcode review`
+  registration runs it in process, and `bcode-review` takes the same subcommands.
+* **Tests and benchmarks.** The scenario harness (`testing/harness.rs`) drives any `View` with
+  a `ScriptedHost` that captures tasks, redraws, clipboard writes, sessions, and followed
+  session views, and serves the fake provider and publisher. `testing/backend.rs` gives screens
+  the real `ReviewServices` over a private state directory, answering on the calling task so
+  completions arrive in a fixed order. `screen_benchmark`, `screen_benchmark_sizes`
+  (`bcode_code_review_ui`), `document_benchmark`, and `data_layer_benchmark`
+  (`bcode_code_review`) keep their measurements.
+* **Plugin.** `plugins/code-review-plugin` keeps the `bcode.code_review/v1` JSON adapters over
+  `bcode_code_review` (`src/service.rs`), the `diff.toggle` palette command, the keymap
+  declarations in its manifest (registered with bcode's keymap catalog, and read at build time
+  by the app's `keymap.rs`, so user overrides of the `code-review*` scopes keep working in
+  both), and, under `static-bundled`, the `bcode review` CLI registration. It declares no TUI
+  surface and depends on the UI crate only for that registration. `packages/tui` lost the
+  generic standalone-surface launcher with it (7.1).
+* **Daemon availability.** `publish-github` is the only subcommand that needs the daemon before
+  running: `bcode review` starts it first, while the standalone binary attaches only to a running
+  one and reports "Bcode is not running" otherwise (questions to Bcode report the same).
+  `publish-github` builds the review bundle with `ReviewStore::review_bundle` directly and uses
+  the daemon only for the GitHub publisher call. (The command previously fetched the bundle with
+  `review.bundle.get` and a `ReviewContextRequest` payload, which that operation rejects because
+  it takes a `PublishReviewRequest`.)
+* **Smoke.** The review cases of `scripts/smoke-continuous-tui-pty.py` drive the app:
+  `review-home-cancel`, `review-invalid-repository`, `review-home-new-workspace` (wizard, then
+  reopen after restart), `review-ask-open-session` (ask Bcode, open the linked session, return;
+  replaces the chat-routing cases `review-linked-navigation` and `review-home-workspace-chat`),
+  `review-click-save-resume` and `review-wizard-unstaged` (replacing the preset-click cases),
+  `review-tree-scroll-resize`, `review-range-edit-thread`, and `review-pointer-no-rewrite`.
+  `completion-review` was dropped with the chat host's composer completion. A step may set
+  `handoff: true` to allow the alternate screen to be left and re-entered while the app hands
+  the terminal to `bcode tui`. Review fixtures enable the harness plugin, which real sessions
+  need. App behavior is documented in `docs/code-review-app.md`.
 
 ### 13.4 Phase 10: visual system
 
@@ -2868,7 +2939,7 @@ names it, with the same keys or the keys given). **Replaced by X**: the spec sup
 behavior and X covers its purpose. **Dropped**: V2 deliberately does not reproduce it, with the
 reason. V1 defects and unreachable bindings are dropped by the rule of Appendix A. Keys are V2
 defaults (every action is in the manifest keymap, the palette, and help; 6.2 "Key bindings").
-Behavioral coverage is in `src/v2/tui/tests/` (`parity.rs` for the phase 6 part 2 items).
+Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for the phase 6 part 2 items).
 
 ### B.1 Entry points and CLI
 

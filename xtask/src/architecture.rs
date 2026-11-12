@@ -394,6 +394,28 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
             "reqwest",
         ],
     ),
+    (
+        // The standalone review app runs its own terminal loop over the review data layer and
+        // the daemon client, without the chat interface or in-process plugin hosting.
+        "bcode_code_review_ui_cli",
+        "packages/code-review-ui/cli",
+        "",
+        &[
+            "bcode_code_review_ui",
+            "bcode_code_review",
+            "bmux_tui_runtime",
+            "bcode_config_layers",
+        ],
+        &[
+            "bcode_tui",
+            "bcode_plugin",
+            "bcode_code_review_plugin",
+            "bcode_bundled_plugins",
+            "bcode_server",
+            "bcode_session",
+            "bcode_agent_runtime",
+        ],
+    ),
     ("bcode_cli", "packages/cli", "", &[], &["bcode_hyperchad"]),
     (
         "bcode_cli",
@@ -560,7 +582,10 @@ fn profile_graph(target: &str, package: &str, directory: &str, features: &str) -
     let mut probe_manifest = manifest
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| format_error(format!("invalid probe manifest: {error}")))?;
-    if matches!(package, "bcode_recap_cli" | "bcode_git_ui_cli") {
+    if matches!(
+        package,
+        "bcode_recap_cli" | "bcode_git_ui_cli" | "bcode_code_review_ui_cli"
+    ) {
         configure_binary_probe(&mut probe_manifest, &workspace_manifest, &path)?;
     }
     if let Some(patches) = workspace_manifest.get("patch") {

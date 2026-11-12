@@ -14,68 +14,21 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_client = { workspace = true }
+bcode_code_review        = { workspace = true }
 bcode_code_review_models = { workspace = true }
-bcode_command = { workspace = true }
-bcode_config = { workspace = true }
-bcode_git = { workspace = true }
-bcode_ipc = { workspace = true }
-bcode_markdown_render = { workspace = true }
-bcode_plugin_sdk = { workspace = true, features = ["tui"] }
-bcode_session_models = { workspace = true }
-bcode_session_view_models = { workspace = true }
-bcode_syntax_render = { workspace = true }
-bmux_color = { workspace = true }
-bmux_keyboard = { workspace = true }
-bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true }
-bmux_tui_components = { workspace = true, features = [
-    "badge",
-    "diff-viewer",
-    "empty-state",
-    "form",
-    "form-field",
-    "key-hint-bar",
-    "menu",
-    "pane",
-    "panel-group",
-    "picker-frame",
-    "progress-bar",
-    "scroll-view",
-    "selectable-list",
-    "spinner",
-    "split-button",
-    "status-bar",
-    "stepper",
-    "tab-bar",
-    "table",
-    "text-input",
-    "text-view",
-    "toast-stack",
-    "tree-view",
-    "virtual-list",
-] }
-clap = { workspace = true, features = ["derive", "std"] }
-hex = { workspace = true }
-regex = { workspace = true, features = ["std", "unicode"] }
-serde = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-switchy = { workspace = true, features = [
-    "database",
-    "database-schema",
-    "database-connection",
-    "database-connection-turso",
-    "schema",
-] }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
-toml = { workspace = true }
+bcode_code_review_ui     = { workspace = true, optional = true }
+bcode_command            = { workspace = true }
+bcode_plugin_sdk         = { workspace = true, features = ["tui"] }
+clap                     = { workspace = true, features = ["derive", "std"], optional = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true }
+toml                     = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+bcode_code_review = { workspace = true, features = ["testing"] }
+tempfile          = { workspace = true }
 
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+static-bundled   = ["dep:bcode_code_review_ui", "dep:clap"]

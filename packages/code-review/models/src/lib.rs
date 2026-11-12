@@ -50,14 +50,14 @@ pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 pub const OP_REVIEW_SUGGESTIONS_LIST: &str = "review.suggestions.list";
 /// Operation that creates or updates a durable AI-suggested review comment.
 pub const OP_REVIEW_SUGGESTION_SAVE: &str = "review.suggestion.save";
-/// Operation that deletes a durable AI-suggested review comment from one review scope (Code
-/// Review V2 moves suggestions when a transient review is saved).
+/// Operation that deletes a durable AI-suggested review comment from one review scope (the
+/// review moves suggestions when a transient review is saved).
 pub const OP_REVIEW_SUGGESTION_DELETE: &str = "review.suggestion.delete";
 /// Operation that lists durable, non-publishable review AI exchanges.
 pub const OP_REVIEW_AI_EXCHANGES_LIST: &str = "review.ai_exchanges.list";
 /// Operation that creates or updates a durable, non-publishable review AI exchange.
 pub const OP_REVIEW_AI_EXCHANGE_SAVE: &str = "review.ai_exchange.save";
-/// Set a thread's kind and severity (Code Review V2).
+/// Set a thread's kind and severity.
 pub const OP_THREAD_CLASSIFY: &str = "thread.classify";
 /// Operation that explicitly deletes a durable review AI exchange.
 pub const OP_REVIEW_AI_EXCHANGE_DELETE: &str = "review.ai_exchange.delete";
@@ -141,7 +141,7 @@ pub struct ReviewWorkspace {
     /// Archived timestamp in milliseconds since Unix epoch, when archived.
     #[serde(default)]
     pub archived_at_ms: Option<u64>,
-    /// Identity-pinned viewed marks (Code Review V2). `viewed_files` stays the authoritative set
+    /// Identity-pinned viewed marks. `viewed_files` stays the authoritative set
     /// of viewed paths for compatibility; a viewed path without a mark here is a legacy mark of
     /// unknown identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -149,13 +149,17 @@ pub struct ReviewWorkspace {
     /// Last resolved revisions per source id, recorded when a review pass completes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reviewed_revisions: BTreeMap<String, ReviewedRevision>,
-    /// Code Review V2 presentation state. It is disposable: an unreadable value is dropped
-    /// rather than failing the workspace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presentation_v2: Option<ReviewV2PresentationState>,
+    /// Review screen presentation state. It is disposable: an unreadable value is dropped
+    /// rather than failing the workspace. It is persisted under the key `presentation_v2`.
+    #[serde(
+        default,
+        rename = "presentation_v2",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presentation: Option<ReviewPresentationState>,
 }
 
-/// A file marked viewed at a specific identity (Code Review V2).
+/// A file marked viewed at a specific identity.
 ///
 /// Matching rule, in order:
 ///
@@ -236,8 +240,8 @@ impl ReviewedRevision {
     }
 }
 
-/// Current schema version of [`ReviewV2PresentationState`].
-pub const REVIEW_V2_PRESENTATION_SCHEMA_VERSION: u16 = 1;
+/// Current schema version of [`ReviewPresentationState`].
+pub const REVIEW_PRESENTATION_SCHEMA_VERSION: u16 = 1;
 
 /// Diff layout mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -355,9 +359,9 @@ pub struct ReviewFileExpansion {
     pub revealed_new_lines: Vec<ReviewLineInterval>,
 }
 
-/// Code Review V2 presentation state persisted per workspace.
+/// Review screen presentation state persisted per workspace (scroll, panels, folds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewV2PresentationState {
+pub struct ReviewPresentationState {
     /// Presentation schema version.
     pub schema_version: u16,
     /// Scroll position by item identity.
@@ -394,10 +398,10 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
-impl Default for ReviewV2PresentationState {
+impl Default for ReviewPresentationState {
     fn default() -> Self {
         Self {
-            schema_version: REVIEW_V2_PRESENTATION_SCHEMA_VERSION,
+            schema_version: REVIEW_PRESENTATION_SCHEMA_VERSION,
             scroll_anchor: None,
             layout_mode: None,
             panels: ReviewPanelState::default(),
@@ -433,7 +437,7 @@ impl ReviewWorkspace {
             archived_at_ms: None,
             viewed_marks: Vec::new(),
             reviewed_revisions: BTreeMap::new(),
-            presentation_v2: None,
+            presentation: None,
         }
     }
 }
@@ -1351,16 +1355,16 @@ pub struct DraftAnchor {
     /// Source id for normalized mixed-surface anchors.
     #[serde(default)]
     pub source_id: Option<String>,
-    /// Commit the anchored source's head resolved to when the anchor was created (Code Review
-    /// V2), when the head was a commit. An anchor whose head differs from the source's current
-    /// head may point at moved lines, so V2 shows it as outdated rather than re-attaching it.
+    /// Commit the anchored source's head resolved to when the anchor was created, when the head
+    /// was a commit. An anchor whose head differs from the source's current head may point at
+    /// moved lines, so the review shows it as outdated rather than re-attaching it.
     /// Omitted when absent, so anchors without it serialize (and hash) exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_oid: Option<String>,
-    /// Blob of the anchored file side when the anchor was created (Code Review V2): the new
+    /// Blob of the anchored file side when the anchor was created: the new
     /// side, or the old side for anchors ending on a removed line, when that side is a blob
     /// object (working-tree content records none). A line anchor stays exact while the side's
-    /// current blob is the same; V2 shows it as outdated once the file's content changed.
+    /// current blob is the same; the review shows it as outdated once the file's content changed.
     /// Omitted when absent, so anchors without it serialize (and hash) exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_oid: Option<String>,
@@ -1704,7 +1708,7 @@ pub struct ReviewPublisherManifest {
 }
 
 /// Request payload for `review.publish.bundle.preview` and `review.publish.bundle.submit`:
-/// publish a bundle the client built (Code Review V2) with a built-in publisher.
+/// publish a bundle the client built with a built-in publisher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishBundleRequest {
     /// Built-in publisher id.
@@ -3166,7 +3170,7 @@ mod workspace_compat_tests {
     use super::*;
 
     #[test]
-    fn old_workspace_json_reads_with_empty_v2_fields() {
+    fn workspace_json_without_viewed_marks_or_presentation_reads_with_empty_fields() {
         let json = r#"{
             "id": "w", "title": "t", "repo_root": "/repo",
             "sources": [{"id": "s", "kind": {"kind": "working_tree_unstaged"}, "label": "u", "included": true}],
@@ -3175,11 +3179,11 @@ mod workspace_compat_tests {
         let workspace: ReviewWorkspace = serde_json::from_str(json).unwrap();
         assert_eq!(workspace.viewed_marks, Vec::new());
         assert_eq!(workspace.reviewed_revisions, BTreeMap::new());
-        assert!(workspace.presentation_v2.is_none());
+        assert!(workspace.presentation.is_none());
         let encoded = serde_json::to_value(&workspace).unwrap();
         assert!(
             encoded.get("viewed_marks").is_none(),
-            "empty V2 fields are omitted"
+            "empty viewed marks are omitted"
         );
     }
 
@@ -3289,8 +3293,8 @@ mod workspace_compat_tests {
     }
 
     #[test]
-    fn v2_presentation_state_round_trips() {
-        let state = ReviewV2PresentationState {
+    fn presentation_state_round_trips() {
+        let state = ReviewPresentationState {
             scroll_anchor: Some(ReviewScrollAnchor {
                 item: ReviewItemKey::Line {
                     source_id: "s".into(),
@@ -3314,11 +3318,11 @@ mod workspace_compat_tests {
                 part: None,
                 revealed_new_lines: vec![ReviewLineInterval { start: 1, end: 20 }],
             }],
-            ..ReviewV2PresentationState::default()
+            ..ReviewPresentationState::default()
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(
-            serde_json::from_str::<ReviewV2PresentationState>(&json).unwrap(),
+            serde_json::from_str::<ReviewPresentationState>(&json).unwrap(),
             state
         );
     }

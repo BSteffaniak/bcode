@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "development-tools"]
+description = "Standalone bcode code review terminal app"
+edition     = { workspace = true }
+keywords    = ["bcode", "code-review", "tui"]
+license     = { workspace = true }
+name        = "bcode_code_review_ui_cli"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bcode-review"
+path = "src/main.rs"
+
+[dependencies]
+bcode_code_review_ui = { workspace = true }
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default          = []
+fail-on-warnings = []

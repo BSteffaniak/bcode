@@ -1,0 +1,75 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "development-tools"]
+description = "Interactive terminal code review app for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "code-review", "tui"]
+license     = { workspace = true }
+name        = "bcode_code_review_ui"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_client              = { workspace = true }
+bcode_code_review         = { workspace = true }
+bcode_code_review_models  = { workspace = true }
+bcode_config_layers       = { workspace = true }
+bcode_ipc                 = { workspace = true }
+bcode_keymap              = { workspace = true }
+bcode_markdown_render     = { workspace = true }
+bcode_session_models      = { workspace = true }
+bcode_session_view        = { workspace = true, features = ["client"] }
+bcode_session_view_models = { workspace = true }
+bcode_syntax_render       = { workspace = true }
+bcode_tui_theme           = { workspace = true, features = ["components"] }
+bmux_color                = { workspace = true }
+bmux_keyboard             = { workspace = true }
+bmux_text_edit            = { workspace = true }
+bmux_tui                  = { workspace = true, features = ["crossterm"] }
+bmux_tui_components = { workspace = true, features = [
+    "badge",
+    "diff-viewer",
+    "empty-state",
+    "form",
+    "form-field",
+    "key-hint-bar",
+    "menu",
+    "pane",
+    "panel-group",
+    "picker-frame",
+    "progress-bar",
+    "scroll-view",
+    "selectable-list",
+    "spinner",
+    "split-button",
+    "status-bar",
+    "stepper",
+    "tab-bar",
+    "table",
+    "text-input",
+    "text-view",
+    "toast-stack",
+    "tree-view",
+    "virtual-list",
+] }
+bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
+clap             = { workspace = true, features = ["derive", "std"] }
+serde            = { workspace = true, features = ["derive", "std"] }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+toml             = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+bcode_code_review = { workspace = true, features = ["testing"] }
+tempfile          = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

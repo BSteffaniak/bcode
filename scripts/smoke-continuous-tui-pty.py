@@ -9,10 +9,10 @@ Usage (after the coordinator grants runtime capacity):
 
 Built-in cases assert only the named journey, not the entire product acceptance.
 Custom --plan JSON contract:
-  {"name":"review-home-workspace-chat", "model":true, "args":["review"],
-   "steps":[{"expect":["Review"], "send":"\\r"},
-            {"expect":["Workspace"], "send":"..."},
-            {"expect":["Ask Bcode"], "send":"\\u0004"}], "exit_code":0}
+  {"name":"review-ask-open-session", "model":true, "args":["review"],
+   "steps":[{"expect":["Code reviews"], "send":"1"},
+            {"expect":["Working tree and index"], "send":"..."},
+            {"expect":["Code reviews"], "send":"q"}], "exit_code":0}
 Expectations are case-insensitive substrings of the *current rendered grid*, not
 source assertions or historical terminal output. A step may have forbid:[...],
 resize:[columns,rows], timeout:seconds, hold:seconds, and send:text. Use hold to
@@ -26,6 +26,9 @@ cannot share a step with send/resize. screen_change:none|some compares this grid
 with the preceding step. no_rewrite:true checks output since that step's action
 for display erase or near-screen-sized printable payload; use only after settled
 no-op pointer events, not resize/scroll/transitions. Evidence records the counts.
+handoff:true lets the application hand the terminal to a child program (or take it
+back) while that step waits: the alternate screen may be left and entered again,
+and the step still only matches the grid while an alternate screen is active.
 Review-only restart_steps runs a second real TUI process against the same isolated
 fixture/state after clean exit; first-* artifacts preserve the original journey.
 This proves saved-workspace restoration rather than retained in-memory navigation.
@@ -48,7 +51,8 @@ coverage. Successful enrollment still needs a separate safe fixture.
 
 Captures, final grid, daemon log and JSON evidence stay in a private temporary
 folder (reported on completion/failure). Fake/review cases enable only fake-provider
-and local default-agent/code-review plugins. xAI case uses bundled compatible only
+and local default-agent/code-review plugins (review cases add the harness plugin,
+since questions about the code run in real sessions). xAI case uses bundled compatible only
 for local recommendation, with a fake key and zero chat submissions. No session is fabricated
 for setup. Cleanup signals only direct children we started and have not reaped.
 --self-test tests harness mechanics only, never application acceptance.
@@ -110,11 +114,6 @@ CASES = {
         "steps": [{"expect": ["Message", "ready"], "hold": 2, "send": 'tool-call question {"questions":[{"header":"Completion","question":"COMPLETION_QUESTION","options":[],"custom":true,"control":"radio","selection_mode":"single","required":true}]}\r'}] +
         completion_steps("COMPLETION_QUESTION", [
             {"expect": ["Ask Bcode"], "send": "\x04"}])},
-    "completion-review": {"fixture": "completion-review", "model": True, "args": ["review"],
-        "steps": [{"expect": ["Bcode Reviews"], "send": "s"},
-                  {"expect": ["Staged", "CONTINUOUS_REVIEW_FILE"], "send": "ja"}] +
-        completion_steps("ask Bcode", [
-            {"expect": ["Staged", "CONTINUOUS_REVIEW_FILE"], "send": "\x04"}])},
 
     "blims-service-timeout": {"fixture": "blims", "model": True,
         "args": ["blims", "enter"], "steps": [
@@ -124,36 +123,6 @@ CASES = {
     "xai-model-chat": {"fixture": "xai", "model": False, "args": [], "steps": [
         {"expect": ["Welcome to Bcode", "xAI", "grok"], "send": "\r"},
         {"expect": ["Ask Bcode"], "hold": 1, "send": "\x04"}]},
-    "review-home-cancel": {"fixture": "review", "model": True,
-        "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "\x04"}]},
-    "review-invalid-repository": {"fixture": "fake", "model": True,
-        "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "v"},
-        {"expect": ["failed to create workspace"], "send": "\x04"}]},
-    "review-home-new-workspace": {"fixture": "review", "model": True,
-        "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "n"},
-        {"expect": ["new review title"], "send": "CONTINUOUS_PTY_REVIEW\r"},
-        {"expect": ["CONTINUOUS_PTY_REVIEW"], "forbid": ["Bcode Reviews", "new review title"], "send": "\x04"}]},
-    "review-linked-navigation": {"fixture": "review", "model": True,
-        "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "s"},
-        {"expect": ["Staged", "CONTINUOUS_REVIEW_FILE"], "forbid": ["Bcode Reviews"], "send": "ja"},
-        {"expect": ["CONTINUOUS_REVIEW_FILE", "ask Bcode"], "forbid": ["select a diff line or range"],
-         "send": "CONTINUOUS_REVIEW_QUESTION\r"},
-        {"expect": ["CONTINUOUS_REVIEW_QUESTION", "session linked:"], "send": "o", "timeout": 60},
-        {"expect": ["Ask Bcode", "CONTINUOUS_REVIEW_QUESTION"], "hold": 0.5, "send": "\x04"},
-        {"expect": ["bcode review", "Staged"], "send": "\x04"}]},
-    "review-home-workspace-chat": {"fixture": "review", "model": True,
-        "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "s"},
-        {"expect": ["Staged", "CONTINUOUS_REVIEW_FILE"], "forbid": ["Bcode Reviews"], "send": "ja"},
-        {"expect": ["CONTINUOUS_REVIEW_FILE", "ask Bcode"], "forbid": ["select a diff line or range"],
-         "send": "CONTINUOUS_REVIEW_QUESTION\r"},
-        {"expect": ["CONTINUOUS_REVIEW_QUESTION", "answered"], "send": "o", "timeout": 60},
-        {"expect": ["Ask Bcode", "CONTINUOUS_REVIEW_QUESTION"], "hold": 0.5, "send": "\x04"},
-        {"expect": ["bcode review", "Staged"], "send": "\x04"}]},
     "quick-cancel": {"model": False, "args": [], "steps": [
         {"expect": ["Welcome to Bcode", "No usable account"], "send": "\x1b"}]},
     "quick-advanced-cancel": {"model": False, "args": [], "steps": [
@@ -172,91 +141,147 @@ CASES = {
 }
 
 
-# Review plans intentionally use observed row anchors and explicit cell columns.
-# Component geometry can change without reviving the old flat Files screen.
-# The coordinator should integrate these against the newly built renderer; a
-# missing/ambiguous anchor fails rather than falling back to guessed row numbers.
+# Review plans use observed row anchors and explicit cell columns, so component
+# geometry can change; a missing or ambiguous anchor fails rather than falling
+# back to guessed row numbers. `q` leaves the review for home and quits home.
 CASES.update({
-    "review-click-presets-resume": {"fixture": "review", "model": True,
+    "review-home-cancel": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews", "Staged changes"],
-         "mouse": {"row_text": "Staged changes  [s]", "column": 10}},
-        {"expect": ["bcode review", "Staged changes", "CONTINUOUS_REVIEW_FILE"],
-         "forbid": ["Bcode Reviews"], "send": "\x04"}],
+        {"expect": ["Code reviews", "Uncommitted changes"], "send": "q"}]},
+    "review-invalid-repository": {"fixture": "fake", "model": True,
+        "args": ["review"], "steps": [
+        {"expect": ["Code reviews", "New review"], "send": "1"},
+        {"expect": ["What do you want to review?"], "send": "\r"},
+        {"expect": ["Which changes?"], "send": "\r"},
+        {"expect": ["Create review"], "send": "\r"},
+        {"expect": ["Could not open the review", "not a git repository"], "send": "\x1b"},
+        {"expect": ["Code reviews"], "forbid": ["Could not open the review"], "send": "q"}]},
+    "review-home-new-workspace": {"fixture": "review", "model": True,
+        "args": ["review"], "steps": [
+        {"expect": ["Code reviews"], "send": "n"},
+        {"expect": ["What do you want to review?", "Working tree"], "send": "\r"},
+        {"expect": ["Which changes?", "Staged changes"], "send": "\x1b[B"},
+        {"expect": ["> Staged changes"], "send": "\r"},
+        # Typing edits the title while the action list keeps its selection.
+        {"expect": ["> Create review", "Sources (1)"], "send": "_PTY"},
+        {"expect": ["Staged changes_PTY", "> Create review"], "send": "\r"},
+        {"expect": ["Staged changes_PTY", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["Code reviews", "Create review"], "send": "q"},
+        {"expect": ["Code reviews", "In progress", "Staged changes_PTY"], "send": "q"}],
         "restart_steps": [
-        {"expect": ["Bcode Reviews", "active   Staged changes", "sources: 1/1 included"],
-         "mouse": {"row_text": "active   Staged changes", "column": 12}},
-        {"expect": ["bcode review", "CONTINUOUS_REVIEW_FILE"],
-         "forbid": ["Bcode Reviews"], "send": "\x04"}]},
-    "review-click-unstaged": {"fixture": "review", "model": True,
+        {"expect": ["Code reviews", "Staged changes_PTY"],
+         "mouse": {"row_text": "0/4", "column": 6}},
+        {"expect": ["Staged changes_PTY", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["Code reviews"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
+    "review-ask-open-session": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews", "Unstaged changes"],
-         "mouse": {"row_text": "Unstaged changes", "column": 10}},
-        {"expect": ["bcode review", "REVIEW_UNSTAGED_CONTENT"],
-         "forbid": ["Bcode Reviews", "CONTINUOUS_REVIEW_FILE"], "send": "\x04"}]},
+        {"expect": ["Code reviews", "Uncommitted changes"], "send": "1"},
+        {"expect": ["Working tree and index", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["Code reviews"], "send": "jj"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": "a"},
+        {"expect": ["Ask Bcode about continuous-review-fixture.txt:1"],
+         "send": "CONTINUOUS_REVIEW_QUESTION\r"},
+        # The linked session opens in Bcode, which takes over the terminal.
+        {"expect": ["You are helping with a local code review", "CONTINUOUS_REVIEW_ANSWER"],
+         "handoff": True, "timeout": 60, "hold": 1, "send": "\x04"},
+        {"expect": ["Bcode answered", "CONTINUOUS_REVIEW_QUESTION", "CONTINUOUS_REVIEW_ANSWER",
+                    "Open session"], "handoff": True, "send": "jo"},
+        {"expect": ["You are helping with a local code review", "CONTINUOUS_REVIEW_ANSWER"],
+         "handoff": True, "hold": 1, "send": "\x04"},
+        {"expect": ["returned from linked Bcode session", "CONTINUOUS_REVIEW_ANSWER"],
+         "handoff": True, "send": "q"},
+        # Leaving an unsaved review with notes asks for a second exit.
+        {"expect": ["this review is not saved"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
+    "review-click-save-resume": {"fixture": "review", "model": True,
+        "args": ["review"], "steps": [
+        {"expect": ["Code reviews", "Uncommitted changes"],
+         "mouse": {"row_text": "Uncommitted changes  1 file", "column": 8}},
+        {"expect": ["Working tree and index", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["Code reviews"], "send": "\x13"},
+        {"expect": ["Working tree and index", "Review saved"], "send": "q"},
+        {"expect": ["Code reviews", "In progress"], "send": "q"}],
+        "restart_steps": [
+        {"expect": ["Code reviews", "In progress", "Uncommitted changes  "],
+         "mouse": {"row_text": "0/4", "column": 6}},
+        {"expect": ["Working tree and index", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["Code reviews"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
+    "review-wizard-unstaged": {"fixture": "review", "model": True,
+        "args": ["review"], "steps": [
+        {"expect": ["Code reviews"], "send": "n"},
+        {"expect": ["What do you want to review?", "Working tree"], "send": "\r"},
+        {"expect": ["Which changes?", "> Unstaged changes  1 file"], "send": "\r"},
+        {"expect": ["> Create review", "Sources (1)"], "send": "\r"},
+        {"expect": ["REVIEW_UNSTAGED_CONTENT"],
+         "forbid": ["Code reviews", "CONTINUOUS_REVIEW_FILE"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
     "review-tree-scroll-resize": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "s"},
-        {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": ""},
-        {"expect": ["nested"], "mouse": {"row_text": "nested", "column": 10}},
-        {"expect": ["alpha", "beta", "日本語"],
-         "mouse": {"row_text": "nested", "column": 10}},
-        {"expect": ["nested"], "forbid": ["alpha", "beta", "日本語"],
-         "send": "\x1b[C"},
-        {"expect": ["alpha", "beta", "日本語"],
-         "mouse": {"row_text": "alpha", "column": 12}},
-        # Source/status prefixes may clip the leaf label in the narrow tree.
-        # Keep expansion coverage above, but resolve the file through its picker.
-        {"expect": ["alpha", "beta", "日本語"], "send": "f"},
-        {"expect": ["Open file"], "send": "scroll-target\r"},
+        {"expect": ["Code reviews"], "send": "1"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE", "▾ alpha/", "▾ beta/", "▾ 日本語/"],
+         "mouse": {"row_text": "▾ nested/", "column": 4}},
+        {"expect": ["▸ nested/"], "forbid": ["▾ alpha/", "▾ beta/", "▾ 日本語/"],
+         "mouse": {"row_text": "▸ nested/", "column": 4}},
+        {"expect": ["▾ alpha/", "▾ beta/", "▾ 日本語/"], "send": "f"},
+        {"expect": ["Files"], "send": "scroll-target"},
+        {"expect": ["Files 1/4"], "send": "\r"},
+        {"expect": ["REVIEW_SCROLL_LINE_001"], "send": "\x1b"},
         {"expect": ["REVIEW_SCROLL_LINE_001"], "resize": [100, 24]},
         {"expect": ["REVIEW_SCROLL_LINE_001"],
          "mouse": {"kind": "wheel_down", "column": 75, "row": 12, "count": 6}},
         {"expect": ["REVIEW_SCROLL_LINE_"], "forbid": ["REVIEW_SCROLL_LINE_001"],
          "screen_change": "some", "send": "G"},
-        {"expect": ["REVIEW_SCROLL_LINE_160"], "send": "g"},
-        {"expect": ["REVIEW_SCROLL_LINE_001"],
-         "mouse": {"kind": "wheel_down", "column": 10, "row": 10, "count": 2}},
-        # A wheel over the tree must not scroll the diff pane.
-        {"expect": ["REVIEW_SCROLL_LINE_001"], "send": "f"},
-        {"expect": ["Open file"], "send": "日本語\r"},
-        {"expect": ["REVIEW_UNICODE_CONTENT", "café", "日本語", "🦀"],
-         "resize": [48, 16]},
-        {"expect": ["bcode review"], "resize": [120, 32]},
-        {"expect": ["REVIEW_UNICODE_CONTENT", "café", "🦀"], "send": "\x04"}]},
+        {"expect": ["REVIEW_UNICODE_CONTENT"], "send": "g"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"],
+         "mouse": {"kind": "wheel_down", "column": 8, "row": 10, "count": 2}},
+        # A wheel over the file tree does not scroll the review.
+        {"expect": ["CONTINUOUS_REVIEW_FILE", "REVIEW_SCROLL_LINE_001"], "resize": [48, 16]},
+        {"expect": ["Uncommitted changes"], "resize": [120, 32]},
+        {"expect": ["Uncommitted changes", "CONTINUOUS_REVIEW_FILE"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
     "review-range-edit-thread": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "s"},
+        {"expect": ["Code reviews"], "send": "1"},
         {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": "f"},
-        {"expect": ["Open file"], "send": "scroll-target\r"},
+        {"expect": ["Files"], "send": "scroll-target"},
+        {"expect": ["Files 1/4"], "send": "\r"},
+        {"expect": ["REVIEW_SCROLL_LINE_001"], "send": "\x1b"},
         {"expect": ["REVIEW_SCROLL_LINE_001", "REVIEW_SCROLL_LINE_003"],
          "mouse": {"kind": "drag", "row_text": "REVIEW_SCROLL_LINE_001",
-                   "end_text": "REVIEW_SCROLL_LINE_003", "column": 65}},
-        {"expect": ["(3 lines) selected"], "send": "c"},
-        {"expect": ["Review composer", "save draft"], "send": "PTY_RANGE_DRAFT\r"},
-        {"expect": ["PTY_RANGE_DRAFT", "saved draft comment"], "hold": 1, "send": "e"},
-        {"expect": ["Edit draft comment", "PTY_RANGE_DRAFT"], "send": "\x05_EDITED\r"},
-        {"expect": ["PTY_RANGE_DRAFT_EDITED", "updated draft comment"], "send": "c"},
-        {"expect": ["Reply to review thread"], "send": "PTY_THREAD_REPLY\r"},
-        {"expect": ["PTY_THREAD_REPLY", "PTY_RANGE_DRAFT_EDITED"], "send": "ur"},
-        {"expect": ["resolved review thread"], "send": "ur"},
-        {"expect": ["reopened review thread"], "hold": 1, "send": "\x04"}],
+                   "end_text": "REVIEW_SCROLL_LINE_003", "column": 60}},
+        # Dragging across lines opens a comment on the range.
+        {"expect": ["Comment on nested/alpha/scroll-target.txt:1-3"], "send": "PTY_RANGE_DRAFT\r"},
+        {"expect": ["PTY_RANGE_DRAFT", "1 draft", "draft saved"], "hold": 1, "send": ")i"},
+        {"expect": ["Edit comment", "PTY_RANGE_DRAFT"], "send": "\x05_EDITED\r"},
+        {"expect": ["PTY_RANGE_DRAFT_EDITED", "comment updated"], "hold": 1, "send": "\x13"},
+        {"expect": ["PTY_RANGE_DRAFT_EDITED", "Review saved"], "send": "q"},
+        {"expect": ["Code reviews", "In progress"], "send": "q"}],
         "restart_steps": [
-        {"expect": ["Bcode Reviews", "drafts   Staged changes", "2 draft(s)"],
-         "mouse": {"row_text": "drafts   Staged changes", "column": 12}},
-        {"expect": ["bcode review"], "forbid": ["Bcode Reviews"], "send": "f"},
-        {"expect": ["Open file"], "send": "scroll-target\r"},
-        {"expect": ["PTY_RANGE_DRAFT_EDITED", "PTY_THREAD_REPLY"], "send": "\x04"}]},
+        {"expect": ["Code reviews", "In progress"],
+         "mouse": {"row_text": "0/4", "column": 6}},
+        {"expect": ["Uncommitted changes", "1 draft"], "forbid": ["Code reviews"], "send": "f"},
+        {"expect": ["Files"], "send": "scroll-target"},
+        {"expect": ["Files 1/4"], "send": "\r"},
+        {"expect": ["PTY_RANGE_DRAFT_EDITED"], "send": "\x1b"},
+        {"expect": ["PTY_RANGE_DRAFT_EDITED"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
     "review-pointer-no-rewrite": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
-        {"expect": ["Bcode Reviews"], "send": "s"},
+        {"expect": ["Code reviews"], "send": "1"},
+        # The first move shows the hovered line's comment affordance; moves within the
+        # same line change nothing and repaint nothing.
         {"expect": ["CONTINUOUS_REVIEW_FILE"], "hold": 1,
          "mouse": {"kind": "move", "column": 80, "row": 12}},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"], "hold": 1,
+         "mouse": {"kind": "move", "column": 81, "row": 12}},
         {"expect": ["CONTINUOUS_REVIEW_FILE"], "screen_change": "none",
          "no_rewrite": True, "hold": 1,
-         "mouse": {"kind": "move", "column": 81, "row": 13}},
+         "mouse": {"kind": "move", "column": 82, "row": 12}},
         {"expect": ["CONTINUOUS_REVIEW_FILE"], "screen_change": "none",
-         "no_rewrite": True, "hold": 1, "send": "\x04"}]},
+         "no_rewrite": True, "hold": 1, "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
 })
 
 
@@ -285,6 +310,9 @@ class Interval:
         self.leaves = 0
         self.active = False
         self.end = 0
+        # Set while a handoff step waits; entries made then are handoffs.
+        self.handoff = False
+        self.handoff_enters = 0
 
     def scan(self, capture):
         # Revisit an unfinished escape sequence, never recount a complete one.
@@ -294,9 +322,11 @@ class Interval:
                 continue
             if match[2] == b"h":
                 self.enters += 1
-                self.active = True
                 if self.enters != 1:
-                    raise AssertionError("alternate screen re-entered during journey")
+                    if not self.handoff or self.active:
+                        raise AssertionError("alternate screen re-entered during journey")
+                    self.handoff_enters += 1
+                self.active = True
             else:
                 self.leaves += 1
                 if not self.active:
@@ -304,8 +334,9 @@ class Interval:
                 self.active = False
 
     def finished(self):
-        if (self.enters, self.leaves, self.active) != (1, 1, False):
-            raise AssertionError(f"expected one screen interval, got {self.enters}/{self.leaves}")
+        expected = 1 + self.handoff_enters
+        if (self.enters, self.leaves, self.active) != (expected, expected, False):
+            raise AssertionError(f"expected {expected} screen interval(s), got {self.enters}/{self.leaves}")
 
 
 def mouse_bytes(mouse, grid, columns, rows):
@@ -438,8 +469,9 @@ def run_pty(command, env, work, steps, probe, timeout, exit_code=0, daemon=None,
             matched = False
             hold_until = None
             while time.monotonic() < end:
+                interval.handoff = bool(step.get("handoff"))
                 pump(master, capture, interval)
-                if interval.leaves:
+                if interval.leaves and not interval.active and not interval.handoff:
                     raise AssertionError(f"screen left before step {index + 1} completed")
                 if interval.active:
                     if not raw(slave):
@@ -590,6 +622,9 @@ idle_shutdown = false
         # Debug nested IPC needs headroom; keep the production search budget bounded.
         text += '[file_references]\ntimeout_ms = 1000\n'
         (work / "completion-target.txt").write_text("offline path completion fixture\n")
+    if fixture == "review":
+        # Questions about the code run in real Bcode sessions.
+        text = text.replace('"bcode.code_review"', '"bcode.code_review", "bcode.harness"')
     if fixture == "blims":
         text = text.replace('"bcode.code_review"', '"bcode.code_review", "bcode.blims"')
         text += '[client]\nrequest_timeout_secs = 2\n'
@@ -687,7 +722,7 @@ def plan_checked(plan):
     if not isinstance(steps, list) or not isinstance(restart, list) or not steps or len(steps) + len(restart) > 32:
         raise ValueError("plan requires 1..32 total steps")
     for step in steps + restart:
-        if not isinstance(step, dict) or set(step) - {"expect", "forbid", "reject", "send", "resize", "timeout", "hold", "daemon_signal", "mouse", "screen_change", "no_rewrite"}:
+        if not isinstance(step, dict) or set(step) - {"expect", "forbid", "reject", "send", "resize", "timeout", "hold", "daemon_signal", "mouse", "screen_change", "no_rewrite", "handoff"}:
             raise ValueError("unknown step fields")
         for field in ("expect", "forbid", "reject"):
             values = step.get(field, [])
@@ -707,6 +742,8 @@ def plan_checked(plan):
             raise ValueError("screen_change must be none or some")
         if "no_rewrite" in step and not isinstance(step["no_rewrite"], bool):
             raise ValueError("no_rewrite must be boolean")
+        if "handoff" in step and not isinstance(step["handoff"], bool):
+            raise ValueError("handoff must be boolean")
         if "mouse" in step:
             mouse = step["mouse"]
             if not isinstance(mouse, dict) or set(mouse) - {"kind", "column", "row", "row_text", "end_text", "count"}:
@@ -751,6 +788,20 @@ def self_test():
         pass
     else:
         raise AssertionError("self-test failed to reject terminal reentry")
+    handoff = Interval()
+    handoff.scan(b"\x1b[?1049h")
+    handoff.handoff = True
+    handoff.scan(b"\x1b[?1049h\x1b[?1049l\x1b[?1049h\x1b[?1049l\x1b[?1049h")
+    handoff.handoff = False
+    handoff.scan(b"\x1b[?1049h\x1b[?1049l\x1b[?1049h\x1b[?1049l\x1b[?1049h\x1b[?1049l")
+    handoff.finished()
+    try:
+        handoff.scan(b"\x1b[?1049h\x1b[?1049l\x1b[?1049h\x1b[?1049l\x1b[?1049h\x1b[?1049l"
+                     b"\x1b[?1049h")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("self-test accepted reentry outside a handoff")
     for plan in CASES.values():
         plan_checked(plan)
     # A workspace title also appears in its preset and details. Include row

@@ -1,18 +1,19 @@
 # Code Review Plugin Extension Points
 
-Code Review is product behavior owned by `plugins/code-review-plugin`. GitHub review integration is provider behavior owned by `plugins/github-review-publisher-plugin`. Host and runtime crates provide only generic routing, TUI, session, and service mechanisms.
+Code Review is product behavior owned by its own crates: the data layer `packages/code-review` (`bcode_code_review`), the app `packages/code-review-ui` (`bcode_code_review_ui`, with the standalone `bcode-review` binary), and the plugin `plugins/code-review-plugin`. GitHub review integration is provider behavior owned by `plugins/github-review-publisher-plugin`. Host and runtime crates provide only generic routing, CLI registration, session, and service mechanisms; they contain no review screens, launchers, or types. See [`code-review-app.md`](code-review-app.md) for the app itself.
 
 ## Stable generic capabilities used
 
-Code Review consumes these generic plugin-host capabilities:
+The review consumes these generic capabilities:
 
-* Manifest-declared native plugin services with versioned interface IDs and typed JSON payloads.
-* Manifest-declared native TUI surfaces registered through `PluginTuiRegistry`. Code Review declares one surface, `code-review`, with internal routes (home, the new-review wizard, and the review). `bcode review` asks the host to open it through the generic standalone-surface launcher (`packages/tui/src/plugin_surface_launcher.rs`), which loads the plugin runtime once and runs whichever loaded plugin declares the requested surface kind. The host has no Code Review-specific launcher, routing, or types.
-* Manifest-declared keymap actions. Code Review's scopes are `code-review` (the review), `code-review-home`, `code-review-wizard`, `code-review-files`, `code-review-threads`, and `code-review-composer`; user keymap configuration overrides them by scope like any other contributor.
-* Renderer-neutral keyboard, mouse, clipboard, redraw, and surface-exit actions from the plugin SDK TUI host.
-* Generic semantic linked-session observation through complete bounded `SessionViewSnapshot` updates; the TUI host owns attachment, `SessionView` projection, reconnect, and authoritative resynchronization, while plugin surfaces never receive raw session events.
-* Typed `PluginTuiAction::OpenSession` suspension: the host retains the plugin surface in memory, runs the ordinary native session viewer with the caller-owned input stream, and redraws the same surface after the viewer exits.
+* Manifest-declared native plugin services with versioned interface IDs and typed JSON payloads. The plugin serves `bcode.code_review/v1` as thin adapters over `bcode_code_review`, so agents and other plugins reach the same records the app writes.
+* Static CLI registration. When statically bundled, the plugin registers `bcode review`, which runs the `bcode_code_review_ui` app in the same process (the same way the git plugin registers `bcode git`). Only `publish-github` asks the host to start the daemon before it runs.
+* Manifest-declared keymap actions. The review's scopes are `code-review` (the review), `code-review-home`, `code-review-wizard`, `code-review-files`, `code-review-threads`, and `code-review-composer`; user keymap configuration overrides them by scope like any other contributor. The plugin manifest is the one declaration: the app reads it at build time and the plugin registers it with bcode's keymap catalog.
+* Generic daemon client operations: creating sessions, sending messages, and following a session's live view through `bcode_session_view::follow::follow_session_view`, which owns attachment, bounded `SessionView` projection, reconnect, and resynchronization. The review receives complete `SessionViewSnapshot` updates, never raw session events.
 * Generic plugin service discovery and invocation for publisher, importer, and review-source providers.
+* Theme discovery and component styles from `bcode_tui_theme`, shared with the chat TUI and `bcode-git`.
+
+The app reaches all of these through its `ReviewHost` trait, so a host that embeds the review elsewhere (for example in the chat TUI) is another implementation of that trait.
 
 The Code Review domain contracts are provider-neutral and live in `packages/code-review/models`:
 
@@ -25,31 +26,13 @@ Pull-request targets are provider-neutral. A publisher manifest may name the rev
 
 Provider-specific repository, pull-request, authentication, API, and anchor behavior must stay in the provider plugin. New host capabilities are appropriate only when the SDK cannot express a required mechanism generically; product-specific behavior must not be added to host/runtime crates.
 
-## Plugin semantic session observation
+## Linked sessions
 
-Native plugin surfaces that need a bounded embedded view call
-`PluginTuiHost::subscribe_session_view`. The request identifies a session, a hard-bounded
-`ProjectionWindowRequest`, and renderer-local reasoning policy. The TUI host attaches through the
-normal bounded projection path, hydrates a `SessionView`, and emits complete
-`SessionViewSnapshot` values. It applies durable, live, and runtime-work events only at the shared
-`SessionView` boundary.
-
-A reconnect or daemon resynchronization request replaces the observer with a newly attached
-bounded view before updates resume. The host may expose `Reconnecting` or `Resyncing` connection
-state in snapshots, but plugin consumers always replace state by session ID; they do not merge raw
-events or retain transcript authority. Multiple plugin-domain anchors may share one host
-subscription and one current snapshot.
-
-The SDK deliberately does not expose raw session event subscriptions to plugin surfaces. This
-keeps transcript semantics frontend-independent and prevents plugins from recreating event-log
-reducers. Full native session interaction remains owned by the ordinary session frontend.
-
-`PluginTuiAction::OpenSession` provides generic nested navigation without transferring session
-behavior to a plugin. The host suspends and retains the requesting surface, runs the ordinary
-native session viewer with the existing terminal input stream, then redraws the same surface after
-the viewer exits. Immediate review return state therefore remains plugin-owned in memory; the host
-receives only the typed session ID. Attach failure returns an error through the ordinary viewer path
-without converting the session into plugin state.
+Questions about the code run in ordinary Bcode sessions. The review creates the session, sends
+the question, and follows the session's bounded live view to show its progress and answer.
+Opening a linked session hands the terminal to `bcode tui <session>` and resumes the review where
+it was when that exits, so full session interaction stays with the ordinary session frontend and
+the review keeps only its own state.
 
 Reviewer AI exchanges persist only review-domain identity, anchor, question, linked session ID, and
 lifecycle metadata. Session transcript and runtime state remain session-owned.
@@ -59,10 +42,9 @@ Workspaces also persist a versioned Code Review-owned semantic presentation stat
 expansions, per-layer positions, collapsed threads, expanded answers, and the resolved-thread and
 viewed-file filters. Raw terminal rows, focus internals, transcript, permissions, interactions,
 tools, and runtime state are excluded. The state is disposable: an unreadable or newer value is
-dropped, and stale keys resolve best-effort. Exact native-session return remains in-memory through
-retained surface suspension. The first review interface's presentation column
-(`presentation_state_json`) stays in the schema but is no longer read or written; workspaces it
-wrote open with their sources, viewed files, drafts, AI exchanges, suggestions, and publish
+dropped, and stale keys resolve best-effort. The older presentation column
+(`presentation_state_json`) stays in the schema but is not read or written; workspaces that only
+have it open with their sources, viewed files, drafts, AI exchanges, suggestions, and publish
 records.
 
 ## Disableability
@@ -72,7 +54,7 @@ The bundled Code Review and GitHub provider plugins are enabled by the aggregate
 * `static-bundled-code-review-plugin`
 * `static-bundled-github-review-publisher-plugin`
 
-Both dependencies are optional. Their static plugin registration and Code Review TUI registry entries are feature-gated. A build can omit either or both features; without them, no Code Review product behavior is registered and the rest of Bcode remains usable.
+Both dependencies are optional. Their static plugin registration, the `bcode review` subcommand, and the review keymap registration are feature-gated. A build can omit either or both features; without them, no Code Review product behavior is registered and the rest of Bcode remains usable. The standalone `bcode-review` binary does not depend on either feature.
 
 Dynamic builds use the same plugin manifests and versioned interfaces. Disabling or removing the provider leaves local Code Review and built-in local publishers usable. Disabling Code Review leaves the GitHub provider undiscovered because no consumer requests its review interfaces, without changing host behavior.
 
