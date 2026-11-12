@@ -99,6 +99,7 @@ static-bundled = [
     "native",
     "presentation",
     "bcode_tui_components/terminal-viewer",
+    "bmux_tui_components/terminal-view",
     "embedded-languages",
     "dep:bcode_tui_components",
     "dep:bmux_keyboard",
