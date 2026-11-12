@@ -2168,13 +2168,19 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
   (`RowContext::annotation_stamp`), so an update or a spinner frame rebuilds only that session's
   cards. Spinners advance from the poll (`AgentStreams::tick`), which asks the host for the next
   frame with `ReviewHost::request_redraw_after`.
+* **Follow lifecycle.** A session is followed while some card links it; deleting the last
+  question of a session drops its subscription and what was observed of it. When following stops
+  (the daemon goes away, the stream closes), the card keeps the last observed feed and answer,
+  adds the reason as an error, drops a pending permission prompt (it can no longer be answered
+  from the review) and offers Retry.
 * **Attention.** When a session gets a permission request, answers, or fails and none of its
   cards is in the visible range, a toast names the card's location; the existing scrollbar
   marks show where cards are.
 * **Verification.** Screen tests over the scripted host's session stream cover streaming,
   reasoning, tool lines and the output expander, tokens and cost, the permission prompt
   answered with keys, stop and a cancelled turn, a failed turn's error, the toast for an
-  off-screen card, and that asking never returns `Action::OpenSession`. The PTY case
+  off-screen card, a stopped stream keeping the answer, deleting a question ending its follow,
+  and that asking never returns `Action::OpenSession`. The PTY case
   `review-ask-live-feed` asks in a real `bcode review` with the fake provider, sees the answer in
   the card while the review keeps the terminal, then opens the session with `o` and returns.
   The 400×120 screen benchmark stays under 1.4 ms p95 paint.

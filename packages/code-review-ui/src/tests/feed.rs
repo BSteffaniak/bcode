@@ -365,3 +365,64 @@ fn an_off_screen_card_that_needs_the_reviewer_raises_a_toast() {
         setup.scenario.surface().toasts()
     );
 }
+
+#[test]
+fn a_stopped_stream_keeps_the_answer_and_drops_the_prompt() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 120, 60);
+    let (session, prompt) = ask(&mut setup, "Why rename it?");
+    let mut answered = snapshot(
+        vec![
+            user(&prompt),
+            assistant("Callers expect the new name.", false),
+        ],
+        false,
+    );
+    answered.permissions.push(permission("perm-1"));
+    send(&mut setup, &session, answered);
+    setup
+        .scenario
+        .host()
+        .session_view(&session)
+        .expect("subscribed")
+        .try_send(SessionViewFollowUpdate::Disconnected {
+            message: "daemon went away".to_owned(),
+        })
+        .expect("delivered");
+    let screen = stable(&mut setup.scenario);
+    let text = screen.text();
+    assert!(screen.contains("stream stopped"), "{text}");
+    assert!(screen.contains("Callers expect the new name."), "{text}");
+    assert!(screen.contains("⚠ daemon went away"), "{text}");
+    // The request can no longer be answered here, so its keys are the review's again.
+    assert!(!screen.contains("Allow y"), "{text}");
+    setup.scenario.key("y");
+    stable(&mut setup.scenario);
+    assert_eq!(
+        setup.scenario.host().permission_answers(),
+        Vec::<(String, bool, bool)>::new()
+    );
+}
+
+#[test]
+fn deleting_a_question_stops_following_its_session() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 120, 60);
+    let (session, prompt) = ask(&mut setup, "Is this needed?");
+    let screen = send(
+        &mut setup,
+        &session,
+        snapshot(vec![user(&prompt), assistant("No.", false)], false),
+    );
+    let follow = setup
+        .scenario
+        .host()
+        .session_view(&session)
+        .expect("subscribed");
+    assert!(!follow.is_closed());
+    let delete = screen.find("Delete").expect("delete button");
+    setup.scenario.click(delete.x, delete.y);
+    let screen = stable(&mut setup.scenario);
+    assert!(!screen.contains("Is this needed?"), "{}", screen.text());
+    assert!(follow.is_closed(), "the session is still followed");
+}

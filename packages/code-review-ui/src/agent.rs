@@ -462,6 +462,24 @@ impl AgentState {
         }
     }
 
+    /// Following the session stopped with `message`: what was last observed (`last`) stays
+    /// readable, nothing runs any more, and a pending permission request can no longer be
+    /// answered from the review.
+    fn stopped_following(last: Option<&Self>, message: String) -> Self {
+        let Some(last) = last else {
+            return Self::failed(message);
+        };
+        let mut feed = last.feed.clone();
+        feed.permission = None;
+        feed.push(FeedItem::Error(message.clone()));
+        Self {
+            answer: last.answer.clone(),
+            feed,
+            disconnected: true,
+            ..Self::failed_quietly(message)
+        }
+    }
+
     /// Failed with `message` as the status, without adding it to the feed.
     fn failed_quietly(message: String) -> Self {
         Self {
@@ -642,7 +660,8 @@ impl AgentStreams {
         host: &UiContext,
         sessions: impl IntoIterator<Item = &'a str>,
     ) -> bool {
-        let mut changed = false;
+        let sessions: BTreeSet<&str> = sessions.into_iter().collect();
+        let mut changed = self.forget_unlinked(&sessions);
         for session in sessions {
             if self.subscriptions.contains_key(session) || self.failed.contains(session) {
                 continue;
@@ -693,13 +712,18 @@ impl AgentStreams {
                     }
                     Ok(SessionViewFollowUpdate::Disconnected { message }) => {
                         stopped.push(session.clone());
-                        latest = Some(AgentState::failed(message));
+                        let last = latest.as_ref().or_else(|| self.states.get(session));
+                        latest = Some(AgentState::stopped_following(last, message));
                         break;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         stopped.push(session.clone());
-                        latest = Some(AgentState::failed("session stream disconnected".to_owned()));
+                        let last = latest.as_ref().or_else(|| self.states.get(session));
+                        latest = Some(AgentState::stopped_following(
+                            last,
+                            "session stream disconnected".to_owned(),
+                        ));
                         break;
                     }
                 }
@@ -798,6 +822,32 @@ impl AgentStreams {
             self.bump(&session);
         }
         next
+    }
+
+    /// Stop following sessions no card links any more (their questions were deleted), and drop
+    /// what was observed of them. Returns whether any was dropped.
+    fn forget_unlinked(&mut self, linked: &BTreeSet<&str>) -> bool {
+        let unlinked: Vec<String> = self
+            .states
+            .keys()
+            .chain(self.subscriptions.keys())
+            .chain(self.failed.iter())
+            .filter(|session| !linked.contains(session.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for session in &unlinked {
+            if let Some(permission) = self
+                .states
+                .get(session)
+                .and_then(|state| state.feed.permission.as_ref())
+            {
+                self.answering.remove(&permission.permission_id);
+            }
+            self.retry(session);
+        }
+        !unlinked.is_empty()
     }
 
     /// Forget a stopped observation so the next [`Self::ensure`] subscribes again (retry).
