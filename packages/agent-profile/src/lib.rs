@@ -184,6 +184,10 @@ pub struct AgentContextRequest {
     /// configuration that disables a tool still applies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claimed_tools: Vec<String>,
+    /// The claimed tools whose provider declared them mutating, a subset of `claimed_tools`.
+    /// Agents that must not change project state leave these hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claimed_mutating_tools: Vec<String>,
 }
 
 /// Response returned by [`OP_AGENT_CONTEXT`].

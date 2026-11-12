@@ -28815,8 +28815,12 @@ async fn agent_context_with_tools(
     let config = state.session_config(session_id).await;
     let mut available_tools = available_tools;
     let mut claimed_tools = Vec::new();
+    let mut claimed_mutating_tools = Vec::new();
     for tool in state.client_tools.offered_tools(session_id) {
         claimed_tools.push(tool.definition.name.clone());
+        if !tool.read_only {
+            claimed_mutating_tools.push(tool.definition.name.clone());
+        }
         if !available_tools
             .iter()
             .any(|available| available.name == tool.definition.name)
@@ -28841,6 +28845,7 @@ async fn agent_context_with_tools(
             .ok()
             .map(Box::new),
         claimed_tools,
+        claimed_mutating_tools,
     };
     let response = state
         .plugins
@@ -33426,12 +33431,14 @@ impl<'a> ServerToolInvoker<'a> {
         self
     }
 
-    /// Prepare a client-provided tool from its declared policy class. A provider that is no
-    /// longer connected yields a preparation that fails at invocation as unavailable, so the
-    /// call is still authorized and recorded like any other.
+    /// Prepare a client-provided tool from the policy class it declared when the tool was
+    /// offered to this turn; a re-registration during the turn never changes how its calls are
+    /// authorized. A provider that is no longer connected fails at invocation as unavailable,
+    /// so the call is still authorized and recorded like any other.
     async fn prepare_client_tool(
         &self,
-        provider_id: &str,
+        tool: &RegisteredTool,
+        read_only: bool,
         request: &ToolPreparationRequest,
         scope: &PreparationScope,
     ) -> Result<ToolPreparationResponse, RuntimeError> {
@@ -33439,23 +33446,13 @@ impl<'a> ServerToolInvoker<'a> {
             return Err(RuntimeError::Cancelled);
         }
         let tool_name = &request.invocation.tool_name;
-        let descriptor = self
-            .state
-            .client_tools
-            .descriptor(self.session_id, provider_id, tool_name)
-            .unwrap_or_else(|| bcode_tool::client_tool::ClientToolDescriptor {
-                name: tool_name.clone(),
-                description: String::new(),
-                input_schema: serde_json::json!({"type": "object"}),
-                policy: bcode_tool::client_tool::ClientToolPolicy::Mutating,
-                max_duration_ms: 1,
-            });
-        let preparation = client_tools::preparation(request, &descriptor).map_err(|message| {
-            RuntimeError::ToolPreparation {
-                tool_name: tool_name.clone(),
-                message,
-            }
-        })?;
+        let preparation =
+            client_tools::preparation(request, &tool.definition, read_only).map_err(|message| {
+                RuntimeError::ToolPreparation {
+                    tool_name: tool_name.clone(),
+                    message,
+                }
+            })?;
         if self.persist_requests {
             append_tool_request_event(
                 self.state,
@@ -33487,8 +33484,10 @@ impl ToolInvoker for ServerToolInvoker<'_> {
         scope: &'a PreparationScope,
     ) -> RuntimeFuture<'a, ToolPreparationResponse> {
         Box::pin(async move {
-            if let ToolSource::Client { provider_id } = &tool.source {
-                return self.prepare_client_tool(provider_id, request, scope).await;
+            if let ToolSource::Client { read_only, .. } = &tool.source {
+                return self
+                    .prepare_client_tool(tool, *read_only, request, scope)
+                    .await;
             }
             let ToolSource::Plugin { plugin_id } = &tool.source else {
                 return Err(RuntimeError::ToolPreparation {
@@ -33565,8 +33564,13 @@ async fn invoke_server_registered_tool(
     invocation: &PreparedToolInvocation,
     scope: &InvocationScope,
 ) -> Result<ToolInvocationResponse, RuntimeError> {
-    if let ToolSource::Client { provider_id } = &tool.source {
-        return invoke_client_tool(invoker, provider_id, invocation, scope).await;
+    if let ToolSource::Client {
+        provider_id,
+        deadline_ms,
+        ..
+    } = &tool.source
+    {
+        return invoke_client_tool(invoker, provider_id, *deadline_ms, invocation, scope).await;
     }
     let ToolSource::Plugin { plugin_id } = &tool.source else {
         return Err(RuntimeError::ToolExecution {
@@ -33667,6 +33671,7 @@ async fn invoke_server_registered_tool(
 async fn invoke_client_tool(
     invoker: &ServerToolInvoker<'_>,
     provider_id: &str,
+    deadline_ms: u32,
     invocation: &PreparedToolInvocation,
     scope: &InvocationScope,
 ) -> Result<ToolInvocationResponse, RuntimeError> {
@@ -33709,11 +33714,6 @@ async fn invoke_client_tool(
             })?;
         publish_session_event(invoker.state, &started).await;
     }
-    let deadline_ms = invoker
-        .state
-        .client_tools
-        .descriptor(invoker.session_id, provider_id, &call.name)
-        .map_or(1, |descriptor| descriptor.max_duration_ms);
     let delivery = bcode_tool::client_tool::ClientToolInvocation {
         invocation_id: uuid::Uuid::new_v4().to_string(),
         session_id: invoker.session_id.to_string(),

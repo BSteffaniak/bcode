@@ -267,7 +267,10 @@ impl ClientToolProvider {
 /// connection's running calls and drops its registrations and claims.
 #[derive(Debug)]
 pub struct ClientToolRequests {
-    receiver: tokio::sync::mpsc::Receiver<ClientToolRequest>,
+    // Unbounded so the reader never stops routing responses while the application is busy:
+    // a handler awaiting its own answer's response must not wait for queued requests to drain.
+    // The daemon bounds what arrives by the calls it has in flight for this connection.
+    receiver: tokio::sync::mpsc::UnboundedReceiver<ClientToolRequest>,
 }
 
 impl ClientToolRequests {
@@ -325,7 +328,7 @@ impl ClientToolProvider {
             ..
         } = self.connection;
         let (read, write) = tokio::io::split(stream);
-        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let pending = PendingResponses::default();
         let routes = pending.clone();
         let reader = tokio::spawn(read_provider_frames(read, pending_events, sender, routes));
@@ -350,12 +353,12 @@ impl ClientToolProvider {
 async fn read_provider_frames(
     mut read: tokio::io::ReadHalf<bcode_ipc::LocalIpcStream>,
     pending_events: std::collections::VecDeque<Event>,
-    sender: tokio::sync::mpsc::Sender<ClientToolRequest>,
+    sender: tokio::sync::mpsc::UnboundedSender<ClientToolRequest>,
     routes: PendingResponses,
 ) {
     for event in pending_events {
         if let Some(request) = provider_request(event)
-            && sender.send(request).await.is_err()
+            && sender.send(request).is_err()
         {
             return;
         }
@@ -365,7 +368,7 @@ async fn read_provider_frames(
             bcode_ipc::EnvelopeKind::Event => {
                 if let Ok(event) = bcode_ipc::decode_event(&envelope.payload)
                     && let Some(request) = provider_request(event)
-                    && sender.send(request).await.is_err()
+                    && sender.send(request).is_err()
                 {
                     return;
                 }

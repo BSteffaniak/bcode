@@ -191,7 +191,18 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
     .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
     apply_tool_selection(&mut agent, &tools_config, &request.available_tools);
-    expose_claimed_tools(&mut agent, &tools_config, &request.claimed_tools);
+    let claimed = request
+        .claimed_tools
+        .iter()
+        .filter(|tool| {
+            claim_exposes(
+                &request.agent_id,
+                request.claimed_mutating_tools.contains(tool),
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    expose_claimed_tools(&mut agent, &tools_config, &claimed);
     let enabled_tools =
         enabled_tools_from_available_metadata(active_tools_for(&agent), &request.available_tools);
     let mut system_prompt_suffix = match request.agent_id.as_str() {
@@ -273,6 +284,13 @@ fn apply_tool_selection(
     }
 }
 
+/// Whether a claim exposes a tool to `agent_id`. The plan agent does not change project state,
+/// so it is never shown a claimed tool its provider declared mutating; the tool stays denied
+/// there like any mutating tool the plan agent does not enable.
+fn claim_exposes(agent_id: &str, mutating: bool) -> bool {
+    !(mutating && agent_id == PLAN_AGENT)
+}
+
 /// Expose tools that a connected application offers in the session through a claim.
 ///
 /// The claim is an exposure choice, like the default build tools: it never grants permission,
@@ -320,7 +338,12 @@ fn evaluate_tool_request(
     .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
     apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
-    if request.claimed {
+    if request.claimed
+        && claim_exposes(
+            &request.agent_id,
+            request.operation == bcode_agent_profile::ToolPolicyOperation::Mutating,
+        )
+    {
         expose_claimed_tools(
             &mut agent,
             &tools_config,
@@ -1164,6 +1187,30 @@ command = { "python3 *" = "allow" }
             evaluate_profile_tool_call(&unclaimed, &request, cwd).decision,
             AgentDecision::Deny
         );
+        let plan_request = EvaluateToolCallRequest {
+            agent_id: PLAN_AGENT.to_owned(),
+            effective_config_toml: Some(Box::new(String::new())),
+            ..request
+        };
+        assert_eq!(
+            evaluate_tool_request(&plan_request)
+                .expect("plan evaluation")
+                .decision,
+            AgentDecision::Deny,
+            "the plan agent never runs a claimed mutating tool"
+        );
+        let plan_read = EvaluateToolCallRequest {
+            operation: bcode_agent_profile::ToolPolicyOperation::ReadOnly,
+            requires_permission: false,
+            ..plan_request
+        };
+        assert_eq!(
+            evaluate_tool_request(&plan_read)
+                .expect("plan evaluation")
+                .decision,
+            AgentDecision::Allow,
+            "a claimed read-only tool runs under the plan agent"
+        );
         for hidden in [
             bcode_config::ToolsConfig {
                 disabled: BTreeSet::from(["app.write".to_string()]),
@@ -1202,6 +1249,7 @@ command = { "python3 *" = "allow" }
         let context_tools = |agent: &str, config: &str, names: &[&str]| {
             let request = AgentContextRequest {
                 claimed_tools: Vec::new(),
+                claimed_mutating_tools: Vec::new(),
                 session_id: SessionId::new(),
                 agent_id: agent.to_owned(),
                 available_tools: names
@@ -1265,6 +1313,7 @@ command = { "python3 *" = "allow" }
         let context = |agent: &str, names: &[&str]| {
             let request = AgentContextRequest {
                 claimed_tools: Vec::new(),
+                claimed_mutating_tools: Vec::new(),
                 session_id: SessionId::new(),
                 agent_id: agent.to_owned(),
                 available_tools: names

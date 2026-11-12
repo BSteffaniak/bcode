@@ -36,6 +36,8 @@ pub struct OfferedClientTool {
     pub definition: bcode_tool::ToolDefinition,
     /// Whether every invocation is read-only.
     pub read_only: bool,
+    /// Deadline the provider declared, in milliseconds.
+    pub deadline_ms: u32,
 }
 
 #[derive(Debug)]
@@ -55,7 +57,9 @@ struct PendingInvocation {
 #[derive(Debug, Default)]
 struct Registry {
     providers: BTreeMap<ClientId, ProviderConnection>,
-    claims: BTreeMap<SessionId, ClientId>,
+    /// Claimant connection per session and provider id. Providers claim a session
+    /// independently; the newest connection of one provider replaces the previous one.
+    claims: BTreeMap<(SessionId, String), ClientId>,
     pending: BTreeMap<String, PendingInvocation>,
     /// Finished invocations and the result that finished them, if any.
     finished: BTreeMap<String, Option<ClientToolOutcome>>,
@@ -86,11 +90,14 @@ pub enum InvocationEnd {
     Answered(ClientToolOutcome),
     /// No live claimant offers the tool in the session.
     Unavailable(String),
-    /// The claimant's connection closed before it answered; effects are unknown.
+    /// The claimant's connection closed before the call was delivered; nothing ran.
+    NotDelivered(String),
+    /// The claimant's connection closed after delivery and before it answered; effects are
+    /// unknown.
     Disconnected(String),
-    /// The declared deadline passed.
+    /// The declared deadline passed after delivery; effects are unknown.
     TimedOut(String),
-    /// The turn was cancelled.
+    /// The turn was cancelled after delivery; effects are unknown.
     Cancelled,
 }
 
@@ -245,10 +252,14 @@ impl ClientToolRegistry {
         session_id: SessionId,
     ) -> Result<Option<ClientEventSink>, String> {
         let mut registry = self.lock();
-        if !registry.providers.contains_key(&client_id) {
+        let Some(provider_id) = registry
+            .providers
+            .get(&client_id)
+            .map(|provider| provider.provider_id.clone())
+        else {
             return Err("register client tools before claiming a session".to_owned());
-        }
-        let previous = registry.claims.insert(session_id, client_id);
+        };
+        let previous = registry.claims.insert((session_id, provider_id), client_id);
         let lost = previous
             .filter(|previous| *previous != client_id)
             .and_then(|previous| registry.providers.get(&previous))
@@ -279,8 +290,16 @@ impl ClientToolRegistry {
     /// Stop routing the session's client tools to this connection.
     pub fn release(&self, client_id: ClientId, session_id: SessionId) -> bool {
         let mut registry = self.lock();
-        if registry.claims.get(&session_id) == Some(&client_id) {
-            registry.claims.remove(&session_id);
+        let Some(provider_id) = registry
+            .providers
+            .get(&client_id)
+            .map(|provider| provider.provider_id.clone())
+        else {
+            return false;
+        };
+        let key = (session_id, provider_id);
+        if registry.claims.get(&key) == Some(&client_id) {
+            registry.claims.remove(&key);
             true
         } else {
             false
@@ -307,47 +326,32 @@ impl ClientToolRegistry {
         }
     }
 
-    /// Tools the session's live claimant offers, for pinning in a new turn's catalog.
+    /// Tools the session's live claimants offer, for pinning in a new turn's catalog.
+    ///
+    /// Every provider that claimed the session contributes its tools; tool names are
+    /// namespaced by provider, so they never overlap.
     pub fn offered_tools(&self, session_id: SessionId) -> Vec<OfferedClientTool> {
         let registry = self.lock();
-        let Some(provider) = registry
+        let offered = registry
             .claims
-            .get(&session_id)
-            .and_then(|client_id| registry.providers.get(client_id))
-        else {
-            return Vec::new();
-        };
-        let offered = provider
-            .tools
-            .values()
-            .map(|tool| OfferedClientTool {
-                provider_id: provider.provider_id.clone(),
-                definition: bcode_tool::ToolDefinition {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    input_schema: tool.input_schema.clone(),
-                },
-                read_only: tool.policy == ClientToolPolicy::ReadOnly,
+            .iter()
+            .filter(|((claimed, _), _)| *claimed == session_id)
+            .filter_map(|(_, client_id)| registry.providers.get(client_id))
+            .flat_map(|provider| {
+                provider.tools.values().map(|tool| OfferedClientTool {
+                    provider_id: provider.provider_id.clone(),
+                    definition: bcode_tool::ToolDefinition {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.clone(),
+                    },
+                    read_only: tool.policy == ClientToolPolicy::ReadOnly,
+                    deadline_ms: tool.max_duration_ms,
+                })
             })
             .collect();
         drop(registry);
         offered
-    }
-
-    /// Declared descriptor of a tool the session's live claimant offers as `provider_id`.
-    pub fn descriptor(
-        &self,
-        session_id: SessionId,
-        provider_id: &str,
-        tool_name: &str,
-    ) -> Option<ClientToolDescriptor> {
-        let registry = self.lock();
-        registry
-            .claims
-            .get(&session_id)
-            .and_then(|client_id| registry.providers.get(client_id))
-            .filter(|provider| provider.provider_id == provider_id)
-            .and_then(|provider| provider.tools.get(tool_name).cloned())
     }
 
     /// Record a client's answer.
@@ -393,7 +397,7 @@ impl ClientToolRegistry {
         let mut registry = self.lock();
         let Some((client_id, sink)) = registry
             .claims
-            .get(&session_id)
+            .get(&(session_id, provider_id.to_owned()))
             .and_then(|client_id| {
                 registry
                     .providers
@@ -451,8 +455,8 @@ impl ClientToolRegistry {
             .is_err()
         {
             self.abandon(&invocation_id);
-            return InvocationEnd::Disconnected(format!(
-                "{provider_id} disconnected before the call was delivered"
+            return InvocationEnd::NotDelivered(format!(
+                "{provider_id} disconnected before the call was delivered; it did not run"
             ));
         }
         let end = tokio::select! {
@@ -463,7 +467,8 @@ impl ClientToolRegistry {
                 InvocationEnd::Answered,
             ),
             () = tokio::time::sleep(deadline) => InvocationEnd::TimedOut(format!(
-                "{provider_id} did not answer within {} ms", deadline.as_millis()
+                "{provider_id} did not answer within {} ms; its effects are unknown",
+                deadline.as_millis()
             )),
             () = cancelled => InvocationEnd::Cancelled,
         };
@@ -486,33 +491,22 @@ impl ClientToolRegistry {
 pub fn tool_response(end: InvocationEnd) -> bcode_tool::ToolInvocationResponse {
     let (output, is_error) = match end {
         InvocationEnd::Answered(ClientToolOutcome::Completed { content }) => {
-            if content.len() > MAX_CLIENT_TOOL_RESULT_BYTES {
-                let mut end = MAX_CLIENT_TOOL_RESULT_BYTES;
-                while !content.is_char_boundary(end) {
-                    end -= 1;
-                }
-                (
-                    format!(
-                        "{}\n[client tool result truncated at {MAX_CLIENT_TOOL_RESULT_BYTES} bytes]",
-                        &content[..end]
-                    ),
-                    false,
-                )
-            } else {
-                (content, false)
-            }
+            (bounded_client_text(content), false)
         }
         InvocationEnd::Answered(ClientToolOutcome::Failed { code, message }) => {
-            (format!("{code}: {message}"), true)
+            (bounded_client_text(format!("{code}: {message}")), true)
         }
         InvocationEnd::Unavailable(message) => {
             (format!("{CLIENT_TOOL_UNAVAILABLE}: {message}"), true)
         }
-        InvocationEnd::Disconnected(message) => {
+        InvocationEnd::NotDelivered(message) | InvocationEnd::Disconnected(message) => {
             (format!("{CLIENT_TOOL_DISCONNECTED}: {message}"), true)
         }
         InvocationEnd::TimedOut(message) => (format!("{CLIENT_TOOL_TIMEOUT}: {message}"), true),
-        InvocationEnd::Cancelled => ("tool cancelled".to_owned(), true),
+        InvocationEnd::Cancelled => (
+            "Tool cancelled; execution outcome is unknown. Side effects may have occurred; inspect affected resources before retrying.".to_owned(),
+            true,
+        ),
     };
     bcode_tool::ToolInvocationResponse {
         output,
@@ -523,24 +517,37 @@ pub fn tool_response(end: InvocationEnd) -> bcode_tool::ToolInvocationResponse {
     }
 }
 
-/// Standard authorization facts for a client tool, from its declared policy class.
+/// Client-supplied text bounded to [`MAX_CLIENT_TOOL_RESULT_BYTES`] on a character boundary.
+fn bounded_client_text(text: String) -> String {
+    if text.len() <= MAX_CLIENT_TOOL_RESULT_BYTES {
+        return text;
+    }
+    let mut end = MAX_CLIENT_TOOL_RESULT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[client tool result truncated at {MAX_CLIENT_TOOL_RESULT_BYTES} bytes]",
+        &text[..end]
+    )
+}
+
+/// Standard authorization facts for a client tool, from the policy class it declared when the
+/// tool was offered to the turn.
 pub fn preparation(
     request: &bcode_tool::ToolPreparationRequest,
-    descriptor: &ClientToolDescriptor,
+    definition: &bcode_tool::ToolDefinition,
+    read_only: bool,
 ) -> Result<bcode_tool::ToolPreparationResponse, String> {
-    let definition = bcode_tool::ToolDefinition {
-        name: descriptor.name.clone(),
-        description: descriptor.description.clone(),
-        input_schema: descriptor.input_schema.clone(),
-    };
-    let preparation = match descriptor.policy {
-        ClientToolPolicy::ReadOnly => bcode_agent_profile::ToolPolicyPreparation::read_only(),
-        ClientToolPolicy::Mutating => bcode_agent_profile::ToolPolicyPreparation::new(
+    let preparation = if read_only {
+        bcode_agent_profile::ToolPolicyPreparation::read_only()
+    } else {
+        bcode_agent_profile::ToolPolicyPreparation::new(
             true,
             bcode_agent_profile::ToolPolicyOperation::Mutating,
-        ),
+        )
     };
-    bcode_agent_profile::prepare_tool_policy(request, &definition, preparation)
+    bcode_agent_profile::prepare_tool_policy(request, definition, preparation)
 }
 
 /// Handle one client tool request on its connection.
@@ -742,6 +749,13 @@ mod tests {
         assert!(!response.is_error);
         assert!(response.output.len() <= MAX_CLIENT_TOOL_RESULT_BYTES + 128);
         assert!(response.output.ends_with("bytes]"));
+        let failed = tool_response(InvocationEnd::Answered(ClientToolOutcome::Failed {
+            code: "app_failed".to_owned(),
+            message: "é".repeat(MAX_CLIENT_TOOL_RESULT_BYTES),
+        }));
+        assert!(failed.is_error);
+        assert!(failed.output.len() <= MAX_CLIENT_TOOL_RESULT_BYTES + 128);
+        assert!(failed.output.starts_with("app_failed: "));
     }
 
     #[test]
@@ -758,7 +772,14 @@ mod tests {
             (ClientToolPolicy::Mutating, true),
             (ClientToolPolicy::ReadOnly, false),
         ] {
-            let prepared = preparation(&request, &tool("app.write", policy)).unwrap();
+            let tool = tool("app.write", policy);
+            let definition = bcode_tool::ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            };
+            let prepared =
+                preparation(&request, &definition, policy == ClientToolPolicy::ReadOnly).unwrap();
             let metadata = bcode_agent_profile::tool_policy_authorization_metadata(
                 &prepared.authorization,
                 "app.write",

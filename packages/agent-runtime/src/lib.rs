@@ -982,6 +982,11 @@ pub enum ToolSource {
     Client {
         /// Provider id under which the client registered the tool.
         provider_id: String,
+        /// Whether the tool was declared read-only when it was offered to the turn. Calls are
+        /// authorized with this declaration, not with a registration that replaced it later.
+        read_only: bool,
+        /// Deadline the tool declared when it was offered to the turn, in milliseconds.
+        deadline_ms: u32,
     },
 }
 
@@ -1015,13 +1020,21 @@ impl RegisteredTool {
         }
     }
 
-    /// Create a registration for a tool a connected client application implements.
+    /// Create a registration for a tool a connected client application implements, with the
+    /// policy class and deadline it declared when it was offered.
     #[must_use]
-    pub fn client(definition: ToolDefinition, provider_id: impl Into<String>) -> Self {
+    pub fn client(
+        definition: ToolDefinition,
+        provider_id: impl Into<String>,
+        read_only: bool,
+        deadline_ms: u32,
+    ) -> Self {
         Self {
             definition,
             source: ToolSource::Client {
                 provider_id: provider_id.into(),
+                read_only,
+                deadline_ms,
             },
         }
     }

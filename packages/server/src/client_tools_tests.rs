@@ -29,6 +29,12 @@ pub struct Fixture {
 /// Build the daemon state and serve it on a private socket. The accept loop ends with the
 /// test's runtime.
 pub fn fixture() -> Fixture {
+    fixture_with_agents(false, "")
+}
+
+/// [`fixture`], optionally with the bundled default agents deciding tool exposure and policy,
+/// with the agent and tool settings of `config_toml`.
+pub fn fixture_with_agents(default_agents: bool, config_toml: &str) -> Fixture {
     let workspace = tempfile::tempdir().expect("workspace");
     let sessions = SessionManager::persistent(workspace.path().join("sessions")).expect("sessions");
     let provider = bcode_plugin::StaticBundledPlugin::new(
@@ -40,16 +46,29 @@ pub fn fixture() -> Fixture {
         bcode_filesystem_plugin::static_plugin(),
     );
     let mut state = crate::tests::test_server_state(sessions);
+    let overrides: bcode_config::BcodeConfig =
+        toml::from_str(config_toml).expect("daemon configuration");
+    state.startup_config.agent = overrides.agent;
+    state.startup_config.tools = overrides.tools;
+    let mut enabled = std::collections::BTreeSet::from([
+        "bcode.fake-provider".to_owned(),
+        "bcode.filesystem".to_owned(),
+    ]);
+    let mut plugins = vec![provider, filesystem];
+    if default_agents {
+        enabled.insert("bcode.default-agents".to_owned());
+        plugins.push(bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+            bcode_default_agents_plugin::static_plugin(),
+        ));
+    }
     state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
-            enabled: std::collections::BTreeSet::from([
-                "bcode.fake-provider".to_owned(),
-                "bcode.filesystem".to_owned(),
-            ]),
+            enabled,
             disabled: std::collections::BTreeSet::new(),
         },
-        &[provider, filesystem],
+        &plugins,
     )
     .expect("load plugins");
     let state = Arc::new(state);
@@ -116,6 +135,15 @@ async fn start_lookup_turn(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> tokio::sync::oneshot::Receiver<crate::ModelTurnCompletion> {
+    start_lookup_turn_as(state, session_id, None).await
+}
+
+/// [`start_lookup_turn`] under the named agent.
+async fn start_lookup_turn_as(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    agent: Option<&str>,
+) -> tokio::sync::oneshot::Receiver<crate::ModelTurnCompletion> {
     let submitted = crate::submit_session_model_turn_with_admission(
         state,
         session_id,
@@ -125,6 +153,7 @@ async fn start_lookup_turn(
             execution: TurnExecutionOptions {
                 provider_plugin_id: Some("bcode.fake-provider".into()),
                 model_id: Some("fake-echo".into()),
+                agent_profile: agent.map(str::to_owned),
                 ..Default::default()
             },
             ..Default::default()
@@ -462,5 +491,175 @@ async fn a_split_provider_claims_and_answers_while_other_requests_are_in_flight(
             .await
             .expect("the stream ends")
             .is_none()
+    );
+}
+
+/// Assert the provider receives nothing for a moment.
+async fn assert_never_called(provider: &mut ClientToolProvider) {
+    let nothing = tokio::time::timeout(Duration::from_millis(300), provider.next_request()).await;
+    assert!(nothing.is_err(), "the app is never called: {nothing:?}");
+}
+
+#[tokio::test]
+async fn default_agents_offer_claimed_tools_and_configuration_still_decides() {
+    // A claim exposes the tool to the default build agent; a read-only call runs.
+    let fixture = fixture_with_agents(true, "");
+    let mut app = provider(&fixture, ClientToolPolicy::ReadOnly).await;
+    let session_id = app_session(&fixture, &mut app).await;
+    let completion = start_lookup_turn(&fixture.state, session_id).await;
+    answer_next(&mut app).await;
+    finish(completion).await;
+    let results = tool_results(&fixture.state, session_id).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].model_output, "live value: 42");
+
+    // An exact tool rule denying it, or disabling it, keeps every call from the application.
+    for config in [
+        "[agent.build.permission.tools]\n\"app.lookup\" = \"deny\"\n",
+        "[tools]\ndisabled = [\"app.lookup\"]\n",
+    ] {
+        let fixture = fixture_with_agents(true, config);
+        let mut app = provider(&fixture, ClientToolPolicy::ReadOnly).await;
+        let session_id = app_session(&fixture, &mut app).await;
+        let completion = start_lookup_turn(&fixture.state, session_id).await;
+        finish(completion).await;
+        assert_never_called(&mut app).await;
+        let results = tool_results(&fixture.state, session_id).await;
+        assert!(
+            results.iter().all(|result| result.is_error),
+            "{config}: {results:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_agents_ask_before_claimed_mutating_tools_and_plan_never_runs_them() {
+    let fixture = fixture_with_agents(true, "");
+    let mut provider = provider(&fixture, ClientToolPolicy::Mutating).await;
+    let session_id = app_session(&fixture, &mut provider).await;
+    let completion = start_lookup_turn(&fixture.state, session_id).await;
+    let permissions = pending_permission_ids(&fixture.state, 1).await;
+    assert!(
+        fixture
+            .client
+            .resolve_permission(permissions[0].clone(), true)
+            .await
+            .expect("answer")
+    );
+    answer_next(&mut provider).await;
+    finish(completion).await;
+    assert_eq!(
+        tool_results(&fixture.state, session_id).await[0].model_output,
+        "live value: 42"
+    );
+
+    let planned = app_session(&fixture, &mut provider).await;
+    let completion = start_lookup_turn_as(&fixture.state, planned, Some("plan")).await;
+    finish(completion).await;
+    assert_never_called(&mut provider).await;
+    assert!(fixture.state.pending_permissions.lock().await.is_empty());
+    let results = tool_results(&fixture.state, planned).await;
+    assert!(results.iter().all(|result| result.is_error), "{results:?}");
+}
+
+#[tokio::test]
+async fn a_call_past_its_deadline_is_cancelled_and_its_effects_reported_unknown() {
+    let fixture = fixture();
+    let mut slow = tool("app.lookup", ClientToolPolicy::ReadOnly);
+    slow.max_duration_ms = 200;
+    let mut provider = fixture
+        .client
+        .client_tool_provider("app", vec![slow])
+        .await
+        .expect("register");
+    let session_id = app_session(&fixture, &mut provider).await;
+    let completion = start_lookup_turn(&fixture.state, session_id).await;
+    let ClientToolRequest::Invoke(invocation) =
+        tokio::time::timeout(Duration::from_secs(10), provider.next_request())
+            .await
+            .expect("invocation arrives")
+            .expect("connection")
+    else {
+        panic!("expected an invocation");
+    };
+    let cancel = tokio::time::timeout(Duration::from_secs(10), provider.next_request())
+        .await
+        .expect("cancel arrives")
+        .expect("connection");
+    assert_eq!(
+        cancel,
+        ClientToolRequest::Cancel {
+            invocation_id: invocation.invocation_id.clone()
+        }
+    );
+    // A late answer is accepted and dropped.
+    provider
+        .respond(
+            invocation.invocation_id,
+            ClientToolOutcome::Completed {
+                content: "too late".to_owned(),
+            },
+        )
+        .await
+        .expect("late answer accepted");
+    finish(completion).await;
+    let results = tool_results(&fixture.state, session_id).await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].is_error);
+    assert!(
+        results[0]
+            .model_output
+            .starts_with(bcode_tool::client_tool::CLIENT_TOOL_TIMEOUT),
+        "{results:?}"
+    );
+    assert!(results[0].model_output.contains("unknown"), "{results:?}");
+}
+
+#[tokio::test]
+async fn providers_claim_a_session_independently() {
+    let fixture = fixture();
+    let mut app = provider(&fixture, ClientToolPolicy::ReadOnly).await;
+    let mut other = fixture
+        .client
+        .client_tool_provider(
+            "other",
+            vec![tool("other.lookup", ClientToolPolicy::ReadOnly)],
+        )
+        .await
+        .expect("register other provider");
+    let session_id = app_session(&fixture, &mut app).await;
+    other.claim_session(session_id).await.expect("other claims");
+    let offered = fixture
+        .state
+        .client_tools
+        .offered_tools(session_id)
+        .into_iter()
+        .map(|tool| tool.definition.name)
+        .collect::<Vec<_>>();
+    assert_eq!(offered, ["app.lookup", "other.lookup"]);
+    assert_never_called(&mut app).await;
+
+    // The first provider still answers its own tool.
+    let completion = start_lookup_turn(&fixture.state, session_id).await;
+    answer_next(&mut app).await;
+    finish(completion).await;
+    assert_eq!(
+        tool_results(&fixture.state, session_id).await[0].model_output,
+        "live value: 42"
+    );
+
+    other
+        .release_session(session_id)
+        .await
+        .expect("other releases");
+    assert_eq!(
+        fixture
+            .state
+            .client_tools
+            .offered_tools(session_id)
+            .into_iter()
+            .map(|tool| tool.definition.name)
+            .collect::<Vec<_>>(),
+        ["app.lookup"]
     );
 }

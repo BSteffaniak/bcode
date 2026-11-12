@@ -142,6 +142,8 @@ impl Snapshot {
                 catalog.insert(super::RegisteredTool::client(
                     tool.definition.clone(),
                     tool.provider_id.clone(),
+                    tool.read_only,
+                    tool.deadline_ms,
                 ));
             }
         }
