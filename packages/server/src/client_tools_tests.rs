@@ -321,6 +321,40 @@ async fn app_disconnect_during_a_call_fails_it_without_replay() {
 }
 
 #[tokio::test]
+async fn an_app_attaches_to_a_bcode_session_and_observes_its_own_tool_live() {
+    let fixture = fixture();
+    let session_id = fixture
+        .client
+        .create_session_in_working_directory(None, fixture.workspace.path().to_path_buf())
+        .await
+        .expect("session created by an ordinary client")
+        .id;
+    let mut provider = provider(&fixture, ClientToolPolicy::ReadOnly).await;
+    provider.claim_session(session_id).await.expect("claim");
+    let mut watcher = fixture
+        .client
+        .watch_session(session_id, 16)
+        .await
+        .expect("the app attaches to the session");
+    let completion = start_lookup_turn(&fixture.state, session_id).await;
+    answer_next(&mut provider).await;
+    let observed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let bcode_client::SessionWatchEvent::Durable(event) =
+                watcher.next_event().await.expect("watch")
+                && let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind
+            {
+                break record;
+            }
+        }
+    })
+    .await
+    .expect("the result is observed live");
+    assert_eq!(observed.model_output, "live value: 42");
+    finish(completion).await;
+}
+
+#[tokio::test]
 async fn newest_claim_routes_and_the_previous_claimant_is_told() {
     let fixture = fixture();
     let mut first = provider(&fixture, ClientToolPolicy::ReadOnly).await;

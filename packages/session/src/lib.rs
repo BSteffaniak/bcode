@@ -9501,6 +9501,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_session_is_fenced_while_owned_and_resumed_by_the_next_runtime() {
+        let root = unique_temp_dir();
+        let runtime = |id: &str| {
+            SessionManager::persistent_with_metrics_and_lease_owner(
+                &root,
+                MetricsRegistry::default(),
+                SessionLeaseOwnerContext {
+                    daemon_instance_id: Some(id.to_owned()),
+                    build_fingerprint: Some(format!("{id}-build")),
+                    ..SessionLeaseOwnerContext::default()
+                },
+            )
+            .expect("runtime initializes")
+        };
+        let origin = bcode_session_models::SessionOrigin::new("bdata");
+        let creator = runtime("embedding-app");
+        let session = creator
+            .create_session_with_origin(None, test_working_directory(), Some(origin.clone()))
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        creator
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+
+        let other = runtime("installed-daemon");
+        assert!(
+            other.load_current_session(session.id).await.is_err(),
+            "a second writer is fenced while the first owns the session"
+        );
+        creator
+            .detach_session(session.id, client_id)
+            .await
+            .expect("detach");
+        creator.flush_catalog_updates().await;
+        creator.shutdown_catalog_updates().await;
+
+        let next = runtime("installed-daemon-restarted");
+        next.load_current_session(session.id)
+            .await
+            .expect("the next runtime takes over");
+        next.append_user_message(session.id, ClientId::new(), "continue".to_owned())
+            .await
+            .expect("resume writing");
+        let resumed = next.session_summary(session.id).await.expect("summary");
+        assert_eq!(resumed.origin.as_ref(), Some(&origin));
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn invalid_session_origin_is_rejected_before_anything_is_persisted() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
