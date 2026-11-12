@@ -34833,7 +34833,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             ToolSource::Client { .. } => None,
             ToolSource::Inline => {
                 return ToolAuthorizationDecision::Deny(
-                    "server cannot authorize an inline tool".to_string(),
+                    "server cannot authorize an inline non-plugin tool".to_string(),
                 );
             }
         };
