@@ -1295,7 +1295,7 @@ impl Home {
         let at = |rect: Option<Rect>| rect.filter(|rect| rect.contains(mouse.position));
         if let Some(area) = at(self.regions.suggestions) {
             let menu = Menu::new(&self.suggestion_items)
-                .policy(MenuPolicy::interactive())
+                .policy(theme.menu_policy(MenuPolicy::interactive()))
                 .styles(theme.component.selectable_list_styles());
             return match menu.handle_event(area, &mut self.suggestion_state, event) {
                 MenuOutcome::Activated { index, .. } => self.start_suggestion(index),
@@ -1373,7 +1373,9 @@ impl Home {
         let main = Rect::new(body.x, body.y, body.width - preview_width, body.height);
         self.rebuild_rows(theme, main.width);
         if header {
-            self.paint_header(Rect::new(area.x, area.y, area.width, 1), cx, theme);
+            cx.with_style(theme.header_bar, |cx| {
+                self.paint_header(Rect::new(area.x, area.y, area.width, 1), cx, theme);
+            });
         }
         self.paint_main(main, cx, theme);
         if preview && body.height > 0 {
@@ -1382,11 +1384,13 @@ impl Home {
             self.regions.preview = Some(rect);
         }
         if footer {
-            self.paint_footer(
-                Rect::new(area.x, area.bottom() - 1, area.width, 1),
-                cx,
-                theme,
-            );
+            cx.with_style(theme.footer, |cx| {
+                self.paint_footer(
+                    Rect::new(area.x, area.bottom() - 1, area.width, 1),
+                    cx,
+                    theme,
+                );
+            });
         }
         self.toasts.paint(theme, body, cx);
         if let Some(overlay) = self.overlay.as_mut() {
@@ -1491,7 +1495,7 @@ impl Home {
             y += 1;
             let rect = Rect::new(area.x + 1, y, area.width.saturating_sub(2), rows);
             Menu::new(&self.suggestion_items)
-                .policy(MenuPolicy::interactive())
+                .policy(theme.menu_policy(MenuPolicy::interactive()))
                 .styles(theme.component.selectable_list_styles())
                 .paint(rect, &self.suggestion_state, theme.text, cx);
             self.regions.suggestions = Some(rect);
@@ -1638,8 +1642,27 @@ impl Home {
         let mut state = self.table.borrow_mut();
         table.reconcile(area, &mut state);
         table.paint(area, &state, cx);
-        // Rows on screen get their stats first.
         let first = usize::try_from(state.scroll()).unwrap_or(usize::MAX);
+        // The selected review row carries the selection bar in its indentation (group rows
+        // start with their disclosure marker instead).
+        if let Some(selected) = state.selected()
+            && matches!(self.rows.get(selected), Some(RowRef::Review(_)))
+            && let Some(offset) = selected.checked_sub(first)
+            && let Ok(offset) = u16::try_from(offset)
+            && offset.saturating_add(1) < area.height
+        {
+            let row = if self.focus == HomeFocus::Table {
+                styles.selected
+            } else {
+                theme.cursor
+            };
+            cx.fill(
+                LocalRect::new(area.x.into(), i64::from(area.y + 1 + offset), 1, 1),
+                theme.icons.selection_bar,
+                row.patch(theme.selection_bar),
+            );
+        }
+        // Rows on screen get their stats first.
         let shown = usize::from(area.height.saturating_sub(1));
         *self.visible.borrow_mut() = self
             .rows
@@ -1766,10 +1789,7 @@ impl Home {
             })
             .collect();
         let pane = Pane::new()
-            .title(Line::from_spans(vec![Span::styled(
-                " Preview ",
-                theme.title,
-            )]))
+            .title(theme.pane_title("Preview", false))
             .styles(PaneStyles {
                 background: None,
                 border: theme.border,

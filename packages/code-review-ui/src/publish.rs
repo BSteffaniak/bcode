@@ -687,12 +687,12 @@ impl PublishFlow {
 
     const fn title(&self) -> &'static str {
         match self.step {
-            Step::Loading(_) => "Publish",
-            Step::Checklist => "Publish · checklist",
-            Step::Publishers => "Publish · choose a publisher",
-            Step::Options => "Publish · options",
-            Step::Preview => "Publish · preview",
-            Step::Confirm => "Publish · confirm",
+            Step::Loading(_) => " Publish ",
+            Step::Checklist => " Publish · checklist ",
+            Step::Publishers => " Publish · choose a publisher ",
+            Step::Options => " Publish · options ",
+            Step::Preview => " Publish · preview ",
+            Step::Confirm => " Publish · confirm ",
         }
     }
 
@@ -798,7 +798,7 @@ impl PublishFlow {
         }
         let layout = {
             let component = self.component(theme, area);
-            modal::paint(&component, area, cx)
+            modal::paint(&component, theme, area, cx)
         };
         self.menu.note_layout(&layout);
         self.painted = Some((area, layout));

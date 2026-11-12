@@ -324,10 +324,10 @@ impl ImportFlow {
 
     fn component<'a>(&'a self, theme: &ReviewTheme, area: Rect) -> PickerFrameComponent<'a> {
         let (title, footer) = match self.step {
-            ImportStep::Loading(_) => ("Import external review", "esc close"),
-            ImportStep::Importers => ("Import · choose an importer", "enter choose · esc close"),
+            ImportStep::Loading(_) => (" Import external review ", "esc close"),
+            ImportStep::Importers => (" Import · choose an importer ", "enter choose · esc close"),
             ImportStep::Options => (
-                "Import · options",
+                " Import · options ",
                 "tab next field · ←/→ change · enter import · esc back",
             ),
         };
@@ -352,7 +352,7 @@ impl ImportFlow {
         }
         let layout = {
             let component = self.component(theme, area);
-            modal::paint(&component, area, cx)
+            modal::paint(&component, theme, area, cx)
         };
         self.menu.note_layout(&layout);
         self.painted = Some((area, layout));

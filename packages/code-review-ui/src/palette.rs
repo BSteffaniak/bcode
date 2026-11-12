@@ -269,16 +269,16 @@ impl Overlay {
 
     fn menu_component(&self, theme: &ReviewTheme) -> MenuComponent<'_, '_> {
         MenuComponent::new(MENU_ID, &self.items, &self.menu)
-            .policy(MenuPolicy::interactive())
-            .styles(theme.component.selectable_list_styles())
+            .policy(theme.menu_policy(MenuPolicy::interactive()))
+            .styles(theme.overlay_component.selectable_list_styles())
             .outcome(&self.outcome)
     }
 
     fn frame<'a>(&'a self, theme: &ReviewTheme, area: Size) -> PickerFrameComponent<'a> {
         let (title, footer) = match self.kind {
-            OverlayKind::Palette => ("Commands", "enter run · esc close"),
-            OverlayKind::Help => ("Keys", "enter run · esc close"),
-            OverlayKind::Menu => ("Actions", "enter run · esc close"),
+            OverlayKind::Palette => (" Commands ", "enter run · esc close"),
+            OverlayKind::Help => (" Keys ", "enter run · esc close"),
+            OverlayKind::Menu => (" Actions ", "enter run · esc close"),
         };
         let max = Size::new(
             area.width.saturating_sub(4).min(84),
@@ -317,12 +317,14 @@ impl Overlay {
         let layout = {
             let frame = self.frame(theme, area.size());
             let layout = frame.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-            cx.with_child(
-                i32::from(area.x),
-                i64::from(area.y),
-                LocalRect::new(0, 0, area.width, area.height),
-                |cx| frame.paint(&layout, cx),
-            );
+            cx.with_style(theme.tiers.overlay, |cx| {
+                cx.with_child(
+                    i32::from(area.x),
+                    i64::from(area.y),
+                    LocalRect::new(0, 0, area.width, area.height),
+                    |cx| frame.paint(&layout, cx),
+                );
+            });
             layout
         };
         self.painted = Some((area, layout));

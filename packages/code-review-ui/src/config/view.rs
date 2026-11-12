@@ -54,6 +54,10 @@ pub struct ReviewViewConfig {
     /// What makes a viewed file stale (`viewed_reset` in the plugin table, not `review_v2`).
     #[serde(skip)]
     pub viewed_reset: bcode_code_review::viewed::ViewedReset,
+    /// Colors the terminal shows, resolved at the terminal boundary from `[tui] color_depth`
+    /// and the environment; `None` (tests, previews) means full color.
+    #[serde(skip)]
+    pub color_depth: Option<bmux_tui::capabilities::TerminalColorDepth>,
 }
 
 /// Configured layout choice.
@@ -91,6 +95,19 @@ impl ReviewViewConfig {
             .and_then(|value| value.clone().try_into().ok())
             .unwrap_or_default();
         config
+    }
+
+    /// The review theme for the host's component `styles`, with this configuration's glyphs and
+    /// adapted to its color depth.
+    #[must_use]
+    pub fn theme(
+        self,
+        styles: Option<&bcode_tui_theme::components::ComponentStyles>,
+    ) -> crate::theme::ReviewTheme {
+        crate::theme::ReviewTheme::derive(styles, self.icons.unwrap_or_default()).for_color_depth(
+            self.color_depth
+                .unwrap_or(bmux_tui::capabilities::TerminalColorDepth::TrueColor),
+        )
     }
 
     /// Tab stop interval of diff text: the configured width clamped to `1..=16`, else

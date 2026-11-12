@@ -1,9 +1,15 @@
 //! The review visual system: one [`ReviewTheme`] with semantic roles, derived from the host's
 //! component styles, and the icon set chosen by presentation policy.
 //!
-//! * Every role is derived from the host theme's `ComponentTheme` and diff styles, so
-//!   the review matches the rest of Bcode under any theme. Without a host theme the review
-//!   derives the same roles from a built-in dark seed palette.
+//! * Every role is derived from a few semantic [`Tiers`] (surfaces, text levels, accents),
+//!   which come from the host theme's component styles, so the review matches the rest of
+//!   Bcode under any theme. Without a host theme the review derives the same tiers from a
+//!   built-in dark seed palette.
+//! * Warning color means "needs you" (a pending decision, unsaved comments, a failure);
+//!   status roles never use it: a modified file takes the accent, a renamed one the second
+//!   accent.
+//! * Panels are rounded unless the theme chooses border glyphs; a focused panel's border and
+//!   title take the accent, an unfocused title is muted.
 //! * Roles cover file status, `+`/`−` counts and change bars, comment badges, the gutter, hunk
 //!   headers, gap rows, sticky headers, the cursor line versus a selected range, pane borders
 //!   (focused or not), and muted metadata. BMUX component styles (tree, panels, badges, progress,
@@ -12,24 +18,34 @@
 //!   terminals or fonts without the Unicode symbols ([`IconStyle`], a user setting).
 
 mod load;
+mod tiers;
 
 pub use load::{DEFAULT_THEME, HostTheme};
+pub use tiers::Tiers;
 
 use bcode_code_review_models::ReviewFileStatus;
 use bcode_tui_theme::components::ComponentStyles;
 use bmux_color::Rgb;
+use bmux_tui::capabilities::TerminalColorDepth;
+use bmux_tui::chrome::BorderSet;
 use bmux_tui::style::{Color, Modifier, Style};
+use bmux_tui::text::{Line, Span};
 use bmux_tui_components::badge::BadgeStyles;
+use bmux_tui_components::button::ButtonStyles;
 use bmux_tui_components::diff_viewer::DiffViewerStyle;
 use bmux_tui_components::key_hint_bar::KeyHintBarStyles;
+use bmux_tui_components::menu::MenuPolicy;
 use bmux_tui_components::panel_group::PanelGroupStyles;
 use bmux_tui_components::progress_bar::ProgressBarStyles;
 use bmux_tui_components::scrollbar::ScrollbarStyles;
+use bmux_tui_components::selectable_list::SelectableListHighlightPolicy;
 use bmux_tui_components::split_button::SplitButtonStyles;
 use bmux_tui_components::status_bar::StatusBarStyles;
-use bmux_tui_components::theme::{ComponentTheme, ComponentThemeSeed};
+use bmux_tui_components::theme::{
+    ComponentChrome, ComponentSurfaces, ComponentTheme, ComponentThemeSeed,
+};
 use bmux_tui_components::toast_stack::ToastStackStyles;
-use bmux_tui_components::tree_view::TreeViewStyles;
+use bmux_tui_components::tree_view::{TreeViewSelectionBar, TreeViewStyles};
 use serde::Deserialize;
 
 /// Which glyph set the review paints.
@@ -84,6 +100,8 @@ pub struct Icons {
     pub progress_empty: &'static str,
     /// Menu toggle of the publish button.
     pub menu: &'static str,
+    /// Bar marking the selected row of a list or tree.
+    pub selection_bar: &'static str,
     /// Prompt of the file filter.
     pub filter: &'static str,
     /// Hide-the-panel action of the file panel.
@@ -114,6 +132,7 @@ impl Icons {
         progress_filled: "▰",
         progress_empty: "▱",
         menu: "▾",
+        selection_bar: "▌",
         filter: "⌕",
         collapse: "«",
         collapsed: "▸",
@@ -140,6 +159,7 @@ impl Icons {
         progress_filled: "#",
         progress_empty: "-",
         menu: "v",
+        selection_bar: ">",
         filter: "/",
         collapse: "<<",
         collapsed: ">",
@@ -158,24 +178,43 @@ impl Icons {
 /// Semantic styles of the review screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewTheme {
+    /// Semantic tiers every role below is derived from.
+    pub tiers: Tiers,
     /// Component theme every BMUX component style below is derived from.
     pub component: ComponentTheme,
+    /// Component theme of content inside overlays (pickers, the palette, menus), whose canvas
+    /// is the overlay.
+    pub overlay_component: ComponentTheme,
     /// Diff rows: text, gutter, markers, row tints, and emphasis.
     pub diff: DiffViewerStyle,
     /// Canvas behind the review.
     pub canvas: Style,
     /// Primary text.
     pub text: Style,
-    /// Panel titles.
+    /// Headings.
     pub title: Style,
+    /// Title of an unfocused pane.
+    pub pane_title: Style,
+    /// Title of the focused pane.
+    pub pane_title_focused: Style,
+    /// A neutral pill (a chip of metadata).
+    pub pill: Style,
+    /// A pill that stands out: the current mode or a count that matters.
+    pub pill_accent: Style,
+    /// A pill for something that needs the reviewer.
+    pub pill_warning: Style,
+    /// Bar marking the selected row of a list or tree.
+    pub selection_bar: Style,
     /// Accent for current items.
     pub accent: Style,
     /// Secondary metadata.
     pub muted: Style,
     /// Failed or unavailable content.
     pub error: Style,
-    /// File notices (binary, truncated).
+    /// Something that needs the reviewer (unsaved work, new commits, a stale review).
     pub notice: Style,
+    /// File notices (binary, truncated): information, not a request.
+    pub file_notice: Style,
     /// Added-file status.
     pub status_added: Style,
     /// Modified-file status.
@@ -280,6 +319,9 @@ pub struct ReviewTheme {
     pub icons: Icons,
 }
 
+/// Share of the accent in the background of a selected line range.
+const RANGE_ACCENT_SHARE: f64 = 0.30;
+
 /// Seed of the built-in palette used without a host theme.
 const DEFAULT_SEED: ComponentThemeSeed = ComponentThemeSeed {
     background: Rgb {
@@ -324,81 +366,127 @@ impl ReviewTheme {
     /// `icons`.
     #[must_use]
     pub fn derive(styles: Option<&ComponentStyles>, icons: IconStyle) -> Self {
-        let component = styles.map_or_else(
-            || ComponentTheme::derive(DEFAULT_SEED),
-            |styles| styles.component,
-        );
-        let diff = styles.map_or_else(
-            || DiffViewerStyle {
-                hunk: component.info,
-                ..DiffViewerStyle::default()
-            },
-            |styles| styles.diff,
-        );
-        Self::from_parts(component, diff, Icons::for_style(icons))
+        let Some(styles) = styles else {
+            let component = ComponentTheme::derive(DEFAULT_SEED);
+            return Self::from_parts(
+                component,
+                DiffViewerStyle {
+                    hunk: component.info,
+                    ..DiffViewerStyle::default()
+                },
+                Icons::for_style(icons),
+            );
+        };
+        let component = styles.component;
+        // Second hues, most preferred first: syntax keyword and type colors read as distinct
+        // categories in most palettes; info and link are the fallbacks every theme has.
+        let alternates: Vec<Color> = [
+            Some(styles.syntax.keyword.to_tui()),
+            Some(styles.syntax.type_name.to_tui()),
+            component.info.fg,
+            component.link.fg,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|color| *color != Color::Default)
+        .collect();
+        let tiers = Tiers::derive(&component, styles.control_focused.fg, &alternates);
+        Self::from_tiers(tiers, component, styles.diff, Icons::for_style(icons))
     }
 
-    /// Theme from a component theme and diff styles.
+    /// Theme from a component theme and diff styles, with tiers derived from the component
+    /// theme alone.
     #[must_use]
     pub fn from_parts(component: ComponentTheme, diff: DiffViewerStyle, icons: Icons) -> Self {
-        let raised = with_fallback_bg(component.surfaces.raised, Color::Rgb(30, 33, 41));
-        let overlay = with_fallback_bg(component.surfaces.overlay, Color::Rgb(38, 42, 52));
+        let alternates: Vec<Color> = [component.info.fg, component.link.fg]
+            .into_iter()
+            .flatten()
+            .collect();
+        let tiers = Tiers::derive(&component, None, &alternates);
+        Self::from_tiers(tiers, component, diff, icons)
+    }
+
+    /// Theme from `tiers`, the component theme they came from, and diff styles.
+    #[must_use]
+    pub fn from_tiers(
+        tiers: Tiers,
+        component: ComponentTheme,
+        diff: DiffViewerStyle,
+        icons: Icons,
+    ) -> Self {
+        let overlay_component = overlay_component(&component, &tiers);
+        let component = review_component(&component, &tiers);
+        let bold = |style: Style| style.add_modifier(Modifier::BOLD);
+        let accent_bg = |style: Style| style.fg.map_or(style, |fg| Style::new().bg(fg));
+        // The cursor line is the theme's (inactive) selection; a selected range is the accent
+        // mixed into the canvas, so the two never coincide.
         let cursor_bg = component
             .selected_inactive
             .bg
             .or(component.selected.bg)
+            .or(tiers.surface_alt.bg)
             .unwrap_or(Color::Rgb(44, 48, 60));
-        let selection_bg = component
-            .selected
-            .bg
-            .filter(|selected| *selected != cursor_bg)
+        let selection_bg = mixed(tiers.accent.fg, tiers.canvas.bg, RANGE_ACCENT_SHARE)
+            .or(component.selected.bg)
+            .filter(|selection| *selection != cursor_bg)
             .unwrap_or(Color::Rgb(54, 70, 110));
-        let bold = |style: Style| style.add_modifier(Modifier::BOLD);
         // Counts and change bars use the diff's own added/removed colors, so the tree, the
         // headers, and the rows agree.
-        let added = fg_only(diff.added).unwrap_or(component.success);
-        let removed = fg_only(diff.removed).unwrap_or(component.error);
+        // A theme whose diff roles carry only modifiers (no colors) keeps those modifiers.
+        let added = fg_only(diff.added).unwrap_or_else(|| component.success.patch(diff.added));
+        let removed = fg_only(diff.removed).unwrap_or_else(|| component.error.patch(diff.removed));
         let gutter = diff.muted;
-        let components = components(&component, raised, overlay, cursor_bg);
+        let components = components(&component, &tiers, cursor_bg);
         Self {
+            tiers,
             component,
+            overlay_component,
             diff: DiffViewerStyle {
                 muted: gutter,
                 ..diff
             },
-            canvas: component.canvas,
-            text: component.text,
-            title: component.title,
-            accent: component.accent,
-            muted: component.muted,
+            canvas: tiers.canvas,
+            text: tiers.text,
+            title: bold(tiers.accent),
+            pane_title: bold(tiers.muted),
+            pane_title_focused: bold(tiers.accent),
+            pill: pill(&tiers),
+            pill_accent: tiers.on_accent,
+            pill_warning: bold(component.warning.fg.map_or(component.warning, |fg| {
+                Style::new().bg(fg).fg(on(fg, &tiers))
+            })),
+            selection_bar: bold(tiers.accent),
+            accent: tiers.accent,
+            muted: tiers.muted,
             error: component.error,
             notice: component.warning,
+            file_notice: tiers.muted.add_modifier(Modifier::ITALIC),
             status_added: bold(added),
-            status_modified: bold(component.warning),
+            status_modified: modified_status(&tiers, [component.warning, added, removed]),
             status_deleted: bold(removed),
-            status_renamed: bold(component.info),
-            status_binary: component.muted.add_modifier(Modifier::ITALIC),
-            status_unknown: component.muted,
-            path: bold(component.text),
-            path_viewed: component.muted,
-            directory: bold(component.accent),
+            status_renamed: bold(tiers.accent_alt),
+            status_binary: tiers.muted.add_modifier(Modifier::ITALIC),
+            status_unknown: tiers.muted,
+            path: tiers.strong,
+            path_viewed: tiers.muted,
+            directory: tiers.strong,
             additions: added,
             deletions: removed,
             bar_added: added,
             bar_removed: removed,
-            bar_empty: component.border,
-            badge_draft: bold(component.warning),
+            bar_empty: tiers.dim,
+            badge_draft: bold(tiers.accent_alt),
             badge_open: bold(component.info),
             badge_resolved: bold(component.success),
-            badge_outdated: component.muted.add_modifier(Modifier::ITALIC),
-            badge_ai: bold(component.accent).add_modifier(Modifier::ITALIC),
+            badge_outdated: tiers.muted.add_modifier(Modifier::ITALIC),
+            badge_ai: bold(tiers.accent).add_modifier(Modifier::ITALIC),
             viewed: bold(component.success),
             gutter,
             hunk: diff.hunk,
-            hunk_fill: overlay.patch(diff.hunk),
-            file_header: raised.patch(component.text),
-            source_header: bold(component.title),
-            gap: component.muted,
+            hunk_fill: tiers.canvas.patch(diff.hunk),
+            file_header: tiers.surface_alt,
+            source_header: bold(tiers.accent),
+            gap: tiers.dim,
             gap_action: bold(component.link),
             thread: component.info,
             cursor: Style::new().bg(cursor_bg),
@@ -406,19 +494,18 @@ impl ReviewTheme {
             search_match: Style::new()
                 .fg(Color::Rgb(20, 20, 20))
                 .bg(component.warning.fg.unwrap_or(Color::Yellow)),
-            search_current: Style::new()
-                .fg(Color::Rgb(20, 20, 20))
-                .bg(component.accent.fg.unwrap_or(Color::Cyan))
+            search_current: accent_bg(tiers.accent)
+                .patch(tiers.on_accent)
                 .add_modifier(Modifier::BOLD),
             border: component.border,
-            border_focused: bold(component.border_focused),
-            header_bar: raised.patch(component.text),
-            footer: raised.patch(component.muted),
-            input: component.text,
-            placeholder: component.muted.add_modifier(Modifier::ITALIC),
+            border_focused: tiers.accent,
+            header_bar: tiers.surface_alt,
+            footer: tiers.surface_alt.patch(tiers.muted),
+            input: tiers.text,
+            placeholder: tiers.dim.add_modifier(Modifier::ITALIC),
             scrollbar: components.scrollbar,
             mark_thread: component.info,
-            mark_file: component.accent,
+            mark_file: tiers.accent,
             tree_focused: components.tree_focused,
             tree: components.tree,
             panels: components.panels,
@@ -430,6 +517,61 @@ impl ReviewTheme {
             publish: components.publish,
             icons,
         }
+    }
+
+    /// This theme for a terminal showing `depth` colors.
+    ///
+    /// Without colors, the cues that relied on a background alone get a modifier: the cursor
+    /// line and the selected range are reversed, search matches underlined, filled pills and
+    /// the publish button reversed, and selected rows keep their selection bar.
+    #[must_use]
+    pub fn for_color_depth(mut self, depth: TerminalColorDepth) -> Self {
+        if depth == TerminalColorDepth::Monochrome {
+            self.cursor = self.cursor.add_modifier(Modifier::REVERSED);
+            self.selection = self
+                .selection
+                .add_modifier(Modifier::REVERSED | Modifier::UNDERLINE);
+            self.search_match = self.search_match.add_modifier(Modifier::UNDERLINE);
+            self.search_current = self
+                .search_current
+                .add_modifier(Modifier::UNDERLINE | Modifier::REVERSED);
+            self.tree_focused.selected = self.tree_focused.selected.add_modifier(Modifier::BOLD);
+            self.pill_accent = self.pill_accent.add_modifier(Modifier::REVERSED);
+            self.publish.button.normal =
+                self.publish.button.normal.add_modifier(Modifier::REVERSED);
+        }
+        self
+    }
+
+    /// `policy` with the selection bar as its highlight symbol.
+    #[must_use]
+    pub const fn menu_policy(&self, mut policy: MenuPolicy) -> MenuPolicy {
+        policy.list.highlight = SelectableListHighlightPolicy::new(self.icons.selection_bar, true)
+            .styled(self.selection_bar);
+        policy
+    }
+
+    /// The selection bar of trees and lists.
+    #[must_use]
+    pub const fn tree_selection_bar(&self) -> TreeViewSelectionBar {
+        TreeViewSelectionBar::new(self.icons.selection_bar, self.selection_bar)
+    }
+
+    /// A pane title, ` title `: accent when the pane has focus, muted otherwise.
+    #[must_use]
+    pub fn pane_title(&self, title: &str, focused: bool) -> Line {
+        let style = if focused {
+            self.pane_title_focused
+        } else {
+            self.pane_title
+        };
+        Line::from_spans(vec![Span::styled(format!(" {title} "), style)])
+    }
+
+    /// A pane's right title, ` status `, in muted text.
+    #[must_use]
+    pub fn pane_status(&self, status: &str) -> Line {
+        Line::from_spans(vec![Span::styled(format!(" {status} "), self.muted)])
     }
 
     /// Style of a file status.
@@ -459,15 +601,11 @@ struct Components {
     publish: SplitButtonStyles,
 }
 
-fn components(
-    theme: &ComponentTheme,
-    raised: Style,
-    overlay: Style,
-    cursor_bg: Color,
-) -> Components {
+fn components(theme: &ComponentTheme, tiers: &Tiers, cursor_bg: Color) -> Components {
     let component = *theme;
     let bold = |style: Style| style.add_modifier(Modifier::BOLD);
     let tree = component.tree_view_styles();
+    let button = tiers.on_accent;
     Components {
         scrollbar: ScrollbarStyles::from(component),
         // The selected file stands out while the panel has focus and stays marked (as the
@@ -482,47 +620,128 @@ fn components(
         },
         panels: PanelGroupStyles {
             divider: Style::new(),
-            hovered_divider: component.border_focused,
-            active_divider: bold(component.border_focused),
+            hovered_divider: tiers.accent,
+            active_divider: bold(tiers.accent),
         },
-        badges: BadgeStyles::from(component),
+        badges: BadgeStyles {
+            default: pill(tiers),
+            info: pill(tiers),
+            success: pill(tiers).patch(fg_only(component.success).unwrap_or_default()),
+            warning: pill(tiers).patch(fg_only(component.warning).unwrap_or_default()),
+            error: pill(tiers).patch(fg_only(component.error).unwrap_or_default()),
+            muted: pill(tiers).patch(tiers.muted),
+        },
         progress: ProgressBarStyles {
             filled: component.success,
-            empty: component.border,
-            label: bold(component.text),
+            empty: tiers.dim,
+            label: tiers.strong,
             complete: bold(component.success),
             indeterminate: component.info,
             background: Style::new(),
         },
         hints: KeyHintBarStyles {
-            key: bold(component.accent),
-            label: component.muted,
-            separator: component.border,
+            key: bold(tiers.accent),
+            label: tiers.muted,
+            separator: tiers.dim,
             disabled: component.disabled,
-            background: raised,
+            background: tiers.surface_alt,
         },
         status: StatusBarStyles {
-            background: raised,
+            background: tiers.surface_alt,
             ..component.status_bar_styles()
         },
         toasts: ToastStackStyles {
-            surface: overlay,
+            surface: tiers.overlay,
             ..component.toast_stack_styles()
         },
+        // Publish is a filled button; its menu toggle shares the fill.
         publish: SplitButtonStyles {
-            button: component.into(),
-            menu: component.into(),
-            border: component.border,
+            button: ButtonStyles {
+                normal: button,
+                focused: button.add_modifier(Modifier::UNDERLINE),
+                hovered: button.add_modifier(Modifier::UNDERLINE),
+                pressed: button.add_modifier(Modifier::REVERSED),
+                disabled: tiers.surface_alt.patch(component.disabled),
+            },
+            menu: overlay_component(&component, tiers).into(),
+            border: tiers.accent,
         },
     }
 }
 
-/// `style` with `fallback` as its background when it has none.
-const fn with_fallback_bg(style: Style, fallback: Color) -> Style {
-    if style.bg.is_some() {
-        style
+/// The component theme of the review's own surfaces: the tiers' canvas and overlay, rounded
+/// panels unless the theme chooses glyphs, and accent focus.
+fn review_component(component: &ComponentTheme, tiers: &Tiers) -> ComponentTheme {
+    ComponentTheme {
+        canvas: tiers.canvas,
+        surfaces: ComponentSurfaces {
+            normal: tiers.canvas,
+            // BMUX pickers and toasts sit on the raised surface; the review shows them as
+            // overlays.
+            raised: tiers.overlay,
+            overlay: tiers.overlay,
+            scrim: component.surfaces.scrim,
+        },
+        accent: tiers.accent,
+        title: tiers.accent.add_modifier(Modifier::BOLD),
+        border_focused: tiers.accent,
+        chrome: ComponentChrome {
+            border_set: Some(component.chrome.border_set.unwrap_or(BorderSet::ROUNDED)),
+            ..component.chrome
+        },
+        ..*component
+    }
+}
+
+/// The component theme of content inside an overlay (lists in pickers, the palette, menus):
+/// the overlay is their canvas.
+fn overlay_component(component: &ComponentTheme, tiers: &Tiers) -> ComponentTheme {
+    let review = review_component(component, tiers);
+    ComponentTheme {
+        canvas: tiers.overlay,
+        surfaces: ComponentSurfaces {
+            normal: tiers.overlay,
+            ..review.surfaces
+        },
+        ..review
+    }
+}
+
+/// The modified-file status: the accent, or neutral strong text when the accent is one of
+/// the `taken` colors (warning, which means "needs you", or the added and removed colors).
+fn modified_status(tiers: &Tiers, taken: [Style; 3]) -> Style {
+    let accent = tiers.accent.fg;
+    if accent.is_some() && taken.iter().any(|style| style.fg == accent) {
+        tiers.strong
     } else {
-        style.bg(fallback)
+        tiers.accent.add_modifier(Modifier::BOLD)
+    }
+}
+
+/// A neutral pill: text on the overlay fill, which stands apart from the header and footer
+/// bars (`surface_alt`) it sits on.
+const fn pill(tiers: &Tiers) -> Style {
+    tiers.overlay.patch(tiers.text)
+}
+
+/// `a` mixed into `b` by `share`, when both are RGB colors.
+fn mixed(a: Option<Color>, b: Option<Color>, share: f64) -> Option<Color> {
+    match (a?, b?) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => Some(Color::from(bmux_color::mix(
+            Rgb::new(ar, ag, ab),
+            Rgb::new(br, bg, bb),
+            share,
+        ))),
+        _ => None,
+    }
+}
+
+/// Text color readable on a `fill` background: the tiers' `on_accent` ink when the fill is
+/// RGB, else the canvas color.
+fn on(fill: Color, tiers: &Tiers) -> Color {
+    match fill {
+        Color::Rgb(r, g, b) => Color::from(tiers::readable_extreme(Rgb::new(r, g, b))),
+        _ => tiers.canvas.bg.unwrap_or(Color::Black),
     }
 }
 
@@ -566,7 +785,10 @@ mod tests {
             ]
             .map(|status| theme.status(status));
             for (index, style) in statuses.iter().enumerate() {
-                assert!(statuses[index + 1..].iter().all(|other| other != style));
+                assert!(
+                    statuses[index + 1..].iter().all(|other| other != style),
+                    "{statuses:?}"
+                );
             }
             assert_ne!(theme.additions, theme.deletions);
             assert_ne!(theme.cursor, theme.selection);
@@ -585,6 +807,113 @@ mod tests {
             assert_ne!(theme.tree.selected, theme.tree_focused.selected);
             // Line numbers are the diff layout's gutter style.
             assert_eq!(theme.gutter, theme.diff.muted);
+        }
+    }
+
+    /// Every bundled bcode theme, dark and light variants alike.
+    fn bundled_themes() -> Vec<(String, ReviewTheme)> {
+        use bcode_tui_theme::definition::{
+            ResolvedThemeVariant, ThemeCatalog, ThemeKind, ThemeSelection,
+        };
+        let catalog = ThemeCatalog::bundled().expect("bundled themes");
+        // Selectable themes on their own; profiles (chrome without colors) over the default.
+        let selections: Vec<ThemeSelection> = catalog
+            .definitions()
+            .filter_map(|definition| match definition.kind() {
+                ThemeKind::Theme => Some(ThemeSelection::new(definition.id())),
+                ThemeKind::Profile => Some(
+                    ThemeSelection::new(DEFAULT_THEME).overlays(vec![definition.id().to_owned()]),
+                ),
+                ThemeKind::Base => None,
+            })
+            .collect();
+        let mut themes = Vec::new();
+        for selection in selections {
+            for variant in [ResolvedThemeVariant::Dark, ResolvedThemeVariant::Light] {
+                let Ok(resolved) = catalog.resolve(&selection.clone().variant(variant)) else {
+                    continue;
+                };
+                let id = format!("{selection:?}");
+                let host = HostTheme::from_definition(Some(&resolved));
+                themes.push((
+                    format!("{id} ({variant:?})"),
+                    ReviewTheme::derive(Some(&host.styles), IconStyle::Unicode),
+                ));
+            }
+        }
+        assert!(themes.len() > 20, "{}", themes.len());
+        themes
+    }
+
+    #[test]
+    fn every_bundled_theme_yields_a_complete_review_theme() {
+        for (name, theme) in bundled_themes() {
+            let tiers = theme.tiers;
+            // Status roles of colored themes are distinct (themes without colors tell statuses
+            // apart by their letters), and none of them is the warning color, which means
+            // "needs you".
+            let statuses = [
+                ReviewFileStatus::Added,
+                ReviewFileStatus::Modified,
+                ReviewFileStatus::Deleted,
+                ReviewFileStatus::Renamed,
+            ]
+            .map(|status| theme.status(status));
+            if statuses.iter().all(|style| style.fg.is_some()) {
+                for (index, style) in statuses.iter().enumerate() {
+                    assert!(
+                        statuses[index + 1..].iter().all(|other| other != style),
+                        "{name}: {statuses:?}"
+                    );
+                }
+            }
+            for style in [theme.status_modified, theme.status_renamed] {
+                assert!(
+                    style.fg.is_none() || style.fg != theme.notice.fg,
+                    "{name}: {style:?}"
+                );
+            }
+            assert_ne!(tiers.accent, tiers.accent_alt, "{name}");
+            assert_ne!(theme.cursor, theme.selection, "{name}");
+            // RGB canvases get layered surfaces and text that reads on the accent fill.
+            if let Some(Color::Rgb(..)) = tiers.canvas.bg {
+                assert_ne!(tiers.surface_alt.bg, tiers.canvas.bg, "{name}");
+                assert_ne!(tiers.overlay.bg, tiers.canvas.bg, "{name}");
+                if let (Some(Color::Rgb(fr, fg, fb)), Some(Color::Rgb(br, bg, bb))) =
+                    (tiers.on_accent.fg, tiers.on_accent.bg)
+                {
+                    let contrast = Rgb::new(fr, fg, fb).contrast_ratio(Rgb::new(br, bg, bb));
+                    assert!(contrast >= 4.5, "{name}: {contrast}");
+                }
+            }
+            // Panels are rounded unless the theme chose glyphs.
+            assert!(theme.component.chrome.border_set.is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn without_colors_background_only_cues_get_modifiers() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let plain = theme.for_color_depth(TerminalColorDepth::Monochrome);
+        assert!(plain.cursor.modifiers.contains(Modifier::REVERSED));
+        assert!(plain.selection.modifiers.contains(Modifier::UNDERLINE));
+        assert_ne!(plain.cursor, plain.selection);
+        assert!(plain.search_match.modifiers.contains(Modifier::UNDERLINE));
+        assert!(
+            plain
+                .publish
+                .button
+                .normal
+                .modifiers
+                .contains(Modifier::REVERSED)
+        );
+        // Other depths keep the theme as it is.
+        for depth in [
+            TerminalColorDepth::Ansi16,
+            TerminalColorDepth::Ansi256,
+            TerminalColorDepth::TrueColor,
+        ] {
+            assert_eq!(theme.for_color_depth(depth), theme);
         }
     }
 

@@ -210,6 +210,97 @@ fn styles_follow_semantic_roles_under_a_theme() {
 }
 
 #[test]
+fn surfaces_focus_and_selection_follow_the_visual_tiers() {
+    let fixture = fixture();
+    let (mut scenario, _) = open(&fixture, fixture_branch_compare(), 160, 40);
+    scenario.set_theme(Some(&host_theme(rgb(190, 120, 250))));
+    let screen = stable(&mut scenario);
+    let theme = *scenario.surface().theme();
+    let tiers = theme.tiers;
+    // No cell falls back to the terminal's default background: everything sits on a tier.
+    for y in 0..screen.height() {
+        for x in 0..screen.width() {
+            assert!(
+                screen.style_at(x, y).bg.is_some(),
+                "({x}, {y}) has no background\n{}",
+                screen.text()
+            );
+        }
+    }
+    // The header and footer bars are the `surface_alt` tier from edge to edge.
+    for y in [0, screen.height() - 1] {
+        assert_eq!(screen.style_at(0, y).bg, tiers.surface_alt.bg);
+        assert_eq!(
+            screen.style_at(screen.width() - 1, y).bg,
+            tiers.surface_alt.bg
+        );
+    }
+    // The focused pane's title takes the accent; others are muted. Counts sit at the right of
+    // the title row.
+    let title = |scenario: &Scenario<ReviewSurface>, screen: &Screen, id: &str, needle: &str| {
+        let area = area_of(scenario, id).unwrap();
+        let row = Rect::new(area.x, area.y, area.width, 1);
+        let (x, y) = find_in(screen, row, needle).unwrap_or_else(|| panic!("{needle}"));
+        screen.style_at(x, y)
+    };
+    assert_eq!(
+        title(&scenario, &screen, REVIEW_PANE_ID, "Review").fg,
+        tiers.accent.fg
+    );
+    assert_eq!(
+        title(&scenario, &screen, FILES_PANE_ID, "Files").fg,
+        tiers.muted.fg
+    );
+    let review = area_of(&scenario, REVIEW_PANE_ID).unwrap();
+    let (x, _) = find_in(
+        &screen,
+        Rect::new(review.x, review.y, review.width, 1),
+        "15 files",
+    )
+    .expect("file count");
+    assert!(x > review.x + review.width / 2, "{}", screen.text());
+    // The selected file carries the selection bar in the tree's first column, in the accent;
+    // other rows leave that column blank.
+    let tree = tree_area(&scenario);
+    let selected = selected_file(&scenario).expect("selected file");
+    let name = selected.rsplit('/').next().unwrap_or(&selected);
+    let (_, row) = find_in(&screen, tree, name).expect("selected row");
+    let bar = screen.cell(tree.x, row).expect("bar cell");
+    assert_eq!(bar.symbol.as_str(), theme.icons.selection_bar);
+    assert_eq!(bar.style.fg, tiers.accent.fg);
+    for y in (tree.y..tree.bottom()).filter(|y| *y != row) {
+        assert_eq!(
+            screen.cell(tree.x, y).map(|cell| cell.symbol.as_str()),
+            Some(" ")
+        );
+    }
+    let screen = {
+        scenario.key("tab");
+        stable(&mut scenario)
+    };
+    assert_eq!(
+        title(&scenario, &screen, FILES_PANE_ID, "Files").fg,
+        tiers.accent.fg
+    );
+    assert_eq!(
+        title(&scenario, &screen, REVIEW_PANE_ID, "Review").fg,
+        tiers.muted.fg
+    );
+    // Overlays sit on the overlay tier, their selected row marked by the bar.
+    scenario.key("tab");
+    scenario.key(":");
+    let screen = stable(&mut scenario);
+    let (x, y) = screen
+        .find("Move down")
+        .map(|point| (point.x, point.y))
+        .expect("palette");
+    assert_eq!(screen.style_at(x, y).bg, tiers.overlay.bg);
+    let bar = screen.cell(x - 2, y).expect("palette bar");
+    assert_eq!(bar.symbol.as_str(), theme.icons.selection_bar);
+    assert_eq!(bar.style.fg, tiers.accent.fg);
+}
+
+#[test]
 fn file_tree_shows_statuses_counts_and_directory_aggregates() {
     let fixture = fixture();
     let (scenario, screen) = open(&fixture, fixture_branch_compare(), 160, 40);
@@ -406,9 +497,11 @@ fn filter_narrows_the_file_tree_and_opens_matches() {
         shown[0].contains("docs/") && shown[1].contains("unicode.txt"),
         "{rows:#?}"
     );
+    // The title row names the panel and, at its right, how many files match.
     let files = area_of(&scenario, FILES_PANE_ID).unwrap();
+    let title = screen.text_in(files, files.y);
     assert!(
-        screen.text_in(files, files.y).contains("Files 1/15"),
+        title.contains(" Files ") && title.contains(" 1/15 "),
         "{}",
         screen.text()
     );

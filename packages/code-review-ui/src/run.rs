@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use bcode_code_review::ReviewStore;
 use bcode_session_models::SessionId;
 use bcode_tui_theme::components::ComponentStyles;
-use bmux_tui::capabilities::TerminalCapabilities;
+use bmux_tui::capabilities::{TerminalCapabilities, TerminalColorDepth};
 use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::event::EventOutcome;
 use bmux_tui::focus::FocusTrap;
@@ -94,6 +94,7 @@ pub enum Msg {
 
 /// The app as the runtime drives it.
 pub struct App {
+    color_depth: TerminalColorDepth,
     review: ReviewApp,
     ui: UiContext,
     styles: Option<(u64, ComponentStyles)>,
@@ -200,7 +201,11 @@ impl Program for App {
 /// Panics when called outside a Tokio runtime without a host in `options`.
 pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let repo = bcode_code_review::scope::working_tree_root(&options.path);
-    let loaded = options.config;
+    let mut loaded = options.config;
+    let color_depth = loaded
+        .color_depth
+        .resolve(TerminalCapabilities::detect().color_depth);
+    loaded.view.color_depth = Some(color_depth);
     let keymap = crate::keymap::registry(loaded.keybindings.clone())
         .map_err(|error| RunError::Keymap(format!("invalid review keybindings: {error}")))?;
     let mut diagnostics = loaded.diagnostics.clone();
@@ -225,6 +230,7 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let mut review = ReviewApp::new(services, repo, loaded.view, options.entry);
     review.prepare_keymap(&ui);
     Ok(App {
+        color_depth,
         review,
         ui,
         styles: None,
@@ -281,7 +287,7 @@ enum AppPresenter {
 }
 
 impl AppPresenter {
-    fn new(area: Rect) -> Self {
+    fn new(area: Rect, depth: TerminalColorDepth) -> Self {
         let acceleration = if TerminalCapabilities::left_right_margins() {
             ScrollRegionAcceleration::AutoWithMargins
         } else {
@@ -291,6 +297,7 @@ impl AppPresenter {
         if let Ok(output) = TtyOutput::open() {
             let mut terminal = Terminal::new(Vec::new(), area);
             terminal.set_scroll_region_acceleration(acceleration);
+            terminal.set_color_depth(depth);
             return Self::Async(Box::new(bmux_tui_runtime::AsyncTerminalPresenter::new(
                 terminal,
                 output,
@@ -300,6 +307,7 @@ impl AppPresenter {
         }
         let mut terminal = Terminal::new(std::io::stdout(), area);
         terminal.set_scroll_region_acceleration(acceleration);
+        terminal.set_color_depth(depth);
         Self::Blocking(Box::new(bmux_tui_runtime::TerminalPresenter::new(
             terminal,
             paint as Render,
@@ -417,7 +425,7 @@ async fn session(app: App, target: &WakeTarget) -> Result<App, RunError> {
     let terminal_error = |error: std::io::Error| RunError::Terminal(error.to_string());
     let guard = CrosstermTerminalGuard::enter(std::io::stdout()).map_err(terminal_error)?;
     let size = terminal_size().map_err(terminal_error)?;
-    let presenter = AppPresenter::new(Rect::new(0, 0, size.width, size.height));
+    let presenter = AppPresenter::new(Rect::new(0, 0, size.width, size.height), app.color_depth);
     app.wake_pending.store(false, Ordering::Release);
     let (runtime, handle) =
         bmux_tui_runtime::Runtime::new(app, presenter, bmux_tui_runtime::RuntimeConfig::default());

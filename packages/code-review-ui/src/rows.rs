@@ -1937,12 +1937,54 @@ impl<'a> ItemView<'a> {
         matches!(self.key, ItemKey::Composer)
     }
 
+    /// The composer is a card: its rows sit on `surface_alt` with an accent bar in the gutter
+    /// beside the editor, two cells left of where the editor starts.
     fn paint_composer(&self, width: u16, height: u16, cx: &mut PaintCx<'_, '_>) {
         let (Some(composer), Some(layout)) =
             (self.context.composer, self.context.composer_layout(width))
         else {
             return;
         };
+        let theme = &self.context.params.theme;
+        cx.with_style(theme.tiers.surface_alt, |cx| {
+            cx.fill(LocalRect::new(0, 0, width, height), " ", Style::new());
+            self.paint_composer_content(composer, &layout, width, height, cx);
+        });
+        if layout.indent >= 2 {
+            let bar = Style::new()
+                .fg(theme.tiers.accent.fg.unwrap_or_default())
+                .bg(theme.tiers.surface_alt.bg.unwrap_or_default());
+            cx.fill(
+                LocalRect::new(i32::from(layout.indent - 2), 0, 1, height),
+                theme.icons.accent_bar,
+                theme.tiers.surface_alt.patch(bar),
+            );
+        }
+        let last = height.saturating_sub(1);
+        for (number, button) in layout.buttons.iter().enumerate() {
+            let cells = button
+                .cells
+                .end
+                .min(width)
+                .saturating_sub(button.cells.start);
+            if cells > 0 && last > 0 {
+                cx.push_hit(HitRegion::new(
+                    format!("{}.composer.{number}", self.id.as_str()),
+                    Rect::new(button.cells.start, last, cells, 1),
+                ));
+            }
+        }
+        cx.push_damage(LocalRect::new(0, 0, width, height));
+    }
+
+    fn paint_composer_content(
+        &self,
+        composer: &super::composer::Composer,
+        layout: &super::composer::ComposerLayout,
+        width: u16,
+        height: u16,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
         let theme = &self.context.params.theme;
         cx.write_line(LocalRect::new(0, 0, width, 1), &layout.title);
         let inner = width.saturating_sub(layout.indent);
@@ -1991,20 +2033,6 @@ impl<'a> ItemView<'a> {
             LocalRect::new(0, i64::from(last), width, 1),
             &layout.actions,
         );
-        for (number, button) in layout.buttons.iter().enumerate() {
-            let cells = button
-                .cells
-                .end
-                .min(width)
-                .saturating_sub(button.cells.start);
-            if cells > 0 && last > 0 {
-                cx.push_hit(HitRegion::new(
-                    format!("{}.composer.{number}", self.id.as_str()),
-                    Rect::new(button.cells.start, last, cells, 1),
-                ));
-            }
-        }
-        cx.push_damage(LocalRect::new(0, 0, width, height));
     }
 
     /// Register the painted diff text in the document's selection scope as one BMUX text run

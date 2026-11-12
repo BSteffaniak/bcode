@@ -40,6 +40,62 @@ pub struct ThemeChoice {
     pub paths: Vec<PathBuf>,
 }
 
+/// Terminal color depth policy (`[tui] color_depth`), shared with bcode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColorDepthChoice {
+    /// Follow the environment: no colors under `NO_COLOR` or a dumb terminal, else full color.
+    #[default]
+    Auto,
+    /// 24-bit colors unchanged.
+    Truecolor,
+    /// Colors reduced to the 256-color palette.
+    Ansi256,
+    /// Colors reduced to the 16 ANSI colors.
+    Ansi16,
+    /// No colors; modifiers only.
+    None,
+}
+
+impl ColorDepthChoice {
+    /// The choice named `name`, as bcode spells it.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "auto" => Self::Auto,
+            "truecolor" => Self::Truecolor,
+            "ansi256" => Self::Ansi256,
+            "ansi16" => Self::Ansi16,
+            "none" => Self::None,
+            _ => return None,
+        })
+    }
+
+    /// The depth to present with, given the terminal's detected capabilities.
+    ///
+    /// `auto` honors only `NO_COLOR` and dumb terminals, as bcode does: color variables are
+    /// often dropped by multiplexers and SSH on terminals that show full color, so reduced
+    /// depths are explicit choices.
+    #[must_use]
+    pub const fn resolve(
+        self,
+        detected: bmux_tui::capabilities::TerminalColorDepth,
+    ) -> bmux_tui::capabilities::TerminalColorDepth {
+        use bmux_tui::capabilities::TerminalColorDepth;
+        match self {
+            Self::Auto => match detected {
+                TerminalColorDepth::Monochrome => TerminalColorDepth::Monochrome,
+                TerminalColorDepth::Ansi16
+                | TerminalColorDepth::Ansi256
+                | TerminalColorDepth::TrueColor => TerminalColorDepth::TrueColor,
+            },
+            Self::Truecolor => TerminalColorDepth::TrueColor,
+            Self::Ansi256 => TerminalColorDepth::Ansi256,
+            Self::Ansi16 => TerminalColorDepth::Ansi16,
+            Self::None => TerminalColorDepth::Monochrome,
+        }
+    }
+}
+
 /// Everything the app reads from configuration files.
 #[derive(Debug, Clone, Default)]
 pub struct LoadedConfig {
@@ -55,6 +111,8 @@ pub struct LoadedConfig {
     pub diff_layout: Option<DiffLayout>,
     /// Effective theme selection.
     pub theme: ThemeChoice,
+    /// Terminal color depth from `[tui] color_depth`.
+    pub color_depth: ColorDepthChoice,
     /// Whether `[plugins] disabled` lists the code review plugin.
     pub plugin_disabled: bool,
     /// Problems found while loading; defaults are used for affected sections.
@@ -162,6 +220,14 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
             loaded
                 .diagnostics
                 .push("tui.diff_viewer: unknown layout".to_owned());
+        }
+    }
+    if let Some(depth) = lookup(bcode, &["tui", "color_depth"]) {
+        match depth.as_str().and_then(ColorDepthChoice::parse) {
+            Some(depth) => loaded.color_depth = depth,
+            None => loaded.diagnostics.push(
+                "tui.color_depth: expected auto, truecolor, ansi256, ansi16 or none".to_owned(),
+            ),
         }
     }
     if let Some(toml::Value::Table(theme)) = lookup(bcode, &["tui", "theme"]) {
@@ -310,6 +376,36 @@ mod tests {
         assert_eq!(loaded.theme.name, "nord");
         assert_eq!(loaded.theme.overlays, ["high-contrast"]);
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    }
+
+    #[test]
+    fn color_depth_follows_bcode_and_honors_no_color_on_auto() {
+        use bmux_tui::capabilities::TerminalColorDepth;
+        let depth = |source: &str| from_table(&table(source), PathBuf::from("/config"));
+        let loaded = depth("[tui]\ncolor_depth = \"ansi16\"\n");
+        assert_eq!(loaded.color_depth, ColorDepthChoice::Ansi16);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        let loaded = depth("[tui]\ncolor_depth = \"sepia\"\n");
+        assert_eq!(loaded.color_depth, ColorDepthChoice::Auto);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("tui.color_depth"))
+        );
+        // `auto` drops colors only when the environment asks for none.
+        assert_eq!(
+            ColorDepthChoice::Auto.resolve(TerminalColorDepth::Monochrome),
+            TerminalColorDepth::Monochrome
+        );
+        assert_eq!(
+            ColorDepthChoice::Auto.resolve(TerminalColorDepth::Ansi16),
+            TerminalColorDepth::TrueColor
+        );
+        assert_eq!(
+            ColorDepthChoice::None.resolve(TerminalColorDepth::TrueColor),
+            TerminalColorDepth::Monochrome
+        );
     }
 
     #[test]

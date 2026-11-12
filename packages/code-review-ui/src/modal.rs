@@ -141,8 +141,8 @@ impl MenuPanel {
     #[must_use]
     pub fn component(&self, theme: &ReviewTheme) -> MenuComponent<'_, '_> {
         MenuComponent::new(self.id, &self.items, &self.menu)
-            .policy(MenuPolicy::interactive())
-            .styles(theme.component.selectable_list_styles())
+            .policy(theme.menu_policy(MenuPolicy::interactive()))
+            .styles(theme.overlay_component.selectable_list_styles())
             .outcome(&self.outcome)
     }
 
@@ -194,15 +194,22 @@ pub fn frame<'a>(
         .chrome(theme.component.chrome)
 }
 
-/// Paint `component` over `area`; returns the layout it was painted with.
-pub fn paint(component: &dyn Component, area: Rect, cx: &mut PaintCx<'_, '_>) -> LayoutNode {
+/// Paint `component` over `area` on the overlay tier; returns the layout it was painted with.
+pub fn paint(
+    component: &dyn Component,
+    theme: &ReviewTheme,
+    area: Rect,
+    cx: &mut PaintCx<'_, '_>,
+) -> LayoutNode {
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    cx.with_child(
-        i32::from(area.x),
-        i64::from(area.y),
-        LocalRect::new(0, 0, area.width, area.height),
-        |cx| component.paint(&layout, cx),
-    );
+    cx.with_style(theme.tiers.overlay, |cx| {
+        cx.with_child(
+            i32::from(area.x),
+            i64::from(area.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| component.paint(&layout, cx),
+        );
+    });
     layout
 }
 

@@ -121,6 +121,25 @@ frame and writes only the changed cells. Large terminals stay cheap because:
   whose file leaves the screen stops at its next step. Highlights for files off screen land without
   a frame; completions that arrive together are drawn by one frame.
 
+### Visual system
+
+Every color comes from the bcode theme through a few semantic tiers (`theme::Tiers`): the
+`canvas` the panes sit on, `surface_alt` for the header and footer bars, file headers and the
+comment composer card, `overlay` for the palette, pickers, modals, toasts and pills; text,
+strong, muted and dim; and an accent, a second accent and text on the accent. Themes that define
+few roles still get every tier (tinted surfaces on an RGB canvas, no fills with terminal
+colors). Warning color only marks what needs the reviewer, such as the drafts of an unsaved
+review; a modified file takes the accent and a renamed one the second accent.
+
+Panels are rounded unless the theme chooses its own glyphs, and the focused panel's border and
+title take the accent, with counts at the right of each title row. The selected row of the file
+tree, the threads list, home's table and every menu carries a `▌` bar (`>` with ASCII icons), so
+selection does not depend on color. Publish is a filled button and the header's sources and
+layout are pills.
+
+`NO_COLOR`, a dumb terminal, or `[tui] color_depth` reduce the colors written to the terminal.
+Without colors, the cursor line and selected ranges are reversed and search matches underlined.
+
 ## Configuration
 
 Both entry points read the ordinary bcode configuration files, discovered and layered like
@@ -138,6 +157,8 @@ bcode's own (`--print-config-paths` lists them in order):
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads` and `code-review-composer`. `none` or `unbind` removes a default.
 * `[tui.theme]`: the theme, loaded through `bcode_tui_theme` discovery like `bcode-git`.
+* `[tui] color_depth`: `auto` (the default: no colors under `NO_COLOR` or a dumb terminal, else
+  full color), `truecolor`, `ansi256`, `ansi16`, or `none`, as in bcode.
 * `[tui.diff_viewer]`: bcode's diff layout preference, followed unless the review's own table
   sets a layout.
 * `[plugins] disabled`: listing `bcode.code_review` disables the app.

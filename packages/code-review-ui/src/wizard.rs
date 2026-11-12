@@ -1844,10 +1844,12 @@ impl Wizard {
                 ),
             ])
             .truncate(usize::from(area.width));
-            cx.write_line(
-                LocalRect::new(row.x.into(), row.y.into(), row.width, 1),
-                &title,
-            );
+            cx.with_style(theme.header_bar, |cx| {
+                cx.write_line(
+                    LocalRect::new(row.x.into(), row.y.into(), row.width, 1),
+                    &title,
+                );
+            });
             let status = |step: usize| match step.cmp(&self.step_number()) {
                 std::cmp::Ordering::Less => StepStatus::Complete,
                 std::cmp::Ordering::Equal => StepStatus::Current,

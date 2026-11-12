@@ -1,7 +1,8 @@
 //! Review chrome: the header bar, the footer, and toasts.
 //!
-//! * **Header.** Title, source chips (BMUX `badge`), `+/−` totals, viewed progress (text and a
-//!   BMUX `progress_bar`), the draft count, the layout mode, and a publish `split_button`. Every
+//! * **Header.** Title, source pills (BMUX `badge`), `+/−` totals, viewed progress (text and a
+//!   BMUX `progress_bar`), the draft count (a warning pill while the review is unsaved, since
+//!   leaving would lose them), the layout mode as a pill, and a filled publish `split_button`. Every
 //!   part is measured by its own component or text width, and [`plan_header`] places them; when
 //!   the row is too narrow, parts are dropped in [`HEADER_ELISION_ORDER`] while the title would
 //!   get fewer than its width (at most [`TITLE_KEEP`]) cells, then the title is truncated.
@@ -105,6 +106,8 @@ pub struct HeaderModel {
     pub totals: (u64, u64),
     /// Draft comments.
     pub drafts: usize,
+    /// Whether the review is not saved yet (its drafts need the reviewer).
+    pub unsaved: bool,
     /// Layout mode label.
     pub mode: String,
 }
@@ -115,11 +118,25 @@ impl HeaderModel {
     }
 
     fn drafts_text(&self) -> String {
-        format!(
+        let text = format!(
             "{} draft{}",
             self.drafts,
             if self.drafts == 1 { "" } else { "s" }
-        )
+        );
+        if self.drafts_need_reviewer() {
+            format!(" {text} · unsaved ")
+        } else {
+            text
+        }
+    }
+
+    /// Drafts of an unsaved review are lost unless the reviewer saves or publishes them.
+    const fn drafts_need_reviewer(&self) -> bool {
+        self.unsaved && self.drafts > 0
+    }
+
+    fn mode_text(&self) -> String {
+        format!(" {} ", self.mode)
     }
 
     fn totals_line(&self, theme: &ReviewTheme) -> Line {
@@ -175,9 +192,13 @@ fn publish_button<'a>(items: &'a [MenuItem], theme: &ReviewTheme) -> SplitButton
         .styles(theme.publish)
 }
 
+/// A source pill: the label padded by a cell on each side, on the pill fill.
 fn chip(label: &str) -> BadgeComponent<'_> {
     BadgeComponent::new("review.chip", label)
-        .policy(BadgePolicy::pill())
+        .policy(BadgePolicy {
+            padding: 1,
+            ..BadgePolicy::bare()
+        })
         .severity(BadgeSeverity::Info)
 }
 
@@ -224,7 +245,7 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
             HeaderPart::Drafts,
             text_width(&Line::raw(model.drafts_text())),
         ),
-        (HeaderPart::Mode, text_width(&Line::raw(model.mode.clone()))),
+        (HeaderPart::Mode, text_width(&Line::raw(model.mode_text()))),
         (HeaderPart::Publish, publish_button(&items, theme).width()),
     ];
     let title = text_width(&Line::raw(format!(" {}", model.title)));
@@ -323,7 +344,10 @@ pub fn paint_header(
         match part {
             HeaderPart::Title => text(
                 cx,
-                Line::from_spans(vec![Span::styled(format!(" {}", model.title), theme.title)]),
+                Line::from_spans(vec![Span::styled(
+                    format!(" {}", model.title),
+                    theme.tiers.strong,
+                )]),
             ),
             HeaderPart::Chip(index) => {
                 if let Some(source) = model.sources.get(*index) {
@@ -363,7 +387,9 @@ pub fn paint_header(
                 cx,
                 Line::from_spans(vec![Span::styled(
                     model.drafts_text(),
-                    if model.drafts > 0 {
+                    if model.drafts_need_reviewer() {
+                        theme.pill_warning
+                    } else if model.drafts > 0 {
                         theme.badge_draft
                     } else {
                         theme.muted
@@ -372,7 +398,7 @@ pub fn paint_header(
             ),
             HeaderPart::Mode => text(
                 cx,
-                Line::from_spans(vec![Span::styled(model.mode.clone(), theme.accent)]),
+                Line::from_spans(vec![Span::styled(model.mode_text(), theme.pill)]),
             ),
             HeaderPart::Publish => {
                 publish_button(&items, theme).paint(PUBLISH_ID, rect, publish, cx);
@@ -430,6 +456,18 @@ pub struct Status {
 
 /// Paint the footer row: hints that fit on the left, the status message on the right.
 pub fn paint_footer(
+    hints: &[(String, String)],
+    status: Option<&Status>,
+    theme: &ReviewTheme,
+    area: Rect,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    cx.with_style(theme.footer, |cx| {
+        paint_footer_row(hints, status, theme, area, cx);
+    });
+}
+
+fn paint_footer_row(
     hints: &[(String, String)],
     status: Option<&Status>,
     theme: &ReviewTheme,
@@ -595,6 +633,7 @@ mod tests {
             viewed: (3, 12),
             totals: (120, 45),
             drafts: 2,
+            unsaved: false,
             mode: "unified".to_owned(),
         }
     }
@@ -648,6 +687,33 @@ mod tests {
         assert!(wide.area(HeaderPart::Chip(1)).is_none());
         let two = plan_header(&model_of(2), 220, &theme);
         assert!(two.area(HeaderPart::Chip(1)).is_some());
+    }
+
+    #[test]
+    fn unsaved_drafts_are_a_warning_pill_and_saved_drafts_are_not() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let drafts_style = |unsaved: bool| {
+            let model = HeaderModel {
+                unsaved,
+                ..model_of(1)
+            };
+            let plan = plan_header(&model, 160, &theme);
+            let area = plan.area(HeaderPart::Drafts).expect("drafts shown");
+            let screen = crate::testing::harness::paint(160, 1, |row, cx| {
+                paint_header(&model, &plan, &theme, &SplitButtonState::default(), row, cx);
+            });
+            let text = screen.text_in(area, 0);
+            (text, screen.style_at(area.x + 1, 0))
+        };
+        let (text, style) = drafts_style(true);
+        assert!(
+            text.contains("2 drafts") && text.contains("unsaved"),
+            "{text}"
+        );
+        assert_eq!(style, theme.pill_warning);
+        let (text, style) = drafts_style(false);
+        assert!(!text.contains("unsaved"), "{text}");
+        assert_eq!(style.fg, theme.badge_draft.fg);
     }
 
     #[test]

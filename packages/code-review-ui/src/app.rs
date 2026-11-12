@@ -16,7 +16,7 @@
 use super::config::ReviewViewConfig;
 use super::entry::{self, Entry};
 use super::home::{Home, HomeOutcome};
-use super::theme::{IconStyle, ReviewTheme};
+use super::theme::ReviewTheme;
 use super::wizard::{Wizard, WizardOutcome};
 use super::{ReviewSurface, entry::transient_workspace};
 use crate::action::Action;
@@ -540,7 +540,7 @@ impl ReviewApp {
         }
         self.themed = true;
         self.theme_input = theme.copied();
-        self.theme = ReviewTheme::derive(theme, self.config.icons.unwrap_or(IconStyle::Unicode));
+        self.theme = self.config.theme(theme);
     }
 
     fn render_route(&mut self, area: Rect, cx: &mut PaintCx<'_, '_>) {
@@ -657,11 +657,15 @@ impl View for ReviewApp {
         host: &UiContext,
     ) {
         self.apply_theme(styles);
-        if let Route::Review(review) = &mut self.route {
-            review.render(area, frame, styles, host);
-            return;
-        }
-        self.render_route(area, frame);
+        // Every cell inherits the canvas, so text without a background of its own sits on the
+        // theme's canvas rather than the terminal's default background.
+        frame.with_style(self.theme.canvas, |frame| {
+            if let Route::Review(review) = &mut self.route {
+                review.render(area, frame, styles, host);
+                return;
+            }
+            self.render_route(area, frame);
+        });
     }
 
     fn handle_event(&mut self, event: &Event, host: &UiContext) -> EventResult {

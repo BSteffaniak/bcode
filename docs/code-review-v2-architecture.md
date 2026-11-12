@@ -940,13 +940,14 @@ them in when the same target opens again; saving the review moves them.
   built-in dark seed palette through `ComponentTheme::derive`, so tests and older hosts still get
   a complete, colorful theme.
 * Roles: status (added and removed follow the diff's added/removed colors; modified uses
-  warning, renamed info, binary muted italic), file path (bold; muted once viewed), directory,
-  `+`/`−` counts and change-bar cells (the diff's colors, unused cells in the border color),
-  badges (draft warning, open info, resolved success, outdated muted italic, AI accent italic),
-  viewed mark, gutter (the diff layout's gutter style, so line numbers and the role agree), hunk
-  header text and a full-row hunk fill (overlay surface), file header fill (raised surface; both
-  stay pinned as sticky headers), gaps and their actions (link), threads, the cursor line
-  (inactive-selection background) versus a selected range (selection background, kept distinct),
+  the accent, renamed the second accent, binary muted italic; see 13.4), file path (bold; muted
+  once viewed), directory, `+`/`−` counts and change-bar cells (the diff's colors, unused cells
+  dim), badges (draft second accent, open info, resolved success, outdated muted italic, AI
+  accent italic), viewed mark, gutter (the diff layout's gutter style, so line numbers and the
+  role agree), hunk header text and a full-row hunk fill (canvas), file header fill
+  (`surface_alt`; both stay pinned as sticky headers), gaps and their actions (link), threads,
+  the cursor line (inactive-selection background) versus a selected range (the accent mixed
+  into the canvas, kept distinct),
   pane border versus focused border, header and footer bars, filter input and placeholder, and
   scrollbar marks. The BMUX component styles (tree focused and unfocused, dividers, badges,
   progress bar, key hints, status bar, toasts, publish button) derive from the same theme.
@@ -2034,14 +2035,14 @@ The design learns from bdata (`packages/tui-components/src/theme.rs`, `draw.rs`,
 `packages/app/src/view` in that repository): a small set of semantic tiers, panels, and pills
 used consistently.
 
-* **Semantic tiers.** Surfaces `canvas`, `surface`, `surface_alt`, `overlay`; text `text`,
-  `strong`, `muted`, `dim`; accents `accent`, `accent_alt`, `on_accent`. Each tier is derived from
+* **Semantic tiers.** Surfaces `canvas`, `surface_alt`, `overlay`; text `text`, `strong`,
+  `muted`, `dim`; accents `accent`, `accent_alt`, `on_accent`. Each tier is derived from
   bcode theme roles (`surface.raised`, `surface.overlay`, `control.focused`, the theme accent, and
   so on) with fallbacks through `ComponentTheme::derive`, so every bcode theme, including ones
   that define few roles, produces a complete review theme.
 * **Warning means "needs you".** Warning color is reserved for things that need the reviewer
   (a pending permission, an unsaved review with comments, a failed AI request). Status roles stop
-  using it: modified files use warning today (6.3) and move to an accent or neutral role.
+  using it: modified files used warning (6.3) and move to an accent or neutral role.
 * **Components.** Rounded panels whose border and title take the accent when focused, with a
   right-aligned title for status; layered surfaces (canvas, panel, overlay); a header of pill
   chips; real button pills for actions such as publish; a `▌` selection bar on the selected row;
@@ -2051,6 +2052,62 @@ used consistently.
 * **Placement.** Generic pieces (rounded titled panels with right titles, pills, rail collapse and
   resize) go upstream into BMUX without review semantics (1.3); review-specific composition stays
   in the review UI.
+
+**Built.**
+
+* **Tiers** (`packages/code-review-ui/src/theme/tiers.rs`, `Tiers::derive`). The panes' body is
+  the canvas itself (a separate panel surface would only add a near-identical band around the
+  diff), so the surfaces are `canvas`, `surface_alt` (header and footer bars, file headers,
+  the comment composer card) and `overlay` (palette, pickers, modals, toasts, pills).
+  `surface_alt` and `overlay` use `surface.raised` and `surface.overlay` when they differ from
+  the canvas, else the text color mixed into an RGB canvas (6% and 10%), else no fill. `accent`
+  is `control.focused`, else the focused border, else the theme's accent. `accent_alt` is the
+  first of the syntax keyword, syntax type, info and link colors at least 40° of OKLCH hue from
+  the accent and 20° from success, error and info; without one an RGB accent is turned 70° in
+  hue and a terminal-color accent gets magenta. `dim` is muted mixed toward the canvas while it
+  keeps 2:1 contrast; `on_accent` is the canvas color on the accent when that reaches 4.5:1,
+  else black or white, and a terminal-color accent is reversed. Every review role
+  (`ReviewTheme`) and the BMUX component styles it passes on derive from the tiers.
+* **Surfaces are inherited.** The app paints inside `PaintCx::with_style(canvas)`, the bars
+  inside `with_style(surface_alt)`, and overlays inside `with_style(overlay)`, so text and
+  component cells without a background of their own sit on their tier instead of the terminal's
+  default background. A second component theme (`ReviewTheme::overlay_component`) makes lists,
+  empty states and menus inside overlays use the overlay as their canvas.
+* **Warning means "needs you".** Modified files take the accent, renamed and copied files
+  `accent_alt`; when the accent is the warning, added or removed color, modified files are
+  neutral bold text. Binary and truncated-file notices are muted italic. Drafts are a warning
+  pill (`N drafts · unsaved`) only while the review is unsaved; saved drafts use `accent_alt`.
+* **Panels.** Panes, pickers and modals use the theme's panel glyphs, rounded when the theme
+  sets none. A focused pane's border and title take the accent; unfocused titles are muted bold.
+  Counts sit at the right of the title row (`Files … 6`, `Review … 15 files`, `Threads … 3`)
+  through BMUX `Pane::right_title`, which yields to the title on narrow panes. Overlay titles are
+  padded off the border.
+* **Header and footer.** The header is a `surface_alt` bar: the title in strong text, source
+  pills, totals, viewed text and progress, the drafts count, the layout mode as a pill, and
+  Publish as a filled `on_accent` button. Footer hints show keys in the accent, labels muted and
+  separators dim.
+* **Selection bars.** The file tree and threads list reserve a column for BMUX
+  `TreeViewSelectionBar` (`▌`, or `>` with ASCII icons, in the accent); menus in the palette,
+  pickers, wizard and modals draw it through `SelectableListHighlightPolicy::styled`; home's
+  table draws it in the selected review's indentation.
+* **Composer card.** The comment composer is a `surface_alt` band with an accent bar in the
+  gutter two cells left of the editor; its submit action is a filled pill and the others are
+  neutral pills, with the same hit regions as before.
+* **Color depth.** `[tui] color_depth` (`auto`, `truecolor`, `ansi256`, `ansi16`, `none`) is
+  read like bcode's, and `auto` drops colors only for `NO_COLOR` or a dumb terminal. The run loop
+  reduces frames to that depth (`Terminal::set_color_depth`), and without colors the theme
+  (`ReviewTheme::for_color_depth`) turns background-only cues into modifiers: the cursor line
+  and a selected range are reversed (the range also underlined), search matches underlined,
+  filled pills and Publish reversed; selection bars stay.
+* **Verification.** Every bundled theme in both variants, and every profile over the default
+  theme, yields distinct status roles (for colored themes), no status in the warning color,
+  distinct accents, distinct cursor and range colors, layered surfaces and readable
+  `on_accent` text on RGB canvases (`theme::tests`). A screen test checks that no cell falls back
+  to the terminal background, the bars span the row, focus moves the accent between pane titles,
+  the tree's selection bar marks only the selected row, and the palette sits on the overlay with
+  its bar. The 400×120 screen benchmark stays under 1.6 ms p95 paint.
+* **Not built here.** Spinners beside each busy item, rail collapse beyond the file panel's
+  existing collapse and drag-resize, and a zoom that gives one pane the whole screen remain open.
 
 ### 13.5 Phase 11: inline AI live feed
 

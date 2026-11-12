@@ -460,9 +460,9 @@ impl Composer {
                 break;
             }
             let style = if button == Some(ComposerButton::Submit) {
-                theme.accent.patch(theme.selection)
+                theme.pill_accent
             } else {
-                theme.gap_action
+                theme.pill
             };
             spans.push(Span::styled(text, style));
             if let Some(button) = button {

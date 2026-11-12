@@ -40,7 +40,7 @@ use super::services::ReviewServices;
 use super::source::Decor;
 use super::source::DocumentSource;
 use super::syntax::{MAX_HIGHLIGHT_BYTES, MAX_HIGHLIGHT_LINES, SyntaxStore};
-use super::theme::{IconStyle, ReviewTheme};
+use super::theme::ReviewTheme;
 use crate::action::Action;
 use crate::action::EventResult;
 use crate::config::DiffLayout;
@@ -80,7 +80,8 @@ use bmux_tui_components::text_input::{
 };
 use bmux_tui_components::toast_stack::ToastSeverity;
 use bmux_tui_components::tree_view::{
-    TreeViewComponent, TreeViewItem, TreeViewLabelOverflow, TreeViewState, TreeViewTrailingLayout,
+    TreeViewComponent, TreeViewItem, TreeViewLabelOverflow, TreeViewSelectionBar, TreeViewState,
+    TreeViewTrailingLayout,
 };
 use bmux_tui_components::virtual_list::{
     AnchorPolicy, Edge, ListAnchor, ListPosition, ScrollbarMark, StickyHeaders, VirtualListAction,
@@ -2869,7 +2870,7 @@ impl ReviewSurface {
             return;
         }
         self.theme_input = theme.copied();
-        self.theme = ReviewTheme::derive(theme, self.config.icons.unwrap_or(IconStyle::Unicode));
+        self.theme = self.config.theme(theme);
         if let Some(theme) = theme {
             self.syntax.set_palette(theme.syntax);
         }
@@ -2917,7 +2918,10 @@ impl ReviewSurface {
             area.height - top - u16::from(footer),
         );
         if rail {
-            self.paint_rail(Rect::new(area.x, area.y + 1, area.width, 1), cx);
+            let bar = self.theme.header_bar;
+            cx.with_style(bar, |cx| {
+                self.paint_rail(Rect::new(area.x, area.y + 1, area.width, 1), cx);
+            });
         } else {
             self.rail = None;
         }
@@ -2927,12 +2931,18 @@ impl ReviewSurface {
             self.paint_loading(body, cx);
         }
         if header {
-            self.paint_header(Rect::new(area.x, area.y, area.width, 1), cx);
+            let bar = self.theme.header_bar;
+            cx.with_style(bar, |cx| {
+                self.paint_header(Rect::new(area.x, area.y, area.width, 1), cx);
+            });
         } else {
             self.header = None;
         }
         if footer {
-            self.paint_footer(Rect::new(area.x, area.bottom() - 1, area.width, 1), cx);
+            let bar = self.theme.footer;
+            cx.with_style(bar, |cx| {
+                self.paint_footer(Rect::new(area.x, area.bottom() - 1, area.width, 1), cx);
+            });
         }
         self.toasts.paint(&self.theme, body, cx);
         let theme = self.theme;
@@ -3024,6 +3034,7 @@ impl ReviewSurface {
             viewed,
             totals,
             drafts: self.notes.draft_count(),
+            unsaved: self.is_transient(),
             mode,
         }
     }
@@ -3528,11 +3539,10 @@ impl ReviewSurface {
         } else {
             format!("{}/{}", files.matches(), files.file_count())
         };
+        let focused = matches!(self.focus, Focus::Files | Focus::Filter);
         Pane::new()
-            .title(Line::from_spans(vec![
-                Span::styled(" Files ", theme.title),
-                Span::styled(format!("{count} "), theme.muted),
-            ]))
+            .title(theme.pane_title("Files", focused))
+            .right_title(theme.pane_status(&count))
             .action(PaneTitleAction::new(
                 "collapse",
                 Line::from_spans(vec![Span::styled(
@@ -3569,16 +3579,11 @@ impl ReviewSurface {
         let review_pane = Self::pane(
             REVIEW_PANE_ID,
             Pane::new()
-                .title(Line::from_spans(vec![
-                    Span::styled(" Review ", theme.title),
-                    Span::styled(
-                        {
-                            let files = review.files.file_count();
-                            format!("{files} file{} ", if files == 1 { "" } else { "s" })
-                        },
-                        theme.muted,
-                    ),
-                ]))
+                .title(theme.pane_title("Review", self.focus == Focus::Review))
+                .right_title(theme.pane_status(&{
+                    let files = review.files.file_count();
+                    format!("{files} file{}", if files == 1 { "" } else { "s" })
+                }))
                 .styles(self.pane_styles())
                 .chrome(theme.component.chrome),
             self.focus == Focus::Review,
@@ -3628,7 +3633,8 @@ impl ReviewSurface {
             } else {
                 theme.tree
             })
-            .focus_style(Style::new());
+            .focus_style(Style::new())
+            .selection_bar(theme.tree_selection_bar());
         let viewport = ScrollViewComponent::new(
             TREE_VIEWPORT_ID,
             LogicalSize::new(0, 0),
@@ -3670,10 +3676,8 @@ impl ReviewSurface {
         let count = threads.keys.len();
         drop(threads);
         let chrome = Pane::new()
-            .title(Line::from_spans(vec![
-                Span::styled(" Threads ", theme.title),
-                Span::styled(format!("{count} "), theme.muted),
-            ]))
+            .title(theme.pane_title("Threads", self.focus == Focus::Threads))
+            .right_title(theme.pane_status(&count.to_string()))
             .styles(self.pane_styles())
             .chrome(theme.component.chrome);
         let focused = self.focus == Focus::Threads;
@@ -3692,19 +3696,25 @@ impl ReviewSurface {
             } else {
                 theme.tree
             },
+            theme.tree_selection_bar(),
         );
         Self::pane(THREADS_PANE_ID, chrome, focused, &self.threads_pane, list)
     }
 }
 
 /// The threads list: a flat BMUX tree over the cached thread rows.
-struct ThreadsList<'a>(&'a Review, bmux_tui_components::tree_view::TreeViewStyles);
+struct ThreadsList<'a>(
+    &'a Review,
+    bmux_tui_components::tree_view::TreeViewStyles,
+    TreeViewSelectionBar,
+);
 
 impl Component for ThreadsList<'_> {
     fn revision(&self) -> ComponentRevision {
         let threads = self.0.threads.borrow();
         TreeViewComponent::new(THREADS_TREE_ID, &threads.items, &self.0.threads_state)
             .styles(self.1)
+            .selection_bar(self.2)
             .revision()
     }
 
@@ -3712,6 +3722,7 @@ impl Component for ThreadsList<'_> {
         let threads = self.0.threads.borrow();
         TreeViewComponent::new(THREADS_TREE_ID, &threads.items, &self.0.threads_state)
             .styles(self.1)
+            .selection_bar(self.2)
             .layout(constraints, cx)
     }
 
@@ -3719,6 +3730,7 @@ impl Component for ThreadsList<'_> {
         let threads = self.0.threads.borrow();
         TreeViewComponent::new(THREADS_TREE_ID, &threads.items, &self.0.threads_state)
             .styles(self.1)
+            .selection_bar(self.2)
             .focus_style(Style::new())
             .paint(layout, cx);
     }
@@ -3727,6 +3739,7 @@ impl Component for ThreadsList<'_> {
         let threads = self.0.threads.borrow();
         TreeViewComponent::new(THREADS_TREE_ID, &threads.items, &self.0.threads_state)
             .styles(self.1)
+            .selection_bar(self.2)
             .event(event, layout, cx)
     }
 }
@@ -4134,7 +4147,8 @@ impl ReviewSurface {
         theme: Option<&ComponentStyles>,
     ) {
         self.apply_theme(theme);
-        self.render_frame(area, frame);
+        let canvas = self.theme.canvas;
+        frame.with_style(canvas, |frame| self.render_frame(area, frame));
     }
 
     /// The linked session opened from the review returned (or failed to open).
@@ -4210,7 +4224,8 @@ impl View for ReviewSurface {
     ) {
         self.host_layout = host.diff_layout();
         self.apply_theme(theme);
-        self.render_frame(area, frame);
+        let canvas = self.theme.canvas;
+        frame.with_style(canvas, |frame| self.render_frame(area, frame));
     }
 
     fn handle_event(&mut self, event: &Event, host: &UiContext) -> EventResult {

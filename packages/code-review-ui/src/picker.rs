@@ -93,6 +93,7 @@ pub struct PickerMessage {
 /// A query input over a menu of items.
 pub struct Picker {
     id: &'static str,
+    /// Frame title, padded with a space on each side.
     title: String,
     footer: String,
     placeholder: String,
@@ -128,7 +129,8 @@ impl Picker {
         policy.edge = EdgePolicy::disabled();
         Self {
             id,
-            title: title.into(),
+            // Padded so the title sits apart from the border.
+            title: format!(" {} ", title.into()),
             footer: String::new(),
             placeholder: input.unwrap_or_default().to_owned(),
             items: Vec::new(),
@@ -321,7 +323,7 @@ impl Picker {
                     })
                     .body(&self.body)
                     .policy(EmptyStatePolicy::centered())
-                    .styles(theme.component.empty_state_styles());
+                    .styles(theme.overlay_component.empty_state_styles());
             PickerFrameComponent::new(self.id, frame, empty)
         } else {
             // The picker keeps one active row for keys and pointer alike, so a click on the
@@ -329,8 +331,8 @@ impl Picker {
             let mut policy = MenuPolicy::interactive();
             policy.navigation = MenuNavigation::ActiveItem;
             let menu = MenuComponent::new(self.menu_id(), &self.menu_items, &self.menu)
-                .policy(policy)
-                .styles(theme.component.selectable_list_styles())
+                .policy(theme.menu_policy(policy))
+                .styles(theme.overlay_component.selectable_list_styles())
                 .outcome(&self.outcome);
             PickerFrameComponent::new(self.id, frame, menu)
         };
@@ -354,12 +356,14 @@ impl Picker {
         let layout = {
             let frame = self.frame(theme, area.size());
             let layout = frame.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-            cx.with_child(
-                i32::from(area.x),
-                i64::from(area.y),
-                LocalRect::new(0, 0, area.width, area.height),
-                |cx| frame.paint(&layout, cx),
-            );
+            cx.with_style(theme.tiers.overlay, |cx| {
+                cx.with_child(
+                    i32::from(area.x),
+                    i64::from(area.y),
+                    LocalRect::new(0, 0, area.width, area.height),
+                    |cx| frame.paint(&layout, cx),
+                );
+            });
             layout
         };
         self.painted = Some((area, layout));
