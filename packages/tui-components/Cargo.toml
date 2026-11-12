@@ -13,7 +13,7 @@ version     = { workspace = true }
 [[bin]]
 name              = "bcode_terminal_grid_probe"
 path              = "src/bin/bcode_terminal_grid_probe.rs"
-required-features = ["terminal-viewer"]
+required-features = ["grid-probe"]
 
 [dependencies]
 bcode_markdown_render     = { workspace = true, optional = true }
@@ -56,6 +56,7 @@ composer = []
 default = []
 diff-viewer = ["bmux_tui_components/diff-viewer"]
 fail-on-warnings = []
+grid-probe = ["terminal-viewer", "dep:serde_json"]
 permission = ["bmux_tui_components/modal-frame"]
 plugin-visual = [
     "dep:bcode_markdown_render",

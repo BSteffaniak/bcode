@@ -1,0 +1,124 @@
+{
+ "accept_prompts": {
+  "marker": "Do you want",
+  "label": "permission",
+  "keys": "1",
+  "settle": 1.0
+ },
+ "turns": [
+  {
+   "delay": 6,
+   "blocks": [
+    {
+     "type": "thinking",
+     "thinking": "The user wants a tour. I should read the main file first, then run a build step and update the greeting."
+    },
+    {
+     "type": "text",
+     "text": "I'll start by reading the entry point."
+    },
+    {
+     "type": "tool_use",
+     "id": "toolu_01",
+     "name": "Read",
+     "input": {
+      "file_path": "{PROJECT}/src/main.rs"
+     }
+    }
+   ]
+  },
+  {
+   "blocks": [
+    {
+     "type": "text",
+     "text": "Now I'll generate the build log."
+    },
+    {
+     "type": "tool_use",
+     "id": "toolu_02",
+     "name": "Bash",
+     "input": {
+      "command": "touch build.log && seq 1 40",
+      "description": "Generate the build log"
+     }
+    }
+   ]
+  },
+  {
+   "blocks": [
+    {
+     "type": "tool_use",
+     "id": "toolu_03",
+     "name": "Edit",
+     "input": {
+      "file_path": "{PROJECT}/src/main.rs",
+      "old_string": "println!(\"hello\");",
+      "new_string": "println!(\"hello, world\");"
+     }
+    }
+   ]
+  },
+  {
+   "blocks": [
+    {
+     "type": "tool_use",
+     "id": "toolu_04",
+     "name": "Bash",
+     "input": {
+      "command": "cat missing.txt",
+      "description": "Show the missing file"
+     }
+    }
+   ]
+  },
+  {
+   "blocks": [
+    {
+     "type": "text",
+     "text": "## Summary\n\nThe project is a **tiny Rust binary** with one entry point:\n\n- `src/main.rs` prints a greeting\n- `README.md` describes the project\n\nChanges made:\n\n1. Updated the greeting to `hello, world`\n2. Generated `build.log`\n\n```rust\nfn main() {\n    println!(\"hello, world\");\n}\n```\n\n| File | Status |\n|------|--------|\n| src/main.rs | modified |\n| build.log | created |\n\n> Note: `missing.txt` does not exist, so that step failed."
+    }
+   ]
+  }
+ ],
+ "steps": [
+  {
+   "expect": [
+    "❯"
+   ],
+   "settle": 2,
+   "snapshot": "start",
+   "type": "Give me a tour of the project"
+  },
+  {
+   "expect": [
+    "❯ Give me a tour"
+   ],
+   "settle": 0.5,
+   "send": "\r"
+  },
+  {
+   "expect": [
+    "esc to interrupt"
+   ],
+   "settle": 0.0,
+   "snapshot": "working",
+   "frames": 6,
+   "interval": 0.15,
+   "timeout": 20
+  },
+  {
+   "expect": [
+    "Summary",
+    "missing.txt"
+   ],
+   "settle": 2,
+   "snapshot": "final",
+   "timeout": 90,
+   "send": "\u000f"
+  },
+  {
+   "settle": 2,
+   "snapshot": "expanded"
+  }
+ ]
+}

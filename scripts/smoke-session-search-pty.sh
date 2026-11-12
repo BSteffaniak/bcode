@@ -48,7 +48,7 @@ trap cleanup EXIT
 cd "${root}"
 if [[ "${BCODE_SESSION_SEARCH_PTY_SKIP_BUILD:-0}" != "1" ]]; then
     cargo build "${cargo_profile_args[@]}" --quiet -p bcode --features distribution
-    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --features terminal-viewer --bin bcode_terminal_grid_probe
+    cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --features grid-probe --bin bcode_terminal_grid_probe
 fi
 if [[ ! -x "${bcode_binary}" || ! -x "${grid_probe_binary}" ]]; then
     echo "smoke-session-search-pty: required binaries are missing" >&2

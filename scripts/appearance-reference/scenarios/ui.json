@@ -1,0 +1,137 @@
+{
+ "accept_prompts": {
+  "marker": "Do you want",
+  "label": "permission",
+  "keys": "1",
+  "settle": 1.0
+ },
+ "turns": [
+  {
+   "blocks": [
+    {
+     "type": "text",
+     "text": "Running the slow check."
+    },
+    {
+     "type": "tool_use",
+     "id": "toolu_11",
+     "name": "Bash",
+     "input": {
+      "command": "for i in 1 2 3 4 5 6; do echo step $i; sleep 1; done",
+      "description": "Run the slow check"
+     }
+    }
+   ]
+  },
+  {
+   "blocks": [
+    {
+     "type": "tool_use",
+     "id": "toolu_12",
+     "name": "AskUserQuestion",
+     "input": {
+      "questions": [
+       {
+        "question": "Which greeting should the program print?",
+        "header": "Greeting",
+        "multiSelect": false,
+        "options": [
+         {
+          "label": "hello, world",
+          "description": "The classic greeting"
+         },
+         {
+          "label": "hi there",
+          "description": "A shorter, friendlier greeting"
+         }
+        ]
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "blocks": [
+    {
+     "type": "text",
+     "text": "Great — I'll use **hello, world**."
+    }
+   ]
+  }
+ ],
+ "steps": [
+  {
+   "expect": [
+    "❯"
+   ],
+   "settle": 2,
+   "snapshot": "start",
+   "type": "/"
+  },
+  {
+   "expect": [
+    "/"
+   ],
+   "settle": 1,
+   "snapshot": "slash-menu",
+   "send": "\u001b"
+  },
+  {
+   "settle": 0.5,
+   "send": "\u0015"
+  },
+  {
+   "settle": 1,
+   "type": "?"
+  },
+  {
+   "settle": 1,
+   "snapshot": "shortcuts",
+   "send": "\u001b"
+  },
+  {
+   "settle": 1,
+   "send": "\u0015"
+  },
+  {
+   "settle": 0.5,
+   "type": "Run the slow check"
+  },
+  {
+   "expect": [
+    "❯ Run the slow check"
+   ],
+   "settle": 0.5,
+   "send": "\r"
+  },
+  {
+   "expect": [
+    "Running",
+    "esc to interrupt"
+   ],
+   "settle": 0.0,
+   "snapshot": "tool-running",
+   "frames": 3,
+   "interval": 0.5,
+   "timeout": 40
+  },
+  {
+   "expect": [
+    "Which greeting"
+   ],
+   "settle": 1.5,
+   "snapshot": "question",
+   "timeout": 40,
+   "send": "\r"
+  },
+  {
+   "expect": [
+    "I'll use"
+   ],
+   "settle": 2,
+   "snapshot": "final",
+   "timeout": 40
+  }
+ ]
+}
