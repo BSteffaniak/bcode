@@ -85,6 +85,10 @@ See:
 * [`in_memory_session`](../packages/bcode/examples/in_memory_session.rs)
 * [`local_session_store`](../packages/bcode/examples/local_session_store.rs)
 
+SDK sessions live in the application's own store and are not Bcode sessions: `bcode tui` and
+other consumers cannot list or resume them. For conversations that should be canonical Bcode
+sessions, see [Embedded sessions](embedded-sessions.md).
+
 ## Middleware, reliability, and observability
 
 The SDK supports:

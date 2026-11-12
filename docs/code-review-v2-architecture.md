@@ -2265,23 +2265,60 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
 
 ### 13.7 Phase 13: embedded-session model (Bcode-wide)
 
-This phase changes Bcode beyond the review and needs its own specification and sign-off before
-implementation. The goal: bdata and any other consumer, embedded or not, create real bcode
-sessions that are visible and resumable everywhere.
+This phase changes Bcode beyond the review. The goal: bdata and any other consumer, embedded or
+not, create real bcode sessions that are visible, resumable and observable everywhere. The full
+design is [`embedded-sessions.md`](embedded-sessions.md). It is **specified and awaiting
+sign-off** on its decisions D1–D8; nothing is built yet.
 
-* **One runtime.** The daemon is the single session runtime. "Embedded" means an in-process
-  client of the daemon, not a second runtime.
-* **Client-hosted tools.** An app registers typed tools on its connection; the daemon routes
-  calls for them back to that connection. When the app is not connected, a call fails with a
-  clear tool error and the session history stays intact.
-* **Session origin.** Sessions record their origin (app and app context) for listing and
-  filtering.
-* **Sanctioned daemon start.** Consumer apps get a supported way to start the daemon. Apps that
-  use the user's installed Bcode have one: `BcodeClient::for_installed_bcode` verifies the
-  installed executable's daemon and starts it with `bcode server start`; the explicit
-  constructor, `BcodeClient::for_daemon`, still only attaches to a running one.
-* **SDK mode.** The in-process SDK mode remains for stateless use and app-owned persistence.
-* bdata's migration to this model is follow-up work in that repository.
+* **Modes.** *Attached* (the default): the app is a client of the installed Bcode's daemon, and
+  sessions live in the user's canonical store. *SDK-local* is unchanged and remains for
+  stateless use and app-owned persistence. Its sessions are not Bcode sessions. *App-hosted*
+  (the app's linked Bcode running as a daemon on the shared store) is deferred. If built, it must
+  never migrate sessions in the shared location. An app never falls back silently to another
+  mode or state location.
+* **Session bridge.** Clients verify the daemon's protocol, writer epoch and event schema against
+  their own build. An app built against another Bcode revision therefore cannot talk to the
+  installed daemon directly.
+  * Out-of-tree apps start `bcode session-bridge --stdio` from the verified installed executable.
+    The bridge is an exact-match client of its own daemon and speaks a separately versioned
+    JSON-lines protocol to the app, with a compatibility window of the current and two previous
+    versions.
+  * It returns a stable, versioned view of `SessionViewSnapshot`, in which unknown item kinds
+    degrade to a generic item.
+  * Apps link only the thin `bcode_session_bridge` client.
+  * In-tree apps (`bcode-review`, `bcode-git`) keep using `BcodeClient` directly.
+* **Session origin.** A new canonical `SessionOriginRecorded` event records the app id, display
+  name, bounded secret-free context and visibility.
+  * It is written in the creation prefix (like `ExecutionSessionCreated`), and it is immutable.
+  * The catalog and manifest carry it only as display caches. It is not backfilled, and an
+    unreadable origin is reported as unclassified, not hidden.
+  * It confers no authority.
+  * Pickers show an origin chip, and `SessionCatalogQuery` and `bcode session list --origin`
+    filter on it. `Background` origin sessions stay out of pickers.
+* **App-provided tools.** An app registers namespaced tools (`bdata.run_query`), each with a
+  `ToolPolicyOperation`, on its connection. The tools are offered only in sessions that a live
+  connection of the provider has claimed, and the set is fixed per turn.
+  * Calls pass the shared permission policy first; any observer may answer a prompt.
+  * The daemon then routes `invoke` to the app, with cancellation and a deadline. Results go
+    through tool-result safety.
+  * A disconnect fails the call (`client_tool_disconnected` / `client_tool_unavailable`). Daemon
+    loss turns the call into an interrupted result. Calls are never replayed.
+  * Apps stop evaluating Bcode permissions themselves.
+* **Profiles and context.** Apps may contribute agent profiles that restrict tools but cannot
+  grant permissions, and that fail closed when the app is absent. Turn context blocks are durable
+  by default and request-only on request.
+* **Import.** A bundled `sdk-session-import` plugin imports `PersistedSession` JSON files that the
+  caller names explicitly. Each file becomes a new canonical session with import provenance and
+  an origin. Import is idempotent by external id and reports conflicts.
+* **Order.** Origin, then app tools in the daemon, then the bridge, then profiles and context,
+  then import, then adoption. bdata's migration is follow-up work in that repository.
+* **Invariants.** No change to `INVARIANTS.md` is needed. Two candidates (origin is descriptive;
+  client-provided capabilities fail closed) should be evaluated with `add-invariant` when they are
+  implemented.
+* **Already built.** Apps that use the user's installed Bcode have a supported daemon start:
+  `BcodeClient::for_installed_bcode` verifies the installed executable's daemon and starts it with
+  `bcode server start`. The explicit constructor, `BcodeClient::for_daemon`, still only attaches
+  to a running daemon.
 
 ### 13.8 Phase 14: close
 

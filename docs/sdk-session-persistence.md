@@ -5,6 +5,10 @@ sessions. It does not depend on Bcode's local session database, catalog, daemon,
 Applications may store `PersistedSession` in files, databases, object stores, browser/desktop
 bridges, or their own services.
 
+These sessions stay application-owned; they are not canonical Bcode sessions and do not appear in
+Bcode's catalog. [Embedded sessions](embedded-sessions.md) describes canonical sessions for
+embedding applications and the explicit import of `PersistedSession` files.
+
 ## Versioned payload
 
 `PersistedSession.schema_version` uses `PERSISTED_SESSION_SCHEMA_VERSION`. Version 1 stores the
