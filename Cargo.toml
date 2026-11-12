@@ -127,6 +127,9 @@ members = [
     "packages/session-view",
     "packages/session-view/models",
     "packages/session-import",
+    "packages/session-bridge",
+    "packages/session-bridge/models",
+    "packages/session-bridge/server",
     "packages/session-search",
     "packages/skill",
     "packages/skill/models",
@@ -331,6 +334,9 @@ bcode_server                            = { version = "0.0.1-alpha.0", default-f
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }
 bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
+bcode_session_bridge                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge" }
+bcode_session_bridge_models             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/models" }
+bcode_session_bridge_server             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/server" }
 bcode_session_migration                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration" }
 bcode_session_migration_target          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration-target" }
 bcode_session_milestones_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-milestones-plugin" }

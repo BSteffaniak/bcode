@@ -1,0 +1,40 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "The Bcode side of the session bridge: adapts the versioned bridge protocol to the daemon"
+edition     = { workspace = true }
+keywords    = ["bcode", "bridge", "server", "session"]
+license     = { workspace = true }
+name        = "bcode_session_bridge_server"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_agent_profile         = { workspace = true }
+bcode_client                = { workspace = true }
+bcode_model                 = { workspace = true }
+bcode_session_bridge_models = { workspace = true }
+bcode_session_models        = { workspace = true }
+bcode_session_view          = { workspace = true, features = ["client"] }
+bcode_session_view_models   = { workspace = true }
+bcode_tool                  = { workspace = true }
+serde_json                  = { workspace = true, features = ["std"] }
+tokio                       = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+bcode_agent_runtime         = { workspace = true }
+bcode_config                = { workspace = true }
+bcode_fake_provider_plugin  = { workspace = true, features = ["static-bundled"] }
+bcode_ipc                   = { workspace = true }
+bcode_model_catalog         = { workspace = true }
+bcode_plugin                = { workspace = true }
+bcode_sdk_session_import_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_server                = { workspace = true }
+bcode_session_bridge        = { workspace = true }
+tempfile                    = { workspace = true }
+tokio                       = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
+
+[features]
+default          = []
+fail-on-warnings = []

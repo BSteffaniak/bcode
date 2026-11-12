@@ -1842,6 +1842,8 @@ dependencies = [
  "bcode_ralph_models",
  "bcode_server",
  "bcode_session",
+ "bcode_session_bridge_models",
+ "bcode_session_bridge_server",
  "bcode_session_import",
  "bcode_session_migration",
  "bcode_session_models",
@@ -3427,6 +3429,50 @@ dependencies = [
  "url 2.5.8",
  "uuid",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "bcode_session_bridge"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_bridge_models",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_session_bridge_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_session_bridge_server"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_agent_profile",
+ "bcode_agent_runtime",
+ "bcode_client",
+ "bcode_config",
+ "bcode_fake_provider_plugin",
+ "bcode_ipc",
+ "bcode_model",
+ "bcode_model_catalog",
+ "bcode_plugin",
+ "bcode_sdk_session_import_plugin",
+ "bcode_server",
+ "bcode_session_bridge",
+ "bcode_session_bridge_models",
+ "bcode_session_models",
+ "bcode_session_view",
+ "bcode_session_view_models",
+ "bcode_tool",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -38,6 +38,8 @@ bcode_provider_auth_models = { workspace = true }
 bcode_ralph_models = { workspace = true }
 bcode_server = { workspace = true }
 bcode_session = { workspace = true }
+bcode_session_bridge_models = { workspace = true }
+bcode_session_bridge_server = { workspace = true }
 bcode_session_import = { workspace = true }
 bcode_session_migration = { workspace = true }
 bcode_session_models = { workspace = true }
@@ -65,7 +67,7 @@ rpassword = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["process", "signal", "time"] }
+tokio = { workspace = true, features = ["io-std", "process", "signal", "time"] }
 toml = { workspace = true, features = ["parse", "serde"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

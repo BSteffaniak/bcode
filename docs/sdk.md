@@ -92,6 +92,10 @@ creates sessions tagged with its origin (`BcodeClient::create_session_with_origi
 tools that run in its own process (`bcode_client::client_tools::ClientToolProvider`), and imports
 existing SDK JSON conversations (`BcodeClient::import_session_file` with source `sdk-json`). The
 [`embedded_session`](../packages/bcode/examples/embedded_session.rs) example does all three.
+Those clients must be the same Bcode build as the installed daemon. An application built outside
+the Bcode workspace links `bcode_session_bridge` instead, which starts the installed Bcode's
+versioned `bcode session-bridge --stdio` and offers the same operations; see the
+[`bridge_app`](../packages/session-bridge/examples/bridge_app.rs) example.
 
 ## Middleware, reliability, and observability
 

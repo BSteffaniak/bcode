@@ -2279,9 +2279,8 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
 This phase changes Bcode beyond the review. The goal: bdata and any other consumer, embedded or
 not, create real bcode sessions that are visible, resumable and observable everywhere. The full
 design is [`embedded-sessions.md`](embedded-sessions.md); its section "What is built" is the
-reference for the shipped contracts. Session origin, app-provided tools for in-tree apps and the
-SDK JSON importer are built. The session bridge, app profiles, turn context and the app-hosted
-runtime are not, and decisions D1–D8 still need sign-off for those parts.
+reference for the shipped contracts. Everything except the deferred app-hosted runtime is built;
+decisions D1–D8 were written before the build and have not been signed off.
 
 * **Built.**
   * Origin is a field of the canonical `SessionCreated` event, so it is immutable and in the
@@ -2300,8 +2299,20 @@ runtime are not, and decisions D1–D8 still need sign-off for those parts.
     into canonical sessions with provenance, an origin and a content digest; identical re-imports
     are idempotent and different content is a reported conflict.
   * `packages/bcode/examples/embedded_session.rs` shows all three against the installed daemon.
-  * bdata's adoption is specified step by step in the design and has not been started in the
-    bdata repository.
+  * The session bridge: `bcode session-bridge --stdio` serves a JSON-lines protocol (version 1,
+    window of the current and two earlier versions) as an exact-match client of its own daemon.
+    `bcode_session_bridge_models` holds the protocol, `bcode_session_bridge` is the thin client
+    (serde, thiserror and tokio only) and `bcode_session_bridge_server` adapts every operation to a daemon
+    application operation. Observation sends complete stable views; unknown item kinds decode as
+    `other`. Tool invocations are served concurrently through a split provider connection.
+    `packages/session-bridge/examples/bridge_app.rs` is an out-of-tree style app on the bridge.
+  * Contributed agent profiles narrow a base agent (tools intersected, instructions appended, the
+    base agent's policy decides every call), are listed while their application is connected,
+    and turns that select an unavailable one fail with `agent_profile_unavailable`.
+  * Turn context blocks are stored with the user message by default and read by later turns;
+    request-only blocks stay in daemon memory for their turn and fail it closed when lost.
+  * bdata's adoption on the bridge is specified step by step in the design and has not been
+    started in the bdata repository.
 
 * **Modes.** *Attached* (the default): the app is a client of the installed Bcode's daemon, and
   sessions live in the user's canonical store. *SDK-local* is unchanged and remains for

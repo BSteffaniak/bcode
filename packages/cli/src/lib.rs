@@ -905,6 +905,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             .await?;
         }
         Commands::Xray(args) => Box::pin(xray_launch::run(&args)).await?,
+        Commands::SessionBridge { stdio: _ } => run_session_bridge().await?,
         Commands::ArtifactId => write_artifact_id()?,
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Harness { command } => harness::execute(command).await?,
@@ -4784,6 +4785,7 @@ async fn handle_session_io_command(
         | Commands::RuntimeWork { .. }
         | Commands::Ralph { .. }
         | Commands::Xray(_)
+        | Commands::SessionBridge { .. }
         | Commands::Workflow { .. } => unreachable!("handled by handle_cli"),
         #[cfg(feature = "web-renderer")]
         Commands::Web { .. } => unreachable!("handled by handle_cli"),
@@ -5208,6 +5210,13 @@ impl Cli {
 enum Commands {
     /// Open the browser X-ray inspector for a session, or explicitly choose one.
     Xray(xray_launch::XrayLaunchArgs),
+    /// Let an application built outside Bcode use Bcode sessions: serve the versioned session
+    /// bridge protocol as JSON lines on stdin and stdout until stdin closes.
+    SessionBridge {
+        /// Speak the protocol on stdin and stdout (the only transport).
+        #[arg(long, required = true)]
+        stdio: bool,
+    },
     /// Manage external execution backends through the daemon application.
     Harness {
         #[command(subcommand)]
@@ -21374,6 +21383,25 @@ async fn handle_session_import_command(command: SessionImportCommand) -> Result<
             Box::pin(import_session_files(&client, command)).await?;
         }
     }
+    Ok(())
+}
+
+/// Serve the session bridge on stdin and stdout for an application built outside Bcode. The
+/// bridge is an ordinary client of this executable's own daemon (started when needed), so its
+/// daemon protocol always matches.
+async fn run_session_bridge() -> Result<(), CliError> {
+    let options = bcode_session_bridge_server::BridgeOptions {
+        versions: bcode_session_bridge_models::VersionRange::supported(),
+        bcode_version: build_info().version().to_owned(),
+        executable: std::env::current_exe()?,
+    };
+    bcode_session_bridge_server::serve(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        BcodeClient::default_endpoint(),
+        options,
+    )
+    .await?;
     Ok(())
 }
 

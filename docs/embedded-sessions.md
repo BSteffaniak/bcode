@@ -6,11 +6,11 @@ sessions. Those sessions should be listable, resumable and observable from `bcod
 any other Bcode consumer, whether that consumer embeds Bcode or not. This document specifies how
 that works.
 
-**Status.** Session origin, app-provided tools for apps built in the Bcode workspace, and the SDK
-JSON importer are built; [What is built](#what-is-built) lists the contracts and where they differ
-from the specification below. The session bridge for apps built outside the workspace, app
-profiles, turn context blocks and the app-hosted runtime are not built yet. The decisions at the
-end still need sign-off for the parts that are not built.
+**Status.** Session origin, app-provided tools, the SDK JSON importer, the session bridge for apps
+built outside the Bcode workspace, app-contributed agent profiles and turn context blocks are
+built; [What is built](#what-is-built) lists the contracts and where they differ from the
+specification below. The app-hosted runtime stays deferred (decision D2). The decisions at the end
+were written before the build and have not been signed off.
 
 Related contracts: [session persistence](session-persistence-architecture.md),
 [state locations](state-locations.md), [daemon lifecycle](daemon-lifecycle-architecture.md),
@@ -61,6 +61,9 @@ Related contracts: [session persistence](session-persistence-architecture.md),
 * `bcode_client::client_tools::ClientToolProvider` owns one connection: it registers, claims,
   creates sessions (claimed when their origin names the provider), receives requests and answers
   them; `serve` runs a handler loop.
+  `ClientToolProvider::into_concurrent` splits the connection into a cloneable
+  `ClientToolHandle` and a `ClientToolRequests` stream, so invocations can be answered
+  concurrently and claims or re-registrations do not wait for running calls.
 * The daemon keeps registrations, claims and pending invocations in memory per connection. When a
   turn starts, the claimant's tools are pinned in the turn's tool catalog next to plugin tools.
   The agent-profile contract carries them as `claimed_tools` and `claimed`; the default agents
@@ -97,23 +100,133 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   content under the same session id fails with `session_import_conflict` and nothing is merged.
   Source files are only read.
 
+### Session bridge
+
+* Crates: `bcode_session_bridge_models` (`packages/session-bridge/models`, a leaf: serde and
+  serde_json only) holds the wire protocol; `bcode_session_bridge` (`packages/session-bridge`,
+  serde, thiserror and tokio only) is the thin client applications link; `bcode_session_bridge_server`
+  (`packages/session-bridge/server`) is the Bcode side, run by `bcode session-bridge --stdio`.
+* Transport: JSON lines on the bridge's stdin and stdout. The application writes `ClientFrame`s
+  (`{"id": n, "request": {"op": ...}}`); the bridge writes `BridgeFrame`s: `response` frames
+  carrying `ok` (a `kind`-tagged response) or `error` (`code`, `message`), and `event` frames.
+  Requests run concurrently; responses are matched by id.
+* Versions: `BRIDGE_PROTOCOL_VERSION` is 1 and the window is the current version and up to two
+  earlier ones (`VersionRange::supported()`). `hello` must come first (`hello_required`
+  otherwise); it returns the highest shared version, the bridge's window and the Bcode version,
+  or `version_mismatch` with a message naming both ranges and whether to update the application
+  or Bcode. Requests reject unknown fields (`invalid_request`). Responses and events may gain
+  fields that older clients ignore; the thin client also skips frames it cannot decode.
+* Operations (one `op` each): `hello`, `create_session` (name, absolute working directory,
+  origin, agent, model), `list_sessions` (text, origin filter, working directory or all
+  directories, opaque cursor, at most 200), `summary`, `history_page` (bounded items before a
+  sequence), `observe` / `stop_observing`, `submit` (text, context blocks, model, effort, agent),
+  `cancel_turn`, `rename`, `delete`, `pending_permissions`, `resolve_permission` (approve or deny,
+  remember), `register_tools` (tools and agent profiles), `claim_session`, `release_session`,
+  `tool_result`, `list_agents`, `list_models` (efforts and USD prices per million tokens when
+  known), `usage`, `import_sdk_session`, `open_command` (`[bcode, "tui", <id>]` with the bridge's
+  own executable). Events: `observation`, `observation_ended`, `tool_invoke`, `tool_cancel`,
+  `claim_lost`, `tools_lost`.
+* Every operation is an adapter over an existing daemon application operation through an
+  ordinary `BcodeClient` of the bridge's own daemon (`BcodeClient::default_endpoint`, auto-start
+  and exact match). Daemon error codes pass through unchanged, such as
+  `agent_profile_unavailable` or `session_import_conflict`; transport failures are
+  `bcode_unavailable`.
+* Stable view: `SessionView` carries the newest items (at most 200, each text at most 64 KiB and
+  tool arguments and results at most 16 KiB), whether older items exist, pending permissions,
+  whether a turn runs or is cancelling, streaming reasoning text (8 KiB), agent, model, client
+  count, token and USD cost totals, a session error, and how the last finished turn ended
+  (`completed`, `cancelled`, `failed`, `timed_out`, `tool_round_limit`, `provider_unavailable`,
+  with Bcode's message), so an application sees a turn that failed without producing any item. Item kinds are `user`, `assistant`,
+  `reasoning`, `tool` (with call id, name, status, arguments, result, error flag), `permission`,
+  `interaction` and `notice`; anything else, including kinds a newer Bcode adds and plugin tool
+  contributions, is `other` with display text. Tool statuses and turn outcomes unknown to a
+  client decode as `other` too.
+* Observation is snapshot-only: every `observation` event carries a complete view that replaces
+  the previous one, with a per-observation sequence; changes within 50 ms coalesce. The bridge
+  follows the session with the session view follower, which reattaches after daemon restarts.
+  After `observation_ended`, the application observes again.
+* Listing waits up to five seconds while discovery is still loading and nothing was found; a
+  page reports `degraded` whenever discovery is not complete (for example a fresh store before
+  its first discovery) and `unclassified` for candidates an origin filter could not read.
+* Tools: `register_tools` opens one tool provider connection per bridge and splits it
+  (`ClientToolProvider::into_concurrent`), so invocations are answered concurrently and claims or
+  re-registrations do not wait for running calls. A bridge provides tools under one provider id.
+  Creating a session whose origin names that provider creates it on the provider connection, so
+  it is claimed. When the provider connection closes the bridge sends `tools_lost`; the
+  application registers again and re-claims.
+* Lifetime: at end of stdin the bridge stops its observations and closes its provider
+  connection, which drops the application's tools, profiles and claims. Admitted turns keep
+  running.
+* The bridge does not hold its own permission engine or session state; it is plumbing.
+
+### App-contributed agent profiles
+
+* `bcode_agent_profile::client_profile::ClientAgentProfile`: id `<provider_id>.<name>`, display
+  name, description, `base_agent`, instructions (32 KiB) and the exact tool names it may use
+  (at most 256). At most 16 per connection; a registration is checked whole and rejected with
+  `client_agent_profiles_rejected` when out of bounds, outside the provider namespace, based on
+  another contributed profile, or colliding with a plugin agent id.
+* IPC `RegisterClientAgentProfiles` on a connection that registered tools (protocol 66);
+  `ClientToolProvider::register_agent_profiles`, `ClientToolHandle::register_agent_profiles`, and
+  the bridge's `register_tools` carry them.
+* Restrict-only: the exposed tools are the base agent's exposed tools intersected with the
+  profile's selection; the instructions follow the base agent's; every remaining call is decided
+  by the base agent's policy, and a call outside the selection is denied. Profiles carry no
+  permission rules, so they never grant.
+* Contributed profiles are listed with the agents (`ListAgents`) while a connection of their
+  application is registered, and can be selected like any agent.
+* Fail closed: an agent id shaped `<provider>.<name>` that neither a plugin nor a connected
+  application provides is an unavailable contributed profile. Admission rejects such a turn with
+  `agent_profile_unavailable`, and a queued turn checks again when it starts.
+* As built: users cannot loosen a profile with `[agent."<provider>.<name>"]`; they configure the
+  base agent instead. The proposed model or effort preference is not part of a profile.
+* As built: a session's selected agent is held by the loaded session and persisted only through
+  the agent recorded on legacy user messages, so after a session is reloaded its selection may
+  fall back to the default agent rather than failing closed. Turns that name the profile
+  explicitly (the bridge's `submit` agent, `TurnExecutionOptions.agent_profile`) always fail
+  closed when it is unavailable.
+
+### Turn context blocks
+
+* `TurnAdmissionMetadata.context: TurnContext` (`bcode_session_models::turn_context`): durable
+  `blocks`, request-only `request_only`, and a daemon-assigned `request_only_handle`. At most 16
+  blocks and 16 KiB of labels and text together; labels are 1-64 bytes; blocks are never empty.
+  Out-of-bounds context is rejected with `invalid_turn_context`; nothing is truncated. The field
+  is omitted from durable JSON when empty, so other turns are stored exactly as before.
+* Durable blocks are stored with the user message (in its admission metadata, not in the message
+  text) and read by every later turn: the model reads the message text followed by the blocks,
+  each rendered as `<context label="...">` text. Transcripts and the bridge's view show the text
+  alone.
+* Request-only blocks: admission moves them into bounded daemon memory (256 contexts, one hour)
+  and records only the handle; durable admission refuses request-only blocks, and an
+  application-supplied handle is rejected. Only the turn they were submitted with reads them.
+  When the daemon no longer holds them, for example after a restart, the turn fails closed with
+  `request_only_context_unavailable`. Such turns get no recovery descriptor and are not replayed
+  by invocation recovery.
+* An older Bcode reading a session with durable blocks ignores the field, so its model context
+  lacks the blocks.
+
 ### Protocol and compatibility
 
-* The daemon IPC protocol moved from 62 to 65 (origin, client tools, file import). It stays
-  exact-match.
+* The daemon IPC protocol moved from 62 to 66 (origin, client tools, file import, contributed
+  agent profiles). It stays exact-match; only the bridge protocol has a compatibility window.
 * `SessionImportSummary` and `SessionImported` gained an optional `content_digest`, stored the same
   way as the origin: omitted when absent, ignored by older builds, no schema change.
 * `BcodeClient::for_installed_bcode` sends the configuration sources it loaded, so the daemon can
   verify an app's configuration when it creates sessions.
-* Example: `packages/bcode/examples/embedded_session.rs` registers a tool, creates an origin
-  session, imports an SDK JSON conversation and lists both with `bcode session list --origin`.
+* Examples: `packages/bcode/examples/embedded_session.rs` (an in-tree app on `BcodeClient`)
+  registers a tool, creates an origin session, imports an SDK JSON conversation and lists both
+  with `bcode session list --origin`. `packages/session-bridge/examples/bridge_app.rs` (an app
+  that links only `bcode_session_bridge`) starts the installed Bcode's bridge, registers a tool
+  and a profile, creates an origin session, submits with durable and request-only context,
+  answers the tool call, prints the observed transcript and the `bcode tui` command.
 
 ### Not built
 
-* The session bridge (`bcode session-bridge --stdio`, `bcode_session_bridge`). Apps built outside
-  the Bcode workspace still need an exact build match with the installed daemon.
-* App-contributed agent profiles, `agent_profile_unavailable`, and turn context blocks.
 * The app-hosted runtime (deferred by design).
+* Loosening a contributed profile in user configuration, and model or effort preferences on
+  profiles.
+* The `producer_client_id` tool-event field and `ToolSource::Client` presentation hint.
 * bdata's adoption; see [Adopting this in bdata](#adopting-this-in-bdata).
 
 ## Goals
@@ -597,35 +710,59 @@ machines without Bcode installed.
 
 ## Adopting this in bdata
 
-bdata builds against a sibling Bcode checkout through path dependencies, so until the bridge
-exists it can use the in-tree client contracts when it is built from the same Bcode revision as
-the installed daemon. The changes, in `packages/assistant` and `packages/app/src/assistant`:
+bdata builds against a sibling Bcode checkout, so it would otherwise need the installed Bcode to be
+the same build. With the bridge it depends on `bcode_session_bridge` only (serde, thiserror and tokio) and
+works with any installed Bcode whose bridge window contains its protocol version. The changes, in
+`packages/assistant` and `packages/app/src/assistant`:
 
-1. **Attach.** Replace the SDK-local `Assistant::load` / `run_turn` path with
-   `BcodeClient::for_installed_bcode(InstalledDaemonStart::IfNeeded)`. Report `NotInstalled` and
-   `Unverified` to the user and offer SDK-local mode only as an explicit choice.
-2. **Sessions.** Create conversations with `ClientToolProvider::create_session` and
-   `SessionOrigin::new("bdata").with_display_name("bdata").with_context("connection", <label>)`,
-   using the directory bdata was launched from. Replace `list_conversations` and
-   `load_transcript` with catalog pages filtered by `SessionOriginFilter::app("bdata")` (plus the
-   connection entry) and bounded history or observation reads. Submitting stays a turn submission
-   on the chosen session.
-3. **Tools.** Register the database tools (`list_workspace`, `read_results`, `read_selection`,
-   `list_schemas`, `list_relations`, `describe_relation`, `list_functions`, `validate_sql`,
-   `explain_query`, `run_query`, `propose_edit`) as `bdata.<tool>` descriptors on one
-   `ClientToolProvider`, with `ReadOnly` for inspection tools and `Mutating` for `run_query` and
-   `propose_edit`. Answer invocations from the existing `HostQuery` channel handlers. Keep the
-   domain approvals (sharing result rows) inside the handlers.
-4. **Permissions.** Delete `permissions.rs`'s `ToolPolicy` and the writes through
-   `bcode_config::upsert_agent_permission_rule`; Bcode's permission prompts arrive as ordinary
-   pending permissions on the session and are answered with `resolve_permission`.
-5. **Migration.** On first attached start, import `assistant/conversations/*.json` with
-   `BcodeClient::import_session_file("sdk-json", ..., Some(origin))`, move each imported file to
-   `assistant/migrated/<stamp>/`, skip `assistant/deleted/`, and show per-file failures.
-6. **Inline edits** stay SDK-local (decision D8).
-7. **Validation** in bdata: its own checks, plus a test that a bdata session is listed by
-   `bcode session list --origin bdata` and that a denied `bdata.run_query` never reaches the
-   handler.
+1. **Dependency.** Replace the assistant's dependencies on the Bcode runtime crates used for
+   conversations with `bcode_session_bridge` (a path or git dependency on the Bcode repository).
+   Keep `bcode` (the in-process SDK) only for inline edits.
+2. **Attach.** At assistant start, call `BridgeClient::spawn_installed("bdata")`. Map
+   `BridgeClientError::NotInstalled` and `InvalidOverride` to "Bcode is not installed" and a
+   `version_mismatch` rejection to its message (it says whether to update bdata or Bcode). Offer
+   SDK-local mode only as an explicit choice. Keep one `BridgeClient` for the app's lifetime and
+   drive `BridgeEvents` from one task that forwards to the UI.
+3. **Tools and profile.** Call `register_tools("bdata", tools, profiles)` once after attaching
+   and again after a `tools_lost` event:
+   * one `ToolDescriptor` per database tool, named `bdata.<tool>` (`list_workspace`,
+     `read_results`, `read_selection`, `list_schemas`, `list_relations`, `describe_relation`,
+     `list_functions`, `validate_sql`, `explain_query`: `read_only`; `run_query`, `propose_edit`:
+     `mutating`), with the JSON schemas the `typed_tool_async` definitions already derive and a
+     deadline that covers a slow query;
+   * an `AgentProfile` `bdata.sql` based on `build` with the assistant's current system prompt as
+     instructions and the eleven tools as its selection.
+4. **Invocations.** On `tool_invoke`, decode `arguments_json` with the existing argument types,
+   run the existing handler through the `HostQuery` channel, and answer with `tool_result`
+   (`completed` with the text the handler returns, `failed` with a code and message). Keep domain
+   approvals, such as sharing result rows, inside the handlers. On `tool_cancel`, stop the
+   handler and drop its answer.
+5. **Conversations.** Create conversations with `create_session(name, launch directory,
+   Origin { app_id: "bdata", display_name: "bdata", context: {"connection": <label>} },
+   Some("bdata.sql"), model)`; they are claimed for bdata's tools. List them with
+   `list_sessions(OriginFilter { app_id: "bdata", context: {"connection": <label>} }, ...)` instead
+   of scanning `assistant/conversations`, and show `degraded` pages as incomplete. Open one with
+   `observe(session, n)` and render each `observation` view (the view replaces the previous one);
+   page back with `history_page`. Claim a session opened from the list with `claim_session`.
+6. **Turns.** Send with `submit(session, text, context, Some("bdata.sql"))`, putting the screen
+   summary in a durable `ContextBlock` and anything that must not be stored (such as selected row
+   values) in a `request_only` block. Cancel with `cancel_turn`. Treat a view whose turn is no
+   longer active and whose `last_turn` outcome is not `completed` as the turn's failure, and show
+   its message (for example `provider_unavailable` when no model is configured).
+7. **Permissions.** Delete `permissions.rs`'s `ToolPolicy` and the writes through
+   `bcode_config::upsert_agent_permission_rule`. Show `pending_permissions` from each view and
+   answer with `resolve_permission(id, approve, remember)`; `bcode tui` can answer the same
+   prompt.
+8. **Migration.** On the first attached start, for each `assistant/conversations/*.json` call
+   `import_sdk_session(path, launch directory, Some(bdata origin))`, move each imported file to
+   `assistant/migrated/<stamp>/`, skip `assistant/deleted/`, show per-file failures (including
+   `session_import_conflict`), and leave failed files in place.
+9. **Open in Bcode.** Run the argv from `open_command(session)` with the terminal handed over.
+10. **Inline edits** stay SDK-local (decision D8).
+11. **Validation** in bdata: its own checks; a test against a debug `bcode` (`BCODE_BIN`) with
+    isolated `BCODE_STATE_DIR` and `XDG_CONFIG_HOME` that a bdata conversation is listed by
+    `bcode session list --origin bdata`, that a denied `bdata.run_query` never reaches the
+    handler, and that an older bridge version inside the window still connects.
 
 ## Decisions for sign-off
 

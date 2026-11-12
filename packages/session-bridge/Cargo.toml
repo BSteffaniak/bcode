@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Thin client that lets applications built outside Bcode use real Bcode sessions"
+edition     = { workspace = true }
+keywords    = ["bcode", "bridge", "client", "session"]
+license     = { workspace = true }
+name        = "bcode_session_bridge"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_bridge_models = { workspace = true }
+serde_json                  = { workspace = true, features = ["std"] }
+thiserror                   = { workspace = true }
+tokio                       = { workspace = true, features = ["io-util", "process", "rt", "sync", "time"] }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+tokio      = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
+
+[features]
+default          = []
+fail-on-warnings = []

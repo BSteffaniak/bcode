@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Versioned session bridge protocol models for applications that use Bcode sessions"
+edition     = { workspace = true }
+keywords    = ["bcode", "bridge", "models", "session"]
+license     = { workspace = true }
+name        = "bcode_session_bridge_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []
