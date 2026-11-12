@@ -609,6 +609,8 @@ pub struct ReviewSurface {
     restored: bool,
     /// Questions to send from the next poll.
     asks: VecDeque<(bcode_code_review_models::ReviewAiExchange, String)>,
+    /// Questions on their way that create their own session, by exchange id.
+    fresh_asks: std::collections::BTreeSet<String>,
     next_exchange: u64,
     /// Whether the open document's annotations were requested.
     notes_requested: bool,
@@ -750,6 +752,7 @@ impl ReviewSurface {
             presentation_checked: None,
             restored: false,
             asks: VecDeque::new(),
+            fresh_asks: std::collections::BTreeSet::new(),
             next_exchange: 0,
             notes_requested: false,
             saving_as: false,

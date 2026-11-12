@@ -95,6 +95,9 @@ impl ReviewSurface {
             }));
         }
         while let Some((exchange, text)) = self.asks.pop_front() {
+            if exchange.session_id.is_none() {
+                self.fresh_asks.insert(exchange.exchange_id.clone());
+            }
             let scope = self.note_scope();
             // A new session is bound to the review, so its review tools act on this review.
             let binding = self.assistant_binding(String::new());
@@ -143,9 +146,19 @@ impl ReviewSurface {
             self.status = None;
         }
         match result {
-            Ok(exchange) => self.notes.put_exchange(exchange),
+            Ok(exchange) => {
+                // A question that started its own session: follow every review tool call of
+                // that session, including ones that finished before it was first observed.
+                if self.fresh_asks.remove(&exchange.exchange_id)
+                    && let Some(session) = &exchange.session_id
+                {
+                    self.dock.follow_new_session(session);
+                }
+                self.notes.put_exchange(exchange);
+            }
             Err(failed) => {
                 let (exchange, error) = *failed;
+                self.fresh_asks.remove(&exchange.exchange_id);
                 self.notes.put_exchange(exchange);
                 self.set_status("could not ask Bcode", StatusSeverity::Error);
                 self.toasts

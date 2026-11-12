@@ -74,10 +74,22 @@ const NAVIGATE_TOOL: &str = "code_review.navigate";
 /// Result of the dock's background work.
 #[derive(Debug)]
 pub enum DockResult {
-    /// The newest session bound to this review, when there is one.
-    Found(Option<String>),
-    /// A session was created, bound, and sent the first message (or why not).
-    Started(Result<String, String>),
+    /// The newest session bound to this review, when there is one, looked up during
+    /// conversation `epoch`.
+    Found {
+        /// The conversation the lookup was made for.
+        epoch: u64,
+        /// The session found.
+        session: Option<String>,
+    },
+    /// A session was created, bound, and sent the first message of conversation `epoch` (or
+    /// why not).
+    Started {
+        /// The conversation the session was started for.
+        epoch: u64,
+        /// The session, or why it could not be started.
+        result: Result<String, String>,
+    },
     /// A message was sent (or why not).
     Sent(Result<(), String>),
     /// The review's stored viewed state, read after a tool changed it.
@@ -107,7 +119,11 @@ pub struct Dock {
     lookup: Lookup,
     /// A session is being created; messages wait in `queued`.
     starting: bool,
-    queued: VecDeque<String>,
+    /// Messages waiting for a session, with the conversation they were written in.
+    queued: VecDeque<(u64, String)>,
+    /// The current conversation. A new conversation (`ctrl+n`) starts a new one, so lookups and
+    /// session starts of an earlier conversation never replace the current one.
+    epoch: u64,
     /// Document generation the session was last bound for.
     bound_generation: Option<u64>,
     input: RefCell<TextInputState>,
@@ -136,6 +152,7 @@ impl Default for Dock {
             lookup: Lookup::NotStarted,
             starting: false,
             queued: VecDeque::new(),
+            epoch: 0,
             bound_generation: None,
             input: RefCell::new(TextInputState::new(bmux_text_edit::TextEditBuffer::new())),
             policy,
@@ -171,6 +188,12 @@ impl Dock {
 
     const fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Follow a session this app just created: every review tool call it finishes is a reply
+    /// to the app's messages, so none of them is skipped as already applied.
+    pub(super) fn follow_new_session(&mut self, session: &str) {
+        self.applied.entry(session.to_owned()).or_default();
     }
 }
 
@@ -209,6 +232,7 @@ impl ReviewSurface {
             return;
         }
         self.dock.lookup = Lookup::Running;
+        let epoch = self.dock.epoch;
         let workspace = self.workspace_mut().clone();
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -224,7 +248,10 @@ impl ReviewSurface {
                 .ok()
                 .and_then(|response| response.binding)
                 .map(|binding| binding.session_id);
-            inbox.push(Message::Dock(Box::new(DockResult::Found(result))));
+            inbox.push(Message::Dock(Box::new(DockResult::Found {
+                epoch,
+                session: result,
+            })));
         }));
     }
 
@@ -267,23 +294,42 @@ impl ReviewSurface {
     pub(super) fn finish_dock(&mut self, result: DockResult, host: &UiContext) {
         self.dock.touch();
         match result {
-            DockResult::Found(session) => {
+            DockResult::Found { epoch, session } => {
                 self.dock.lookup = Lookup::Done;
-                if self.dock.session.is_none() && !self.dock.starting {
+                if epoch == self.dock.epoch && self.dock.session.is_none() && !self.dock.starting {
                     self.dock.session = session;
                 }
             }
-            DockResult::Started(Ok(session)) => {
-                self.dock.starting = false;
-                self.dock.session = Some(session);
-                self.dock.bound_generation = Some(self.generation);
-                while let Some(text) = self.dock.queued.pop_front() {
-                    self.send_to_session(text, host);
+            DockResult::Started {
+                epoch,
+                result: Ok(session),
+            } => {
+                let queued = self.take_queued(epoch);
+                if epoch == self.dock.epoch {
+                    self.dock.starting = false;
+                    self.dock.follow_new_session(&session);
+                    self.dock.session = Some(session);
+                    self.dock.bound_generation = Some(self.generation);
+                    for text in queued {
+                        self.send_to_session(text, host);
+                    }
+                } else {
+                    // The reviewer started a new conversation meanwhile: the earlier one keeps
+                    // its session and gets the messages written for it, and the dock stays on
+                    // the new conversation.
+                    for text in queued {
+                        self.send_to(session.clone(), None, text, host);
+                    }
                 }
             }
-            DockResult::Started(Err(error)) => {
-                self.dock.starting = false;
-                self.dock.queued.clear();
+            DockResult::Started {
+                epoch,
+                result: Err(error),
+            } => {
+                if epoch == self.dock.epoch {
+                    self.dock.starting = false;
+                }
+                drop(self.take_queued(epoch));
                 self.toasts.push(
                     ToastSeverity::Error,
                     "Could not start the assistant",
@@ -332,7 +378,7 @@ impl ReviewSurface {
         self.dock.scroll.set(0);
         self.dock.touch();
         if self.dock.starting {
-            self.dock.queued.push_back(message);
+            self.dock.queued.push_back((self.dock.epoch, message));
         } else if self.dock.session.is_some() {
             self.send_to_session(message, host);
         } else {
@@ -344,6 +390,7 @@ impl ReviewSurface {
     /// Create the assistant's session, bind it to the review, and send `message`.
     fn start_assistant(&mut self, message: String, host: &UiContext) {
         self.dock.starting = true;
+        let epoch = self.dock.epoch;
         let template = self.assistant_binding(String::new());
         let title = format!("Review assistant: {}", template.workspace.title);
         let services = self.services.clone();
@@ -381,7 +428,10 @@ impl ReviewSurface {
                 Ok::<_, String>(session)
             }
             .await;
-            inbox.push(Message::Dock(Box::new(DockResult::Started(result))));
+            inbox.push(Message::Dock(Box::new(DockResult::Started {
+                epoch,
+                result,
+            })));
         }));
     }
 
@@ -394,6 +444,26 @@ impl ReviewSurface {
         let rebind = (self.dock.bound_generation != Some(self.generation))
             .then(|| self.assistant_binding(session.clone()));
         self.dock.bound_generation = Some(self.generation);
+        self.send_to(session, rebind, message, host);
+    }
+
+    /// The queued messages of conversation `epoch`, in order.
+    fn take_queued(&mut self, epoch: u64) -> Vec<String> {
+        let (taken, kept) = std::mem::take(&mut self.dock.queued)
+            .into_iter()
+            .partition::<VecDeque<_>, _>(|(queued, _)| *queued == epoch);
+        self.dock.queued = kept;
+        taken.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// Send `message` to `session`, binding it first when `rebind` is given.
+    fn send_to(
+        &self,
+        session: String,
+        rebind: Option<ReviewAssistantBinding>,
+        message: String,
+        host: &UiContext,
+    ) {
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
@@ -487,6 +557,8 @@ impl ReviewSurface {
                 "assistant_new" => {
                     self.dock.session = None;
                     self.dock.lookup = Lookup::Done;
+                    self.dock.starting = false;
+                    self.dock.epoch = self.dock.epoch.wrapping_add(1);
                     self.dock.scroll.set(0);
                     self.dock.touch();
                     self.set_status(
@@ -777,7 +849,8 @@ impl ReviewSurface {
 
     /// Apply finished `code_review.*` tool calls of followed sessions: reload what the writes
     /// changed and follow navigation. Calls already finished when a session is first observed
-    /// are only recorded.
+    /// are only recorded, unless the app created the session itself (the dock's conversation or
+    /// a question's own session); then every call answers the app's messages and is applied.
     pub(super) fn reflect_review_tools(&mut self, host: &UiContext) {
         let mut sessions: Vec<String> = self
             .notes

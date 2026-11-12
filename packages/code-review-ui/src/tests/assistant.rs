@@ -2,7 +2,7 @@
 //! the review, its permission prompt, and the review following what the session's review tools
 //! change.
 
-use super::interaction::{Setup, added_line, cursor, find, fixture, move_to, setup};
+use super::interaction::{Setup, added_line, build, cursor, find, fixture, move_to, setup};
 use super::stable;
 use bcode_code_review::assistant::{Location, ReviewRef, ReviewTools, Side};
 use bcode_code_review::document::{ItemKey, ReviewItem};
@@ -266,18 +266,7 @@ fn the_review_follows_what_the_sessions_review_tools_change() {
     let mut setup = setup(&fixture, 160, 50);
     let (path, line) = first_added(&setup);
     let (session, message) = ask_assistant(&mut setup, "Review this file.");
-    // A navigation already finished when the session is first observed is not replayed.
     let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
-    let before = cursor(&setup.scenario);
-    send(
-        &mut setup,
-        &session,
-        snapshot(vec![
-            tool("old-nav", "code_review.navigate", &navigate),
-            user(&message),
-        ]),
-    );
-    assert_eq!(cursor(&setup.scenario), before);
 
     // The tools write through the store the review reads, as the plugin does.
     let services = setup.backend.services();
@@ -307,7 +296,6 @@ fn the_review_follows_what_the_sessions_review_tools_change() {
         .mark_viewed(&review, std::slice::from_ref(&path), true)
         .expect("viewed");
     let mut items = vec![
-        tool("old-nav", "code_review.navigate", &navigate),
         user(&message),
         tool("write-1", "code_review.add_comment", "{}"),
         tool("view-1", "code_review.mark_viewed", "{}"),
@@ -347,4 +335,107 @@ fn the_review_follows_what_the_sessions_review_tools_change() {
         }
         other => panic!("cursor moved elsewhere: {other:?}"),
     }
+}
+
+/// Where the cursor of `setup` is, as file, side and line.
+fn cursor_line(setup: &Setup) -> Option<(String, Option<u32>)> {
+    match cursor(&setup.scenario) {
+        ItemKey::Line { file, side, line } => Some((
+            file.path.clone(),
+            (side == ReviewLineSide::New).then_some(line),
+        )),
+        ItemKey::LinePair { file, new, .. } => Some((file.path.clone(), new)),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_session_the_dock_started_applies_its_first_tool_calls() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 160, 50);
+    let (path, line) = first_added(&setup);
+    let (session, message) = ask_assistant(&mut setup, "Show me the change.");
+    setup.scenario.key("esc");
+    setup.scenario.key("g");
+    stable(&mut setup.scenario);
+    assert_ne!(cursor_line(&setup), Some((path.clone(), Some(line))));
+    // The navigation finished before the dock first saw the session; it answers the dock's own
+    // message, so it is applied.
+    let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
+    send(
+        &mut setup,
+        &session,
+        snapshot(vec![
+            user(&message),
+            tool("nav-1", "code_review.navigate", &navigate),
+        ]),
+    );
+    assert_eq!(cursor_line(&setup), Some((path, Some(line))));
+}
+
+#[test]
+fn a_reopened_review_does_not_replay_its_assistants_earlier_tool_calls() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 160, 50);
+    let (path, line) = first_added(&setup);
+    let (session, message) = ask_assistant(&mut setup, "Show me the change.");
+
+    // The review opens again and finds the session bound to it.
+    let mut reopened = Setup {
+        scenario: crate::testing::harness::Scenario::new(
+            build(&setup.backend, &setup.workspace, std::time::Duration::ZERO),
+            160,
+            50,
+        ),
+        backend: setup.backend.clone(),
+        workspace: setup.workspace.clone(),
+    };
+    stable(&mut reopened.scenario);
+    reopened.scenario.key("ctrl+k");
+    stable(&mut reopened.scenario);
+    reopened.scenario.key("esc");
+    stable(&mut reopened.scenario);
+    let before = cursor_line(&reopened);
+    let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
+    send(
+        &mut reopened,
+        &session,
+        snapshot(vec![
+            user(&message),
+            tool("nav-1", "code_review.navigate", &navigate),
+        ]),
+    );
+    assert_eq!(
+        cursor_line(&reopened),
+        before,
+        "an earlier navigation is not replayed"
+    );
+}
+
+#[test]
+fn a_new_conversation_is_not_replaced_by_a_lookup_that_finishes_later() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 160, 50);
+    let (session, _) = ask_assistant(&mut setup, "First question.");
+
+    let mut reopened = Setup {
+        scenario: crate::testing::harness::Scenario::new(
+            build(&setup.backend, &setup.workspace, std::time::Duration::ZERO),
+            160,
+            50,
+        ),
+        backend: setup.backend.clone(),
+        workspace: setup.workspace.clone(),
+    };
+    stable(&mut reopened.scenario);
+    // ctrl+k looks the bound session up; ctrl+n asks for a new conversation before the
+    // lookup's answer arrives.
+    reopened.scenario.keys(&["ctrl+k", "ctrl+n"]);
+    stable(&mut reopened.scenario);
+    reopened.scenario.paste("A fresh start.");
+    reopened.scenario.key("enter");
+    stable(&mut reopened.scenario);
+    let (sent_to, text) = reopened.backend.messages().last().cloned().expect("sent");
+    assert!(text.starts_with("A fresh start."), "{text}");
+    assert_ne!(sent_to, session, "the new conversation has its own session");
 }

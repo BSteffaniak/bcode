@@ -46,7 +46,7 @@ fn workspace(fixture: &GitFixture) -> ReviewWorkspace {
     }
 }
 
-fn build(
+pub(super) fn build(
     backend: &Arc<TestBackend>,
     workspace: &ReviewWorkspace,
     motion: Duration,
