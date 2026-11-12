@@ -9,11 +9,16 @@
 //! tool:
 //!
 //! * Reads (`summary`, `list_files`, `file_diff`, `file_content`, `list_threads`,
-//!   `pull_request`, `list_reviews`) and `navigate` are read-only: allowed unless a rule says
-//!   otherwise.
+//!   `list_reviews`) and `navigate` are read-only: allowed unless a rule says otherwise.
+//!   `file_diff` and `file_content` also declare the file they read, so read path rules (such
+//!   as a denied `**/.env`) apply to them.
+//! * `pull_request` asks GitHub with the user's credentials, so it also declares the
+//!   repository's web address and web rules decide it; without a rule it asks.
 //! * Writes (`add_comment`, `reply`, `resolve_thread`, `mark_viewed`, `suggest_change`) are
 //!   mutating and ask by default.
-//! * `publish` sends the review out of the repository and asks by default.
+//! * `publish` sends the review out of the repository and asks by default. An `output_path`
+//!   must be relative to the session's working directory and stay inside it; the publish also
+//!   declares that file as a write, so write path rules apply and the prompt names it.
 //!
 //! The session's id and working directory come from the host's workspace context during
 //! preparation and travel to the invocation in the preparation descriptor.
@@ -349,6 +354,9 @@ pub struct Descriptor {
     pub session_id: Option<String>,
     /// The session's working directory (the repository).
     pub working_directory: PathBuf,
+    /// Where `publish` writes, resolved inside the working directory during preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,14 +388,45 @@ fn prepare(
     if !workspace.working_directory.is_absolute() {
         return Err("the session's working directory must be absolute".to_owned());
     }
+    // Arguments the model got wrong fail at invocation with a clear message; here they only
+    // decide which resources the call declares.
+    let arguments = serde_json::from_value::<Arguments>(request.invocation.arguments.clone())
+        .unwrap_or_default();
+    let output_path = match (access, arguments.output_path.as_deref()) {
+        (Access::Publish, Some(path)) if !path.is_empty() => {
+            Some(inside(&workspace.working_directory, path, "output_path")?)
+        }
+        _ => None,
+    };
+    let (requires_permission, operation, category) = match access {
+        Access::Read => (
+            false,
+            read_operation(&definition.name, &workspace.working_directory, &arguments)?,
+            CATEGORY_READ,
+        ),
+        Access::Write => (true, ToolPolicyOperation::Mutating, CATEGORY_WRITE),
+        Access::Publish => (
+            true,
+            output_path
+                .as_ref()
+                .map_or(ToolPolicyOperation::Mutating, |path| {
+                    ToolPolicyOperation::Compound {
+                        operations: vec![
+                            ToolPolicyOperation::Mutating,
+                            ToolPolicyOperation::Write {
+                                paths: vec![path.display().to_string()],
+                                category: "write".to_owned(),
+                            },
+                        ],
+                    }
+                }),
+            CATEGORY_PUBLISH,
+        ),
+    };
     let descriptor = Descriptor {
         session_id: workspace.workspace_id,
         working_directory: workspace.working_directory,
-    };
-    let (requires_permission, operation, category) = match access {
-        Access::Read => (false, ToolPolicyOperation::ReadOnly, CATEGORY_READ),
-        Access::Write => (true, ToolPolicyOperation::Mutating, CATEGORY_WRITE),
-        Access::Publish => (true, ToolPolicyOperation::Mutating, CATEGORY_PUBLISH),
+        output_path,
     };
     Ok(ToolPolicyPreparation::new(requires_permission, operation)
         .with_identity(ToolPolicyIdentity {
@@ -397,6 +436,69 @@ fn prepare(
             permission_category: Some(category.to_owned()),
         })
         .with_descriptor(serde_json::to_value(descriptor).map_err(|error| error.to_string())?))
+}
+
+/// `path` resolved inside `root`: it must be relative and must not leave `root`.
+fn inside(root: &std::path::Path, path: &str, name: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let relative = std::path::Path::new(path);
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "`{name}` must be a path relative to the session's working directory that stays inside it"
+        ));
+    }
+    Ok(root.join(relative))
+}
+
+/// The policy operation of a read tool: read-only, plus the file it reads for `file_diff` and
+/// `file_content`, plus the repository's web address for `pull_request`.
+fn read_operation(
+    name: &str,
+    working_directory: &std::path::Path,
+    arguments: &Arguments,
+) -> Result<ToolPolicyOperation, String> {
+    let resource = match name {
+        "code_review.file_diff" | "code_review.file_content" => {
+            match arguments.path.as_deref().filter(|path| !path.is_empty()) {
+                // Review paths are relative to the repository root.
+                Some(path) => {
+                    let root = git(working_directory, &["rev-parse", "--show-toplevel"])
+                        .map_or_else(|| working_directory.to_path_buf(), PathBuf::from);
+                    Some(ToolPolicyOperation::Read {
+                        paths: vec![inside(&root, path, "path")?.display().to_string()],
+                    })
+                }
+                None => None,
+            }
+        }
+        "code_review.pull_request" => Some(ToolPolicyOperation::Web {
+            url: Some(repository_url(working_directory)),
+        }),
+        _ => None,
+    };
+    Ok(resource.map_or(ToolPolicyOperation::ReadOnly, |resource| {
+        ToolPolicyOperation::Compound {
+            operations: vec![ToolPolicyOperation::ReadOnly, resource],
+        }
+    }))
+}
+
+/// The web address of the repository's `origin`, or GitHub's when it has none.
+fn repository_url(working_directory: &std::path::Path) -> String {
+    git(working_directory, &["remote", "get-url", "origin"])
+        .and_then(|url| bcode_forge_models::RepositoryRef::from_remote_url(&url))
+        .map_or_else(
+            || format!("https://{}/", bcode_forge::GITHUB_HOST),
+            |repository| {
+                format!(
+                    "https://{}/{}/{}",
+                    repository.host, repository.owner, repository.name
+                )
+            },
+        )
 }
 
 /// Arguments of the tools; each tool reads the ones it takes.
@@ -570,7 +672,7 @@ fn run(
             )?)
         }
         "code_review.publish" => {
-            let options = arguments
+            let options = descriptor
                 .output_path
                 .as_ref()
                 .map_or(Value::Null, |path| json!({"output_path": path}));

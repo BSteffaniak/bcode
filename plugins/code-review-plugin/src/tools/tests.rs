@@ -57,8 +57,14 @@ impl Harness {
     }
 
     fn prepare(&mut self, tool: &str, arguments: &Value, session: &str) -> ToolPreparationResponse {
+        let response = self.prepare_raw(tool, arguments, session);
+        assert!(response.error.is_none(), "{tool}: {:?}", response.error);
+        response.payload_json().expect("preparation")
+    }
+
+    fn prepare_raw(&mut self, tool: &str, arguments: &Value, session: &str) -> ServiceResponse {
         let root = self.fixture.root().to_path_buf();
-        let response = self.service(
+        self.service(
             OP_PREPARE_TOOL,
             &json!({
                 "invocation": {"invocation_id": "call-1", "tool_name": tool, "arguments": arguments},
@@ -68,9 +74,7 @@ impl Harness {
                     "payload": {"working_directory": root, "workspace_id": session},
                 }],
             }),
-        );
-        assert!(response.error.is_none(), "{tool}: {:?}", response.error);
-        response.payload_json().expect("preparation")
+        )
     }
 
     /// Prepare and invoke `tool` as `session` does.
@@ -201,12 +205,14 @@ fn reads_are_read_only_and_changes_ask_for_permission() {
             | "code_review.mark_viewed"
             | "code_review.suggest_change" => ("mutating", true, "code_review.write"),
             "code_review.publish" => ("mutating", true, "code_review.publish"),
+            // It reads GitHub with the user's credentials, so web rules decide it too.
+            "code_review.pull_request" => ("compound", false, "code_review.read"),
             _ => ("read_only", false, "code_review.read"),
         };
         assert_eq!(metadata["operation"]["kind"], expected.0, "{name}");
         assert_eq!(metadata["requires_permission"], expected.1, "{name}");
         assert_eq!(metadata["permission_category"], expected.2, "{name}");
-        assert_eq!(read_only, expected.0 == "read_only", "{name}");
+        assert_eq!(read_only, !expected.1, "{name}");
         assert_eq!(prepared.descriptor["session_id"], SESSION, "{name}");
     }
 }
@@ -391,12 +397,71 @@ fn publishing_previews_unless_asked_to_submit() {
     );
     let preview = harness.ok("code_review.publish", &json!({}), SESSION);
     assert!(preview.contains("Looks good overall."), "{preview}");
-    let output = harness.state.path().join("review.md");
     harness.ok(
         "code_review.publish",
-        &json!({"publisher": "markdown_file", "submit": true, "output_path": output}),
+        &json!({"publisher": "markdown_file", "submit": true, "output_path": "exports/review.md"}),
         SESSION,
     );
+    let output = harness.fixture.root().join("exports/review.md");
     let written = std::fs::read_to_string(&output).expect("published file");
     assert!(written.contains("Looks good overall."), "{written}");
+}
+
+#[test]
+fn publishing_writes_only_inside_the_working_directory_and_declares_the_file() {
+    let mut harness = Harness::new();
+    let prepared = harness.prepare(
+        "code_review.publish",
+        &json!({"publisher": "markdown_file", "submit": true, "output_path": "exports/review.md"}),
+        SESSION,
+    );
+    let operation = &prepared.authorization[0].metadata["operation"];
+    let declared = harness
+        .fixture
+        .root()
+        .join("exports/review.md")
+        .display()
+        .to_string();
+    assert!(
+        operation.to_string().contains(&declared),
+        "the write is declared so write rules apply and the prompt names it: {operation}"
+    );
+    let outside = harness.state.path().join("review.md");
+    for output_path in [
+        outside.display().to_string(),
+        "../review.md".to_owned(),
+        "exports/../../review.md".to_owned(),
+    ] {
+        let response = harness.prepare_raw(
+            "code_review.publish",
+            &json!({"publisher": "markdown_file", "submit": true, "output_path": output_path}),
+            SESSION,
+        );
+        assert!(response.error.is_some(), "{output_path} is refused");
+    }
+    assert!(!outside.exists());
+}
+
+#[test]
+fn file_reads_declare_the_file_so_read_rules_apply() {
+    let mut harness = Harness::new();
+    for tool in ["code_review.file_diff", "code_review.file_content"] {
+        let prepared = harness.prepare(tool, &json!({"path": "src/.env"}), SESSION);
+        let operation = &prepared.authorization[0].metadata["operation"];
+        let declared = harness
+            .fixture
+            .root()
+            .join("src/.env")
+            .display()
+            .to_string();
+        assert!(
+            operation.to_string().contains(&declared),
+            "{tool}: {operation}"
+        );
+        let escaping = harness.prepare_raw(tool, &json!({"path": "../secret"}), SESSION);
+        assert!(
+            escaping.error.is_some(),
+            "{tool} refuses paths outside the repository"
+        );
+    }
 }
