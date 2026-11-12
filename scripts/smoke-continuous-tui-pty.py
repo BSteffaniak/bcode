@@ -216,6 +216,24 @@ CASES.update({
         # Leaving an unsaved review with notes asks for a second exit.
         {"expect": ["this review is not saved"], "send": "q"},
         {"expect": ["Code reviews"], "send": "q"}]},
+    # The assistant dock (ctrl+k) runs a review tool in a session bound to the review: the
+    # write asks inline in the dock, and once allowed the draft shows in the review.
+    "review-assistant-tool": {"fixture": "review-assistant", "model": True,
+        "args": ["review"], "steps": [
+        {"expect": ["Code reviews", "Uncommitted changes"], "send": "1"},
+        {"expect": ["Working tree and index", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["Code reviews"], "send": "jj"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": "\x0b"},
+        {"expect": ["Assistant", "Ask about this review."],
+         "send": 'tool-call code_review.add_comment {"path":"continuous-review-fixture.txt",'
+                 '"line":1,"body":"PTY_NOTE"}\r'},
+        {"expect": ["? Use code_review.add_comment?", "y allow"], "timeout": 60, "send": "y"},
+        {"expect": ["PTY_NOTE", "1 draft", "✓ code_review.add_comment"],
+         "forbid": ["? Use code_review.add_comment?"], "timeout": 60, "send": "\x1b"},
+        # Leaving an unsaved review with notes asks for a second exit.
+        {"expect": ["PTY_NOTE"], "send": "q"},
+        {"expect": ["this review is not saved"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
     "review-click-save-resume": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
         {"expect": ["Code reviews", "Uncommitted changes"],
@@ -644,7 +662,7 @@ idle_shutdown = false
         # Debug nested IPC needs headroom; keep the production search budget bounded.
         text += '[file_references]\ntimeout_ms = 1000\n'
         (work / "completion-target.txt").write_text("offline path completion fixture\n")
-    if fixture == "review":
+    if fixture in ("review", "review-assistant"):
         # Questions about the code run in real Bcode sessions.
         text = text.replace('"bcode.code_review"', '"bcode.code_review", "bcode.harness"')
     if fixture == "blims":
@@ -665,6 +683,9 @@ model_id = "fake-echo"
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 '''
+    if fixture == "review-assistant":
+        # The assistant's messages script review tool calls line by line.
+        text += "[model.settings]\nfake_prompt_tool_directives = \"true\"\n"
     if fixture in ("review", "completion", "completion-review"):
         # A submitted parent emits a visible sentinel in completion fixtures.
         # Initial question tool requests still use the normal fake tool directive.
@@ -688,7 +709,7 @@ model_id = "fake-echo"
         env["XAI_API_KEY"] = "bcode-pty-fake-not-a-real-credential"
         env.update({"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1",
                     "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "localhost,127.0.0.1"})
-    if fixture in ("review", "completion", "completion-review"):
+    if fixture in ("review", "review-assistant", "completion", "completion-review"):
         # Keep search workspace separate from harness state/config and build artifacts.
         git_env = {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
         repo = work / "repo"
@@ -699,7 +720,7 @@ model_id = "fake-echo"
         if fixture in ("completion", "completion-review"):
             (repo / "completion-target.txt").write_text("offline path completion fixture\n")
         tracked = ["continuous-review-fixture.txt"]
-        if fixture == "review":
+        if fixture in ("review", "review-assistant"):
             # Preserve the original first file/first line for existing journeys.
             # Enough content to scroll independently of the tree, plus sibling
             # folders, Unicode and a path wider than a normal sidebar.
@@ -721,7 +742,7 @@ model_id = "fake-echo"
             tracked.append("completion-target.txt")
         subprocess.run(["/usr/bin/git", "-C", str(repo), "add", "--", *tracked],
                        env=git_env, check=True, timeout=5, capture_output=True)
-        if fixture == "review":
+        if fixture in ("review", "review-assistant"):
             (repo / "nested/beta/sibling.txt").write_text(
                 "REVIEW_SIBLING_CONTENT\nREVIEW_UNSTAGED_CONTENT\n")
     return env, config, state
@@ -730,7 +751,7 @@ model_id = "fake-echo"
 def plan_checked(plan):
     if not isinstance(plan, dict) or set(plan) - {"name", "fixture", "model", "args", "steps", "restart_steps", "exit_code"}:
         raise ValueError("unknown plan fields")
-    if plan.get("fixture", "fake") not in ("fake", "review", "xai", "blims", "completion", "completion-review"):
+    if plan.get("fixture", "fake") not in ("fake", "review", "review-assistant", "xai", "blims", "completion", "completion-review"):
         raise ValueError("unsupported fixture")
     if plan.get("fixture") == "xai" and plan != CASES["xai-model-chat"]:
         raise ValueError("xAI fixture restricted to fixed no-prompt model-choice journey")

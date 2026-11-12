@@ -2,6 +2,7 @@
 //! (in-process) over generated fixture repositories.
 
 mod app;
+mod assistant;
 mod benchmark;
 mod chrome;
 mod feed;

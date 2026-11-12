@@ -19,6 +19,8 @@ pub const COMPOSER_SCOPE: &str = "code-review-composer";
 pub const FILES_SCOPE: &str = "code-review-files";
 /// Thread panel scope.
 pub const THREADS_SCOPE: &str = "code-review-threads";
+/// Review assistant dock scope.
+pub const ASSISTANT_SCOPE: &str = "code-review-assistant";
 /// Keys of an AI card's live feed (permission answers, stop).
 pub const FEED_SCOPE: &str = "code-review-feed";
 /// New-review wizard scope.
@@ -102,6 +104,7 @@ mod tests {
             COMPOSER_SCOPE,
             FILES_SCOPE,
             THREADS_SCOPE,
+            ASSISTANT_SCOPE,
             WIZARD_SCOPE,
         ] {
             assert!(
@@ -190,6 +193,7 @@ mod tests {
             crate::surface::THREADS_SCOPE,
             crate::surface::COMPOSER_SCOPE,
             crate::surface::FEED_SCOPE,
+            crate::surface::ASSISTANT_SCOPE,
         ]
         .into_iter()
         .map(str::to_owned)

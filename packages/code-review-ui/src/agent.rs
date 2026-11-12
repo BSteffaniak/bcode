@@ -213,10 +213,11 @@ pub fn prompt(context: &AskContext) -> String {
     text
 }
 
-/// Ask: persist the exchange, create and prompt the session, link it, and persist the link.
+/// Ask: persist the exchange, create the session and bind it to the review (`binding`, whose
+/// session id is filled in), prompt it, link it, and persist the link.
 ///
 /// When the exchange already names a session (a follow-up), the prompt goes to that session
-/// instead and nothing new is created or linked.
+/// instead and nothing new is created, bound, or linked.
 ///
 /// # Errors
 ///
@@ -226,6 +227,7 @@ pub async fn ask(
     scope: NoteScope,
     mut exchange: ReviewAiExchange,
     text: String,
+    binding: bcode_code_review_models::ReviewAssistantBinding,
     now_ms: u64,
 ) -> Result<ReviewAiExchange, Box<(ReviewAiExchange, String)>> {
     let save = |exchange: ReviewAiExchange| {
@@ -264,6 +266,16 @@ pub async fn ask(
                 format!("Review: {}", exchange.anchor.file_path),
                 scope.repo_path.clone(),
             )
+            .await
+            .map_err(|error| error.message)?;
+        services
+            .call(bcode_code_review_models::BindReviewAssistantRequest {
+                repo_path: scope.repo_path.clone(),
+                binding: bcode_code_review_models::ReviewAssistantBinding {
+                    session_id: session.clone(),
+                    ..binding
+                },
+            })
             .await
             .map_err(|error| error.message)?;
         services

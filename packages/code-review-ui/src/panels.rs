@@ -16,6 +16,10 @@
 //! 3. The threads panel shows when the user opened it: to the right when the body is at least
 //!    [`THREADS_RIGHT_BODY`] columns, under the document when the body has at least
 //!    [`THREADS_BOTTOM_BODY_HEIGHT`] rows, otherwise not at all.
+//! 4. The assistant dock shows when the user opened it: to the right when the body is at least
+//!    [`ASSISTANT_RIGHT_BODY`] columns (and [`ASSISTANT_BESIDE_THREADS_BODY`] when the threads
+//!    panel is also to the right), under the document (after the threads panel) when the body
+//!    has at least [`THREADS_BOTTOM_BODY_HEIGHT`] rows, otherwise not at all.
 
 use bcode_code_review_models::ReviewPanelState;
 use bmux_tui_components::panel_group::{
@@ -42,6 +46,17 @@ pub const REVIEW_MIN_WIDTH: u16 = 40;
 pub const THREADS_RIGHT_BODY: u16 = 150;
 /// Body height from which the threads panel can sit under the document.
 pub const THREADS_BOTTOM_BODY_HEIGHT: u16 = 20;
+/// Body width from which the assistant dock sits to the right.
+pub const ASSISTANT_RIGHT_BODY: u16 = 120;
+/// Body width from which the assistant dock sits to the right beside a right threads panel.
+pub const ASSISTANT_BESIDE_THREADS_BODY: u16 = 190;
+/// Narrowest assistant dock to the right.
+pub const ASSISTANT_MIN_WIDTH: u16 = 30;
+/// Default assistant dock width (right) and height (bottom).
+const ASSISTANT_DEFAULT_WIDTH: u16 = 56;
+const ASSISTANT_DEFAULT_HEIGHT: u16 = 14;
+/// Smallest assistant dock height under the document.
+const ASSISTANT_MIN_HEIGHT: u16 = 6;
 /// Default threads panel width (right) or height (bottom).
 const THREADS_DEFAULT_WIDTH: u16 = 44;
 const THREADS_DEFAULT_HEIGHT: u16 = 10;
@@ -59,11 +74,13 @@ pub enum PanelId {
     Review,
     /// Threads list.
     Threads,
+    /// Review assistant dock.
+    Assistant,
 }
 
-/// Where the threads panel is.
+/// Where a side panel (threads, assistant) is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadsPlacement {
+pub enum SidePlacement {
     /// Not shown.
     Hidden,
     /// To the right of the document.
@@ -80,7 +97,9 @@ pub struct PanelPlan {
     /// Whether the file panel shows.
     pub files: bool,
     /// Where the threads panel shows.
-    pub threads: ThreadsPlacement,
+    pub threads: SidePlacement,
+    /// Where the assistant dock shows.
+    pub assistant: SidePlacement,
 }
 
 /// Panel visibility, sizes, and the BMUX group states.
@@ -88,12 +107,12 @@ pub struct PanelPlan {
 pub struct Panels {
     /// Horizontal group: files, the review column, threads on the right.
     pub root: RefCell<PanelGroupState>,
-    /// Vertical group of the review column: document, threads at the bottom.
+    /// Vertical group of the review column: document, then bottom panels.
     pub column: RefCell<PanelGroupState>,
     /// Panels in `root`, in order.
     root_members: Vec<PanelId>,
-    /// Whether `column` holds the threads panel.
-    column_threads: bool,
+    /// Panels in `column`, in order (the document first).
+    column_members: Vec<PanelId>,
     /// The user's file panel choice; `None` follows the width.
     pub files_choice: Option<bool>,
     /// File panel width chosen by resizing.
@@ -102,6 +121,10 @@ pub struct Panels {
     pub threads_open: bool,
     /// Threads panel size chosen by resizing (columns to the right, rows at the bottom).
     pub threads_size: Option<u16>,
+    /// Whether the user opened the assistant dock.
+    pub assistant_open: bool,
+    /// Assistant dock size chosen by resizing (columns to the right, rows at the bottom).
+    pub assistant_size: Option<u16>,
     plan: Option<PanelPlan>,
     body: (u16, u16),
 }
@@ -112,11 +135,13 @@ impl Default for Panels {
             root: RefCell::new(PanelGroupState::new(Vec::new())),
             column: RefCell::new(PanelGroupState::new(Vec::new())),
             root_members: Vec::new(),
-            column_threads: false,
+            column_members: Vec::new(),
             files_choice: None,
             files_width: None,
             threads_open: false,
             threads_size: None,
+            assistant_open: false,
+            assistant_size: None,
             plan: None,
             body: (0, 0),
         }
@@ -158,18 +183,32 @@ impl Panels {
                 None => width >= FILES_AUTO_BODY,
             };
         let threads = if !bordered || !self.threads_open {
-            ThreadsPlacement::Hidden
+            SidePlacement::Hidden
         } else if width >= THREADS_RIGHT_BODY {
-            ThreadsPlacement::Right
+            SidePlacement::Right
         } else if height >= THREADS_BOTTOM_BODY_HEIGHT {
-            ThreadsPlacement::Bottom
+            SidePlacement::Bottom
         } else {
-            ThreadsPlacement::Hidden
+            SidePlacement::Hidden
+        };
+        let beside = match threads {
+            SidePlacement::Right => ASSISTANT_BESIDE_THREADS_BODY,
+            _ => ASSISTANT_RIGHT_BODY,
+        };
+        let assistant = if !bordered || !self.assistant_open {
+            SidePlacement::Hidden
+        } else if width >= beside {
+            SidePlacement::Right
+        } else if height >= THREADS_BOTTOM_BODY_HEIGHT {
+            SidePlacement::Bottom
+        } else {
+            SidePlacement::Hidden
         };
         PanelPlan {
             bordered,
             files,
             threads,
+            assistant,
         }
     }
 
@@ -185,10 +224,10 @@ impl Panels {
         &self.root_members
     }
 
-    /// Whether the column group holds the threads panel.
+    /// Panels of the column group, in order (the document first).
     #[must_use]
-    pub const fn column_threads(&self) -> bool {
-        self.column_threads
+    pub fn column_members(&self) -> &[PanelId] {
+        &self.column_members
     }
 
     /// Bring the group states in line with the plan for a `width` x `height` body.
@@ -220,61 +259,92 @@ impl Panels {
             REVIEW_MIN_WIDTH.min(width),
             None,
         ));
-        if plan.threads == ThreadsPlacement::Right {
-            let max = side_room.max(FILES_MIN_WIDTH);
+        let side_max = side_room.max(FILES_MIN_WIDTH);
+        if plan.threads == SidePlacement::Right {
             members.push(PanelId::Threads);
             sizes.push(PanelSize::fixed(
                 self.threads_size
                     .unwrap_or(THREADS_DEFAULT_WIDTH)
-                    .clamp(FILES_MIN_WIDTH, max),
+                    .clamp(FILES_MIN_WIDTH, side_max),
             ));
-            constraints.push(PanelGroupConstraints::new(FILES_MIN_WIDTH, Some(max)));
+            constraints.push(PanelGroupConstraints::new(FILES_MIN_WIDTH, Some(side_max)));
+        }
+        if plan.assistant == SidePlacement::Right {
+            let max = side_room.max(ASSISTANT_MIN_WIDTH);
+            members.push(PanelId::Assistant);
+            // By default a third of the body, at most the default width.
+            let default = (width / 3).clamp(ASSISTANT_MIN_WIDTH, ASSISTANT_DEFAULT_WIDTH);
+            sizes.push(PanelSize::fixed(
+                self.assistant_size
+                    .unwrap_or(default)
+                    .clamp(ASSISTANT_MIN_WIDTH, max),
+            ));
+            constraints.push(PanelGroupConstraints::new(ASSISTANT_MIN_WIDTH, Some(max)));
         }
         let mut root = PanelGroupState::new(sizes);
         root.set_constraints(constraints);
         *self.root.borrow_mut() = root;
         self.root_members = members;
-        self.column_threads = plan.threads == ThreadsPlacement::Bottom;
-        let mut column = if self.column_threads {
-            let max = height.saturating_sub(MIN_PANE_ROWS).max(THREADS_MIN_HEIGHT);
-            PanelGroupState::new([
-                PanelSize::flex(1),
-                PanelSize::fixed(
-                    self.threads_size
-                        .unwrap_or(THREADS_DEFAULT_HEIGHT)
-                        .clamp(THREADS_MIN_HEIGHT, max),
-                ),
-            ])
-        } else {
-            PanelGroupState::new([PanelSize::flex(1)])
-        };
-        column.set_constraints(column_constraints(self.column_threads, height));
+        // The column: the document, then the bottom panels.
+        let max_bottom = height.saturating_sub(MIN_PANE_ROWS);
+        let mut column_members = vec![PanelId::Review];
+        let mut column_sizes = vec![PanelSize::flex(1)];
+        let mut column_constraints = vec![PanelGroupConstraints::new(MIN_PANE_ROWS, None)];
+        for (member, placement, size, default, min) in [
+            (
+                PanelId::Threads,
+                plan.threads,
+                self.threads_size,
+                THREADS_DEFAULT_HEIGHT,
+                THREADS_MIN_HEIGHT,
+            ),
+            (
+                PanelId::Assistant,
+                plan.assistant,
+                self.assistant_size,
+                ASSISTANT_DEFAULT_HEIGHT,
+                ASSISTANT_MIN_HEIGHT,
+            ),
+        ] {
+            if placement != SidePlacement::Bottom {
+                continue;
+            }
+            let max = max_bottom.max(min);
+            column_members.push(member);
+            column_sizes.push(PanelSize::fixed(size.unwrap_or(default).clamp(min, max)));
+            column_constraints.push(PanelGroupConstraints::new(min, Some(max)));
+        }
+        if column_members.len() == 1 {
+            column_constraints = vec![PanelGroupConstraints::new(0, None)];
+        }
+        let mut column = PanelGroupState::new(column_sizes);
+        column.set_constraints(column_constraints);
         *self.column.borrow_mut() = column;
+        self.column_members = column_members;
         plan
     }
 
     /// Record sizes after a divider drag. Returns whether a persisted size changed.
     pub fn note_resize(&mut self) -> bool {
-        let before = (self.files_width, self.threads_size);
-        {
-            let root = self.root.borrow();
-            for (member, size) in self.root_members.iter().zip(root.sizes()) {
-                let PanelSize::Fixed(cells) = *size else {
-                    continue;
-                };
-                match member {
-                    PanelId::Files => self.files_width = Some(cells),
-                    PanelId::Threads => self.threads_size = Some(cells),
-                    PanelId::Review => {}
+        let before = (self.files_width, self.threads_size, self.assistant_size);
+        let mut record = |member: PanelId, cells: u16| match member {
+            PanelId::Files => self.files_width = Some(cells),
+            PanelId::Threads => self.threads_size = Some(cells),
+            PanelId::Assistant => self.assistant_size = Some(cells),
+            PanelId::Review => {}
+        };
+        for (members, group) in [
+            (&self.root_members, &self.root),
+            (&self.column_members, &self.column),
+        ] {
+            let group = group.borrow();
+            for (member, size) in members.clone().into_iter().zip(group.sizes()) {
+                if let PanelSize::Fixed(cells) = *size {
+                    record(member, cells);
                 }
             }
         }
-        if self.column_threads
-            && let Some(PanelSize::Fixed(rows)) = self.column.borrow().sizes().get(1).copied()
-        {
-            self.threads_size = Some(rows);
-        }
-        before != (self.files_width, self.threads_size)
+        before != (self.files_width, self.threads_size, self.assistant_size)
     }
 
     /// Toggle the file panel at the current body width; returns whether it is now shown.
@@ -299,6 +369,13 @@ impl Panels {
         self.threads_open
     }
 
+    /// Toggle the assistant dock; returns whether the user wants it open.
+    pub const fn toggle_assistant(&mut self) -> bool {
+        self.assistant_open = !self.assistant_open;
+        self.plan = None;
+        self.assistant_open
+    }
+
     /// Grow (positive) or shrink the file panel by `delta` columns.
     pub fn resize_files(&mut self, delta: i32) -> bool {
         let (width, _) = self.body;
@@ -321,18 +398,6 @@ impl Panels {
         self.files_width = Some(next);
         self.plan = None;
         true
-    }
-}
-
-fn column_constraints(threads: bool, height: u16) -> Vec<PanelGroupConstraints> {
-    if threads {
-        let max = height.saturating_sub(MIN_PANE_ROWS).max(THREADS_MIN_HEIGHT);
-        vec![
-            PanelGroupConstraints::new(MIN_PANE_ROWS, None),
-            PanelGroupConstraints::new(THREADS_MIN_HEIGHT, Some(max)),
-        ]
-    } else {
-        vec![PanelGroupConstraints::new(0, None)]
     }
 }
 
@@ -385,11 +450,44 @@ mod tests {
     #[test]
     fn threads_panel_moves_below_the_document_when_narrow() {
         let mut panels = Panels::default();
-        assert_eq!(panels.plan(200, 40).threads, ThreadsPlacement::Hidden);
+        assert_eq!(panels.plan(200, 40).threads, SidePlacement::Hidden);
         panels.toggle_threads();
-        assert_eq!(panels.plan(200, 40).threads, ThreadsPlacement::Right);
-        assert_eq!(panels.plan(120, 40).threads, ThreadsPlacement::Bottom);
-        assert_eq!(panels.plan(120, 10).threads, ThreadsPlacement::Hidden);
+        assert_eq!(panels.plan(200, 40).threads, SidePlacement::Right);
+        assert_eq!(panels.plan(120, 40).threads, SidePlacement::Bottom);
+        assert_eq!(panels.plan(120, 10).threads, SidePlacement::Hidden);
+    }
+
+    #[test]
+    fn the_assistant_dock_moves_below_the_document_when_narrow() {
+        let mut panels = Panels::default();
+        assert_eq!(panels.plan(200, 40).assistant, SidePlacement::Hidden);
+        panels.toggle_assistant();
+        assert_eq!(
+            panels.plan(ASSISTANT_RIGHT_BODY, 40).assistant,
+            SidePlacement::Right
+        );
+        assert_eq!(
+            panels.plan(ASSISTANT_RIGHT_BODY - 1, 40).assistant,
+            SidePlacement::Bottom
+        );
+        assert_eq!(panels.plan(100, 10).assistant, SidePlacement::Hidden);
+        // Beside a right threads panel it needs more room, else it goes below.
+        panels.toggle_threads();
+        assert_eq!(panels.plan(160, 40).threads, SidePlacement::Right);
+        assert_eq!(panels.plan(160, 40).assistant, SidePlacement::Bottom);
+        assert_eq!(
+            panels.plan(ASSISTANT_BESIDE_THREADS_BODY, 40).assistant,
+            SidePlacement::Right
+        );
+        // Both below: the document, then threads, then the assistant.
+        panels.sync(110, 40);
+        assert_eq!(
+            panels.column_members(),
+            [PanelId::Review, PanelId::Threads, PanelId::Assistant]
+        );
+        // A tiny body shows neither, and the document keeps its rows.
+        panels.sync(MIN_BORDERED_WIDTH - 1, 40);
+        assert_eq!(panels.column_members(), [PanelId::Review]);
     }
 
     #[test]

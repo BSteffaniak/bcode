@@ -24,8 +24,17 @@ pub const TOOL_TAIL_LINES: usize = 3;
 const MAX_ANSWER_BYTES: usize = 64 * 1024;
 /// Bytes kept of reasoning, a question, a notice, or an error.
 const MAX_TEXT_BYTES: usize = 8 * 1024;
+/// Bytes kept of a tool call's JSON arguments.
+pub const MAX_ARGUMENTS_BYTES: usize = 4 * 1024;
 /// Bytes kept of one output line or a tool summary.
 const MAX_LINE_BYTES: usize = 512;
+
+/// Prefix of the code review plugin's tools.
+pub const REVIEW_TOOL_PREFIX: &str = "code_review.";
+
+/// Where the review assistant's context block starts after a message's text; feeds show the
+/// text before it.
+pub const CONTEXT_MARKER: &str = "\n\n[Review context: ";
 
 /// Where the question starts in the prompts the review sends.
 const QUESTION_MARKER: &str = "\nQuestion:\n";
@@ -50,6 +59,8 @@ pub struct ToolLine {
     pub name: String,
     /// One-line summary of its arguments.
     pub summary: String,
+    /// Its JSON arguments as requested (the first [`MAX_ARGUMENTS_BYTES`]).
+    pub arguments: String,
     /// State.
     pub state: ToolState,
     /// The last [`MAX_OUTPUT_LINES`] lines of its output.
@@ -235,12 +246,15 @@ impl Feed {
 }
 
 /// The question of a user message: the text after the review prompt's `Question:` marker, else
-/// the whole message, trimmed and bounded.
+/// the whole message, without an assistant context block, trimmed and bounded.
 #[must_use]
 pub fn question_of(text: &str) -> String {
     let question = text
         .rfind(QUESTION_MARKER)
         .map_or(text, |at| &text[at + QUESTION_MARKER.len()..]);
+    let question = question
+        .rfind(CONTEXT_MARKER)
+        .map_or(question, |at| &question[..at]);
     bounded(question.trim(), MAX_TEXT_BYTES)
 }
 
@@ -264,6 +278,7 @@ fn feed_item(item: &TranscriptViewItem) -> Option<FeedItem> {
             id: draft.tool_call_id.clone(),
             name: draft.tool_name.clone(),
             summary: String::new(),
+            arguments: String::new(),
             state: ToolState::Running,
             output: Vec::new(),
             total_lines: 0,
@@ -311,6 +326,10 @@ fn tool_line(tool: &ToolInvocationView) -> ToolLine {
         id: tool.tool_call_id.clone(),
         name: tool.tool_name.clone().unwrap_or_else(|| "tool".to_owned()),
         summary: arguments_summary(tool.arguments_json.as_deref()),
+        arguments: bounded(
+            tool.arguments_json.as_deref().unwrap_or_default(),
+            MAX_ARGUMENTS_BYTES,
+        ),
         state,
         output,
         total_lines,
@@ -497,5 +516,9 @@ mod tests {
     fn questions_come_from_review_prompts_or_whole_messages() {
         assert_eq!(question_of("context\n\nQuestion:\n  Why?  \n"), "Why?");
         assert_eq!(question_of("  typed in Bcode "), "typed in Bcode");
+        assert_eq!(
+            question_of("Is it safe?\n\n[Review context: \"x\"; the reviewer is at a.rs:3.]"),
+            "Is it safe?"
+        );
     }
 }

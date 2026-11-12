@@ -2009,7 +2009,10 @@ before is the same app without these changes; per presented frame):
   without leaving the review, open the linked session with `o`, return; replaces the
   chat-routing cases `review-linked-navigation` and `review-home-workspace-chat`),
   `review-click-save-resume` and `review-wizard-unstaged` (replacing the preset-click cases),
-  `review-tree-scroll-resize`, `review-range-edit-thread`, and `review-pointer-no-rewrite`.
+  `review-tree-scroll-resize`, `review-range-edit-thread`, `review-pointer-no-rewrite`, and
+  `review-assistant-tool` (the assistant dock runs `code_review.add_comment` through the fake
+  provider's prompt tool directives, the prompt is allowed in the dock, and the draft appears;
+  its `review-assistant` fixture enables those directives instead of the scripted answer).
   `completion-review` drives the composer's `@path` completion (accept, ordinary typing,
   `esc`, closing the composer). A step may set
   `handoff: true` to allow the alternate screen to be left and re-entered while the app hands
@@ -2206,6 +2209,59 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
 * **Live reflection.** The app reflects tool writes as they happen (a drafted comment appears at
   its anchor, a resolve updates the thread), through the same annotation store and refresh path
   as the reviewer's own edits.
+
+**Built.**
+
+* **Dock** (`packages/code-review-ui/src/surface/dock.rs`). `ctrl+k` opens the dock and focuses
+  it, focuses it when it is open elsewhere, and closes it when focused (scope
+  `code-review-assistant`: `esc` back, `ctrl+c` stop, `ctrl+x` attach or detach the place,
+  `ctrl+n` new conversation, `ctrl+o` open in Bcode, `pageup`/`pagedown` scroll). `Panels` places
+  it right of the document from 120 columns (190 beside a right threads panel; a third of the
+  body by default, at most 56 columns), under it (after the threads panel) from 20 rows, and
+  hides it otherwise; its divider resizes it and a click focuses it. The header row has chips for
+  the review and the cursor's place; while the place is attached a message carries it as a
+  context block after the text (feeds show the text without it). The conversation is
+  `rows::dock_rows`: every observed turn rendered with the AI card's feed rows, the permission
+  prompt, and a working line; it is laid out at the width the first layout pass measures, cached
+  by the session's revision, clipped rather than wrapped, and scrolls from the newest row. A
+  pending prompt replaces the input and takes the feed keys.
+* **Session and binding.** The first message creates a session, binds it with
+  `review.assistant.bind` (table `review_assistant_sessions`: session id, the review's workspace,
+  the resolved sources and stacks of its open document), then sends. Reopening the review looks up
+  the newest binding of its annotation scope and continues that session; the binding is refreshed
+  with the next message after the review reopens. AI cards' new sessions are bound the same way.
+* **Review tools** (`plugins/code-review-plugin/src/tools.rs` over
+  `bcode_code_review::assistant`). `code_review.list_reviews`, `summary`, `list_files`,
+  `file_diff`, `file_content`, `list_threads`, `pull_request` (the GitHub CLI through
+  `bcode_forge`, giving checks state) and `navigate` are read-only; `add_comment`, `reply`,
+  `resolve_thread`, `mark_viewed` and `suggest_change` are mutating; `publish` is mutating with
+  its own permission category. Preparation takes the session id and working directory from the
+  host's workspace context into the descriptor; invocation opens the review through the
+  session's binding (or a saved review's id) with the bound revisions, and writes through
+  `ReviewStore` with anchors built from the file's hunks (line kind, source, head and blob), as
+  the app records them. Reads are bounded and report cuts.
+* **Permissions.** The default agents enable the tools (the plan agent turns the writes and
+  `publish` off). Exact-name rules under `[agent.<id>.permission.tools]` now also apply to
+  read-only operations (`agent-policy`), so every review tool can be set to allow, ask, or deny;
+  `[agent.<id>.tools]` turns one off.
+* **Live reflection.** After the follow streams drain, finished `code_review.*` writes in any
+  followed session reload the annotations (and, for `mark_viewed`, the stored viewed state) and a
+  finished `navigate` moves the cursor; calls already finished when a session is first observed
+  are recorded, not replayed. The feed keeps each tool call's arguments (4 KiB) for this.
+* **Verification.** Plugin tests drive every tool through the plugin entry point (listing,
+  preparation policies, a bound session's reads, writes landing in the app's scope, publishing).
+  Screen tests cover opening and placing the dock, a bound session with the attached place,
+  answering the dock's permission prompt with `y`, and the review following tool writes, viewed
+  marks and navigation without replaying old calls. The PTY case `review-assistant-tool` drives
+  `code_review.add_comment` through the fake provider in a real `bcode review`: the prompt shows
+  in the dock, `y` allows it, and the draft appears in the review. The 400×120 screen benchmark
+  stays under 1.5 ms p95 paint with the dock closed.
+* **Not built here.** Chips for model, effort, agent and permission mode (the review host has no
+  session settings API); publishing to forge publishers from a tool (plugin tools cannot call
+  other plugins' services, so GitHub publishing stays in the app); CI status beyond the pull
+  request's aggregate checks state; reflecting writes made by sessions the review does not follow
+  (an unrelated chat session's writes show on the next refresh or reopen); a persisted dock
+  open/size state.
 
 ### 13.7 Phase 13: embedded-session model (Bcode-wide)
 

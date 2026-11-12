@@ -95,6 +95,9 @@ keymap_actions = [
     { id = "bcode.code_review.threads_toggle", scope = "code-review", description = "Show / hide threads panel", defaults = [
         "shift+t",
     ] },
+    { id = "bcode.code_review.assistant_toggle", scope = "code-review", description = "Open, focus, or close the review assistant", defaults = [
+        "ctrl+k",
+    ] },
     { id = "bcode.code_review.comment", scope = "code-review", description = "Comment on the line, range, or file (reply on a thread)", defaults = [
         "c",
     ] },
@@ -324,6 +327,30 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.wizard_back", scope = "code-review-wizard", description = "Back one step", defaults = [
         "esc",
+    ] },
+    { id = "bcode.code_review.assistant_close", scope = "code-review-assistant", description = "Close the assistant", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "bcode.code_review.assistant_back", scope = "code-review-assistant", description = "Back to the review (the assistant stays open)", defaults = [
+        "esc",
+    ] },
+    { id = "bcode.code_review.assistant_stop", scope = "code-review-assistant", description = "Stop the assistant's running turn", defaults = [
+        "ctrl+c",
+    ] },
+    { id = "bcode.code_review.assistant_context", scope = "code-review-assistant", description = "Attach or detach the cursor's place as context", defaults = [
+        "ctrl+x",
+    ] },
+    { id = "bcode.code_review.assistant_new", scope = "code-review-assistant", description = "Start a new conversation", defaults = [
+        "ctrl+n",
+    ] },
+    { id = "bcode.code_review.assistant_open", scope = "code-review-assistant", description = "Open the assistant's session in Bcode", defaults = [
+        "ctrl+o",
+    ] },
+    { id = "bcode.code_review.assistant_scroll_up", scope = "code-review-assistant", description = "Scroll the conversation up", defaults = [
+        "pageup",
+    ] },
+    { id = "bcode.code_review.assistant_scroll_down", scope = "code-review-assistant", description = "Scroll the conversation down", defaults = [
+        "pagedown",
     ] },
     { id = "bcode.code_review.feed_allow", scope = "code-review-feed", description = "Allow the AI card's permission request once", defaults = [
         "y",

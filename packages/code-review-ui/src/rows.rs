@@ -124,7 +124,7 @@ use std::fmt::Write as _;
 
 mod agent;
 
-pub use agent::{exchange_turn, is_newest, item_id, open_key};
+pub use agent::{dock_key, dock_rows, exchange_turn, is_newest, item_id, open_key};
 
 /// Presentation inputs shared by every row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,8 +7,9 @@ Code Review is product behavior owned by its own crates: the data layer `package
 The review consumes these generic capabilities:
 
 * Manifest-declared native plugin services with versioned interface IDs and typed JSON payloads. The plugin serves `bcode.code_review/v1` as thin adapters over `bcode_code_review`, so agents and other plugins reach the same records the app writes.
+* Plugin tools (`bcode.tool/v1`). The plugin offers the review to agents as `code_review.*` tools whose operations are `bcode_code_review::assistant`. Each declares a policy operation through the standard tool preparation (`ToolPolicyOperation::ReadOnly` for reads and navigation, `Mutating` for writes and publishing) and takes the calling session and its working directory from the host's workspace context, so Bcode's ordinary permission rules and prompts govern them and the host knows nothing about reviews.
 * Static CLI registration. When statically bundled, the plugin registers `bcode review`, which runs the `bcode_code_review_ui` app in the same process (the same way the git plugin registers `bcode git`). Only `publish-github` asks the host to start the daemon before it runs.
-* Contributed keymap actions. The review's scopes are `code-review` (the review), `code-review-home`, `code-review-wizard`, `code-review-files`, `code-review-threads`, `code-review-composer`, and `code-review-feed` (an AI card's permission answers and stop); user keymap configuration overrides them by scope like any other contributor. The app's `packages/code-review-ui/keymap.toml` is the one declaration: the app reads it at build time and the statically bundled plugin contributes it to bcode's keymap through its TUI registry.
+* Contributed keymap actions. The review's scopes are `code-review` (the review), `code-review-home`, `code-review-wizard`, `code-review-files`, `code-review-threads`, `code-review-composer`, `code-review-feed` (an AI card's permission answers and stop), and `code-review-assistant` (the assistant dock); user keymap configuration overrides them by scope like any other contributor. The app's `packages/code-review-ui/keymap.toml` is the one declaration: the app reads it at build time and the statically bundled plugin contributes it to bcode's keymap through its TUI registry.
 * Generic daemon client operations: creating sessions, sending messages, answering permission requests (`resolve_permission_with_remember`), stopping a running turn (`cancel_session_turn`), and following a session's live view through `bcode_session_view::follow::follow_session_view`, which owns attachment, bounded `SessionView` projection, reconnect, and resynchronization. The review receives complete `SessionViewSnapshot` updates, never raw session events.
 * Generic plugin service discovery and invocation for publisher, importer, and review-source providers.
 * Theme discovery and component styles from `bcode_tui_theme`, shared with the chat TUI and `bcode-git`.
@@ -36,6 +37,13 @@ permission resolution), and stop (an ordinary turn cancellation). The card keeps
 summary of the view, never the transcript. Opening a linked session (`o`) hands the terminal to
 `bcode tui <session>` and resumes the review where it was when that exits, so full session
 interaction stays with the ordinary session frontend and the review keeps only its own state.
+
+The review assistant dock is the same mechanism with one session per review: the app creates it,
+records a review assistant binding (`review_assistant_sessions`: the session id, the review's
+workspace, and the revisions its sources resolved to), and follows it in the dock. AI cards'
+sessions are bound the same way. The binding is review-domain state; the session itself stays
+session-owned. Tools find the review through the binding of the calling session, which the host
+names in the tool's workspace context.
 
 Reviewer AI exchanges persist only review-domain identity, anchor, question, linked session ID, and
 lifecycle metadata. Session transcript and runtime state remain session-owned.

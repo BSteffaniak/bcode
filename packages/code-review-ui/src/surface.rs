@@ -151,6 +151,7 @@ enum Phase {
 
 mod annotate;
 mod assist;
+mod dock;
 mod feed;
 mod find;
 mod flows;
@@ -158,6 +159,7 @@ mod pointer;
 mod stack;
 
 pub use annotate::COMPOSER_SCOPE;
+pub use dock::{ASSISTANT_PANE_ID, ASSISTANT_SCOPE, DockResult};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
 
@@ -178,6 +180,8 @@ pub enum Focus {
     Filter,
     /// The threads panel.
     Threads,
+    /// The assistant dock.
+    Assistant,
 }
 
 /// Saving of presentation state.
@@ -636,6 +640,8 @@ pub struct ReviewSurface {
     feed_requests: VecDeque<feed::FeedRequest>,
     /// When the next spinner frame was asked for.
     feed_wake: Option<Instant>,
+    /// The review assistant dock.
+    dock: dock::Dock,
 }
 
 impl std::fmt::Debug for ReviewSurface {
@@ -693,6 +699,7 @@ impl ReviewSurface {
             opened_at: None,
             generation: 0,
             focus: Focus::Review,
+            dock: dock::Dock::default(),
             panels: Panels::default(),
             files_pane: Cell::new(PaneState::new(Rect::default())),
             review_pane: Cell::new(PaneState::new(Rect::default())),
@@ -1662,6 +1669,7 @@ impl ReviewSurface {
             Message::NoteDone(result) => self.finish_note(result),
             Message::Asked(result) => self.finish_ask(*result),
             Message::Feed(outcome) => self.finish_feed(outcome),
+            Message::Dock(result) => self.finish_dock(*result, host),
             Message::SavedAs(result) => self.finish_save_review(*result),
             Message::Publish(result) => self.apply_publish(result),
             Message::Import(result) => self.apply_import(result),
@@ -1877,6 +1885,7 @@ impl ReviewSurface {
                     return action;
                 }
             }
+            Focus::Assistant => return self.assistant_key(stroke, host),
             Focus::Review => {}
         }
         if let Some(action) = self.feed_key(stroke, host) {
@@ -2260,11 +2269,15 @@ impl ReviewSurface {
     fn focus_next(&mut self) {
         let plan = self.panels.current();
         let files = plan.is_some_and(|plan| plan.files);
-        let threads =
-            plan.is_some_and(|plan| plan.threads != super::panels::ThreadsPlacement::Hidden);
+        let threads = plan.is_some_and(|plan| plan.threads != super::panels::SidePlacement::Hidden);
+        let assistant =
+            plan.is_some_and(|plan| plan.assistant != super::panels::SidePlacement::Hidden);
         self.focus = match self.focus {
             Focus::Review if files => Focus::Files,
             Focus::Review | Focus::Files | Focus::Filter if threads => Focus::Threads,
+            Focus::Review | Focus::Files | Focus::Filter | Focus::Threads if assistant => {
+                Focus::Assistant
+            }
             Focus::Composer | Focus::Search => self.focus,
             _ => Focus::Review,
         };
@@ -2648,8 +2661,8 @@ impl ReviewSurface {
             let outcome = overlay.mouse(event, &self.theme);
             return self.overlay_outcome(outcome, host);
         }
-        if self.rail_mouse(event) {
-            return Action::Redraw;
+        if let Some(action) = self.side_mouse(event, *mouse) {
+            return action;
         }
         let wheel = match mouse.kind {
             MouseEventKind::ScrollDown => 3,
@@ -2740,6 +2753,14 @@ impl ReviewSurface {
         }
     }
 
+    /// A mouse event the stack rail or the assistant dock handles.
+    fn side_mouse(&mut self, event: &Event, mouse: bmux_tui::event::MouseEvent) -> Option<Action> {
+        if self.rail_mouse(event) {
+            return Some(Action::Redraw);
+        }
+        self.assistant_mouse(mouse)
+    }
+
     /// Give keyboard focus to the pane under `position`.
     fn focus_at(&mut self, position: bmux_tui::geometry::Point) {
         let inside = |id: &str| {
@@ -2752,6 +2773,8 @@ impl ReviewSurface {
             Some(Focus::Files)
         } else if inside(THREADS_PANE_ID) {
             Some(Focus::Threads)
+        } else if inside(ASSISTANT_PANE_ID) {
+            Some(Focus::Assistant)
         } else if inside(REVIEW_PANE_ID) || inside(LIST_ID) {
             Some(Focus::Review)
         } else {
@@ -3109,6 +3132,11 @@ impl ReviewSurface {
                 push(key("focus_next"), "next pane");
                 push(key("files_back"), "back");
             }
+            Focus::Assistant => {
+                for (key, label) in self.assistant_hints() {
+                    push(key, label);
+                }
+            }
             Focus::Threads => {
                 push(key("down"), "move");
                 push(key("threads_open"), "open");
@@ -3324,6 +3352,9 @@ impl ReviewSurface {
 
     /// Run one review action (from a key, the palette, or help).
     fn run_action(&mut self, action: &str, count: Option<u32>, host: &UiContext) -> Action {
+        if action == "assistant_toggle" {
+            return self.toggle_assistant(host);
+        }
         if let Some(result) = self.surface_action(action, count, host) {
             return result;
         }
@@ -3336,7 +3367,8 @@ impl ReviewSurface {
         // Focus never stays on a pane that is not shown.
         let shown = match self.focus {
             Focus::Files | Focus::Filter => plan.files,
-            Focus::Threads => plan.threads != super::panels::ThreadsPlacement::Hidden,
+            Focus::Threads => plan.threads != super::panels::SidePlacement::Hidden,
+            Focus::Assistant => plan.assistant != super::panels::SidePlacement::Hidden,
             Focus::Review | Focus::Composer | Focus::Search => true,
         };
         if !shown {
@@ -3362,6 +3394,9 @@ impl ReviewSurface {
             let tree_rows = layout
                 .find(&LayoutId::new(TREE_VIEWPORT_ID))
                 .map(|node| node.size.height);
+            if let Some(node) = layout.find(&LayoutId::new(dock::ASSISTANT_FEED_ID)) {
+                self.prepare_assistant(u16::try_from(node.size.width).unwrap_or(u16::MAX));
+            }
             (probe.get().unwrap_or(Size::new(0, 0)), tree_rows)
         };
         let prepared = self.prepare_list(list_size);
@@ -3628,21 +3663,27 @@ impl ReviewSurface {
                     let Some(pane) = review_pane.take() else {
                         continue;
                     };
-                    root = if self.panels.column_threads() {
-                        root.child(
-                            PanelGroupComponent::new(
-                                COLUMN_ID,
-                                super::panels::group(PanelGroupAxis::Vertical, theme.panels),
-                                &self.panels.column,
-                            )
-                            .child(pane)
-                            .child(self.threads_pane(review)),
+                    root = if self.panels.column_members().len() > 1 {
+                        let mut column = PanelGroupComponent::new(
+                            COLUMN_ID,
+                            super::panels::group(PanelGroupAxis::Vertical, theme.panels),
+                            &self.panels.column,
                         )
+                        .child(pane);
+                        for member in &self.panels.column_members()[1..] {
+                            column = match member {
+                                PanelId::Threads => column.child(self.threads_pane(review)),
+                                PanelId::Assistant => column.child(self.assistant_pane()),
+                                PanelId::Files | PanelId::Review => column,
+                            };
+                        }
+                        root.child(column)
                     } else {
                         root.child(pane)
                     };
                 }
                 PanelId::Threads => root = root.child(self.threads_pane(review)),
+                PanelId::Assistant => root = root.child(self.assistant_pane()),
             }
         }
         Element::new(root)
@@ -3693,6 +3734,77 @@ impl ReviewSurface {
             content,
         )
         .border_scrollbar(TREE_VIEWPORT_ID, &self.tree_scroll)
+    }
+
+    fn assistant_pane(&self) -> PaneComponent<'_, '_> {
+        let theme = &self.theme;
+        let focused = self.focus == Focus::Assistant;
+        let status = self
+            .dock
+            .session()
+            .and_then(|session| self.agents.state(session))
+            .map(|state| {
+                let mut parts = Vec::new();
+                if state.needs_you() {
+                    parts.push("needs you".to_owned());
+                } else if state.working {
+                    parts.push("working…".to_owned());
+                }
+                if state.feed.tokens > 0 {
+                    parts.push(super::agent::feed::tokens_label(state.feed.tokens));
+                }
+                if let Some(cost) = &state.feed.cost {
+                    parts.push(cost.clone());
+                }
+                parts.join(" · ")
+            })
+            .unwrap_or_default();
+        let chrome = Pane::new()
+            .title(theme.pane_title("Assistant", focused))
+            .right_title(theme.pane_status(&status))
+            .styles(self.pane_styles())
+            .chrome(theme.component.chrome);
+        // The chips and the prompt hint clip rather than wrap: each is one row.
+        let chips = TextBlock::new(Text::from_lines(vec![self.assistant_chips()]))
+            .wrap(bmux_tui::text::TextWrap::None);
+        let mut content = Column::new()
+            .id("review.assistant.content")
+            .child(chips)
+            .flex(Flex::new(1, self.assistant_feed()));
+        if self.assistant_prompt_pending() {
+            let hint = self
+                .assistant_hints()
+                .into_iter()
+                .filter_map(|(key, label)| key.map(|key| format!("{key} {label}")))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            content = content.child(
+                TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
+                    Span::styled(hint, theme.pill_warning),
+                ])]))
+                .wrap(bmux_tui::text::TextWrap::None),
+            );
+        } else {
+            let prompt = TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
+                Span::styled(theme.icons.accent_bar, theme.accent),
+                Span::raw(" "),
+            ])]));
+            let input = TextInputComponent::new(
+                dock::ASSISTANT_INPUT_ID,
+                self.dock.input(),
+                self.dock.policy(),
+            )
+            .style(theme.input)
+            .placeholder("Ask about this review…", theme.placeholder)
+            .focused(focused);
+            content = content.child(
+                Row::new()
+                    .id("review.assistant.input_row")
+                    .child(prompt)
+                    .flex(Flex::new(1, input)),
+            );
+        }
+        Self::pane(ASSISTANT_PANE_ID, chrome, focused, &self.dock.pane, content)
     }
 
     fn threads_pane<'a>(&'a self, review: &'a Review) -> PaneComponent<'a, 'a> {
@@ -4208,7 +4320,7 @@ impl View for ReviewSurface {
                     .map(|key| ((*action).to_owned(), key))
             })
             .collect();
-        for scope in [FILES_SCOPE, THREADS_SCOPE] {
+        for scope in [FILES_SCOPE, THREADS_SCOPE, ASSISTANT_SCOPE] {
             for action in crate::keymap::actions_for(scope) {
                 if let Some(key) = host.keymap_keys(scope, &action.id).into_iter().next() {
                     let name = action
@@ -4289,6 +4401,10 @@ impl View for ReviewSurface {
                 }
                 Action::Redraw
             }
+            Event::Paste(text) if self.focus == Focus::Assistant => {
+                self.assistant_paste(text);
+                Action::Redraw
+            }
             Event::Paste(text) if self.focus == Focus::Search => {
                 self.search_paste(text);
                 Action::Redraw
@@ -4354,6 +4470,7 @@ impl View for ReviewSurface {
         self.pump_notes(host);
         self.pump_feed(host);
         changed |= self.agents.drain();
+        self.reflect_review_tools(host);
         changed |= self.tick_feed(host);
         self.feed_attention();
         if changed {

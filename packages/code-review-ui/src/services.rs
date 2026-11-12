@@ -198,6 +198,10 @@ store_operations! {
     models::SaveExternalReviewImportRequest => models::SaveExternalReviewImportResponse,
         models::OP_REVIEW_EXTERNAL_IMPORT_SAVE,
         |store, request| store.save_external_import(request);
+    models::BindReviewAssistantRequest => models::BindReviewAssistantResponse,
+        "review.assistant.bind", |store, request| store.bind_assistant(request);
+    models::GetReviewAssistantRequest => models::GetReviewAssistantResponse,
+        "review.assistant.get", |store, request| store.assistant_binding(&request);
     PreviewBundle => models::PublishReviewPreviewResponse,
         models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW,
         |_store, request| bcode_code_review::store::preview_bundle(&request.0);

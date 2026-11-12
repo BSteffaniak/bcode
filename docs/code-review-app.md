@@ -102,6 +102,80 @@ Each session has its own layout revision, so a streaming update or a spinner fra
 that session's cards. Follow-ups in one session each show their own turn, found by the question;
 a turn that has left the observed window says so and `o` reads it in Bcode.
 
+### Review assistant
+
+`ctrl+k` opens the assistant dock and focuses it; when the dock is open elsewhere it focuses it,
+and when it is focused it closes it. The dock is a chat with a Bcode session working on this
+review. It sits to the right of the document when the body is at least 120 columns wide (190
+beside a right threads panel) and under the document otherwise; drag its divider to resize it.
+
+* The header row carries chips: the review and the cursor's place (its line, selected range, or
+  file). While the place chip is attached (`ctrl+x` detaches or attaches it), a message carries a
+  short context block naming it after the text; the conversation shows the text as typed.
+* The first message creates a session in the repository, binds it to the review, and sends the
+  message. Reopening the review continues its newest bound session; `ctrl+n` starts a new one.
+* The conversation shows every observed turn like an AI card: `▍you` and the message, reasoning,
+  tool lines with their output, and the answers, with a spinner while the session works. Its
+  pane title shows `needs you`, `working…`, tokens and cost. `pageup`/`pagedown` and the wheel
+  scroll it; clicks open reasoning and tool output.
+* A permission request of the session replaces the input with its prompt: `y` allow, `a` always,
+  `n` decline, `d` never (Always and Never when the request can be remembered). `ctrl+c` stops
+  the running turn, `ctrl+o` opens the session in Bcode, and `esc` returns to the review with the
+  dock open. A request while the dock is hidden raises a toast.
+* When a `code_review.*` tool that changes the review finishes in the dock's session (or an AI
+  card's), the review reloads its comments and viewed files as it does for the reviewer's own
+  edits: a drafted comment appears at its line, a resolved thread resolves, a viewed file shows
+  as viewed. `code_review.navigate` moves the cursor to the place it names. Tool calls that had
+  already finished when a session is first observed are not replayed.
+
+#### Review tools
+
+The code review plugin offers these tools to every Bcode session. A session the app started (the
+assistant's, or an AI card's) is bound to its review, so the tools act on the review on screen
+with the revisions it shows; any other session passes `review` with a saved review's id.
+
+| Tool | Access | What it does |
+|---|---|---|
+| `code_review.list_reviews` | read | Saved reviews of the repository (id, title, sources). |
+| `code_review.summary` | read | Title, sources and the revisions they resolve to, stack layers, files and lines, viewed files, threads, suggestions. |
+| `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed. |
+| `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
+| `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). |
+| `code_review.list_threads` | read | Threads (location, kind, severity, resolved, comments) and pending suggestions. |
+| `code_review.pull_request` | read | The pull request behind the review (by its pull request sources, else its branch): title, state, branches, review decision, CI checks, via the GitHub CLI. |
+| `code_review.navigate` | read | Moves the reviewer's view to a file or line. |
+| `code_review.add_comment` | write | Drafts a comment on lines (`path`, `line`, `end_line`, `side`), a file, or the review, with an optional kind and severity. |
+| `code_review.reply` | write | Replies in a thread. |
+| `code_review.resolve_thread` | write | Resolves or reopens a thread. |
+| `code_review.mark_viewed` | write | Marks files viewed or not viewed at their current content. |
+| `code_review.suggest_change` | write | A suggested comment the reviewer accepts or rejects, optionally replacing the lines (a `suggestion` block). |
+| `code_review.publish` | publish | Previews, or with `submit` publishes, the comments with a built-in publisher (`local_markdown`, `markdown_file`, `json_file`). |
+
+Reads are bounded (2,000 files, 2,000 diff or content lines per call, 200 threads, 4 KiB per
+comment, 128 KiB of output) and say when they were cut. Writes and publishing return what they
+did. Publishing to a forge such as GitHub stays in the app (`P`), which reaches publisher plugins.
+
+#### Tool permissions
+
+The tools follow Bcode's permission rules like any other tool. Reads and `navigate` are
+read-only and allowed; writes and `publish` are mutating and ask, and the prompt appears in the
+dock (or the AI card) as above. The plan agent has the writes and `publish` turned off. Set each
+tool to `allow`, `ask`, or `deny` per agent with exact-name rules, or turn it off:
+
+```toml
+[agent.build.permission.tools]
+"code_review.add_comment" = "allow"   # draft comments without asking
+"code_review.mark_viewed" = "allow"
+"code_review.publish" = "deny"        # never publish from an agent
+"code_review.file_content" = "ask"    # ask before reading file contents
+
+[agent.build.tools]
+"code_review.pull_request" = false    # no GitHub calls
+```
+
+When a prompt offers Always or Never, the answer is remembered as a rule for the session's
+agent. See [`permissions.md`](permissions.md) for how rules layer.
+
 ### Comment composer
 
 Typing `@` and part of a path in the comment composer suggests repository paths (tracked and
@@ -183,7 +257,8 @@ bcode's own (`--print-config-paths` lists them in order):
   value is reported and the default is used.
 * `[tui.keybindings.scopes."code-review*"]`: keybinding overrides of the review scopes
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
-  `code-review-threads`, `code-review-composer` and `code-review-feed`. `none` or `unbind` removes a default.
+  `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.
+  `none` or `unbind` removes a default.
 * `[tui.theme]`: the theme, loaded through `bcode_tui_theme` discovery like `bcode-git`.
 * `[tui] color_depth`: `auto` (the default: no colors under `NO_COLOR` or a dumb terminal, else
   full color), `truecolor`, `ansi256`, `ansi16`, or `none`, as in bcode.

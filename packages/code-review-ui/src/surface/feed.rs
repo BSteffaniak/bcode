@@ -153,11 +153,7 @@ impl ReviewSurface {
             );
             return;
         };
-        let (approved, remember) = match action {
-            AgentAction::Allow => (true, false),
-            AgentAction::Always => (true, true),
-            AgentAction::Decline => (false, false),
-            AgentAction::Never => (false, true),
+        match action {
             AgentAction::Stop => {
                 self.feed_requests.push_back(FeedRequest::Stop { session });
                 self.set_status("stopping the Bcode turn…", StatusSeverity::Info);
@@ -167,11 +163,23 @@ impl ReviewSurface {
                 self.toggle_feed_item(&exchange_id, &session, usize::from(index));
                 return;
             }
+            _ => {}
+        }
+        self.answer_permission(&session, action);
+    }
+
+    /// Answer the pending permission request of `session` (allow, always, decline, never).
+    pub(super) fn answer_permission(&mut self, session: &str, action: AgentAction) {
+        let (approved, remember) = match action {
+            AgentAction::Allow => (true, false),
+            AgentAction::Always => (true, true),
+            AgentAction::Decline => (false, false),
+            AgentAction::Never => (false, true),
             _ => return,
         };
         let Some(permission) = self
             .agents
-            .state(&session)
+            .state(session)
             .and_then(|state| state.feed.permission.clone())
         else {
             self.set_status("no permission request is pending", StatusSeverity::Info);
@@ -181,9 +189,9 @@ impl ReviewSurface {
             return;
         }
         self.agents
-            .set_answering(&session, &permission.permission_id, true);
+            .set_answering(session, &permission.permission_id, true);
         self.feed_requests.push_back(FeedRequest::Permission {
-            session,
+            session: session.to_owned(),
             permission_id: permission.permission_id,
             approved,
             remember: remember && permission.can_remember,
@@ -291,6 +299,32 @@ impl ReviewSurface {
     /// Toast attention changes of sessions whose cards are all off screen.
     pub(super) fn feed_attention(&mut self) {
         for (session, attention) in self.agents.take_attention() {
+            if self.assistant_sessions().as_deref() == Some(session.as_str()) {
+                let shown = self.panels.current().is_some_and(|plan| {
+                    plan.assistant != super::super::panels::SidePlacement::Hidden
+                });
+                if shown {
+                    continue;
+                }
+                let (severity, title) = match &attention {
+                    Attention::Permission(tool) => (
+                        ToastSeverity::Warning,
+                        format!("The assistant needs your permission to use {tool}"),
+                    ),
+                    Attention::Answered => {
+                        (ToastSeverity::Success, "The assistant answered".to_owned())
+                    }
+                    Attention::Failed(_) => {
+                        (ToastSeverity::Error, "The assistant failed".to_owned())
+                    }
+                };
+                let body = match attention {
+                    Attention::Failed(message) => Some(message),
+                    _ => None,
+                };
+                self.toasts.push(severity, title, body);
+                continue;
+            }
             let cards: Vec<(String, String)> = self
                 .notes
                 .exchanges()

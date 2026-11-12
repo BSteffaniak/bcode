@@ -250,7 +250,9 @@ impl Card<'_> {
         }
     }
 
-    fn turn(&mut self, turn: &Turn, exchange_id: &str, folds: &Folds) {
+    /// The items of `turn`; opened items are keyed by `exchange_id`, and the toggles of item `i`
+    /// carry `base + i`.
+    fn turn(&mut self, turn: &Turn, exchange_id: &str, folds: &Folds, base: usize) {
         let theme = self.theme;
         if turn.earlier > 0 {
             self.push(vec![Span::styled(
@@ -268,7 +270,7 @@ impl Card<'_> {
             let open = item_id(item)
                 .is_some_and(|id| folds.feed_open.contains(&open_key(exchange_id, id)));
             let toggle = ItemAction::Agent(AgentAction::Toggle(
-                u16::try_from(index).unwrap_or(u16::MAX),
+                u16::try_from(base + index).unwrap_or(u16::MAX),
             ));
             match item {
                 FeedItem::Reasoning { words, text, .. } => {
@@ -406,7 +408,7 @@ impl Card<'_> {
         if let Some((turn, newest)) =
             state.and_then(|state| exchange_turn(exchange, state, newest_exchange))
         {
-            self.turn(turn, &exchange.exchange_id, folds);
+            self.turn(turn, &exchange.exchange_id, folds, 0);
             return newest;
         }
         if let Some(state) = state.filter(|_| exchange.status != ReviewAiExchangeStatus::Pending) {
@@ -497,6 +499,89 @@ impl Card<'_> {
         }
         self.buttons(&buttons);
     }
+}
+
+/// The key opened items of the review assistant's session `session` are kept under in
+/// [`Folds::feed_open`] (with [`open_key`]).
+#[must_use]
+pub fn dock_key(session: &str) -> String {
+    format!("assistant:{session}")
+}
+
+/// Rows of the review assistant's conversation with its session.
+///
+/// Every observed turn (the question as `▍you`, then reasoning, tool lines and answers as on an
+/// AI card), the pending permission prompt, and a status line while the session works. Toggles
+/// carry `turn index * MAX_TURN_ITEMS + item index`.
+#[must_use]
+pub fn dock_rows(
+    session: &str,
+    agents: &AgentStreams,
+    folds: &Folds,
+    theme: &ReviewTheme,
+    width: usize,
+) -> (Vec<Line>, Vec<ActionCells<ItemAction>>) {
+    let mut card = Card {
+        theme,
+        width,
+        pad: String::new(),
+        body_width: width,
+        lines: Vec::new(),
+        actions: Vec::new(),
+    };
+    let Some(state) = agents.state(session) else {
+        card.push(vec![Span::styled("connecting…", theme.muted)]);
+        return (card.lines, card.actions);
+    };
+    let key = dock_key(session);
+    for (index, turn) in state.feed.turns.iter().enumerate() {
+        if index > 0 {
+            card.lines.push(Line::default());
+        }
+        if !turn.question.is_empty() {
+            card.question(&turn.question);
+        }
+        card.turn(
+            turn,
+            &key,
+            folds,
+            index * crate::agent::feed::MAX_TURN_ITEMS,
+        );
+    }
+    if let Some(permission) = &state.feed.permission {
+        card.lines.push(Line::default());
+        card.permission(
+            permission,
+            agents.is_answering(&permission.permission_id),
+            agents.keys(),
+        );
+    }
+    let clock = agents.clock(session);
+    if state.working && state.feed.permission.is_none() {
+        let spinner = Spinner::named(theme.icons.spinner).unwrap_or_else(Spinner::braille);
+        let elapsed = DEFAULT_INTERVAL.saturating_mul(u32::try_from(clock.step % 64).unwrap_or(0));
+        let mut spans = vec![
+            spinner.span(elapsed, theme.accent),
+            Span::raw(" "),
+            Span::styled(
+                if state.cancelling {
+                    "stopping…"
+                } else {
+                    "working…"
+                },
+                theme.badge_draft,
+            ),
+        ];
+        if clock.seconds > 0 {
+            spans.push(Span::styled(theme.icons.separator, theme.tiers.dim));
+            spans.push(Span::styled(format!("{}s", clock.seconds), theme.muted));
+        }
+        card.lines.push(Line::default());
+        card.push(spans);
+    } else if state.phase == AgentPhase::Failed && state.feed.turns.is_empty() {
+        card.alert(&state.status);
+    }
+    (card.lines, card.actions)
 }
 
 /// A button label with its key, when it has one.

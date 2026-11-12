@@ -96,10 +96,12 @@ impl ReviewSurface {
         }
         while let Some((exchange, text)) = self.asks.pop_front() {
             let scope = self.note_scope();
+            // A new session is bound to the review, so its review tools act on this review.
+            let binding = self.assistant_binding(String::new());
             let services = self.services.clone();
             let inbox = self.inbox.clone();
             host.spawn(Box::pin(async move {
-                let result = agent::ask(services, scope, exchange, text, now_ms()).await;
+                let result = agent::ask(services, scope, exchange, text, binding, now_ms()).await;
                 inbox.push(Message::Asked(Box::new(result)));
             }));
         }
@@ -108,6 +110,7 @@ impl ReviewSurface {
             .exchanges()
             .iter()
             .filter_map(|exchange| exchange.session_id.clone())
+            .chain(self.assistant_sessions())
             .collect();
         if self
             .agents

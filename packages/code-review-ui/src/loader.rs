@@ -101,6 +101,8 @@ pub enum Message {
     },
     /// A permission answer or a stop of an AI card's session finished.
     Feed(crate::agent::FeedOutcome),
+    /// Work of the assistant dock finished.
+    Dock(Box<super::surface::DockResult>),
     /// An AI question finished: the linked exchange, or the exchange as recorded and the error.
     Asked(
         Box<
