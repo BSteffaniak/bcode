@@ -429,6 +429,68 @@ fn pull_requests_and_stacks_come_from_the_provider() {
 }
 
 #[test]
+fn stacks_over_the_limit_warn_and_the_warnings_can_be_dismissed() {
+    use bcode_code_review_models::{ReviewStackLimit, StackOverLimit};
+    let fixture = fixture();
+    let backend = Arc::new(
+        TestBackend::default()
+            .with_provider(FakeProvider::new(fixture.root()))
+            .with_stack_limit(ReviewStackLimit {
+                max_layers: 2,
+                over_limit: StackOverLimit::Warn,
+            }),
+    );
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 5);
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    let warning = "4 layers, over the 2-layer limit";
+    assert!(screen.contains(warning), "{}", screen.text());
+    // The warning does not block the choice; `enter` on it dismisses it.
+    assert_eq!(
+        scenario.surface().wizard().unwrap().picker().focused(),
+        Some("stack-limit-warning")
+    );
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert!(!screen.contains(warning), "{}", screen.text());
+    assert_eq!(
+        scenario.surface().wizard().unwrap().picker().focused(),
+        Some("whole")
+    );
+    scenario.key("enter");
+    settled(&mut scenario);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(created.sources.len(), 1);
+    // Every layer is in the review, and a warning that stays until closed says so.
+    let toast = "Stack of 4 layers";
+    assert!(
+        scenario
+            .surface()
+            .review()
+            .unwrap()
+            .toasts()
+            .contains(&toast),
+        "{:?}",
+        scenario.surface().review().unwrap().toasts()
+    );
+    let screen = settled(&mut scenario);
+    let close = screen.find("×").expect("toast close button");
+    scenario.click(close.x, close.y);
+    settled(&mut scenario);
+    assert!(
+        !scenario
+            .surface()
+            .review()
+            .unwrap()
+            .toasts()
+            .contains(&toast),
+        "{:?}",
+        scenario.surface().review().unwrap().toasts()
+    );
+}
+
+#[test]
 fn missing_or_failing_providers_are_explained_and_other_types_still_work() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default());

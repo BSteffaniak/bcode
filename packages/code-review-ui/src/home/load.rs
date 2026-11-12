@@ -128,10 +128,17 @@ pub async fn stack(
     number: u64,
 ) -> Result<ReviewStack, String> {
     let transport = services.transport();
-    resolve_stack(&transport, &route, &repo, Some(repository), number)
-        .await
-        .map(|response| response.stack)
-        .map_err(|error| provider_message(&route.manifest.label, &error))
+    resolve_stack(
+        &transport,
+        &route,
+        &repo,
+        Some(repository),
+        number,
+        services.stack_limit().resolve_limit(),
+    )
+    .await
+    .map(|response| response.stack)
+    .map_err(|error| provider_message(&route.manifest.label, &error))
 }
 
 /// Stats of one review: its sources resolved without asking providers (no network), each

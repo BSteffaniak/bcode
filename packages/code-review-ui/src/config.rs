@@ -4,8 +4,9 @@
 //! standalone `bcode-review` binary read identical values:
 //!
 //! * `[plugins.config."bcode.code_review"]` — the review's plugin table: where review state is
-//!   stored ([`CodeReviewConfig`]), when viewed files reset (`viewed_reset`), and presentation
-//!   settings.
+//!   stored ([`CodeReviewConfig`]), when viewed files reset (`viewed_reset`), how many layers a
+//!   stack may have and whether more warn or stop (`[…stack] max_layers`, `over_limit`;
+//!   [`ReviewStackLimit`]), and presentation settings.
 //! * `[tui.keybindings.scopes."code-review*"]` — keybinding overrides of the review scopes.
 //! * `[tui.theme]` — theme selection shared with the rest of bcode.
 //! * `[tui.diff_viewer]` — bcode's diff layout preference, which the review follows unless its
@@ -17,6 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bcode_code_review::CodeReviewConfig;
+use bcode_code_review_models::ReviewStackLimit;
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 
 pub mod view;
@@ -107,6 +109,8 @@ pub struct LoadedConfig {
     pub keybindings: BTreeMap<String, BTreeMap<String, String>>,
     /// Presentation settings from the plugin table.
     pub view: ReviewViewConfig,
+    /// Stack layer limit from the plugin table's `stack` table.
+    pub stack_limit: ReviewStackLimit,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
     /// Effective theme selection.
@@ -167,6 +171,15 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
             Some(table) => {
                 loaded.plugin = table.clone();
                 loaded.view = ReviewViewConfig::from_plugin_table(table);
+                if let Some(stack) = table.get("stack") {
+                    match stack.clone().try_into::<ReviewStackLimit>() {
+                        Ok(limit) => loaded.stack_limit = limit,
+                        Err(error) => loaded.diagnostics.push(format!(
+                            "plugins.config.\"{PLUGIN_ID}\".stack: {}",
+                            first_line(&error.to_string())
+                        )),
+                    }
+                }
                 if let Some(reset) = table.get("viewed_reset")
                     && reset
                         .clone()
@@ -321,6 +334,40 @@ mod tests {
             reset("[plugins.config.\"bcode.code_review\"]\nviewed_reset = \"lines\"");
         assert_eq!(fallback, ViewedReset::Diff);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn the_stack_table_sets_the_layer_limit_and_reports_bad_values() {
+        use bcode_code_review_models::{ReviewStackLimit, StackOverLimit};
+        let limit = |text: &str| {
+            let loaded = from_table(&table(text), PathBuf::from("/config"));
+            (loaded.stack_limit, loaded.diagnostics)
+        };
+        assert_eq!(limit(""), (ReviewStackLimit::default(), Vec::new()));
+        assert_eq!(
+            limit(
+                "[plugins.config.\"bcode.code_review\".stack]\nmax_layers = 100\nover_limit = \"stop\""
+            ),
+            (
+                ReviewStackLimit {
+                    max_layers: 100,
+                    over_limit: StackOverLimit::Stop,
+                },
+                Vec::new()
+            )
+        );
+        // Unset keys keep their defaults.
+        let (partial, _) = limit("[plugins.config.\"bcode.code_review\".stack]\nmax_layers = 8");
+        assert_eq!(partial.over_limit, StackOverLimit::Warn);
+        assert_eq!(partial.resolve_limit(), None);
+        assert!(partial.warns_for(9) && !partial.warns_for(8));
+        for bad in ["over_limit = \"halt\"", "max_layers = -1", "max_layer = 5"] {
+            let (fallback, diagnostics) = limit(&format!(
+                "[plugins.config.\"bcode.code_review\".stack]\n{bad}"
+            ));
+            assert_eq!(fallback, ReviewStackLimit::default(), "{bad}");
+            assert_eq!(diagnostics.len(), 1, "{bad}: {diagnostics:?}");
+        }
     }
 
     #[test]

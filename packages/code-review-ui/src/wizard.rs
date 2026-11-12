@@ -127,6 +127,9 @@ impl SourceType {
 }
 
 /// What an input on the wizard asks the app to do.
+/// Picker id of the stack step's over-limit warning row (`enter` dismisses it).
+const STACK_LIMIT_WARNING_ID: &str = "stack-limit-warning";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WizardOutcome {
     /// Nothing happened.
@@ -290,6 +293,9 @@ pub struct Wizard {
     status: Option<Status>,
     action_keys: BTreeMap<String, String>,
     pending_items: bool,
+    /// The stack (by the pull request it was resolved for) whose over-limit warning was
+    /// dismissed.
+    stack_limit_dismissed: Option<u64>,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -336,6 +342,7 @@ impl Wizard {
             status: None,
             action_keys: BTreeMap::new(),
             pending_items: true,
+            stack_limit_dismissed: None,
         }
     }
 
@@ -1152,7 +1159,27 @@ impl Wizard {
                 ),
             ),
             Step::Details(Details::Stack(StackStage::Mode(stack))) => {
-                let mut items = vec![
+                let limit = self.services.stack_limit();
+                let mut items = Vec::new();
+                if self.stack_limit_dismissed != Some(stack.requested)
+                    && limit.warns_for(stack.layers.len())
+                {
+                    items.push(PickerItem::new(
+                        STACK_LIMIT_WARNING_ID,
+                        Line::from_spans(vec![
+                            Span::styled(
+                                format!(
+                                    "{} layers, over the {}-layer limit; every layer is loaded",
+                                    stack.layers.len(),
+                                    limit.max_layers
+                                ),
+                                theme.notice,
+                            ),
+                            Span::styled("  enter to dismiss", theme.muted),
+                        ]),
+                    ));
+                }
+                items.extend([
                     PickerItem::new(
                         "whole",
                         row(
@@ -1175,7 +1202,7 @@ impl Wizard {
                         "layers",
                         Line::from_spans(vec![Span::styled("One layer", theme.title)]),
                     ),
-                ];
+                ]);
                 items.extend(stack.layers.iter().map(|layer| {
                     PickerItem::new(
                         format!("layer-{}", layer.pull.number),
@@ -1663,6 +1690,11 @@ impl Wizard {
             }
             Step::Details(Details::Stack(StackStage::Resolving(_))) => {}
             Step::Details(Details::Stack(StackStage::Mode(stack))) => {
+                if id == STACK_LIMIT_WARNING_ID {
+                    self.stack_limit_dismissed = Some(stack.requested);
+                    self.pending_items = true;
+                    return WizardOutcome::Redraw;
+                }
                 let Some(Ok(Some(answer))) = &self.pulls else {
                     return WizardOutcome::Ignored;
                 };

@@ -13,12 +13,13 @@
 //! exactly one layer.
 //!
 //! Work is bounded per file: one blob read plus one `git diff -U0` per layer, limited to the
-//! file's old and new paths, and at most [`MAX_ATTRIBUTION_LINES`] tracked lines.
+//! file's old and new paths, and at most [`MAX_ATTRIBUTION_LINES`] tracked lines. How many layers
+//! a stack has is the client's choice (`[plugins.config."bcode.code_review".stack]`), not a limit
+//! of this operation.
 
 use super::{DataError, git};
 use bcode_code_review_models::{
-    REVIEW_STACK_MAX_LAYERS, ReviewStackAttributionRequest, ReviewStackAttributionResponse,
-    ReviewStackLineAttribution,
+    ReviewStackAttributionRequest, ReviewStackAttributionResponse, ReviewStackLineAttribution,
 };
 use bcode_git::models::{DiffFile, DiffFileStatus};
 use std::path::Path;
@@ -52,11 +53,6 @@ pub fn attribution(
         return Err(DataError::InvalidRequest(
             "the stack has no layers".to_string(),
         ));
-    }
-    if stack.layers.len() > REVIEW_STACK_MAX_LAYERS {
-        return Err(DataError::InvalidRequest(format!(
-            "stacks are limited to {REVIEW_STACK_MAX_LAYERS} layers"
-        )));
     }
     git::validate_oid(&stack.base_oid)?;
     for layer in &stack.layers {

@@ -288,9 +288,16 @@ async fn stack(
             .ok_or_else(|| format!("no open pull request has the current branch {branch}"))?;
         (pull.number, Some(listed.repository))
     };
-    let resolved = resolve_stack(&transport, &route, &repo, repository, number)
-        .await
-        .map_err(|error| provider_message(label, &error))?;
+    let resolved = resolve_stack(
+        &transport,
+        &route,
+        &repo,
+        repository,
+        number,
+        services.stack_limit().resolve_limit(),
+    )
+    .await
+    .map_err(|error| provider_message(label, &error))?;
     let top = resolved
         .stack
         .layers

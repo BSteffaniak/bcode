@@ -249,8 +249,10 @@ fn resolve(
     repo: &Path,
     sources: Vec<ReviewSource>,
 ) -> ResolveReviewSourcesResponse {
-    let request = block_on(resolve_request_with_providers(transport, repo, sources))
-        .expect("provider routing");
+    let request = block_on(resolve_request_with_providers(
+        transport, repo, sources, None,
+    ))
+    .expect("provider routing");
     // The request crosses the service boundary as JSON.
     let request: ResolveReviewSourcesRequest =
         serde_json::from_slice(&serde_json::to_vec(&request).expect("encode")).expect("decode");
@@ -420,6 +422,7 @@ fn provider_backed_sources_report_provider_required_when_no_provider_is_enabled(
         &enabled,
         repo,
         vec![source("last", ReviewSourceKind::LastCommit)],
+        None,
     ))
     .expect("request");
     assert_eq!(request.provider_resolutions.len(), 0);

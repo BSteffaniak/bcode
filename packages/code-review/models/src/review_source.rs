@@ -38,8 +38,58 @@ pub const REVIEW_SOURCE_ERROR_FAILED: &str = "provider_failed";
 /// Diagnostic code: the provider failed while the client gathered a source's resolution.
 pub const REVIEW_DIAGNOSTIC_PROVIDER_FAILED: &str = "provider_failed";
 
-/// Maximum layers a stack may have; longer chains are cut at the trunk end with a warning.
-pub const REVIEW_STACK_MAX_LAYERS: usize = 64;
+/// Layer limit of a stack when the configuration sets none.
+pub const DEFAULT_REVIEW_STACK_MAX_LAYERS: usize = 64;
+
+/// What happens when a stack has more layers than [`ReviewStackLimit::max_layers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackOverLimit {
+    /// Resolve every layer and warn; the warning can be dismissed.
+    #[default]
+    Warn,
+    /// Cut the chain at the limit (at the trunk end below the requested pull request, at the
+    /// top above it), with a warning in the stack.
+    Stop,
+}
+
+/// How many layers a resolved stack may have, and what happens beyond that
+/// (`[plugins.config."bcode.code_review".stack]`: `max_layers`, `over_limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewStackLimit {
+    /// Layers beyond which [`Self::over_limit`] applies.
+    pub max_layers: usize,
+    /// Warn or stop beyond [`Self::max_layers`].
+    pub over_limit: StackOverLimit,
+}
+
+impl Default for ReviewStackLimit {
+    fn default() -> Self {
+        Self {
+            max_layers: DEFAULT_REVIEW_STACK_MAX_LAYERS,
+            over_limit: StackOverLimit::default(),
+        }
+    }
+}
+
+impl ReviewStackLimit {
+    /// The limit a provider applies while resolving: the configured one when stopping, none when
+    /// only warning.
+    #[must_use]
+    pub const fn resolve_limit(&self) -> Option<usize> {
+        match self.over_limit {
+            StackOverLimit::Stop => Some(self.max_layers),
+            StackOverLimit::Warn => None,
+        }
+    }
+
+    /// Whether a stack of `layers` layers deserves the over-limit warning.
+    #[must_use]
+    pub const fn warns_for(&self, layers: usize) -> bool {
+        matches!(self.over_limit, StackOverLimit::Warn) && layers > self.max_layers
+    }
+}
 
 /// Operations a review-source provider supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -132,6 +182,10 @@ pub struct ReviewSourceStackResolveRequest {
     pub repository: Option<String>,
     /// Pull request whose stack is resolved.
     pub number: u64,
+    /// Most layers to resolve; the chain is cut beyond it with a warning. `None` resolves the
+    /// whole stack.
+    #[serde(default)]
+    pub max_layers: Option<usize>,
 }
 
 /// One layer of a stack.

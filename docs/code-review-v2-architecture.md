@@ -450,7 +450,7 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
 | Operation | Request → response |
 | --- | --- |
 | `review_source.manifest` | → provider id (stored in source kinds), label, capabilities (`pulls_list`, `stack_resolve`, `pull_fetch`) |
-| `review_source.pulls.list` | repository (or detect from remotes) → repository, default branch, open `PullRequestSummary` values (number, title, author, base and head branch, head OID, base OID if known, review requested from me, draft, updated, URL), review-requested-from-me first, then most recently updated |
+| `review_source.pulls.list` | repository (or detect from remotes) → repository, default branch, the 100 most recently updated open `PullRequestSummary` values (number, title, author, base and head branch, head OID, base OID if known, review requested from me, draft, updated, URL), review-requested-from-me first, then most recently updated |
 | `review_source.stack.resolve` | pull request number → `ReviewStack`: trunk, whether it is the default branch, layers trunk → top (each a summary plus its parent layer), siblings, warnings |
 | `review_source.pull.fetch` | pull request number and optional base branch → `ReviewPullFetchResult`: local head/base refs and their OIDs |
 
@@ -463,22 +463,31 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   routing lives in `packages/code-review/src/provider.rs` behind a `ProviderTransport` trait (the review
   app's host plugin services in production, fakes in tests). With the provider plugin disabled nothing answers, and only the
   provider-backed sources report `provider_required`.
-* **Stack detection** (GitHub implementation): from the open pull requests whose head branch is in
-  the repository itself (forks are excluded), the chain extends down while some pull request's
+* **Stack detection** (GitHub implementation): the provider walks GitHub branch by branch instead
+  of listing the repository's pull requests, so a busy repository cannot push a layer out of
+  view. It looks up the requested pull request by number, then asks once per branch for the open
+  pull requests whose head or base is that branch (one GraphQL query per branch); the default
+  branch itself is never asked, so a stack of `n` layers costs about `n + 1` queries. Over the
+  open pull requests whose head branch is in the repository itself (forks are excluded), the
+  chain extends down while some pull request's
   head is the current base branch and stops at the default branch; it extends up while exactly one
   pull request targets the current head. Several pull requests on one layer stop the upward walk
   and are reported as siblings; several open pull requests with the same head branch below pick
   the most recently updated, with a warning. A missing layer (for example a closed pull request
   in the middle) ends the chain with `rooted_at_default_branch: false` and a warning. Cycles stop
-  at the first repeated pull request with a warning. Chains are cut at 64 layers. No
+  at the first repeated pull request with a warning. A request with `max_layers` cuts the chain
+  there with a warning (below the requested pull request first, then above it); without it the
+  whole stack is walked. The client sends the configured limit only when
+  `[plugins.config."bcode.code_review".stack] over_limit = "stop"`; with `"warn"` (the default)
+  it resolves every layer and warns when there are more than `max_layers`. A failed lookup fails the resolution rather than return a partial stack. No
   Graphite-specific metadata is used.
 * **Fetching** runs `git fetch --no-tags --no-write-fetch-head --refmap= <remote>` with explicit
   refspecs `+refs/pull/N/head:refs/bcode-review/pull/N/head` and
   `+refs/heads/<base>:refs/bcode-review/pull/N/base`, so only review-owned refs change (no
   branches, no remote-tracking refs). The remote is the local remote that names the repository
   (`origin` preferred), else its HTTPS URL. Each stack layer is fetched with its own base
-  branch. Layers are fetched one at a time when a source resolves (at most 64), and fetched
-  review refs are not pruned yet.
+  branch. Layers are fetched one at a time when a source resolves (every layer of the resolved
+  stack), and fetched review refs are not pruned yet.
 * **Whole-stack attribution** (`review.stack.attribution`, code review service): given a
   `ResolvedReviewStack` and one path (plus the base path for renames), returns for the
   whole-stack diff the new-side line ranges each layer wrote last and the old-side line ranges
@@ -486,7 +495,8 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   the zero-context diff between consecutive heads (for a restacked stack, exactly each layer's
   own diff) and mapping earlier lines forward through later hunks; renames and deletions are
   followed. Work is one blob read and one `git diff -U0` per layer for one file, with at most
-  2,000,000 tracked lines. A comment publishes to the layer that wrote its anchor line (7.3).
+  2,000,000 tracked lines; the number of layers is the client's choice, not a limit of the
+  operation. A comment publishes to the layer that wrote its anchor line (7.3).
   Each range also carries `layer_line` (serde-defaulted): where the range starts in that layer's
   own diff, on the new side the line in the layer's head and on the old side the line in the head
   below it, so a comment can be published at the right line of the layer's pull request; ranges

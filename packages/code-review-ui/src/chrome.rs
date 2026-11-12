@@ -15,6 +15,7 @@
 
 use super::theme::ReviewTheme;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::event::{Event, MouseEventKind};
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::text::{Line, Span};
@@ -31,8 +32,8 @@ use bmux_tui_components::status_bar::{
     StatusBarComponent, StatusBarPolicy, StatusSegment, StatusSeverity,
 };
 use bmux_tui_components::toast_stack::{
-    ToastItem, ToastPlacement, ToastSeverity, ToastStackComponent, ToastStackPolicy,
-    ToastStackState,
+    ToastItem, ToastPlacement, ToastSeverity, ToastStack, ToastStackComponent, ToastStackOutcome,
+    ToastStackPolicy, ToastStackState,
 };
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -519,19 +520,25 @@ struct Toast {
     title: String,
     body: Option<String>,
     severity: ToastSeverity,
-    expires: Instant,
+    /// When the toast goes away by itself; `None` for a sticky toast, which stays until
+    /// dismissed.
+    expires: Option<Instant>,
 }
 
-/// Toast notifications.
+/// Toast notifications. Every toast has a close button; sticky ones stay until it is clicked or
+/// [`Self::dismiss_all`] runs (the "Dismiss notifications" command).
 #[derive(Debug, Default)]
 pub struct Toasts {
     shown: Vec<Toast>,
     next: u64,
     state: Cell<ToastStackState>,
+    /// Where the stack was last painted and the policy it was painted with, so clicks on its
+    /// close buttons resolve against the same geometry.
+    painted: Cell<Option<(Rect, ToastStackPolicy)>>,
 }
 
 impl Toasts {
-    /// Show a toast.
+    /// Show a toast that goes away by itself.
     pub fn push(
         &mut self,
         severity: ToastSeverity,
@@ -543,24 +550,107 @@ impl Toasts {
         } else {
             TOAST_TTL
         };
+        self.insert(severity, title.into(), body, Some(Instant::now() + ttl));
+    }
+
+    /// Show a toast that stays until it is dismissed.
+    pub fn push_sticky(
+        &mut self,
+        severity: ToastSeverity,
+        title: impl Into<String>,
+        body: Option<String>,
+    ) {
+        self.insert(severity, title.into(), body, None);
+    }
+
+    fn insert(
+        &mut self,
+        severity: ToastSeverity,
+        title: String,
+        body: Option<String>,
+        expires: Option<Instant>,
+    ) {
         self.next += 1;
         self.shown.push(Toast {
             id: format!("toast-{}", self.next),
-            title: title.into(),
+            title,
             body,
             severity,
-            expires: Instant::now() + ttl,
+            expires,
         });
         if self.shown.len() > MAX_TOASTS {
-            self.shown.remove(0);
+            // Make room by dropping the oldest toast that would go away anyway; sticky toasts
+            // only give way to each other.
+            let oldest = self
+                .shown
+                .iter()
+                .position(|toast| toast.expires.is_some())
+                .unwrap_or(0);
+            self.shown.remove(oldest);
         }
     }
 
     /// Drop expired toasts. Returns whether any was dropped.
     pub fn expire(&mut self, now: Instant) -> bool {
         let before = self.shown.len();
-        self.shown.retain(|toast| toast.expires > now);
+        self.shown
+            .retain(|toast| toast.expires.is_none_or(|expires| expires > now));
         self.shown.len() != before
+    }
+
+    /// Drop every toast, sticky ones included. Returns whether any was shown.
+    pub fn dismiss_all(&mut self) -> bool {
+        let any = !self.shown.is_empty();
+        self.shown.clear();
+        any
+    }
+
+    /// Handle a mouse event over the painted stack: hover and press its close buttons, and drop
+    /// a toast whose close button is clicked. Returns whether the event was the stack's (it was
+    /// inside the stack); events elsewhere are left to the caller.
+    pub fn mouse(&mut self, event: &Event) -> bool {
+        let Event::Mouse(mouse) = event else {
+            return false;
+        };
+        let Some((area, policy)) = self.painted.get() else {
+            return false;
+        };
+        let inside = area.contains(mouse.position);
+        if !inside {
+            // Leaving the stack clears its hover; a press elsewhere is not the stack's.
+            if matches!(mouse.kind, MouseEventKind::Move) {
+                let mut state = self.state.get();
+                if state.hovered_close().is_some() {
+                    state = ToastStackState::default();
+                    self.state.set(state);
+                }
+            }
+            return false;
+        }
+        let items = self.items();
+        let stack = ToastStack::new(&items).policy(policy);
+        let mut state = self.state.get();
+        let closed = match stack.handle_event(area, &mut state, event) {
+            ToastStackOutcome::CloseRequested { id, .. } => Some(id.to_owned()),
+            ToastStackOutcome::Ignored | ToastStackOutcome::Redraw => None,
+        };
+        self.state.set(state);
+        if let Some(id) = closed {
+            self.shown.retain(|toast| toast.id != id);
+        }
+        true
+    }
+
+    /// The shown toasts as stack items, newest first (the painting order).
+    fn items(&self) -> Vec<ToastItem<'_>> {
+        self.shown
+            .iter()
+            .rev()
+            .map(|toast| {
+                let item = ToastItem::new(&toast.id, &toast.title).severity(toast.severity);
+                toast.body.as_ref().map_or(item, |body| item.body(body))
+            })
+            .collect()
     }
 
     /// Titles of the shown toasts, oldest first.
@@ -580,25 +670,21 @@ impl Toasts {
 
     /// Paint the toasts at the bottom right of `body`, newest at the bottom.
     pub fn paint(&self, theme: &ReviewTheme, body: Rect, cx: &mut PaintCx<'_, '_>) {
+        self.painted.set(None);
         if self.shown.is_empty() || body.width < 8 || body.height < 3 {
             return;
         }
-        let items: Vec<ToastItem<'_>> = self
-            .shown
-            .iter()
-            .rev()
-            .map(|toast| {
-                let item = ToastItem::new(&toast.id, &toast.title).severity(toast.severity);
-                toast.body.as_ref().map_or(item, |body| item.body(body))
-            })
-            .collect();
+        let items = self.items();
         let width = TOAST_WIDTH.min(body.width.saturating_sub(2));
+        let policy = ToastStackPolicy {
+            placement: ToastPlacement::Bottom,
+            width,
+            close_button: true,
+            mouse: true,
+            ..ToastStackPolicy::cards()
+        };
         let stack = ToastStackComponent::new("review.toasts", &items, &self.state)
-            .policy(ToastStackPolicy {
-                placement: ToastPlacement::Bottom,
-                width,
-                ..ToastStackPolicy::cards()
-            })
+            .policy(policy)
             .styles(theme.toasts);
         let room = Size::new(width, body.height.saturating_sub(2));
         let node = stack.layout(Constraints::loose(room), &mut LayoutCx::new());
@@ -616,6 +702,7 @@ impl Toasts {
             size.height,
         );
         cx.paint_component(&stack, rect);
+        self.painted.set(Some((rect, policy)));
     }
 }
 
@@ -623,6 +710,23 @@ impl Toasts {
 mod tests {
     use super::*;
     use crate::theme::IconStyle;
+
+    #[test]
+    fn sticky_toasts_stay_until_dismissed_and_outlast_passing_ones() {
+        let mut toasts = Toasts::default();
+        toasts.push_sticky(ToastSeverity::Warning, "sticky", None);
+        toasts.push(ToastSeverity::Info, "passing", None);
+        assert!(toasts.expire(Instant::now() + ERROR_TOAST_TTL + Duration::from_secs(1)));
+        assert_eq!(toasts.titles(), ["sticky"]);
+        // A full stack drops passing toasts before the sticky one.
+        for index in 0..MAX_TOASTS {
+            toasts.push(ToastSeverity::Info, format!("passing {index}"), None);
+        }
+        assert_eq!(toasts.titles(), ["sticky", "passing 1", "passing 2"]);
+        assert!(toasts.dismiss_all());
+        assert!(toasts.is_empty());
+        assert!(!toasts.dismiss_all());
+    }
 
     fn model_of(sources: usize) -> HeaderModel {
         HeaderModel {

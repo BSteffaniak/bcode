@@ -230,6 +230,28 @@ pub struct PullRequestList {
     pub default_branch: Option<String>,
 }
 
+/// One pull request looked up by number, with the repository's default branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestLookup {
+    /// The pull request, or `None` when the repository has no pull request with that number.
+    pub pull_request: Option<PullRequest>,
+    /// The transport that answered: [`Transport::Http`] or [`Transport::Cli`].
+    pub via: Transport,
+    /// The repository's default branch, when the forge reports it.
+    #[serde(default)]
+    pub default_branch: Option<String>,
+}
+
+/// The open pull requests next to one branch: those that come from it and those that go into
+/// it. Walking these from any pull request finds its whole stack.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BranchPullRequests {
+    /// Open pull requests whose head branch is the branch, newest first.
+    pub with_head: Vec<PullRequest>,
+    /// Open pull requests whose base branch is the branch, newest first.
+    pub with_base: Vec<PullRequest>,
+}
+
 /// Why pull requests could not be fetched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForgeError {

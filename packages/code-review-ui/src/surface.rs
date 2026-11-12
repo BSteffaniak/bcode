@@ -1076,6 +1076,26 @@ impl ReviewSurface {
         self.config.policy(self.host_layout)
     }
 
+    /// Warn, in a toast that stays until dismissed, when a stack of the review has more layers
+    /// than the configured limit and the limit only warns. Every layer is in the review; the
+    /// warning says so and how to change the limit.
+    fn warn_about_stack_size(&mut self, deepest: Option<usize>) {
+        let limit = self.services.stack_limit();
+        let Some(layers) = deepest.filter(|layers| limit.warns_for(*layers)) else {
+            return;
+        };
+        self.toasts.push_sticky(
+            ToastSeverity::Warning,
+            format!("Stack of {layers} layers"),
+            Some(format!(
+                "Over the {}-layer limit; every layer is loaded. Set \
+                 [plugins.config.\"bcode.code_review\".stack] max_layers, or over_limit = \
+                 \"stop\" to cut stacks there.",
+                limit.max_layers
+            )),
+        );
+    }
+
     fn set_status(&mut self, text: impl Into<String>, severity: StatusSeverity) {
         self.status = Some(Status {
             text: text.into(),
@@ -1717,6 +1737,7 @@ impl ReviewSurface {
 
     fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
+        let (first_open, deepest_stack) = (self.review.is_none(), deepest_stack(&opened));
         self.refreshing = false;
         self.generation += 1;
         let fingerprints = std::mem::take(&mut opened.fingerprints);
@@ -1793,6 +1814,9 @@ impl ReviewSurface {
                 .join("; ");
             self.toasts
                 .push(ToastSeverity::Warning, "Some sources failed", Some(body));
+        }
+        if first_open {
+            self.warn_about_stack_size(deepest_stack);
         }
         for (source_id, answer) in &fingerprints {
             review.doc.accept_fingerprints(source_id, answer);
@@ -2146,6 +2170,11 @@ impl ReviewSurface {
             "unview_all" => self.view_all(false),
             "attention_next" => self.attention_next(),
             "copy_report" => self.copy_report(),
+            "dismiss_notifications" => {
+                if !self.toasts.dismiss_all() {
+                    self.set_status("No notifications", StatusSeverity::Info);
+                }
+            }
             "ai_menu" => self.open_ai_menu(host),
             "activate" => return Some(self.activate(host)),
             "goto_line" => {
@@ -2648,6 +2677,13 @@ impl ReviewSurface {
             SplitButtonOutcome::Selected { id, .. } => self.publish_menu_action(&id, host),
             _ => Action::Redraw,
         }
+    }
+
+    /// Route a mouse event to the toasts, which are painted over the body (under a modal or an
+    /// overlay). `None` when they do not take it.
+    fn toast_mouse(&mut self, event: &Event) -> Option<Action> {
+        (self.modal.is_none() && self.overlay.is_none() && self.toasts.mouse(event))
+            .then_some(Action::Redraw)
     }
 
     fn handle_mouse(&mut self, event: &Event, host: &UiContext) -> Action {
@@ -4073,6 +4109,16 @@ fn switch_layout(review: &mut Review, mode: LayoutMode) {
 
 /// `key` in a re-opened document: the same item when it exists, else its file's header (line
 /// content is not resident in a fresh document).
+/// Layers of the deepest stack among `opened`'s sources, when any source is a stack.
+fn deepest_stack(opened: &Opened) -> Option<usize> {
+    opened
+        .inputs
+        .iter()
+        .filter_map(|input| input.stack.as_ref())
+        .map(|stack| stack.stack.layers.len())
+        .max()
+}
+
 fn carried_key(doc: &ReviewDocument, key: &ItemKey) -> Option<ItemKey> {
     doc.map_key(key)
         .filter(|key| doc.index_of(key).is_some())
@@ -4417,7 +4463,9 @@ impl View for ReviewSurface {
                 }
                 Action::Redraw
             }
-            Event::Mouse(_) => self.handle_mouse(event, host),
+            Event::Mouse(_) => self
+                .toast_mouse(event)
+                .unwrap_or_else(|| self.handle_mouse(event, host)),
             Event::Resize(_) => {
                 // A resize cancels a drag and the hover (their rows moved).
                 if let Some(review) = self.review.as_mut() {

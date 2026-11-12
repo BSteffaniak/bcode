@@ -11,15 +11,21 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+#[cfg(feature = "http")]
+use std::collections::BTreeMap;
+#[cfg(feature = "http")]
+use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "http")]
+use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(feature = "http")]
 use std::time::Duration;
 
 pub use bcode_forge_models as models;
 use bcode_forge_models::{
-    ChecksState, ForgeError, PullRequest, PullRequestList, PullRequestSource, PullRequestState,
-    RepositoryRef, ReviewDecision, Transport,
+    BranchPullRequests, ChecksState, ForgeError, PullRequest, PullRequestList, PullRequestLookup,
+    PullRequestSource, PullRequestState, RepositoryRef, ReviewDecision, Transport,
 };
 use serde_json::Value;
 #[cfg(feature = "http")]
@@ -31,26 +37,104 @@ pub const GITHUB_HOST: &str = "github.com";
 #[cfg(feature = "http")]
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The GraphQL query for a repository's recent pull requests, with review decisions, the
-/// latest commit's checks, requested reviewers, the repository's default branch, and the
-/// authenticated user (to tell whether a review is requested from them).
-const PULL_REQUESTS_QUERY: &str = "query($owner: String!, $name: String!) {
-  viewer { login }
-  repository(owner: $owner, name: $name) {
-    defaultBranchRef { name }
-    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes {
-        number title url state isDraft
+/// The fields of a pull request every query asks for: enough for lists, stacks, and
+/// [`parse_pull_request`].
+macro_rules! pull_request_fields {
+    () => {
+        "number title url state isDraft
         headRefName headRefOid baseRefName baseRefOid
         headRepository { nameWithOwner }
         author { login }
         reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
         reviewDecision updatedAt
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-      }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
+    };
+}
+
+/// The fields a stack walk needs: [`pull_request_fields`] without reviews and checks, which
+/// cost a nested connection per pull request.
+macro_rules! stack_pull_request_fields {
+    () => {
+        "number title url state isDraft
+        headRefName headRefOid baseRefName baseRefOid
+        headRepository { nameWithOwner }
+        author { login }
+        updatedAt"
+    };
+}
+
+/// The GraphQL query for a repository's recent pull requests in any state, with review
+/// decisions, the latest commit's checks, requested reviewers, the repository's default branch,
+/// and the authenticated user (to tell whether a review is requested from them).
+const PULL_REQUESTS_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { ",
+    pull_request_fields!(),
+    " }
     }
   }
-}";
+}"
+);
+
+/// [`PULL_REQUESTS_QUERY`] for open pull requests only, so a busy repository's merged and
+/// closed ones do not crowd them out.
+const OPEN_PULL_REQUESTS_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    pullRequests(first: 100, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { ",
+    pull_request_fields!(),
+    " }
+    }
+  }
+}"
+);
+
+/// The GraphQL query for one pull request by number, with the repository's default branch.
+const PULL_REQUEST_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    pullRequest(number: $number) { ",
+    pull_request_fields!(),
+    " }
+  }
+}"
+);
+
+/// The GraphQL query for the open pull requests that come from and go into one branch.
+const BRANCH_PULL_REQUESTS_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    withHead: pullRequests(first: 100, states: OPEN, headRefName: $branch,
+                           orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { ",
+    stack_pull_request_fields!(),
+    " }
+    }
+    withBase: pullRequests(first: 100, states: OPEN, baseRefName: $branch,
+                           orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { ",
+    stack_pull_request_fields!(),
+    " }
+    }
+  }
+}"
+);
+
+/// A GraphQL variable's value.
+#[derive(Debug, Clone, Copy)]
+enum Variable<'a> {
+    Text(&'a str),
+    Number(u64),
+}
 
 /// A credential and where it came from (for display; never the value).
 #[derive(Clone, PartialEq, Eq)]
@@ -128,12 +212,77 @@ fn resolve_token_with(
 }
 
 /// GitHub as a [`PullRequestSource`].
+///
+/// With the `http` feature, each host's HTTPS client and token are kept for the source's
+/// lifetime (and shared by its clones), so a series of queries, such as a stack walk, reuses one
+/// connection instead of opening one per query.
 #[derive(Debug, Clone)]
 pub struct GitHub {
     transport: Transport,
     hosts: Vec<String>,
     token_env: Option<String>,
     cwd: PathBuf,
+    #[cfg(feature = "http")]
+    sessions: Arc<Mutex<BTreeMap<String, HttpSession>>>,
+}
+
+/// One host's HTTPS client, the runtime it runs on, and its token.
+#[cfg(feature = "http")]
+#[derive(Debug)]
+struct HttpSession {
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+    token: Token,
+}
+
+#[cfg(feature = "http")]
+impl HttpSession {
+    fn new(host: &str, token_env: Option<&str>, cwd: &Path) -> Result<Self, ForgeError> {
+        let token = resolve_token(host, token_env, cwd)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ForgeError::Failed(format!("could not start HTTP client: {error}")))?;
+        let client = reqwest::Client::builder()
+            .timeout(TIMEOUT)
+            .user_agent(concat!("bcode/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| ForgeError::Failed(error.to_string()))?;
+        Ok(Self {
+            runtime,
+            client,
+            token,
+        })
+    }
+
+    fn post(&self, endpoint: &str, body: &Value) -> Result<Value, ForgeError> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .post(endpoint)
+                .bearer_auth(self.token.value())
+                .json(body)
+                .send()
+                .await
+                .map_err(|error| ForgeError::Failed(format!("{endpoint}: {error}")))?;
+            let status = response.status();
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|error| ForgeError::Failed(format!("{endpoint}: {error}")))?;
+            match status.as_u16() {
+                200 => Ok(value),
+                401 => Err(ForgeError::Unauthenticated(format!(
+                    "GitHub rejected the token from {}",
+                    self.token.source
+                ))),
+                code => Err(ForgeError::Failed(format!(
+                    "{endpoint} answered {code}: {}",
+                    value["message"].as_str().unwrap_or("no details")
+                ))),
+            }
+        })
+    }
 }
 
 impl GitHub {
@@ -145,6 +294,8 @@ impl GitHub {
             hosts: vec![GITHUB_HOST.to_owned()],
             token_env: None,
             cwd: cwd.into(),
+            #[cfg(feature = "http")]
+            sessions: Arc::default(),
         }
     }
 
@@ -173,79 +324,196 @@ impl GitHub {
         self
     }
 
+    /// The 100 most recently updated open pull requests of `repository`. Unlike
+    /// [`PullRequestSource::pull_requests`], merged and closed pull requests do not take places
+    /// in the list.
+    ///
+    /// # Errors
+    /// * [`ForgeError::UnsupportedHost`] when [`PullRequestSource::serves`] is false.
+    /// * [`ForgeError::Unauthenticated`] when no credentials are available.
+    /// * [`ForgeError::Failed`] when GitHub cannot be reached or answers with an error.
+    pub fn open_pull_requests(
+        &self,
+        repository: &RepositoryRef,
+    ) -> Result<PullRequestList, ForgeError> {
+        let (value, via) = self.query(repository, OPEN_PULL_REQUESTS_QUERY, &[])?;
+        Ok(PullRequestList {
+            pull_requests: parse_pull_requests(&value)?,
+            via,
+            default_branch: parse_default_branch(&value),
+        })
+    }
+
+    /// Pull request `number` of `repository` in any state, and the default branch.
+    ///
+    /// # Errors
+    /// * [`ForgeError::UnsupportedHost`] when [`PullRequestSource::serves`] is false.
+    /// * [`ForgeError::Unauthenticated`] when no credentials are available.
+    /// * [`ForgeError::Failed`] when GitHub cannot be reached or answers with an error other than
+    ///   not finding the pull request.
+    pub fn pull_request(
+        &self,
+        repository: &RepositoryRef,
+        number: u64,
+    ) -> Result<PullRequestLookup, ForgeError> {
+        let (value, via) = self.query(
+            repository,
+            PULL_REQUEST_QUERY,
+            &[("number", Variable::Number(number))],
+        )?;
+        Ok(PullRequestLookup {
+            pull_request: parse_single_pull_request(&value)?,
+            via,
+            default_branch: parse_default_branch(&value),
+        })
+    }
+
+    /// The open pull requests of `repository` whose head or base branch is `branch` (up to 100
+    /// of each). Pull requests from forks are included; their head branch names a branch of the
+    /// fork.
+    ///
+    /// # Errors
+    /// * [`ForgeError::UnsupportedHost`] when [`PullRequestSource::serves`] is false.
+    /// * [`ForgeError::Unauthenticated`] when no credentials are available.
+    /// * [`ForgeError::Failed`] when GitHub cannot be reached or answers with an error.
+    pub fn branch_pull_requests(
+        &self,
+        repository: &RepositoryRef,
+        branch: &str,
+    ) -> Result<BranchPullRequests, ForgeError> {
+        let (value, _) = self.query(
+            repository,
+            BRANCH_PULL_REQUESTS_QUERY,
+            &[("branch", Variable::Text(branch))],
+        )?;
+        parse_branch_pull_requests(&value)
+    }
+
+    /// Run `query` against `repository` (its `owner` and `name` are passed as variables) with the
+    /// configured transport, returning the response and the transport that answered.
+    fn query(
+        &self,
+        repository: &RepositoryRef,
+        query: &str,
+        variables: &[(&str, Variable<'_>)],
+    ) -> Result<(Value, Transport), ForgeError> {
+        if !self.serves(repository) {
+            return Err(ForgeError::UnsupportedHost(repository.host.clone()));
+        }
+        let mut all = vec![
+            ("owner", Variable::Text(&repository.owner)),
+            ("name", Variable::Text(&repository.name)),
+        ];
+        all.extend_from_slice(variables);
+        match self.transport {
+            Transport::Http => Ok((self.http(repository, query, &all)?, Transport::Http)),
+            Transport::Cli => Ok((self.cli(repository, query, &all)?, Transport::Cli)),
+            Transport::Auto if !cfg!(feature = "http") => {
+                Ok((self.cli(repository, query, &all)?, Transport::Cli))
+            }
+            Transport::Auto => match self.http(repository, query, &all) {
+                Ok(value) => Ok((value, Transport::Http)),
+                Err(http) => match self.cli(repository, query, &all) {
+                    Ok(value) => Ok((value, Transport::Cli)),
+                    // Report why the preferred way failed, and that the fallback did too.
+                    Err(cli) => Err(match http {
+                        ForgeError::Unauthenticated(message) => {
+                            ForgeError::Unauthenticated(format!("{message}; gh: {cli}"))
+                        }
+                        other => ForgeError::Failed(format!("{other}; gh: {cli}")),
+                    }),
+                },
+            },
+        }
+    }
+
     #[cfg(not(feature = "http"))]
     #[allow(clippy::unused_self)] // the same shape as the HTTPS transport
-    fn http(&self, _repository: &RepositoryRef) -> Result<Value, ForgeError> {
+    fn http(
+        &self,
+        _repository: &RepositoryRef,
+        _query: &str,
+        _variables: &[(&str, Variable<'_>)],
+    ) -> Result<Value, ForgeError> {
         Err(ForgeError::Failed(
             "the HTTPS transport is not built into this binary (use `gh`)".into(),
         ))
     }
 
     #[cfg(feature = "http")]
-    fn http(&self, repository: &RepositoryRef) -> Result<Value, ForgeError> {
-        let token = resolve_token(&repository.host, self.token_env.as_deref(), &self.cwd)?;
+    fn http(
+        &self,
+        repository: &RepositoryRef,
+        query: &str,
+        variables: &[(&str, Variable<'_>)],
+    ) -> Result<Value, ForgeError> {
         let endpoint = if repository.host == GITHUB_HOST {
             "https://api.github.com/graphql".to_owned()
         } else {
             format!("https://{}/api/graphql", repository.host)
         };
-        let body = json!({
-            "query": PULL_REQUESTS_QUERY,
-            "variables": { "owner": repository.owner, "name": repository.name },
-        });
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| ForgeError::Failed(format!("could not start HTTP client: {error}")))?;
-        runtime.block_on(async {
-            let response = reqwest::Client::builder()
-                .timeout(TIMEOUT)
-                .user_agent(concat!("bcode/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .map_err(|error| ForgeError::Failed(error.to_string()))?
-                .post(&endpoint)
-                .bearer_auth(token.value())
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| ForgeError::Failed(format!("{endpoint}: {error}")))?;
-            let status = response.status();
-            let value: Value = response
-                .json()
-                .await
-                .map_err(|error| ForgeError::Failed(format!("{endpoint}: {error}")))?;
-            match status.as_u16() {
-                200 => Ok(value),
-                401 => Err(ForgeError::Unauthenticated(format!(
-                    "GitHub rejected the token from {}",
-                    token.source
-                ))),
-                code => Err(ForgeError::Failed(format!(
-                    "{endpoint} answered {code}: {}",
-                    value["message"].as_str().unwrap_or("no details")
-                ))),
-            }
-        })
+        let variables: serde_json::Map<String, Value> = variables
+            .iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    Variable::Text(text) => json!(text),
+                    Variable::Number(number) => json!(number),
+                };
+                ((*name).to_owned(), value)
+            })
+            .collect();
+        let body = json!({ "query": query, "variables": variables });
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let session = match sessions.entry(repository.host.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(HttpSession::new(
+                &repository.host,
+                self.token_env.as_deref(),
+                &self.cwd,
+            )?),
+        };
+        let result = session.post(&endpoint, &body);
+        if matches!(result, Err(ForgeError::Unauthenticated(_))) {
+            // A rejected token is resolved again next time (it may have been refreshed).
+            sessions.remove(&repository.host);
+        }
+        result
     }
 
-    fn cli(&self, repository: &RepositoryRef) -> Result<Value, ForgeError> {
-        let output = gh(
-            &[
-                "api",
-                "graphql",
-                "--hostname",
-                &repository.host,
-                "-f",
-                &format!("query={PULL_REQUESTS_QUERY}"),
-                "-f",
-                &format!("owner={}", repository.owner),
-                "-f",
-                &format!("name={}", repository.name),
-            ],
-            &self.cwd,
-        )?;
-        serde_json::from_str(&output)
-            .map_err(|error| ForgeError::Failed(format!("unexpected gh output: {error}")))
+    fn cli(
+        &self,
+        repository: &RepositoryRef,
+        query: &str,
+        variables: &[(&str, Variable<'_>)],
+    ) -> Result<Value, ForgeError> {
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "--hostname".to_owned(),
+            repository.host.clone(),
+            "-f".to_owned(),
+            format!("query={query}"),
+        ];
+        for (name, value) in variables {
+            // `-f` passes text verbatim (a branch named `123` stays a string); `-F` converts
+            // numbers.
+            match value {
+                Variable::Text(text) => args.extend(["-f".to_owned(), format!("{name}={text}")]),
+                Variable::Number(number) => {
+                    args.extend(["-F".to_owned(), format!("{name}={number}")]);
+                }
+            }
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_gh(&args, &self.cwd)?;
+        // `gh` exits with an error when GitHub reports one, but still prints the response, whose
+        // errors the parsers interpret (a missing pull request is not a failure).
+        match serde_json::from_str::<Value>(&output.stdout) {
+            Ok(value) if value.get("data").is_some_and(|data| !data.is_null()) => Ok(value),
+            Ok(_) | Err(_) if !output.success => Err(ForgeError::Failed(output.stderr)),
+            Ok(value) => Ok(value),
+            Err(error) => Err(ForgeError::Failed(format!("unexpected gh output: {error}"))),
+        }
     }
 }
 
@@ -255,29 +523,7 @@ impl PullRequestSource for GitHub {
     }
 
     fn pull_requests(&self, repository: &RepositoryRef) -> Result<PullRequestList, ForgeError> {
-        if !self.serves(repository) {
-            return Err(ForgeError::UnsupportedHost(repository.host.clone()));
-        }
-        let (value, via) = match self.transport {
-            Transport::Http => (self.http(repository)?, Transport::Http),
-            Transport::Cli => (self.cli(repository)?, Transport::Cli),
-            Transport::Auto if !cfg!(feature = "http") => (self.cli(repository)?, Transport::Cli),
-            Transport::Auto => match self.http(repository) {
-                Ok(value) => (value, Transport::Http),
-                Err(http) => match self.cli(repository) {
-                    Ok(value) => (value, Transport::Cli),
-                    // Report why the preferred way failed, and that the fallback did too.
-                    Err(cli) => {
-                        return Err(match http {
-                            ForgeError::Unauthenticated(message) => {
-                                ForgeError::Unauthenticated(format!("{message}; gh: {cli}"))
-                            }
-                            other => ForgeError::Failed(format!("{other}; gh: {cli}")),
-                        });
-                    }
-                },
-            },
-        };
+        let (value, via) = self.query(repository, PULL_REQUESTS_QUERY, &[])?;
         Ok(PullRequestList {
             pull_requests: parse_pull_requests(&value)?,
             via,
@@ -286,42 +532,60 @@ impl PullRequestSource for GitHub {
     }
 }
 
-/// Run `gh` in `cwd`, returning its standard output.
-fn gh(args: &[&str], cwd: &Path) -> Result<String, ForgeError> {
+/// What `gh` printed and whether it succeeded.
+struct GhOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `gh` in `cwd`.
+fn run_gh(args: &[&str], cwd: &Path) -> Result<GhOutput, ForgeError> {
     let output = Command::new("gh")
         .args(args)
         .current_dir(cwd)
         .env("GH_PROMPT_DISABLED", "1")
         .output()
         .map_err(|error| ForgeError::Failed(format!("gh is not available: {error}")))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(GhOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
+/// Run `gh` in `cwd`, returning its standard output.
+fn gh(args: &[&str], cwd: &Path) -> Result<String, ForgeError> {
+    let output = run_gh(args, cwd)?;
+    if output.success {
+        Ok(output.stdout)
     } else {
-        Err(ForgeError::Failed(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ))
+        Err(ForgeError::Failed(output.stderr))
     }
 }
 
-/// Pull requests from a GraphQL response to [`PULL_REQUESTS_QUERY`].
-///
-/// # Errors
-/// * [`ForgeError::Failed`] when the response reports errors or lacks the repository.
-pub fn parse_pull_requests(value: &Value) -> Result<Vec<PullRequest>, ForgeError> {
-    if let Some(errors) = value["errors"]
+/// The messages of a GraphQL response's errors, when it reports any.
+fn response_errors(value: &Value) -> Option<Vec<&Value>> {
+    value["errors"]
         .as_array()
         .filter(|errors| !errors.is_empty())
-    {
-        let messages: Vec<&str> = errors
-            .iter()
-            .filter_map(|error| error["message"].as_str())
-            .collect();
-        return Err(ForgeError::Failed(format!(
-            "GitHub answered: {}",
-            messages.join("; ")
-        )));
+        .map(|errors| errors.iter().collect())
+}
+
+fn answered_with(errors: &[&Value]) -> ForgeError {
+    let messages: Vec<&str> = errors
+        .iter()
+        .filter_map(|error| error["message"].as_str())
+        .collect();
+    ForgeError::Failed(format!("GitHub answered: {}", messages.join("; ")))
+}
+
+/// The pull requests of the connection `field` of a GraphQL response's repository.
+fn connection_pull_requests(value: &Value, field: &str) -> Result<Vec<PullRequest>, ForgeError> {
+    if let Some(errors) = response_errors(value) {
+        return Err(answered_with(&errors));
     }
-    let Some(nodes) = value["data"]["repository"]["pullRequests"]["nodes"].as_array() else {
+    let Some(nodes) = value["data"]["repository"][field]["nodes"].as_array() else {
         return Err(ForgeError::Failed(
             "GitHub did not return the repository's pull requests".into(),
         ));
@@ -333,8 +597,61 @@ pub fn parse_pull_requests(value: &Value) -> Result<Vec<PullRequest>, ForgeError
         .collect())
 }
 
-/// The repository's default branch from a GraphQL response to [`PULL_REQUESTS_QUERY`], when it
-/// reports one (empty repositories have none).
+/// Pull requests from a GraphQL response to [`PULL_REQUESTS_QUERY`] (or its open-only form).
+///
+/// # Errors
+/// * [`ForgeError::Failed`] when the response reports errors or lacks the repository.
+pub fn parse_pull_requests(value: &Value) -> Result<Vec<PullRequest>, ForgeError> {
+    connection_pull_requests(value, "pullRequests")
+}
+
+/// The pull request of a response to [`PULL_REQUEST_QUERY`]; `None` when GitHub reports that the
+/// repository has no pull request with that number.
+///
+/// # Errors
+/// * [`ForgeError::Failed`] when the response reports other errors or lacks the repository.
+pub fn parse_single_pull_request(value: &Value) -> Result<Option<PullRequest>, ForgeError> {
+    if let Some(errors) = response_errors(value) {
+        let not_found = |error: &&Value| {
+            error["type"].as_str() == Some("NOT_FOUND")
+                && error["path"]
+                    .as_array()
+                    .is_some_and(|path| path.last().and_then(Value::as_str) == Some("pullRequest"))
+        };
+        if !errors.iter().all(not_found) {
+            return Err(answered_with(&errors));
+        }
+    }
+    let repository = &value["data"]["repository"];
+    if !repository.is_object() {
+        return Err(ForgeError::Failed(
+            "GitHub did not return the repository".into(),
+        ));
+    }
+    let node = &repository["pullRequest"];
+    if node.is_null() {
+        return Ok(None);
+    }
+    let viewer = value["data"]["viewer"]["login"].as_str();
+    parse_pull_request(node, viewer)
+        .map(Some)
+        .ok_or_else(|| ForgeError::Failed("GitHub returned an unreadable pull request".into()))
+}
+
+/// The open pull requests from and into a branch, from a response to
+/// [`BRANCH_PULL_REQUESTS_QUERY`].
+///
+/// # Errors
+/// * [`ForgeError::Failed`] when the response reports errors or lacks the repository.
+pub fn parse_branch_pull_requests(value: &Value) -> Result<BranchPullRequests, ForgeError> {
+    Ok(BranchPullRequests {
+        with_head: connection_pull_requests(value, "withHead")?,
+        with_base: connection_pull_requests(value, "withBase")?,
+    })
+}
+
+/// The repository's default branch from a GraphQL response to [`PULL_REQUESTS_QUERY`] or
+/// [`PULL_REQUEST_QUERY`], when it reports one (empty repositories have none).
 #[must_use]
 pub fn parse_default_branch(value: &Value) -> Option<String> {
     value["data"]["repository"]["defaultBranchRef"]["name"]

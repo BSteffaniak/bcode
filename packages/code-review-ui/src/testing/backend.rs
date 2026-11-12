@@ -61,6 +61,13 @@ impl TestBackend {
         self
     }
 
+    /// Use `limit` for stacks.
+    #[must_use]
+    pub fn with_stack_limit(mut self, limit: bcode_code_review_models::ReviewStackLimit) -> Self {
+        self.services = self.services.with_stack_limit(limit);
+        self
+    }
+
     /// The services screens are built with.
     #[must_use]
     pub fn services(&self) -> ReviewServices {

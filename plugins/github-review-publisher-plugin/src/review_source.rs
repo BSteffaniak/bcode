@@ -1,8 +1,8 @@
 //! GitHub review-source provider (`bcode.review_source/v1`).
 //!
-//! Lists open pull requests through `bcode_forge`, detects stacks of pull requests from their
-//! base/head branch relationships (Graphite-style and GitHub native stacked pull requests; no
-//! tool-specific metadata), and fetches a pull request's head and base commits into a
+//! Lists open pull requests through `bcode_forge`, detects stacks of pull requests by walking
+//! their base/head branch relationships on GitHub (Graphite-style and GitHub native stacked pull
+//! requests; no tool-specific metadata), and fetches a pull request's head and base commits into a
 //! review-owned reference namespace (`refs/bcode-review/pull/<N>/{head,base}`) so they never
 //! touch the user's branches or remote-tracking references.
 
@@ -11,14 +11,12 @@ use bcode_code_review_models::{
     OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary, REVIEW_SOURCE_ERROR_FAILED,
     REVIEW_SOURCE_ERROR_FETCH_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
     REVIEW_SOURCE_ERROR_UNAUTHENTICATED, REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY,
-    REVIEW_STACK_MAX_LAYERS, ReviewPullFetchResult, ReviewSourceCapabilities,
-    ReviewSourceProviderManifest, ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest,
-    ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
-    ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer, ReviewStackSibling,
+    ReviewPullFetchResult, ReviewSourceCapabilities, ReviewSourceProviderManifest,
+    ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
+    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse, ReviewStack,
+    ReviewStackLayer, ReviewStackSibling,
 };
-use bcode_forge::models::{
-    ForgeError, PullRequest, PullRequestList, PullRequestSource, RepositoryRef,
-};
+use bcode_forge::models::{ForgeError, PullRequest, PullRequestList, RepositoryRef};
 use bcode_plugin_sdk::prelude::{ServiceRequest, ServiceResponse};
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
@@ -100,18 +98,15 @@ pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
         OP_REVIEW_SOURCE_MANIFEST => crate::json_response(&manifest()),
         OP_REVIEW_SOURCE_PULLS_LIST => handle(request, |req: ReviewSourcePullsListRequest| {
             let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-            let list = repository.pull_requests(&req.repo_path)?;
+            let list = repository
+                .github(&req.repo_path)
+                .open_pull_requests(&repository.0)?;
             Ok(pulls_list_response(&repository, list))
         }),
         OP_REVIEW_SOURCE_STACK_RESOLVE => {
             handle(request, |req: ReviewSourceStackResolveRequest| {
                 let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-                let list = repository.pull_requests(&req.repo_path)?;
-                let pulls = stack_candidates(&repository, &list.pull_requests);
-                let stack = detect_stack(&pulls, list.default_branch.as_deref(), req.number)
-                    .ok_or_else(|| {
-                        ReviewSourceError::PullNotFound(req.number, repository.display())
-                    })?;
+                let stack = resolve_stack(&repository, &req.repo_path, req.number, req.max_layers)?;
                 Ok(ReviewSourceStackResolveResponse {
                     repository: repository.display(),
                     stack,
@@ -123,10 +118,9 @@ pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
             let base_branch = match req.base_branch {
                 Some(base) => base,
                 None => repository
-                    .pull_requests(&req.repo_path)?
-                    .pull_requests
-                    .into_iter()
-                    .find(|pull| pull.number == req.number)
+                    .github(&req.repo_path)
+                    .pull_request(&repository.0, req.number)?
+                    .pull_request
                     .map(|pull| pull.base)
                     .ok_or_else(|| {
                         ReviewSourceError::PullNotFound(req.number, repository.display())
@@ -196,9 +190,9 @@ impl Repository {
         }
     }
 
-    fn pull_requests(&self, repo_path: &Path) -> Result<PullRequestList, ReviewSourceError> {
-        let github = bcode_forge::GitHub::new(repo_path).enterprise_hosts([self.0.host.clone()]);
-        Ok(github.pull_requests(&self.0)?)
+    /// A forge client for this repository's host, running `gh` in `repo_path`.
+    fn github(&self, repo_path: &Path) -> bcode_forge::GitHub {
+        bcode_forge::GitHub::new(repo_path).enterprise_hosts([self.0.host.clone()])
     }
 
     /// The local remote that points at this repository (`origin` preferred), or its HTTPS URL.
@@ -319,94 +313,176 @@ fn stack_candidates(repository: &Repository, pulls: &[PullRequest]) -> Vec<PullR
         .collect()
 }
 
-/// Detect the linear stack containing pull request `requested` among open pull requests.
+/// Resolve the stack containing open pull request `number` by walking GitHub branch by branch:
+/// one query for the pull request, then one per layer (see [`walk_stack`]). The cost follows the
+/// stack's depth, not how many pull requests the repository has.
+///
+/// # Errors
+///
+/// * [`ReviewSourceError::PullNotFound`] when `number` is not an open pull request whose head
+///   branch is in the repository.
+/// * The forge's errors when GitHub cannot be asked or answers with an error.
+fn resolve_stack(
+    repository: &Repository,
+    repo_path: &Path,
+    number: u64,
+    max_layers: Option<usize>,
+) -> Result<ReviewStack, ReviewSourceError> {
+    let github = repository.github(repo_path);
+    let lookup = github.pull_request(&repository.0, number)?;
+    let start = stack_candidates(repository, lookup.pull_request.as_slice())
+        .pop()
+        .ok_or_else(|| ReviewSourceError::PullNotFound(number, repository.display()))?;
+    let mut branches = ForgeBranches {
+        github: &github,
+        repository,
+    };
+    walk_stack(
+        &mut branches,
+        &start,
+        lookup.default_branch.as_deref(),
+        max_layers,
+    )
+}
+
+/// Open stack candidates next to one branch.
+#[derive(Debug, Clone, Default)]
+pub struct BranchNeighbors {
+    /// Open pull requests whose head branch is the branch: candidates for the layer below one
+    /// based on it.
+    pub with_head: Vec<PullRequestSummary>,
+    /// Open pull requests whose base branch is the branch: the layers on top of the one whose
+    /// head it is.
+    pub with_base: Vec<PullRequestSummary>,
+}
+
+/// Where a stack walk learns which open pull requests come from and go into a branch.
+pub trait StackBranches {
+    /// Why a branch could not be looked up.
+    type Error;
+
+    /// The open stack candidates (head branch in the repository) next to `branch`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever stops the lookup; the walk stops with it rather than return a partial stack.
+    fn neighbors(&mut self, branch: &str) -> Result<BranchNeighbors, Self::Error>;
+}
+
+/// [`StackBranches`] answered by GitHub, one query per branch.
+struct ForgeBranches<'a> {
+    github: &'a bcode_forge::GitHub,
+    repository: &'a Repository,
+}
+
+impl StackBranches for ForgeBranches<'_> {
+    type Error = ReviewSourceError;
+
+    fn neighbors(&mut self, branch: &str) -> Result<BranchNeighbors, ReviewSourceError> {
+        let pulls = self
+            .github
+            .branch_pull_requests(&self.repository.0, branch)?;
+        Ok(BranchNeighbors {
+            with_head: stack_candidates(self.repository, &pulls.with_head),
+            with_base: stack_candidates(self.repository, &pulls.with_base),
+        })
+    }
+}
+
+/// Walk the linear stack containing `start`, asking `branches` about each branch once.
 ///
 /// A stack is a chain where each pull request's base branch is the head branch of the one below
-/// it, ending at `default_branch`. From `requested`, the chain extends down while some pull
+/// it, ending at `default_branch`. From `start`, the chain extends down while some pull
 /// request's head branch is the current base branch, and up while exactly one pull request
-/// targets the current head branch.
+/// targets the current head branch. The default branch itself is never looked up (it may have
+/// thousands of pull requests), so a stack of `n` layers costs about `n` lookups.
 ///
 /// * A missing layer (no open pull request for a base branch other than the default branch)
 ///   ends the chain early; the stack reports `rooted_at_default_branch: false` and a warning.
 /// * Branching: when several pull requests target the same layer, the chain does not continue
-///   past it; the other pull requests are reported as siblings. Below `requested`, when several
+///   past it; the other pull requests are reported as siblings. Below `start`, when several
 ///   open pull requests share a head branch, the most recently updated one is used.
 /// * Cycles are guarded: the chain stops at the first repeated pull request, with a warning.
-/// * Chains are cut at [`REVIEW_STACK_MAX_LAYERS`] layers.
+/// * With `max_layers`, chains are cut at that many layers with a warning: below `start` first,
+///   then above it. Without it the whole stack is walked (cycles still end the walk).
 ///
-/// Returns `None` when `requested` is not among `pulls`.
-#[must_use]
-pub fn detect_stack(
-    pulls: &[PullRequestSummary],
+/// # Errors
+///
+/// The first lookup error; no partial stack is returned.
+pub fn walk_stack<B: StackBranches>(
+    branches: &mut B,
+    start: &PullRequestSummary,
     default_branch: Option<&str>,
-    requested: u64,
-) -> Option<ReviewStack> {
-    let start = pulls.iter().find(|pull| pull.number == requested)?;
-    let mut graph = StackGraph::new(pulls, default_branch, start);
-    let mut chain = graph.below(start);
+    max_layers: Option<usize>,
+) -> Result<ReviewStack, B::Error> {
+    let mut walk = StackWalk {
+        branches,
+        neighbors: BTreeMap::new(),
+        default_branch,
+        max_layers,
+        cut_above: None,
+        visited: BTreeSet::from([start.number]),
+        warnings: Vec::new(),
+    };
+    let mut chain = walk.below(start)?;
     chain.reverse();
-    chain.push(start);
-    graph.extend_up(&mut chain);
-    let siblings = graph.siblings(&chain);
+    chain.push(start.clone());
+    walk.extend_up(&mut chain)?;
+    let siblings = walk.siblings(&chain)?;
 
     let trunk = chain[0].base_branch.clone();
-    let layers = chain
-        .iter()
-        .enumerate()
-        .map(|(index, pull)| ReviewStackLayer {
-            pull: (*pull).clone(),
-            parent: index.checked_sub(1).map(|below| chain[below].number),
-        })
+    let parents: Vec<Option<u64>> = std::iter::once(None)
+        .chain(chain.iter().map(|pull| Some(pull.number)))
         .collect();
-    Some(ReviewStack {
+    let layers = chain
+        .into_iter()
+        .zip(parents)
+        .map(|(pull, parent)| ReviewStackLayer { pull, parent })
+        .collect();
+    Ok(ReviewStack {
         rooted_at_default_branch: default_branch == Some(trunk.as_str()),
         trunk,
         layers,
-        requested,
+        requested: start.number,
         siblings,
-        warnings: graph.warnings,
+        warnings: walk.warnings,
     })
 }
 
-/// Pull requests indexed by head and base branch, plus the walk's bookkeeping.
-struct StackGraph<'a> {
-    by_head: BTreeMap<&'a str, Vec<&'a PullRequestSummary>>,
-    by_base: BTreeMap<&'a str, Vec<&'a PullRequestSummary>>,
-    default_branch: Option<&'a str>,
+/// The walk's lookups (each branch asked once) and bookkeeping.
+struct StackWalk<'w, B: StackBranches> {
+    branches: &'w mut B,
+    neighbors: BTreeMap<String, BranchNeighbors>,
+    default_branch: Option<&'w str>,
+    max_layers: Option<usize>,
+    /// The layer the limit left out above the chain's top: the chain's continuation, not a
+    /// sibling.
+    cut_above: Option<u64>,
     visited: BTreeSet<u64>,
     warnings: Vec<String>,
 }
 
-impl<'a> StackGraph<'a> {
-    fn new(
-        pulls: &'a [PullRequestSummary],
-        default_branch: Option<&'a str>,
-        start: &PullRequestSummary,
-    ) -> Self {
-        let mut by_head: BTreeMap<&str, Vec<&PullRequestSummary>> = BTreeMap::new();
-        let mut by_base: BTreeMap<&str, Vec<&PullRequestSummary>> = BTreeMap::new();
-        for pull in pulls {
-            by_head.entry(&pull.head_branch).or_default().push(pull);
-            by_base.entry(&pull.base_branch).or_default().push(pull);
+impl<B: StackBranches> StackWalk<'_, B> {
+    fn neighbors(&mut self, branch: &str) -> Result<&BranchNeighbors, B::Error> {
+        if !self.neighbors.contains_key(branch) {
+            let found = self.branches.neighbors(branch)?;
+            self.neighbors.insert(branch.to_owned(), found);
         }
-        Self {
-            by_head,
-            by_base,
-            default_branch,
-            visited: BTreeSet::from([start.number]),
-            warnings: Vec::new(),
-        }
+        Ok(&self.neighbors[branch])
     }
 
-    fn children(&self, pull: &PullRequestSummary) -> &[&'a PullRequestSummary] {
-        self.by_base
-            .get(pull.head_branch.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+    /// Open pull requests whose head branch is `pull`'s base branch.
+    fn parents(&mut self, pull: &PullRequestSummary) -> Result<Vec<PullRequestSummary>, B::Error> {
+        Ok(self.neighbors(&pull.base_branch)?.with_head.clone())
+    }
+
+    /// Open pull requests whose base branch is `pull`'s head branch.
+    fn children(&mut self, pull: &PullRequestSummary) -> Result<Vec<PullRequestSummary>, B::Error> {
+        Ok(self.neighbors(&pull.head_branch)?.with_base.clone())
     }
 
     /// Record a cycle when one of `candidates` is already in the chain.
-    fn cycle(&mut self, candidates: &[&PullRequestSummary]) -> bool {
+    fn cycle(&mut self, candidates: &[PullRequestSummary]) -> bool {
         let Some(repeated) = candidates
             .iter()
             .find(|pull| self.visited.contains(&pull.number))
@@ -421,18 +497,18 @@ impl<'a> StackGraph<'a> {
     }
 
     /// The layers below `start`, nearest first.
-    fn below(&mut self, start: &'a PullRequestSummary) -> Vec<&'a PullRequestSummary> {
-        let mut below = Vec::new();
-        let mut current = start;
+    fn below(&mut self, start: &PullRequestSummary) -> Result<Vec<PullRequestSummary>, B::Error> {
+        let mut below: Vec<PullRequestSummary> = Vec::new();
+        let mut current = start.clone();
         while self.default_branch != Some(current.base_branch.as_str()) {
-            if below.len() + 1 >= REVIEW_STACK_MAX_LAYERS {
+            if let Some(max) = self.max_layers.filter(|max| below.len() + 1 >= *max) {
                 self.warnings.push(format!(
-                    "the stack has more than {REVIEW_STACK_MAX_LAYERS} layers; lower layers are \
-                     left out"
+                    "the stack has more than {max} layers; lower layers are left out"
                 ));
                 break;
             }
-            let Some(candidates) = self.by_head.get(current.base_branch.as_str()).cloned() else {
+            let candidates = self.parents(&current)?;
+            if candidates.is_empty() {
                 if let Some(default_branch) = self.default_branch {
                     self.warnings.push(format!(
                         "no open pull request has head branch {}; the stack is missing a layer \
@@ -441,67 +517,74 @@ impl<'a> StackGraph<'a> {
                     ));
                 }
                 break;
-            };
+            }
             if self.cycle(&candidates) {
                 break;
             }
-            let Some(parent) = candidates.iter().copied().max_by(|left, right| {
+            let count = candidates.len();
+            let Some(parent) = candidates.into_iter().max_by(|left, right| {
                 left.updated
                     .cmp(&right.updated)
                     .then_with(|| left.number.cmp(&right.number))
             }) else {
                 break;
             };
-            if candidates.len() > 1 {
+            if count > 1 {
                 self.warnings.push(format!(
                     "several open pull requests have head branch {}; using #{}",
                     current.base_branch, parent.number
                 ));
             }
             self.visited.insert(parent.number);
-            below.push(parent);
+            below.push(parent.clone());
             current = parent;
         }
-        below
+        Ok(below)
     }
 
     /// Extend `chain` upward while exactly one pull request targets its top.
-    fn extend_up(&mut self, chain: &mut Vec<&'a PullRequestSummary>) {
-        while let Some(top) = chain.last().copied() {
-            let children = self.children(top).to_vec();
+    fn extend_up(&mut self, chain: &mut Vec<PullRequestSummary>) -> Result<(), B::Error> {
+        while let Some(top) = chain.last() {
+            let children = self.children(&top.clone())?;
             if self.cycle(&children) {
                 break;
             }
             let [child] = children.as_slice() else {
                 break;
             };
-            if chain.len() >= REVIEW_STACK_MAX_LAYERS {
+            if let Some(max) = self.max_layers.filter(|max| chain.len() >= *max) {
                 self.warnings.push(format!(
-                    "the stack has more than {REVIEW_STACK_MAX_LAYERS} layers; upper layers are \
-                     left out"
+                    "the stack has more than {max} layers; upper layers are left out"
                 ));
+                self.cut_above = Some(child.number);
                 break;
             }
             self.visited.insert(child.number);
-            chain.push(child);
+            chain.push(child.clone());
         }
+        Ok(())
     }
 
     /// Open pull requests targeting a layer of `chain` that are not part of it.
-    fn siblings(&self, chain: &[&PullRequestSummary]) -> Vec<ReviewStackSibling> {
-        let in_chain: BTreeSet<u64> = chain.iter().map(|pull| pull.number).collect();
-        chain
-            .iter()
-            .flat_map(|layer| {
-                self.children(layer)
-                    .iter()
+    fn siblings(
+        &mut self,
+        chain: &[PullRequestSummary],
+    ) -> Result<Vec<ReviewStackSibling>, B::Error> {
+        let mut in_chain: BTreeSet<u64> = chain.iter().map(|pull| pull.number).collect();
+        in_chain.extend(self.cut_above);
+        let mut siblings = Vec::new();
+        for layer in chain {
+            siblings.extend(
+                self.children(layer)?
+                    .into_iter()
                     .filter(|child| !in_chain.contains(&child.number))
-                    .map(|child| ReviewStackSibling {
+                    .map(|pull| ReviewStackSibling {
                         parent: layer.number,
-                        pull: (*child).clone(),
-                    })
-            })
-            .collect()
+                        pull,
+                    }),
+            );
+        }
+        Ok(siblings)
     }
 }
 

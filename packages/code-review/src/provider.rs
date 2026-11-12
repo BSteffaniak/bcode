@@ -106,12 +106,14 @@ pub async fn discover_providers<T: ProviderTransport + Sync>(
 ///   reviewed layer (or the stack's top), each with its own base branch.
 ///
 /// Sources whose provider is not among `routes` get no entry. Provider failures become
-/// [`ReviewSourceProviderOutcome::Failed`] entries.
+/// [`ReviewSourceProviderOutcome::Failed`] entries. Stacks are resolved with `max_layers` (see
+/// [`ReviewSourceStackResolveRequest::max_layers`]).
 pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
     transport: &T,
     routes: &[ProviderRoute],
     repo_path: &Path,
     sources: &[ReviewSource],
+    max_layers: Option<usize>,
 ) -> Vec<ReviewSourceProviderResolution> {
     let mut resolutions = Vec::new();
     for source in sources.iter().filter(|source| source.included) {
@@ -141,6 +143,7 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
             plugin_id: &route.plugin_id,
             repo_path,
             repository,
+            max_layers,
         };
         let outcome = if stacked {
             target.stacked(number).await
@@ -165,7 +168,7 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
 }
 
 /// Build the `review.sources.resolve` request for a workspace, asking the enabled providers
-/// about its provider-backed sources first.
+/// about its provider-backed sources first (stacks with `max_layers`).
 ///
 /// # Errors
 ///
@@ -174,13 +177,14 @@ pub async fn resolve_request_with_providers<T: ProviderTransport + Sync>(
     transport: &T,
     repo_path: &Path,
     sources: Vec<ReviewSource>,
+    max_layers: Option<usize>,
 ) -> Result<ResolveReviewSourcesRequest, ProviderCallError> {
     let needs_provider = sources.iter().any(|source| {
         source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
     });
     let provider_resolutions = if needs_provider {
         let routes = discover_providers(transport).await?;
-        gather_provider_resolutions(transport, &routes, repo_path, &sources).await
+        gather_provider_resolutions(transport, &routes, repo_path, &sources, max_layers).await
     } else {
         Vec::new()
     };
@@ -215,7 +219,8 @@ pub async fn list_pulls<T: ProviderTransport + Sync>(
     .await
 }
 
-/// Resolve the stack containing pull request `number` through `route`.
+/// Resolve the stack containing pull request `number` through `route`, cut at `max_layers` when
+/// given.
 ///
 /// # Errors
 ///
@@ -226,6 +231,7 @@ pub async fn resolve_stack<T: ProviderTransport + Sync>(
     repo_path: &Path,
     repository: Option<String>,
     number: u64,
+    max_layers: Option<usize>,
 ) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
     call(
         transport,
@@ -235,6 +241,7 @@ pub async fn resolve_stack<T: ProviderTransport + Sync>(
             repo_path: repo_path.to_path_buf(),
             repository,
             number,
+            max_layers,
         },
     )
     .await
@@ -246,6 +253,7 @@ struct Target<'a, T> {
     plugin_id: &'a str,
     repo_path: &'a Path,
     repository: &'a str,
+    max_layers: Option<usize>,
 }
 
 impl<T: ProviderTransport + Sync> Target<'_, T> {
@@ -280,6 +288,7 @@ impl<T: ProviderTransport + Sync> Target<'_, T> {
                 repo_path: self.repo_path.to_path_buf(),
                 repository: Some(self.repository.to_string()),
                 number,
+                max_layers: self.max_layers,
             },
         )
         .await?;

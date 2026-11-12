@@ -1,9 +1,76 @@
-//! Review-source provider tests: stack detection from synthetic pull-request lists, listing
-//! order, repository naming, and fetching from a local remote (no network).
+//! Review-source provider tests: stack walks over synthetic pull-request lists, listing order,
+//! repository naming, and fetching from a local remote (no network).
 
 use super::*;
 use bcode_forge::models::{PullRequestState, Transport};
+use std::convert::Infallible;
 use std::path::PathBuf;
+
+/// Branch lookups answered from a fixed list of open pull requests, recording each branch asked.
+struct Listed<'a> {
+    pulls: &'a [PullRequestSummary],
+    asked: Vec<String>,
+}
+
+impl StackBranches for Listed<'_> {
+    type Error = Infallible;
+
+    fn neighbors(&mut self, branch: &str) -> Result<BranchNeighbors, Infallible> {
+        self.asked.push(branch.to_owned());
+        let matching = |side: fn(&PullRequestSummary) -> &str| {
+            self.pulls
+                .iter()
+                .filter(|pull| side(pull) == branch)
+                .cloned()
+                .collect()
+        };
+        Ok(BranchNeighbors {
+            with_head: matching(|pull| &pull.head_branch),
+            with_base: matching(|pull| &pull.base_branch),
+        })
+    }
+}
+
+/// Walk the stack of `requested` over `pulls`, returning it and the branches looked up.
+fn walk(
+    pulls: &[PullRequestSummary],
+    default_branch: Option<&str>,
+    requested: u64,
+    max_layers: Option<usize>,
+) -> Option<(ReviewStack, Vec<String>)> {
+    let start = pulls.iter().find(|pull| pull.number == requested)?;
+    let mut listed = Listed {
+        pulls,
+        asked: Vec::new(),
+    };
+    let stack = match walk_stack(&mut listed, start, default_branch, max_layers) {
+        Ok(stack) => stack,
+        Err(never) => match never {},
+    };
+    Some((stack, listed.asked))
+}
+
+fn detect_stack(
+    pulls: &[PullRequestSummary],
+    default_branch: Option<&str>,
+    requested: u64,
+) -> Option<ReviewStack> {
+    walk(pulls, default_branch, requested, None).map(|(stack, _)| stack)
+}
+
+/// A chain of `layers` pull requests `l0 ← l1 ← …` on `main`, numbered from 1.
+fn chain(layers: u64) -> Vec<PullRequestSummary> {
+    (0..layers)
+        .map(|index| {
+            let base = if index == 0 {
+                "main".to_string()
+            } else {
+                format!("l{}", index - 1)
+            };
+            pr(index + 1, &base, &format!("l{index}"))
+        })
+        .collect()
+}
 
 fn pr(number: u64, base: &str, head: &str) -> PullRequestSummary {
     PullRequestSummary {
@@ -154,21 +221,58 @@ fn duplicate_head_branches_below_use_the_latest_pull_request() {
 }
 
 #[test]
-fn chains_are_bounded() {
-    let pulls: Vec<PullRequestSummary> = (0..100u64)
-        .map(|index| {
-            let base = if index == 0 {
-                "main".to_string()
-            } else {
-                format!("l{}", index - 1)
-            };
-            pr(index + 1, &base, &format!("l{index}"))
-        })
-        .collect();
-    let stack = detect_stack(&pulls, Some("main"), 50).unwrap();
-    assert!(stack.layers.len() <= REVIEW_STACK_MAX_LAYERS);
+fn a_layer_limit_cuts_the_chain_with_a_warning() {
+    let pulls = chain(100);
+    let (stack, _) = walk(&pulls, Some("main"), 50, Some(64)).unwrap();
+    assert_eq!(stack.layers.len(), 64);
     assert!(stack.layers.iter().any(|layer| layer.pull.number == 50));
+    // Every layer below #50 fits, so the layers above #64 are the ones left out.
+    assert_eq!(stack.layers.first().map(|layer| layer.pull.number), Some(1));
+    assert_eq!(stack.layers.last().map(|layer| layer.pull.number), Some(64));
     assert_eq!(stack.warnings.len(), 1, "{:?}", stack.warnings);
+    assert!(
+        stack.warnings[0].contains("more than 64 layers"),
+        "{:?}",
+        stack.warnings
+    );
+    // The layer cut off above is the chain's continuation, not a sibling.
+    assert!(stack.siblings.is_empty(), "{:?}", sibling_pairs(&stack));
+    // Without a limit the whole chain is walked.
+    let whole = detect_stack(&pulls, Some("main"), 50).unwrap();
+    assert_eq!(numbers(&whole), (1..=100).collect::<Vec<u64>>());
+    assert!(whole.warnings.is_empty(), "{:?}", whole.warnings);
+}
+
+#[test]
+fn deep_stacks_are_walked_whole_with_one_lookup_per_layer() {
+    // An 87-layer stack from its second layer: the depth that motivated walking branches
+    // instead of listing the repository's most recent pull requests.
+    let mut pulls = chain(87);
+    pulls.push(pr(500, "main", "unrelated"));
+    let (stack, asked) = walk(&pulls, Some("main"), 2, None).unwrap();
+    assert_eq!(numbers(&stack), (1..=87).collect::<Vec<u64>>());
+    assert!(stack.rooted_at_default_branch);
+    assert!(stack.warnings.is_empty(), "{:?}", stack.warnings);
+    // Each layer's head branch once; the default branch, which may have thousands of pull
+    // requests, never.
+    let unique: BTreeSet<&String> = asked.iter().collect();
+    assert_eq!(unique.len(), asked.len(), "{asked:?}");
+    assert_eq!(asked.len(), 87);
+    assert!(!asked.iter().any(|branch| branch == "main"));
+}
+
+#[test]
+fn a_failed_lookup_fails_the_walk() {
+    struct Offline;
+    impl StackBranches for Offline {
+        type Error = ReviewSourceError;
+        fn neighbors(&mut self, _branch: &str) -> Result<BranchNeighbors, ReviewSourceError> {
+            Err(ReviewSourceError::Failed("GitHub is unreachable".into()))
+        }
+    }
+    let start = pr(2, "a", "b");
+    let error = walk_stack(&mut Offline, &start, Some("main"), None).unwrap_err();
+    assert_eq!(error.code(), REVIEW_SOURCE_ERROR_FAILED);
 }
 
 fn forge_pull(number: u64, state: PullRequestState, head_repository: &str) -> PullRequest {

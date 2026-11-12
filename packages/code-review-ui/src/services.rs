@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use bcode_code_review::provider::ProviderCallError;
 use bcode_code_review::{DataError, ReviewData, ReviewStore, StoreError};
 use bcode_code_review_models as models;
+use bcode_code_review_models::ReviewStackLimit;
 
 use crate::host::{HostTransport, ReviewHost};
 
@@ -227,6 +228,7 @@ pub struct ReviewServices {
     store: ReviewStore,
     host: Arc<dyn ReviewHost>,
     execution: Execution,
+    stack_limit: ReviewStackLimit,
     #[cfg(test)]
     probe: Arc<probe::Probe>,
     /// Test state (such as a temporary state directory) that lives as long as any clone.
@@ -252,11 +254,25 @@ impl ReviewServices {
             store,
             host,
             execution: Execution::Pool,
+            stack_limit: ReviewStackLimit::default(),
             #[cfg(test)]
             probe: Arc::default(),
             #[cfg(test)]
             _guard: None,
         }
+    }
+
+    /// Use `limit` for stacks: what providers are asked to cut, and when the app warns.
+    #[must_use]
+    pub const fn with_stack_limit(mut self, limit: ReviewStackLimit) -> Self {
+        self.stack_limit = limit;
+        self
+    }
+
+    /// The configured stack layer limit.
+    #[must_use]
+    pub const fn stack_limit(&self) -> ReviewStackLimit {
+        self.stack_limit
     }
 
     /// Services that answer on the calling task, so scenario tests observe completions in a

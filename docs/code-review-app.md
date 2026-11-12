@@ -263,6 +263,13 @@ bcode's own (`--print-config-paths` lists them in order):
   lines in the same sections (functions), even when the rest of the file changes, for example
   after a rebase. `"file"` resets it when either side of the file changes at all. Any other
   value is reported and the default is used.
+* `[plugins.config."bcode.code_review".stack]`: how many layers a stack of pull requests may
+  have. `max_layers` (default 64) is the limit; `over_limit` says what happens beyond it.
+  `"warn"` (the default) loads every layer and shows a warning that can be dismissed: a row of
+  the new-review wizard's stack step (`enter` dismisses it) and, when the review opens, a toast
+  that stays until its `×` is clicked or the "Dismiss notifications" command runs. `"stop"` asks
+  the provider to cut the stack at the limit, with a warning in the stack step. Invalid values
+  are reported and the defaults are used.
 * `[tui.keybindings.scopes."code-review*"]`: keybinding overrides of the review scopes
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.

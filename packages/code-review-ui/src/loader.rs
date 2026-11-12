@@ -208,9 +208,14 @@ pub async fn open(
             )
         })
         .collect();
-    let request = resolve_request_with_providers(&services.transport(), &repo_path, sources)
-        .await
-        .map_err(|error| error.message)?;
+    let request = resolve_request_with_providers(
+        &services.transport(),
+        &repo_path,
+        sources,
+        services.stack_limit().resolve_limit(),
+    )
+    .await
+    .map_err(|error| error.message)?;
     let resolved: ResolveReviewSourcesResponse = services
         .call(request)
         .await
