@@ -23,6 +23,7 @@ fn config(legacy: &[(&str, Action)], words: &[(&str, Action)]) -> AgentConfig {
 fn evaluate(config: &AgentConfig, source: &str) -> AgentDecision {
     let analysis = analyze(&ShellAnalysisRequest::posix(source));
     let request = EvaluateToolCallRequest {
+        claimed: false,
         session_id: bcode_session_models::SessionId::new(),
         agent_id: "build".to_owned(),
         tool_name: "shell.run".to_owned(),

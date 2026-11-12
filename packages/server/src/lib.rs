@@ -28646,6 +28646,17 @@ async fn agent_context_with_tools(
     available_tools: Vec<ServiceToolDefinition>,
 ) -> Option<AgentContextResponse> {
     let config = state.session_config(session_id).await;
+    let mut available_tools = available_tools;
+    let mut claimed_tools = Vec::new();
+    for tool in state.client_tools.offered_tools(session_id) {
+        claimed_tools.push(tool.definition.name.clone());
+        if !available_tools
+            .iter()
+            .any(|available| available.name == tool.definition.name)
+        {
+            available_tools.push(tool.definition);
+        }
+    }
     let request = AgentContextRequest {
         session_id,
         agent_id: agent_id.to_string(),
@@ -28653,6 +28664,7 @@ async fn agent_context_with_tools(
         effective_config_toml: bcode_config::encode_effective_config(&config)
             .ok()
             .map(Box::new),
+        claimed_tools,
     };
     state
         .plugins
@@ -38574,6 +38586,11 @@ async fn evaluate_agent_tool_policy_with_metadata(
         .chain(metadata.aliases.iter().cloned())
         .collect();
     let config = state.session_config(session_id).await;
+    let claimed = state
+        .client_tools
+        .offered_tools(session_id)
+        .iter()
+        .any(|tool| tool.definition.name == call.name);
     let request = EvaluateToolCallRequest {
         session_id,
         agent_id: agent_id.to_string(),
@@ -38581,6 +38598,7 @@ async fn evaluate_agent_tool_policy_with_metadata(
         operation: metadata.operation.clone(),
         aliases,
         requires_permission: metadata.requires_permission,
+        claimed,
         policy_profile,
         cwd,
         effective_config_toml: bcode_config::encode_effective_config(&config)

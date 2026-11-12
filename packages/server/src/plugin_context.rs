@@ -802,6 +802,7 @@ async fn authorize_resource_path(
         return denied();
     }
     let evaluation = bcode_agent_profile::EvaluateToolCallRequest {
+        claimed: false,
         session_id: bound.session.unwrap_or_default(),
         agent_id: bound.agent.clone(),
         tool_name: "filesystem.read".into(),
@@ -925,6 +926,7 @@ async fn authorize_workspace(
         return denied();
     }
     let evaluation = bcode_agent_profile::EvaluateToolCallRequest {
+        claimed: false,
         session_id: bound.session.unwrap_or_default(),
         agent_id: bound.agent.clone(),
         tool_name: "filesystem.list".into(),

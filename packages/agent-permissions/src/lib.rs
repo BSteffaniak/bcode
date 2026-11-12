@@ -152,6 +152,7 @@ pub fn runtime_permission_request_to_profile_request(
         .chain(metadata.aliases)
         .collect();
     Ok(EvaluateToolCallRequest {
+        claimed: false,
         session_id: request.context.session_id,
         agent_id: request.context.agent_id.clone(),
         tool_name: request.call.name.clone(),

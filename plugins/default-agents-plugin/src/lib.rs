@@ -191,6 +191,7 @@ fn agent_context(request: &ServiceRequest) -> ServiceResponse {
     .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
     apply_tool_selection(&mut agent, &tools_config, &request.available_tools);
+    expose_claimed_tools(&mut agent, &tools_config, &request.claimed_tools);
     let enabled_tools =
         enabled_tools_from_available_metadata(active_tools_for(&agent), &request.available_tools);
     let mut system_prompt_suffix = match request.agent_id.as_str() {
@@ -272,6 +273,27 @@ fn apply_tool_selection(
     }
 }
 
+/// Expose tools that a connected application offers in the session through a claim.
+///
+/// The claim is an exposure choice, like the default build tools: it never grants permission,
+/// so mutating tools still ask. A tool stays hidden when configuration disables it, when the
+/// agent's tool map turns it off, or when the tool default is `none`.
+fn expose_claimed_tools(
+    agent: &mut AgentConfig,
+    tools_config: &bcode_config::ToolsConfig,
+    claimed: &[String],
+) {
+    if tools_config.default == bcode_config::ToolDefaultMode::None {
+        return;
+    }
+    for tool in claimed {
+        if tools_config.disabled.contains(tool) || agent.tools.get(tool) == Some(&false) {
+            continue;
+        }
+        agent.tools.insert(tool.clone(), true);
+    }
+}
+
 fn apply_tool_selection_for_evaluation(
     agent: &mut AgentConfig,
     tools_config: &bcode_config::ToolsConfig,
@@ -298,6 +320,13 @@ fn evaluate_tool_request(
     .unwrap_or_else(|| (load_config().0, load_tools_config()));
     let mut agent = agent_config(&config, &request.agent_id);
     apply_tool_selection_for_evaluation(&mut agent, &tools_config, &request.tool_name);
+    if request.claimed {
+        expose_claimed_tools(
+            &mut agent,
+            &tools_config,
+            std::slice::from_ref(&request.tool_name),
+        );
+    }
     if let Some(pinned) = &request.policy_profile {
         let current = policy_profile_identity(
             &request.agent_id,
@@ -385,6 +414,7 @@ fn preview_command_request(
         .as_ref()
         .is_some_and(|analysis| analysis.completeness.is_complete());
     let evaluation = EvaluateToolCallRequest {
+        claimed: false,
         session_id: bcode_session_models::SessionId::new(),
         agent_id: request.agent_id.clone(),
         tool_name: "shell.run".to_owned(),
@@ -829,6 +859,7 @@ read = { "**" = "deny" }
         assert_eq!(build_accent(&deny_agents).as_deref(), Some("#aabbcc"));
 
         let request = |config: &str| EvaluateToolCallRequest {
+            claimed: false,
             session_id: SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "filesystem.read".to_string(),
@@ -875,6 +906,7 @@ read = { "**" = "deny" }
         )
         .expect("changed config");
         let evaluation = evaluate_tool_request(&EvaluateToolCallRequest {
+            claimed: false,
             session_id: SessionId::new(),
             agent_id: "build".to_string(),
             tool_name: "shell.run".to_string(),
@@ -967,6 +999,7 @@ read = { "**" = "deny" }
         let (config, _) = load_config();
         let agent = agent_config(&config, PLAN_AGENT);
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: SessionId::new(),
             agent_id: PLAN_AGENT.to_string(),
             tool_name: "shell.run".to_string(),
@@ -1097,6 +1130,55 @@ command = { "python3 *" = "allow" }
     }
 
     #[test]
+    fn claimed_client_tools_are_exposed_but_never_granted() {
+        let claimed = ["app.write".to_string()];
+        let agent_tools = |tools_config: &bcode_config::ToolsConfig| {
+            let mut agent = agent_config(&default_config(), BUILD_AGENT);
+            apply_tool_selection(&mut agent, tools_config, &[]);
+            expose_claimed_tools(&mut agent, tools_config, &claimed);
+            agent
+        };
+        let defaults = bcode_config::ToolsConfig::default();
+        let agent = agent_tools(&defaults);
+        assert!(active_tools_for(&agent).contains(&claimed[0]));
+        let request = EvaluateToolCallRequest {
+            session_id: SessionId::new(),
+            agent_id: BUILD_AGENT.to_owned(),
+            tool_name: claimed[0].clone(),
+            operation: bcode_agent_profile::ToolPolicyOperation::Mutating,
+            aliases: Vec::new(),
+            requires_permission: true,
+            claimed: true,
+            policy_profile: None,
+            cwd: Some("/tmp".to_owned()),
+            effective_config_toml: None,
+        };
+        let cwd = std::path::Path::new("/tmp");
+        assert_eq!(
+            evaluate_profile_tool_call(&agent, &request, cwd).decision,
+            AgentDecision::Ask,
+            "a claim exposes a mutating tool; it still asks"
+        );
+        let unclaimed = agent_config(&default_config(), BUILD_AGENT);
+        assert_eq!(
+            evaluate_profile_tool_call(&unclaimed, &request, cwd).decision,
+            AgentDecision::Deny
+        );
+        for hidden in [
+            bcode_config::ToolsConfig {
+                disabled: BTreeSet::from(["app.write".to_string()]),
+                ..bcode_config::ToolsConfig::default()
+            },
+            bcode_config::ToolsConfig {
+                default: bcode_config::ToolDefaultMode::None,
+                ..bcode_config::ToolsConfig::default()
+            },
+        ] {
+            assert!(!active_tools_for(&agent_tools(&hidden)).contains(&claimed[0]));
+        }
+    }
+
+    #[test]
     fn tool_selection_disabled_wins_over_enabled_and_agent_defaults() {
         let mut agent = agent_config(&default_config(), BUILD_AGENT);
         let tools_config = bcode_config::ToolsConfig {
@@ -1119,6 +1201,7 @@ command = { "python3 *" = "allow" }
         let _state = StateGuard::set(&root.join("missing-permissions.toml"));
         let context_tools = |agent: &str, config: &str, names: &[&str]| {
             let request = AgentContextRequest {
+                claimed_tools: Vec::new(),
                 session_id: SessionId::new(),
                 agent_id: agent.to_owned(),
                 available_tools: names
@@ -1181,6 +1264,7 @@ command = { "python3 *" = "allow" }
         let _state = StateGuard::set(&root.join("missing-permissions.toml"));
         let context = |agent: &str, names: &[&str]| {
             let request = AgentContextRequest {
+                claimed_tools: Vec::new(),
                 session_id: SessionId::new(),
                 agent_id: agent.to_owned(),
                 available_tools: names
@@ -1334,6 +1418,7 @@ tools = { "filesystem.read" = true }
         let _state = StateGuard::set(&root.join("missing-permissions.toml"));
         for tool in manifest_defaults().unwrap().build_preauthorizations {
             let mut request = EvaluateToolCallRequest {
+                claimed: false,
                 session_id: SessionId::new(),
                 agent_id: BUILD_AGENT.into(),
                 tool_name: tool.clone(),
@@ -1473,6 +1558,7 @@ tools = { "filesystem.read" = true }
 read = { "**" = "ask" }
 "#;
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "filesystem.read".to_string(),

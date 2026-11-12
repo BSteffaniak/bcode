@@ -263,6 +263,7 @@ fn evaluate(case: &Case) -> AgentDecision {
         },
     };
     let request = EvaluateToolCallRequest {
+        claimed: false,
         session_id: bcode_session_models::SessionId::new(),
         agent_id: "corpus".to_owned(),
         tool_name: "shell.run".to_owned(),

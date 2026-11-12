@@ -12,6 +12,7 @@ use std::path::Path;
 
 fn request(source: &str) -> EvaluateToolCallRequest {
     EvaluateToolCallRequest {
+        claimed: false,
         session_id: bcode_session_models::SessionId::new(),
         agent_id: "property".to_owned(),
         tool_name: "shell.run".to_owned(),

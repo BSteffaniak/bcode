@@ -2218,6 +2218,7 @@ mod tests {
 
     fn request(agent_id: &str, command: &str) -> EvaluateToolCallRequest {
         EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: agent_id.to_string(),
             tool_name: "shell.run".to_string(),
@@ -2898,6 +2899,7 @@ mod tests {
             },
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "filesystem.write".to_string(),
@@ -2919,6 +2921,7 @@ mod tests {
 
     fn path_request(tool_name: &str, path: &str) -> EvaluateToolCallRequest {
         EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: tool_name.to_string(),
@@ -3086,6 +3089,7 @@ mod tests {
             },
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.exec".to_string(),
@@ -3123,6 +3127,7 @@ mod tests {
             },
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: PLAN_AGENT.to_string(),
             tool_name: "custom.fetch".to_string(),
@@ -3156,6 +3161,7 @@ mod tests {
             },
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.write".to_string(),
@@ -3201,6 +3207,7 @@ mod tests {
             (vec!["src/a", "unmatched/b"], AgentDecision::Deny),
         ] {
             let request = EvaluateToolCallRequest {
+                claimed: false,
                 session_id: bcode_session_models::SessionId::new(),
                 agent_id: BUILD_AGENT.to_owned(),
                 tool_name: "custom.batch".to_owned(),
@@ -3271,6 +3278,7 @@ mod tests {
             ] {
                 let paths = paths.into_iter().map(str::to_owned).collect();
                 let request = EvaluateToolCallRequest {
+                    claimed: false,
                     session_id: bcode_session_models::SessionId::new(),
                     agent_id: BUILD_AGENT.to_owned(),
                     tool_name: "custom.batch".to_owned(),
@@ -3310,6 +3318,7 @@ mod tests {
             },
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.patch".to_string(),
@@ -3341,6 +3350,7 @@ mod tests {
             },
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.write".to_string(),
@@ -3368,6 +3378,7 @@ mod tests {
             permission: PermissionConfig::default(),
         };
         let request = EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: "custom.side-effect".to_string(),
@@ -3387,6 +3398,7 @@ mod tests {
     #[test]
     fn exact_tool_rules_can_ask_or_deny_read_only_tools() {
         let request = |tool: &str| EvaluateToolCallRequest {
+            claimed: false,
             session_id: bcode_session_models::SessionId::new(),
             agent_id: BUILD_AGENT.to_string(),
             tool_name: tool.to_string(),

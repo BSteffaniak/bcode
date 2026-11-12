@@ -14,6 +14,7 @@ use std::path::Path;
 
 fn decision(config: &AgentPermissionConfig, agent: &str, source: &str) -> AgentDecision {
     let request = EvaluateToolCallRequest {
+        claimed: false,
         session_id: bcode_session_models::SessionId::new(),
         agent_id: agent.to_owned(),
         tool_name: "shell.run".to_owned(),

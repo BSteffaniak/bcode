@@ -117,8 +117,13 @@ impl BcodeClient {
             not_found(std::env::var_os(bcode_daemon_lifecycle::BCODE_BIN_ENV).as_deref())
         })?;
         let target = verified_target(&executable, start).await?;
-        let (config, _) = crate::load_current_client_config()?;
-        let client = Self::for_daemon(target, &config, crate::current_working_directory())?;
+        let (config, launch) = crate::load_current_client_config()?;
+        let mut client = Self::for_daemon(target, &config, crate::current_working_directory())?;
+        // This process loaded the configuration from its own layers, so it can name the
+        // sources the daemon re-verifies before admitting session configuration.
+        if let Some(context) = &mut client.runtime_context {
+            context.config_launch = Some(Box::new(launch));
+        }
         Ok(InstalledBcode { client, executable })
     }
 }

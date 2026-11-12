@@ -177,6 +177,12 @@ pub struct AgentContextRequest {
     /// the runtime permissions state above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_config_toml: Option<Box<String>>,
+    /// Tools a connected client application offers in this session through a session claim.
+    ///
+    /// The claim exposes them like default-enabled tools; it grants no permission, and explicit
+    /// configuration that disables a tool still applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claimed_tools: Vec<String>,
 }
 
 /// Response returned by [`OP_AGENT_CONTEXT`].
@@ -467,6 +473,10 @@ pub struct EvaluateToolCallRequest {
     /// Whether the tool owner requires explicit permission absent a stronger decision.
     #[serde(default)]
     pub requires_permission: bool,
+    /// Whether a connected client application offers this tool in the session through a claim.
+    /// The claim exposes the tool; it grants no permission.
+    #[serde(default)]
+    pub claimed: bool,
     /// Exact pinned policy/profile identity for workflow execution. Providers must evaluate the
     /// supplied normalized operation against this identity rather than ambient later policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
