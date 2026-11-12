@@ -54,6 +54,17 @@ use model::{
     Group, PullsAnswer, RowKey, RowRef, Suggestion, SuggestionAction, SuggestionInputs,
     SuggestionKind, WorkspaceStats, plural,
 };
+
+/// Where finding the current branch's stack stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackStep {
+    /// Nothing asked yet.
+    Idle,
+    /// Looking the branch's pull request up (the recent list did not show it).
+    LookingUp,
+    /// The stack was asked for.
+    Requested,
+}
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -200,7 +211,7 @@ pub struct Home {
     pulls: Option<PullsAnswer>,
     pulls_error: Option<String>,
     stack: Option<ReviewStack>,
-    stack_requested: bool,
+    stack_step: StackStep,
     stats: BTreeMap<String, WorkspaceStats>,
     stats_requested: BTreeSet<String>,
     stats_in_flight: usize,
@@ -281,7 +292,7 @@ impl Home {
             pulls: None,
             pulls_error: None,
             stack: None,
-            stack_requested: false,
+            stack_step: StackStep::Idle,
             stats: BTreeMap::new(),
             stats_requested: BTreeSet::new(),
             stats_in_flight: 0,
@@ -456,7 +467,7 @@ impl Home {
         self.needs_refresh = false;
         self.generation += 1;
         self.stats_requested.clear();
-        self.stack_requested = false;
+        self.stack_step = StackStep::Idle;
         self.loading += 3;
         let (services, repo) = (self.services.clone(), self.repo.clone());
         self.spawn(host, async move {
@@ -472,9 +483,11 @@ impl Home {
         });
     }
 
-    /// Ask for the stack of the current branch's pull request once both are known.
+    /// Ask for the stack of the current branch's pull request once both are known. The recent
+    /// list of a busy repository may not show that pull request, so it is first looked up by
+    /// the branch.
     fn request_stack(&mut self, host: &UiContext) {
-        if self.stack_requested {
+        if matches!(self.stack_step, StackStep::Requested) {
             return;
         }
         let (Some(state), Some(pulls)) = (&self.state, &self.pulls) else {
@@ -483,16 +496,33 @@ impl Home {
         if !pulls.route.manifest.capabilities.stack_resolve {
             return;
         }
-        let Some(number) = state.branch.as_ref().and_then(|branch| {
-            pulls
-                .pulls
-                .iter()
-                .find(|pull| pull.head_branch == *branch)
-                .map(|pull| pull.number)
-        }) else {
+        let Some(branch) = state.branch.clone() else {
             return;
         };
-        self.stack_requested = true;
+        let own = pulls
+            .pulls
+            .iter()
+            .find(|pull| pull.head_branch == branch)
+            .map(|pull| pull.number);
+        let Some(number) = own else {
+            if matches!(self.stack_step, StackStep::Idle) && state.base.as_ref() != Some(&branch) {
+                self.stack_step = StackStep::LookingUp;
+                self.loading += 1;
+                let (services, route, repo, repository) = (
+                    self.services.clone(),
+                    pulls.route.clone(),
+                    self.repo.clone(),
+                    pulls.repository.clone(),
+                );
+                self.spawn(host, async move {
+                    HomeMessage::OwnPull(
+                        load::lookup(services, route, repo, repository, branch).await,
+                    )
+                });
+            }
+            return;
+        };
+        self.stack_step = StackStep::Requested;
         self.loading += 1;
         let services = self.services.clone();
         let (route, repo, repository) = (
@@ -501,7 +531,9 @@ impl Home {
             pulls.repository.clone(),
         );
         self.spawn(host, async move {
-            HomeMessage::Stack(load::stack(services, route, repo, repository, number).await)
+            HomeMessage::Stack(
+                load::stack(services, route, repo, repository, number, Some(branch)).await,
+            )
         });
     }
 
@@ -574,6 +606,7 @@ impl Home {
             HomeMessage::Listed(_)
             | HomeMessage::State(_)
             | HomeMessage::Pulls(_)
+            | HomeMessage::OwnPull(_)
             | HomeMessage::Stack(_)
                 if !current =>
             {
@@ -619,6 +652,18 @@ impl Home {
                         self.pulls_error = None;
                     }
                     Err(error) => self.pulls_error = Some(error),
+                }
+            }
+            HomeMessage::OwnPull(result) => {
+                self.loading = self.loading.saturating_sub(1);
+                // Nothing found (or the lookup failed): the branch has no pull request to
+                // suggest, and `LookingUp` keeps it from being asked again until a refresh.
+                if let (Ok(found), Some(pulls)) = (result, self.pulls.as_mut()) {
+                    for pull in found {
+                        if !pulls.pulls.iter().any(|known| known.number == pull.number) {
+                            pulls.pulls.push(pull);
+                        }
+                    }
                 }
             }
             HomeMessage::Stack(result) => {

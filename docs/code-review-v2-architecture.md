@@ -465,9 +465,10 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   provider-backed sources report `provider_required`.
 * **Stack detection** (GitHub implementation): the provider walks GitHub branch by branch instead
   of listing the repository's pull requests, so a busy repository cannot push a layer out of
-  view. It looks up the requested pull request by number, then asks once per branch for the open
-  pull requests whose head or base is that branch (one GraphQL query per branch); the default
-  branch itself is never asked, so a stack of `n` layers costs about `n + 1` queries. Over the
+  view. It looks up the requested pull request by number, then the open pull requests whose head
+  or base is each branch the walk reaches, 40 branches per GraphQL request together with the
+  request's discovery `hints` ([`review-discovery.md`](review-discovery.md)); the default branch
+  itself is never asked. Over the
   open pull requests whose head branch is in the repository itself (forks are excluded), the
   chain extends down while some pull request's
   head is the current base branch and stops at the default branch; it extends up while exactly one

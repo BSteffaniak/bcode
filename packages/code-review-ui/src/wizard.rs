@@ -645,12 +645,25 @@ impl Wizard {
             self.repo.clone(),
             pulls.repository.clone(),
         );
+        let head_branch = pulls
+            .pulls
+            .iter()
+            .find(|pull| pull.number == number)
+            .map(|pull| pull.head_branch.clone());
         self.step = Step::Details(Details::Stack(StackStage::Resolving(number)));
         self.pending_items = true;
         self.spawn(host, async move {
             WizardMessage::Stack {
                 number,
-                result: super::home::load::stack(services, route, repo, repository, number).await,
+                result: super::home::load::stack(
+                    services,
+                    route,
+                    repo,
+                    repository,
+                    number,
+                    head_branch,
+                )
+                .await,
             }
         });
     }

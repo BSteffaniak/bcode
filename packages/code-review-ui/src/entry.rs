@@ -12,7 +12,7 @@
 
 use crate::services::ReviewServices;
 use bcode_code_review::provider::{
-    ProviderCallError, ProviderRoute, discover_providers, lookup_pulls, resolve_stack,
+    ProviderCallError, ProviderRoute, discover_providers, lookup_pulls,
 };
 use bcode_code_review_models::{
     GetReviewWorkspaceRequest, GetReviewWorkspaceResponse, ListReviewWorkspacesRequest,
@@ -264,10 +264,10 @@ async fn stack(
     .await?;
     let transport = services.transport();
     let label = &route.manifest.label;
-    let (number, repository) = if let Some(reference) = reference {
+    let (number, repository, head_branch) = if let Some(reference) = reference {
         let wanted = parse_pull_reference(reference)
             .ok_or_else(|| format!("{reference} is not a pull request number or URL"))?;
-        (wanted.number, None)
+        (wanted.number, None, None)
     } else {
         let state: ReviewRepoStateResponse = services
             .call(ReviewRepoStateRequest {
@@ -286,15 +286,16 @@ async fn stack(
             .iter()
             .find(|pull| pull.head_branch == branch)
             .ok_or_else(|| format!("no open pull request has the current branch {branch}"))?;
-        (pull.number, Some(listed.repository))
+        (pull.number, Some(listed.repository), Some(branch))
     };
-    let resolved = resolve_stack(
+    let resolved = bcode_code_review::discovery::resolve_stack_with_discovery(
         &transport,
         &route,
         &repo,
         repository,
         number,
         services.stack_limit().resolve_limit(),
+        head_branch,
     )
     .await
     .map_err(|error| provider_message(label, &error))?;

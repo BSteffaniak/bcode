@@ -22,6 +22,8 @@ pub const OP_REVIEW_SOURCE_PULLS_LIST: &str = "review_source.pulls.list";
 pub const OP_REVIEW_SOURCE_STACK_RESOLVE: &str = "review_source.stack.resolve";
 /// Operation that fetches a pull request's head and base commits into the local repository.
 pub const OP_REVIEW_SOURCE_PULL_FETCH: &str = "review_source.pull.fetch";
+/// Operation that makes several pull requests' head and base commits local at once.
+pub const OP_REVIEW_SOURCE_PULLS_FETCH: &str = "review_source.pulls.fetch";
 /// Code review operation that attributes a whole-stack file diff to the stack's layers.
 pub const OP_REVIEW_STACK_ATTRIBUTION: &str = "review.stack.attribution";
 
@@ -103,6 +105,17 @@ pub struct ReviewSourceCapabilities {
     /// `review_source.pull.fetch` is supported.
     #[serde(default)]
     pub pull_fetch: bool,
+    /// Operations that take many items in one call.
+    #[serde(default)]
+    pub batched: ReviewSourceBatchCapabilities,
+}
+
+/// Batched operations a review-source provider supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewSourceBatchCapabilities {
+    /// `review_source.pulls.fetch` (several pull requests in one call) is supported.
+    #[serde(default)]
+    pub pulls_fetch: bool,
 }
 
 /// Response payload for `review_source.manifest`.
@@ -191,6 +204,11 @@ pub struct ReviewSourceStackResolveRequest {
     /// whole stack.
     #[serde(default)]
     pub max_layers: Option<usize>,
+    /// Branches that discovery suggests are in the stack. A provider may look them up together
+    /// up front instead of one at a time; hints never decide the stack, so a wrong or missing
+    /// hint changes only the cost.
+    #[serde(default)]
+    pub hints: Vec<String>,
 }
 
 /// One layer of a stack.
@@ -274,6 +292,42 @@ pub struct ReviewSourcePullFetchRequest {
     /// Base branch to fetch with it; `None` uses the pull request's base branch.
     #[serde(default)]
     pub base_branch: Option<String>,
+}
+
+/// One pull request of a `review_source.pulls.fetch` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPullFetchTarget {
+    /// Pull request number.
+    pub number: u64,
+    /// Base branch to fetch with it.
+    pub base_branch: String,
+    /// Head commit the provider reported, when known: a provider may use a local copy instead of
+    /// fetching it.
+    #[serde(default)]
+    pub head_oid: Option<String>,
+    /// Base branch commit the provider reported, when known (as `head_oid`).
+    #[serde(default)]
+    pub base_oid: Option<String>,
+}
+
+/// Request payload for `review_source.pulls.fetch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSourcePullsFetchRequest {
+    /// Absolute path of the local repository.
+    pub repo_path: PathBuf,
+    /// Provider repository identifier; `None` detects it from the repository's remotes.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Pull requests to make local.
+    pub pulls: Vec<ReviewPullFetchTarget>,
+}
+
+/// Response payload for `review_source.pulls.fetch`: one result per requested pull request, in
+/// request order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSourcePullsFetchResponse {
+    /// Fetch results.
+    pub fetched: Vec<ReviewPullFetchResult>,
 }
 
 /// Response payload for `review_source.pull.fetch`: the pull request's commits exist locally.

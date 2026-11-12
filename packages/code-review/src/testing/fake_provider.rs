@@ -166,6 +166,7 @@ impl FakeProvider {
                             pulls_list: true,
                             stack_resolve: true,
                             pull_fetch: true,
+                            ..ReviewSourceCapabilities::default()
                         },
                     })
                     .expect("manifest"),

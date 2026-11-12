@@ -1,0 +1,19 @@
+id      = "bcode.graphite"
+name    = "Bcode Graphite"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Stack parents and restack warnings from Graphite's branch metadata, as review discovery"
+interface_id = "bcode.review_discovery/v1"
+name         = "Graphite Review Discovery"
+
+[concurrency]
+max  = 2
+type = "limited"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_graphite_plugin.dylib"
+type         = "native"

@@ -28,6 +28,12 @@ description  = "Local Git code review services"
 interface_id = "bcode.code_review/v1"
 name         = "Code Review"
 
+[[services]]
+class        = "service"
+description  = "Branches related to a stack by Git history, as review discovery hints"
+interface_id = "bcode.review_discovery/v1"
+name         = "Git Review Discovery"
+
 [concurrency]
 max  = 2
 type = "limited"

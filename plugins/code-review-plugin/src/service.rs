@@ -296,3 +296,26 @@ pub fn dispatch_store(
 
 #[cfg(test)]
 mod tests;
+
+/// Serve `bcode.review_discovery/v1` with git topology discovery.
+pub fn dispatch_discovery(request: &ServiceRequest) -> ServiceResponse {
+    use bcode_code_review::discovery::git;
+    match request.operation.as_str() {
+        models::OP_REVIEW_DISCOVERY_MANIFEST => json_response(&git::manifest()),
+        models::OP_REVIEW_DISCOVERY_DISCOVER => {
+            match serde_json::from_slice::<models::ReviewDiscoveryRequest>(&request.payload) {
+                Ok(discovery) => match git::discover(&discovery) {
+                    Ok(response) => json_response(&response),
+                    Err(error) => ServiceResponse::error("discovery_failed", error.to_string()),
+                },
+                Err(error) => {
+                    ServiceResponse::error(models::REVIEW_ERROR_INVALID_REQUEST, error.to_string())
+                }
+            }
+        }
+        _ => ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported review discovery operation",
+        ),
+    }
+}

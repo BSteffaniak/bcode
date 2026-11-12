@@ -89,6 +89,9 @@ impl RustPlugin for CodeReviewPlugin {
         if context.request.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID {
             return tools::invoke_service(&mut self.data, &context);
         }
+        if context.request.interface_id == bcode_code_review_models::REVIEW_DISCOVERY_INTERFACE_ID {
+            return service::dispatch_discovery(&context.request);
+        }
         if context.request.interface_id != CODE_REVIEW_SERVICE_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",

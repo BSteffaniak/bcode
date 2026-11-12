@@ -302,6 +302,27 @@ fn home_filter_matches_titles_and_sources_and_narrow_screens_degrade() {
 }
 
 #[test]
+fn the_current_branchs_stack_is_suggested_when_the_recent_list_misses_its_pull_request() {
+    let fixture = fixture();
+    // #100 (the current branch's pull request) is too old for the provider's recent list.
+    let backend = Arc::new(
+        TestBackend::default().with_provider(FakeProvider::new(fixture.root()).unlisted(&[100])),
+    );
+    let (scenario, _) = open(&fixture, &backend, Entry::Home, 160, 40);
+    let titles = scenario.surface().home().unwrap().suggestion_titles();
+    assert!(titles.contains(&"Stack of #100 (4 layers)"), "{titles:?}");
+    assert!(
+        backend
+            .provider()
+            .unwrap()
+            .calls()
+            .contains(&format!("review_source.pulls.list {HEAD_BRANCH}")),
+        "{:?}",
+        backend.provider().unwrap().calls()
+    );
+}
+
+#[test]
 fn suggestions_follow_repository_state_and_the_provider() {
     let fixture = fixture();
     // Without a provider: uncommitted changes, the branch ahead of its base, and the wizard.

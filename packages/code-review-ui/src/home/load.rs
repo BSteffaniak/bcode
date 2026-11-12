@@ -5,9 +5,7 @@
 use super::model::{PullsAnswer, WorkspaceStats};
 use crate::entry::provider_message;
 use crate::services::ReviewServices;
-use bcode_code_review::provider::{
-    ProviderRoute, discover_providers, list_pulls, lookup_pulls, resolve_stack,
-};
+use bcode_code_review::provider::{ProviderRoute, discover_providers, list_pulls, lookup_pulls};
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, ListReviewWorkspacesRequest,
     ListReviewWorkspacesResponse, ResolveReviewSourcesRequest, ResolveReviewSourcesResponse,
@@ -26,6 +24,9 @@ pub enum HomeMessage {
     State(Result<ReviewRepoStateResponse, String>),
     /// Pull requests (`Ok(None)`: no provider lists them).
     Pulls(Result<Option<PullsAnswer>, String>),
+    /// The open pull requests whose head is the current branch, looked up because the recent
+    /// list did not show one.
+    OwnPull(Result<Vec<bcode_code_review_models::PullRequestSummary>, String>),
     /// The stack containing the current branch's pull request.
     Stack(Result<ReviewStack, String>),
     /// Stats of one review.
@@ -136,7 +137,8 @@ pub async fn lookup(
         .map_err(|error| provider_message(&route.manifest.label, &error))
 }
 
-/// The stack containing pull request `number`.
+/// The stack containing pull request `number` (whose head branch is `head_branch`, when known),
+/// with discovery's hints and warnings.
 ///
 /// # Errors
 ///
@@ -147,15 +149,17 @@ pub async fn stack(
     repo: PathBuf,
     repository: String,
     number: u64,
+    head_branch: Option<String>,
 ) -> Result<ReviewStack, String> {
     let transport = services.transport();
-    resolve_stack(
+    bcode_code_review::discovery::resolve_stack_with_discovery(
         &transport,
         &route,
         &repo,
         Some(repository),
         number,
         services.stack_limit().resolve_limit(),
+        head_branch,
     )
     .await
     .map(|response| response.stack)

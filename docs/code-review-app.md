@@ -212,7 +212,13 @@ The new-review wizard's pull request and stack steps list the provider's 100 mos
 updated open pull requests, and typing filters that list. When what is typed (a number, `#number`,
 pull request URL, or exact head branch name) is not in it, the last row offers to look it up with
 the provider; `enter` asks, and what it finds joins the list. `bcode review stack` without a
-number looks up the current branch's pull request the same way.
+number looks up the current branch's pull request the same way, and so does the home screen's
+stack suggestion when the recent list does not show the branch's pull request.
+
+Resolving a stack asks the review discovery contributors (git history, Graphite) which branches
+belong to it, so the provider looks them up in a few batched requests, and adds their warnings
+(for example a layer that needs a restack) to the stack step. See
+[`review-discovery.md`](review-discovery.md).
 
 ### Rendering and terminal output
 

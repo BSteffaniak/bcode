@@ -9,10 +9,13 @@ use crate::testing::fixture::{
     FixtureSpec, GitFixture, HEAD_BRANCH, STACK_BRANCHES, STACK_SHARED_FILE,
 };
 use bcode_code_review_models::{
-    PullRequestSummary, REVIEW_DIAGNOSTIC_PROVIDER_FAILED, REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED,
-    REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
-    ResolveReviewSourcesResponse, ResolvedReviewStack, ResolvedStackLayer, ReviewFileHunksRequest,
-    ReviewLineKind, ReviewSourceCapabilities, ReviewStackAttributionRequest,
+    AnnotationSeverity, BranchAnnotation, BranchLink, OP_REVIEW_DISCOVERY_DISCOVER,
+    OP_REVIEW_DISCOVERY_MANIFEST, PullRequestSummary, REVIEW_DIAGNOSTIC_PROVIDER_FAILED,
+    REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED, REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION,
+    REVIEW_DISCOVERY_INTERFACE_ID, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
+    ResolveReviewSourcesResponse, ResolvedReviewStack, ResolvedStackLayer, ReviewDiscoveryManifest,
+    ReviewDiscoveryRequest, ReviewDiscoveryResponse, ReviewFileHunksRequest, ReviewLineKind,
+    ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewStackAttributionRequest,
     ReviewStackAttributionResponse, ReviewStackLayer, ReviewStackLineAttribution, RevisionRef,
 };
 use std::collections::BTreeSet;
@@ -21,6 +24,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 const FAKE_PLUGIN: &str = "test.fake_review_source";
+const FAKE_DISCOVERY_PLUGIN: &str = "test.fake_discovery";
 const FAKE_PROVIDER: &str = "fake";
 const FAKE_REPOSITORY: &str = "octo/fixture";
 /// Pull request numbers of the fixture's stack layers, bottom to top.
@@ -86,22 +90,88 @@ struct FakeProvider {
     plugins: Vec<String>,
     /// Error returned by every fetch, when set.
     fetch_error: Option<ProviderCallError>,
+    /// Whether the provider fetches many pull requests in one call.
+    batch_fetch: bool,
+    /// What a discovery contributor answers, when one is enabled.
+    discovery: Option<ReviewDiscoveryResponse>,
     /// Calls received, as `operation` or `operation #number base`.
     calls: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
+    /// "Fetch" pull request `number` by resolving the fixture's local branches.
+    fn fetched(&self, number: u64, base_branch: Option<String>) -> ReviewPullFetchResult {
+        let layer = fixture_stack(number)
+            .layers
+            .into_iter()
+            .find(|layer| layer.pull.number == number)
+            .expect("known pull request");
+        let base_branch = base_branch.unwrap_or(layer.pull.base_branch);
+        ReviewPullFetchResult {
+            number,
+            head_ref: format!("refs/heads/{}", layer.pull.head_branch),
+            head_oid: rev_parse(&self.repo, &layer.pull.head_branch),
+            base_ref: format!("refs/heads/{base_branch}"),
+            base_oid: rev_parse(&self.repo, &base_branch),
+            base_branch,
+        }
+    }
+
     fn new(repo: &Path) -> Self {
         Self {
             repo: repo.to_path_buf(),
             plugins: vec![FAKE_PLUGIN.to_string()],
             fetch_error: None,
+            batch_fetch: false,
+            discovery: None,
             calls: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls").clone()
+    }
+
+    /// Answer `review_source.pulls.list` lookups by number from the fixture stack.
+    fn listed(&self, payload: &[u8]) -> ReviewSourcePullsListResponse {
+        let request: ReviewSourcePullsListRequest =
+            serde_json::from_slice(payload).expect("pulls request");
+        let query = request.query.unwrap_or_default();
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("{OP_REVIEW_SOURCE_PULLS_LIST} {query}"));
+        ReviewSourcePullsListResponse {
+            repository: FAKE_REPOSITORY.into(),
+            default_branch: Some(HEAD_BRANCH.into()),
+            pulls: fixture_stack(103)
+                .layers
+                .into_iter()
+                .map(|layer| layer.pull)
+                .filter(|pull| pull.number.to_string() == query)
+                .collect(),
+        }
+    }
+
+    /// Answer the discovery contributor's operations.
+    fn discovered(&self, operation: &str, payload: &[u8]) -> Vec<u8> {
+        match operation {
+            OP_REVIEW_DISCOVERY_MANIFEST => serde_json::to_vec(&ReviewDiscoveryManifest {
+                id: "fake".into(),
+                label: "Fake tool".into(),
+            }),
+            OP_REVIEW_DISCOVERY_DISCOVER => {
+                let request: ReviewDiscoveryRequest =
+                    serde_json::from_slice(payload).expect("discovery request");
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("{operation} {}", request.branches.join(" ")));
+                serde_json::to_vec(self.discovery.as_ref().expect("discovery enabled"))
+            }
+            other => panic!("unexpected discovery operation {other}"),
+        }
+        .expect("encode")
     }
 
     fn answer(&self, operation: &str, payload: &[u8]) -> Result<Vec<u8>, ProviderCallError> {
@@ -116,6 +186,9 @@ impl FakeProvider {
                         pulls_list: false,
                         stack_resolve: true,
                         pull_fetch: true,
+                        batched: ReviewSourceBatchCapabilities {
+                            pulls_fetch: self.batch_fetch,
+                        },
                     },
                 })
             }
@@ -126,7 +199,15 @@ impl FakeProvider {
                 self.calls
                     .lock()
                     .expect("calls")
-                    .push(format!("{operation} #{}", request.number));
+                    .push(if request.hints.is_empty() {
+                        format!("{operation} #{}", request.number)
+                    } else {
+                        format!(
+                            "{operation} #{} hints {}",
+                            request.number,
+                            request.hints.join(" ")
+                        )
+                    });
                 encode(&ReviewSourceStackResolveResponse {
                     repository: FAKE_REPOSITORY.into(),
                     stack: fixture_stack(request.number),
@@ -143,20 +224,31 @@ impl FakeProvider {
                 if let Some(error) = &self.fetch_error {
                     return Err(error.clone());
                 }
-                let layer = fixture_stack(request.number)
-                    .layers
-                    .into_iter()
-                    .find(|layer| layer.pull.number == request.number)
-                    .expect("known pull request");
-                let base_branch = request.base_branch.unwrap_or(layer.pull.base_branch);
-                encode(&ReviewPullFetchResult {
-                    number: request.number,
-                    head_ref: format!("refs/heads/{}", layer.pull.head_branch),
-                    head_oid: rev_parse(&self.repo, &layer.pull.head_branch),
-                    base_ref: format!("refs/heads/{base_branch}"),
-                    base_oid: rev_parse(&self.repo, &base_branch),
-                    base_branch,
-                })
+                encode(&self.fetched(request.number, request.base_branch))
+            }
+            OP_REVIEW_SOURCE_PULLS_LIST => encode(&self.listed(payload)),
+            OP_REVIEW_SOURCE_PULLS_FETCH => {
+                assert!(
+                    self.batch_fetch,
+                    "batched fetch used without the capability"
+                );
+                let request: ReviewSourcePullsFetchRequest =
+                    serde_json::from_slice(payload).expect("fetch request");
+                let numbers: Vec<String> = request
+                    .pulls
+                    .iter()
+                    .map(|pull| format!("#{}", pull.number))
+                    .collect();
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(format!("{operation} {}", numbers.join(" ")));
+                let fetched = request
+                    .pulls
+                    .iter()
+                    .map(|target| self.fetched(target.number, Some(target.base_branch.clone())))
+                    .collect();
+                encode(&ReviewSourcePullsFetchResponse { fetched })
             }
             other => panic!("unexpected operation {other}"),
         }
@@ -183,6 +275,8 @@ impl ProviderTransport for FakeProvider {
     ) -> impl Future<Output = Result<Vec<String>, ProviderCallError>> + Send {
         std::future::ready(Ok(if interface_id == REVIEW_SOURCE_INTERFACE_ID {
             self.plugins.clone()
+        } else if interface_id == REVIEW_DISCOVERY_INTERFACE_ID && self.discovery.is_some() {
+            vec![FAKE_DISCOVERY_PLUGIN.to_string()]
         } else {
             Vec::new()
         }))
@@ -195,6 +289,10 @@ impl ProviderTransport for FakeProvider {
         operation: &str,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Vec<u8>, ProviderCallError>> + Send {
+        if plugin_id == FAKE_DISCOVERY_PLUGIN {
+            assert_eq!(interface_id, REVIEW_DISCOVERY_INTERFACE_ID);
+            return std::future::ready(Ok(self.discovered(operation, &payload)));
+        }
         assert_eq!(plugin_id, FAKE_PLUGIN);
         assert_eq!(interface_id, REVIEW_SOURCE_INTERFACE_ID);
         std::future::ready(self.answer(operation, &payload))
@@ -354,6 +452,122 @@ fn stack_and_pull_request_sources_resolve_through_a_provider() {
     )));
     assert!(calls.contains(&format!("{OP_REVIEW_SOURCE_PULL_FETCH} #101 {HEAD_BRANCH}")));
     assert!(calls.contains(&format!("{OP_REVIEW_SOURCE_PULL_FETCH} #103 -")));
+}
+
+#[test]
+fn one_open_resolves_each_stack_once_and_fetches_each_pull_request_once() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    // "Step through every layer" plus the whole stack: four sources over one three-layer stack.
+    let sources = || {
+        vec![
+            layer_source("layer-1", 101),
+            layer_source("layer-2", 102),
+            layer_source("layer-3", 103),
+            stack_source("stack", 103),
+        ]
+    };
+    for batch_fetch in [false, true] {
+        let mut provider = FakeProvider::new(repo);
+        provider.batch_fetch = batch_fetch;
+        let response = resolve(&provider, repo, sources());
+        assert!(
+            response.diagnostics.is_empty(),
+            "{:?}",
+            response.diagnostics
+        );
+        assert_eq!(response.stacks.len(), 4);
+        let calls = provider.calls();
+        let count = |prefix: &str| calls.iter().filter(|call| call.starts_with(prefix)).count();
+        assert_eq!(count(OP_REVIEW_SOURCE_STACK_RESOLVE), 1, "{calls:?}");
+        if batch_fetch {
+            // Every layer in one call, planned across all four sources.
+            assert_eq!(count(OP_REVIEW_SOURCE_PULL_FETCH), 0, "{calls:?}");
+            assert!(
+                calls.contains(&format!("{OP_REVIEW_SOURCE_PULLS_FETCH} #101 #102 #103")),
+                "{calls:?}"
+            );
+            assert_eq!(count(OP_REVIEW_SOURCE_PULLS_FETCH), 1, "{calls:?}");
+        } else {
+            assert_eq!(count(OP_REVIEW_SOURCE_PULL_FETCH), 3, "{calls:?}");
+        }
+    }
+}
+
+#[test]
+fn discovery_hints_go_to_the_provider_and_its_warnings_onto_the_stack() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    let mut provider = FakeProvider::new(repo);
+    let link = |branch: &str, parent: &str| BranchLink {
+        branch: branch.into(),
+        parent: parent.into(),
+        parent_oid: None,
+    };
+    provider.discovery = Some(ReviewDiscoveryResponse {
+        // The tool records stack-2's parent as main, unlike its pull request (stack-1).
+        links: vec![
+            link(STACK_BRANCHES[0], HEAD_BRANCH),
+            link(STACK_BRANCHES[1], HEAD_BRANCH),
+            link(STACK_BRANCHES[2], STACK_BRANCHES[1]),
+        ],
+        related: Vec::new(),
+        annotations: vec![BranchAnnotation {
+            branch: STACK_BRANCHES[2].into(),
+            severity: AnnotationSeverity::Warning,
+            code: "needs_restack".into(),
+            message: "needs a restack".into(),
+        }],
+    });
+    let routes = block_on(discover_providers(&provider)).expect("routes");
+    let response = block_on(crate::discovery::resolve_stack_with_discovery(
+        &provider,
+        &routes[0],
+        repo,
+        Some(FAKE_REPOSITORY.into()),
+        103,
+        None,
+        None,
+    ))
+    .expect("stack");
+    let calls = provider.calls();
+    // The head branch is looked up by number, the contributor asked about it, and the provider
+    // given its hints.
+    assert!(
+        calls.contains(&format!("{OP_REVIEW_SOURCE_PULLS_LIST} 103")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "{OP_REVIEW_DISCOVERY_DISCOVER} {}",
+            STACK_BRANCHES[2]
+        )),
+        "{calls:?}"
+    );
+    let resolve = calls
+        .iter()
+        .find(|call| call.starts_with(OP_REVIEW_SOURCE_STACK_RESOLVE))
+        .expect("resolved");
+    // Hints follow the tool's links up to the trunk and no further: its wrong parent for
+    // stack-2 leaves stack-1 out, which costs the provider a lookup, not a wrong stack.
+    assert_eq!(
+        resolve,
+        &format!(
+            "{OP_REVIEW_SOURCE_STACK_RESOLVE} #103 hints {} {HEAD_BRANCH}",
+            STACK_BRANCHES[1]
+        )
+    );
+    assert_eq!(
+        response.stack.warnings,
+        [
+            format!(
+                "Fake tool records {HEAD_BRANCH} as the parent of #102, but its pull request's \
+                 base is {}",
+                STACK_BRANCHES[0]
+            ),
+            "Fake tool: #103 needs a restack".to_owned(),
+        ]
+    );
 }
 
 #[test]

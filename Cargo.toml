@@ -24,6 +24,7 @@ members = [
     "plugins/read-plugin",
     "plugins/loop-plugin",
     "plugins/github-review-publisher-plugin",
+    "plugins/graphite-plugin",
     "plugins/document-plugin",
     "plugins/ocr-plugin",
     "plugins/question-plugin",
@@ -247,8 +248,8 @@ bcode_cli                               = { version = "0.0.1-alpha.0", default-f
 bcode_client                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
 bcode_code_review                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/code-review" }
 bcode_code_review_models                = { version = "0.0.1-alpha.0", default-features = false, path = "packages/code-review/models" }
-bcode_code_review_ui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/code-review-ui" }
 bcode_code_review_plugin                = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/code-review-plugin" }
+bcode_code_review_ui                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/code-review-ui" }
 bcode_command                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/command" }
 bcode_compressed_session_search_plugin  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/compressed-session-search-plugin" }
 bcode_config                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
@@ -274,6 +275,7 @@ bcode_git_models                        = { version = "0.0.1-alpha.0", default-f
 bcode_git_plugin                        = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/git-plugin" }
 bcode_git_ui                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/git-ui" }
 bcode_github_review_publisher_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/github-review-publisher-plugin" }
+bcode_graphite_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/graphite-plugin" }
 bcode_hello_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "examples/hello-plugin" }
 bcode_hyperchad                         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/hyperchad" }
 bcode_hyperchad_ui                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/hyperchad/ui" }
@@ -298,12 +300,11 @@ bcode_ocr_plugin                        = { version = "0.0.1-alpha.0", default-f
 bcode_openai_compatible_provider_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/openai-compatible-provider-plugin" }
 bcode_openai_responses                  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/openai-responses" }
 bcode_opencode_session_import_plugin    = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/opencode-session-import-plugin" }
+bcode_path_display                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/path-display" }
 bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/pi-session-import-plugin" }
-bcode_sdk_session_import_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sdk-session-import-plugin" }
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_config                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-config" }
 bcode_plugin_models                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin/models" }
-bcode_path_display                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/path-display" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_presentation_policy               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/presentation-policy" }
 bcode_presentation_policy_models        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/presentation-policy/models" }
@@ -319,6 +320,7 @@ bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-f
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
 bcode_ralph_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph/models" }
 bcode_read_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/read-plugin" }
+bcode_sdk_session_import_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sdk-session-import-plugin" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }

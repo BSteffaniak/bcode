@@ -11,7 +11,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-#[cfg(feature = "http")]
 use std::collections::BTreeMap;
 #[cfg(feature = "http")]
 use std::collections::btree_map::Entry;
@@ -109,25 +108,36 @@ const PULL_REQUEST_QUERY: &str = concat!(
 }"
 );
 
-/// The GraphQL query for the open pull requests that come from and go into one branch.
-const BRANCH_PULL_REQUESTS_QUERY: &str = concat!(
-    "query($owner: String!, $name: String!, $branch: String!) {
-  repository(owner: $owner, name: $name) {
-    withHead: pullRequests(first: 100, states: OPEN, headRefName: $branch,
-                           orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes { ",
-    stack_pull_request_fields!(),
-    " }
+/// Branches per request of [`GitHub::branches_pull_requests`]: two connections each, so a
+/// request stays well inside GitHub's node limits.
+const BRANCHES_PER_QUERY: usize = 40;
+
+/// Open pull requests per branch and direction that [`GitHub::branches_pull_requests`] reads.
+const PULLS_PER_BRANCH: usize = 50;
+
+/// The GraphQL query for the open pull requests that come from (`h<i>`) and go into (`c<i>`)
+/// each of `count` branches (`$b<i>`).
+fn branches_query(count: usize) -> String {
+    use std::fmt::Write as _;
+    let mut query = String::from("query($owner: String!, $name: String!");
+    for index in 0..count {
+        let _ = write!(query, ", $b{index}: String!");
     }
-    withBase: pullRequests(first: 100, states: OPEN, baseRefName: $branch,
-                           orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes { ",
-    stack_pull_request_fields!(),
-    " }
+    query.push_str(") {\n  repository(owner: $owner, name: $name) {\n");
+    for index in 0..count {
+        for (alias, filter) in [("h", "headRefName"), ("c", "baseRefName")] {
+            let _ = writeln!(
+                query,
+                "    {alias}{index}: pullRequests(first: {PULLS_PER_BRANCH}, states: OPEN, \
+                 {filter}: $b{index}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ \
+                 nodes {{ {} }} }}",
+                stack_pull_request_fields!()
+            );
+        }
     }
-  }
-}"
-);
+    query.push_str("  }\n}");
+    query
+}
 
 /// A GraphQL variable's value.
 #[derive(Debug, Clone, Copy)]
@@ -368,7 +378,7 @@ impl GitHub {
         })
     }
 
-    /// The open pull requests of `repository` whose head or base branch is `branch` (up to 100
+    /// The open pull requests of `repository` whose head or base branch is `branch` (up to 50
     /// of each). Pull requests from forks are included; their head branch names a branch of the
     /// fork.
     ///
@@ -381,12 +391,34 @@ impl GitHub {
         repository: &RepositoryRef,
         branch: &str,
     ) -> Result<BranchPullRequests, ForgeError> {
-        let (value, _) = self.query(
-            repository,
-            BRANCH_PULL_REQUESTS_QUERY,
-            &[("branch", Variable::Text(branch))],
-        )?;
-        parse_branch_pull_requests(&value)
+        let mut answers = self.branches_pull_requests(repository, &[branch.to_owned()])?;
+        Ok(answers.remove(branch).unwrap_or_default())
+    }
+
+    /// [`Self::branch_pull_requests`] for many branches: 40 branches per GraphQL request, so a
+    /// stack of `n` layers is looked up in `n / 40` requests rather than `n`.
+    ///
+    /// # Errors
+    /// As [`Self::branch_pull_requests`]; the first failing request fails the call.
+    pub fn branches_pull_requests(
+        &self,
+        repository: &RepositoryRef,
+        branches: &[String],
+    ) -> Result<BTreeMap<String, BranchPullRequests>, ForgeError> {
+        let mut answers = BTreeMap::new();
+        for chunk in branches.chunks(BRANCHES_PER_QUERY) {
+            let names: Vec<String> = (0..chunk.len()).map(|index| format!("b{index}")).collect();
+            let variables: Vec<(&str, Variable<'_>)> = names
+                .iter()
+                .zip(chunk)
+                .map(|(name, branch)| (name.as_str(), Variable::Text(branch)))
+                .collect();
+            let (value, _) = self.query(repository, &branches_query(chunk.len()), &variables)?;
+            for (index, branch) in chunk.iter().enumerate() {
+                answers.insert(branch.clone(), parse_branch_pull_requests(&value, index)?);
+            }
+        }
+        Ok(answers)
     }
 
     /// Run `query` against `repository` (its `owner` and `name` are passed as variables) with the
@@ -638,15 +670,18 @@ pub fn parse_single_pull_request(value: &Value) -> Result<Option<PullRequest>, F
         .ok_or_else(|| ForgeError::Failed("GitHub returned an unreadable pull request".into()))
 }
 
-/// The open pull requests from and into a branch, from a response to
-/// [`BRANCH_PULL_REQUESTS_QUERY`].
+/// The open pull requests from and into the branch at `index` of a response to a
+/// [`branches_query`].
 ///
 /// # Errors
 /// * [`ForgeError::Failed`] when the response reports errors or lacks the repository.
-pub fn parse_branch_pull_requests(value: &Value) -> Result<BranchPullRequests, ForgeError> {
+pub fn parse_branch_pull_requests(
+    value: &Value,
+    index: usize,
+) -> Result<BranchPullRequests, ForgeError> {
     Ok(BranchPullRequests {
-        with_head: connection_pull_requests(value, "withHead")?,
-        with_base: connection_pull_requests(value, "withBase")?,
+        with_head: connection_pull_requests(value, &format!("h{index}"))?,
+        with_base: connection_pull_requests(value, &format!("c{index}"))?,
     })
 }
 
@@ -757,6 +792,33 @@ mod tests {
         assert_eq!(pulls[3].base_oid, None);
         assert_eq!(parse_default_branch(&response()).as_deref(), Some("main"));
         assert_eq!(parse_default_branch(&json!({ "data": {} })), None);
+    }
+
+    #[test]
+    fn batched_branch_answers_are_read_per_branch() {
+        let query = branches_query(2);
+        for needle in [
+            "$b0: String!",
+            "$b1: String!",
+            "h0: pullRequests",
+            "c1: pullRequests",
+        ] {
+            assert!(query.contains(needle), "{needle}: {query}");
+        }
+        let node = |number: u64, base: &str, head: &str| json!({ "number": number, "state": "OPEN", "headRefName": head, "baseRefName": base });
+        let value = json!({ "data": { "repository": {
+            "h0": { "nodes": [node(1, "main", "a")] },
+            "c0": { "nodes": [node(2, "a", "b")] },
+            "h1": { "nodes": [] },
+            "c1": { "nodes": [node(3, "b", "c"), node(4, "b", "d")] },
+        } } });
+        let first = parse_branch_pull_requests(&value, 0).unwrap();
+        assert_eq!(first.with_head[0].number, 1);
+        assert_eq!(first.with_base[0].number, 2);
+        let second = parse_branch_pull_requests(&value, 1).unwrap();
+        assert_eq!(second.with_head, Vec::new());
+        assert_eq!(second.with_base.len(), 2);
+        assert!(parse_branch_pull_requests(&value, 2).is_err());
     }
 
     #[test]

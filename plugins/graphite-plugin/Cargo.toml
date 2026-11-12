@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Graphite stack discovery for bcode code review"
+edition     = { workspace = true }
+keywords    = ["bcode", "graphite", "code-review", "plugin"]
+license     = { workspace = true }
+name        = "bcode_graphite_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_code_review_models = { workspace = true }
+bcode_plugin_sdk         = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true }
+thiserror                = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

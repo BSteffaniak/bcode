@@ -248,6 +248,10 @@ static-bundled-github-review-publisher-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-github-review-publisher-plugin",
 ]
+static-bundled-graphite-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-graphite-plugin",
+]
 static-bundled-harness-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-harness-plugin",
@@ -277,10 +281,6 @@ static-bundled-pi-session-import-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-pi-session-import-plugin",
 ]
-static-bundled-sdk-session-import-plugin = [
-    "bundled-plugins",
-    "bcode_bundled_plugins/static-bundled-sdk-session-import-plugin",
-]
 static-bundled-plugins = [
     "static-bundled-claude-code-plugin",
     "static-bundled-codex-harness-plugin",
@@ -308,6 +308,10 @@ static-bundled-read-plugin = [
     "cli",
     "bcode_bundled_plugins/static-bundled-read-plugin",
     "bcode_cli/static-bundled-read-plugin",
+]
+static-bundled-sdk-session-import-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-sdk-session-import-plugin",
 ]
 static-bundled-session-derivation-plugin = [
     "bundled-plugins",

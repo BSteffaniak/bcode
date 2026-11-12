@@ -10,16 +10,18 @@
 //! diagnostic; every other source keeps working.
 
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
-    OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
-    REVIEW_SOURCE_INTERFACE_ID, ResolveReviewSourcesRequest, ReviewPullFetchResult, ReviewSource,
-    ReviewSourceKind, ReviewSourceProviderManifest, ReviewSourceProviderOutcome,
-    ReviewSourceProviderResolution, ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest,
-    ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
+    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH,
+    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED,
+    REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_INTERFACE_ID, ResolveReviewSourcesRequest,
+    ReviewPullFetchResult, ReviewPullFetchTarget, ReviewSource, ReviewSourceKind,
+    ReviewSourceProviderManifest, ReviewSourceProviderOutcome, ReviewSourceProviderResolution,
+    ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
+    ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
     ReviewSourceStackResolveResponse, ReviewStack,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 
@@ -115,7 +117,9 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
     sources: &[ReviewSource],
     max_layers: Option<usize>,
 ) -> Vec<ReviewSourceProviderResolution> {
-    let mut resolutions = Vec::new();
+    // 1. Resolve each source's stack (once per stack) and note the pull requests it needs.
+    let mut targets: BTreeMap<(String, String), (Target<'_, T>, Asked)> = BTreeMap::new();
+    let mut plans = Vec::new();
     for source in sources.iter().filter(|source| source.included) {
         let (provider, repository, number, stacked) = match &source.kind {
             ReviewSourceKind::PullRequest {
@@ -138,33 +142,70 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
         let Some(route) = routes.iter().find(|route| route.manifest.id == *provider) else {
             continue;
         };
-        let target = Target {
-            transport,
-            plugin_id: &route.plugin_id,
-            repo_path,
-            repository,
-            max_layers,
-        };
-        let outcome = if stacked {
-            target.stacked(number).await
-        } else {
-            target
-                .fetch(number, None)
-                .await
-                .map(|fetch| (None, vec![fetch]))
-        };
-        resolutions.push(ReviewSourceProviderResolution {
-            source_id: source.id.clone(),
-            outcome: match outcome {
-                Ok((stack, fetched)) => ReviewSourceProviderOutcome::Resolved { stack, fetched },
-                Err(error) => ReviewSourceProviderOutcome::Failed {
-                    code: error.code,
-                    message: error.message,
+        let key = (route.plugin_id.clone(), repository.clone());
+        let (target, asked) = targets.entry(key.clone()).or_insert_with(|| {
+            (
+                Target {
+                    transport,
+                    route,
+                    repo_path,
+                    repository,
+                    max_layers,
+                    batch_fetch: route.manifest.capabilities.batched.pulls_fetch,
                 },
-            },
+                Asked::default(),
+            )
         });
+        let needs = if stacked {
+            target.stack(asked, number).await
+        } else {
+            Ok((None, vec![(number, None)]))
+        };
+        plans.push((source.id.clone(), key, needs));
     }
-    resolutions
+    // 2. Fetch every needed pull request: once each, batched where the provider can.
+    for (key, (target, asked)) in &mut targets {
+        let needed: BTreeSet<FetchKey> = plans
+            .iter()
+            .filter(|(_, plan_key, _)| plan_key == key)
+            .filter_map(|(_, _, needs)| needs.as_ref().ok())
+            .flat_map(|(_, keys)| keys.iter().cloned())
+            .collect();
+        target.fetch_all(asked, &needed).await;
+    }
+    // 3. Answer each source from what was asked.
+    plans
+        .into_iter()
+        .map(|(source_id, key, needs)| {
+            let asked = &targets[&key].1;
+            let outcome = needs.and_then(|(stack, keys)| {
+                let fetched = keys
+                    .iter()
+                    .map(|fetch_key| {
+                        asked.fetched.get(fetch_key).cloned().unwrap_or_else(|| {
+                            Err(ProviderCallError::new(
+                                REVIEW_SOURCE_ERROR_FAILED,
+                                format!("pull request #{} was not fetched", fetch_key.0),
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((stack, fetched))
+            });
+            ReviewSourceProviderResolution {
+                source_id,
+                outcome: match outcome {
+                    Ok((stack, fetched)) => {
+                        ReviewSourceProviderOutcome::Resolved { stack, fetched }
+                    }
+                    Err(error) => ReviewSourceProviderOutcome::Failed {
+                        code: error.code,
+                        message: error.message,
+                    },
+                },
+            }
+        })
+        .collect()
 }
 
 /// Build the `review.sources.resolve` request for a workspace, asking the enabled providers
@@ -247,7 +288,7 @@ pub async fn lookup_pulls<T: ProviderTransport + Sync>(
 }
 
 /// Resolve the stack containing pull request `number` through `route`, cut at `max_layers` when
-/// given.
+/// given, with discovery `hints` (see [`ReviewSourceStackResolveRequest::hints`]).
 ///
 /// # Errors
 ///
@@ -259,6 +300,7 @@ pub async fn resolve_stack<T: ProviderTransport + Sync>(
     repository: Option<String>,
     number: u64,
     max_layers: Option<usize>,
+    hints: Vec<String>,
 ) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
     call(
         transport,
@@ -269,6 +311,7 @@ pub async fn resolve_stack<T: ProviderTransport + Sync>(
             repository,
             number,
             max_layers,
+            hints,
         },
     )
     .await
@@ -277,63 +320,166 @@ pub async fn resolve_stack<T: ProviderTransport + Sync>(
 /// One provider and repository being asked about a source.
 struct Target<'a, T> {
     transport: &'a T,
-    plugin_id: &'a str,
+    route: &'a ProviderRoute,
     repo_path: &'a Path,
     repository: &'a str,
     max_layers: Option<usize>,
+    batch_fetch: bool,
 }
 
-impl<T: ProviderTransport + Sync> Target<'_, T> {
-    async fn fetch(
-        &self,
-        number: u64,
-        base_branch: Option<String>,
-    ) -> Result<ReviewPullFetchResult, ProviderCallError> {
-        call(
-            self.transport,
-            self.plugin_id,
-            OP_REVIEW_SOURCE_PULL_FETCH,
-            &ReviewSourcePullFetchRequest {
-                repo_path: self.repo_path.to_path_buf(),
-                repository: Some(self.repository.to_string()),
-                number,
-                base_branch,
-            },
-        )
-        .await
-    }
+/// A pull request fetch: its number and the base branch fetched with it (`None`: its own).
+type FetchKey = (u64, Option<String>);
 
-    async fn stacked(
+impl<T: ProviderTransport + Sync> Target<'_, T> {
+    /// The stack containing `number` and the fetches its layers up to `number` need. A stack
+    /// already resolved for another source that has `number` as a layer is reused, so one open
+    /// resolves each stack once.
+    async fn stack(
         &self,
+        asked: &mut Asked,
         number: u64,
-    ) -> Result<(Option<ReviewStack>, Vec<ReviewPullFetchResult>), ProviderCallError> {
-        let response: ReviewSourceStackResolveResponse = call(
-            self.transport,
-            self.plugin_id,
-            OP_REVIEW_SOURCE_STACK_RESOLVE,
-            &ReviewSourceStackResolveRequest {
-                repo_path: self.repo_path.to_path_buf(),
-                repository: Some(self.repository.to_string()),
+    ) -> Result<(Option<ReviewStack>, Vec<FetchKey>), ProviderCallError> {
+        let known = asked
+            .stacks
+            .iter()
+            .find(|stack| stack.layer(number).is_some())
+            .cloned();
+        let stack = if let Some(stack) = known {
+            stack
+        } else {
+            let response = crate::discovery::resolve_stack_with_discovery(
+                self.transport,
+                self.route,
+                self.repo_path,
+                Some(self.repository.to_string()),
                 number,
-                max_layers: self.max_layers,
-            },
-        )
-        .await?;
-        let layers = response.stack.layers_through(number).ok_or_else(|| {
+                self.max_layers,
+                None,
+            )
+            .await?;
+            for layer in &response.stack.layers {
+                asked.layers.insert(
+                    layer.pull.number,
+                    ReviewPullFetchTarget {
+                        number: layer.pull.number,
+                        base_branch: layer.pull.base_branch.clone(),
+                        head_oid: Some(layer.pull.head_oid.clone()).filter(|oid| !oid.is_empty()),
+                        base_oid: layer.pull.base_oid.clone(),
+                    },
+                );
+            }
+            asked.stacks.push(response.stack.clone());
+            response.stack
+        };
+        let layers = stack.layers_through(number).ok_or_else(|| {
             ProviderCallError::new(
                 REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
                 format!("pull request #{number} is not a layer of its stack"),
             )
         })?;
-        let mut fetched = Vec::with_capacity(layers.len());
-        for layer in layers {
-            fetched.push(
-                self.fetch(layer.pull.number, Some(layer.pull.base_branch.clone()))
-                    .await?,
-            );
-        }
-        Ok((Some(response.stack), fetched))
+        let keys = layers
+            .iter()
+            .map(|layer| (layer.pull.number, Some(layer.pull.base_branch.clone())))
+            .collect();
+        Ok((Some(stack), keys))
     }
+
+    /// Fetch every pull request of `needed` not fetched yet: stack layers in one
+    /// `review_source.pulls.fetch` when the provider supports it, the rest one at a time.
+    /// Results (and failures) are kept in `asked`.
+    async fn fetch_all(&self, asked: &mut Asked, needed: &BTreeSet<FetchKey>) {
+        let missing: Vec<&FetchKey> = needed
+            .iter()
+            .filter(|key| !asked.fetched.contains_key(*key))
+            .collect();
+        let batch: Vec<(&FetchKey, ReviewPullFetchTarget)> = if self.batch_fetch {
+            missing
+                .iter()
+                .filter_map(|key| {
+                    let base = key.1.as_ref()?;
+                    let target = asked.layers.get(&key.0)?;
+                    Some((
+                        *key,
+                        ReviewPullFetchTarget {
+                            base_branch: base.clone(),
+                            ..target.clone()
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !batch.is_empty() {
+            let response: Result<ReviewSourcePullsFetchResponse, _> = call(
+                self.transport,
+                &self.route.plugin_id,
+                OP_REVIEW_SOURCE_PULLS_FETCH,
+                &ReviewSourcePullsFetchRequest {
+                    repo_path: self.repo_path.to_path_buf(),
+                    repository: Some(self.repository.to_string()),
+                    pulls: batch.iter().map(|(_, target)| target.clone()).collect(),
+                },
+            )
+            .await;
+            match response {
+                Ok(response) if response.fetched.len() == batch.len() => {
+                    for ((key, _), fetched) in batch.iter().zip(response.fetched) {
+                        asked.fetched.insert((*key).clone(), Ok(fetched));
+                    }
+                }
+                Ok(response) => {
+                    let error = ProviderCallError::new(
+                        REVIEW_SOURCE_ERROR_FAILED,
+                        format!(
+                            "{} answered {} of {} pull requests",
+                            OP_REVIEW_SOURCE_PULLS_FETCH,
+                            response.fetched.len(),
+                            batch.len()
+                        ),
+                    );
+                    for (key, _) in &batch {
+                        asked.fetched.insert((*key).clone(), Err(error.clone()));
+                    }
+                }
+                Err(error) => {
+                    for (key, _) in &batch {
+                        asked.fetched.insert((*key).clone(), Err(error.clone()));
+                    }
+                }
+            }
+        }
+        for key in missing {
+            if asked.fetched.contains_key(key) {
+                continue;
+            }
+            let fetched = call(
+                self.transport,
+                &self.route.plugin_id,
+                OP_REVIEW_SOURCE_PULL_FETCH,
+                &ReviewSourcePullFetchRequest {
+                    repo_path: self.repo_path.to_path_buf(),
+                    repository: Some(self.repository.to_string()),
+                    number: key.0,
+                    base_branch: key.1.clone(),
+                },
+            )
+            .await;
+            asked.fetched.insert(key.clone(), fetched);
+        }
+    }
+}
+
+/// What one open asked one provider about, so sources naming the same pull requests (for
+/// example one source per layer of a stack) share a single resolution and fetch.
+#[derive(Debug, Default)]
+struct Asked {
+    /// Stacks resolved so far.
+    stacks: Vec<ReviewStack>,
+    /// The layers of those stacks as fetch targets (with the commits the provider reported).
+    layers: BTreeMap<u64, ReviewPullFetchTarget>,
+    /// Fetch results and failures.
+    fetched: BTreeMap<FetchKey, Result<ReviewPullFetchResult, ProviderCallError>>,
 }
 
 async fn call<T, Req, Resp>(
@@ -347,10 +493,34 @@ where
     Req: Serialize + Sync,
     Resp: DeserializeOwned,
 {
+    call_interface(
+        transport,
+        plugin_id,
+        REVIEW_SOURCE_INTERFACE_ID,
+        operation,
+        request,
+    )
+    .await
+}
+
+/// Invoke `operation` of `interface_id` on `plugin_id` with a JSON request and decode the JSON
+/// answer.
+pub(crate) async fn call_interface<T, Req, Resp>(
+    transport: &T,
+    plugin_id: &str,
+    interface_id: &str,
+    operation: &str,
+    request: &Req,
+) -> Result<Resp, ProviderCallError>
+where
+    T: ProviderTransport + Sync,
+    Req: Serialize + Sync,
+    Resp: DeserializeOwned,
+{
     let payload = serde_json::to_vec(request)
         .map_err(|error| ProviderCallError::new(REVIEW_SOURCE_ERROR_FAILED, error.to_string()))?;
     let response = transport
-        .invoke(plugin_id, REVIEW_SOURCE_INTERFACE_ID, operation, payload)
+        .invoke(plugin_id, interface_id, operation, payload)
         .await?;
     serde_json::from_slice(&response).map_err(|error| {
         ProviderCallError::new(

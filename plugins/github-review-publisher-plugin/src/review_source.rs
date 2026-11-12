@@ -7,19 +7,21 @@
 //! touch the user's branches or remote-tracking references.
 
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
-    OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary, REVIEW_SOURCE_ERROR_FAILED,
-    REVIEW_SOURCE_ERROR_FETCH_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
-    REVIEW_SOURCE_ERROR_UNAUTHENTICATED, REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY,
-    ReviewPullFetchResult, ReviewSourceCapabilities, ReviewSourceProviderManifest,
-    ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
-    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse, ReviewStack,
-    ReviewStackLayer, ReviewStackSibling,
+    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH,
+    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary,
+    REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_FETCH_FAILED,
+    REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
+    REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY, ReviewPullFetchResult, ReviewPullFetchTarget,
+    ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewSourceProviderManifest,
+    ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
+    ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
+    ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer, ReviewStackSibling,
 };
 use bcode_forge::models::{ForgeError, PullRequest, PullRequestList, RepositoryRef};
 use bcode_plugin_sdk::prelude::{ServiceRequest, ServiceResponse};
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use thiserror::Error;
@@ -87,6 +89,7 @@ pub fn manifest() -> ReviewSourceProviderManifest {
             pulls_list: true,
             stack_resolve: true,
             pull_fetch: true,
+            batched: ReviewSourceBatchCapabilities { pulls_fetch: true },
         },
     }
 }
@@ -108,7 +111,13 @@ pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
         OP_REVIEW_SOURCE_STACK_RESOLVE => {
             handle(request, |req: ReviewSourceStackResolveRequest| {
                 let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-                let stack = resolve_stack(&repository, &req.repo_path, req.number, req.max_layers)?;
+                let stack = resolve_stack(
+                    &repository,
+                    &req.repo_path,
+                    req.number,
+                    req.max_layers,
+                    &req.hints,
+                )?;
                 Ok(ReviewSourceStackResolveResponse {
                     repository: repository.display(),
                     stack,
@@ -130,6 +139,13 @@ pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
             };
             let remote = repository.fetch_remote(&req.repo_path);
             fetch_pull(&req.repo_path, &remote, req.number, &base_branch)
+        }),
+        OP_REVIEW_SOURCE_PULLS_FETCH => handle(request, |req: ReviewSourcePullsFetchRequest| {
+            let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
+            let remote = repository.fetch_remote(&req.repo_path);
+            Ok(ReviewSourcePullsFetchResponse {
+                fetched: fetch_pulls(&req.repo_path, &remote, &req.pulls)?,
+            })
         }),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -192,9 +208,23 @@ impl Repository {
         }
     }
 
-    /// A forge client for this repository's host, running `gh` in `repo_path`.
+    /// A forge client for this repository's host, running `gh` in `repo_path`. Clients are kept
+    /// for the plugin's lifetime per repository path and host, so successive operations (a
+    /// lookup, a stack resolution, a fetch) reuse one token and connection.
     fn github(&self, repo_path: &Path) -> bcode_forge::GitHub {
-        bcode_forge::GitHub::new(repo_path).enterprise_hosts([self.0.host.clone()])
+        static CLIENTS: std::sync::OnceLock<
+            std::sync::Mutex<BTreeMap<(std::path::PathBuf, String), bcode_forge::GitHub>>,
+        > = std::sync::OnceLock::new();
+        let mut clients = CLIENTS
+            .get_or_init(std::sync::Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clients
+            .entry((repo_path.to_path_buf(), self.0.host.clone()))
+            .or_insert_with(|| {
+                bcode_forge::GitHub::new(repo_path).enterprise_hosts([self.0.host.clone()])
+            })
+            .clone()
     }
 
     /// The local remote that points at this repository (`origin` preferred), or its HTTPS URL.
@@ -381,15 +411,26 @@ fn resolve_stack(
     repo_path: &Path,
     number: u64,
     max_layers: Option<usize>,
+    hints: &[String],
 ) -> Result<ReviewStack, ReviewSourceError> {
     let github = repository.github(repo_path);
     let lookup = github.pull_request(&repository.0, number)?;
     let start = stack_candidates(repository, lookup.pull_request.as_slice())
         .pop()
         .ok_or_else(|| ReviewSourceError::PullNotFound(number, repository.display()))?;
+    let default_branch = lookup.default_branch.as_deref();
+    let mut seen = BTreeSet::new();
+    let pending = [&start.head_branch, &start.base_branch]
+        .into_iter()
+        .chain(hints)
+        .filter(|branch| Some(branch.as_str()) != default_branch && seen.insert(*branch))
+        .cloned()
+        .collect();
     let mut branches = ForgeBranches {
         github: &github,
         repository,
+        known: BTreeMap::new(),
+        pending,
     };
     walk_stack(
         &mut branches,
@@ -423,23 +464,57 @@ pub trait StackBranches {
     fn neighbors(&mut self, branch: &str) -> Result<BranchNeighbors, Self::Error>;
 }
 
-/// [`StackBranches`] answered by GitHub, one query per branch.
+/// Most branches looked up in one batch while walking: the forge's per-request batch.
+const LOOKUP_BATCH: usize = 40;
+
+/// [`StackBranches`] answered by GitHub in batches. A branch the walk needs is looked up together
+/// with the next hinted branches not looked up yet (in the order discovery ranked them), so a
+/// well-hinted stack of `n` layers costs about `n / 40` requests, and hints the walk never needs
+/// beyond the batch cost nothing.
 struct ForgeBranches<'a> {
     github: &'a bcode_forge::GitHub,
     repository: &'a Repository,
+    known: BTreeMap<String, BranchNeighbors>,
+    /// Hinted branches not looked up yet, most relevant first.
+    pending: std::collections::VecDeque<String>,
+}
+
+impl ForgeBranches<'_> {
+    /// Look `branch` up with the next pending hints, and keep every answer.
+    fn look_up(&mut self, branch: &str) -> Result<(), ReviewSourceError> {
+        let mut batch = vec![branch.to_owned()];
+        while batch.len() < LOOKUP_BATCH {
+            let Some(next) = self.pending.pop_front() else {
+                break;
+            };
+            if next != branch && !self.known.contains_key(&next) {
+                batch.push(next);
+            }
+        }
+        for (name, pulls) in self
+            .github
+            .branches_pull_requests(&self.repository.0, &batch)?
+        {
+            self.known.insert(
+                name,
+                BranchNeighbors {
+                    with_head: stack_candidates(self.repository, &pulls.with_head),
+                    with_base: stack_candidates(self.repository, &pulls.with_base),
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 impl StackBranches for ForgeBranches<'_> {
     type Error = ReviewSourceError;
 
     fn neighbors(&mut self, branch: &str) -> Result<BranchNeighbors, ReviewSourceError> {
-        let pulls = self
-            .github
-            .branch_pull_requests(&self.repository.0, branch)?;
-        Ok(BranchNeighbors {
-            with_head: stack_candidates(self.repository, &pulls.with_head),
-            with_base: stack_candidates(self.repository, &pulls.with_base),
-        })
+        if !self.known.contains_key(branch) {
+            self.look_up(branch)?;
+        }
+        Ok(self.known.get(branch).cloned().unwrap_or_default())
     }
 }
 
@@ -655,20 +730,8 @@ pub fn fetch_pull(
     number: u64,
     base_branch: &str,
 ) -> Result<ReviewPullFetchResult, ReviewSourceError> {
-    if remote.is_empty() || remote.starts_with('-') || remote.chars().any(char::is_control) {
-        return Err(ReviewSourceError::InvalidRequest(format!(
-            "invalid remote {remote:?}"
-        )));
-    }
-    let base_source = format!("refs/heads/{base_branch}");
-    if base_branch.is_empty()
-        || base_branch.starts_with('-')
-        || git(repo_path, &["check-ref-format", &base_source]).is_err()
-    {
-        return Err(ReviewSourceError::InvalidRequest(format!(
-            "invalid base branch {base_branch:?}"
-        )));
-    }
+    validate_remote(remote)?;
+    let base_source = validate_base_branch(repo_path, base_branch)?;
     let head_ref = format!("{FETCH_REF_NAMESPACE}/{number}/head");
     let base_ref = format!("{FETCH_REF_NAMESPACE}/{number}/base");
     let head_spec = format!("+refs/pull/{number}/head:{head_ref}");
@@ -689,27 +752,229 @@ pub fn fetch_pull(
         ],
     )
     .map_err(ReviewSourceError::Fetch)?;
-    let commit = |reference: &str| {
-        git(
-            repo_path,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{reference}^{{commit}}"),
-            ],
-        )
-        .map(|oid| oid.trim().to_string())
-        .map_err(|error| ReviewSourceError::Fetch(format!("{reference}: {error}")))
-    };
     Ok(ReviewPullFetchResult {
         number,
-        head_oid: commit(&head_ref)?,
+        head_oid: ref_commit(repo_path, &head_ref)?,
         head_ref,
         base_branch: base_branch.to_string(),
-        base_oid: commit(&base_ref)?,
+        base_oid: ref_commit(repo_path, &base_ref)?,
         base_ref,
     })
+}
+
+/// Make the head and base commits of every pull request of `targets` local under
+/// `refs/bcode-review/pull/<number>/{head,base}`, returning them in `targets` order.
+///
+/// A commit the provider reported (`head_oid`, `base_oid`) that already exists locally is pointed
+/// at directly, without the network; the rest arrive in one `git fetch` from `remote` with every
+/// refspec, so a stack costs at most one fetch however many layers it has.
+///
+/// # Errors
+///
+/// * [`ReviewSourceError::InvalidRequest`] when `remote` or a base branch is not a safe name.
+/// * [`ReviewSourceError::Fetch`] when `git fetch` or a reference update fails, or a reference
+///   does not resolve afterwards.
+pub fn fetch_pulls(
+    repo_path: &Path,
+    remote: &str,
+    targets: &[ReviewPullFetchTarget],
+) -> Result<Vec<ReviewPullFetchResult>, ReviewSourceError> {
+    validate_remote(remote)?;
+    let reported: Vec<&str> = targets
+        .iter()
+        .flat_map(|target| [target.head_oid.as_deref(), target.base_oid.as_deref()])
+        .flatten()
+        .collect();
+    let local = local_commits(repo_path, &reported)?;
+    let mut refspecs: Vec<String> = Vec::new();
+    let mut updates = String::new();
+    // Commits each review ref will hold, when known before fetching.
+    let mut known: BTreeMap<String, String> = BTreeMap::new();
+    for target in targets {
+        let number = target.number;
+        let head_ref = format!("{FETCH_REF_NAMESPACE}/{number}/head");
+        let base_ref = format!("{FETCH_REF_NAMESPACE}/{number}/base");
+        for (oid, local_ref, is_head) in [
+            (target.head_oid.as_deref(), head_ref, true),
+            (target.base_oid.as_deref(), base_ref, false),
+        ] {
+            if let Some(oid) = oid.filter(|oid| local.contains(*oid)) {
+                let _ = writeln!(updates, "update {local_ref} {oid}");
+                known.insert(local_ref, oid.to_owned());
+            } else if is_head {
+                refspecs.push(format!("+refs/pull/{number}/head:{local_ref}"));
+            } else {
+                // The base branch name only reaches git when it is fetched.
+                let source = validate_base_branch(repo_path, &target.base_branch)?;
+                refspecs.push(format!("+{source}:{local_ref}"));
+            }
+        }
+    }
+    if !refspecs.is_empty() {
+        let mut args = vec![
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            // No opportunistic remote-tracking updates: only the review-owned refs change.
+            "--refmap=",
+            "--end-of-options",
+            remote,
+        ];
+        args.extend(refspecs.iter().map(String::as_str));
+        git(repo_path, &args).map_err(ReviewSourceError::Fetch)?;
+    }
+    if !updates.is_empty() {
+        git_with_input(repo_path, &["update-ref", "--stdin"], &updates)
+            .map_err(ReviewSourceError::Fetch)?;
+    }
+    let fetched_refs: Vec<String> = refspecs
+        .iter()
+        .filter_map(|refspec| refspec.rsplit_once(':').map(|(_, local)| local.to_owned()))
+        .collect();
+    for (reference, oid) in fetched_refs
+        .iter()
+        .zip(ref_commits(repo_path, &fetched_refs)?)
+    {
+        known.insert(reference.clone(), oid);
+    }
+    targets
+        .iter()
+        .map(|target| {
+            let head_ref = format!("{FETCH_REF_NAMESPACE}/{}/head", target.number);
+            let base_ref = format!("{FETCH_REF_NAMESPACE}/{}/base", target.number);
+            let commit = |reference: &str| {
+                known
+                    .get(reference)
+                    .cloned()
+                    .ok_or_else(|| ReviewSourceError::Fetch(format!("{reference} did not resolve")))
+            };
+            Ok(ReviewPullFetchResult {
+                number: target.number,
+                head_oid: commit(&head_ref)?,
+                head_ref,
+                base_branch: target.base_branch.clone(),
+                base_oid: commit(&base_ref)?,
+                base_ref,
+            })
+        })
+        .collect()
+}
+
+/// Which of `oids` (full commit ids) are commits in the local repository: one
+/// `git cat-file --batch-check` for all of them.
+fn local_commits(repo_path: &Path, oids: &[&str]) -> Result<BTreeSet<String>, ReviewSourceError> {
+    let candidates: Vec<&str> = oids
+        .iter()
+        .copied()
+        .filter(|oid| oid.len() >= 40 && oid.chars().all(|c| c.is_ascii_hexdigit()))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let input = candidates.join("\n") + "\n";
+    let output = git_with_input(
+        repo_path,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        &input,
+    )
+    .map_err(ReviewSourceError::Fetch)?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.strip_suffix(" commit"))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The commits `references` point at, in order: one `git rev-parse` for all of them.
+fn ref_commits(repo_path: &Path, references: &[String]) -> Result<Vec<String>, ReviewSourceError> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let specs: Vec<String> = references
+        .iter()
+        .map(|reference| format!("{reference}^{{commit}}"))
+        .collect();
+    // Each revision resolves or the command fails. The references are review-owned
+    // (`refs/bcode-review/…`), so none can read as an option (`rev-parse` would echo
+    // `--end-of-options` back as output).
+    let mut args = vec!["rev-parse"];
+    args.extend(specs.iter().map(String::as_str));
+    let output = git(repo_path, &args).map_err(ReviewSourceError::Fetch)?;
+    let oids: Vec<String> = output.lines().map(str::to_owned).collect();
+    if oids.len() != references.len() {
+        return Err(ReviewSourceError::Fetch(format!(
+            "{} of {} fetched references resolved",
+            oids.len(),
+            references.len()
+        )));
+    }
+    Ok(oids)
+}
+
+fn validate_remote(remote: &str) -> Result<(), ReviewSourceError> {
+    if remote.is_empty() || remote.starts_with('-') || remote.chars().any(char::is_control) {
+        return Err(ReviewSourceError::InvalidRequest(format!(
+            "invalid remote {remote:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// `refs/heads/<base_branch>`, when `base_branch` is a safe branch name.
+fn validate_base_branch(repo_path: &Path, base_branch: &str) -> Result<String, ReviewSourceError> {
+    let source = format!("refs/heads/{base_branch}");
+    if base_branch.is_empty()
+        || base_branch.starts_with('-')
+        || git(repo_path, &["check-ref-format", &source]).is_err()
+    {
+        return Err(ReviewSourceError::InvalidRequest(format!(
+            "invalid base branch {base_branch:?}"
+        )));
+    }
+    Ok(source)
+}
+
+/// The commit `reference` points at.
+fn ref_commit(repo_path: &Path, reference: &str) -> Result<String, ReviewSourceError> {
+    git(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ],
+    )
+    .map(|oid| oid.trim().to_string())
+    .map_err(|error| ReviewSourceError::Fetch(format!("{reference}: {error}")))
+}
+
+fn git_with_input(repo_path: &Path, args: &[&str], input: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git could not start: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("git stdin unavailable")?
+        .write_all(input.as_bytes())
+        .map_err(|error| format!("git stdin: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("git: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 fn git(repo_path: &Path, args: &[&str]) -> Result<String, String> {

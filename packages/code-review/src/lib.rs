@@ -25,6 +25,7 @@
 
 pub mod assistant;
 pub mod data;
+pub mod discovery;
 pub mod document;
 pub mod provider;
 pub mod publish_plan;

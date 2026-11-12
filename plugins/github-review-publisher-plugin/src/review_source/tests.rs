@@ -473,6 +473,62 @@ fn fetching_a_pull_request_writes_review_owned_refs_only() {
 }
 
 #[test]
+fn batched_fetches_use_local_commits_and_fetch_the_rest_at_once() {
+    let (_dir, upstream, clone) = upstream_and_clone();
+    let local_main = run(&clone, &["rev-parse", "main"]);
+    let target =
+        |number: u64, head_oid: Option<String>, base_oid: Option<String>| ReviewPullFetchTarget {
+            number,
+            base_branch: "main".into(),
+            head_oid,
+            base_oid,
+        };
+    // Commits that are already local need no remote at all.
+    let local = fetch_pulls(
+        &clone,
+        "no-such-remote",
+        &[target(
+            5,
+            Some(local_main.clone()),
+            Some(local_main.clone()),
+        )],
+    )
+    .expect("local fetch");
+    assert_eq!(local[0].head_oid, local_main);
+    assert_eq!(local[0].base_oid, local_main);
+    assert_eq!(
+        run(&clone, &["rev-parse", "refs/bcode-review/pull/5/head"]),
+        local_main
+    );
+    // A commit that is not local (and an unreported one) arrive in one fetch, beside a local one.
+    let pull_head = run(&upstream, &["rev-parse", "refs/pull/7/head"]);
+    let fetched = fetch_pulls(
+        &clone,
+        "origin",
+        &[
+            target(7, Some(pull_head.clone()), None),
+            target(5, Some(local_main.clone()), Some(local_main.clone())),
+        ],
+    )
+    .expect("fetch");
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|result| result.number)
+            .collect::<Vec<_>>(),
+        [7, 5]
+    );
+    assert_eq!(fetched[0].head_oid, pull_head);
+    assert_eq!(fetched[0].base_oid, run(&upstream, &["rev-parse", "main"]));
+    assert_eq!(fetched[1].head_oid, local_main);
+    // Unsafe names are refused before anything runs.
+    assert!(matches!(
+        fetch_pulls(&clone, "--upload-pack=x", &[target(5, None, None)]),
+        Err(ReviewSourceError::InvalidRequest(_))
+    ));
+}
+
+#[test]
 fn fetch_rejects_unsafe_names_and_reports_missing_pulls() {
     let (_dir, _upstream, clone) = upstream_and_clone();
     for base in ["", "-x", "a..b", "bad\nname"] {

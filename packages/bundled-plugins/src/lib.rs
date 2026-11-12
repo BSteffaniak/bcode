@@ -305,6 +305,11 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(git_plugin());
     #[cfg(feature = "static-bundled-github-review-publisher-plugin")]
     plugins.push(github_review_publisher_plugin());
+    #[cfg(feature = "static-bundled-graphite-plugin")]
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/graphite-plugin/bcode-plugin.toml"),
+        bcode_graphite_plugin::static_plugin(),
+    ));
     #[cfg(feature = "static-bundled-model-plugin")]
     plugins.push(model_plugin());
     #[cfg(feature = "static-bundled-jev-provider-plugin")]

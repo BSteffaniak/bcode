@@ -1752,6 +1752,7 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
+ "bcode_graphite_plugin",
  "bcode_harness_plugin",
  "bcode_jev_provider_plugin",
  "bcode_loop_plugin",
@@ -2453,6 +2454,18 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "bcode_graphite_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_code_review_models",
+ "bcode_plugin_sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

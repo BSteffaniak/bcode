@@ -6,10 +6,12 @@
 
 mod assistant;
 mod data;
+mod review_discovery;
 mod review_source;
 
 pub use assistant::*;
 pub use data::*;
+pub use review_discovery::*;
 pub use review_source::*;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

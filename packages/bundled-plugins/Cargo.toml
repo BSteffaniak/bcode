@@ -27,6 +27,7 @@ bcode_file_references_plugin            = { workspace = true, optional = true }
 bcode_filesystem_plugin                 = { workspace = true, optional = true }
 bcode_git_plugin                        = { workspace = true, optional = true }
 bcode_github_review_publisher_plugin    = { workspace = true, optional = true }
+bcode_graphite_plugin                   = { workspace = true, optional = true }
 bcode_harness_plugin                    = { workspace = true, optional = true }
 bcode_jev_provider_plugin               = { workspace = true, optional = true }
 bcode_loop_plugin                       = { workspace = true, optional = true }
@@ -36,12 +37,12 @@ bcode_ocr_plugin                        = { workspace = true, optional = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
 bcode_opencode_session_import_plugin    = { workspace = true, optional = true }
 bcode_pi_session_import_plugin          = { workspace = true, optional = true }
-bcode_sdk_session_import_plugin         = { workspace = true, optional = true }
 bcode_plugin                            = { workspace = true }
 bcode_plugin_sdk                        = { workspace = true, features = ["tui"] }
 bcode_prompt_profile_plugin             = { workspace = true, optional = true }
 bcode_question_plugin                   = { workspace = true, optional = true }
 bcode_read_plugin                       = { workspace = true, optional = true }
+bcode_sdk_session_import_plugin         = { workspace = true, optional = true }
 bcode_session_derivation_plugin         = { workspace = true, optional = true }
 bcode_session_milestones_plugin         = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
@@ -151,6 +152,10 @@ static-bundled-github-review-publisher-plugin = [
     "dep:bcode_github_review_publisher_plugin",
     "bcode_github_review_publisher_plugin/static-bundled",
 ]
+static-bundled-graphite-plugin = [
+    "dep:bcode_graphite_plugin",
+    "bcode_graphite_plugin/static-bundled",
+]
 static-bundled-harness-plugin = [
     "dep:bcode_harness_plugin",
     "bcode_harness_plugin/static-bundled",
@@ -187,10 +192,6 @@ static-bundled-pi-session-import-plugin = [
     "dep:bcode_pi_session_import_plugin",
     "bcode_pi_session_import_plugin/static-bundled",
 ]
-static-bundled-sdk-session-import-plugin = [
-    "dep:bcode_sdk_session_import_plugin",
-    "bcode_sdk_session_import_plugin/static-bundled",
-]
 static-bundled-plugins = [
     "static-bundled-claude-code-plugin",
     "static-bundled-codex-harness-plugin",
@@ -213,6 +214,7 @@ static-bundled-plugins = [
     "static-bundled-filesystem-plugin",
     "static-bundled-git-plugin",
     "static-bundled-github-review-publisher-plugin",
+    "static-bundled-graphite-plugin",
     "static-bundled-model-plugin",
     "static-bundled-jev-provider-plugin",
     "static-bundled-openai-compatible-provider-plugin",
@@ -249,6 +251,10 @@ static-bundled-read-plugin = [
 static-bundled-recap-plugin = [
     "dep:bcode_recap_plugin",
     "bcode_recap_plugin/static-bundled",
+]
+static-bundled-sdk-session-import-plugin = [
+    "dep:bcode_sdk_session_import_plugin",
+    "bcode_sdk_session_import_plugin/static-bundled",
 ]
 static-bundled-session-derivation-plugin = [
     "dep:bcode_session_derivation_plugin",
