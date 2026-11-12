@@ -3135,6 +3135,7 @@ impl TuiEffect {
                         let mut snapshot = watcher.initial_snapshot().await?;
                         loop {
                             let page = bcode_session_models::SessionCatalogPage {
+                                unclassified_origin_count: 0,
                                 sessions: snapshot.sessions,
                                 catalog_status: snapshot.catalog_status,
                                 catalog_sources: snapshot.catalog_sources,

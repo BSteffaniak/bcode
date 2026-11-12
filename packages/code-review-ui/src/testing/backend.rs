@@ -85,6 +85,12 @@ impl TestBackend {
         self.host.sessions()
     }
 
+    /// Origins recorded on session creation so far, in request order.
+    #[must_use]
+    pub fn session_origins(&self) -> Vec<bcode_session_models::SessionOrigin> {
+        self.host.session_origins()
+    }
+
     /// Messages sent so far: `(session id, text)`.
     #[must_use]
     pub fn messages(&self) -> Vec<(String, String)> {

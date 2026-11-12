@@ -118,6 +118,9 @@ pub struct CreateSessionRequest {
     pub name: Option<String>,
     /// Absolute canonical session working directory.
     pub working_directory: PathBuf,
+    /// Application that creates the session, recorded once in its creation event.
+    #[serde(default)]
+    pub origin: Option<crate::SessionOrigin>,
 }
 
 /// Result of changing an idle session's canonical working directory.

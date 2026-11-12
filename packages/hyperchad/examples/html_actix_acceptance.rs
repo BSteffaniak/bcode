@@ -57,6 +57,7 @@ fn acceptance_snapshot(session_id: SessionId) -> SessionViewSnapshot {
 
 fn acceptance_session(session_id: SessionId) -> SessionSummary {
     SessionSummary {
+        origin: None,
         id: session_id,
         name: Some("HyperChad acceptance fixture".to_owned()),
         explicit_name: Some("HyperChad acceptance fixture".to_owned()),

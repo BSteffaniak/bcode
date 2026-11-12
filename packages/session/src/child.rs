@@ -557,6 +557,7 @@ impl SessionManager {
                 request.working_directory.clone(),
                 execution,
                 Some(request.clone()),
+                None,
             )
             .await?;
         self.link_child_session(request.parent_id, request.child_id)
@@ -839,6 +840,7 @@ impl SessionManager {
             session_id: request.child_id,
             provenance: None,
             kind: SessionEventKind::SessionCreated {
+                origin: None,
                 name: request.name.clone(),
                 working_directory: request.working_directory.clone(),
             },
@@ -1144,6 +1146,7 @@ fn validate_child_prefix(events: &[SessionEvent], id: SessionId) -> Result<(), S
     match (&created.kind, &relationship.kind) {
         (
             SessionEventKind::SessionCreated {
+                origin: _,
                 name,
                 working_directory,
             },

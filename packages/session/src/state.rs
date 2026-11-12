@@ -208,6 +208,7 @@ impl SessionState {
                     })
                 }),
                 location: None,
+                origin: state.origin,
             },
             working_directory,
             clients: BTreeSet::new(),
@@ -304,6 +305,12 @@ impl SessionState {
         self.next_sequence += 1;
         self.event_count = self.event_count.saturating_add(1);
         match &event.kind {
+            SessionEventKind::SessionCreated {
+                origin: Some(origin),
+                ..
+            } => {
+                self.summary.origin = Some((**origin).clone());
+            }
             SessionEventKind::ChildSessionCreated { request, .. } => {
                 self.summary.parent_id = Some(request.parent_id);
             }

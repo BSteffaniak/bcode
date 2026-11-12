@@ -265,6 +265,10 @@ pub async fn ask(
             .create_session(
                 format!("Review: {}", exchange.anchor.file_path),
                 scope.repo_path.clone(),
+                crate::host::review_session_origin(
+                    crate::host::ReviewSessionPurpose::Question,
+                    &binding.workspace.id,
+                ),
             )
             .await
             .map_err(|error| error.message)?;

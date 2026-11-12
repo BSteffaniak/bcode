@@ -119,6 +119,7 @@ pub enum SessionLifecycleRequest {
     CreateSession {
         name: Option<String>,
         working_directory: PathBuf,
+        origin: Option<bcode_session_models::SessionOrigin>,
     },
     CreateChildSession {
         request: bcode_session_models::SessionChildCreateRequest,
@@ -1191,9 +1192,11 @@ impl RoutedRequest {
             Request::CreateSession {
                 name,
                 working_directory,
+                origin,
             } => Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CreateSession {
                 name,
                 working_directory,
+                origin,
             })),
             Request::CreateChildSession { request } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CreateChildSession {

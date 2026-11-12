@@ -257,6 +257,7 @@ async fn bounded_initial_history_returns_terminal_without_transport_work() {
     let session_id = watcher.session_id;
     watcher.initial = Some(AttachedSessionHistory {
         session: SessionSummary {
+            origin: None,
             id: session_id,
             parent_id: None,
             name: None,

@@ -6736,6 +6736,10 @@ enum SessionCommand {
         /// With --all-directories, emit one session summary per JSON line (JSONL).
         #[arg(long)]
         json: bool,
+        /// Only sessions created by this application id (for example `bdata`). Sessions without
+        /// a recorded origin never match.
+        #[arg(long, value_name = "APP_ID")]
+        origin: Option<String>,
     },
     /// Explicitly reconcile durable child links/cards; never runs during ordinary reads.
     ReconcileChildren {
@@ -9486,8 +9490,16 @@ fn dispatch_non_ranking_session_command(
             all_directories,
             with_status,
             json,
+            origin,
         } => Box::pin(async move {
-            Box::pin(list_sessions(cwd, all_directories, with_status, json)).await?;
+            Box::pin(list_sessions(
+                cwd,
+                all_directories,
+                with_status,
+                json,
+                origin.map(bcode_session_models::SessionOriginFilter::app),
+            ))
+            .await?;
             Ok(())
         }),
         SessionCommand::Refresh { cwd, sources, json } => Box::pin(async move {
@@ -17942,6 +17954,7 @@ async fn list_sessions(
     all_directories: bool,
     with_status: bool,
     json: bool,
+    origin: Option<bcode_session_models::SessionOriginFilter>,
 ) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     if all_directories {
@@ -17951,7 +17964,10 @@ async fn list_sessions(
             let page = client
                 .list_sessions_page_with_scope(
                     bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
-                    bcode_session_models::SessionCatalogQuery::default(),
+                    bcode_session_models::SessionCatalogQuery {
+                        text: None,
+                        origin: origin.clone(),
+                    },
                     cursor,
                     100,
                 )
@@ -17973,7 +17989,7 @@ async fn list_sessions(
         }
         return Ok(());
     }
-    let catalog = match cwd {
+    let mut catalog = match cwd {
         Some(directory) => {
             client
                 .list_sessions_in_working_directory(std::path::absolute(directory)?)
@@ -17981,6 +17997,11 @@ async fn list_sessions(
         }
         None => client.list_sessions_with_status().await?,
     };
+    if let Some(filter) = &origin {
+        catalog
+            .sessions
+            .retain(|session| filter.matches(session.origin.as_ref()));
+    }
     let mut output = std::io::stdout().lock();
     if with_status {
         write_session_catalog(&mut output, &catalog)
@@ -18072,13 +18093,17 @@ fn write_session_list<W: std::io::Write>(
         writeln!(output, "no sessions")?;
     }
     for session in sessions {
-        writeln!(
+        write!(
             output,
             "{}\t{}\t{} clients",
             session.display_title(),
             session.id,
             session.client_count
         )?;
+        if let Some(origin) = &session.origin {
+            write!(output, "\torigin={}", origin.app_id)?;
+        }
+        writeln!(output)?;
     }
     output.flush()?;
     Ok(())
@@ -29627,7 +29652,7 @@ mod session_configuration_cli_tests {
         ] {
             let parsed = Cli::try_parse_from(args).expect("list parses");
             assert!(matches!(parsed.command, Some(Commands::Session {
-                command: SessionCommand::List { cwd, all_directories: false, json: true, with_status: false }
+                command: SessionCommand::List { cwd, all_directories: false, json: true, with_status: false, origin: None }
             }) if cwd == expected));
         }
     }
@@ -29651,6 +29676,7 @@ mod session_configuration_cli_tests {
                     all_directories: true,
                     json: true,
                     with_status: true,
+                    origin: None,
                 }
             })
         ));
@@ -29700,8 +29726,17 @@ mod session_configuration_cli_tests {
                     all_directories: false,
                     json: false,
                     with_status: false,
+                    origin: None,
                 }
             })
+        ));
+        let parsed = Cli::try_parse_from(["bcode", "session", "list", "--origin", "bdata"])
+            .expect("origin list parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::List { origin: Some(origin), .. }
+            }) if origin == "bdata"
         ));
     }
 
@@ -29878,6 +29913,7 @@ mod session_configuration_cli_tests {
             }),
         };
         let mut page = SessionCatalogPage {
+            unclassified_origin_count: 0,
             sessions: vec![],
             catalog_status: SessionCatalogStatus::Degraded("unavailable location".into()),
             catalog_sources: vec![],

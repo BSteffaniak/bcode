@@ -148,7 +148,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Older positional request/response layouts are rejected rather than misinterpreted.
 /// Version 61 combines upstream contracts with managed execution lifecycle observations.
 /// Older positional payloads are rejected.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 62;
+/// Version 63 adds session origin at creation and origin catalog filters.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 63;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -638,6 +639,9 @@ pub enum Request {
     CreateSession {
         name: Option<String>,
         working_directory: PathBuf,
+        /// Application that creates the session; recorded once and descriptive only.
+        #[serde(default)]
+        origin: Option<bcode_session_models::SessionOrigin>,
     },
     ListSessions {
         working_directory: PathBuf,
@@ -4757,7 +4761,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 62);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 63);
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(59), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(57), ProtocolVersion::current());
@@ -6694,6 +6698,7 @@ mod tests {
         let response = Response::Ok(ResponsePayload::Attached {
             session_id,
             session: SessionSummary {
+                origin: None,
                 parent_id: None,
                 id: session_id,
                 name: None,
@@ -6738,6 +6743,7 @@ mod tests {
             .parse()
             .expect("session id should parse");
         let summary = SessionSummary {
+            origin: None,
             parent_id: None,
             id: session_id,
             name: Some("Canonical title".to_owned()),
@@ -7272,6 +7278,7 @@ mod tests {
             .parse()
             .expect("session id should parse");
         SessionSummary {
+            origin: None,
             parent_id: None,
             id: session_id,
             name: Some(name.to_owned()),
@@ -7719,6 +7726,7 @@ mod tests {
     fn sample_session_event_kinds(_session_id: SessionId) -> Vec<SessionEventKind> {
         vec![
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("session".to_string()),
                 working_directory: "/tmp/bcode".into(),
             },

@@ -152,6 +152,19 @@ fn ctrl_k_opens_the_dock_and_asks_a_session_bound_to_the_review() {
         .binding
         .expect("the session is bound to the review");
     assert_eq!(binding.workspace.id, setup.workspace.id);
+    let origin = setup
+        .backend
+        .session_origins()
+        .last()
+        .cloned()
+        .expect("the session records its origin");
+    assert_eq!(origin.app_id, "bcode.code-review");
+    assert_eq!(
+        origin.context.get("purpose").map(String::as_str),
+        Some("assistant")
+    );
+    assert_eq!(origin.context.get("workspace"), Some(&setup.workspace.id));
+    assert_eq!(origin.validate(), Ok(()));
     assert_ne!(
         binding.resolved.len(),
         0,

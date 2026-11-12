@@ -616,6 +616,7 @@ async fn evidence_release_wakes_existing_watch_and_preserves_unknown() {
     let mut seeded = event.clone();
     seeded.sequence = 0;
     seeded.kind = bcode_session_models::SessionEventKind::SessionCreated {
+        origin: None,
         name: None,
         working_directory: std::env::current_dir().unwrap(),
     };

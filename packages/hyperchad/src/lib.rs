@@ -4974,6 +4974,7 @@ mod tests {
         let mut attached = AttachedSessionHistory {
             submissions: Vec::new(),
             session: SessionSummary {
+                origin: None,
                 id: session_id,
                 name: Some("session".to_owned()),
                 explicit_name: Some("session".to_owned()),

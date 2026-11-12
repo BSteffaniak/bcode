@@ -7633,6 +7633,7 @@ fn handle_request_inner<'a>(
         SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
+            origin,
         } => Box::pin(async move {
             use bcode_session_models::SessionApplication as _;
             let result = Box::pin(
@@ -7640,6 +7641,7 @@ fn handle_request_inner<'a>(
                     bcode_session_models::CreateSessionRequest {
                         name,
                         working_directory,
+                        origin,
                     },
                 ),
             )
@@ -47428,6 +47430,7 @@ mod tests {
         );
 
         let missing = SessionSummary {
+            origin: None,
             automatic_title: None,
             automatic_title_source_sequence: None,
             parent_id: None,
@@ -107598,6 +107601,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         // Queue both mutations and EOF before starting the handler.
         for id in 1..=2 {
             let request = Request::CreateSession {
+                origin: None,
                 name: Some(format!("pipeline-{id}")),
                 working_directory: workspace.path().to_path_buf(),
             };
@@ -107779,6 +107783,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         for request in [
             SessionLifecycleRequest::Ping,
             SessionLifecycleRequest::CreateSession {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },

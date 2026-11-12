@@ -4068,12 +4068,32 @@ impl BcodeClient {
         name: Option<String>,
         working_directory: std::path::PathBuf,
     ) -> Result<SessionSummary, ClientError> {
+        self.create_session_with_origin(name, working_directory, None)
+            .await
+    }
+
+    /// Create a session in a specific working directory that records the creating application.
+    ///
+    /// The origin is written once in the session's creation event. It labels the session in
+    /// pickers and catalog filters and never grants access or changes how the session runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, or rejects the request, including an
+    /// origin outside the origin contract's bounds (`session_origin_invalid`).
+    pub async fn create_session_with_origin(
+        &self,
+        name: Option<String>,
+        working_directory: std::path::PathBuf,
+        origin: Option<bcode_session_models::SessionOrigin>,
+    ) -> Result<SessionSummary, ClientError> {
         let working_directory =
             resolve_path_from(Some(working_directory), &current_working_directory());
         match self
             .send_request(Request::CreateSession {
                 name,
                 working_directory,
+                origin,
             })
             .await?
         {
@@ -14629,6 +14649,7 @@ mod portable_application_adapter_tests {
         let created = bcode_session_models::SessionApplication::create_session(
             &client,
             bcode_session_models::CreateSessionRequest {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("relative"),
             },

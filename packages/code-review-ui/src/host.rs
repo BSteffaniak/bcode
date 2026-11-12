@@ -86,6 +86,49 @@ pub struct ExternalCommand {
     pub args: Vec<String>,
 }
 
+/// Application id recorded as the origin of every session the review creates.
+pub const REVIEW_SESSION_APP_ID: &str = "bcode.code-review";
+/// Picker label of review sessions.
+pub const REVIEW_SESSION_DISPLAY_NAME: &str = "Code review";
+
+/// What a review session is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSessionPurpose {
+    /// An inline question about a place in the diff.
+    Question,
+    /// The review assistant dock's conversation.
+    Assistant,
+}
+
+impl ReviewSessionPurpose {
+    /// Stable origin context value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+/// Origin recorded on a review session: the review app, the session's purpose and the review
+/// workspace it belongs to. The workspace id is left out when it exceeds the origin bounds.
+#[must_use]
+pub fn review_session_origin(
+    purpose: ReviewSessionPurpose,
+    workspace_id: &str,
+) -> bcode_session_models::SessionOrigin {
+    let origin = bcode_session_models::SessionOrigin::new(REVIEW_SESSION_APP_ID)
+        .with_display_name(REVIEW_SESSION_DISPLAY_NAME)
+        .with_context("purpose", purpose.as_str());
+    let with_workspace = origin.clone().with_context("workspace", workspace_id);
+    if !workspace_id.is_empty() && with_workspace.validate().is_ok() {
+        with_workspace
+    } else {
+        origin
+    }
+}
+
 /// Session view updates of a followed session. Dropping it stops following.
 #[derive(Debug)]
 pub struct SessionFollow {
@@ -102,8 +145,14 @@ pub trait ReviewHost: Send + Sync {
     /// comparing themes on every frame.
     fn theme_generation(&self) -> u64;
 
-    /// Create a Bcode session named `title` working in `working_directory`; returns its id.
-    fn create_session(&self, title: String, working_directory: PathBuf) -> HostFuture<String>;
+    /// Create a Bcode session named `title` working in `working_directory` and record `origin`
+    /// as the application that created it; returns its id.
+    fn create_session(
+        &self,
+        title: String,
+        working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> HostFuture<String>;
 
     /// Send `text` to `session_id` as a user message.
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()>;
@@ -362,13 +411,18 @@ impl ReviewHost for StandaloneHost {
         self.theme.lock().expect("theme lock").1
     }
 
-    fn create_session(&self, title: String, working_directory: PathBuf) -> HostFuture<String> {
+    fn create_session(
+        &self,
+        title: String,
+        working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> HostFuture<String> {
         let bcode = Arc::clone(&self.bcode);
         Box::pin(async move {
             bcode
                 .client()
                 .await?
-                .create_session_in_working_directory(Some(title), working_directory)
+                .create_session_with_origin(Some(title), working_directory, Some(origin))
                 .await
                 .map(|session| session.id.to_string())
                 .map_err(|error| bcode.failure(&error))

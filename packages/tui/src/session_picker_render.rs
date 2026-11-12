@@ -295,6 +295,7 @@ mod tests {
         for theme_id in ["terminal-native", "bcode-dark", "bcode-light"] {
             let theme = TuiTheme::for_theme_id(theme_id);
             let session = SessionSummary {
+                origin: None,
                 id: SessionId::new(),
                 parent_id: None,
                 name: Some("Design review".to_owned()),

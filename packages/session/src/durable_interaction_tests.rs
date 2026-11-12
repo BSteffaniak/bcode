@@ -252,6 +252,7 @@ async fn generic_append_rejects_durable_events_in_memory_and_sql_without_mutatio
         .unwrap();
     let mut created = event(id, 0, operation());
     created.kind = SessionEventKind::SessionCreated {
+        origin: None,
         name: None,
         working_directory: root.path().to_path_buf(),
     };
@@ -360,6 +361,7 @@ async fn prepare_terminal_fixture(
         .unwrap();
     let mut created = event(session, 0, operation());
     created.kind = SessionEventKind::SessionCreated {
+        origin: None,
         name: None,
         working_directory: root.to_path_buf(),
     };

@@ -60,6 +60,7 @@ fn verified_non_model_parent_does_not_hide_missing_execution_boundaries() {
     let empty = json!({"model_requests_observed":0,"complete_model_inputs_exported":false});
     let mut parent = event(SessionId::new(), 0);
     parent.kind = SessionEventKind::SessionCreated {
+        origin: None,
         name: None,
         working_directory: std::path::PathBuf::new(),
     };
@@ -149,6 +150,7 @@ fn cached_eof_fetches_appended_model_request_and_missing_capture_is_incomplete()
     let id = SessionId::new();
     let mut created = event(id, 0);
     created.kind = SessionEventKind::SessionCreated {
+        origin: None,
         name: None,
         working_directory: std::path::PathBuf::new(),
     };

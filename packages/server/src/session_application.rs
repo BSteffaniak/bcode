@@ -1143,10 +1143,11 @@ impl SessionApplication for SessionApplicationHandle<'_> {
                     )
                 })?,
         );
-        let session = Box::pin(session_operations::create(
+        let session = Box::pin(session_operations::create_with_origin(
             self.state,
             request.name,
             request.working_directory,
+            request.origin,
         ))
         .await
         .map_err(|error| failure(error.code(), error.message()))?;
@@ -1661,6 +1662,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let summary = application(&state)
                 .create_session(CreateSessionRequest {
+                    origin: None,
                     name: Some("typed session".to_owned()),
                     working_directory: directory.path().to_path_buf(),
                 })
@@ -1729,6 +1731,7 @@ mod tests {
         {
             let error = application(&state)
                 .create_session(CreateSessionRequest {
+                    origin: None,
                     name: None,
                     working_directory: PathBuf::from("relative"),
                 })
@@ -1816,6 +1819,7 @@ mod tests {
             let caller = ClientId::new();
             let session = application_for(&state, caller)
                 .create_session(CreateSessionRequest {
+                    origin: None,
                     name: None,
                     working_directory: std::env::current_dir().unwrap(),
                 })
@@ -1925,6 +1929,7 @@ mod tests {
             let caller = ClientId::new();
             let session = application_for(&state, caller)
                 .create_session(CreateSessionRequest {
+                    origin: None,
                     name: None,
                     working_directory: std::env::current_dir().unwrap(),
                 })
@@ -2091,6 +2096,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let session = application(&state)
                 .create_session(CreateSessionRequest {
+                    origin: None,
                     name: None,
                     working_directory: directory.path().to_path_buf(),
                 })
@@ -2141,6 +2147,7 @@ mod tests {
             let errors = [
                 application(&state)
                     .create_session(CreateSessionRequest {
+                        origin: None,
                         name: None,
                         working_directory: PathBuf::from("relative"),
                     })
@@ -2192,6 +2199,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let session = application(&state)
                 .create_session(CreateSessionRequest {
+                    origin: None,
                     name: None,
                     working_directory: directory.path().to_path_buf(),
                 })

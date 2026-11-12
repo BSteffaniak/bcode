@@ -2533,9 +2533,9 @@ impl ChatLoopState {
                     self.session_picker_launch_directory.clone(),
                 )
             },
-            query: bcode_session_models::SessionCatalogQuery {
-                text: Some(picker.filter().buffer().text().to_owned()),
-            },
+            query: super::session_picker::catalog_query_from_filter(
+                picker.filter().buffer().text(),
+            ),
             cursor: picker.catalog_cursor().cloned(),
         });
     }
@@ -8472,6 +8472,7 @@ mod scheduler_tests {
         let cursor = SessionCatalogCursor {
             scope: SessionDiscoveryScope::AllWorkingDirectories,
             query: SessionCatalogQuery {
+                origin: None,
                 text: Some("東京 query".to_owned()),
             },
             revision: 1,
@@ -8482,6 +8483,7 @@ mod scheduler_tests {
         assert!(picker.next_catalog_page());
         state.session_picker = Some(picker);
         let page = || SessionCatalogPage {
+            unclassified_origin_count: 0,
             sessions: Vec::new(),
             catalog_status: SessionCatalogStatus::Loaded,
             catalog_sources: Vec::new(),

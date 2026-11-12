@@ -310,6 +310,7 @@ mod child_monitor_tests;
 
 fn session_summary(session_id: SessionId) -> SessionSummary {
     SessionSummary {
+        origin: None,
         id: session_id,
         parent_id: None,
         name: Some("Opened session".to_owned()),
@@ -1682,6 +1683,7 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[]);
     app.apply_session_summary(&SessionSummary {
+        origin: None,
         id: session_id,
         parent_id: None,
         name: Some("Canonical title".to_owned()),
@@ -1713,6 +1715,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[]);
     app.apply_session_summary(&SessionSummary {
+        origin: None,
         id: session_id,
         parent_id: None,
         name: Some("A readable session title".to_owned()),
@@ -1948,6 +1951,7 @@ fn live_session_rename_overrides_attach_summary_title() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[]);
     app.apply_session_summary(&SessionSummary {
+        origin: None,
         id: session_id,
         parent_id: None,
         name: Some("Old title".to_owned()),
@@ -1985,6 +1989,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
             session_id,
             1,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("Visual parity work".to_owned()),
                 working_directory: "/tmp/bcode-tui-test".into(),
             },

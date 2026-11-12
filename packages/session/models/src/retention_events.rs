@@ -1030,9 +1030,21 @@ pub fn inspect_durable(
         SessionEventKind::SessionCreated {
             name,
             working_directory,
+            origin,
         } => {
             i.optional_text(name.as_ref(), 3)?;
             i.path(working_directory, 3)?;
+            i.nodes(1, 3)?;
+            if let Some(origin) = origin {
+                i.nodes(5, 4)?;
+                i.text(&origin.app_id, 5)?;
+                i.optional_text(origin.app_display_name.as_ref(), 5)?;
+                i.collection(origin.context.len(), 5)?;
+                for (key, value) in &origin.context {
+                    i.text(key, 6)?;
+                    i.text(value, 6)?;
+                }
+            }
         }
         SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }

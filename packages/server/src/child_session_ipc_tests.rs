@@ -79,6 +79,7 @@ async fn create_tree(
             &mut stream,
             1,
             Request::CreateSession {
+                origin: None,
                 name: Some("parent".into()),
                 working_directory: cwd.clone(),
             },

@@ -1672,6 +1672,9 @@ impl CreateSessionError {
             Self::Session(bcode_session::SessionError::StorageMigrationRequired { .. }) => {
                 "session_storage_migration_required"
             }
+            Self::Session(bcode_session::SessionError::InvalidOrigin(_)) => {
+                "session_origin_invalid"
+            }
             Self::Session(_) => "session_create_failed",
         }
     }
@@ -1689,6 +1692,9 @@ impl CreateSessionError {
             }
             Self::Session(bcode_session::SessionError::StorageMigrationRequired { .. }) => {
                 "session storage requires explicit migration before child creation"
+            }
+            Self::Session(bcode_session::SessionError::InvalidOrigin(_)) => {
+                "session origin is out of bounds: the app id must be 1-64 bytes of [a-z0-9._-], the display name at most 64 bytes, and the context at most 16 entries of 64-byte keys and 256-byte values"
             }
             Self::Session(_) => "session creation failed",
         }
@@ -2325,18 +2331,29 @@ pub async fn require_selected_location(
     Ok(())
 }
 
-/// Create and publish one canonical session without transport framing.
+/// Create and publish one canonical session without an origin.
+#[cfg(test)]
 pub async fn create(
     state: &ServerState,
     name: Option<String>,
     working_directory: PathBuf,
+) -> Result<SessionSummary, CreateSessionError> {
+    create_with_origin(state, name, working_directory, None).await
+}
+
+/// Create and publish one canonical session, recording the creating application when given.
+pub async fn create_with_origin(
+    state: &ServerState,
+    name: Option<String>,
+    working_directory: PathBuf,
+    origin: Option<bcode_session_models::SessionOrigin>,
 ) -> Result<SessionSummary, CreateSessionError> {
     if !working_directory.is_absolute() {
         return Err(CreateSessionError::WorkingDirectoryMustBeAbsolute);
     }
     let session = state
         .sessions
-        .create_session(name, working_directory)
+        .create_session_with_origin(name, working_directory, origin)
         .await?;
     state
         .session_catalog

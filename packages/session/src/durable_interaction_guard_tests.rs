@@ -104,6 +104,7 @@ async fn authority_loss_at_final_commit_check_rolls_back_events_and_projections(
         .unwrap();
     let mut created = event(session, 0, operation());
     created.kind = SessionEventKind::SessionCreated {
+        origin: None,
         name: None,
         working_directory: root.path().to_path_buf(),
     };

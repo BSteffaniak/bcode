@@ -1120,6 +1120,7 @@ mod tests {
             timestamp_ms: 1,
             provenance: None,
             kind: SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().into(),
             },
@@ -1190,6 +1191,7 @@ mod tests {
         };
         let kinds = [
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().into(),
             },

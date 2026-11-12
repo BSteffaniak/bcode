@@ -9,6 +9,7 @@ fn child_summary(
     parent_id: Option<SessionId>,
 ) -> bcode_session_models::SessionSummary {
     bcode_session_models::SessionSummary {
+        origin: None,
         id,
         parent_id,
         name: None,
@@ -457,6 +458,7 @@ async fn monitor_mouse_row_selects_and_chevron_expands_without_opening_session()
     let child = SessionId::new();
     let mut model = root_test_model_with_history(root, &[]);
     let summary = bcode_session_models::SessionSummary {
+        origin: None,
         id: child,
         parent_id: Some(root),
         name: Some("子 👩‍💻 e\u{301}".to_owned()),

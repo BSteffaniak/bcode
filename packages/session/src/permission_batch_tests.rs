@@ -27,6 +27,7 @@ async fn initialize(root: &std::path::Path, id: SessionId) -> SessionDb {
         id,
         0,
         SessionEventKind::SessionCreated {
+            origin: None,
             name: Some("permission batch".into()),
             working_directory: root.into(),
         },

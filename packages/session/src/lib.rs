@@ -622,6 +622,9 @@ pub enum SessionError {
     /// Background execution-session provenance is malformed or inconsistent.
     #[error("invalid execution session provenance: {0}")]
     InvalidExecutionSessionProvenance(String),
+    /// The requested session origin is outside the origin contract's bounds.
+    #[error("invalid session origin: {0}")]
+    InvalidOrigin(#[from] bcode_session_models::SessionOriginError),
     /// Session is owned by another daemon or cannot be leased.
     #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
@@ -1615,7 +1618,29 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
-        self.create_session_record(name, working_directory, None, None)
+        self.create_session_record(name, working_directory, None, None, None)
+            .await
+    }
+
+    /// Create a new session that records the application that created it.
+    ///
+    /// The origin is written once, inside the canonical creation event, and never changes.
+    /// It is descriptive only: it does not affect storage, execution or authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::InvalidOrigin`] when the origin is out of bounds, before anything
+    /// is persisted, or an error if the session-created event cannot be persisted.
+    pub async fn create_session_with_origin(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        origin: Option<bcode_session_models::SessionOrigin>,
+    ) -> Result<SessionSummary, SessionError> {
+        if let Some(origin) = &origin {
+            origin.validate()?;
+        }
+        self.create_session_record(name, working_directory, None, None, origin)
             .await
     }
 
@@ -1625,11 +1650,18 @@ impl SessionManager {
         working_directory: PathBuf,
         execution: Option<ExecutionSessionProvenance>,
         child: Option<bcode_session_models::SessionChildCreateRequest>,
+        origin: Option<bcode_session_models::SessionOrigin>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SessionSummary, SessionError>> + Send + '_>,
     > {
         // Erase the storage implementation's future type at its owning boundary.
-        Box::pin(self.create_session_record_inner(name, working_directory, execution, child))
+        Box::pin(self.create_session_record_inner(
+            name,
+            working_directory,
+            execution,
+            child,
+            origin,
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1639,6 +1671,7 @@ impl SessionManager {
         working_directory: PathBuf,
         execution: Option<ExecutionSessionProvenance>,
         child: Option<bcode_session_models::SessionChildCreateRequest>,
+        origin: Option<bcode_session_models::SessionOrigin>,
     ) -> Result<SessionSummary, SessionError> {
         let started_at = std::time::Instant::now();
         self.metrics
@@ -1675,6 +1708,7 @@ impl SessionManager {
                 })
             }),
             location: None,
+            origin: origin.clone(),
         };
         let state = SessionState {
             summary: summary.clone(),
@@ -1719,6 +1753,7 @@ impl SessionManager {
                 SessionEventKind::SessionCreated {
                     name,
                     working_directory,
+                    origin: origin.map(Box::new),
                 },
                 now_ms,
             )
@@ -1827,7 +1862,7 @@ impl SessionManager {
             }
         };
         validate_execution_session_provenance(Some(&provenance))?;
-        self.create_session_record(name, working_directory, Some(provenance), None)
+        self.create_session_record(name, working_directory, Some(provenance), None, None)
             .await
     }
 
@@ -1854,6 +1889,7 @@ impl SessionManager {
             name,
             worktree_directory.to_path_buf(),
             Some(provenance),
+            None,
             None,
         )
         .await
@@ -4346,6 +4382,7 @@ mod tests {
         coordinator.start();
         let session_id = SessionId::new();
         let summary = SessionSummary {
+            origin: None,
             parent_id: None,
             id: session_id,
             name: Some("deleted".to_owned()),
@@ -4388,6 +4425,7 @@ mod tests {
         coordinator.start();
         let session_id = SessionId::new();
         let summary = SessionSummary {
+            origin: None,
             parent_id: None,
             id: session_id,
             name: Some("deleted".to_owned()),
@@ -4837,6 +4875,7 @@ mod tests {
             let sequence = u64::try_from(sequence).expect("benchmark sequence fits");
             let kind = if sequence == 0 {
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some(format!("migration benchmark {}", profile.name())),
                     working_directory: test_working_directory(),
                 }
@@ -9376,6 +9415,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_origin_survives_restart_and_cache_loss_without_backfill() {
+        let root = unique_temp_dir();
+        let origin = bcode_session_models::SessionOrigin::new("bdata")
+            .with_display_name("bdata")
+            .with_context("connection", "prod-replica");
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should initialize");
+            let session = manager
+                .create_session_with_origin(
+                    Some("app session".to_owned()),
+                    test_working_directory(),
+                    Some(origin.clone()),
+                )
+                .await
+                .expect("session");
+            assert_eq!(session.origin.as_ref(), Some(&origin));
+            manager.flush_catalog_updates().await;
+            manager.shutdown_catalog_updates().await;
+            session.id
+        };
+
+        let restarted = SessionManager::persistent(&root).expect("manager should restore");
+        let listed = restarted
+            .all_session_summaries()
+            .await
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .expect("listed after restart");
+        assert_eq!(listed.origin.as_ref(), Some(&origin));
+        restarted.flush_catalog_updates().await;
+        restarted.shutdown_catalog_updates().await;
+        drop(restarted);
+
+        std::fs::remove_file(db::session_dir_path(&root, session_id).join("manifest.json"))
+            .expect("remove manifest");
+        std::fs::remove_file(db::global_catalog_db_path(&root)).expect("remove catalog");
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let listed = restored
+            .all_session_summaries()
+            .await
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .expect("missing caches must not hide the session");
+        assert_eq!(
+            listed.origin, None,
+            "listing never replays to recover origin"
+        );
+        restored
+            .append_user_message(session_id, ClientId::new(), "continue".to_owned())
+            .await
+            .expect("canonical database should load for writing");
+        let loaded = restored
+            .session_summary(session_id)
+            .await
+            .expect("loaded summary");
+        assert_eq!(
+            loaded.origin.as_ref(),
+            Some(&origin),
+            "opening reads origin from the creation event"
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn invalid_session_origin_is_rejected_before_anything_is_persisted() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let error = manager
+            .create_session_with_origin(
+                None,
+                test_working_directory(),
+                Some(bcode_session_models::SessionOrigin::new("Not Valid")),
+            )
+            .await
+            .expect_err("invalid origin");
+        assert!(matches!(error, SessionError::InvalidOrigin(_)), "{error}");
+        assert_eq!(manager.all_session_summaries().await.len(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn background_origin_sessions_are_hidden_from_pickers_but_open_directly() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session_with_origin(
+                None,
+                test_working_directory(),
+                Some(
+                    bcode_session_models::SessionOrigin::new("bdata")
+                        .with_visibility(SessionVisibility::Background),
+                ),
+            )
+            .await
+            .expect("session");
+        assert!(!session.is_picker_visible());
+        let opened = manager
+            .session_summary(session.id)
+            .await
+            .expect("background origin session opens directly");
+        assert_eq!(opened.id, session.id);
+        assert!(!opened.is_picker_visible());
+    }
+
+    #[tokio::test]
     async fn unreadable_manifest_and_catalog_cache_do_not_hide_canonical_database() {
         let root = unique_temp_dir();
         let session_id = {
@@ -10217,6 +10360,7 @@ mod tests {
                 0,
                 "SessionCreated",
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some("created".to_string()),
                     working_directory: test_working_directory(),
                 },

@@ -2263,6 +2263,7 @@ mod text_update_retention_tests {
             copies: 4,
         };
         let mut summary = bcode_session_models::SessionSummary {
+            origin: None,
             parent_id: None,
             id: SessionId::new(),
             name: Some("legacy".to_owned()),
@@ -4228,6 +4229,7 @@ mod text_update_retention_tests {
             timestamp_ms: 0,
             provenance: None,
             kind: SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("new title".into()),
                 working_directory: "/new".into(),
             },
@@ -10119,6 +10121,7 @@ impl SessionView {
             ObservationRetentionExceeded, ObservationRetentionUsage,
         };
         let SessionEventKind::SessionCreated {
+            origin: _,
             name,
             working_directory,
         } = &event.kind
@@ -10308,6 +10311,7 @@ impl SessionView {
 
         match &event.kind {
             SessionEventKind::SessionCreated {
+                origin: _,
                 name,
                 working_directory,
             } => {
@@ -19135,6 +19139,7 @@ mod tests {
             session_id,
             1,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/tmp"),
             },
@@ -19794,6 +19799,7 @@ mod tests {
                 session_id,
                 1,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some("deterministic".to_owned()),
                     working_directory: PathBuf::from("/tmp/deterministic"),
                 },
@@ -22523,6 +22529,7 @@ mod tests {
                 session_id,
                 1,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: None,
                     working_directory: PathBuf::from("/tmp/project"),
                 },
@@ -23567,6 +23574,7 @@ mod tests {
                 session_id,
                 1,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: None,
                     working_directory: PathBuf::from("/tmp/project"),
                 },
@@ -27186,6 +27194,7 @@ mod tests {
                 session_id,
                 1,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: None,
                     working_directory: PathBuf::from("/tmp/project"),
                 },

@@ -62,6 +62,7 @@ pub struct ScriptedHost {
     spawned: AtomicUsize,
     session_views: Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<SessionViewFollowUpdate>>>,
     sessions: Mutex<Vec<(String, String)>>,
+    session_origins: Mutex<Vec<bcode_session_models::SessionOrigin>>,
     messages: Mutex<Vec<(String, String)>>,
     session_failure: Mutex<Option<String>>,
     permissions: Mutex<Vec<(String, bool, bool)>>,
@@ -112,6 +113,7 @@ impl ScriptedHost {
             spawned: AtomicUsize::new(0),
             session_views: Mutex::new(BTreeMap::new()),
             sessions: Mutex::default(),
+            session_origins: Mutex::default(),
             messages: Mutex::default(),
             session_failure: Mutex::default(),
             permissions: Mutex::default(),
@@ -199,6 +201,16 @@ impl ScriptedHost {
     #[must_use]
     pub fn sessions(&self) -> Vec<(String, String)> {
         self.sessions.lock().expect("sessions lock").clone()
+    }
+
+    /// Origins recorded on session creation requests so far, in request order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    #[must_use]
+    pub fn session_origins(&self) -> Vec<bcode_session_models::SessionOrigin> {
+        self.session_origins.lock().expect("origins lock").clone()
     }
 
     /// Messages sent so far: `(session id, text)`.
@@ -356,7 +368,16 @@ impl ReviewHost for ScriptedHost {
         0
     }
 
-    fn create_session(&self, title: String, _working_directory: PathBuf) -> HostFuture<String> {
+    fn create_session(
+        &self,
+        title: String,
+        _working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> HostFuture<String> {
+        self.session_origins
+            .lock()
+            .expect("origins lock")
+            .push(origin);
         let failure = self.session_failure.lock().expect("failure lock").clone();
         if let Some(message) = failure {
             return Box::pin(async move { Err(HostError::failed(message)) });

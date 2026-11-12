@@ -278,6 +278,15 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Descriptive record of the application that created a session.
+pub mod origin;
+pub use origin::{
+    MAX_SESSION_ORIGIN_APP_ID_BYTES, MAX_SESSION_ORIGIN_CONTEXT_ENTRIES,
+    MAX_SESSION_ORIGIN_CONTEXT_KEY_BYTES, MAX_SESSION_ORIGIN_CONTEXT_VALUE_BYTES,
+    MAX_SESSION_ORIGIN_DISPLAY_NAME_BYTES, SESSION_ORIGIN_VERSION, SessionOrigin,
+    SessionOriginError, SessionOriginFilter,
+};
+
 /// Read-only discovery selection; does not change session execution context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -293,6 +302,10 @@ pub enum SessionDiscoveryScope {
 pub struct SessionCatalogQuery {
     /// Case-insensitive title or working-directory substring.
     pub text: Option<String>,
+    /// Only sessions whose recorded origin matches. Sessions without a readable origin never
+    /// match and are counted as unclassified on the page.
+    #[serde(default)]
+    pub origin: Option<SessionOriginFilter>,
 }
 
 /// Stable activity-order boundary for bounded catalog pagination.
@@ -347,6 +360,10 @@ pub struct SessionCatalogPage {
     pub catalog_revision: u64,
     /// Continue, or restart with no cursor. No total-result ceiling is imposed.
     pub next_cursor: Option<SessionCatalogCursor>,
+    /// Examined candidates that an origin filter could not classify because their origin cache
+    /// was unreadable. Zero when the query has no origin filter.
+    #[serde(default)]
+    pub unclassified_origin_count: usize,
 }
 
 /// Session catalog discovery status, versioned by the enclosing application protocol.
@@ -2139,6 +2156,10 @@ pub struct SessionSummary {
     /// Owning state location, when aggregated discovery spans more than one location.
     #[serde(default)]
     pub location: Option<SessionLocationSummary>,
+    /// Application that created the session, when one was recorded. Display and filter data
+    /// only; it never confers authority.
+    #[serde(default)]
+    pub origin: Option<SessionOrigin>,
 }
 
 impl SessionSummary {
@@ -2162,6 +2183,10 @@ impl SessionSummary {
         self.execution
             .as_ref()
             .is_none_or(|execution| matches!(execution.visibility, SessionVisibility::Visible))
+            && self
+                .origin
+                .as_ref()
+                .is_none_or(|origin| matches!(origin.visibility, SessionVisibility::Visible))
     }
 
     /// Return the best user-visible title for this session.
@@ -4905,6 +4930,10 @@ pub enum SessionEventKind {
         name: Option<String>,
         #[serde(default)]
         working_directory: PathBuf,
+        /// Application that created the session. Recorded only here, so it is immutable and
+        /// sits in the bounded creation prefix.
+        #[serde(default)]
+        origin: Option<Box<SessionOrigin>>,
     },
     ClientAttached {
         client_id: ClientId,

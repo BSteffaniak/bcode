@@ -557,6 +557,7 @@ impl SessionManager {
             session_id: destination_id,
             provenance: None,
             kind: SessionEventKind::SessionCreated {
+                origin: None,
                 name: request.destination_name.clone(),
                 working_directory: request
                     .destination_working_directory

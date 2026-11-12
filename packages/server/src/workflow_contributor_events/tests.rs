@@ -197,6 +197,7 @@ fn discovery_ignores_non_tool_events_but_advances_over_them() {
         id,
         0,
         SessionEventKind::SessionCreated {
+            origin: None,
             name: Some("private session title".into()),
             working_directory: "/private".into(),
         },

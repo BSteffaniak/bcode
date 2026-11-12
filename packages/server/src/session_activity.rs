@@ -376,6 +376,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },
@@ -421,6 +422,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },
@@ -448,6 +450,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },
@@ -492,6 +495,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },
@@ -578,6 +582,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },
@@ -619,6 +624,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("/"),
             },

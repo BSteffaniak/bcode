@@ -660,6 +660,7 @@ mod tests {
             session_id,
             0,
             bcode_session_models::SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("doctor immutability".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -835,6 +836,7 @@ mod tests {
                 session_id,
                 0,
                 bcode_session_models::SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some("strict".to_string()),
                     working_directory: temp_dir.path().to_path_buf(),
                 },

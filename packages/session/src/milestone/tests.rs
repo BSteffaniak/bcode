@@ -302,6 +302,7 @@ async fn initialized_session() -> (tempfile::TempDir, SessionDb, u64) {
         &db,
         &mut sequence,
         SessionEventKind::SessionCreated {
+            origin: None,
             name: None,
             working_directory: root.path().into(),
         },

@@ -319,6 +319,12 @@ fn ai_answers_follow_up_copy_suggest_draft_and_decide_suggestions() {
     let sessions = setup.backend.sessions();
     assert_eq!(sessions.len(), 1);
     let session = sessions[0].0.clone();
+    let origin = &setup.backend.session_origins()[0];
+    assert_eq!(origin.app_id, "bcode.code-review");
+    assert_eq!(
+        origin.context.get("purpose").map(String::as_str),
+        Some("question")
+    );
     assert!(
         setup.backend.messages()[0]
             .1

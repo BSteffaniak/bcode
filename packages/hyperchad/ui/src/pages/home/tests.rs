@@ -478,6 +478,7 @@ fn semantic_component_identities_are_stable_bounded_and_order_independent() {
         let mut values = [session_a, session_b]
             .into_iter()
             .map(|id| bcode_session_models::SessionSummary {
+                origin: None,
                 id,
                 name: Some(format!("session {id}")),
                 explicit_name: None,
@@ -1291,6 +1292,7 @@ fn application_shell_declares_canonical_tablet_and_narrow_layouts() {
 #[test]
 fn session_navigation_marks_selected_active_and_idle_sessions() {
     let selected = bcode_session_models::SessionSummary {
+        origin: None,
         id: bcode_session_models::SessionId::new(),
         name: Some("Selected session".to_owned()),
         explicit_name: None,
@@ -1407,6 +1409,7 @@ fn opaque_action_context_is_propagated_to_all_forms() {
 #[test]
 fn opaque_session_context_is_propagated_to_navigation() {
     let session = bcode_session_models::SessionSummary {
+        origin: None,
         id: bcode_session_models::SessionId::new(),
         name: Some("session".to_owned()),
         explicit_name: None,

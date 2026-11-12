@@ -619,6 +619,8 @@ enum PersistedSessionEventKind {
         name: Option<String>,
         #[serde(default)]
         working_directory: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Box<bcode_session_models::SessionOrigin>>,
     },
     ClientAttached {
         client_id: ClientId,
@@ -1120,9 +1122,11 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::SessionCreated {
                 name,
                 working_directory,
+                origin,
             } => Self::SessionCreated {
                 name: name.clone(),
                 working_directory: working_directory.clone(),
+                origin: origin.clone(),
             },
             SessionEventKind::ClientAttached { client_id } => Self::ClientAttached {
                 client_id: *client_id,
@@ -1649,9 +1653,11 @@ impl PersistedSessionEventKind {
             Self::SessionCreated {
                 name,
                 working_directory,
+                origin,
             } => SessionEventKind::SessionCreated {
                 name,
                 working_directory,
+                origin,
             },
             Self::ClientAttached { client_id } => SessionEventKind::ClientAttached { client_id },
             Self::ClientDetached { client_id } => SessionEventKind::ClientDetached { client_id },

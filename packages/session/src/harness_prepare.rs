@@ -279,6 +279,7 @@ impl crate::SessionManager {
                 session_id: owner.session_id,
                 provenance: None,
                 kind: SessionEventKind::SessionCreated {
+                    origin: None,
                     name: None,
                     working_directory: cwd.to_path_buf(),
                 },

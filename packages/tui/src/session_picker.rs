@@ -934,6 +934,35 @@ fn search_result_item(
     ])
 }
 
+/// Filter prefix that selects sessions by the application that created them.
+const ORIGIN_FILTER_PREFIX: &str = "origin:";
+
+/// Split picker filter text into an origin filter (`origin:<app id>`) and free text.
+///
+/// The remaining words are the catalog text query. An `origin:` token without a value is
+/// ignored rather than matching nothing.
+#[must_use]
+pub fn catalog_query_from_filter(filter: &str) -> bcode_session_models::SessionCatalogQuery {
+    let (origin, text) = split_origin_filter(filter);
+    bcode_session_models::SessionCatalogQuery {
+        text: Some(text),
+        origin: origin.map(bcode_session_models::SessionOriginFilter::app),
+    }
+}
+
+fn split_origin_filter(filter: &str) -> (Option<String>, String) {
+    let mut origin = None;
+    let mut words = Vec::new();
+    for word in filter.split_whitespace() {
+        match word.strip_prefix(ORIGIN_FILTER_PREFIX) {
+            Some(app_id) if !app_id.is_empty() => origin = Some(app_id.to_ascii_lowercase()),
+            Some(_) => {}
+            None => words.push(word),
+        }
+    }
+    (origin, words.join(" "))
+}
+
 fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
     let name = session.display_title();
     let display_name = session.import.as_ref().map_or_else(
@@ -946,6 +975,10 @@ fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
             }
         },
     );
+    let display_name = match &session.origin {
+        Some(origin) => format!("[{}] {display_name}", origin.label()),
+        None => display_name,
+    };
     let id = session.id.to_string();
     let cwd = display_from_current_dir(&session.working_directory).to_string();
     let mut spans = vec![
@@ -987,10 +1020,23 @@ fn session_location_label(session: &SessionSummary) -> Option<String> {
 }
 
 fn session_matches(session: &SessionSummary, query: &str) -> bool {
+    let (origin, text) = split_origin_filter(query);
+    if let Some(app_id) = origin
+        && !bcode_session_models::SessionOriginFilter::app(app_id).matches(session.origin.as_ref())
+    {
+        return false;
+    }
+    session_text_matches(session, &text)
+}
+
+fn session_text_matches(session: &SessionSummary, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     session.display_title().to_ascii_lowercase().contains(query)
+        || session.origin.as_ref().is_some_and(|origin| {
+            origin.app_id.contains(query) || origin.label().to_ascii_lowercase().contains(query)
+        })
         || session.id.to_string().contains(query)
         || session.import.as_ref().is_some_and(|import| {
             import.source_id.to_ascii_lowercase().contains(query)
@@ -1062,6 +1108,7 @@ mod tests {
 
     fn summary(title: &str, working_directory: &str) -> SessionSummary {
         SessionSummary {
+            origin: None,
             id: SessionId::new(),
             parent_id: None,
             name: Some(title.to_owned()),
@@ -1282,6 +1329,35 @@ mod tests {
             .expect("ambiguity must always be surfaced");
         assert!(label.contains("ambiguous"), "{label}");
         assert!(label.contains("maintenance"), "{label}");
+    }
+
+    #[test]
+    fn app_sessions_carry_an_origin_chip_and_filter_by_origin() {
+        let mut app_session = summary("query plan", "/tmp/workspace");
+        app_session.origin =
+            Some(bcode_session_models::SessionOrigin::new("bdata").with_display_name("bdata app"));
+        let native = summary("query plan", "/tmp/workspace");
+
+        let text = super::session_item(&app_session, Style::new())
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(text.starts_with("[bdata app] query plan"), "{text}");
+
+        assert!(super::session_matches(&app_session, "origin:bdata"));
+        assert!(super::session_matches(&app_session, "origin:bdata query"));
+        assert!(!super::session_matches(&app_session, "origin:bdata other"));
+        assert!(!super::session_matches(&native, "origin:bdata"));
+        assert!(super::session_matches(&app_session, "bdata app"));
+
+        let query = super::catalog_query_from_filter("origin:BData  query plan");
+        assert_eq!(query.text.as_deref(), Some("query plan"));
+        assert_eq!(
+            query.origin,
+            Some(bcode_session_models::SessionOriginFilter::app("bdata"))
+        );
+        assert_eq!(super::catalog_query_from_filter("origin: x").origin, None);
     }
 
     #[test]

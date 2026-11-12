@@ -353,7 +353,14 @@ impl ReviewSurface {
             let result = async {
                 let session = services
                     .host()
-                    .create_session(title, repo.clone())
+                    .create_session(
+                        title,
+                        repo.clone(),
+                        crate::host::review_session_origin(
+                            crate::host::ReviewSessionPurpose::Assistant,
+                            &template.workspace.id,
+                        ),
+                    )
                     .await
                     .map_err(|error| error.message)?;
                 services

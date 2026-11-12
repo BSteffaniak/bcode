@@ -255,7 +255,11 @@ impl SessionCatalog {
                     after: Some(candidate.position),
                 });
         let mut sessions = Vec::new();
+        let mut unclassified_origin_count = 0;
         for (index, candidate) in candidates {
+            if candidate.summary.is_none() && query.origin.is_some() {
+                unclassified_origin_count += 1;
+            }
             if let Some(mut session) = candidate.summary {
                 if let Some(location) = locations.get(index) {
                     session.location = Some(location.summary());
@@ -269,8 +273,11 @@ impl SessionCatalog {
             }
         }
         let text = query.text.as_ref().map(|text| text.to_lowercase());
-        sessions.retain(|session| catalog_summary_matches(session, &scope, text.as_deref()));
+        sessions.retain(|session| {
+            catalog_summary_matches(session, &scope, text.as_deref(), query.origin.as_ref())
+        });
         Ok(SessionCatalogPage {
+            unclassified_origin_count,
             sessions,
             catalog_status: if degraded || local_import_gap {
                 SessionCatalogStatus::Degraded("native catalog requires maintenance or local imports require the compatibility listing API".into())
@@ -1355,6 +1362,7 @@ fn importable_to_summary(
             .unwrap_or_else(|| summary.external_session_id.clone()),
     );
     SessionSummary {
+        origin: None,
         automatic_title: None,
         automatic_title_source_sequence: None,
         parent_id: None,
@@ -1431,8 +1439,10 @@ fn catalog_summary_matches(
     session: &SessionSummary,
     scope: &bcode_session_models::SessionDiscoveryScope,
     text: Option<&str>,
+    origin: Option<&bcode_session_models::SessionOriginFilter>,
 ) -> bool {
     session.is_picker_visible()
+        && origin.is_none_or(|filter| filter.matches(session.origin.as_ref()))
         && match scope {
             bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories => true,
             bcode_session_models::SessionDiscoveryScope::WorkingDirectory(path) => {
@@ -1459,6 +1469,11 @@ fn validate_catalog_selection(
 ) -> Result<(), String> {
     if !(1..=256).contains(&limit) || query.text.as_ref().is_some_and(|text| text.len() > 4096) {
         return Err("catalog page limit must be 1..=256 and query at most 4096 bytes".into());
+    }
+    if let Some(filter) = &query.origin {
+        filter
+            .validate()
+            .map_err(|error| format!("invalid catalog origin filter: {error}"))?;
     }
     if let bcode_session_models::SessionDiscoveryScope::WorkingDirectory(path) = scope
         && !path.is_absolute()
@@ -1539,6 +1554,140 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(next.sessions[0].id, last.sessions[0].id);
+        drop(state);
+    }
+
+    fn single_location_state(root: &std::path::Path) -> std::sync::Arc<crate::ServerState> {
+        let config = bcode_config::StateConfig {
+            root: Some(root.to_path_buf()),
+            sessions_root: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let mut raw =
+            crate::tests::test_server_state(bcode_session::SessionManager::persistent_lazy(root));
+        raw.locations = Some(
+            bcode_config::resolve_state_location_set(
+                &config,
+                &bcode_config::StateLocationSelection::default(),
+            )
+            .unwrap(),
+        );
+        raw.daemon_status.state_location_id = raw
+            .locations
+            .as_ref()
+            .map(|locations| locations.primary().id().as_str().to_owned());
+        std::sync::Arc::new(raw)
+    }
+
+    /// Page through every candidate; returns sorted ids and the summed unclassified count.
+    async fn collect_global_pages(
+        state: &std::sync::Arc<crate::ServerState>,
+        query: bcode_session_models::SessionCatalogQuery,
+    ) -> (Vec<SessionId>, usize) {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        let mut unclassified = 0;
+        loop {
+            let page = state
+                .session_catalog
+                .page_with_scope(
+                    state,
+                    bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                    query.clone(),
+                    cursor,
+                    2,
+                )
+                .await
+                .unwrap();
+            unclassified += page.unclassified_origin_count;
+            ids.extend(page.sessions.into_iter().map(|session| session.id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        ids.sort();
+        (ids, unclassified)
+    }
+
+    #[tokio::test]
+    async fn origin_filters_page_by_app_and_report_unclassified_candidates() {
+        use bcode_session_models::{
+            SessionCatalogQuery, SessionOrigin, SessionOriginFilter, SessionVisibility,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let manager = bcode_session::SessionManager::persistent(root.path()).unwrap();
+        let bdata = SessionOrigin::new("bdata").with_context("connection", "prod");
+        let mut created = Vec::new();
+        for origin in [
+            Some(bdata.clone()),
+            None,
+            Some(SessionOrigin::new("bcode.code-review")),
+            Some(bdata.clone().with_context("connection", "dev")),
+            Some(bdata.clone().with_visibility(SessionVisibility::Background)),
+            Some(bdata.clone()),
+        ] {
+            created.push(
+                manager
+                    .create_session_with_origin(None, root.path().to_path_buf(), origin)
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        manager.flush_catalog_updates().await;
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+        // The last bdata session's manifest is damaged, so its origin cannot be classified.
+        let damaged = root
+            .path()
+            .join(created[5].to_string())
+            .join("manifest.json");
+        std::fs::write(damaged, b"damaged").unwrap();
+        let state = single_location_state(root.path());
+        let sorted = |indices: &[usize]| {
+            let mut ids = indices
+                .iter()
+                .map(|index| created[*index])
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let by_origin = |filter: SessionOriginFilter| SessionCatalogQuery {
+            text: None,
+            origin: Some(filter),
+        };
+
+        let (ids, unclassified) =
+            collect_global_pages(&state, by_origin(SessionOriginFilter::app("bdata"))).await;
+        assert_eq!(
+            ids,
+            sorted(&[0, 3]),
+            "background sessions stay out of pickers"
+        );
+        assert_eq!(unclassified, 1);
+        let prod = SessionOriginFilter::app("bdata").with_context("connection", "prod");
+        assert_eq!(
+            collect_global_pages(&state, by_origin(prod)).await.0,
+            sorted(&[0])
+        );
+        let (ids, unclassified) =
+            collect_global_pages(&state, SessionCatalogQuery::default()).await;
+        assert_eq!(ids, sorted(&[0, 1, 2, 3]));
+        assert_eq!(unclassified, 0, "unfiltered pages classify nothing");
+        assert!(
+            state
+                .session_catalog
+                .page_with_scope(
+                    &state,
+                    bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                    by_origin(SessionOriginFilter::app("Not Valid")),
+                    None,
+                    2,
+                )
+                .await
+                .is_err()
+        );
         drop(state);
     }
 
@@ -1660,6 +1809,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::tests::test_server_state(manager));
         let scope = SessionDiscoveryScope::AllWorkingDirectories;
         let query = SessionCatalogQuery {
+            origin: None,
             text: Some("not-a-session-title".into()),
         };
         let page = state
@@ -1786,6 +1936,7 @@ mod tests {
                     &state,
                     SessionDiscoveryScope::AllWorkingDirectories,
                     SessionCatalogQuery {
+                        origin: None,
                         text: Some(first.id.to_string())
                     },
                     None,
@@ -2946,6 +3097,7 @@ mod tests {
 
     fn summary(id: SessionId, location: Option<SessionLocationSummary>) -> SessionSummary {
         SessionSummary {
+            origin: None,
             automatic_title: None,
             automatic_title_source_sequence: None,
             parent_id: None,

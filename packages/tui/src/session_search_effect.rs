@@ -472,6 +472,7 @@ mod tests {
         };
 
         let mut summary = bcode_session_models::SessionSummary {
+            origin: None,
             id: session_id,
             parent_id: None,
             name: Some("Canonical title".to_owned()),

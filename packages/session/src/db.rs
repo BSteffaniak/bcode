@@ -432,6 +432,11 @@ pub struct SessionDbState {
     /// Immutable ordinary-session parent, independent of execution provenance.
     pub parent_id: Option<SessionId>,
     pub execution: Option<ExecutionSessionProvenance>,
+    /// Application that created the session, read from the creation event.
+    ///
+    /// `None` when no origin was recorded or the creation event cannot be decoded; an
+    /// unreadable origin never hides or fails the session.
+    pub origin: Option<bcode_session_models::SessionOrigin>,
 }
 
 /// Typed transcript projection row stored in a per-session database.
@@ -2059,6 +2064,7 @@ impl SessionDb {
             optional_string(&row, "reasoning_by_model")
                 .as_deref()
                 .map_or_else(Default::default, decode_reasoning_by_model);
+        let origin = self.creation_origin().await;
         Ok(Some(SessionDbState {
             session_id: row_session_id,
             last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
@@ -2097,6 +2103,7 @@ impl SessionDb {
                     column: "parent_id".into(),
                 })?,
             execution,
+            origin,
         }))
     }
 
@@ -5265,6 +5272,26 @@ impl SessionDb {
         Ok(items)
     }
 
+    /// Return the origin recorded in the session's creation event, if any.
+    ///
+    /// This is one bounded point read of the first canonical event. It never replays history,
+    /// and a missing or undecodable creation event yields `None` rather than an error.
+    pub async fn creation_origin(&self) -> Option<bcode_session_models::SessionOrigin> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await
+            .ok()??;
+        match strict_event_from_row(&row, self.session_id).ok()?.kind {
+            SessionEventKind::SessionCreated { origin, .. } => origin.map(|origin| *origin),
+            _ => None,
+        }
+    }
+
     /// Return the first canonical event sequence, if any.
     ///
     /// # Errors
@@ -7131,6 +7158,7 @@ async fn project_event(
         SessionEventKind::SessionCreated {
             name,
             working_directory,
+            ..
         } => {
             db.upsert("session_state")
                 .value("session_id", event.session_id.to_string())
@@ -8319,6 +8347,7 @@ mod tests {
                 id,
                 sequence,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: None,
                     working_directory: root.path().to_path_buf(),
                 },
@@ -8335,6 +8364,7 @@ mod tests {
             id,
             i64::MAX.cast_unsigned(),
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().to_path_buf(),
             },
@@ -8378,6 +8408,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().to_path_buf(),
             },
@@ -8615,6 +8646,14 @@ mod tests {
         )
     }
 
+    fn session_created(working_directory: &std::path::Path) -> SessionEventKind {
+        SessionEventKind::SessionCreated {
+            name: None,
+            working_directory: working_directory.into(),
+            origin: None,
+        }
+    }
+
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -8680,6 +8719,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: std::path::PathBuf::from("."),
             },
@@ -8720,6 +8760,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("target API".to_owned()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -8748,6 +8789,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("target API".to_owned()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -9251,6 +9293,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("opaque migration".to_owned()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -9378,6 +9421,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("test".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -9484,6 +9528,7 @@ mod tests {
                     session_id,
                     0,
                     SessionEventKind::SessionCreated {
+                        origin: None,
                         name: Some("batch".to_owned()),
                         working_directory: temp_dir.path().to_path_buf(),
                     },
@@ -9564,6 +9609,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("test".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -10850,6 +10896,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: None,
                     working_directory: std::path::PathBuf::from("."),
                 },
@@ -11370,6 +11417,7 @@ mod tests {
             (
                 0,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some("projection".to_string()),
                     working_directory: temp_dir.path().to_path_buf(),
                 },
@@ -11466,6 +11514,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -11632,6 +11681,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("writer contract".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -11708,6 +11758,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some("missing contract".to_string()),
                     working_directory: temp_dir.path().to_path_buf(),
                 },
@@ -11801,6 +11852,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("projection".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -11850,6 +11902,7 @@ mod tests {
                 session_id,
                 0,
                 SessionEventKind::SessionCreated {
+                    origin: None,
                     name: Some("snapshot".to_string()),
                     working_directory: temp_dir.path().to_path_buf(),
                 },
@@ -12012,16 +12065,9 @@ mod tests {
         let db = SessionDb::open_turso_in_root(id, root.path())
             .await
             .unwrap();
-        db.append_event(&event(
-            id,
-            0,
-            SessionEventKind::SessionCreated {
-                name: None,
-                working_directory: root.path().into(),
-            },
-        ))
-        .await
-        .unwrap();
+        db.append_event(&event(id, 0, session_created(root.path())))
+            .await
+            .unwrap();
         let original = bcode_session_models::OriginalUsage {
             provider_id:"provider".into(),api_shape:"responses".into(),complete:true,
             reports:vec![bcode_session_models::OriginalUsageReport { source:"response.completed".into(),usage_json:r#"{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cache_write_tokens":80},"future":123456789012345678901234567890}"#.into(),confirmed:BTreeMap::new() }],..Default::default()
@@ -12200,16 +12246,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = SessionId::new();
         let db = SessionDb::open_turso_in_root(id, dir.path()).await.unwrap();
-        db.append_event(&event(
-            id,
-            0,
-            SessionEventKind::SessionCreated {
-                name: None,
-                working_directory: dir.path().into(),
-            },
-        ))
-        .await
-        .unwrap();
+        db.append_event(&event(id, 0, session_created(dir.path())))
+            .await
+            .unwrap();
         let legacy = event(
             id,
             1,
@@ -12309,6 +12348,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: dir.path().into(),
             },
@@ -12356,6 +12396,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: dir.path().into(),
             },
@@ -12449,6 +12490,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: dir.path().into(),
             },
@@ -12557,6 +12599,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -12621,6 +12664,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -12769,6 +12813,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("projection".to_owned()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -13527,6 +13572,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("projection".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -13571,6 +13617,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("read immutability".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -13821,6 +13868,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -14156,6 +14204,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -14344,6 +14393,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("projection".to_string()),
                 working_directory: temp_dir.path().to_path_buf(),
             },
@@ -14412,6 +14462,7 @@ mod tests {
                     session_id,
                     sequence,
                     SessionEventKind::SessionCreated {
+                        origin: None,
                         name: Some(format!("irrelevant-{sequence}")),
                         working_directory: temp_dir.path().to_path_buf(),
                     },
@@ -14834,6 +14885,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().to_path_buf(),
             },
@@ -14897,6 +14949,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().to_path_buf(),
             },
@@ -15119,6 +15172,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("crash history 世界".repeat(20_000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15172,6 +15226,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("cancel".repeat(20_000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15228,6 +15283,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("compressible".repeat(2000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15311,6 +15367,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("rollback".repeat(10_000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15360,6 +15417,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("old".repeat(20_000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15439,6 +15497,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("history".repeat(10_000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15698,6 +15757,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().to_path_buf(),
             },
@@ -15792,6 +15852,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("future representation".repeat(1000)),
                 working_directory: root.path().to_path_buf(),
             },
@@ -15843,6 +15904,7 @@ mod tests {
             id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: None,
                 working_directory: root.path().to_path_buf(),
             },
@@ -15920,6 +15982,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("artifact projection".to_owned()),
                 working_directory: std::path::PathBuf::from("/tmp"),
             },
@@ -15997,6 +16060,7 @@ mod tests {
             session_id,
             0,
             SessionEventKind::SessionCreated {
+                origin: None,
                 name: Some("artifact projection".to_owned()),
                 working_directory: std::path::PathBuf::from("/tmp"),
             },
@@ -16047,6 +16111,7 @@ mod tests {
                     session_id,
                     0,
                     SessionEventKind::SessionCreated {
+                        origin: None,
                         name: Some("legacy".to_owned()),
                         working_directory: std::path::PathBuf::from("/tmp"),
                     },

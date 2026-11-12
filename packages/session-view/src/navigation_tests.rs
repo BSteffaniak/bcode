@@ -4,6 +4,7 @@ use bcode_session_models::{SessionLocationSummary, SessionTitleSource};
 
 fn summary(parent_id: Option<SessionId>) -> SessionSummary {
     SessionSummary {
+        origin: None,
         id: SessionId::new(),
         parent_id,
         name: Some("子 👩‍💻 e\u{301}".to_owned()),
