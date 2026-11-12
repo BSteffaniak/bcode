@@ -26,7 +26,7 @@
 
 use super::agent::AgentStreams;
 use super::chrome::{self, HeaderModel, HeaderPart, HeaderPlan, Status, Toasts};
-use super::composer::Composer;
+use super::composer::{Composer, ComposerInput};
 use super::config::{ReviewViewConfig, resolve};
 use super::files::FileTree;
 use super::loader::{self, Inbox, Message, NeedResult, Opened};
@@ -1622,6 +1622,11 @@ impl ReviewSurface {
             Message::Import(result) => self.apply_import(result),
             Message::Rereview(plan) => self.apply_rereview(*plan, host),
             Message::Carried(result) => self.apply_carried(result),
+            Message::PathCompletions { generation, result } => {
+                if let Some(composer) = self.composer.as_mut() {
+                    composer.answer_completion(generation, result);
+                }
+            }
         }
     }
 
@@ -4175,8 +4180,10 @@ impl View for ReviewSurface {
                 Action::Redraw
             }
             Event::Paste(text) if self.focus == Focus::Composer => {
-                if let Some(composer) = self.composer.as_mut() {
-                    composer.paste(text);
+                if let Some(composer) = self.composer.as_mut()
+                    && composer.paste(text) == ComposerInput::Edited
+                {
+                    self.complete_paths(host);
                 }
                 Action::Redraw
             }

@@ -1249,34 +1249,27 @@ fn list_review_workspaces_for_request(
         Box::pin(async move {
             let db = CodeReviewDb::new(database);
             let mut items = Vec::new();
-            for workspace in workspaces {
+            for mut workspace in workspaces {
                 let review_key = workspace_review_key(&workspace);
-                let (thread_count, draft_count) = db.draft_counts(&review_key).await?;
+                let mut counts = db.draft_counts(&review_key).await?;
                 if let Some(legacy_review_key) = workspace_legacy_review_key(&workspace)? {
-                    let (_, legacy_draft_count) = db.draft_counts(&legacy_review_key).await?;
-                    let (thread_count, draft_count) = if draft_count == 0 && legacy_draft_count > 0
-                    {
-                        db.draft_counts(&legacy_review_key).await?
-                    } else {
-                        (thread_count, draft_count)
-                    };
-                    let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
-                    items.push(ReviewWorkspaceListItem {
-                        workspace,
-                        thread_count,
-                        draft_count,
-                        last_publish,
-                    });
-                } else {
-                    let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
-                    items.push(ReviewWorkspaceListItem {
-                        workspace,
-                        thread_count,
-                        draft_count,
-                        last_publish,
-                    });
+                    let legacy = db.draft_counts(&legacy_review_key).await?;
+                    if counts.1 == 0 && legacy.1 > 0 {
+                        counts = legacy;
+                    }
                 }
+                let (thread_count, draft_count, drafts_updated) = counts;
+                // A review is updated when its comments change, not only its own record.
+                workspace.updated_at_ms = workspace.updated_at_ms.max(drafts_updated);
+                let last_publish = db.last_publish_record(Some(&workspace.id)).await?;
+                items.push(ReviewWorkspaceListItem {
+                    workspace,
+                    thread_count,
+                    draft_count,
+                    last_publish,
+                });
             }
+            items.sort_by_key(|item| std::cmp::Reverse(item.workspace.updated_at_ms));
             Ok(items)
         })
     })?;
@@ -1337,12 +1330,31 @@ fn update_review_workspace_for_request(
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let mut workspace = request.workspace;
     workspace.repo_root.clone_from(&repo_root);
-    workspace.updated_at_ms = Some(now_ms());
-    let saved = workspace.clone();
-    with_database(&repo_root, config, move |database| {
-        Box::pin(async move { CodeReviewDb::new(database).save_workspace(&saved).await })
+    let saved = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            let db = CodeReviewDb::new(database);
+            // Presentation state (scroll position, panels) records how the review was last
+            // looked at; only changes to the review itself make it updated.
+            let stored = db.get_workspace(&workspace.id).await?;
+            workspace.updated_at_ms = match stored {
+                Some(stored) if same_review(&stored, &workspace) => stored.updated_at_ms,
+                _ => Some(now_ms()),
+            };
+            db.save_workspace(&workspace).await?;
+            Ok(workspace)
+        })
     })?;
-    Ok(UpdateReviewWorkspaceResponse { workspace })
+    Ok(UpdateReviewWorkspaceResponse { workspace: saved })
+}
+
+/// Whether `a` and `b` are the same review apart from timestamps and presentation state.
+fn same_review(a: &ReviewWorkspace, b: &ReviewWorkspace) -> bool {
+    a.title == b.title
+        && a.sources == b.sources
+        && a.viewed_files == b.viewed_files
+        && a.viewed_marks == b.viewed_marks
+        && a.reviewed_revisions == b.reviewed_revisions
+        && a.archived_at_ms == b.archived_at_ms
 }
 
 fn archive_review_workspace_for_request(

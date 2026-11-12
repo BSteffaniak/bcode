@@ -10,6 +10,9 @@ pub use managed_bootstrap::{
     ManagedSessionConnection,
 };
 mod generation;
+mod installed;
+pub use bcode_daemon_lifecycle::installed_bcode_executable;
+pub use installed::{InstalledBcode, InstalledBcodeError, InstalledDaemonStart};
 pub mod harness;
 mod session_observation;
 /// Public local HTTP/SSE X-ray observation client.

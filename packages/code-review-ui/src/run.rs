@@ -37,7 +37,7 @@ use crate::app::ReviewApp;
 use crate::config::LoadedConfig;
 use crate::context::UiContext;
 use crate::entry::Entry;
-use crate::host::{ExternalCommand, ReviewHost, StandaloneHost};
+use crate::host::{BcodeAccess, ExternalCommand, ReviewHost, StandaloneHost};
 use crate::services::ReviewServices;
 use crate::theme::HostTheme;
 use crate::view::View;
@@ -57,8 +57,8 @@ pub struct RunOptions {
     pub entry: Entry,
     /// The Bcode executable the app runs inside (`bcode review`): the standalone host opens
     /// sessions with it and may start the daemon from it. `None` (the standalone `bcode-review`
-    /// binary) opens sessions with `bcode` from the path and only attaches to a daemon that is
-    /// already running, since this executable cannot serve as one.
+    /// binary) uses the user's installed Bcode (`BCODE_BIN`, else `bcode` on the path), whose
+    /// daemon it verifies and starts when needed, since this executable cannot serve as one.
     pub bcode_program: Option<PathBuf>,
 }
 
@@ -209,18 +209,16 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     } else {
         let (theme, theme_error) = HostTheme::load(&loaded.theme, &loaded.config_dir, &repo);
         diagnostics.extend(theme_error);
-        let availability = if options.bcode_program.is_some() {
-            bcode_client::DaemonAvailability::AutoStart
-        } else {
-            bcode_client::DaemonAvailability::RequireRunning
-        };
-        let client =
-            bcode_client::BcodeClient::default_endpoint().with_daemon_availability(availability);
-        let mut standalone = StandaloneHost::new(client, theme);
-        if let Some(program) = options.bcode_program {
-            standalone = standalone.with_bcode_program(program.to_string_lossy().into_owned());
-        }
-        Arc::new(standalone) as Arc<dyn ReviewHost>
+        let access = options
+            .bcode_program
+            .map_or(BcodeAccess::Installed, |program| BcodeAccess::Running {
+                client: Box::new(
+                    bcode_client::BcodeClient::default_endpoint()
+                        .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart),
+                ),
+                program,
+            });
+        Arc::new(StandaloneHost::new(access, theme)) as Arc<dyn ReviewHost>
     };
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host));
     let ui = UiContext::new(host, Arc::new(keymap), loaded.diff_layout);
@@ -571,10 +569,7 @@ mod tests {
             .build()
             .expect("runtime");
         let _guard = runtime.enter();
-        let host = StandaloneHost::new(
-            bcode_client::BcodeClient::default_endpoint(),
-            HostTheme::fallback(),
-        );
+        let host = StandaloneHost::new(BcodeAccess::Installed, HostTheme::fallback());
         let frames = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&frames);
         host.connect_redraw(Arc::new(move || {

@@ -90,6 +90,13 @@ pub enum Message {
     Rereview(Box<super::rereview::RereviewPlan>),
     /// Patches unchanged since the last pass: `(source id, path, patch id)`.
     Carried(Result<Vec<(String, String, String)>, String>),
+    /// Paths matching the composer's `@word`, for the completion tagged `generation`.
+    PathCompletions {
+        /// Completion generation the search was made for.
+        generation: u64,
+        /// Matching paths, or why the search failed.
+        result: Result<bcode_code_review_models::ReviewFilesSearchResponse, String>,
+    },
     /// An AI question finished: the linked exchange, or the exchange as recorded and the error.
     Asked(
         Box<

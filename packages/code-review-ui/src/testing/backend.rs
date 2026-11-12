@@ -91,6 +91,11 @@ impl TestBackend {
         self.host.messages()
     }
 
+    /// Fail creating sessions with `message` (see [`ScriptedHost::fail_sessions`]).
+    pub fn fail_sessions(&self, message: Option<&str>) {
+        self.host.fail_sessions(message);
+    }
+
     /// Make every later call of `operation` fail (or succeed again when `fail` is false).
     pub fn set_failing(&self, operation: &str, fail: bool) {
         self.services.set_failing(operation, fail);

@@ -31,6 +31,9 @@ use bmux_tui_components::toast_stack::ToastSeverity;
 use bmux_tui_components::tree_view::TreeViewItem;
 use bmux_tui_components::virtual_list::{AnchorPolicy, Edge};
 
+/// Footer status while a question is being sent to Bcode.
+const ASKING_STATUS: &str = "asking Bcode…";
+
 /// Keymap scope of the composer.
 pub const COMPOSER_SCOPE: &str = "code-review-composer";
 
@@ -127,6 +130,14 @@ impl ReviewSurface {
         &mut self,
         result: Result<ReviewAiExchange, Box<(ReviewAiExchange, String)>>,
     ) {
+        // The footer said a question was on its way; it is no longer.
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.text == ASKING_STATUS)
+        {
+            self.status = None;
+        }
         match result {
             Ok(exchange) => {
                 let session = exchange.session_id.clone();
@@ -141,6 +152,7 @@ impl ReviewSurface {
                 let (exchange, error) = *failed;
                 self.follow_ups.remove(&exchange.exchange_id);
                 self.notes.put_exchange(exchange);
+                self.set_status("could not ask Bcode", StatusSeverity::Error);
                 self.toasts
                     .push(ToastSeverity::Error, "Could not ask Bcode", Some(error));
             }
@@ -261,7 +273,7 @@ impl ReviewSurface {
                 .map(|()| "comment updated"),
             ComposerMode::Ask => {
                 self.ask_question(&anchor, text, now);
-                Ok("asking Bcode…")
+                Ok(ASKING_STATUS)
             }
         };
         match result {
@@ -281,6 +293,10 @@ impl ReviewSurface {
             self.focus = Focus::Review;
             return Action::Redraw;
         };
+        // Open suggestions take their keys before the composer's bindings.
+        if composer.completion_key(stroke).is_some() {
+            return Action::Redraw;
+        }
         match action {
             Some("composer_submit") => self.submit_composer(),
             Some("composer_cancel") => {
@@ -299,11 +315,38 @@ impl ReviewSurface {
             }
             _ => match composer.key(stroke) {
                 ComposerInput::Submit => self.submit_composer(),
-                ComposerInput::Edited => {}
+                ComposerInput::Edited => self.complete_paths(host),
                 ComposerInput::Ignored => return Action::None,
             },
         }
         Action::Redraw
+    }
+
+    /// Search paths for the composer's `@word` after an edit, when it changed.
+    pub(super) fn complete_paths(&mut self, host: &UiContext) {
+        let Some(request) = self
+            .composer
+            .as_mut()
+            .and_then(Composer::refresh_completion)
+        else {
+            return;
+        };
+        let services = self.services.clone();
+        let inbox = self.inbox.clone();
+        let search = bcode_code_review_models::ReviewFilesSearchRequest {
+            repo_path: self.repo_path.clone(),
+            query: request.query,
+            revision: Some(bcode_code_review_models::RevisionRef::WorkingTree),
+            cursor: None,
+            limit: Some(u32::from(crate::path_completion::MAX_SUGGESTIONS)),
+        };
+        host.spawn(Box::pin(async move {
+            let result = services.call(search).await.map_err(|error| error.message);
+            inbox.push(Message::PathCompletions {
+                generation: request.generation,
+                result,
+            });
+        }));
     }
 
     /// A clicked composer button.
@@ -320,6 +363,7 @@ impl ReviewSurface {
                 composer.touch();
             }
             ComposerButton::Cancel => self.close_composer(),
+            ComposerButton::Suggestion(index) => composer.accept_suggestion(index),
         }
     }
 

@@ -33,10 +33,12 @@ pub enum CliError {
     /// The Bcode daemon could not be reached.
     #[error(transparent)]
     Client(#[from] bcode_client::ClientError),
-    /// The command needs a running Bcode, and none is running (the standalone app never starts
-    /// one, because it is not the Bcode program).
+    /// The command needs a running Bcode, and none is running.
     #[error("Bcode is not running; start bcode and try again")]
     BcodeNotRunning,
+    /// The installed Bcode could not be reached.
+    #[error(transparent)]
+    InstalledBcode(#[from] bcode_client::InstalledBcodeError),
     /// A payload could not be encoded or decoded.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -420,20 +422,22 @@ pub struct GithubPublishCliRequest {
 }
 
 /// Build the review's bundle from the stored state, then preview or submit it through the
-/// daemon's review publisher. Inside Bcode the daemon is started when needed; the standalone app
-/// requires one to be running already.
+/// daemon's review publisher. Inside Bcode that is the running Bcode's daemon; the standalone app
+/// uses the installed Bcode's. Either starts its daemon when needed.
 async fn publish_github_review(
     request: GithubPublishCliRequest,
     inside_bcode: bool,
 ) -> Result<(), CliError> {
     let repo = resolve_repo_argument(&request.repo)?;
     let bundle = review_bundle(&repo, request.target.clone()).await?;
-    let availability = if inside_bcode {
-        bcode_client::DaemonAvailability::AutoStart
+    let client = if inside_bcode {
+        BcodeClient::default_endpoint()
+            .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart)
     } else {
-        bcode_client::DaemonAvailability::RequireRunning
+        BcodeClient::for_installed_bcode(bcode_client::InstalledDaemonStart::IfNeeded)
+            .await?
+            .into_client()
     };
-    let client = BcodeClient::default_endpoint().with_daemon_availability(availability);
     let repository = match request.github_repo {
         Some(repository) => repository,
         None => detect_github_repository(&repo)?,

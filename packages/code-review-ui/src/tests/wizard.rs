@@ -545,3 +545,48 @@ fn enter_typed_before_the_listing_answers_picks_from_the_new_answer() {
         Some(crate::wizard::SourceType::CompareBranches.id())
     );
 }
+
+/// Clicking an option picks it, whether or not it is the active row, wherever the picker sits.
+#[test]
+fn clicking_options_picks_them_on_every_step() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    let screen = settled(&mut scenario);
+    // The active first row.
+    let point = screen.find("Working tree").expect("row");
+    scenario.click(point.x, point.y);
+    let screen = settled(&mut scenario);
+    assert_eq!(step(&scenario), 2);
+    // A row of the smaller step-2 picker, below its first row.
+    let point = screen.find("Staged changes").expect("staged row");
+    scenario.click(point.x, point.y);
+    settled(&mut scenario);
+    assert_eq!(step(&scenario), 3);
+    assert_eq!(
+        scenario.surface().wizard().unwrap().picker().query(),
+        "Staged changes"
+    );
+}
+
+/// Outside a git repository the working-tree counts say they are unavailable instead of
+/// counting forever.
+#[test]
+fn working_tree_counts_outside_a_repository_are_unavailable() {
+    let directory = tempfile::tempdir().expect("directory");
+    let backend = Arc::new(TestBackend::default());
+    let app = ReviewApp::new(
+        backend.services(),
+        directory.path().to_path_buf(),
+        crate::config::ReviewViewConfig::default(),
+        Entry::Home,
+    );
+    let mut scenario = Scenario::new(app, 140, 40);
+    settled(&mut scenario);
+    scenario.key("n");
+    settled(&mut scenario);
+    let screen = pick_type(&mut scenario, 0);
+    assert_eq!(step(&scenario), 2);
+    assert!(screen.contains("counts unavailable"), "{}", screen.text());
+    assert!(!screen.contains("counting"), "{}", screen.text());
+}

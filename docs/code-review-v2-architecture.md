@@ -1020,9 +1020,9 @@ accepts the option shapes V1's host launcher sent (`workspace`, or a JSON `targe
 caller opening `code-review` gets the matching V2 review.
 
 **Implementation (phase 9).** The review no longer runs as a plugin surface (13.3), so the
-`code-review` surface declaration and the generic `plugin_surface_launcher` were removed: no
-other plugin used the launcher (eval and metrics startup surfaces have their own adapters). A
-startup surface kind without an adapter now fails with `unsupported_startup_surface`.
+`code-review` surface declaration was removed. The generic `plugin_surface_launcher` stays: the
+SDK's `StaticCliHostAction::OpenTuiSurface` lets any plugin ask for its surface at startup, and
+the host provides that plumbing for every declared surface kind without a dedicated adapter.
 
 **Implementation (phase 5).** `packages/code-review-ui/src/app.rs` is the `code-review-v2` surface (`code-review`
 since phase 7)
@@ -1937,16 +1937,19 @@ before is the same app without these changes; per presented frame):
   blocking-task spawning, and redraw requests; a host requests a frame whenever a spawned task
   finishes, through the wake-up the driving loop hands it (`connect_redraw`). Only the standalone
   host talks to the daemon, so `bcode_code_review` has no daemon client dependency. `context::UiContext` pairs the host with the resolved keymap and the
-  `[tui.diff_viewer]` layout preference. Host-provided completion of the comment composer
-  (the chat host's focused-text-field protocol) has no standalone provider and was removed with
-  the plugin surface.
+  `[tui.diff_viewer]` layout preference. The comment composer completes `@paths` itself
+  (`path_completion`): a local completer over the data layer's file search with BMUX's completion
+  controller, shown inside the composer, so it works in any host.
 * **Run loop.** `run.rs` drives the app with `bmux_tui_runtime`: input goes straight to the app;
   host wakes (coalesced) poll it and present; every presented frame polls again, so animations
   run at the runtime cadence and the loop idles when nothing changes. `o` on a linked session
   ends the runtime, runs `bcode tui <session>` with the terminal handed over, and resumes the
   app. Inside `bcode review` that command is the running Bcode executable and the client may
-  start the daemon; the standalone `bcode-review` uses `bcode` from the path and only attaches
-  to a running daemon (13.7's sanctioned daemon start is still missing).
+  start the daemon. The standalone `bcode-review` connects to the installed Bcode with
+  `BcodeClient::for_installed_bcode` (`BCODE_BIN`, else `bcode` on the path, verified with
+  `DaemonTarget::verify` and started with `bcode server start` when its daemon is not running),
+  and opens sessions with that executable. `bcode-git` needs no such change: it talks only to its
+  own git daemon, which it starts from its own executable.
 * **Entry points.** `cli.rs` is the shared command line: the plugin's `bcode review`
   registration runs it in process, and `bcode-review` takes the same subcommands.
 * **Tests and benchmarks.** The scenario harness (`testing/harness.rs`) drives any `View` with
@@ -1957,15 +1960,17 @@ before is the same app without these changes; per presented frame):
   (`bcode_code_review_ui`), `document_benchmark`, and `data_layer_benchmark`
   (`bcode_code_review`) keep their measurements.
 * **Plugin.** `plugins/code-review-plugin` keeps the `bcode.code_review/v1` JSON adapters over
-  `bcode_code_review` (`src/service.rs`), the `diff.toggle` palette command, the keymap
-  declarations in its manifest (registered with bcode's keymap catalog, and read at build time
-  by the app's `keymap.rs`, so user overrides of the `code-review*` scopes keep working in
-  both), and, under `static-bundled`, the `bcode review` CLI registration. It declares no TUI
-  surface and depends on the UI crate only for that registration. `packages/tui` lost the
-  generic standalone-surface launcher with it (7.1).
+  `bcode_code_review` (`src/service.rs`), the `diff.toggle` palette command and, under
+  `static-bundled`, the `bcode review` CLI registration and the keymap contribution: the app owns
+  the keymap declarations (`packages/code-review-ui/keymap.toml`), and the plugin's TUI registry
+  contributes the same actions to bcode's keymap, so user overrides of the `code-review*` scopes
+  are validated by bcode and applied by the app. It declares no TUI surface and depends on the UI
+  crate only under `static-bundled`. `packages/tui` keeps the generic standalone-surface launcher
+  (7.1).
 * **Daemon availability.** `publish-github` is the only subcommand that needs the daemon before
-  running: `bcode review` starts it first, while the standalone binary attaches only to a running
-  one and reports "Bcode is not running" otherwise (questions to Bcode report the same).
+  running: `bcode review` starts its own, and the standalone binary starts the installed Bcode's
+  as above. A missing `bcode` executable or a failed start is reported to the request that
+  needed it.
   `publish-github` builds the review bundle with `ReviewStore::review_bundle` directly and uses
   the daemon only for the GitHub publisher call. (The command previously fetched the bundle with
   `review.bundle.get` and a `ReviewContextRequest` payload, which that operation rejects because
@@ -1976,10 +1981,25 @@ before is the same app without these changes; per presented frame):
   replaces the chat-routing cases `review-linked-navigation` and `review-home-workspace-chat`),
   `review-click-save-resume` and `review-wizard-unstaged` (replacing the preset-click cases),
   `review-tree-scroll-resize`, `review-range-edit-thread`, and `review-pointer-no-rewrite`.
-  `completion-review` was dropped with the chat host's composer completion. A step may set
+  `completion-review` drives the composer's `@path` completion (accept, ordinary typing,
+  `esc`, closing the composer). A step may set
   `handoff: true` to allow the alternate screen to be left and re-entered while the app hands
   the terminal to `bcode tui`. Review fixtures enable the harness plugin, which real sessions
   need. App behavior is documented in `docs/code-review-app.md`.
+
+**Follow-ups to phase 9.**
+
+* **Review list times.** Saving a workspace only makes it updated when the review changed (title,
+  sources, viewed files and marks, reviewed revisions, archive state); presentation-only saves
+  keep the stored time, and the listing reports the later of that and the review's last comment
+  change. Previously every scroll or panel change made a review "updated now".
+* **Wizard.** The working-tree step says "counts unavailable" when the repository state cannot be
+  read (outside a git repository) and redraws its rows when the state arrives. Picker rows take
+  clicks on the active row too (BMUX `MenuNavigation::ActiveItem`), and BMUX's
+  `PickerFrameComponent` now routes pointer events through terminal-space clips, which made rows
+  of frames placed away from the terminal origin unclickable.
+* **Asking Bcode.** The footer's "asking Bcode…" is replaced when the question finishes, and by
+  "could not ask Bcode" when it fails.
 
 ### 13.4 Phase 10: visual system
 
@@ -2055,8 +2075,10 @@ sessions that are visible and resumable everywhere.
   clear tool error and the session history stays intact.
 * **Session origin.** Sessions record their origin (app and app context) for listing and
   filtering.
-* **Sanctioned daemon start.** Consumer apps get a supported way to start the daemon (today the
-  explicit constructor, `BcodeClient::for_daemon`, only attaches to a running one).
+* **Sanctioned daemon start.** Consumer apps get a supported way to start the daemon. Apps that
+  use the user's installed Bcode have one: `BcodeClient::for_installed_bcode` verifies the
+  installed executable's daemon and starts it with `bcode server start`; the explicit
+  constructor, `BcodeClient::for_daemon`, still only attaches to a running one.
 * **SDK mode.** The in-process SDK mode remains for stateless use and app-owned persistence.
 * bdata's migration to this model is follow-up work in that repository.
 

@@ -403,6 +403,62 @@ fn composer_preview_newlines_and_narrow_widths() {
 }
 
 #[test]
+fn composer_completes_at_paths_by_key_and_click() {
+    let fixture = fixture();
+    std::fs::write(fixture.root().join("completion-target.txt"), "target\n").unwrap();
+    std::fs::write(fixture.root().join("completion-other.txt"), "other\n").unwrap();
+    let mut setup = setup(&fixture, 100, 40);
+    let index = find(&setup.scenario, 0, added_line);
+    move_to(&mut setup.scenario, index);
+    setup.scenario.key("c");
+    setup.scenario.paste("see @completion-t");
+    let screen = stable(&mut setup.scenario);
+    assert!(screen.contains("Suggestions"), "{}", screen.text());
+    assert!(
+        screen.contains("completion-target.txt"),
+        "{}",
+        screen.text()
+    );
+    // Enter accepts the suggestion instead of saving the comment.
+    setup.scenario.key("enter");
+    let screen = stable(&mut setup.scenario);
+    let composer = setup
+        .scenario
+        .surface()
+        .composer()
+        .expect("still composing");
+    assert_eq!(composer.text(), "see @completion-target.txt");
+    assert!(!screen.contains("Suggestions"), "{}", screen.text());
+    // Ordinary typing after the accepted path opens nothing.
+    setup.scenario.paste(" ordinary");
+    let screen = stable(&mut setup.scenario);
+    assert!(!screen.contains("Suggestions"), "{}", screen.text());
+
+    // A click on a suggestion accepts it.
+    setup.scenario.paste(" @completion-");
+    let screen = stable(&mut setup.scenario);
+    let other = screen.find("completion-other.txt").expect("suggested");
+    setup.scenario.click(other.x, other.y);
+    stable(&mut setup.scenario);
+    assert_eq!(
+        setup.scenario.surface().composer().unwrap().text(),
+        "see @completion-target.txt ordinary @completion-other.txt"
+    );
+
+    // Escape closes the suggestions first, then the composer.
+    setup.scenario.paste(" @completion-t");
+    assert!(stable(&mut setup.scenario).contains("Suggestions"));
+    setup.scenario.key("esc");
+    let screen = stable(&mut setup.scenario);
+    assert!(!screen.contains("Suggestions"), "{}", screen.text());
+    assert!(setup.scenario.surface().composer().is_some());
+    setup.scenario.key("esc");
+    stable(&mut setup.scenario);
+    assert!(setup.scenario.surface().composer().is_none());
+    assert_eq!(drafts(&setup), [] as [DraftComment; 0]);
+}
+
+#[test]
 fn drag_across_lines_selects_a_range_and_opens_a_range_composer() {
     let fixture = fixture();
     let mut setup = setup(&fixture, 100, 40);
@@ -783,6 +839,27 @@ fn questions_quote_the_same_diff_lines_in_either_layout() {
         matches!((last_removed, first_added), (Some(removed), Some(added)) if removed < added),
         "{block}"
     );
+}
+
+#[test]
+fn a_failed_question_replaces_the_asking_status() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 100, 40);
+    setup
+        .backend
+        .fail_sessions(Some("Bcode is not running; start bcode and try again"));
+    let index = find(&setup.scenario, 0, added_line);
+    move_to(&mut setup.scenario, index);
+    setup.scenario.key("a");
+    setup.scenario.paste("Why this change?");
+    setup.scenario.key("enter");
+    let screen = stable(&mut setup.scenario);
+    assert_eq!(
+        setup.scenario.surface().status(),
+        Some("could not ask Bcode")
+    );
+    assert!(!screen.contains("asking Bcode"), "{}", screen.text());
+    assert!(screen.contains("Bcode is not running"), "{}", screen.text());
 }
 
 #[test]

@@ -115,6 +115,28 @@ CASES = {
         completion_steps("COMPLETION_QUESTION", [
             {"expect": ["Ask Bcode"], "send": "\x04"}])},
 
+    # The review shows the fixture's files, so suggestions are told apart by their header and
+    # by what the composer's text becomes.
+    "completion-review": {"fixture": "completion-review", "model": True, "args": ["review"],
+        "steps": [
+        {"expect": ["Code reviews", "Staged changes"], "send": "1"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"], "forbid": ["Code reviews"], "send": "jj"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": "a"},
+        {"expect": ["Ask Bcode about"], "hold": 1, "send": "@completion-t"},
+        {"expect": ["Suggestions", "@completion-t"], "send": "\r"},
+        {"expect": ["Ask Bcode about", "@completion-target.txt"], "forbid": ["Suggestions"],
+         "reject": ["COMPLETION_PARENT_SUBMITTED"], "hold": 1, "send": " ordinary"},
+        {"expect": ["@completion-target.txt ordinary"], "reject": ["COMPLETION_PARENT_SUBMITTED"],
+         "send": "\x15@completion-t"},
+        {"expect": ["Suggestions", "@completion-t"], "reject": ["COMPLETION_PARENT_SUBMITTED"],
+         "send": "\x1b"},
+        {"expect": ["Ask Bcode about", "@completion-t"], "forbid": ["Suggestions"],
+         "reject": ["COMPLETION_PARENT_SUBMITTED"], "send": " ordinary"},
+        {"expect": ["@completion-t ordinary"], "reject": ["COMPLETION_PARENT_SUBMITTED"],
+         "send": "\x1b"},
+        {"expect": ["CONTINUOUS_REVIEW_FILE"], "forbid": ["Ask Bcode about"], "send": "q"},
+        {"expect": ["Code reviews"], "send": "q"}]},
+
     "blims-service-timeout": {"fixture": "blims", "model": True,
         "args": ["blims", "enter"], "steps": [
         {"expect": ["Pixel office"], "daemon_signal": "suspend", "send": "r"},

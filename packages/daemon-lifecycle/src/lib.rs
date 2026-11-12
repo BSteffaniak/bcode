@@ -10,6 +10,11 @@ pub mod application;
 mod image_retention_tests;
 mod target;
 pub use target::{DaemonTarget, DaemonTargetError};
+mod installed;
+pub use installed::{
+    BCODE_BIN_ENV, InstalledDaemonStartError, installed_bcode_executable,
+    installed_bcode_executable_from, start_installed_daemon,
+};
 
 mod execution_lifetime;
 pub use execution_lifetime::{

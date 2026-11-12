@@ -1961,6 +1961,30 @@ impl<'a> ItemView<'a> {
             cx.with_child(i32::from(layout.indent), 1, area, |cx| {
                 editor.paint(&node, cx);
             });
+            if let Some(completion) = composer.completion.as_ref()
+                && layout.suggestions > 0
+            {
+                let header = 1 + layout.editor_rows;
+                cx.write_line(
+                    LocalRect::new(i32::from(layout.indent), i64::from(header), inner, 1),
+                    &completion.header(theme),
+                );
+                let rows = layout.suggestions - 1;
+                if rows > 0 {
+                    let list = completion.list(theme);
+                    let size = bmux_tui::geometry::Size::new(inner, rows);
+                    let node = list.layout(Constraints::tight(size), &mut LayoutCx::new());
+                    let area = LocalRect::new(0, 0, inner, rows);
+                    cx.with_child(
+                        i32::from(layout.indent),
+                        i64::from(header + 1),
+                        area,
+                        |cx| {
+                            list.paint(&node, cx);
+                        },
+                    );
+                }
+            }
         }
         let last = height.saturating_sub(1);
         cx.write_line(
@@ -2157,15 +2181,23 @@ impl Component for ItemView<'_> {
                 return EventOutcome::Ignored;
             };
             let last = u16::try_from(composer.height.saturating_sub(1)).unwrap_or(0);
-            if let Some(button) = composer
-                .buttons
-                .iter()
-                .find(|button| y == last && button.cells.contains(&x))
-                && kind == PointerKind::Down
+            // Suggestion rows follow the editor and the suggestions' header row.
+            let first_suggestion = 2 + composer.editor_rows;
+            let suggestion = (composer.suggestions > 1
+                && x >= composer.indent
+                && (first_suggestion..first_suggestion + composer.suggestions - 1).contains(&y))
+            .then(|| super::composer::ComposerButton::Suggestion(y - first_suggestion));
+            if let Some(action) = suggestion.or_else(|| {
+                composer
+                    .buttons
+                    .iter()
+                    .find(|button| y == last && button.cells.contains(&x))
+                    .map(|button| button.action)
+            }) && kind == PointerKind::Down
             {
                 self.interaction.clicks.borrow_mut().push(ItemClick {
                     key: self.key.clone(),
-                    action: ItemAction::Composer(button.action),
+                    action: ItemAction::Composer(action),
                 });
             }
             // The composer owns its rows: no list activation or drag passes through it.

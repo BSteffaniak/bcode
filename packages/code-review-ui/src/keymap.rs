@@ -1,7 +1,8 @@
 //! Keymap actions of the review and their resolution with user overrides.
 //!
-//! The actions are the ones the code review plugin manifest declares, so the review binds the
-//! same keys whether it runs standalone or from bcode. Users rebind or unbind them under
+//! The actions are declared once, in this crate's `keymap.toml`. The app binds them whether it
+//! runs standalone or from bcode, and the code review plugin contributes the same declarations
+//! to bcode's keymap. Users rebind or unbind them under
 //! `[tui.keybindings.scopes."code-review*"]`.
 
 use std::collections::BTreeMap;
@@ -21,8 +22,8 @@ pub const THREADS_SCOPE: &str = "code-review-threads";
 /// New-review wizard scope.
 pub const WIZARD_SCOPE: &str = "code-review-wizard";
 
-/// The plugin manifest that declares the review's keymap actions.
-const MANIFEST: &str = include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml");
+/// The review's keymap action declarations.
+const DECLARATIONS: &str = include_str!("../keymap.toml");
 
 #[derive(serde::Deserialize)]
 struct Declarations {
@@ -33,13 +34,13 @@ struct Declarations {
 ///
 /// # Panics
 ///
-/// Panics when the bundled manifest declarations do not parse, which the crate's tests rule out.
+/// Panics when the bundled declarations do not parse, which the crate's tests rule out.
 #[must_use]
 pub fn actions() -> Vec<KeymapAction> {
     static ACTIONS: std::sync::OnceLock<Vec<KeymapAction>> = std::sync::OnceLock::new();
     ACTIONS
         .get_or_init(|| {
-            toml::from_str::<Declarations>(MANIFEST)
+            toml::from_str::<Declarations>(DECLARATIONS)
                 .expect("bundled keymap declarations are valid")
                 .keymap_actions
         })

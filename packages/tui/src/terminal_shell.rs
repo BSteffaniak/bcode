@@ -476,11 +476,12 @@ impl TerminalShell {
 
     /// Dispatch a supported plugin startup surface while borrowing this terminal owner.
     ///
-    /// Each supported surface keeps its own loading behavior and never enters a second terminal
-    /// guard. Repository paths must be resolved by CLI.
+    /// The generic standalone launcher shows progress while the plugin surface prepares; other
+    /// adapters retain their existing loading behavior but never enter a second terminal guard.
+    /// Repository paths must be resolved by CLI.
     ///
     /// # Errors
-    /// Returns unresolved path/options, unsupported surface, or terminal errors.
+    /// Returns unresolved path/options, unsupported surface, launcher, or terminal errors.
     #[allow(clippy::future_not_send)]
     pub async fn run_plugin_surface(
         &mut self,
@@ -541,8 +542,35 @@ impl TerminalShell {
                 ))
                 .await
             }
-            _ => Err(crate::unsupported_startup_surface(&surface_kind)),
+            _ => Box::pin(self.run_standalone_plugin_surface(surface_kind, repo, options)).await,
         }
+    }
+
+    /// Open any registered plugin surface as a standalone startup surface: the plugin runtime is
+    /// loaded once, the plugin declaring `surface_kind` opens it, and it runs until it closes.
+    #[allow(clippy::future_not_send)]
+    async fn run_standalone_plugin_surface(
+        &mut self,
+        surface_kind: String,
+        repo_path: std::path::PathBuf,
+        options: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), TuiError> {
+        self.stop_requested = false;
+        let prepared = self
+            .wait(
+                "Opening…",
+                crate::plugin_surface_launcher::prepare(surface_kind, repo_path, options),
+            )
+            .await?;
+        let Some(prepared) = prepared.filter(|_| !self.stop_requested()) else {
+            return Ok(());
+        };
+        Box::pin(crate::plugin_surface_launcher::run_prepared(
+            &mut self.terminal()?,
+            prepared,
+        ))
+        .await
+        .map(|_| ())
     }
 
     /// Display caller-owned initialization progress while awaiting an operation.

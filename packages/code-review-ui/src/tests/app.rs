@@ -927,3 +927,52 @@ fn a_review_with_path_only_viewed_marks_opens_with_its_viewed_files_and_drafts()
     assert_eq!(placements, [AnchorPlacement::Line]);
     assert!(screen.contains("written earlier"), "{}", screen.text());
 }
+
+/// A review is updated when it changes (its comments, viewed files, title), not when it is
+/// only looked at: opening and scrolling it keeps its home "Updated" time.
+#[test]
+fn looking_at_a_review_keeps_its_updated_time_and_commenting_moves_it() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let review = create(
+        &backend,
+        &fixture,
+        "Old review",
+        vec![ReviewSourceKind::LastCommit],
+    );
+    let updated = |backend: &TestBackend| {
+        let response: ListReviewWorkspacesResponse =
+            backend.call_now(ListReviewWorkspacesRequest {
+                repo_path: fixture.root().to_path_buf(),
+                include_archived: true,
+            });
+        response.items[0].workspace.updated_at_ms.unwrap()
+    };
+    let created = updated(&backend);
+    std::thread::sleep(Duration::from_millis(5));
+    let (mut scenario, _) = open(&fixture, &backend, Entry::Home, 160, 40);
+    scenario.key("enter");
+    settled(&mut scenario);
+    scenario.keys(&["j", "j", "j"]);
+    settled(&mut scenario);
+    scenario.key("q");
+    settled(&mut scenario);
+    assert_eq!(updated(&backend), created, "only looked at");
+    // Presentation was still remembered.
+    assert!(
+        stored(&backend, &fixture, &review.id)
+            .presentation
+            .is_some()
+    );
+
+    std::thread::sleep(Duration::from_millis(5));
+    scenario.key("enter");
+    settled(&mut scenario);
+    scenario.key("shift+c");
+    scenario.paste("a comment");
+    scenario.key("ctrl+s");
+    settled(&mut scenario);
+    scenario.key("q");
+    settled(&mut scenario);
+    assert!(updated(&backend) > created, "commented");
+}

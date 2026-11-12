@@ -6,9 +6,11 @@
 //! generic pieces the workflow prose editor composes. A markdown preview replaces the editor
 //! while toggled.
 //!
-//! [`Composer::layout`] is the single geometry of the item: its height, the editor's rows, and
-//! the clickable action buttons. Measuring, painting, and click routing all read it.
+//! [`Composer::layout`] is the single geometry of the item: its height, the editor's rows, the
+//! `@path` suggestions (see [`crate::path_completion`]), and the clickable action buttons.
+//! Measuring, painting, and click routing all read it.
 
+use super::path_completion::{self, PathCompletion, SearchRequest};
 use super::rows::ActionCells;
 use super::theme::ReviewTheme;
 use bcode_code_review::document::{AnchorTarget, DocAnchor};
@@ -60,6 +62,8 @@ pub enum ComposerButton {
     Preview,
     /// Cancel.
     Cancel,
+    /// Accept the `@path` suggestion at this index.
+    Suggestion(u16),
 }
 
 /// Outcome of a key or paste in the composer.
@@ -86,6 +90,9 @@ pub struct ComposerLayout {
     pub editor_rows: u16,
     /// Preview rows, in preview mode.
     pub preview: Vec<Line>,
+    /// Rows of the `@path` suggestions under the editor (a header, then one per suggestion);
+    /// 0 when none are open.
+    pub suggestions: u16,
     /// Action row (last row).
     pub actions: Line,
     /// Clickable buttons on the action row.
@@ -107,8 +114,11 @@ pub struct Composer {
     pub kind: ReviewThreadKind,
     /// Severity of a new thread.
     pub severity: ReviewThreadSeverity,
+    /// Open `@path` completion.
+    pub completion: Option<PathCompletion>,
     policy: TextInputPolicy,
     revision: u64,
+    completion_generation: u64,
 }
 
 impl Composer {
@@ -128,8 +138,10 @@ impl Composer {
             preview: false,
             kind: ReviewThreadKind::Note,
             severity: ReviewThreadSeverity::Info,
+            completion: None,
             policy,
             revision: 0,
+            completion_generation: 0,
         }
     }
 
@@ -184,6 +196,92 @@ impl Composer {
                 self.touch();
                 ComposerInput::Edited
             }
+        }
+    }
+
+    /// Follow the `@word` at the cursor after an edit: open or update completion for it (the
+    /// returned search must be run and answered with [`Self::answer_completion`]), or close
+    /// completion when the cursor left it.
+    pub fn refresh_completion(&mut self) -> Option<SearchRequest> {
+        let token = {
+            let input = self.input.borrow();
+            let buffer = input.buffer();
+            path_completion::token_at(buffer.text(), buffer.cursor_byte_index())
+        };
+        let Some(token) = token else {
+            if self.completion.take().is_some() {
+                self.touch();
+            }
+            return None;
+        };
+        if let Some(completion) = &mut self.completion
+            && completion.token().query == token.query
+        {
+            completion.retarget(token);
+            return None;
+        }
+        self.completion_generation = self.completion_generation.wrapping_add(1);
+        let request = SearchRequest {
+            query: token.query.clone(),
+            generation: self.completion_generation,
+        };
+        self.completion = Some(PathCompletion::new(token, self.completion_generation));
+        self.touch();
+        Some(request)
+    }
+
+    /// Apply a search answer to the open completion.
+    pub fn answer_completion(
+        &mut self,
+        generation: u64,
+        result: Result<bcode_code_review_models::ReviewFilesSearchResponse, String>,
+    ) {
+        if self
+            .completion
+            .as_mut()
+            .is_some_and(|completion| completion.answer(generation, result))
+        {
+            self.touch();
+        }
+    }
+
+    /// Route a key to open completion first: `None` when completion is closed or the key is
+    /// not one of its commands.
+    pub fn completion_key(&mut self, stroke: KeyStroke) -> Option<ComposerInput> {
+        let command = path_completion::command_for(stroke)?;
+        let completion = self.completion.as_mut()?;
+        let (_, accepted) = completion.command(command);
+        if let Some(path) = accepted {
+            self.insert_path(&path);
+        } else if !completion.is_active() {
+            self.completion = None;
+        }
+        self.touch();
+        Some(ComposerInput::Edited)
+    }
+
+    /// Accept the suggestion at `index` (a click).
+    pub fn accept_suggestion(&mut self, index: u16) {
+        let Some(path) = self
+            .completion
+            .as_ref()
+            .filter(|completion| completion.accepts())
+            .and_then(|completion| completion.path(usize::from(index)))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.insert_path(&path);
+        self.touch();
+    }
+
+    fn insert_path(&mut self, path: &str) {
+        if let Some(completion) = self.completion.take() {
+            path_completion::insert(
+                self.input.borrow_mut().buffer_mut(),
+                completion.token(),
+                path,
+            );
         }
     }
 
@@ -303,17 +401,22 @@ impl Composer {
             )
         };
         let (actions, buttons) = self.actions(theme, width, indent);
+        let suggestions = match &self.completion {
+            Some(completion) if !self.preview => completion.rows(),
+            _ => 0,
+        };
         let body = if self.preview {
             preview.len() as u64
         } else {
             u64::from(editor_rows)
         };
         ComposerLayout {
-            height: 2 + body,
+            height: 2 + body + u64::from(suggestions),
             title,
             indent,
             editor_rows,
             preview,
+            suggestions,
             actions,
             buttons,
         }

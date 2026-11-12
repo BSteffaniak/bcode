@@ -623,7 +623,11 @@ impl<'a> CodeReviewDb<'a> {
         Ok(drafts)
     }
 
-    pub async fn draft_counts(&self, review_key: &str) -> Result<(usize, usize), StoreError> {
+    /// Thread and comment counts of `review_key`'s drafts, and when a comment last changed.
+    pub async fn draft_counts(
+        &self,
+        review_key: &str,
+    ) -> Result<(usize, usize, Option<u64>), StoreError> {
         let thread_rows = self
             .db
             .select("draft_threads")
@@ -633,19 +637,24 @@ impl<'a> CodeReviewDb<'a> {
             .await?;
         let thread_count = thread_rows.len();
         let mut draft_count = 0usize;
+        let mut latest = None;
         for thread in thread_rows {
             let thread_id = required_text(&thread, "thread_id")?;
-            draft_count = draft_count.saturating_add(
-                self.db
-                    .select("draft_comments")
-                    .columns(&["comment_id"])
-                    .filter(Box::new(where_eq("thread_id", thread_id)))
-                    .execute(self.db)
-                    .await?
-                    .len(),
-            );
+            let comments = self
+                .db
+                .select("draft_comments")
+                .columns(&["comment_id", "updated_at_ms"])
+                .filter(Box::new(where_eq("thread_id", thread_id)))
+                .execute(self.db)
+                .await?;
+            draft_count = draft_count.saturating_add(comments.len());
+            latest = comments
+                .iter()
+                .filter_map(|comment| optional_i64(comment, "updated_at_ms").map(i64_to_u64))
+                .chain(latest)
+                .max();
         }
-        Ok((thread_count, draft_count))
+        Ok((thread_count, draft_count, latest))
     }
 
     pub async fn save_draft(

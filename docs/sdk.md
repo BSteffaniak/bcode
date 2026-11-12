@@ -177,6 +177,15 @@ are resolved through the existing configuration/provider-auth owners, not daemon
 defaults. No private IPC setup, persistence handle or extra hosting framework is needed.
 The request-only effective configuration is not written to a configuration file.
 
+**Connecting to the installed Bcode.** An app that wants the user's own Bcode rather than an
+explicitly pinned artifact (as `bcode-review` does) calls
+`BcodeClient::for_installed_bcode(InstalledDaemonStart::IfNeeded)`. It selects `BCODE_BIN`, else
+the first `bcode` on `PATH`, verifies its running daemon for the process's state and
+configuration scope with `DaemonTarget::verify`, starts it with that executable's
+`server start` when none is running (`InstalledDaemonStart::Never` only attaches), and returns
+the client from `for_daemon` with the executable it verified, so the app can run Bcode commands
+against the same daemon.
+
 For the repository example, supply existing absolute paths and a trusted SHA-256:
 
 ```sh

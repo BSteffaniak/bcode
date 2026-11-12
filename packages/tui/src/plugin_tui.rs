@@ -1765,6 +1765,29 @@ pub async fn open_plugin_tui_surface(
     surface_kind: &str,
     request: PluginTuiSurfaceOpenRequest,
 ) -> Result<BoxedPluginTuiSurface, PluginLoadError> {
+    open_plugin_tui_surface_from(
+        runtime,
+        tui_registry(plugin_id),
+        plugin_id,
+        surface_kind,
+        request,
+    )
+    .await
+}
+
+/// Open a declared plugin TUI surface through the given plugin TUI registry.
+///
+/// # Errors
+///
+/// Returns an error when the plugin is not loaded, has no TUI registry, does not declare the
+/// surface kind, or the factory fails to open it.
+pub(crate) async fn open_plugin_tui_surface_from(
+    runtime: &PluginRuntimeHost,
+    registry: Option<PluginTuiRegistry>,
+    plugin_id: &str,
+    surface_kind: &str,
+    request: PluginTuiSurfaceOpenRequest,
+) -> Result<BoxedPluginTuiSurface, PluginLoadError> {
     if !runtime
         .plugin_ids()
         .iter()
@@ -1772,8 +1795,8 @@ pub async fn open_plugin_tui_surface(
     {
         return Err(PluginLoadError::PluginNotLoaded(plugin_id.to_string()));
     }
-    let registry = tui_registry(plugin_id)
-        .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
+    let registry =
+        registry.ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_string()))?;
     if runtime
         .registry()
         .tui_surface(plugin_id, surface_kind)

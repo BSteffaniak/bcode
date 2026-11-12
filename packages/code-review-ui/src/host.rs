@@ -197,47 +197,121 @@ impl ProviderTransport for HostTransport<'_> {
     }
 }
 
-/// Host of the standalone app: the local Bcode daemon for sessions and plugin services, the
-/// platform clipboard and opener, and the app's own runtime for tasks and redraws.
+/// How the standalone host reaches Bcode.
+#[derive(Debug, Clone)]
+pub enum BcodeAccess {
+    /// The app runs inside the Bcode executable (`bcode review`): `client` reaches its daemon
+    /// (and may start it), and sessions open with `program`.
+    Running {
+        /// Client of the running Bcode's daemon.
+        client: Box<bcode_client::BcodeClient>,
+        /// The running Bcode executable.
+        program: PathBuf,
+    },
+    /// The app is its own executable (`bcode-review`): the user's installed Bcode is located,
+    /// verified, and started when needed on first use
+    /// ([`bcode_client::BcodeClient::for_installed_bcode`]).
+    Installed,
+}
+
+/// The Bcode daemon behind the standalone host, connected lazily for [`BcodeAccess::Installed`]
+/// and connected again after the daemon goes away.
+struct BcodeConnection {
+    access: BcodeAccess,
+    installed: tokio::sync::Mutex<Option<bcode_client::InstalledBcode>>,
+}
+
+impl BcodeConnection {
+    async fn client(&self) -> Result<bcode_client::BcodeClient, HostError> {
+        if let BcodeAccess::Running { client, .. } = &self.access {
+            return Ok((**client).clone());
+        }
+        let mut installed = self.installed.lock().await;
+        if let Some(installed) = installed.as_ref() {
+            return Ok(installed.client().clone());
+        }
+        let connected = bcode_client::BcodeClient::for_installed_bcode(
+            bcode_client::InstalledDaemonStart::IfNeeded,
+        )
+        .await
+        .map_err(|error| HostError::failed(error.to_string()))?;
+        let client = connected.client().clone();
+        *installed = Some(connected);
+        drop(installed);
+        Ok(client)
+    }
+
+    /// Map a failed call, forgetting an installed connection whose daemon is gone or was
+    /// replaced so the next call locates and verifies Bcode again.
+    fn failure(&self, error: &bcode_client::ClientError) -> HostError {
+        let gone = error.is_daemon_unavailable()
+            || matches!(error, bcode_client::ClientError::IncompatibleDaemon { .. });
+        if gone
+            && matches!(self.access, BcodeAccess::Installed)
+            && let Ok(mut installed) = self.installed.try_lock()
+        {
+            *installed = None;
+        }
+        client_error(error)
+    }
+
+    /// The Bcode executable that opens sessions.
+    fn program(&self) -> String {
+        let program = match &self.access {
+            BcodeAccess::Running { program, .. } => Some(program.clone()),
+            BcodeAccess::Installed => self
+                .installed
+                .try_lock()
+                .ok()
+                .and_then(|installed| {
+                    installed
+                        .as_ref()
+                        .map(|installed| installed.executable().to_path_buf())
+                })
+                .or_else(bcode_client::installed_bcode_executable),
+        };
+        program.map_or_else(
+            || "bcode".to_owned(),
+            |program| program.to_string_lossy().into_owned(),
+        )
+    }
+}
+
+/// Host of the standalone app: a Bcode daemon for sessions and plugin services, the platform
+/// clipboard and opener, and the app's own runtime for tasks and redraws.
 pub struct StandaloneHost {
-    client: bcode_client::BcodeClient,
+    bcode: Arc<BcodeConnection>,
     runtime: tokio::runtime::Handle,
     theme: Mutex<(HostTheme, u64)>,
     redraw: Arc<OnceLock<Redraw>>,
-    bcode_program: String,
 }
 
 impl std::fmt::Debug for StandaloneHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StandaloneHost")
-            .field("bcode_program", &self.bcode_program)
+            .field("bcode", &self.bcode.access)
             .finish_non_exhaustive()
     }
 }
 
 impl StandaloneHost {
-    /// Host over `client` and the current Tokio runtime, presenting `theme`.
+    /// Host reaching Bcode through `access` on the current Tokio runtime, presenting `theme`.
     ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime.
     #[must_use]
-    pub fn new(client: bcode_client::BcodeClient, theme: HostTheme) -> Self {
+    pub fn new(access: BcodeAccess, theme: HostTheme) -> Self {
         Self {
-            client,
+            bcode: Arc::new(BcodeConnection {
+                access,
+                installed: tokio::sync::Mutex::new(None),
+            }),
             runtime: tokio::runtime::Handle::current(),
             theme: Mutex::new((theme, 0)),
             redraw: Arc::default(),
-            bcode_program: "bcode".to_owned(),
         }
-    }
-
-    /// Use `program` (instead of `bcode` on the path) to open sessions.
-    #[must_use]
-    pub fn with_bcode_program(mut self, program: impl Into<String>) -> Self {
-        self.bcode_program = program.into();
-        self
     }
 
     /// Present `theme` from now on and request a redraw.
@@ -273,27 +347,31 @@ impl ReviewHost for StandaloneHost {
     }
 
     fn create_session(&self, title: String, working_directory: PathBuf) -> HostFuture<String> {
-        let client = self.client.clone();
+        let bcode = Arc::clone(&self.bcode);
         Box::pin(async move {
-            client
+            bcode
+                .client()
+                .await?
                 .create_session_in_working_directory(Some(title), working_directory)
                 .await
                 .map(|session| session.id.to_string())
-                .map_err(|error| client_error(&error))
+                .map_err(|error| bcode.failure(&error))
         })
     }
 
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()> {
-        let client = self.client.clone();
+        let bcode = Arc::clone(&self.bcode);
         Box::pin(async move {
             let id = session_id
                 .parse::<SessionId>()
                 .map_err(|error| HostError::failed(error.to_string()))?;
-            client
+            bcode
+                .client()
+                .await?
                 .send_user_message(id, text, bcode_session_models::PromptPlacement::FollowUp)
                 .await
                 .map(|_| ())
-                .map_err(|error| client_error(&error))
+                .map_err(|error| bcode.failure(&error))
         })
     }
 
@@ -311,9 +389,14 @@ impl ReviewHost for StandaloneHost {
             client_name: "bcode-review-session-view".to_owned(),
             interaction_kind: None,
         };
-        let client = self.client.clone();
+        let bcode = Arc::clone(&self.bcode);
         let redraw = Arc::clone(&self.redraw);
         drop(self.runtime.spawn(async move {
+            // Without Bcode the follower ends at once, which the view reports as a closed
+            // follow, like a daemon that goes away while following.
+            let Ok(client) = bcode.client().await else {
+                return;
+            };
             let mut sink = RedrawingSink {
                 sender: &mut sender,
                 redraw,
@@ -325,18 +408,20 @@ impl ReviewHost for StandaloneHost {
 
     fn open_session_command(&self, session_id: &str) -> Option<ExternalCommand> {
         Some(ExternalCommand {
-            program: self.bcode_program.clone(),
+            program: self.bcode.program(),
             args: vec!["tui".to_owned(), session_id.to_owned()],
         })
     }
 
     fn plugins_serving(&self, interface_id: String) -> HostFuture<Vec<String>> {
-        let client = self.client.clone();
+        let bcode = Arc::clone(&self.bcode);
         Box::pin(async move {
-            let services = client
+            let services = bcode
+                .client()
+                .await?
                 .plugin_services()
                 .await
-                .map_err(|error| client_error(&error))?;
+                .map_err(|error| bcode.failure(&error))?;
             Ok(services
                 .into_iter()
                 .filter(|service| service.interface_id == interface_id)
@@ -352,12 +437,14 @@ impl ReviewHost for StandaloneHost {
         operation: String,
         payload: Vec<u8>,
     ) -> HostFuture<Vec<u8>> {
-        let client = self.client.clone();
+        let bcode = Arc::clone(&self.bcode);
         Box::pin(async move {
-            let response = client
+            let response = bcode
+                .client()
+                .await?
                 .invoke_plugin_service(plugin_id, interface_id, operation, payload)
                 .await
-                .map_err(|error| client_error(&error))?;
+                .map_err(|error| bcode.failure(&error))?;
             match response.error {
                 Some(error) => Err(HostError {
                     code: error.code,

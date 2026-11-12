@@ -14,7 +14,9 @@ use bmux_tui::geometry::{Insets, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::text::{Line, Span};
 use bmux_tui_components::empty_state::{EmptyStateComponent, EmptyStatePolicy};
-use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuOutcome, MenuPolicy, MenuState};
+use bmux_tui_components::menu::{
+    MenuComponent, MenuItem, MenuNavigation, MenuOutcome, MenuPolicy, MenuState,
+};
 use bmux_tui_components::picker_frame::{
     PickerFrame, PickerFrameComponent, PickerFramePlacement, PickerFramePolicy,
 };
@@ -322,8 +324,12 @@ impl Picker {
                     .styles(theme.component.empty_state_styles());
             PickerFrameComponent::new(self.id, frame, empty)
         } else {
+            // The picker keeps one active row for keys and pointer alike, so a click on the
+            // active row picks it like a click on any other.
+            let mut policy = MenuPolicy::interactive();
+            policy.navigation = MenuNavigation::ActiveItem;
             let menu = MenuComponent::new(self.menu_id(), &self.menu_items, &self.menu)
-                .policy(MenuPolicy::interactive())
+                .policy(policy)
                 .styles(theme.component.selectable_list_styles())
                 .outcome(&self.outcome);
             PickerFrameComponent::new(self.id, frame, menu)

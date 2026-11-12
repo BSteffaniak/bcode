@@ -269,6 +269,8 @@ pub struct Wizard {
     step: Step,
     picker: Picker,
     state: Option<ReviewRepoStateResponse>,
+    /// Why the repository's state could not be read (outside a git repository, for example).
+    state_error: Option<String>,
     state_requested: bool,
     pulls: Option<Result<Option<PullsAnswer>, String>>,
     pulls_requested: bool,
@@ -319,6 +321,7 @@ impl Wizard {
             step: Step::Type,
             picker: type_picker(),
             state: None,
+            state_error: None,
             state_requested: false,
             pulls: None,
             pulls_requested: false,
@@ -608,15 +611,20 @@ impl Wizard {
     fn apply(&mut self, message: WizardMessage, host: &UiContext) {
         match message {
             WizardMessage::State(result) => {
-                if let Ok(state) = result {
-                    let prefill = self.step == Step::Details(Details::Branch)
-                        && self.picker.query().is_empty();
-                    if prefill && let Some(base) = &state.base {
-                        self.picker.set_query(base);
-                        self.request_listing(host, false);
+                match result {
+                    Ok(state) => {
+                        let prefill = self.step == Step::Details(Details::Branch)
+                            && self.picker.query().is_empty();
+                        if prefill && let Some(base) = &state.base {
+                            self.picker.set_query(base);
+                            self.request_listing(host, false);
+                        }
+                        self.state = Some(state);
                     }
-                    self.state = Some(state);
+                    Err(error) => self.state_error = Some(error),
                 }
+                // Counts shown in the step's rows depend on the state.
+                self.pending_items = true;
             }
             WizardMessage::Refs {
                 seq,
@@ -990,9 +998,14 @@ impl Wizard {
                 None,
             ),
             Step::Details(Details::WorkingTree) => {
+                let pending = if self.state_error.is_some() {
+                    "counts unavailable"
+                } else {
+                    "counting…"
+                };
                 let counts = |count: Option<bcode_code_review_models::ReviewChangeCount>| {
                     count.map_or_else(
-                        || "counting…".to_owned(),
+                        || pending.to_owned(),
                         |count| {
                             if count.is_empty() {
                                 "no changes".to_owned()

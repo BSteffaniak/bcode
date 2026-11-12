@@ -31,7 +31,7 @@ to a GitHub pull request without opening it.
 | `bcode_code_review` | The data layer as plain Rust calls: repository reads (`ReviewData`), stored review state (`ReviewStore`), provider routing, viewed marks, scopes, the renderer-neutral review document, and publish planning. |
 | `bcode_code_review_ui` | The BMUX program: home, new-review wizard, the review surface, keymap, theme, configuration, the shared command line, and the `ReviewHost` boundary. |
 | `bcode_code_review_ui_cli` | The `bcode-review` binary. |
-| `bcode_code_review_plugin` | Serves `bcode.code_review/v1` as JSON adapters over `bcode_code_review` for agents and other plugins, declares the review keymap actions, and (when statically bundled) registers the `bcode review` subcommand. |
+| `bcode_code_review_plugin` | Serves `bcode.code_review/v1` as JSON adapters over `bcode_code_review` for agents and other plugins, and (when statically bundled) contributes the app's keymap actions to bcode's keymap and registers the `bcode review` subcommand. |
 
 The app calls the data layer directly; there is no JSON encoding or service dispatch between
 the UI and its data. The daemon's plugin uses the same functions and the same state database,
@@ -48,7 +48,7 @@ The UI reaches everything outside the review through `ReviewHost`: the theme and
 sessions (create, send a message, follow a session's live view, the command that opens a session
 in Bcode), plugin services (publishers, importers and review-source providers), the clipboard,
 external URLs, background tasks, and redraw requests. `StandaloneHost` implements it for both
-entry points with the default daemon client and the platform clipboard and opener; it is the
+entry points with a daemon client (see below) and the platform clipboard and opener; it is the
 only part of the app that talks to the daemon for sessions and plugin services, so the data layer
 has no daemon client dependency. `run` connects any host's redraws to its loop
 (`ReviewHost::connect_redraw`). Another host, for example one that embeds the review in the chat
@@ -62,12 +62,31 @@ linked sessions, for plugin services, and for `publish-github`.
 
 * Inside `bcode review` the client starts the daemon when needed, and opening a linked session
   (`o`) runs `bcode tui <session>` with the same executable.
-* The standalone `bcode-review` never starts a daemon (it is not the Bcode program). It attaches
-  to a running one and opens sessions with `bcode` from the path. Without a running Bcode,
-  questions and `publish-github` report that Bcode is not running.
+* The standalone `bcode-review` is not the Bcode executable, so its own artifact names no daemon.
+  On first use it reaches the user's installed Bcode with
+  `BcodeClient::for_installed_bcode`: the executable is `BCODE_BIN` when set, else the first
+  `bcode` on `PATH`; its daemon for the current state and configuration scope is verified
+  (`DaemonTarget::verify`) and, when none is running, started with `bcode server start` the way
+  Bcode starts its own. Linked sessions open with that same executable. A missing executable or a
+  failed start is reported where the request was made (a question's toast, `publish-github`'s
+  error); when the daemon goes away later, the next request locates and verifies Bcode again.
 
 Opening a session hands the terminal to `bcode tui` and resumes the review where it was when
 that exits.
+
+### Comment composer
+
+Typing `@` and part of a path in the comment composer suggests repository paths (tracked and
+untracked, ignoring ignored files) from the data layer's file search, listed inside the composer
+under the editor. `up`/`down` (or `ctrl+p`/`ctrl+n`) move, `tab` or `enter` accepts, `esc` closes
+the suggestions, and a click accepts one. Accepting replaces the `@word` under the cursor with
+`@<path>` as one undoable edit; while suggestions are open, `enter` never submits the comment.
+
+### Review list
+
+Home's "Updated" column, its order, and `resume` follow when a review last changed: its title,
+sources, viewed files, reviewed revisions or archive state, or its comments. Opening or scrolling
+a review records where it was left without making it updated.
 
 ### Rendering and terminal output
 
@@ -110,9 +129,10 @@ bcode's own (`--print-config-paths` lists them in order):
   sets a layout.
 * `[plugins] disabled`: listing `bcode.code_review` disables the app.
 
-The review keymap actions are declared in the plugin manifest
-(`plugins/code-review-plugin/bcode-plugin.toml`), which the app reads at build time, so the app
-and bcode's keymap catalog share one declaration.
+The review keymap actions are declared once, in `packages/code-review-ui/keymap.toml`. The app
+reads them at build time, and the statically bundled plugin contributes the same declarations to
+bcode's keymap (its TUI registry), so bcode knows the review scopes and validates overrides of
+them.
 
 Review state lives in `code-review.db`, shared by the app and the daemon's plugin. It is in
 `code-review/` under the bcode state directory by default, in the repository's

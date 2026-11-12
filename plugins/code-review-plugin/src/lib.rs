@@ -5,14 +5,15 @@
 //! Local Git code review plugin for Bcode.
 //!
 //! The plugin serves `bcode.code_review/v1` as JSON adapters over the `bcode_code_review` data
-//! layer, registers the review keymap actions, and (when statically bundled) the `bcode review`
-//! command, which runs the `bcode_code_review_ui` app in process.
+//! layer and, when statically bundled, contributes the review app's keymap actions to bcode's
+//! keymap and registers the `bcode review` command, which runs the `bcode_code_review_ui` app in
+//! process.
 
 #[cfg(feature = "static-bundled")]
 mod cli;
 
-mod keybindings;
 mod service;
+#[cfg(feature = "static-bundled")]
 pub mod tui;
 
 pub use bcode_code_review::{CodeReviewConfig, CodeReviewStateLocation};

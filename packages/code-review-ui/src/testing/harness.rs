@@ -63,6 +63,7 @@ pub struct ScriptedHost {
     session_views: Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<SessionViewFollowUpdate>>>,
     sessions: Mutex<Vec<(String, String)>>,
     messages: Mutex<Vec<(String, String)>>,
+    session_failure: Mutex<Option<String>>,
     provider: OnceLock<FakeProvider>,
     publisher: OnceLock<FakePublisher>,
 }
@@ -109,9 +110,19 @@ impl ScriptedHost {
             session_views: Mutex::new(BTreeMap::new()),
             sessions: Mutex::default(),
             messages: Mutex::default(),
+            session_failure: Mutex::default(),
             provider: OnceLock::new(),
             publisher: OnceLock::new(),
         }
+    }
+
+    /// Fail creating sessions with `message` from now on (`None` succeeds again).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the failure lock is poisoned.
+    pub fn fail_sessions(&self, message: Option<&str>) {
+        *self.session_failure.lock().expect("failure lock") = message.map(str::to_owned);
     }
 
     /// Offer `layout` as bcode's diff layout preference.
@@ -313,6 +324,10 @@ impl ReviewHost for ScriptedHost {
     }
 
     fn create_session(&self, title: String, _working_directory: PathBuf) -> HostFuture<String> {
+        let failure = self.session_failure.lock().expect("failure lock").clone();
+        if let Some(message) = failure {
+            return Box::pin(async move { Err(HostError::failed(message)) });
+        }
         let id = SessionId::new().to_string();
         self.sessions
             .lock()
