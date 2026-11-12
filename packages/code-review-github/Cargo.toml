@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "GitHub pull requests and stacks as a bcode code review source"
+edition     = { workspace = true }
+keywords    = ["bcode", "github", "code-review", "stacked-prs"]
+license     = { workspace = true }
+name        = "bcode_code_review_github"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_code_review_models   = { workspace = true }
+bcode_code_review_provider = { workspace = true }
+bcode_forge                = { workspace = true, features = ["http"] }
+thiserror                  = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile   = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

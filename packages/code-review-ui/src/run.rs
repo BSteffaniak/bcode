@@ -226,7 +226,11 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         Arc::new(StandaloneHost::new(access, theme)) as Arc<dyn ReviewHost>
     };
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host))
-        .with_stack_limit(loaded.stack_limit);
+        .with_stack_limit(loaded.stack_limit)
+        // Built-in providers run in-process; a running Bcode's plugins can add more.
+        .with_source(Arc::new(bcode_code_review_github::GitHubReviewSource))
+        .with_contributor(Arc::new(bcode_code_review::discovery::git::GitDiscovery))
+        .with_contributor(Arc::new(bcode_code_review_graphite::GraphiteDiscovery));
     let ui = UiContext::new(host, Arc::new(keymap), loaded.diff_layout);
     let mut review = ReviewApp::new(services, repo, loaded.view, options.entry);
     review.prepare_keymap(&ui);

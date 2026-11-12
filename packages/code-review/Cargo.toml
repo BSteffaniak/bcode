@@ -12,15 +12,15 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_code_review_models = { workspace = true }
-bcode_config             = { workspace = true }
-bcode_git                = { workspace = true }
-bcode_path_display       = { workspace = true }
-hex                      = { workspace = true }
-regex                    = { workspace = true, features = ["std", "unicode"] }
-serde                    = { workspace = true, features = ["derive", "std"] }
-serde_json               = { workspace = true }
-sha2                     = { workspace = true }
-tempfile                 = { workspace = true, optional = true }
+bcode_code_review_provider = { workspace = true }
+bcode_config = { workspace = true }
+bcode_git = { workspace = true }
+bcode_path_display = { workspace = true }
+hex = { workspace = true }
+regex = { workspace = true, features = ["std", "unicode"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 switchy = { workspace = true, features = [
     "database",
     "database-schema",
@@ -28,8 +28,9 @@ switchy = { workspace = true, features = [
     "database-connection-turso",
     "schema",
 ] }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio     = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

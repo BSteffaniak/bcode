@@ -1,49 +1,38 @@
-//! Client-side routing to review-source providers (`bcode.review_source/v1`).
+//! Routing to review-source providers and discovery contributors.
 //!
-//! Plugin services cannot call each other: the host's nested-service bridge serves host
-//! interfaces only. Like publisher routing, provider routing therefore happens in the client.
-//! Before resolving a workspace, the client discovers the enabled providers, asks the matching
-//! provider to resolve stacks and fetch pull requests for every pull-request, stack-layer, and
-//! stack source, and passes the answers to `review.sources.resolve` as
-//! [`ReviewSourceProviderResolution`] values. Without a matching provider (for example when the
-//! GitHub plugin is disabled) a source gets no answer and resolves to a `provider_required`
-//! diagnostic; every other source keeps working.
+//! A [`ProviderRegistry`] holds the providers and contributors a review can ask: the built-in
+//! ones the application links and calls in-process (GitHub, git history, Graphite), plus any a
+//! running Bcode offers through its plugins ([`plugin_manifests`] finds them; the application
+//! wraps them as [`JsonReviewSource`] / [`JsonDiscovery`]). Built-in ones win over plugin ones with
+//! the same id, so nothing built in depends on Bcode.
+//!
+//! Every call here blocks (providers run git and talk to the network); callers run them on
+//! blocking threads. Before resolving a workspace, the client asks the matching provider to
+//! resolve stacks and fetch pull requests for every pull-request, stack-layer, and stack source,
+//! and passes the answers to `review.sources.resolve` as [`ReviewSourceProviderResolution`]
+//! values. Without a matching provider a source gets no answer and resolves to a
+//! `provider_required` diagnostic; every other source keeps working.
+
+pub use bcode_code_review_provider::{
+    DiscoveryContributor, JsonCall, JsonDiscovery, JsonReviewSource, ProviderCallError,
+    ProviderResult, ReviewSourceProvider,
+};
 
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH,
-    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED,
-    REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_INTERFACE_ID, ResolveReviewSourcesRequest,
-    ReviewPullFetchResult, ReviewPullFetchTarget, ReviewSource, ReviewSourceKind,
-    ReviewSourceProviderManifest, ReviewSourceProviderOutcome, ReviewSourceProviderResolution,
-    ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
-    ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
-    ReviewSourceStackResolveResponse, ReviewStack,
+    OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST, REVIEW_DISCOVERY_INTERFACE_ID,
+    REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_INTERFACE_ID,
+    ResolveReviewSourcesRequest, ReviewDiscoveryManifest, ReviewPullFetchResult,
+    ReviewPullFetchTarget, ReviewSource, ReviewSourceKind, ReviewSourceProviderManifest,
+    ReviewSourceProviderOutcome, ReviewSourceProviderResolution, ReviewSourcePullFetchRequest,
+    ReviewSourcePullsFetchRequest, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
+    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse, ReviewStack,
 };
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 
-/// A failed provider call: a service error code and message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderCallError {
-    /// Stable error code.
-    pub code: String,
-    /// Human-readable message.
-    pub message: String,
-}
-
-impl ProviderCallError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
-        Self {
-            code: code.to_string(),
-            message: message.into(),
-        }
-    }
-}
-
-/// Access to plugin services from a client: the daemon client in production, fakes in tests.
+/// Access to a running Bcode's plugin services, for finding plugin-backed providers.
 pub trait ProviderTransport {
     /// Ids of enabled plugins that serve `interface_id`.
     fn plugins_serving(
@@ -61,64 +50,200 @@ pub trait ProviderTransport {
     ) -> impl Future<Output = Result<Vec<u8>, ProviderCallError>> + Send;
 }
 
-/// One enabled review-source provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One review-source provider of a registry.
+#[derive(Clone)]
 pub struct ProviderRoute {
-    /// Plugin serving the provider.
-    pub plugin_id: String,
     /// The provider's manifest.
     pub manifest: ReviewSourceProviderManifest,
+    /// The provider.
+    pub provider: Arc<dyn ReviewSourceProvider>,
 }
 
-/// Discover the enabled review-source providers. A provider whose manifest cannot be read is
-/// skipped (its sources then report `provider_required`).
+impl std::fmt::Debug for ProviderRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderRoute")
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ProviderRoute {
+    fn eq(&self, other: &Self) -> bool {
+        self.manifest == other.manifest && Arc::ptr_eq(&self.provider, &other.provider)
+    }
+}
+
+impl Eq for ProviderRoute {}
+
+/// One discovery contributor of a registry.
+#[derive(Clone)]
+pub struct ContributorRoute {
+    /// The contributor's manifest.
+    pub manifest: ReviewDiscoveryManifest,
+    /// The contributor.
+    pub contributor: Arc<dyn DiscoveryContributor>,
+}
+
+impl std::fmt::Debug for ContributorRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContributorRoute")
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The providers and contributors a review asks, in preference order.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderRegistry {
+    sources: Vec<ProviderRoute>,
+    contributors: Vec<ContributorRoute>,
+}
+
+impl ProviderRegistry {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `provider` unless a provider with its id is already present. Returns whether it was
+    /// added.
+    pub fn add_source(&mut self, provider: Arc<dyn ReviewSourceProvider>) -> bool {
+        let manifest = provider.manifest();
+        if self.source(&manifest.id).is_some() {
+            return false;
+        }
+        self.sources.push(ProviderRoute { manifest, provider });
+        true
+    }
+
+    /// Add `contributor` unless a contributor with its id is already present. Returns whether it
+    /// was added.
+    pub fn add_contributor(&mut self, contributor: Arc<dyn DiscoveryContributor>) -> bool {
+        let manifest = contributor.manifest();
+        if self
+            .contributors
+            .iter()
+            .any(|route| route.manifest.id == manifest.id)
+        {
+            return false;
+        }
+        self.contributors.push(ContributorRoute {
+            manifest,
+            contributor,
+        });
+        true
+    }
+
+    /// [`Self::add_source`], builder style.
+    #[must_use]
+    pub fn with_source(mut self, provider: Arc<dyn ReviewSourceProvider>) -> Self {
+        self.add_source(provider);
+        self
+    }
+
+    /// [`Self::add_contributor`], builder style.
+    #[must_use]
+    pub fn with_contributor(mut self, contributor: Arc<dyn DiscoveryContributor>) -> Self {
+        self.add_contributor(contributor);
+        self
+    }
+
+    /// Review-source providers, in preference order.
+    #[must_use]
+    pub fn sources(&self) -> &[ProviderRoute] {
+        &self.sources
+    }
+
+    /// Discovery contributors, in preference order.
+    #[must_use]
+    pub fn contributors(&self) -> &[ContributorRoute] {
+        &self.contributors
+    }
+
+    /// The provider with id `id`.
+    #[must_use]
+    pub fn source(&self, id: &str) -> Option<&ProviderRoute> {
+        self.sources.iter().find(|route| route.manifest.id == id)
+    }
+}
+
+/// Manifests of the review-source providers and discovery contributors a running Bcode's plugins
+/// offer, by plugin id. A plugin whose manifest cannot be read is skipped.
 ///
 /// # Errors
 ///
-/// * Returns the transport error when the plugin services cannot be listed.
-pub async fn discover_providers<T: ProviderTransport + Sync>(
+/// * The transport's error when the plugin services cannot be listed.
+#[allow(clippy::type_complexity)]
+pub async fn plugin_manifests<T: ProviderTransport + Sync>(
     transport: &T,
-) -> Result<Vec<ProviderRoute>, ProviderCallError> {
-    let mut routes = Vec::new();
+) -> Result<
+    (
+        Vec<(String, ReviewSourceProviderManifest)>,
+        Vec<(String, ReviewDiscoveryManifest)>,
+    ),
+    ProviderCallError,
+> {
+    let mut sources = Vec::new();
     for plugin_id in transport
         .plugins_serving(REVIEW_SOURCE_INTERFACE_ID)
         .await?
     {
-        if let Ok(manifest) = call::<_, _, ReviewSourceProviderManifest>(
-            transport,
-            &plugin_id,
-            OP_REVIEW_SOURCE_MANIFEST,
-            &serde_json::json!({}),
-        )
-        .await
+        if let Ok(payload) = transport
+            .invoke(
+                &plugin_id,
+                REVIEW_SOURCE_INTERFACE_ID,
+                OP_REVIEW_SOURCE_MANIFEST,
+                b"{}".to_vec(),
+            )
+            .await
+            && let Ok(manifest) = serde_json::from_slice(&payload)
         {
-            routes.push(ProviderRoute {
-                plugin_id,
-                manifest,
-            });
+            sources.push((plugin_id, manifest));
         }
     }
-    Ok(routes)
+    let mut contributors = Vec::new();
+    for plugin_id in transport
+        .plugins_serving(REVIEW_DISCOVERY_INTERFACE_ID)
+        .await?
+    {
+        if let Ok(payload) = transport
+            .invoke(
+                &plugin_id,
+                REVIEW_DISCOVERY_INTERFACE_ID,
+                OP_REVIEW_DISCOVERY_MANIFEST,
+                b"{}".to_vec(),
+            )
+            .await
+            && let Ok(manifest) = serde_json::from_slice(&payload)
+        {
+            contributors.push((plugin_id, manifest));
+        }
+    }
+    Ok((sources, contributors))
 }
 
 /// Ask the matching providers about every included provider-backed source.
 ///
 /// * `PullRequest`: fetch the pull request.
-/// * `StackLayer` / `Stack`: resolve the stack, then fetch every layer from the trunk up to the
-///   reviewed layer (or the stack's top), each with its own base branch.
+/// * `StackLayer` / `Stack`: resolve the stack (with discovery, once per stack), then fetch every
+///   layer from the trunk up to the reviewed layer (or the stack's top), each with its own base
+///   branch, every layer of every source in one batched fetch where the provider can.
 ///
-/// Sources whose provider is not among `routes` get no entry. Provider failures become
+/// Sources whose provider is not in `registry` get no entry. Provider failures become
 /// [`ReviewSourceProviderOutcome::Failed`] entries. Stacks are resolved with `max_layers` (see
 /// [`ReviewSourceStackResolveRequest::max_layers`]).
-pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
-    transport: &T,
-    routes: &[ProviderRoute],
+#[must_use]
+pub fn gather_provider_resolutions(
+    registry: &ProviderRegistry,
     repo_path: &Path,
     sources: &[ReviewSource],
     max_layers: Option<usize>,
 ) -> Vec<ReviewSourceProviderResolution> {
     // 1. Resolve each source's stack (once per stack) and note the pull requests it needs.
-    let mut targets: BTreeMap<(String, String), (Target<'_, T>, Asked)> = BTreeMap::new();
+    let mut targets: BTreeMap<(String, String), (Target<'_>, Asked)> = BTreeMap::new();
     let mut plans = Vec::new();
     for source in sources.iter().filter(|source| source.included) {
         let (provider, repository, number, stacked) = match &source.kind {
@@ -139,14 +264,14 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
             } => (provider, repository, *top, true),
             _ => continue,
         };
-        let Some(route) = routes.iter().find(|route| route.manifest.id == *provider) else {
+        let Some(route) = registry.source(provider) else {
             continue;
         };
-        let key = (route.plugin_id.clone(), repository.clone());
+        let key = (route.manifest.id.clone(), repository.clone());
         let (target, asked) = targets.entry(key.clone()).or_insert_with(|| {
             (
                 Target {
-                    transport,
+                    registry,
                     route,
                     repo_path,
                     repository,
@@ -157,7 +282,7 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
             )
         });
         let needs = if stacked {
-            target.stack(asked, number).await
+            target.stack(asked, number)
         } else {
             Ok((None, vec![(number, None)]))
         };
@@ -171,7 +296,7 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
             .filter_map(|(_, _, needs)| needs.as_ref().ok())
             .flat_map(|(_, keys)| keys.iter().cloned())
             .collect();
-        target.fetch_all(asked, &needed).await;
+        target.fetch_all(asked, &needed);
     }
     // 3. Answer each source from what was asked.
     plans
@@ -208,57 +333,46 @@ pub async fn gather_provider_resolutions<T: ProviderTransport + Sync>(
         .collect()
 }
 
-/// Build the `review.sources.resolve` request for a workspace, asking the enabled providers
+/// Build the `review.sources.resolve` request for a workspace, asking `registry`'s providers
 /// about its provider-backed sources first (stacks with `max_layers`).
-///
-/// # Errors
-///
-/// * Returns the transport error when the plugin services cannot be listed.
-pub async fn resolve_request_with_providers<T: ProviderTransport + Sync>(
-    transport: &T,
+#[must_use]
+pub fn resolve_request_with_providers(
+    registry: &ProviderRegistry,
     repo_path: &Path,
     sources: Vec<ReviewSource>,
     max_layers: Option<usize>,
-) -> Result<ResolveReviewSourcesRequest, ProviderCallError> {
+) -> ResolveReviewSourcesRequest {
     let needs_provider = sources.iter().any(|source| {
         source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
     });
     let provider_resolutions = if needs_provider {
-        let routes = discover_providers(transport).await?;
-        gather_provider_resolutions(transport, &routes, repo_path, &sources, max_layers).await
+        gather_provider_resolutions(registry, repo_path, &sources, max_layers)
     } else {
         Vec::new()
     };
-    Ok(ResolveReviewSourcesRequest {
+    ResolveReviewSourcesRequest {
         repo_path: repo_path.to_path_buf(),
         sources,
         provider_resolutions,
-    })
+    }
 }
 
-/// List the open pull requests of `repository` (detected from the remotes when `None`) through
+/// The open pull requests of `repository` (detected from the remotes when `None`) through
 /// `route`: review requested from me first, then most recently updated.
 ///
 /// # Errors
 ///
 /// * The provider's error (for example `unauthenticated` or `unsupported_repository`).
-pub async fn list_pulls<T: ProviderTransport + Sync>(
-    transport: &T,
+pub fn list_pulls(
     route: &ProviderRoute,
     repo_path: &Path,
     repository: Option<String>,
-) -> Result<ReviewSourcePullsListResponse, ProviderCallError> {
-    call(
-        transport,
-        &route.plugin_id,
-        OP_REVIEW_SOURCE_PULLS_LIST,
-        &ReviewSourcePullsListRequest {
-            repo_path: repo_path.to_path_buf(),
-            repository,
-            query: None,
-        },
-    )
-    .await
+) -> ProviderResult<ReviewSourcePullsListResponse> {
+    route.provider.list_pulls(&ReviewSourcePullsListRequest {
+        repo_path: repo_path.to_path_buf(),
+        repository,
+        query: None,
+    })
 }
 
 /// Look up the open pull requests `query` names through `route`: a number (`123`, `#123`) or URL,
@@ -267,24 +381,17 @@ pub async fn list_pulls<T: ProviderTransport + Sync>(
 /// # Errors
 ///
 /// * The provider's error (for example `unauthenticated` or `unsupported_repository`).
-pub async fn lookup_pulls<T: ProviderTransport + Sync>(
-    transport: &T,
+pub fn lookup_pulls(
     route: &ProviderRoute,
     repo_path: &Path,
     repository: Option<String>,
     query: &str,
-) -> Result<ReviewSourcePullsListResponse, ProviderCallError> {
-    call(
-        transport,
-        &route.plugin_id,
-        OP_REVIEW_SOURCE_PULLS_LIST,
-        &ReviewSourcePullsListRequest {
-            repo_path: repo_path.to_path_buf(),
-            repository,
-            query: Some(query.to_owned()),
-        },
-    )
-    .await
+) -> ProviderResult<ReviewSourcePullsListResponse> {
+    route.provider.list_pulls(&ReviewSourcePullsListRequest {
+        repo_path: repo_path.to_path_buf(),
+        repository,
+        query: Some(query.to_owned()),
+    })
 }
 
 /// Resolve the stack containing pull request `number` through `route`, cut at `max_layers` when
@@ -293,33 +400,28 @@ pub async fn lookup_pulls<T: ProviderTransport + Sync>(
 /// # Errors
 ///
 /// * The provider's error (for example `pull_not_found`).
-pub async fn resolve_stack<T: ProviderTransport + Sync>(
-    transport: &T,
+pub fn resolve_stack(
     route: &ProviderRoute,
     repo_path: &Path,
     repository: Option<String>,
     number: u64,
     max_layers: Option<usize>,
     hints: Vec<String>,
-) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
-    call(
-        transport,
-        &route.plugin_id,
-        OP_REVIEW_SOURCE_STACK_RESOLVE,
-        &ReviewSourceStackResolveRequest {
+) -> ProviderResult<ReviewSourceStackResolveResponse> {
+    route
+        .provider
+        .resolve_stack(&ReviewSourceStackResolveRequest {
             repo_path: repo_path.to_path_buf(),
             repository,
             number,
             max_layers,
             hints,
-        },
-    )
-    .await
+        })
 }
 
-/// One provider and repository being asked about a source.
-struct Target<'a, T> {
-    transport: &'a T,
+/// One provider and repository being asked about sources.
+struct Target<'a> {
+    registry: &'a ProviderRegistry,
     route: &'a ProviderRoute,
     repo_path: &'a Path,
     repository: &'a str,
@@ -330,15 +432,15 @@ struct Target<'a, T> {
 /// A pull request fetch: its number and the base branch fetched with it (`None`: its own).
 type FetchKey = (u64, Option<String>);
 
-impl<T: ProviderTransport + Sync> Target<'_, T> {
+impl Target<'_> {
     /// The stack containing `number` and the fetches its layers up to `number` need. A stack
     /// already resolved for another source that has `number` as a layer is reused, so one open
     /// resolves each stack once.
-    async fn stack(
+    fn stack(
         &self,
         asked: &mut Asked,
         number: u64,
-    ) -> Result<(Option<ReviewStack>, Vec<FetchKey>), ProviderCallError> {
+    ) -> ProviderResult<(Option<ReviewStack>, Vec<FetchKey>)> {
         let known = asked
             .stacks
             .iter()
@@ -348,15 +450,14 @@ impl<T: ProviderTransport + Sync> Target<'_, T> {
             stack
         } else {
             let response = crate::discovery::resolve_stack_with_discovery(
-                self.transport,
+                self.registry,
                 self.route,
                 self.repo_path,
                 Some(self.repository.to_string()),
                 number,
                 self.max_layers,
                 None,
-            )
-            .await?;
+            )?;
             for layer in &response.stack.layers {
                 asked.layers.insert(
                     layer.pull.number,
@@ -387,7 +488,7 @@ impl<T: ProviderTransport + Sync> Target<'_, T> {
     /// Fetch every pull request of `needed` not fetched yet: stack layers in one
     /// `review_source.pulls.fetch` when the provider supports it, the rest one at a time.
     /// Results (and failures) are kept in `asked`.
-    async fn fetch_all(&self, asked: &mut Asked, needed: &BTreeSet<FetchKey>) {
+    fn fetch_all(&self, asked: &mut Asked, needed: &BTreeSet<FetchKey>) {
         let missing: Vec<&FetchKey> = needed
             .iter()
             .filter(|key| !asked.fetched.contains_key(*key))
@@ -411,17 +512,14 @@ impl<T: ProviderTransport + Sync> Target<'_, T> {
             Vec::new()
         };
         if !batch.is_empty() {
-            let response: Result<ReviewSourcePullsFetchResponse, _> = call(
-                self.transport,
-                &self.route.plugin_id,
-                OP_REVIEW_SOURCE_PULLS_FETCH,
-                &ReviewSourcePullsFetchRequest {
+            let response = self
+                .route
+                .provider
+                .fetch_pulls(&ReviewSourcePullsFetchRequest {
                     repo_path: self.repo_path.to_path_buf(),
                     repository: Some(self.repository.to_string()),
                     pulls: batch.iter().map(|(_, target)| target.clone()).collect(),
-                },
-            )
-            .await;
+                });
             match response {
                 Ok(response) if response.fetched.len() == batch.len() => {
                     for ((key, _), fetched) in batch.iter().zip(response.fetched) {
@@ -432,8 +530,7 @@ impl<T: ProviderTransport + Sync> Target<'_, T> {
                     let error = ProviderCallError::new(
                         REVIEW_SOURCE_ERROR_FAILED,
                         format!(
-                            "{} answered {} of {} pull requests",
-                            OP_REVIEW_SOURCE_PULLS_FETCH,
+                            "the provider answered {} of {} pull requests",
                             response.fetched.len(),
                             batch.len()
                         ),
@@ -453,18 +550,15 @@ impl<T: ProviderTransport + Sync> Target<'_, T> {
             if asked.fetched.contains_key(key) {
                 continue;
             }
-            let fetched = call(
-                self.transport,
-                &self.route.plugin_id,
-                OP_REVIEW_SOURCE_PULL_FETCH,
-                &ReviewSourcePullFetchRequest {
+            let fetched = self
+                .route
+                .provider
+                .fetch_pull(&ReviewSourcePullFetchRequest {
                     repo_path: self.repo_path.to_path_buf(),
                     repository: Some(self.repository.to_string()),
                     number: key.0,
                     base_branch: key.1.clone(),
-                },
-            )
-            .await;
+                });
             asked.fetched.insert(key.clone(), fetched);
         }
     }
@@ -480,54 +574,6 @@ struct Asked {
     layers: BTreeMap<u64, ReviewPullFetchTarget>,
     /// Fetch results and failures.
     fetched: BTreeMap<FetchKey, Result<ReviewPullFetchResult, ProviderCallError>>,
-}
-
-async fn call<T, Req, Resp>(
-    transport: &T,
-    plugin_id: &str,
-    operation: &str,
-    request: &Req,
-) -> Result<Resp, ProviderCallError>
-where
-    T: ProviderTransport + Sync,
-    Req: Serialize + Sync,
-    Resp: DeserializeOwned,
-{
-    call_interface(
-        transport,
-        plugin_id,
-        REVIEW_SOURCE_INTERFACE_ID,
-        operation,
-        request,
-    )
-    .await
-}
-
-/// Invoke `operation` of `interface_id` on `plugin_id` with a JSON request and decode the JSON
-/// answer.
-pub(crate) async fn call_interface<T, Req, Resp>(
-    transport: &T,
-    plugin_id: &str,
-    interface_id: &str,
-    operation: &str,
-    request: &Req,
-) -> Result<Resp, ProviderCallError>
-where
-    T: ProviderTransport + Sync,
-    Req: Serialize + Sync,
-    Resp: DeserializeOwned,
-{
-    let payload = serde_json::to_vec(request)
-        .map_err(|error| ProviderCallError::new(REVIEW_SOURCE_ERROR_FAILED, error.to_string()))?;
-    let response = transport
-        .invoke(plugin_id, interface_id, operation, payload)
-        .await?;
-    serde_json::from_slice(&response).map_err(|error| {
-        ProviderCallError::new(
-            REVIEW_SOURCE_ERROR_FAILED,
-            format!("unexpected {operation} response from {plugin_id}: {error}"),
-        )
-    })
 }
 
 #[cfg(test)]

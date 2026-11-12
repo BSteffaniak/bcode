@@ -11,9 +11,7 @@
 //!   other entry keeps working.
 
 use crate::services::ReviewServices;
-use bcode_code_review::provider::{
-    ProviderCallError, ProviderRoute, discover_providers, lookup_pulls,
-};
+use bcode_code_review::provider::{ProviderCallError, ProviderRoute, lookup_pulls};
 use bcode_code_review_models::{
     GetReviewWorkspaceRequest, GetReviewWorkspaceResponse, ListReviewWorkspacesRequest,
     ListReviewWorkspacesResponse, REVIEW_SOURCE_ERROR_UNAUTHENTICATED, ReviewRepoStateRequest,
@@ -183,17 +181,16 @@ pub const NO_PROVIDER: &str = "Pull request and stack reviews need a review-sour
 /// # Errors
 ///
 /// Returns a message when the plugin services cannot be listed or no provider qualifies.
-pub async fn provider(
+pub fn provider(
     services: &ReviewServices,
     capable: impl Fn(&ProviderRoute) -> bool,
 ) -> Result<ProviderRoute, String> {
-    let transport = services.transport();
-    let routes = discover_providers(&transport)
-        .await
-        .map_err(|error| format!("could not list review-source providers: {}", error.message))?;
-    routes
-        .into_iter()
+    services
+        .providers()
+        .sources()
+        .iter()
         .find(|route| capable(route))
+        .cloned()
         .ok_or_else(|| NO_PROVIDER.to_owned())
 }
 
@@ -225,9 +222,10 @@ async fn pull_request(
 ) -> Result<ReviewWorkspace, String> {
     let wanted = parse_pull_reference(reference)
         .ok_or_else(|| format!("{reference} is not a pull request number or URL"))?;
-    let route = provider(services, |route| route.manifest.capabilities.pull_fetch).await?;
-    let transport = services.transport();
-    let listed = lookup_pulls(&transport, &route, &repo, None, &wanted.number.to_string())
+    let route = provider(services, |route| route.manifest.capabilities.pull_fetch)?;
+    let (asked, path, query) = (route.clone(), repo.clone(), wanted.number.to_string());
+    let listed = services
+        .blocking(move || lookup_pulls(&asked, &path, None, &query))
         .await
         .map_err(|error| provider_message(&route.manifest.label, &error))?;
     let pull = listed.pulls.iter().find(|pull| {
@@ -260,9 +258,7 @@ async fn stack(
 ) -> Result<ReviewWorkspace, String> {
     let route = provider(services, |route| {
         route.manifest.capabilities.stack_resolve && route.manifest.capabilities.pull_fetch
-    })
-    .await?;
-    let transport = services.transport();
+    })?;
     let label = &route.manifest.label;
     let (number, repository, head_branch) = if let Some(reference) = reference {
         let wanted = parse_pull_reference(reference)
@@ -278,7 +274,9 @@ async fn stack(
         let branch = state
             .branch
             .ok_or("HEAD is detached; pass a pull request number")?;
-        let listed = lookup_pulls(&transport, &route, &repo, None, &branch)
+        let (asked, path, query) = (route.clone(), repo.clone(), branch.clone());
+        let listed = services
+            .blocking(move || lookup_pulls(&asked, &path, None, &query))
             .await
             .map_err(|error| provider_message(label, &error))?;
         let pull = listed
@@ -288,17 +286,22 @@ async fn stack(
             .ok_or_else(|| format!("no open pull request has the current branch {branch}"))?;
         (pull.number, Some(listed.repository), Some(branch))
     };
-    let resolved = bcode_code_review::discovery::resolve_stack_with_discovery(
-        &transport,
-        &route,
-        &repo,
-        repository,
-        number,
-        services.stack_limit().resolve_limit(),
-        head_branch,
-    )
-    .await
-    .map_err(|error| provider_message(label, &error))?;
+    let (registry, asked, path) = (services.providers(), route.clone(), repo.clone());
+    let max_layers = services.stack_limit().resolve_limit();
+    let resolved = services
+        .blocking(move || {
+            bcode_code_review::discovery::resolve_stack_with_discovery(
+                &registry,
+                &asked,
+                &path,
+                repository,
+                number,
+                max_layers,
+                head_branch,
+            )
+        })
+        .await
+        .map_err(|error| provider_message(label, &error))?;
     let top = resolved
         .stack
         .layers

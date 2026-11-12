@@ -1,0 +1,332 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! The interfaces code review uses to learn about pull requests and stacks.
+//!
+//! * [`ReviewSourceProvider`]: a forge (GitHub, …) answering exact questions about pull
+//!   requests: lookups, stack resolution, fetching their commits. Authoritative.
+//! * [`DiscoveryContributor`]: local evidence (git history, a stacking tool's metadata) about how
+//!   branches relate, plus notes about them. Hints only.
+//!
+//! Built-in implementations are libraries the review links and calls in-process; the same
+//! implementations are served to Bcode's plugins as JSON operations ([`serve_review_source`],
+//! [`serve_discovery`]), and a plugin's provider can be called through the trait
+//! ([`JsonReviewSource`], [`JsonDiscovery`]). Methods block (they run git and talk to the
+//! network); callers run them on blocking threads, which is also how calls proceed in parallel.
+//! See `docs/review-loading-architecture.md`.
+
+use bcode_code_review_models::{
+    OP_REVIEW_DISCOVERY_DISCOVER, OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST,
+    OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
+    OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED, ReviewDiscoveryManifest,
+    ReviewDiscoveryRequest, ReviewDiscoveryResponse, ReviewPullFetchResult,
+    ReviewSourceProviderManifest, ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest,
+    ReviewSourcePullsFetchResponse, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
+    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse,
+};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+/// Error code: the operation is not one the interface defines.
+pub const ERROR_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
+/// Error code: the request could not be read.
+pub const ERROR_INVALID_REQUEST: &str = "invalid_request";
+
+/// A failed provider or contributor call: a stable error code and a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCallError {
+    /// Stable error code (for review sources, the `REVIEW_SOURCE_ERROR_*` codes).
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+}
+
+impl ProviderCallError {
+    /// An error with `code` and `message`.
+    #[must_use]
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ProviderCallError {}
+
+/// Result of a provider or contributor call.
+pub type ProviderResult<T> = Result<T, ProviderCallError>;
+
+/// A forge's answers about pull requests (`bcode.review_source/v1`). Every method blocks.
+pub trait ReviewSourceProvider: Send + Sync {
+    /// The provider's id, label, and capabilities.
+    fn manifest(&self) -> ReviewSourceProviderManifest;
+
+    /// Recent open pull requests, or those a query names.
+    ///
+    /// # Errors
+    /// The provider's failure (for example `unauthenticated`).
+    fn list_pulls(
+        &self,
+        request: &ReviewSourcePullsListRequest,
+    ) -> ProviderResult<ReviewSourcePullsListResponse>;
+
+    /// The stack containing a pull request.
+    ///
+    /// # Errors
+    /// The provider's failure (for example `pull_not_found`).
+    fn resolve_stack(
+        &self,
+        request: &ReviewSourceStackResolveRequest,
+    ) -> ProviderResult<ReviewSourceStackResolveResponse>;
+
+    /// Make one pull request's commits local.
+    ///
+    /// # Errors
+    /// The provider's failure (for example `fetch_failed`).
+    fn fetch_pull(
+        &self,
+        request: &ReviewSourcePullFetchRequest,
+    ) -> ProviderResult<ReviewPullFetchResult>;
+
+    /// Make several pull requests' commits local at once.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] when the provider does not batch
+    /// (its manifest says so).
+    fn fetch_pulls(
+        &self,
+        request: &ReviewSourcePullsFetchRequest,
+    ) -> ProviderResult<ReviewSourcePullsFetchResponse>;
+}
+
+/// Local evidence about branches (`bcode.review_discovery/v1`). Every method blocks and must
+/// stay local and fast.
+pub trait DiscoveryContributor: Send + Sync {
+    /// The contributor's id and label.
+    fn manifest(&self) -> ReviewDiscoveryManifest;
+
+    /// Links, related branches, and annotations around the requested branches.
+    ///
+    /// # Errors
+    /// The contributor's failure; callers treat it as a warning.
+    fn discover(&self, request: &ReviewDiscoveryRequest)
+    -> ProviderResult<ReviewDiscoveryResponse>;
+}
+
+fn decode<T: DeserializeOwned>(payload: &[u8]) -> ProviderResult<T> {
+    serde_json::from_slice(payload)
+        .map_err(|error| ProviderCallError::new(ERROR_INVALID_REQUEST, error.to_string()))
+}
+
+fn encode<T: Serialize>(value: &T) -> ProviderResult<Vec<u8>> {
+    serde_json::to_vec(value)
+        .map_err(|error| ProviderCallError::new(REVIEW_SOURCE_ERROR_FAILED, error.to_string()))
+}
+
+/// Answer one `bcode.review_source/v1` operation with `provider` (JSON in, JSON out).
+///
+/// # Errors
+/// [`ERROR_INVALID_REQUEST`] for an unreadable request, [`ERROR_UNSUPPORTED_OPERATION`] for an
+/// unknown operation, else the provider's failure.
+pub fn serve_review_source(
+    provider: &dyn ReviewSourceProvider,
+    operation: &str,
+    payload: &[u8],
+) -> ProviderResult<Vec<u8>> {
+    match operation {
+        OP_REVIEW_SOURCE_MANIFEST => encode(&provider.manifest()),
+        OP_REVIEW_SOURCE_PULLS_LIST => encode(&provider.list_pulls(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_STACK_RESOLVE => encode(&provider.resolve_stack(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_PULL_FETCH => encode(&provider.fetch_pull(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_PULLS_FETCH => encode(&provider.fetch_pulls(&decode(payload)?)?),
+        _ => Err(ProviderCallError::new(
+            ERROR_UNSUPPORTED_OPERATION,
+            format!("unsupported review-source operation {operation}"),
+        )),
+    }
+}
+
+/// Answer one `bcode.review_discovery/v1` operation with `contributor` (JSON in, JSON out).
+///
+/// # Errors
+/// As [`serve_review_source`].
+pub fn serve_discovery(
+    contributor: &dyn DiscoveryContributor,
+    operation: &str,
+    payload: &[u8],
+) -> ProviderResult<Vec<u8>> {
+    match operation {
+        OP_REVIEW_DISCOVERY_MANIFEST => encode(&contributor.manifest()),
+        OP_REVIEW_DISCOVERY_DISCOVER => encode(&contributor.discover(&decode(payload)?)?),
+        _ => Err(ProviderCallError::new(
+            ERROR_UNSUPPORTED_OPERATION,
+            format!("unsupported review discovery operation {operation}"),
+        )),
+    }
+}
+
+/// A blocking JSON call: `(operation, payload) → response payload`.
+pub type JsonCall = Box<dyn Fn(&str, Vec<u8>) -> ProviderResult<Vec<u8>> + Send + Sync>;
+
+fn call<Req: Serialize, Resp: DeserializeOwned>(
+    invoke: &JsonCall,
+    operation: &str,
+    request: &Req,
+) -> ProviderResult<Resp> {
+    let response = invoke(operation, encode(request)?)?;
+    serde_json::from_slice(&response).map_err(|error| {
+        ProviderCallError::new(
+            REVIEW_SOURCE_ERROR_FAILED,
+            format!("unexpected {operation} response: {error}"),
+        )
+    })
+}
+
+/// A review-source provider reached through JSON operations (for example a Bcode plugin's).
+pub struct JsonReviewSource {
+    manifest: ReviewSourceProviderManifest,
+    invoke: JsonCall,
+}
+
+impl JsonReviewSource {
+    /// The provider `manifest` describes, answering through `invoke`.
+    #[must_use]
+    pub fn new(manifest: ReviewSourceProviderManifest, invoke: JsonCall) -> Self {
+        Self { manifest, invoke }
+    }
+}
+
+impl ReviewSourceProvider for JsonReviewSource {
+    fn manifest(&self) -> ReviewSourceProviderManifest {
+        self.manifest.clone()
+    }
+
+    fn list_pulls(
+        &self,
+        request: &ReviewSourcePullsListRequest,
+    ) -> ProviderResult<ReviewSourcePullsListResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULLS_LIST, request)
+    }
+
+    fn resolve_stack(
+        &self,
+        request: &ReviewSourceStackResolveRequest,
+    ) -> ProviderResult<ReviewSourceStackResolveResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_STACK_RESOLVE, request)
+    }
+
+    fn fetch_pull(
+        &self,
+        request: &ReviewSourcePullFetchRequest,
+    ) -> ProviderResult<ReviewPullFetchResult> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULL_FETCH, request)
+    }
+
+    fn fetch_pulls(
+        &self,
+        request: &ReviewSourcePullsFetchRequest,
+    ) -> ProviderResult<ReviewSourcePullsFetchResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULLS_FETCH, request)
+    }
+}
+
+/// A discovery contributor reached through JSON operations (for example a Bcode plugin's).
+pub struct JsonDiscovery {
+    manifest: ReviewDiscoveryManifest,
+    invoke: JsonCall,
+}
+
+impl JsonDiscovery {
+    /// The contributor `manifest` describes, answering through `invoke`.
+    #[must_use]
+    pub fn new(manifest: ReviewDiscoveryManifest, invoke: JsonCall) -> Self {
+        Self { manifest, invoke }
+    }
+}
+
+impl DiscoveryContributor for JsonDiscovery {
+    fn manifest(&self) -> ReviewDiscoveryManifest {
+        self.manifest.clone()
+    }
+
+    fn discover(
+        &self,
+        request: &ReviewDiscoveryRequest,
+    ) -> ProviderResult<ReviewDiscoveryResponse> {
+        call(&self.invoke, OP_REVIEW_DISCOVERY_DISCOVER, request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_code_review_models::ReviewSourceCapabilities;
+    use std::sync::Arc;
+
+    struct Echo;
+
+    impl DiscoveryContributor for Echo {
+        fn manifest(&self) -> ReviewDiscoveryManifest {
+            ReviewDiscoveryManifest {
+                id: "echo".into(),
+                label: "Echo".into(),
+            }
+        }
+
+        fn discover(
+            &self,
+            request: &ReviewDiscoveryRequest,
+        ) -> ProviderResult<ReviewDiscoveryResponse> {
+            Ok(ReviewDiscoveryResponse {
+                related: request.branches.clone(),
+                ..ReviewDiscoveryResponse::default()
+            })
+        }
+    }
+
+    #[test]
+    fn json_round_trips_reach_the_same_answers_as_direct_calls() {
+        let served: Arc<dyn DiscoveryContributor> = Arc::new(Echo);
+        let through_json = JsonDiscovery::new(
+            served.manifest(),
+            Box::new(move |operation, payload| {
+                serve_discovery(served.as_ref(), operation, &payload)
+            }),
+        );
+        let request = ReviewDiscoveryRequest {
+            repo_path: "/repo".into(),
+            branches: vec!["a".into()],
+            trunk: None,
+        };
+        assert_eq!(through_json.discover(&request), Echo.discover(&request));
+        assert_eq!(through_json.manifest().id, "echo");
+        let unknown = serve_discovery(&Echo, "review_discovery.nope", b"{}").unwrap_err();
+        assert_eq!(unknown.code, ERROR_UNSUPPORTED_OPERATION);
+        let invalid = serve_discovery(&Echo, OP_REVIEW_DISCOVERY_DISCOVER, b"nope").unwrap_err();
+        assert_eq!(invalid.code, ERROR_INVALID_REQUEST);
+        // Review sources answer unknown operations the same way.
+        let manifest = ReviewSourceProviderManifest {
+            id: "x".into(),
+            label: "X".into(),
+            capabilities: ReviewSourceCapabilities::default(),
+        };
+        let source = JsonReviewSource::new(
+            manifest,
+            Box::new(|operation, _| {
+                Err(ProviderCallError::new(
+                    ERROR_UNSUPPORTED_OPERATION,
+                    operation,
+                ))
+            }),
+        );
+        assert_eq!(source.manifest().id, "x");
+    }
+}

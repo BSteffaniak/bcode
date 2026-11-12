@@ -14,14 +14,13 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_code_review_models = { workspace = true }
-bcode_plugin_sdk         = { workspace = true }
-serde                    = { workspace = true, features = ["derive", "std"] }
-serde_json               = { workspace = true }
-thiserror                = { workspace = true }
+bcode_code_review_graphite = { workspace = true }
+bcode_code_review_models   = { workspace = true }
+bcode_code_review_provider = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default          = []

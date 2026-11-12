@@ -47,10 +47,28 @@ impl std::fmt::Debug for TestBackend {
 }
 
 impl TestBackend {
-    /// Enable `provider` as the only review-source provider.
+    /// Enable `provider` as the only review-source provider, registered in-process through the
+    /// JSON adapter (the way a plugin-backed provider is reached) so its calls are recorded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fake cannot answer its manifest (a test bug).
     #[must_use]
-    pub fn with_provider(self, provider: FakeProvider) -> Self {
-        self.host.set_provider(provider);
+    pub fn with_provider(mut self, provider: FakeProvider) -> Self {
+        let provider = Arc::new(provider);
+        self.host.set_provider(Arc::clone(&provider));
+        let manifest = serde_json::from_slice(
+            &provider
+                .answer(bcode_code_review_models::OP_REVIEW_SOURCE_MANIFEST, b"{}")
+                .expect("fake manifest"),
+        )
+        .expect("fake manifest");
+        self.services = self.services.with_source(Arc::new(
+            bcode_code_review::provider::JsonReviewSource::new(
+                manifest,
+                Box::new(move |operation, payload| provider.answer(operation, &payload)),
+            ),
+        ));
         self
     }
 

@@ -11,6 +11,7 @@ use bcode_code_review_models::{
     REVIEW_DISCOVERY_MAX_ITEMS, ReviewDiscoveryManifest, ReviewDiscoveryRequest,
     ReviewDiscoveryResponse,
 };
+use bcode_code_review_provider::{DiscoveryContributor, ProviderCallError, ProviderResult};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -23,6 +24,24 @@ pub fn manifest() -> ReviewDiscoveryManifest {
     ReviewDiscoveryManifest {
         id: GIT_DISCOVERY_ID.to_owned(),
         label: "Git".to_owned(),
+    }
+}
+
+/// Git history as a [`DiscoveryContributor`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitDiscovery;
+
+impl DiscoveryContributor for GitDiscovery {
+    fn manifest(&self) -> ReviewDiscoveryManifest {
+        manifest()
+    }
+
+    fn discover(
+        &self,
+        request: &ReviewDiscoveryRequest,
+    ) -> ProviderResult<ReviewDiscoveryResponse> {
+        discover(request)
+            .map_err(|error| ProviderCallError::new("discovery_failed", error.to_string()))
     }
 }
 

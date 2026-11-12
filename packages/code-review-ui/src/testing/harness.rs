@@ -33,7 +33,7 @@ use bmux_tui::geometry::{Point, Rect, Size};
 use bmux_tui::paint::PaintCx;
 use bmux_tui::style::Style;
 
-use super::fake_provider::{FAKE_PLUGIN, FakeProvider};
+use super::fake_provider::FakeProvider;
 use super::fake_publisher::{FAKE_PUBLISHER_PLUGIN, FakePublisher};
 use crate::action::{Action, EventResult};
 use crate::config::DiffLayout;
@@ -68,7 +68,7 @@ pub struct ScriptedHost {
     permissions: Mutex<Vec<(String, bool, bool)>>,
     cancels: Mutex<Vec<String>>,
     delayed_redraws: AtomicUsize,
-    provider: OnceLock<FakeProvider>,
+    provider: OnceLock<std::sync::Arc<FakeProvider>>,
     publisher: OnceLock<FakePublisher>,
 }
 
@@ -145,7 +145,7 @@ impl ScriptedHost {
     /// # Panics
     ///
     /// Panics when a provider is already set.
-    pub fn set_provider(&self, provider: FakeProvider) {
+    pub fn set_provider(&self, provider: std::sync::Arc<FakeProvider>) {
         assert!(self.provider.set(provider).is_ok(), "provider already set");
     }
 
@@ -164,7 +164,7 @@ impl ScriptedHost {
     /// The fake provider, when set.
     #[must_use]
     pub fn provider(&self) -> Option<&FakeProvider> {
-        self.provider.get()
+        self.provider.get().map(std::sync::Arc::as_ref)
     }
 
     /// The fake publisher, when set.
@@ -439,11 +439,9 @@ impl ReviewHost for ScriptedHost {
     }
 
     fn plugins_serving(&self, interface_id: String) -> HostFuture<Vec<String>> {
-        let plugins = if self.provider.get().is_some()
-            && interface_id == bcode_code_review_models::REVIEW_SOURCE_INTERFACE_ID
-        {
-            vec![FAKE_PLUGIN.to_owned()]
-        } else if self.publisher.get().is_some()
+        // The fake provider is registered in-process (see `TestBackend::with_provider`), as the
+        // built-in providers are; only publishers and importers are plugin-backed here.
+        let plugins = if self.publisher.get().is_some()
             && (interface_id == bcode_code_review_models::REVIEW_PUBLISHER_INTERFACE_ID
                 || interface_id == bcode_code_review_models::REVIEW_IMPORTER_INTERFACE_ID)
         {
@@ -462,16 +460,10 @@ impl ReviewHost for ScriptedHost {
         payload: Vec<u8>,
     ) -> HostFuture<Vec<u8>> {
         let answer = self
-            .provider
+            .publisher
             .get()
-            .filter(|_| plugin_id == FAKE_PLUGIN)
-            .map(|provider| provider.answer(&operation, &payload))
-            .or_else(|| {
-                self.publisher
-                    .get()
-                    .filter(|_| plugin_id == FAKE_PUBLISHER_PLUGIN)
-                    .map(|publisher| publisher.answer(&interface_id, &operation, &payload))
-            });
+            .filter(|_| plugin_id == FAKE_PUBLISHER_PLUGIN)
+            .map(|publisher| publisher.answer(&interface_id, &operation, &payload));
         Box::pin(async move {
             answer
                 .unwrap_or_else(|| {

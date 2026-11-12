@@ -100,13 +100,13 @@ Every layer needs its head and base commits under review-owned refs
 
 ## Contributors
 
-### Git topology (code review plugin)
+### Git topology (`packages/code-review`, `discovery::git`)
 
 From the seeds' tips: branches whose history contains a seed (layers above) and branches a seed
 contains that the trunk does not (layers below), local and remote-tracking, without remote
 prefixes. One `git for-each-ref` per seed; no tool required.
 
-### Graphite (`plugins/graphite-plugin`)
+### Graphite (`packages/code-review-graphite`; `plugins/graphite-plugin` serves it to Bcode)
 
 Reads Graphite's branch metadata from git (`refs/branch-metadata/<branch>`, one JSON blob per
 tracked branch) with a single `git cat-file --batch`, so it needs neither the `gt` binary nor the

@@ -8,29 +8,17 @@
 pub mod git;
 
 use crate::provider::{
-    ProviderCallError, ProviderRoute, ProviderTransport, call_interface, lookup_pulls,
-    resolve_stack,
+    ProviderCallError, ProviderRegistry, ProviderRoute, lookup_pulls, resolve_stack,
 };
 use bcode_code_review_models::{
-    AnnotationSeverity, BranchAnnotation, BranchLink, OP_REVIEW_DISCOVERY_DISCOVER,
-    OP_REVIEW_DISCOVERY_MANIFEST, REVIEW_DISCOVERY_INTERFACE_ID, REVIEW_DISCOVERY_MAX_ITEMS,
-    ReviewDiscoveryManifest, ReviewDiscoveryRequest, ReviewDiscoveryResponse,
-    ReviewSourceStackResolveResponse, ReviewStack,
+    AnnotationSeverity, BranchAnnotation, BranchLink, REVIEW_DISCOVERY_MAX_ITEMS,
+    ReviewDiscoveryRequest, ReviewDiscoveryResponse, ReviewSourceStackResolveResponse, ReviewStack,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Most hinted branches sent with one stack resolution.
 pub const MAX_HINTS: usize = 400;
-
-/// One enabled discovery contributor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Contributor {
-    /// Plugin serving it.
-    pub plugin_id: String,
-    /// Its manifest.
-    pub manifest: ReviewDiscoveryManifest,
-}
 
 /// What every contributor said, each item with the label of the contributor that said it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -149,42 +137,11 @@ impl Discovery {
     }
 }
 
-/// The enabled discovery contributors. A contributor whose manifest cannot be read is skipped.
-///
-/// # Errors
-///
-/// * Returns the transport error when the plugin services cannot be listed.
-pub async fn discover_contributors<T: ProviderTransport + Sync>(
-    transport: &T,
-) -> Result<Vec<Contributor>, ProviderCallError> {
-    let mut contributors = Vec::new();
-    for plugin_id in transport
-        .plugins_serving(REVIEW_DISCOVERY_INTERFACE_ID)
-        .await?
-    {
-        if let Ok(manifest) = call_interface::<_, _, ReviewDiscoveryManifest>(
-            transport,
-            &plugin_id,
-            REVIEW_DISCOVERY_INTERFACE_ID,
-            OP_REVIEW_DISCOVERY_MANIFEST,
-            &serde_json::json!({}),
-        )
-        .await
-        {
-            contributors.push(Contributor {
-                plugin_id,
-                manifest,
-            });
-        }
-    }
-    Ok(contributors)
-}
-
-/// Ask every contributor about `branches` and merge their answers; failures are recorded, not
-/// returned.
-pub async fn discover<T: ProviderTransport + Sync>(
-    transport: &T,
-    contributors: &[Contributor],
+/// Ask every contributor of `registry` about `branches`, in parallel, and merge their answers;
+/// failures are recorded, not returned.
+#[must_use]
+pub fn discover(
+    registry: &ProviderRegistry,
     repo_path: &Path,
     branches: &[String],
     trunk: Option<&str>,
@@ -194,20 +151,29 @@ pub async fn discover<T: ProviderTransport + Sync>(
         branches: branches.to_vec(),
         trunk: trunk.map(str::to_owned),
     };
+    let answers: Vec<(String, Result<ReviewDiscoveryResponse, ProviderCallError>)> =
+        std::thread::scope(|scope| {
+            // Every contributor starts before any is joined, so they run at once.
+            let mut workers = Vec::new();
+            for route in registry.contributors() {
+                let request = &request;
+                workers.push(scope.spawn(move || {
+                    (
+                        route.manifest.label.clone(),
+                        route.contributor.discover(request),
+                    )
+                }));
+            }
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().ok())
+                .collect()
+        });
     let mut discovery = Discovery::default();
-    for contributor in contributors {
-        let label = contributor.manifest.label.as_str();
-        match call_interface::<_, _, ReviewDiscoveryResponse>(
-            transport,
-            &contributor.plugin_id,
-            REVIEW_DISCOVERY_INTERFACE_ID,
-            OP_REVIEW_DISCOVERY_DISCOVER,
-            &request,
-        )
-        .await
-        {
-            Ok(response) => discovery.add(label, response),
-            Err(error) => discovery.failures.push((label.to_owned(), error.message)),
+    for (label, answer) in answers {
+        match answer {
+            Ok(response) => discovery.add(&label, response),
+            Err(error) => discovery.failures.push((label, error.message)),
         }
     }
     discovery
@@ -216,14 +182,14 @@ pub async fn discover<T: ProviderTransport + Sync>(
 /// Resolve the stack containing pull request `number` through `route` with discovery.
 ///
 /// The contributors are asked about its head branch (`head_branch`, else looked up by number when
-/// any contributor is enabled); their hints go with the resolution and their warnings onto the
+/// any contributor is registered); their hints go with the resolution and their warnings onto the
 /// stack. Without contributors this is [`resolve_stack`].
 ///
 /// # Errors
 ///
 /// * The provider's error; discovery failures become warnings instead.
-pub async fn resolve_stack_with_discovery<T: ProviderTransport + Sync>(
-    transport: &T,
+pub fn resolve_stack_with_discovery(
+    registry: &ProviderRegistry,
     route: &ProviderRoute,
     repo_path: &Path,
     repository: Option<String>,
@@ -231,40 +197,21 @@ pub async fn resolve_stack_with_discovery<T: ProviderTransport + Sync>(
     max_layers: Option<usize>,
     head_branch: Option<String>,
 ) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
-    let contributors = discover_contributors(transport).await.unwrap_or_default();
     let mut discovery = Discovery::default();
     let mut hints = Vec::new();
-    if !contributors.is_empty() {
-        let head = match head_branch {
-            Some(head) => Some(head),
-            None => lookup_pulls(
-                transport,
-                route,
-                repo_path,
-                repository.clone(),
-                &number.to_string(),
-            )
-            .await
-            .ok()
-            .and_then(|listed| listed.pulls.into_iter().find(|pull| pull.number == number))
-            .map(|pull| pull.head_branch),
-        };
+    if !registry.contributors().is_empty() {
+        let head = head_branch.or_else(|| {
+            lookup_pulls(route, repo_path, repository.clone(), &number.to_string())
+                .ok()
+                .and_then(|listed| listed.pulls.into_iter().find(|pull| pull.number == number))
+                .map(|pull| pull.head_branch)
+        });
         if let Some(head) = head {
-            discovery = discover(
-                transport,
-                &contributors,
-                repo_path,
-                std::slice::from_ref(&head),
-                None,
-            )
-            .await;
+            discovery = discover(registry, repo_path, std::slice::from_ref(&head), None);
             hints = discovery.hints(&head);
         }
     }
-    let mut response = resolve_stack(
-        transport, route, repo_path, repository, number, max_layers, hints,
-    )
-    .await?;
+    let mut response = resolve_stack(route, repo_path, repository, number, max_layers, hints)?;
     discovery.annotate(&mut response.stack);
     Ok(response)
 }

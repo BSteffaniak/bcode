@@ -1,4 +1,11 @@
-//! GitHub review-source provider (`bcode.review_source/v1`).
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! GitHub as a code review source ([`GitHubReviewSource`], a [`ReviewSourceProvider`]).
+//!
+//! The review links this crate and calls it in-process; the GitHub Bcode plugin serves the same
+//! provider as `bcode.review_source/v1` for agents and other plugins.
 //!
 //! Lists open pull requests through `bcode_forge`, detects stacks of pull requests by walking
 //! their base/head branch relationships on GitHub (Graphite-style and GitHub native stacked pull
@@ -7,9 +14,7 @@
 //! touch the user's branches or remote-tracking references.
 
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH,
-    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary,
-    REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_FETCH_FAILED,
+    PullRequestSummary, REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_FETCH_FAILED,
     REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
     REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY, ReviewPullFetchResult, ReviewPullFetchTarget,
     ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewSourceProviderManifest,
@@ -17,9 +22,8 @@ use bcode_code_review_models::{
     ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
     ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer, ReviewStackSibling,
 };
+use bcode_code_review_provider::{ProviderCallError, ProviderResult, ReviewSourceProvider};
 use bcode_forge::models::{ForgeError, PullRequest, PullRequestList, RepositoryRef};
-use bcode_plugin_sdk::prelude::{ServiceRequest, ServiceResponse};
-use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -94,81 +98,90 @@ pub fn manifest() -> ReviewSourceProviderManifest {
     }
 }
 
-/// Handle one `bcode.review_source/v1` operation.
-#[must_use]
-pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
-    match request.operation.as_str() {
-        OP_REVIEW_SOURCE_MANIFEST => crate::json_response(&manifest()),
-        OP_REVIEW_SOURCE_PULLS_LIST => handle(request, |req: ReviewSourcePullsListRequest| {
-            let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-            let github = repository.github(&req.repo_path);
-            let list = match req.query.as_deref().map(str::trim) {
-                Some(query) if !query.is_empty() => lookup_pulls(&github, &repository, query)?,
-                _ => github.open_pull_requests(&repository.0)?,
-            };
-            Ok(pulls_list_response(&repository, list))
-        }),
-        OP_REVIEW_SOURCE_STACK_RESOLVE => {
-            handle(request, |req: ReviewSourceStackResolveRequest| {
-                let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-                let stack = resolve_stack(
-                    &repository,
-                    &req.repo_path,
-                    req.number,
-                    req.max_layers,
-                    &req.hints,
-                )?;
-                Ok(ReviewSourceStackResolveResponse {
-                    repository: repository.display(),
-                    stack,
-                })
-            })
-        }
-        OP_REVIEW_SOURCE_PULL_FETCH => handle(request, |req: ReviewSourcePullFetchRequest| {
-            let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-            let base_branch = match req.base_branch {
-                Some(base) => base,
-                None => repository
-                    .github(&req.repo_path)
-                    .pull_request(&repository.0, req.number)?
-                    .pull_request
-                    .map(|pull| pull.base)
-                    .ok_or_else(|| {
-                        ReviewSourceError::PullNotFound(req.number, repository.display())
-                    })?,
-            };
-            let remote = repository.fetch_remote(&req.repo_path);
-            fetch_pull(&req.repo_path, &remote, req.number, &base_branch)
-        }),
-        OP_REVIEW_SOURCE_PULLS_FETCH => handle(request, |req: ReviewSourcePullsFetchRequest| {
-            let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-            let remote = repository.fetch_remote(&req.repo_path);
-            Ok(ReviewSourcePullsFetchResponse {
-                fetched: fetch_pulls(&req.repo_path, &remote, &req.pulls)?,
-            })
-        }),
-        _ => ServiceResponse::error(
-            "unsupported_operation",
-            "unsupported GitHub review-source operation",
-        ),
+impl From<ReviewSourceError> for ProviderCallError {
+    fn from(error: ReviewSourceError) -> Self {
+        Self::new(error.code(), error.to_string())
     }
 }
 
-fn handle<Req, Resp>(
-    request: &ServiceRequest,
-    operation: impl FnOnce(Req) -> Result<Resp, ReviewSourceError>,
-) -> ServiceResponse
-where
-    Req: DeserializeOwned,
-    Resp: serde::Serialize,
-{
-    let payload = match serde_json::from_slice::<Req>(&request.payload) {
-        Ok(payload) => payload,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-    match operation(payload) {
-        Ok(response) => crate::json_response(&response),
-        Err(error) => ServiceResponse::error(error.code(), error.to_string()),
+/// GitHub as a [`ReviewSourceProvider`]: pull requests through `bcode_forge` (the HTTPS API,
+/// falling back to `gh`), commits through `git fetch` into review-owned references.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitHubReviewSource;
+
+impl ReviewSourceProvider for GitHubReviewSource {
+    fn manifest(&self) -> ReviewSourceProviderManifest {
+        manifest()
+    }
+
+    fn list_pulls(
+        &self,
+        request: &ReviewSourcePullsListRequest,
+    ) -> ProviderResult<ReviewSourcePullsListResponse> {
+        let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
+        let github = repository.github(&request.repo_path);
+        let list = match request.query.as_deref().map(str::trim) {
+            Some(query) if !query.is_empty() => lookup_pulls(&github, &repository, query)?,
+            _ => github
+                .open_pull_requests(&repository.0)
+                .map_err(ReviewSourceError::from)?,
+        };
+        Ok(pulls_list_response(&repository, list))
+    }
+
+    fn resolve_stack(
+        &self,
+        request: &ReviewSourceStackResolveRequest,
+    ) -> ProviderResult<ReviewSourceStackResolveResponse> {
+        let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
+        let stack = resolve_stack(
+            &repository,
+            &request.repo_path,
+            request.number,
+            request.max_layers,
+            &request.hints,
+        )?;
+        Ok(ReviewSourceStackResolveResponse {
+            repository: repository.display(),
+            stack,
+        })
+    }
+
+    fn fetch_pull(
+        &self,
+        request: &ReviewSourcePullFetchRequest,
+    ) -> ProviderResult<ReviewPullFetchResult> {
+        let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
+        let base_branch = match request.base_branch.clone() {
+            Some(base) => base,
+            None => repository
+                .github(&request.repo_path)
+                .pull_request(&repository.0, request.number)
+                .map_err(ReviewSourceError::from)?
+                .pull_request
+                .map(|pull| pull.base)
+                .ok_or_else(|| {
+                    ReviewSourceError::PullNotFound(request.number, repository.display())
+                })?,
+        };
+        let remote = repository.fetch_remote(&request.repo_path);
+        Ok(fetch_pull(
+            &request.repo_path,
+            &remote,
+            request.number,
+            &base_branch,
+        )?)
+    }
+
+    fn fetch_pulls(
+        &self,
+        request: &ReviewSourcePullsFetchRequest,
+    ) -> ProviderResult<ReviewSourcePullsFetchResponse> {
+        let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
+        let remote = repository.fetch_remote(&request.repo_path);
+        Ok(ReviewSourcePullsFetchResponse {
+            fetched: fetch_pulls(&request.repo_path, &remote, &request.pulls)?,
+        })
     }
 }
 

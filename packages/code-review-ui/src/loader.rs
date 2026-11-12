@@ -208,14 +208,16 @@ pub async fn open(
             )
         })
         .collect();
-    let request = resolve_request_with_providers(
-        &services.transport(),
-        &repo_path,
-        sources,
-        services.stack_limit().resolve_limit(),
-    )
-    .await
-    .map_err(|error| error.message)?;
+    let (registry, path) = (services.providers(), repo_path.clone());
+    let max_layers = services.stack_limit().resolve_limit();
+    let request = services
+        .blocking(move || {
+            Ok(resolve_request_with_providers(
+                &registry, &path, sources, max_layers,
+            ))
+        })
+        .await
+        .map_err(|error| error.message)?;
     let resolved: ResolveReviewSourcesResponse = services
         .call(request)
         .await

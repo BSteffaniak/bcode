@@ -5,7 +5,7 @@
 use super::model::{PullsAnswer, WorkspaceStats};
 use crate::entry::provider_message;
 use crate::services::ReviewServices;
-use bcode_code_review::provider::{ProviderRoute, discover_providers, list_pulls, lookup_pulls};
+use bcode_code_review::provider::{ProviderRoute, list_pulls, lookup_pulls};
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, ListReviewWorkspacesRequest,
     ListReviewWorkspacesResponse, ResolveReviewSourcesRequest, ResolveReviewSourcesResponse,
@@ -98,17 +98,18 @@ pub async fn state(
 ///
 /// Returns the provider's failure as a message.
 pub async fn pulls(services: ReviewServices, repo: PathBuf) -> Result<Option<PullsAnswer>, String> {
-    let transport = services.transport();
-    let routes = discover_providers(&transport)
-        .await
-        .map_err(|error| error.message)?;
-    let Some(route) = routes
-        .into_iter()
+    let Some(route) = services
+        .providers()
+        .sources()
+        .iter()
         .find(|route| route.manifest.capabilities.pulls_list)
+        .cloned()
     else {
         return Ok(None);
     };
-    let listed = list_pulls(&transport, &route, &repo, None)
+    let asked = route.clone();
+    let listed = services
+        .blocking(move || list_pulls(&asked, &repo, None))
         .await
         .map_err(|error| provider_message(&route.manifest.label, &error))?;
     Ok(Some(PullsAnswer {
@@ -130,11 +131,12 @@ pub async fn lookup(
     repository: String,
     query: String,
 ) -> Result<Vec<bcode_code_review_models::PullRequestSummary>, String> {
-    let transport = services.transport();
-    lookup_pulls(&transport, &route, &repo, Some(repository), &query)
+    let label = route.manifest.label.clone();
+    services
+        .blocking(move || lookup_pulls(&route, &repo, Some(repository), &query))
         .await
         .map(|listed| listed.pulls)
-        .map_err(|error| provider_message(&route.manifest.label, &error))
+        .map_err(|error| provider_message(&label, &error))
 }
 
 /// The stack containing pull request `number` (whose head branch is `head_branch`, when known),
@@ -151,19 +153,24 @@ pub async fn stack(
     number: u64,
     head_branch: Option<String>,
 ) -> Result<ReviewStack, String> {
-    let transport = services.transport();
-    bcode_code_review::discovery::resolve_stack_with_discovery(
-        &transport,
-        &route,
-        &repo,
-        Some(repository),
-        number,
-        services.stack_limit().resolve_limit(),
-        head_branch,
-    )
-    .await
-    .map(|response| response.stack)
-    .map_err(|error| provider_message(&route.manifest.label, &error))
+    let label = route.manifest.label.clone();
+    let registry = services.providers();
+    let max_layers = services.stack_limit().resolve_limit();
+    services
+        .blocking(move || {
+            bcode_code_review::discovery::resolve_stack_with_discovery(
+                &registry,
+                &route,
+                &repo,
+                Some(repository),
+                number,
+                max_layers,
+                head_branch,
+            )
+        })
+        .await
+        .map(|response| response.stack)
+        .map_err(|error| provider_message(&label, &error))
 }
 
 /// Stats of one review: its sources resolved without asking providers (no network), each

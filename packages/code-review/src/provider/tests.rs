@@ -10,32 +10,25 @@ use crate::testing::fixture::{
 };
 use bcode_code_review_models::{
     AnnotationSeverity, BranchAnnotation, BranchLink, OP_REVIEW_DISCOVERY_DISCOVER,
-    OP_REVIEW_DISCOVERY_MANIFEST, PullRequestSummary, REVIEW_DIAGNOSTIC_PROVIDER_FAILED,
-    REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED, REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION,
-    REVIEW_DISCOVERY_INTERFACE_ID, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
+    OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH,
+    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary,
+    REVIEW_DIAGNOSTIC_PROVIDER_FAILED, REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED,
+    REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
     ResolveReviewSourcesResponse, ResolvedReviewStack, ResolvedStackLayer, ReviewDiscoveryManifest,
     ReviewDiscoveryRequest, ReviewDiscoveryResponse, ReviewFileHunksRequest, ReviewLineKind,
-    ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewStackAttributionRequest,
-    ReviewStackAttributionResponse, ReviewStackLayer, ReviewStackLineAttribution, RevisionRef,
+    ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewSourcePullsFetchResponse,
+    ReviewSourcePullsListResponse, ReviewStackAttributionRequest, ReviewStackAttributionResponse,
+    ReviewStackLayer, ReviewStackLineAttribution, RevisionRef,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
-const FAKE_PLUGIN: &str = "test.fake_review_source";
-const FAKE_DISCOVERY_PLUGIN: &str = "test.fake_discovery";
 const FAKE_PROVIDER: &str = "fake";
 const FAKE_REPOSITORY: &str = "octo/fixture";
 /// Pull request numbers of the fixture's stack layers, bottom to top.
 const LAYER_NUMBERS: [u64; 3] = [101, 102, 103];
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime")
-        .block_on(future)
-}
 
 fn pull(number: u64, base: &str, head: &str) -> PullRequestSummary {
     PullRequestSummary {
@@ -83,11 +76,14 @@ fn rev_parse(repo: &Path, spec: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// A provider that serves the fixture stack and fetches by resolving local branches.
+/// A provider that serves the fixture stack and fetches by resolving local branches. It answers
+/// JSON operations (the shape a plugin-backed provider has) and records every call; [`registry`]
+/// registers it through the JSON adapters.
+#[derive(Clone)]
 struct FakeProvider {
     repo: PathBuf,
-    /// Plugins advertising the review-source interface (empty: the provider plugin is disabled).
-    plugins: Vec<String>,
+    /// Whether the provider is registered at all.
+    enabled: bool,
     /// Error returned by every fetch, when set.
     fetch_error: Option<ProviderCallError>,
     /// Whether the provider fetches many pull requests in one call.
@@ -95,7 +91,7 @@ struct FakeProvider {
     /// What a discovery contributor answers, when one is enabled.
     discovery: Option<ReviewDiscoveryResponse>,
     /// Calls received, as `operation` or `operation #number base`.
-    calls: Mutex<Vec<String>>,
+    calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeProvider {
@@ -120,11 +116,11 @@ impl FakeProvider {
     fn new(repo: &Path) -> Self {
         Self {
             repo: repo.to_path_buf(),
-            plugins: vec![FAKE_PLUGIN.to_string()],
+            enabled: true,
             fetch_error: None,
             batch_fetch: false,
             discovery: None,
-            calls: Mutex::new(Vec::new()),
+            calls: Arc::default(),
         }
     }
 
@@ -268,35 +264,34 @@ mod erased {
     }
 }
 
-impl ProviderTransport for FakeProvider {
-    fn plugins_serving(
-        &self,
-        interface_id: &str,
-    ) -> impl Future<Output = Result<Vec<String>, ProviderCallError>> + Send {
-        std::future::ready(Ok(if interface_id == REVIEW_SOURCE_INTERFACE_ID {
-            self.plugins.clone()
-        } else if interface_id == REVIEW_DISCOVERY_INTERFACE_ID && self.discovery.is_some() {
-            vec![FAKE_DISCOVERY_PLUGIN.to_string()]
-        } else {
-            Vec::new()
-        }))
+/// A registry with `fake` as its provider (when enabled) and its discovery contributor (when it
+/// has an answer), both reached through the JSON adapters.
+fn registry(fake: &FakeProvider) -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    if fake.enabled {
+        let served = fake.clone();
+        let manifest: ReviewSourceProviderManifest = serde_json::from_slice(
+            &fake
+                .answer(OP_REVIEW_SOURCE_MANIFEST, b"{}")
+                .expect("manifest"),
+        )
+        .expect("manifest");
+        registry.add_source(Arc::new(JsonReviewSource::new(
+            manifest,
+            Box::new(move |operation, payload| served.answer(operation, &payload)),
+        )));
     }
-
-    fn invoke(
-        &self,
-        plugin_id: &str,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> impl Future<Output = Result<Vec<u8>, ProviderCallError>> + Send {
-        if plugin_id == FAKE_DISCOVERY_PLUGIN {
-            assert_eq!(interface_id, REVIEW_DISCOVERY_INTERFACE_ID);
-            return std::future::ready(Ok(self.discovered(operation, &payload)));
-        }
-        assert_eq!(plugin_id, FAKE_PLUGIN);
-        assert_eq!(interface_id, REVIEW_SOURCE_INTERFACE_ID);
-        std::future::ready(self.answer(operation, &payload))
+    if fake.discovery.is_some() {
+        let served = fake.clone();
+        registry.add_contributor(Arc::new(JsonDiscovery::new(
+            ReviewDiscoveryManifest {
+                id: "fake".into(),
+                label: "Fake tool".into(),
+            },
+            Box::new(move |operation, payload| Ok(served.discovered(operation, &payload))),
+        )));
     }
+    registry
 }
 
 fn source(id: &str, kind: ReviewSourceKind) -> ReviewSource {
@@ -343,14 +338,11 @@ fn pull_source(id: &str, number: u64) -> ReviewSource {
 
 /// Resolve `sources` the way a client does: ask the providers, then the service.
 fn resolve(
-    transport: &FakeProvider,
+    provider: &FakeProvider,
     repo: &Path,
     sources: Vec<ReviewSource>,
 ) -> ResolveReviewSourcesResponse {
-    let request = block_on(resolve_request_with_providers(
-        transport, repo, sources, None,
-    ))
-    .expect("provider routing");
+    let request = resolve_request_with_providers(&registry(provider), repo, sources, None);
     // The request crosses the service boundary as JSON.
     let request: ResolveReviewSourcesRequest =
         serde_json::from_slice(&serde_json::to_vec(&request).expect("encode")).expect("decode");
@@ -519,16 +511,16 @@ fn discovery_hints_go_to_the_provider_and_its_warnings_onto_the_stack() {
             message: "needs a restack".into(),
         }],
     });
-    let routes = block_on(discover_providers(&provider)).expect("routes");
-    let response = block_on(crate::discovery::resolve_stack_with_discovery(
-        &provider,
-        &routes[0],
+    let registry = registry(&provider);
+    let response = crate::discovery::resolve_stack_with_discovery(
+        &registry,
+        &registry.sources()[0],
         repo,
         Some(FAKE_REPOSITORY.into()),
         103,
         None,
         None,
-    ))
+    )
     .expect("stack");
     let calls = provider.calls();
     // The head branch is looked up by number, the contributor asked about it, and the provider
@@ -576,7 +568,7 @@ fn provider_backed_sources_report_provider_required_when_no_provider_is_enabled(
     let repo = fixture.root();
     // The provider plugin is disabled: nothing serves `bcode.review_source/v1`.
     let mut provider = FakeProvider::new(repo);
-    provider.plugins.clear();
+    provider.enabled = false;
     let mut other = pull_source("other-provider", 103);
     other.kind = ReviewSourceKind::PullRequest {
         provider: "someone-else".into(),
@@ -631,16 +623,17 @@ fn provider_backed_sources_report_provider_required_when_no_provider_is_enabled(
     );
     assert_eq!(enabled.calls(), vec![OP_REVIEW_SOURCE_MANIFEST.to_string()]);
 
-    // Workspaces without provider-backed sources never ask for providers.
-    let request = block_on(resolve_request_with_providers(
-        &enabled,
+    // Workspaces without provider-backed sources never ask providers anything.
+    let registry = registry(&enabled);
+    let before = enabled.calls().len();
+    let request = resolve_request_with_providers(
+        &registry,
         repo,
         vec![source("last", ReviewSourceKind::LastCommit)],
         None,
-    ))
-    .expect("request");
+    );
     assert_eq!(request.provider_resolutions.len(), 0);
-    assert_eq!(enabled.calls().len(), 1);
+    assert_eq!(enabled.calls().len(), before);
 }
 
 #[test]

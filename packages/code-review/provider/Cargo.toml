@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Review-source provider and discovery contributor interfaces for bcode code review"
+edition     = { workspace = true }
+keywords    = ["bcode", "code-review", "provider"]
+license     = { workspace = true }
+name        = "bcode_code_review_provider"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_code_review_models = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

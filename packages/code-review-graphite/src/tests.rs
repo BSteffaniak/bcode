@@ -174,24 +174,26 @@ fn unreadable_metadata_is_skipped_and_repositories_without_graphite_answer_nothi
 }
 
 #[test]
-fn the_service_answers_its_manifest_and_discovery() {
+fn the_contributor_answers_through_its_trait_and_as_json() {
+    use bcode_code_review_models::OP_REVIEW_DISCOVERY_DISCOVER;
+    use bcode_code_review_provider::serve_discovery;
     let (_dir, root, _) = repo();
-    let request = |operation: &str, payload: Vec<u8>| ServiceRequest {
-        interface_id: REVIEW_DISCOVERY_INTERFACE_ID.into(),
-        operation: operation.into(),
-        payload,
-    };
-    let response = invoke(&request(OP_REVIEW_DISCOVERY_MANIFEST, b"{}".to_vec()));
-    let manifest: ReviewDiscoveryManifest = serde_json::from_slice(&response.payload).unwrap();
-    assert_eq!(manifest.id, GRAPHITE_DISCOVERY_ID);
-    let payload = serde_json::to_vec(&ReviewDiscoveryRequest {
+    let request = ReviewDiscoveryRequest {
         repo_path: root,
         branches: vec!["a".into()],
         trunk: None,
-    })
+    };
+    assert_eq!(GraphiteDiscovery.manifest().id, GRAPHITE_DISCOVERY_ID);
+    let direct = GraphiteDiscovery.discover(&request).unwrap();
+    assert_eq!(links(&direct), [("a", "main"), ("b", "a")]);
+    let served: ReviewDiscoveryResponse = serde_json::from_slice(
+        &serve_discovery(
+            &GraphiteDiscovery,
+            OP_REVIEW_DISCOVERY_DISCOVER,
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap(),
+    )
     .unwrap();
-    let response = invoke(&request(OP_REVIEW_DISCOVERY_DISCOVER, payload));
-    assert!(response.error.is_none(), "{:?}", response.error);
-    let answer: ReviewDiscoveryResponse = serde_json::from_slice(&response.payload).unwrap();
-    assert_eq!(links(&answer), [("a", "main"), ("b", "a")]);
+    assert_eq!(served, direct);
 }

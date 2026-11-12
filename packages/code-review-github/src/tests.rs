@@ -573,19 +573,18 @@ fn repositories_are_detected_from_remotes() {
 }
 
 #[test]
-fn the_manifest_and_unknown_operations_answer_through_the_service() {
-    let request = |operation: &str, payload: &[u8]| ServiceRequest {
-        interface_id: bcode_code_review_models::REVIEW_SOURCE_INTERFACE_ID.into(),
-        operation: operation.into(),
-        payload: payload.to_vec(),
-    };
-    let response = invoke(&request(OP_REVIEW_SOURCE_MANIFEST, b"{}"));
-    assert!(response.error.is_none());
-    let manifest: ReviewSourceProviderManifest = serde_json::from_slice(&response.payload).unwrap();
+fn the_provider_is_served_as_json_operations() {
+    use bcode_code_review_models::{OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULLS_LIST};
+    use bcode_code_review_provider::serve_review_source;
+    let manifest: ReviewSourceProviderManifest = serde_json::from_slice(
+        &serve_review_source(&GitHubReviewSource, OP_REVIEW_SOURCE_MANIFEST, b"{}").unwrap(),
+    )
+    .unwrap();
     assert_eq!(manifest.id, PROVIDER_ID);
     assert!(manifest.capabilities.stack_resolve && manifest.capabilities.pull_fetch);
-    let unknown = invoke(&request("review_source.nope", b"{}"));
-    assert_eq!(unknown.error.unwrap().code, "unsupported_operation");
-    let invalid = invoke(&request(OP_REVIEW_SOURCE_PULLS_LIST, b"not json"));
-    assert_eq!(invalid.error.unwrap().code, "invalid_request");
+    assert!(manifest.capabilities.batched.pulls_fetch);
+    let unknown = serve_review_source(&GitHubReviewSource, "review_source.nope", b"{}");
+    assert_eq!(unknown.unwrap_err().code, "unsupported_operation");
+    let invalid = serve_review_source(&GitHubReviewSource, OP_REVIEW_SOURCE_PULLS_LIST, b"no");
+    assert_eq!(invalid.unwrap_err().code, "invalid_request");
 }

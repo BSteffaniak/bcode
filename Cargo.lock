@@ -1928,6 +1928,7 @@ name = "bcode_code_review"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_code_review_models",
+ "bcode_code_review_provider",
  "bcode_config",
  "bcode_git",
  "bcode_path_display",
@@ -1940,6 +1941,30 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+]
+
+[[package]]
+name = "bcode_code_review_github"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_code_review_models",
+ "bcode_code_review_provider",
+ "bcode_forge",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bcode_code_review_graphite"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_code_review_models",
+ "bcode_code_review_provider",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1969,11 +1994,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_code_review_provider"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_code_review_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bcode_code_review_ui"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
  "bcode_code_review",
+ "bcode_code_review_github",
+ "bcode_code_review_graphite",
  "bcode_code_review_models",
  "bcode_config_layers",
  "bcode_ipc",
@@ -2445,7 +2481,9 @@ dependencies = [
 name = "bcode_github_review_publisher_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_code_review_github",
  "bcode_code_review_models",
+ "bcode_code_review_provider",
  "bcode_forge",
  "bcode_plugin_sdk",
  "reqwest 0.12.28",
@@ -2460,12 +2498,11 @@ dependencies = [
 name = "bcode_graphite_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_code_review_graphite",
  "bcode_code_review_models",
+ "bcode_code_review_provider",
  "bcode_plugin_sdk",
- "serde",
  "serde_json",
- "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]

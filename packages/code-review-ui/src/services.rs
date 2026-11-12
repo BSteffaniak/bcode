@@ -17,7 +17,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use bcode_code_review::provider::ProviderCallError;
+use bcode_code_review::provider::{
+    DiscoveryContributor, JsonCall, JsonDiscovery, JsonReviewSource, ProviderCallError,
+    ProviderRegistry, ReviewSourceProvider, plugin_manifests,
+};
 use bcode_code_review::{DataError, ReviewData, ReviewStore, StoreError};
 use bcode_code_review_models as models;
 use bcode_code_review_models::ReviewStackLimit;
@@ -229,6 +232,10 @@ pub struct ReviewServices {
     host: Arc<dyn ReviewHost>,
     execution: Execution,
     stack_limit: ReviewStackLimit,
+    /// Providers and contributors: built-in ones, plus plugin-backed ones once found.
+    providers: Arc<Mutex<ProviderRegistry>>,
+    /// Whether plugin-backed providers were looked for (once, in the background).
+    plugins_sought: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     probe: Arc<probe::Probe>,
     /// Test state (such as a temporary state directory) that lives as long as any clone.
@@ -255,6 +262,8 @@ impl ReviewServices {
             host,
             execution: Execution::Pool,
             stack_limit: ReviewStackLimit::default(),
+            providers: Arc::default(),
+            plugins_sought: Arc::default(),
             #[cfg(test)]
             probe: Arc::default(),
             #[cfg(test)]
@@ -267,6 +276,93 @@ impl ReviewServices {
     pub const fn with_stack_limit(mut self, limit: ReviewStackLimit) -> Self {
         self.stack_limit = limit;
         self
+    }
+
+    /// Register a built-in review-source provider (called in-process). Built-in providers win
+    /// over plugin-backed ones with the same id.
+    #[must_use]
+    pub fn with_source(self, provider: Arc<dyn ReviewSourceProvider>) -> Self {
+        lock(&self.providers).add_source(provider);
+        self
+    }
+
+    /// Register a built-in discovery contributor (called in-process).
+    #[must_use]
+    pub fn with_contributor(self, contributor: Arc<dyn DiscoveryContributor>) -> Self {
+        lock(&self.providers).add_contributor(contributor);
+        self
+    }
+
+    /// The providers and contributors to ask now: the built-in ones, plus those a running
+    /// Bcode's plugins offer once they are found. Finding them starts on the first call, in the
+    /// background, so nothing built in waits for Bcode (or starts it) and the standalone app works
+    /// without it.
+    #[must_use]
+    pub fn providers(&self) -> ProviderRegistry {
+        if !self
+            .plugins_sought
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let services = self.clone();
+            handle.spawn(async move { services.add_plugin_providers().await });
+        }
+        lock(&self.providers).clone()
+    }
+
+    /// Add the providers and contributors a running Bcode's plugins offer that are not built in.
+    /// Their calls block on the host from the blocking threads provider work runs on.
+    async fn add_plugin_providers(&self) {
+        let Ok((sources, contributors)) = plugin_manifests(&self.transport()).await else {
+            return;
+        };
+        let handle = tokio::runtime::Handle::current();
+        let call = |plugin_id: String, interface: &'static str| -> JsonCall {
+            let (host, handle) = (Arc::clone(&self.host), handle.clone());
+            Box::new(move |operation, payload| {
+                handle
+                    .block_on(host.invoke_plugin(
+                        plugin_id.clone(),
+                        interface.to_owned(),
+                        operation.to_owned(),
+                        payload,
+                    ))
+                    .map_err(ProviderCallError::from)
+            })
+        };
+        let mut registry = lock(&self.providers);
+        for (plugin_id, manifest) in sources {
+            if registry.source(&manifest.id).is_none() {
+                let invoke = call(plugin_id, models::REVIEW_SOURCE_INTERFACE_ID);
+                registry.add_source(Arc::new(JsonReviewSource::new(manifest, invoke)));
+            }
+        }
+        for (plugin_id, manifest) in contributors {
+            let invoke = call(plugin_id, models::REVIEW_DISCOVERY_INTERFACE_ID);
+            registry.add_contributor(Arc::new(JsonDiscovery::new(manifest, invoke)));
+        }
+    }
+
+    /// Run blocking provider work: on the blocking pool, or on the calling task in scenario tests.
+    ///
+    /// # Errors
+    ///
+    /// * `work`'s error, or a failure when the blocking task did not finish.
+    pub async fn blocking<T, F>(&self, work: F) -> Result<T, ProviderCallError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ProviderCallError> + Send + 'static,
+    {
+        match self.execution {
+            Execution::Pool => tokio::task::spawn_blocking(work).await.map_err(|error| {
+                ProviderCallError::new(
+                    models::REVIEW_SOURCE_ERROR_FAILED,
+                    format!("provider work did not finish: {error}"),
+                )
+            })?,
+            #[cfg(test)]
+            Execution::Inline => work(),
+        }
     }
 
     /// The configured stack layer limit.
@@ -287,6 +383,8 @@ impl ReviewServices {
         Self {
             execution: Execution::Inline,
             _guard: Some(guard),
+            // Scenario tests register their providers; nothing is looked for in the background.
+            plugins_sought: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ..Self::new(store, host)
         }
     }
@@ -343,6 +441,13 @@ impl ReviewServices {
     pub(crate) fn set_failing(&self, operation: &str, fail: bool) {
         self.probe.set_failing(operation, fail);
     }
+}
+
+/// Lock `mutex`, recovering the guard if a holder panicked (the registry stays usable).
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

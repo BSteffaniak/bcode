@@ -613,6 +613,27 @@ mod tests {
         }
     }
 
+    /// A route for a "fake" provider: suggestions only read its manifest, never call it.
+    fn manifest_only_route() -> ProviderRoute {
+        let manifest = ReviewSourceProviderManifest {
+            id: "fake".into(),
+            label: "Fake".into(),
+            capabilities: ReviewSourceCapabilities::default(),
+        };
+        ProviderRoute {
+            manifest: manifest.clone(),
+            provider: std::sync::Arc::new(bcode_code_review::provider::JsonReviewSource::new(
+                manifest,
+                Box::new(|operation, _| {
+                    Err(bcode_code_review::provider::ProviderCallError::new(
+                        "unexpected",
+                        operation,
+                    ))
+                }),
+            )),
+        }
+    }
+
     #[test]
     fn suggestions_cover_repository_state_providers_and_moved_reviews() {
         let state = ReviewRepoStateResponse {
@@ -628,14 +649,7 @@ mod tests {
             },
             staged: ReviewChangeCount::default(),
         };
-        let route = ProviderRoute {
-            plugin_id: "p".into(),
-            manifest: ReviewSourceProviderManifest {
-                id: "fake".into(),
-                label: "Fake".into(),
-                capabilities: ReviewSourceCapabilities::default(),
-            },
-        };
+        let route = manifest_only_route();
         let pulls = PullsAnswer {
             route,
             repository: "o/r".into(),

@@ -6,9 +6,8 @@
 //!
 //! Serves three interfaces: the review publisher (`bcode.review_publisher/v1`), the read-only
 //! review importer (`bcode.review_importer/v1`), and the review-source provider
-//! (`bcode.review_source/v1`, see [`review_source`]).
-
-pub mod review_source;
+//! (`bcode.review_source/v1`), the last a thin adapter over `bcode_code_review_github`, which the
+//! review itself links and calls in-process.
 
 use bcode_code_review_models::{
     ExternalAnchorMappingStatus, ExternalPublishReviewRequest, ExternalReviewAnchorMapping,
@@ -56,7 +55,14 @@ impl RustPlugin for GitHubReviewPublisherPlugin {
                     "unsupported GitHub importer operation",
                 ),
             },
-            REVIEW_SOURCE_INTERFACE_ID => review_source::invoke(&context.request),
+            REVIEW_SOURCE_INTERFACE_ID => match bcode_code_review_provider::serve_review_source(
+                &bcode_code_review_github::GitHubReviewSource,
+                &context.request.operation,
+                &context.request.payload,
+            ) {
+                Ok(payload) => ServiceResponse::ok(payload),
+                Err(error) => ServiceResponse::error(error.code, error.message),
+            },
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported GitHub review interface",
@@ -128,7 +134,7 @@ fn import_for_request(
 
 fn github_manifest() -> ReviewPublisherManifest {
     ReviewPublisherManifest {
-        pull_request_provider: Some(review_source::PROVIDER_ID.to_string()),
+        pull_request_provider: Some(bcode_code_review_github::PROVIDER_ID.to_string()),
         id: PUBLISHER_ID.to_string(),
         label: "GitHub PR review".to_string(),
         description: "Publish review comments to a GitHub pull request".to_string(),
@@ -489,7 +495,7 @@ fn target_options(
     value: &serde_json::Value,
     target: Option<&bcode_code_review_models::ReviewPullRequestTarget>,
 ) -> Result<(Option<String>, Option<u64>), GitHubPublisherError> {
-    let target = target.filter(|target| target.provider == review_source::PROVIDER_ID);
+    let target = target.filter(|target| target.provider == bcode_code_review_github::PROVIDER_ID);
     let repository = string_option(value, "repository")
         .or_else(|| target.map(|target| target.repository.clone()));
     if repository
@@ -1538,7 +1544,7 @@ mod tests {
         summary_only.thread_id = "whole-stack".to_string();
         let mut bundle = empty_bundle();
         bundle.pull_request = Some(bcode_code_review_models::ReviewPullRequestTarget {
-            provider: review_source::PROVIDER_ID.to_string(),
+            provider: bcode_code_review_github::PROVIDER_ID.to_string(),
             repository: "owner/stacked".to_string(),
             number: 42,
         });

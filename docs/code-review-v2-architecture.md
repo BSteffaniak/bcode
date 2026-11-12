@@ -503,7 +503,7 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
   below it, so a comment can be published at the right line of the layer's pull request; ranges
   merge only while those lines stay consecutive.
 
-The GitHub implementation lives in `plugins/github-review-publisher-plugin` (`review_source.rs`)
+The GitHub implementation lives in `packages/code-review-github` (served to Bcode by `plugins/github-review-publisher-plugin`)
 using `packages/forge`, which now also reports each pull request's author, base OID, and whether a
 review is requested from the authenticated user, and the repository's default branch.
 
