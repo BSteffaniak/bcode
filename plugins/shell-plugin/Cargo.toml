@@ -25,13 +25,13 @@ bcode_tool_runtime                  = { workspace = true, optional = true }
 bcode_tui_components                = { workspace = true, optional = true }
 bcode_workflow                      = { workspace = true, optional = true }
 bmux_keyboard                       = { workspace = true, optional = true }
+bmux_pty                            = { workspace = true, optional = true }
 bmux_terminal_grid                  = { workspace = true, optional = true }
 bmux_tui                            = { workspace = true, optional = true }
 bmux_tui_components                 = { workspace = true, optional = true }
 dunce                               = { workspace = true, optional = true }
 hex                                 = { workspace = true, optional = true }
 libc                                = { workspace = true, optional = true }
-portable-pty                        = { workspace = true, optional = true }
 ruff_formatter                      = { workspace = true, optional = true }
 ruff_python_formatter               = { workspace = true, optional = true }
 serde                               = { workspace = true, features = ["derive", "std"] }
@@ -46,6 +46,9 @@ tree-sitter-javascript              = { workspace = true, optional = true }
 tree-sitter-python                  = { workspace = true, optional = true }
 url                                 = { workspace = true, optional = true }
 vte                                 = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+portable-pty = { workspace = true, optional = true }
 
 [dev-dependencies]
 bcode_session        = { workspace = true }
@@ -73,6 +76,7 @@ native = [
     "dep:bcode_workflow",
     "dep:dunce",
     "dep:hex",
+    "dep:bmux_pty",
     "dep:libc",
     "dep:portable-pty",
     "dep:sha2",

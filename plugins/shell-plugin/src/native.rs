@@ -1247,6 +1247,8 @@ fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
 mod conpty_bootstrap;
 #[path = "native/direnv_probe.rs"]
 mod direnv_probe;
+#[path = "native/terminal_process.rs"]
+mod terminal_process;
 
 fn should_use_direnv(cwd: Option<&Path>, config: ShellToolEnvConfig) -> Result<bool, String> {
     select_direnv(cwd, config, direnv_probe::check)
@@ -1485,7 +1487,7 @@ struct ShellInvocationActionReader {
 }
 
 impl ShellInvocationActionReader {
-    fn poll(&self, master: &dyn portable_pty::MasterPty) -> Result<(), String> {
+    fn poll(&self, terminal: &dyn terminal_process::TerminalChild) -> Result<(), String> {
         // Bound each input batch so a resize flood cannot starve timeout/cancellation checks.
         for _ in 0..32 {
             let response = self
@@ -1522,16 +1524,10 @@ impl ShellInvocationActionReader {
                     if columns == 0 || rows == 0 {
                         return Err("terminal resize dimensions must be positive".to_owned());
                     }
-                    let current = master.get_size().map_err(|error| error.to_string())?;
-                    if current.cols == columns && current.rows == rows {
+                    let current = terminal.size().map_err(|error| error.to_string())?;
+                    if current == (columns, rows) {
                         continue;
                     }
-                    let size = portable_pty::PtySize {
-                        rows,
-                        cols: columns,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    };
                     if let Some(recording) = &self.recording {
                         recording
                             .write_resize_with(
@@ -1539,16 +1535,13 @@ impl ShellInvocationActionReader {
                                     .unwrap_or(u64::MAX),
                                 columns,
                                 rows,
-                                || {
-                                    master
-                                        .resize(size)
-                                        .map_err(|error| io::Error::other(error.to_string()))?;
-                                    Ok(())
-                                },
+                                || terminal.resize(columns, rows),
                             )
                             .map_err(|error| error.to_string())?;
                     } else {
-                        master.resize(size).map_err(|error| error.to_string())?;
+                        terminal
+                            .resize(columns, rows)
+                            .map_err(|error| error.to_string())?;
                     }
                     let mut applied = self
                         .applied_resizes
@@ -1572,27 +1565,13 @@ struct TerminalShellStatus {
     cancelled: bool,
 }
 
-fn terminate_terminal_process(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-) -> io::Result<()> {
-    #[cfg(unix)]
-    if let Some(pid) = child.process_id().and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: portable-pty creates a dedicated session/process group for this
-        // still-unreaped child. Descendants must not retain terminal output pipes.
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        return Ok(());
-    }
-    child.kill()
+fn terminate_terminal_process(child: &mut dyn terminal_process::TerminalChild) -> io::Result<()> {
+    child.terminate()
 }
 
 fn reap_terminal_child(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-) -> Result<portable_pty::ExitStatus, String> {
+    child: &mut dyn terminal_process::TerminalChild,
+) -> Result<terminal_process::TerminalExit, String> {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
@@ -1667,15 +1646,13 @@ impl TerminalCaptureUpdates {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn wait_for_terminal_shell_status(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    child: &mut dyn terminal_process::TerminalChild,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     timeout: Duration,
     tool_call_id: &str,
     events: ServiceEventEmitter,
     control: Option<&ShellInvocationActionReader>,
-    master: Option<&dyn portable_pty::MasterPty>,
     updates: Option<&TerminalCaptureUpdates>,
 ) -> Result<TerminalShellStatus, String> {
     let started = Instant::now();
@@ -1685,8 +1662,8 @@ fn wait_for_terminal_shell_status(
         if let Some(updates) = updates {
             updates.publish();
         }
-        if let (Some(control), Some(master)) = (control, master) {
-            control.poll(master)?;
+        if let Some(control) = control {
+            control.poll(&*child)?;
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
@@ -1724,9 +1701,9 @@ fn wait_for_terminal_shell_status(
         std::thread::sleep(Duration::from_millis(10));
     };
     Ok(TerminalShellStatus {
-        exit_code: i32::try_from(status.exit_code()).unwrap_or(i32::MAX),
-        signal: status.signal().map(ToOwned::to_owned),
+        exit_code: i32::try_from(status.code).unwrap_or(i32::MAX),
         success: status.success(),
+        signal: status.signal,
         timed_out,
         cancelled,
     })
@@ -1775,16 +1752,14 @@ fn encode_terminal_output(
     Ok((encoded, full_encoded, inline_output))
 }
 
-fn remove_private_shell_environment(
-    command: &mut portable_pty::CommandBuilder,
-    configured: &[String],
-) {
-    for name in DAEMON_PRIVATE_ENV_VARS {
-        command.env_remove(name);
-    }
-    for name in configured {
-        command.env_remove(name);
-    }
+/// Inherited environment variables a shell command must not see: the daemon's own, and
+/// those configured.
+fn private_shell_environment(configured: &[String]) -> Vec<&str> {
+    DAEMON_PRIVATE_ENV_VARS
+        .iter()
+        .copied()
+        .chain(configured.iter().map(String::as_str))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1815,16 +1790,6 @@ fn run_terminal_shell_command_inner(
     let env_config = shell_config.env;
     let columns = arguments.terminal_columns(DEFAULT_TERMINAL_COLUMNS);
     let rows = arguments.terminal_rows(DEFAULT_TERMINAL_ROWS);
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system
-        .openpty(portable_pty::PtySize {
-            rows,
-            cols: columns,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| error.to_string())?;
-
     let command_plan =
         shell_program_and_args(&arguments.command, cwd.as_deref(), env_config, tool_call_id)?;
     let ShellCommandPlan {
@@ -1838,56 +1803,23 @@ fn run_terminal_shell_command_inner(
         prelude_markers.replay.push(prelude_marker.clone());
         prelude_markers.clean.push(prelude_marker);
     }
-    let mut command = portable_pty::CommandBuilder::new(program);
-    for arg in args {
-        command.arg(arg);
-    }
-    if let Some(cwd) = cwd.as_deref() {
-        command.cwd(cwd);
-    }
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
-    remove_private_shell_environment(&mut command, &shell_config.remove_env);
-
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| error.to_string())?;
-    drop(pair.slave);
-    #[cfg_attr(windows, allow(unused_mut))]
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| error.to_string())?;
-    #[cfg(windows)]
-    let mut reader = conpty_bootstrap::CursorQueryResponder::new(
-        reader,
-        pair.master
-            .take_writer()
-            .map_err(|error| error.to_string())?,
-    );
-    #[cfg(unix)]
-    let reader_fd = pair
-        .master
-        .as_raw_fd()
-        .map(|fd| {
-            use std::os::fd::{AsRawFd as _, BorrowedFd};
-            // SAFETY: the master owns this descriptor until after capture initialization.
-            let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
-            // SAFETY: fcntl operates on an owned, valid descriptor. Its file description is
-            // shared with the cloned PTY reader, so that reader cannot block after poll.
-            let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
-            if flags < 0
-                || unsafe {
-                    libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
-                } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(owned)
-        })
-        .transpose()
-        .map_err(|error: io::Error| error.to_string())?;
+    let capture_cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+    let capture_guard = CaptureCancellationGuard(capture_cancellation.clone());
+    let reader_budget = ShellExecutionBudget {
+        deadline: budget.deadline + Duration::from_millis(500),
+        cancellation: capture_cancellation,
+    };
+    let (mut child, mut reader) = terminal_process::spawn(
+        &terminal_process::TerminalSpawn {
+            program: &program,
+            args: &args,
+            cwd: cwd.as_deref(),
+            remove_env: private_shell_environment(&shell_config.remove_env),
+            columns,
+            rows,
+        },
+        reader_budget.clone(),
+    )?;
     let clean_artifact_path = clean_artifact_path(paths.artifact_dir, tool_call_id)?;
     let raw_artifact_path = raw_artifact_path(paths.artifact_dir, tool_call_id)?;
     let replay_artifact_path = replay_artifact_path(paths.artifact_dir, tool_call_id)?;
@@ -1926,22 +1858,10 @@ fn run_terminal_shell_command_inner(
     };
     let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
     let (stream_tx, stream_rx) = std::sync::mpsc::channel();
-    let capture_cancellation = bcode_plugin_sdk::ServiceCancellation::default();
-    let capture_guard = CaptureCancellationGuard(capture_cancellation.clone());
-    let reader_budget = ShellExecutionBudget {
-        deadline: budget.deadline + Duration::from_millis(500),
-        cancellation: capture_cancellation,
-    };
     let cancellation_for_reader = cancellation.clone();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
-            #[cfg(unix)]
-            let mut reader = DeadlineTerminalReader {
-                reader: &mut reader,
-                fd: reader_fd,
-                budget: reader_budget.clone(),
-            };
             let result = read_limited_streaming(
                 &mut reader,
                 events,
@@ -1988,8 +1908,8 @@ fn run_terminal_shell_command_inner(
         match initialization_budget.receive_with(&recording_ready_rx, || updates.publish()) {
             Ok(recording) => recording,
             Err(error) => {
-                let _ = terminate_terminal_process(&mut child);
-                let _ = reap_terminal_child(&mut child);
+                let _ = terminate_terminal_process(&mut *child);
+                let _ = reap_terminal_child(&mut *child);
                 return Err(error);
             }
         };
@@ -2004,23 +1924,23 @@ fn run_terminal_shell_command_inner(
             applied_resizes: Arc::clone(&applied_resizes),
         });
     let status = match wait_for_terminal_shell_status(
-        &mut child,
+        &mut *child,
         cancellation,
         budget.deadline.saturating_duration_since(Instant::now()),
         tool_call_id,
         events,
         control.as_ref(),
-        Some(&*pair.master),
         Some(&updates),
     ) {
         Ok(status) => status,
         Err(error) => {
-            let _ = terminate_terminal_process(&mut child);
-            let _ = reap_terminal_child(&mut child);
+            let _ = terminate_terminal_process(&mut *child);
+            let _ = reap_terminal_child(&mut *child);
             return Err(error);
         }
     };
-    drop(pair.master);
+    // Releasing the terminal ends output on platforms where it is held until then.
+    drop(child);
     let capture_budget = if status.timed_out || status.cancelled {
         // Bounded cleanup grace preserves terminal status and recordings after killing the child.
         ShellExecutionBudget {
@@ -2256,52 +2176,6 @@ const STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
 struct ShellExecutionBudget {
     deadline: Instant,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
-}
-
-#[cfg(unix)]
-struct DeadlineTerminalReader<'a> {
-    reader: &'a mut Box<dyn Read + Send>,
-    fd: Option<std::os::fd::OwnedFd>,
-    budget: ShellExecutionBudget,
-}
-
-#[cfg(unix)]
-impl Read for DeadlineTerminalReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        use std::os::fd::AsRawFd as _;
-        loop {
-            self.budget.check().map_err(io::Error::other)?;
-            let Some(fd) = &self.fd else {
-                return Err(io::Error::other(
-                    "terminal does not support bounded capture",
-                ));
-            };
-            let mut poll = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: poll points to one initialized descriptor, owned for this reader's lifetime.
-            let ready = unsafe { libc::poll(&raw mut poll, 1, 10) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if ready > 0 {
-                match self.reader.read(buffer) {
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) => {}
-                    result => return result,
-                }
-            }
-        }
-    }
 }
 
 struct CaptureCancellationGuard(bcode_plugin_sdk::ServiceCancellation);
@@ -3394,53 +3268,57 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_child_does_not_receive_github_oidc_minting_authority() {
-        let pair = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
-        command.args([
-            "-c",
-            "test -z \"${GITHUB_TOKEN+x}\" && test -z \"${GH_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_URL+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained",
-        ]);
-        command.env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "test-only-minting-token");
-        command.env(
-            "ACTIONS_ID_TOKEN_REQUEST_URL",
-            "https://example.invalid/oidc",
-        );
-        command.env("GITHUB_TOKEN", "synthetic-publication-token");
-        command.env("GH_TOKEN", "synthetic-cli-token");
-        command.env("BCODE_TEST_PUBLIC", "retained");
-        remove_private_shell_environment(&mut command, &[]);
-        let mut child = pair.slave.spawn_command(command).unwrap();
-        assert!(child.wait().unwrap().success());
+        let script = "test -z \"${GITHUB_TOKEN+x}\" && test -z \"${GH_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_URL+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained";
+        let parent = [
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "test-only-minting-token"),
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", "https://example.invalid/oidc"),
+            ("GITHUB_TOKEN", "synthetic-publication-token"),
+            ("GH_TOKEN", "synthetic-cli-token"),
+            ("BCODE_TEST_PUBLIC", "retained"),
+        ];
+        assert!(terminal_child_succeeds(script, &parent, &[]));
     }
 
     #[cfg(unix)]
     #[test]
     fn shell_child_does_not_receive_configured_removed_environment() {
-        let pair = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
+        let script = "test -z \"${BCODE_TEST_SECRET+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained";
+        let parent = [
+            ("BCODE_TEST_SECRET", "host-credential"),
+            ("BCODE_TEST_PUBLIC", "retained"),
+        ];
+        assert!(terminal_child_succeeds(
+            script,
+            &parent,
+            &["BCODE_TEST_SECRET".to_string()]
+        ));
+    }
+
+    /// Run `script` on a terminal as shell commands run, with `parent` standing in for
+    /// variables the plugin process inherited and `configured` removed variables.
+    #[cfg(unix)]
+    fn terminal_child_succeeds(
+        script: &str,
+        parent: &[(&str, &str)],
+        configured: &[String],
+    ) -> bool {
+        // The process environment is shared by every test, so inherited variables are
+        // simulated by setting them on the command before the removals apply.
+        let mut command = bmux_pty::PtyCommand::new("/bin/sh").args(["-c", script]);
+        for (name, value) in parent {
+            command = command.env(name, value);
+        }
+        for name in private_shell_environment(configured) {
+            command = command.env_remove(name);
+        }
+        let mut process = command.spawn(bmux_pty::PtySize::new(80, 24)).unwrap();
+        process
+            .events()
+            .find_map(|event| match event {
+                bmux_pty::PtyEvent::Exited(exit) => Some(exit.success()),
+                _ => None,
             })
-            .unwrap();
-        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
-        command.args([
-            "-c",
-            "test -z \"${BCODE_TEST_SECRET+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained",
-        ]);
-        command.env("BCODE_TEST_SECRET", "host-credential");
-        command.env("BCODE_TEST_PUBLIC", "retained");
-        remove_private_shell_environment(&mut command, &["BCODE_TEST_SECRET".to_string()]);
-        let mut child = pair.slave.spawn_command(command).unwrap();
-        assert!(child.wait().unwrap().success());
+            .unwrap_or(false)
     }
 
     #[cfg(unix)]
@@ -5340,15 +5218,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // One lifecycle matrix shares the full invocation/reopen path.
     fn terminal_recordings_preserve_timeout_cancellation_and_nonzero_status() {
-        let signal_name = |signal| {
-            // portable-pty records the platform's strsignal spelling.
-            let status: std::process::ExitStatus =
-                std::os::unix::process::ExitStatusExt::from_raw(signal);
-            portable_pty::ExitStatus::from(status)
-                .signal()
-                .expect("signal status")
-                .to_owned()
-        };
+        // Recordings keep the platform's strsignal spelling.
+        let signal_name = terminal_process::signal_name;
         let terminated = signal_name(libc::SIGTERM);
         let killed = signal_name(libc::SIGKILL);
         let environment = isolated_config_environment("recording-terminal-status");
@@ -5919,6 +5790,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_missing_working_directory_is_refused_rather_than_replaced() {
+        let environment = isolated_config_environment("missing-cwd");
+        let dir = tempfile::tempdir().expect("artifacts");
+        let missing = dir.path().join("does-not-exist");
+        let marker = dir.path().join("ran");
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "missing-cwd",
+            &ShellRunArguments {
+                command: format!("touch {}", marker.display()),
+                cwd: Some(missing),
+                timeout_ms: Some(10_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(dir.path()),
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        // Running anywhere else (the home directory, say) could act on the wrong files.
+        assert!(response.is_error, "{}", response.output);
+        assert!(response.output.contains("does not exist"), "{}", response.output);
+        assert!(!marker.exists(), "the command must not run");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_output_flood_cannot_extend_deadline() {
         let environment = isolated_config_environment("output-flood");
         let dir = tempfile::tempdir().expect("artifacts");
@@ -6136,44 +6042,31 @@ mod tests {
         killed: bool,
     }
 
-    impl portable_pty::ChildKiller for PendingTerminalChild {
-        fn kill(&mut self) -> std::io::Result<()> {
+    impl terminal_process::TerminalChild for PendingTerminalChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<terminal_process::TerminalExit>> {
+            Ok(self.killed.then(|| terminal_process::TerminalExit {
+                code: 1,
+                signal: Some("killed".to_owned()),
+            }))
+        }
+
+        fn terminate(&mut self) -> std::io::Result<()> {
             self.killed = true;
             Ok(())
         }
 
-        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-            Box::new(Self {
-                killed: self.killed,
-            })
-        }
-    }
-
-    impl portable_pty::Child for PendingTerminalChild {
-        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            Ok(self
-                .killed
-                .then(|| portable_pty::ExitStatus::with_signal("killed")))
+        fn size(&self) -> std::io::Result<(u16, u16)> {
+            Ok((80, 24))
         }
 
-        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-            Ok(portable_pty::ExitStatus::with_signal("killed"))
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            None
-        }
-
-        #[cfg(windows)]
-        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-            None
+        fn resize(&self, _columns: u16, _rows: u16) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
     #[test]
     fn terminal_wait_cancels_and_kills_promptly() {
-        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
-            Box::new(PendingTerminalChild { killed: false });
+        let mut child = PendingTerminalChild { killed: false };
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let cancellation = bcode_plugin_sdk::ServiceCancellation::new(cancelled);
         let started = Instant::now();
@@ -6183,7 +6076,6 @@ mod tests {
             Duration::from_secs(10),
             "cancel-test",
             ServiceEventEmitter::default(),
-            None,
             None,
             None,
         )
@@ -6197,8 +6089,7 @@ mod tests {
 
     #[test]
     fn terminal_wait_times_out_kills_and_reports_status_promptly() {
-        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
-            Box::new(PendingTerminalChild { killed: false });
+        let mut child = PendingTerminalChild { killed: false };
         let started = Instant::now();
         let status = wait_for_terminal_shell_status(
             &mut child,
@@ -6206,7 +6097,6 @@ mod tests {
             Duration::ZERO,
             "timeout-test",
             ServiceEventEmitter::default(),
-            None,
             None,
             None,
         )
