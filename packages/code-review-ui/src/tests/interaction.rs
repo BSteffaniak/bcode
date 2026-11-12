@@ -29,13 +29,13 @@ use bmux_tui::geometry::Rect;
 use std::sync::Arc;
 use std::time::Duration;
 
-struct Setup {
-    scenario: Scenario<ReviewSurface>,
-    backend: Arc<TestBackend>,
-    workspace: ReviewWorkspace,
+pub(super) struct Setup {
+    pub(super) scenario: Scenario<ReviewSurface>,
+    pub(super) backend: Arc<TestBackend>,
+    pub(super) workspace: ReviewWorkspace,
 }
 
-fn fixture() -> GitFixture {
+pub(super) fn fixture() -> GitFixture {
     GitFixture::generate(FixtureSpec::small())
 }
 
@@ -63,7 +63,7 @@ fn build(
 }
 
 /// A durable workspace (stored first) opened at `width` x `height`.
-fn setup(fixture: &GitFixture, width: u16, height: u16) -> Setup {
+pub(super) fn setup(fixture: &GitFixture, width: u16, height: u16) -> Setup {
     let backend = Arc::new(TestBackend::default());
     let workspace = workspace(fixture);
     let _ = backend.call_now(UpdateReviewWorkspaceRequest {
@@ -97,11 +97,11 @@ fn stored_workspace(setup: &Setup) -> ReviewWorkspace {
     response.workspace.expect("stored workspace")
 }
 
-fn cursor(scenario: &Scenario<ReviewSurface>) -> ItemKey {
+pub(super) fn cursor(scenario: &Scenario<ReviewSurface>) -> ItemKey {
     scenario.surface().cursor().cloned().expect("cursor")
 }
 
-fn index_of(scenario: &Scenario<ReviewSurface>, key: &ItemKey) -> usize {
+pub(super) fn index_of(scenario: &Scenario<ReviewSurface>, key: &ItemKey) -> usize {
     scenario
         .surface()
         .document()
@@ -109,7 +109,7 @@ fn index_of(scenario: &Scenario<ReviewSurface>, key: &ItemKey) -> usize {
         .expect("indexed key")
 }
 
-fn move_to(scenario: &mut Scenario<ReviewSurface>, index: usize) -> Screen {
+pub(super) fn move_to(scenario: &mut Scenario<ReviewSurface>, index: usize) -> Screen {
     let current = index_of(scenario, &cursor(scenario));
     let (count, key) = if index >= current {
         (index - current, "j")
@@ -126,7 +126,7 @@ fn move_to(scenario: &mut Scenario<ReviewSurface>, index: usize) -> Screen {
 }
 
 /// Index of the first item matching `predicate` at or after `from`.
-fn find(
+pub(super) fn find(
     scenario: &Scenario<ReviewSurface>,
     from: usize,
     predicate: impl Fn(&ReviewItem) -> bool,
@@ -137,7 +137,7 @@ fn find(
         .expect("matching item")
 }
 
-fn added_line(item: &ReviewItem) -> bool {
+pub(super) fn added_line(item: &ReviewItem) -> bool {
     use bcode_code_review::document::LineKind;
     match item {
         ReviewItem::Line(line) => line.kind == LineKind::Added,
@@ -934,7 +934,7 @@ fn a_failed_question_replaces_the_asking_status() {
 }
 
 #[test]
-fn asking_bcode_links_a_session_shows_live_status_and_restores_position() {
+fn asking_bcode_stays_in_the_review_and_opening_the_session_restores_position() {
     let fixture = fixture();
     let mut setup = setup(&fixture, 100, 40);
     let index = find(&setup.scenario, 0, added_line);
@@ -943,18 +943,23 @@ fn asking_bcode_links_a_session_shows_live_status_and_restores_position() {
     setup.scenario.paste("Why this change?");
     setup.scenario.key("enter");
     stable(&mut setup.scenario);
-    let opened = setup
-        .scenario
-        .actions()
-        .iter()
-        .find_map(|action| match action {
-            Action::OpenSession { session_id } => Some(session_id.to_string()),
-            _ => None,
-        });
-    let session = opened.expect("the linked session opens");
+    // Asking never hands the terminal to the session.
+    assert!(
+        !setup
+            .scenario
+            .actions()
+            .iter()
+            .any(|action| matches!(action, Action::OpenSession { .. })),
+        "{:?}",
+        setup.scenario.actions()
+    );
+    assert!(matches!(
+        cursor(&setup.scenario),
+        ItemKey::AgentThread { .. }
+    ));
     let sessions = setup.backend.sessions();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].0, session);
+    let session = sessions[0].0.clone();
     assert!(sessions[0].1.starts_with("Review: "), "{:?}", sessions[0]);
     let messages = setup.backend.messages();
     assert!(messages[0].1.contains("Why this change?"));
@@ -975,9 +980,19 @@ fn asking_bcode_links_a_session_shows_live_status_and_restores_position() {
         exchanges.exchanges[0].session_id.as_deref(),
         Some(session.as_str())
     );
-    // While the session is open, the surface may be re-rendered and moved; returning restores
-    // the exact position.
+    // `o` on the card opens the session in Bcode; returning restores the exact position even
+    // when the surface moved meanwhile.
     let before = (cursor(&setup.scenario), setup.scenario.surface().top_key());
+    setup.scenario.key("o");
+    let opened = setup
+        .scenario
+        .actions()
+        .iter()
+        .find_map(|action| match action {
+            Action::OpenSession { session_id } => Some(session_id.to_string()),
+            _ => None,
+        });
+    assert_eq!(opened.as_deref(), Some(session.as_str()));
     setup.scenario.keys(&["G"]);
     stable(&mut setup.scenario);
     assert_ne!(cursor(&setup.scenario), before.0);

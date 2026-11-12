@@ -9,7 +9,7 @@ Usage (after the coordinator grants runtime capacity):
 
 Built-in cases assert only the named journey, not the entire product acceptance.
 Custom --plan JSON contract:
-  {"name":"review-ask-open-session", "model":true, "args":["review"],
+  {"name":"review-ask-live-feed", "model":true, "args":["review"],
    "steps":[{"expect":["Code reviews"], "send":"1"},
             {"expect":["Working tree and index"], "send":"..."},
             {"expect":["Code reviews"], "send":"q"}], "exit_code":0}
@@ -183,10 +183,10 @@ CASES.update({
         {"expect": ["Code reviews"], "send": "n"},
         {"expect": ["What do you want to review?", "Working tree"], "send": "\r"},
         {"expect": ["Which changes?", "Staged changes"], "send": "\x1b[B"},
-        {"expect": ["> Staged changes"], "send": "\r"},
+        {"expect": ["\u258c Staged changes"], "send": "\r"},
         # Typing edits the title while the action list keeps its selection.
-        {"expect": ["> Create review", "Sources (1)"], "send": "_PTY"},
-        {"expect": ["Staged changes_PTY", "> Create review"], "send": "\r"},
+        {"expect": ["\u258c Create review", "Sources (1)"], "send": "_PTY"},
+        {"expect": ["Staged changes_PTY", "\u258c Create review"], "send": "\r"},
         {"expect": ["Staged changes_PTY", "CONTINUOUS_REVIEW_FILE"],
          "forbid": ["Code reviews", "Create review"], "send": "q"},
         {"expect": ["Code reviews", "In progress", "Staged changes_PTY"], "send": "q"}],
@@ -196,7 +196,7 @@ CASES.update({
         {"expect": ["Staged changes_PTY", "CONTINUOUS_REVIEW_FILE"],
          "forbid": ["Code reviews"], "send": "q"},
         {"expect": ["Code reviews"], "send": "q"}]},
-    "review-ask-open-session": {"fixture": "review", "model": True,
+    "review-ask-live-feed": {"fixture": "review", "model": True,
         "args": ["review"], "steps": [
         {"expect": ["Code reviews", "Uncommitted changes"], "send": "1"},
         {"expect": ["Working tree and index", "CONTINUOUS_REVIEW_FILE"],
@@ -204,11 +204,11 @@ CASES.update({
         {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": "a"},
         {"expect": ["Ask Bcode about continuous-review-fixture.txt:1"],
          "send": "CONTINUOUS_REVIEW_QUESTION\r"},
-        # The linked session opens in Bcode, which takes over the terminal.
-        {"expect": ["You are helping with a local code review", "CONTINUOUS_REVIEW_ANSWER"],
-         "handoff": True, "timeout": 60, "hold": 1, "send": "\x04"},
-        {"expect": ["Bcode answered", "CONTINUOUS_REVIEW_QUESTION", "CONTINUOUS_REVIEW_ANSWER",
-                    "Open session"], "handoff": True, "send": "jo"},
+        # The answer streams into the card below the line; the review keeps the terminal.
+        {"expect": ["Bcode answered", "\u258dyou", "CONTINUOUS_REVIEW_QUESTION",
+                    "CONTINUOUS_REVIEW_ANSWER", "Open in Bcode", "CONTINUOUS_REVIEW_FILE"],
+         "forbid": ["You are helping with a local code review"], "timeout": 60, "send": "o"},
+        # `o` on the card opens the linked session in Bcode, which takes over the terminal.
         {"expect": ["You are helping with a local code review", "CONTINUOUS_REVIEW_ANSWER"],
          "handoff": True, "hold": 1, "send": "\x04"},
         {"expect": ["returned from linked Bcode session", "CONTINUOUS_REVIEW_ANSWER"],
@@ -234,8 +234,8 @@ CASES.update({
         "args": ["review"], "steps": [
         {"expect": ["Code reviews"], "send": "n"},
         {"expect": ["What do you want to review?", "Working tree"], "send": "\r"},
-        {"expect": ["Which changes?", "> Unstaged changes  1 file"], "send": "\r"},
-        {"expect": ["> Create review", "Sources (1)"], "send": "\r"},
+        {"expect": ["Which changes?", "\u258c Unstaged changes  1 file"], "send": "\r"},
+        {"expect": ["\u258c Create review", "Sources (1)"], "send": "\r"},
         {"expect": ["REVIEW_UNSTAGED_CONTENT"],
          "forbid": ["Code reviews", "CONTINUOUS_REVIEW_FILE"], "send": "q"},
         {"expect": ["Code reviews"], "send": "q"}]},
@@ -248,7 +248,7 @@ CASES.update({
          "mouse": {"row_text": "▸ nested/", "column": 4}},
         {"expect": ["▾ alpha/", "▾ beta/", "▾ 日本語/"], "send": "f"},
         {"expect": ["Files"], "send": "scroll-target"},
-        {"expect": ["Files 1/4"], "send": "\r"},
+        {"expect": ["1/4 \u2500 \u00ab"], "send": "\r"},
         {"expect": ["REVIEW_SCROLL_LINE_001"], "send": "\x1b"},
         {"expect": ["REVIEW_SCROLL_LINE_001"], "resize": [100, 24]},
         {"expect": ["REVIEW_SCROLL_LINE_001"],
@@ -268,7 +268,7 @@ CASES.update({
         {"expect": ["Code reviews"], "send": "1"},
         {"expect": ["CONTINUOUS_REVIEW_FILE"], "send": "f"},
         {"expect": ["Files"], "send": "scroll-target"},
-        {"expect": ["Files 1/4"], "send": "\r"},
+        {"expect": ["1/4 \u2500 \u00ab"], "send": "\r"},
         {"expect": ["REVIEW_SCROLL_LINE_001"], "send": "\x1b"},
         {"expect": ["REVIEW_SCROLL_LINE_001", "REVIEW_SCROLL_LINE_003"],
          "mouse": {"kind": "drag", "row_text": "REVIEW_SCROLL_LINE_001",
@@ -285,7 +285,7 @@ CASES.update({
          "mouse": {"row_text": "0/4", "column": 6}},
         {"expect": ["Uncommitted changes", "1 draft"], "forbid": ["Code reviews"], "send": "f"},
         {"expect": ["Files"], "send": "scroll-target"},
-        {"expect": ["Files 1/4"], "send": "\r"},
+        {"expect": ["1/4 \u2500 \u00ab"], "send": "\r"},
         {"expect": ["PTY_RANGE_DRAFT_EDITED"], "send": "\x1b"},
         {"expect": ["PTY_RANGE_DRAFT_EDITED"], "send": "q"},
         {"expect": ["Code reviews"], "send": "q"}]},

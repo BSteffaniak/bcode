@@ -64,6 +64,9 @@ pub struct ScriptedHost {
     sessions: Mutex<Vec<(String, String)>>,
     messages: Mutex<Vec<(String, String)>>,
     session_failure: Mutex<Option<String>>,
+    permissions: Mutex<Vec<(String, bool, bool)>>,
+    cancels: Mutex<Vec<String>>,
+    delayed_redraws: AtomicUsize,
     provider: OnceLock<FakeProvider>,
     publisher: OnceLock<FakePublisher>,
 }
@@ -111,6 +114,9 @@ impl ScriptedHost {
             sessions: Mutex::default(),
             messages: Mutex::default(),
             session_failure: Mutex::default(),
+            permissions: Mutex::default(),
+            cancels: Mutex::default(),
+            delayed_redraws: AtomicUsize::new(0),
             provider: OnceLock::new(),
             publisher: OnceLock::new(),
         }
@@ -203,6 +209,33 @@ impl ScriptedHost {
     #[must_use]
     pub fn messages(&self) -> Vec<(String, String)> {
         self.messages.lock().expect("messages lock").clone()
+    }
+
+    /// Permission answers sent so far: `(permission id, approved, remember)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    #[must_use]
+    pub fn permission_answers(&self) -> Vec<(String, bool, bool)> {
+        self.permissions.lock().expect("permissions lock").clone()
+    }
+
+    /// Sessions whose running turn was stopped, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    #[must_use]
+    pub fn cancelled_turns(&self) -> Vec<String> {
+        self.cancels.lock().expect("cancels lock").clone()
+    }
+
+    /// Frames requested for later through [`ReviewHost::request_redraw_after`] (never
+    /// delivered: scenarios render explicitly).
+    #[must_use]
+    pub fn delayed_redraw_requests(&self) -> usize {
+        self.delayed_redraws.load(Ordering::SeqCst)
     }
 
     /// Sender of view updates for a session a screen follows.
@@ -344,6 +377,25 @@ impl ReviewHost for ScriptedHost {
         Box::pin(async { Ok(()) })
     }
 
+    fn resolve_permission(
+        &self,
+        permission_id: String,
+        approved: bool,
+        remember: bool,
+    ) -> HostFuture<()> {
+        self.permissions.lock().expect("permissions lock").push((
+            permission_id,
+            approved,
+            remember,
+        ));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_turn(&self, session_id: String) -> HostFuture<()> {
+        self.cancels.lock().expect("cancels lock").push(session_id);
+        Box::pin(async { Ok(()) })
+    }
+
     fn follow_session(
         &self,
         session_id: SessionId,
@@ -438,6 +490,10 @@ impl ReviewHost for ScriptedHost {
 
     fn request_redraw(&self) {
         self.redraws.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn request_redraw_after(&self, _delay: Duration) {
+        self.delayed_redraws.fetch_add(1, Ordering::SeqCst);
     }
 }
 

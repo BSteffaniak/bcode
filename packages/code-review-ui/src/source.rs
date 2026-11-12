@@ -80,11 +80,10 @@ impl VirtualItemSource<RowKey> for DocumentSource<'_> {
         // re-measure items in place, plus annotation content and the live composer.
         let base = self.context.params.layout_revision;
         match self.context.doc.item(index) {
-            Some(ReviewItem::Thread(_) | ReviewItem::AgentThread(_)) => {
+            Some(item @ (ReviewItem::Thread(_) | ReviewItem::AgentThread(_))) => {
                 base ^ self
                     .context
-                    .params
-                    .annotation_revision
+                    .annotation_stamp(item)
                     .wrapping_mul(0x9e37_79b9)
             }
             Some(ReviewItem::Composer(_)) => {

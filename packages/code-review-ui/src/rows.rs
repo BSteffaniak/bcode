@@ -122,6 +122,10 @@ impl fmt::Display for RowKey {
 
 use std::fmt::Write as _;
 
+mod agent;
+
+pub use agent::{exchange_turn, is_newest, item_id, open_key};
+
 /// Presentation inputs shared by every row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewParams {
@@ -202,6 +206,18 @@ pub enum AgentAction {
     Refine,
     /// Reject the latest pending suggestion.
     Reject,
+    /// Allow the session's pending permission request once.
+    Allow,
+    /// Allow it and remember the rule.
+    Always,
+    /// Decline it once.
+    Decline,
+    /// Decline it and remember the rule.
+    Never,
+    /// Stop the session's running turn.
+    Stop,
+    /// Open or close the feed item at this index of the card's turn (reasoning, tool output).
+    Toggle(u16),
 }
 
 /// How threads and AI answers are folded (presentation only; persisted with the workspace).
@@ -211,6 +227,9 @@ pub struct Folds {
     pub collapsed: std::collections::BTreeSet<String>,
     /// AI exchanges whose whole answer is shown.
     pub expanded: std::collections::BTreeSet<String>,
+    /// Opened feed items of AI cards (reasoning text, all tool output), keyed by
+    /// [`open_key`]; not saved with the workspace.
+    pub feed_open: std::collections::BTreeSet<String>,
     /// Changes whenever the folds change.
     pub revision: u64,
 }
@@ -513,14 +532,7 @@ impl RowContext<'_> {
             } else {
                 0
             },
-            annotation_revision: if matches!(
-                item,
-                ReviewItem::Thread(_) | ReviewItem::AgentThread(_)
-            ) {
-                self.params.annotation_revision
-            } else {
-                0
-            },
+            annotation_revision: self.annotation_stamp(item),
             content: ContentStamp::of(item),
         };
         self.cache.borrow_mut().get_or_build(key, || {
@@ -528,6 +540,28 @@ impl RowContext<'_> {
             rows.selection = selection_runs(item, &rows, self.params.layout_revision);
             rows
         })
+    }
+
+    /// Revision of an annotation item's content: the annotations, plus the live state of an AI
+    /// card's session, so a session update lays out only that session's cards again. Zero for
+    /// other items.
+    #[must_use]
+    pub fn annotation_stamp(&self, item: &ReviewItem) -> u64 {
+        match item {
+            ReviewItem::Thread(_) => self.params.annotation_revision,
+            ReviewItem::AgentThread(agent) => {
+                let session = agent
+                    .exchange_id
+                    .as_deref()
+                    .and_then(|id| self.notes.exchange(id))
+                    .and_then(|exchange| exchange.session_id.as_deref());
+                self.params.annotation_revision
+                    ^ session
+                        .map_or(0, |session| self.agents.session_revision(session))
+                        .rotate_left(23)
+            }
+            _ => 0,
+        }
     }
 
     /// Stamp of the highlights both blob sides of a diff row's file have, so its cached rows
@@ -606,7 +640,7 @@ impl RowContext<'_> {
                 cells,
                 self.gutter_indent(width),
             ),
-            ReviewItem::AgentThread(agent) => agent_rows(
+            ReviewItem::AgentThread(agent) => agent::agent_rows(
                 agent,
                 self.notes,
                 self.agents,
@@ -1342,18 +1376,33 @@ fn indented(lines: Vec<Line>, prefix: &str, width: usize) -> Vec<Line> {
 
 /// Markdown rendered at `width` cells, at most `max` rows (an ellipsis row marks elided rows).
 fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Line> {
+    markdown_rows(text, width, max, false, theme)
+}
+
+/// Markdown rendered at `width` cells, at most `max` rows. A finished text shows its first rows
+/// and an ellipsis row after them; a `streaming` text is rendered as an incomplete document and
+/// shows its last rows (where text arrives) with the ellipsis row before them.
+fn markdown_rows(
+    text: &str,
+    width: usize,
+    max: usize,
+    streaming: bool,
+    theme: &ReviewTheme,
+) -> Vec<Line> {
     let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
-    let mut lines = bcode_markdown_render::render_markdown(
-        text,
-        &bcode_markdown_render::MarkdownRenderOptions::new(width),
-    )
-    .lines;
+    let mut options = bcode_markdown_render::MarkdownRenderOptions::new(width);
+    options.streaming = streaming;
+    let mut lines = bcode_markdown_render::render_markdown(text, &options).lines;
     if lines.len() > max {
-        lines.truncate(max.saturating_sub(1));
-        lines.push(Line::from_spans(vec![Span::styled(
-            theme.icons.ellipsis,
-            theme.muted,
-        )]));
+        let ellipsis = Line::from_spans(vec![Span::styled(theme.icons.ellipsis, theme.muted)]);
+        let keep = max.saturating_sub(1);
+        if streaming {
+            lines.drain(..lines.len() - keep);
+            lines.insert(0, ellipsis);
+        } else {
+            lines.truncate(keep);
+            lines.push(ellipsis);
+        }
     }
     if lines.is_empty() {
         lines.push(Line::default());
@@ -1735,168 +1784,6 @@ fn external_thread_rows(
     ItemRows::lines(lines, Vec::new())
 }
 
-/// Header of an AI answer: icon, live status, and an outdated label. Returns whether the
-/// question or its stream failed.
-fn agent_header(
-    agent: &bcode_code_review::document::AgentThreadItem,
-    status: Option<bcode_code_review_models::ReviewAiExchangeStatus>,
-    live: Option<&super::agent::AgentState>,
-    theme: &ReviewTheme,
-    indent: usize,
-) -> (Vec<Span>, bool) {
-    use super::agent::AgentPhase;
-    use bcode_code_review_models::ReviewAiExchangeStatus;
-    let icons = &theme.icons;
-    let (status, status_style, failed) = match (status, live) {
-        (Some(ReviewAiExchangeStatus::Failed), _) => ("failed", theme.error, true),
-        (Some(ReviewAiExchangeStatus::Pending), _) => ("asking…", theme.badge_draft, false),
-        (_, Some(state)) => match state.phase {
-            AgentPhase::Waiting => ("connecting…", theme.muted, false),
-            AgentPhase::Working => ("working…", theme.badge_draft, false),
-            AgentPhase::Answered => ("answered", theme.badge_resolved, false),
-            AgentPhase::Failed => ("stream stopped", theme.error, true),
-        },
-        _ => ("suggestion", theme.badge_ai, false),
-    };
-    let mut header = vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled(icons.ai, theme.badge_ai),
-        Span::raw(" "),
-        Span::styled("Bcode", theme.badge_ai),
-        Span::raw(" "),
-        Span::styled(status, status_style),
-    ];
-    if let bcode_code_review::document::AnchorPlacement::Outdated(reason) = agent.placement {
-        header.push(Span::raw(" "));
-        header.push(Span::styled(outdated_label(reason), theme.badge_outdated));
-    }
-    (header, failed)
-}
-
-/// Rows of an AI answer: a header with live status, the question, the answer preview (or the
-/// status), suggestions, and actions.
-#[allow(clippy::too_many_lines)]
-fn agent_rows(
-    agent: &bcode_code_review::document::AgentThreadItem,
-    notes: &super::notes::ReviewNotes,
-    agents: &super::agent::AgentStreams,
-    folds: &Folds,
-    theme: &ReviewTheme,
-    width: usize,
-    indent: usize,
-) -> ItemRows {
-    let exchange = agent
-        .exchange_id
-        .as_deref()
-        .and_then(|id| notes.exchange(id));
-    let session_state = exchange
-        .and_then(|exchange| exchange.session_id.as_deref())
-        .and_then(|session| agents.state(session));
-    let (header, failed) = agent_header(
-        agent,
-        exchange.map(|exchange| exchange.status),
-        session_state,
-        theme,
-        indent,
-    );
-    let mut lines = vec![Line::from_spans(header).truncate(width)];
-    let body_indent = indent + 2;
-    let body_width = width.saturating_sub(body_indent);
-    let pad = " ".repeat(body_indent);
-    if let Some(exchange) = exchange {
-        let question = exchange.question.lines().next().unwrap_or_default();
-        lines.push(
-            Line::from_spans(vec![
-                Span::raw(pad.clone()),
-                Span::styled("Q ", theme.badge_ai),
-                Span::styled(question.to_owned(), theme.text),
-            ])
-            .truncate(width),
-        );
-        if let Some(error) = &exchange.error {
-            lines.push(
-                Line::from_spans(vec![
-                    Span::raw(pad.clone()),
-                    Span::styled(error.clone(), theme.error),
-                ])
-                .truncate(width),
-            );
-        }
-    }
-    let expanded = agent
-        .exchange_id
-        .as_ref()
-        .is_some_and(|id| folds.expanded.contains(id));
-    let answered = session_state.is_some_and(|state| !state.answer.trim().is_empty());
-    match session_state {
-        Some(state) if !state.answer.is_empty() => {
-            let max = if expanded {
-                MAX_EXPANDED_ANSWER_ROWS
-            } else {
-                MAX_ANSWER_ROWS
-            };
-            lines.extend(indented(
-                markdown(&state.answer, body_width, max, theme),
-                &pad,
-                width,
-            ));
-        }
-        Some(state) if !state.status.is_empty() => lines.push(
-            Line::from_spans(vec![
-                Span::raw(pad),
-                Span::styled(state.status.clone(), theme.muted),
-            ])
-            .truncate(width),
-        ),
-        _ => {}
-    }
-    let (suggestion_lines, mut actions) = suggestion_rows(
-        &agent.suggestion_ids,
-        notes,
-        theme,
-        body_indent,
-        width,
-        u16::try_from(lines.len()).unwrap_or(u16::MAX),
-        |action| {
-            ItemAction::Agent(match action {
-                SuggestionAction::Accept => AgentAction::Accept,
-                SuggestionAction::Refine => AgentAction::Refine,
-                SuggestionAction::Reject => AgentAction::Reject,
-            })
-        },
-    );
-    lines.extend(suggestion_lines);
-    let session = exchange.and_then(|exchange| exchange.session_id.as_ref());
-    let mut buttons = Vec::new();
-    if session.is_some() {
-        buttons.push(("Open session", ItemAction::Agent(AgentAction::Open)));
-        buttons.push(("Follow up", ItemAction::Agent(AgentAction::FollowUp)));
-    }
-    if answered {
-        buttons.push((
-            if expanded { "Less" } else { "More" },
-            ItemAction::Agent(AgentAction::Expand),
-        ));
-        buttons.push(("Copy", ItemAction::Agent(AgentAction::Copy)));
-        buttons.push(("Suggest comment", ItemAction::Agent(AgentAction::Suggest)));
-        buttons.push(("Draft", ItemAction::Agent(AgentAction::Draft)));
-    }
-    if failed && session.is_some() {
-        buttons.push(("Retry", ItemAction::Agent(AgentAction::Retry)));
-    }
-    if exchange.is_some() {
-        buttons.push(("Delete", ItemAction::Agent(AgentAction::Delete)));
-    }
-    if !buttons.is_empty() {
-        let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let (rows, placed_actions) =
-            action_row(&buttons, row, body_indent.min(width), width, theme);
-        lines.extend(rows);
-        actions.extend(placed_actions);
-    }
-    ItemRows::lines(lines, actions)
-}
-
 /// Component of one document item.
 pub struct ItemView<'a> {
     id: LayoutId,
@@ -2269,7 +2156,15 @@ impl Component for ItemView<'_> {
                 .composer
                 .map_or(0, super::composer::Composer::revision)
         } else {
-            self.context.params.annotation_revision
+            self.context.doc.item(self.index).map_or(
+                self.context.params.annotation_revision,
+                |item| match item {
+                    ReviewItem::Thread(_) | ReviewItem::AgentThread(_) => {
+                        self.context.annotation_stamp(item)
+                    }
+                    _ => self.context.params.annotation_revision,
+                },
+            )
         };
         ComponentRevision::new(
             self.context.params.layout_revision ^ content.wrapping_mul(0x9e37_79b9),

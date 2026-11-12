@@ -108,6 +108,16 @@ pub struct Icons {
     pub collapse: &'static str,
     /// A collapsed group (the menu toggle marks an expanded one).
     pub collapsed: &'static str,
+    /// A running tool call.
+    pub running: &'static str,
+    /// A failed tool call.
+    pub failed: &'static str,
+    /// Rule before a line of tool output.
+    pub output: &'static str,
+    /// An error.
+    pub alert: &'static str,
+    /// Name of the BMUX spinner preset of busy items (`braille` or `ascii`).
+    pub spinner: &'static str,
 }
 
 impl Icons {
@@ -136,6 +146,11 @@ impl Icons {
         filter: "⌕",
         collapse: "«",
         collapsed: "▸",
+        running: "◌",
+        failed: "✗",
+        output: "│",
+        alert: "⚠",
+        spinner: "braille",
     };
 
     /// ASCII glyphs.
@@ -163,6 +178,11 @@ impl Icons {
         filter: "/",
         collapse: "<<",
         collapsed: ">",
+        running: "*",
+        failed: "x",
+        output: "|",
+        alert: "!",
+        spinner: "ascii",
     };
 
     /// The glyph set of `style`.
@@ -942,6 +962,10 @@ mod tests {
             icons.menu,
             icons.filter,
             icons.collapse,
+            icons.running,
+            icons.failed,
+            icons.output,
+            icons.alert,
         ] {
             assert!(glyph.is_ascii(), "{glyph:?}");
         }

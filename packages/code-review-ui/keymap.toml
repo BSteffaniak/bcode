@@ -325,6 +325,22 @@ keymap_actions = [
     { id = "bcode.code_review.wizard_back", scope = "code-review-wizard", description = "Back one step", defaults = [
         "esc",
     ] },
+    { id = "bcode.code_review.feed_allow", scope = "code-review-feed", description = "Allow the AI card's permission request once", defaults = [
+        "y",
+    ] },
+    { id = "bcode.code_review.feed_always", scope = "code-review-feed", description = "Always allow the AI card's permission request", defaults = [
+        "a",
+    ] },
+    { id = "bcode.code_review.feed_decline", scope = "code-review-feed", description = "Decline the AI card's permission request once", defaults = [
+        "n",
+    ] },
+    { id = "bcode.code_review.feed_never", scope = "code-review-feed", description = "Never allow the AI card's permission request", defaults = [
+        "d",
+    ] },
+    { id = "bcode.code_review.feed_stop", scope = "code-review-feed", description = "Stop the AI card's running turn", defaults = [
+        "esc",
+        "ctrl+c",
+    ] },
     { id = "bcode.code_review.composer_submit", scope = "code-review-composer", description = "Save the comment", defaults = [
         "ctrl+s",
     ] },

@@ -74,6 +74,33 @@ linked sessions, for plugin services, and for `publish-github`.
 Opening a session hands the terminal to `bcode tui` and resumes the review where it was when
 that exits.
 
+### AI cards
+
+Asking Bcode (a new question, a follow-up, or an AI command) never leaves the review. The cursor
+moves to the question's card below its anchor, and the card follows the linked session live:
+
+* The title shows a spinner while the turn runs, the status (`asking…`, `working…`,
+  `needs you`, `stopping…`, `answered`, `stopped`, `failed`), the session's tokens and estimated
+  cost, and the seconds the turn has run.
+* The body is the question's turn: `▍you` and the question as asked, reasoning collapsed to
+  `▸ thinking · N words` (a click opens it), tool lines `◌` running, `✓` done, `✗` failed with
+  the last three lines of output and an `All N lines` expander, the answer as markdown that
+  streams in (its last rows while streaming; `z`/More shows the whole answer), notices, and
+  errors.
+* A pending permission request of the session replaces the card's actions with its prompt:
+  `y` allow, `a` always, `n` decline, `d` never (scope `code-review-feed`; Always and Never
+  only when the request can be remembered). While the turn runs, `esc` or `ctrl+c` stops it.
+  These keys apply only on such a card; elsewhere the same keys keep their review meaning.
+* `o` opens the session in Bcode (`Open in Bcode`).
+* When a card needs the reviewer while it is off screen (a permission request, an answer, a
+  failure), a toast names its location; the scrollbar marks every card.
+
+A card keeps a bounded summary of its session (`agent::Feed`): eight turns, 24 items per turn,
+200 output lines per tool and bounded text, so a long session costs the same as a short one.
+Each session has its own layout revision, so a streaming update or a spinner frame lays out only
+that session's cards. Follow-ups in one session each show their own turn, found by the question;
+a turn that has left the observed window says so and `o` reads it in Bcode.
+
 ### Comment composer
 
 Typing `@` and part of a path in the comment composer suggests repository paths (tracked and
@@ -155,7 +182,7 @@ bcode's own (`--print-config-paths` lists them in order):
   value is reported and the default is used.
 * `[tui.keybindings.scopes."code-review*"]`: keybinding overrides of the review scopes
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
-  `code-review-threads` and `code-review-composer`. `none` or `unbind` removes a default.
+  `code-review-threads`, `code-review-composer` and `code-review-feed`. `none` or `unbind` removes a default.
 * `[tui.theme]`: the theme, loaded through `bcode_tui_theme` discovery like `bcode-git`.
 * `[tui] color_depth`: `auto` (the default: no colors under `NO_COLOR` or a dumb terminal, else
   full color), `truecolor`, `ansi256`, `ansi16`, or `none`, as in bcode.

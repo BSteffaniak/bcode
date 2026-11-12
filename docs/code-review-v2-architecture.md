@@ -2005,8 +2005,9 @@ before is the same app without these changes; per presented frame):
   it takes a `PublishReviewRequest`.)
 * **Smoke.** The review cases of `scripts/smoke-continuous-tui-pty.py` drive the app:
   `review-home-cancel`, `review-invalid-repository`, `review-home-new-workspace` (wizard, then
-  reopen after restart), `review-ask-open-session` (ask Bcode, open the linked session, return;
-  replaces the chat-routing cases `review-linked-navigation` and `review-home-workspace-chat`),
+  reopen after restart), `review-ask-live-feed` (ask Bcode, see the answer stream into the card
+  without leaving the review, open the linked session with `o`, return; replaces the
+  chat-routing cases `review-linked-navigation` and `review-home-workspace-chat`),
   `review-click-save-resume` and `review-wizard-unstaged` (replacing the preset-click cases),
   `review-tree-scroll-resize`, `review-range-edit-thread`, and `review-pointer-no-rewrite`.
   `completion-review` drives the composer's `@path` completion (accept, ordinary typing,
@@ -2126,6 +2127,60 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
   finished answer), a toast appears and the scrollbar marks the card's position.
 * **Bounds.** Cards keep a bounded window of transcript items and reuse the identity-keyed layout
   cache (6.4); streaming updates relayout only the card that changed.
+
+**Built.**
+
+* **No view switch.** Finishing a question no longer opens its session; the cursor moves to the
+  question's card (`focus_card`) and stays in the review. `o` (Open in Bcode) still hands the
+  terminal to `bcode tui <session>` and restores the position on return.
+* **Feed model** (`packages/code-review-ui/src/agent/feed.rs`). `AgentState::from_snapshot`
+  reduces each `SessionViewSnapshot` to a bounded `Feed`: turns split at user messages, each
+  with its question (the text after the review prompt's `Question:` marker), reasoning (word
+  count and bounded text), tool lines (state, a one-line argument summary, the last 200 output
+  lines and the line count), answers with their streaming flag, notices (system messages,
+  compactions, interactions waiting in Bcode), and errors (a failed or cancelled turn, a
+  connection error); session-wide the first pending permission request (with how many more wait)
+  and the metered tokens and estimated cost. Limits: 8 turns, 24 items per turn, 64 KiB per
+  answer, 8 KiB per other text. The follow projection grew to 64 items and 512 KiB.
+* **Cards** (`packages/code-review-ui/src/rows/agent.rs`). An exchange's card shows the newest
+  turn asking its question; when the question has left the window, the newest exchange of the
+  session shows the session's newest turn and older ones say the turn is earlier in the session.
+  The title carries the spinner (BMUX `Spinner`, braille or ASCII), status, tokens, cost and
+  elapsed seconds; the body is `▍you` with the question, `▸ thinking · N words` (a click opens
+  it), tool lines `◌`/`✓`/`✗` with the last three output lines and `All N lines`, the answer as
+  BMUX markdown (`streaming` set while it streams, showing its last rows; finished answers show
+  the first rows and More), notices and `⚠` errors. Buttons: Open in Bcode, then Stop while the
+  turn runs; nothing more while a permission prompt shows; else Follow up, More, Copy, Suggest
+  comment, Draft, Retry (only when following stopped) and Delete. Copy, Suggest and Draft use
+  the exchange's own turn's answer.
+* **Permission prompt and stop.** The newest card of a session with a pending request shows
+  `? Use <tool>?`, the argument summary, the policy's reason and Allow / Always / Decline /
+  Never (Always and Never only when the request can be remembered). The keys live in scope
+  `code-review-feed` (`y`, `a`, `n`, `d`, and `esc`/`ctrl+c` to stop), consulted before the
+  review's scope only on a card where they apply, so `a`, `n`, `d` and `esc` keep their review
+  meaning elsewhere. Answers and stops are queued and sent from the next poll through
+  `ReviewHost::resolve_permission` and `ReviewHost::cancel_turn` (`resolve_permission_with_remember`
+  and `cancel_session_turn` on the daemon); an answered prompt shows `answering…` until the
+  session drops the request, and a failure shows the prompt again with a toast. The footer
+  hints list the card's feed keys while they apply.
+* **Per-card relayout and spinners.** `AgentStreams` keeps a revision per session; the row
+  cache key, the item's layout revision and its component revision of an AI card use it
+  (`RowContext::annotation_stamp`), so an update or a spinner frame rebuilds only that session's
+  cards. Spinners advance from the poll (`AgentStreams::tick`), which asks the host for the next
+  frame with `ReviewHost::request_redraw_after`.
+* **Attention.** When a session gets a permission request, answers, or fails and none of its
+  cards is in the visible range, a toast names the card's location; the existing scrollbar
+  marks show where cards are.
+* **Verification.** Screen tests over the scripted host's session stream cover streaming,
+  reasoning, tool lines and the output expander, tokens and cost, the permission prompt
+  answered with keys, stop and a cancelled turn, a failed turn's error, the toast for an
+  off-screen card, and that asking never returns `Action::OpenSession`. The PTY case
+  `review-ask-live-feed` asks in a real `bcode review` with the fake provider, sees the answer in
+  the card while the review keeps the terminal, then opens the session with `o` and returns.
+  The 400×120 screen benchmark stays under 1.4 ms p95 paint.
+* **Not built here.** "Show all" in a panel inside the review (the session opens in Bcode
+  instead), a follow-up composer inside the card (follow-ups use the inline composer at the
+  anchor), and opening reasoning or tool output from the keyboard (they open on a click).
 
 ### 13.6 Phase 12: review assistant
 

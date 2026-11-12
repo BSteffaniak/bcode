@@ -151,12 +151,14 @@ enum Phase {
 
 mod annotate;
 mod assist;
+mod feed;
 mod find;
 mod flows;
 mod pointer;
 mod stack;
 
 pub use annotate::COMPOSER_SCOPE;
+pub use feed::FEED_SCOPE;
 pub use flows::Modal;
 
 pub use find::{SearchState, ThreadsFilter};
@@ -630,8 +632,10 @@ pub struct ReviewSurface {
     exit_armed: bool,
     /// Closing asks the app to edit the review's sources.
     edit_requested: bool,
-    /// Questions sent as follow-ups in an existing session (their session is not opened).
-    follow_ups: BTreeSet<String>,
+    /// Permission answers and stops waiting to be sent.
+    feed_requests: VecDeque<feed::FeedRequest>,
+    /// When the next spinner frame was asked for.
+    feed_wake: Option<Instant>,
 }
 
 impl std::fmt::Debug for ReviewSurface {
@@ -739,7 +743,8 @@ impl ReviewSurface {
             clipboard: None,
             exit_armed: false,
             edit_requested: false,
-            follow_ups: BTreeSet::new(),
+            feed_requests: VecDeque::new(),
+            feed_wake: None,
         }
     }
 
@@ -1056,7 +1061,6 @@ impl ReviewSurface {
                 .wrapping_add(u64::from(review.gutter_digits)),
             paint_revision: self.paint_revision,
             annotation_revision: self.notes.revision().wrapping_mul(1_000_003)
-                ^ self.agents.revision()
                 ^ self.folds.revision.wrapping_mul(0x5851_f42d),
         }
     }
@@ -1657,6 +1661,7 @@ impl ReviewSurface {
             }
             Message::NoteDone(result) => self.finish_note(result),
             Message::Asked(result) => self.finish_ask(*result),
+            Message::Feed(outcome) => self.finish_feed(outcome),
             Message::SavedAs(result) => self.finish_save_review(*result),
             Message::Publish(result) => self.apply_publish(result),
             Message::Import(result) => self.apply_import(result),
@@ -1873,6 +1878,10 @@ impl ReviewSurface {
                 }
             }
             Focus::Review => {}
+        }
+        if let Some(action) = self.feed_key(stroke, host) {
+            self.count = None;
+            return action;
         }
         let action = host.keymap_action(SCOPE, stroke);
         let Some(action) = action else {
@@ -2119,6 +2128,11 @@ impl ReviewSurface {
                         .unwrap_or(Action::Redraw),
                 );
             }
+            "feed_allow" => self.feed_action(super::rows::AgentAction::Allow),
+            "feed_always" => self.feed_action(super::rows::AgentAction::Always),
+            "feed_decline" => self.feed_action(super::rows::AgentAction::Decline),
+            "feed_never" => self.feed_action(super::rows::AgentAction::Never),
+            "feed_stop" => self.feed_action(super::rows::AgentAction::Stop),
             "view_all" => self.view_all(true),
             "unview_all" => self.view_all(false),
             "attention_next" => self.attention_next(),
@@ -3107,8 +3121,14 @@ impl ReviewSurface {
                     .review
                     .as_ref()
                     .and_then(|review| review.cursor.as_ref());
-                for (action, label) in item_hints(cursor) {
-                    push(key(action), label);
+                let feed = self.feed_hints();
+                for (key, label) in &feed {
+                    push(Some(key.clone()), label);
+                }
+                if feed.is_empty() {
+                    for (action, label) in item_hints(cursor) {
+                        push(key(action), label);
+                    }
                 }
                 let on_gap = self
                     .review
@@ -3232,6 +3252,11 @@ impl ReviewSurface {
                 &crate::keymap::actions_for(annotate::COMPOSER_SCOPE),
                 keys(annotate::COMPOSER_SCOPE),
                 Some("Comment composer"),
+            ));
+            entries.extend(super::palette::entries(
+                &crate::keymap::actions_for(FEED_SCOPE),
+                keys(FEED_SCOPE),
+                Some("AI card"),
             ));
             entries.extend(super::palette::entries(
                 &crate::keymap::actions_for(FILES_SCOPE),
@@ -4078,7 +4103,7 @@ const fn item_hints(cursor: Option<&ItemKey>) -> &'static [(&'static str, &'stat
         ],
         Some(ItemKey::AgentThread { .. }) => &[
             ("activate", "actions"),
-            ("open_session", "open session"),
+            ("open_session", "open in Bcode"),
             ("ask", "follow up"),
             ("fold", "more"),
             ("copy_answer", "copy"),
@@ -4173,6 +4198,7 @@ impl ReviewSurface {
 impl View for ReviewSurface {
     fn prepare_keymap(&mut self, host: &UiContext) {
         self.host_layout = host.diff_layout();
+        self.prepare_feed_keys(host);
         self.action_keys = HINT_ACTIONS
             .iter()
             .filter_map(|action| {
@@ -4326,7 +4352,10 @@ impl View for ReviewSurface {
         }
         let notes_before = self.notes.pending();
         self.pump_notes(host);
+        self.pump_feed(host);
         changed |= self.agents.drain();
+        changed |= self.tick_feed(host);
+        self.feed_attention();
         if changed {
             self.sync_notes();
         }

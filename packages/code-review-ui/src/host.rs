@@ -12,6 +12,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use bcode_code_review::provider::{ProviderCallError, ProviderTransport};
 use bcode_session_models::{ProjectionWindowRequest, SessionId};
@@ -107,6 +108,18 @@ pub trait ReviewHost: Send + Sync {
     /// Send `text` to `session_id` as a user message.
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()>;
 
+    /// Answer the pending permission request `permission_id`: allow it (`approved`) or decline
+    /// it, once or remembered as a rule (`remember`).
+    fn resolve_permission(
+        &self,
+        permission_id: String,
+        approved: bool,
+        remember: bool,
+    ) -> HostFuture<()>;
+
+    /// Stop the running turn of `session_id`.
+    fn cancel_turn(&self, session_id: String) -> HostFuture<()>;
+
     /// Follow a session's live semantic view until the returned receiver is dropped.
     ///
     /// # Errors
@@ -158,6 +171,9 @@ pub trait ReviewHost: Send + Sync {
 
     /// Ask for a new frame; repeated requests before the frame coalesce.
     fn request_redraw(&self);
+
+    /// Ask for a new frame once `delay` has passed (the next frame of an animation).
+    fn request_redraw_after(&self, delay: Duration);
 
     /// Route [`Self::request_redraw`] (and the frames requested when spawned work finishes) to
     /// `redraw`, the wake-up of the loop that drives the UI. The app's own run loop connects it
@@ -375,6 +391,46 @@ impl ReviewHost for StandaloneHost {
         })
     }
 
+    fn resolve_permission(
+        &self,
+        permission_id: String,
+        approved: bool,
+        remember: bool,
+    ) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let resolved = bcode
+                .client()
+                .await?
+                .resolve_permission_with_remember(permission_id, approved, remember)
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            if resolved {
+                Ok(())
+            } else {
+                Err(HostError::failed(
+                    "the permission request is no longer pending",
+                ))
+            }
+        })
+    }
+
+    fn cancel_turn(&self, session_id: String) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = session_id
+                .parse::<SessionId>()
+                .map_err(|error| HostError::failed(error.to_string()))?;
+            bcode
+                .client()
+                .await?
+                .cancel_session_turn(id)
+                .await
+                .map(drop)
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
     fn follow_session(
         &self,
         session_id: SessionId,
@@ -503,6 +559,16 @@ impl ReviewHost for StandaloneHost {
         if let Some(redraw) = self.redraw.get() {
             redraw();
         }
+    }
+
+    fn request_redraw_after(&self, delay: Duration) {
+        let redraw = Arc::clone(&self.redraw);
+        drop(self.runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(redraw) = redraw.get() {
+                redraw();
+            }
+        }));
     }
 
     /// Only the first call takes effect.

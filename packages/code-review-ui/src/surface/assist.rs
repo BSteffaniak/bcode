@@ -216,10 +216,18 @@ impl ReviewSurface {
     // AI answers and suggestions
     // ----------------------------------------------------------------------------------------
 
-    /// The latest answer of an exchange's linked session, trimmed; `None` without one.
+    /// The finished answer of an exchange's turn in its linked session, trimmed; `None` without
+    /// one. When the turn is no longer in the observed window, the newest exchange of the
+    /// session takes the session's latest answer.
     fn answer_text(&self, exchange_id: &str) -> Option<String> {
-        let session = self.notes.exchange(exchange_id)?.session_id.as_deref()?;
-        let answer = self.agents.state(session)?.answer.trim();
+        let exchange = self.notes.exchange(exchange_id)?;
+        let state = self.agents.state(exchange.session_id.as_deref()?)?;
+        let newest = crate::rows::is_newest(exchange, &self.notes);
+        let answer = match crate::rows::exchange_turn(exchange, state, newest) {
+            Some((turn, _)) => turn.answer(),
+            None if newest => state.answer.trim(),
+            None => "",
+        };
         (!answer.is_empty()).then(|| answer.to_owned())
     }
 

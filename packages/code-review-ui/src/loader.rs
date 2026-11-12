@@ -99,6 +99,8 @@ pub enum Message {
         /// Matching paths, or why the search failed.
         result: Result<bcode_code_review_models::ReviewFilesSearchResponse, String>,
     },
+    /// A permission answer or a stop of an AI card's session finished.
+    Feed(crate::agent::FeedOutcome),
     /// An AI question finished: the linked exchange, or the exchange as recorded and the error.
     Asked(
         Box<

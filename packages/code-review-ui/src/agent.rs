@@ -10,7 +10,14 @@
 //! * Structured commands ([`AiCommand`]) ask a fixed instruction about the anchor.
 //! * Linked sessions are observed through the host's semantic session view
 //!   ([`crate::host::ReviewHost::follow_session`]); each update replaces the session's derived
-//!   status (waiting, working, answered, failed) and the latest completed answer.
+//!   status (waiting, working, answered, failed), its bounded live [`Feed`] (questions,
+//!   reasoning, tool lines, the streaming answer, errors, a pending permission request, tokens
+//!   and cost), and the latest completed answer. Each session has its own revision, so an update
+//!   or a spinner frame lays out only the cards of that session again.
+
+pub mod feed;
+
+pub use feed::{Feed, FeedItem};
 
 use super::notes::NoteScope;
 use crate::context::UiContext;
@@ -29,6 +36,7 @@ use bcode_session_view_models::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Lines of the anchored diff sent with a question.
 pub const MAX_PROMPT_LINES: usize = 80;
@@ -316,8 +324,16 @@ pub struct AgentState {
     pub phase: AgentPhase,
     /// One-line status.
     pub status: String,
-    /// Latest completed answer (empty until there is one).
+    /// Latest completed answer of the session (empty until there is one).
     pub answer: String,
+    /// The bounded live feed.
+    pub feed: Feed,
+    /// Whether a turn is running (the spinner turns and stop applies).
+    pub working: bool,
+    /// Whether stopping the running turn was requested.
+    pub cancelling: bool,
+    /// Whether following the session stopped (the daemon went away, or it never started).
+    pub disconnected: bool,
 }
 
 impl AgentState {
@@ -326,20 +342,40 @@ impl AgentState {
             phase: AgentPhase::Waiting,
             status: String::new(),
             answer: String::new(),
+            feed: Feed {
+                turns: Vec::new(),
+                permission: None,
+                tokens: 0,
+                cost: None,
+            },
+            working: false,
+            cancelling: false,
+            disconnected: false,
         }
     }
 
-    const fn failed(message: String) -> Self {
+    fn failed(message: String) -> Self {
+        let mut feed = Feed::default();
+        feed.push(FeedItem::Error(message.clone()));
         Self {
             phase: AgentPhase::Failed,
             status: message,
-            answer: String::new(),
+            feed,
+            disconnected: true,
+            ..Self::waiting()
         }
+    }
+
+    /// Whether the session waits for the reviewer (a pending permission request).
+    #[must_use]
+    pub const fn needs_you(&self) -> bool {
+        self.feed.permission.is_some()
     }
 
     /// State derived from a session snapshot.
     #[must_use]
     pub fn from_snapshot(snapshot: &SessionViewSnapshot) -> Self {
+        let mut feed = Feed::from_snapshot(snapshot);
         let answer = snapshot
             .transcript
             .items
@@ -354,51 +390,84 @@ impl AgentState {
                 _ => None,
             })
             .unwrap_or_default();
-        let failed = matches!(
-            snapshot.runtime.last_turn_outcome,
-            Some(
-                bcode_session_models::ModelTurnOutcome::Cancelled
-                    | bcode_session_models::ModelTurnOutcome::Error
-                    | bcode_session_models::ModelTurnOutcome::IdleTimeout
-                    | bcode_session_models::ModelTurnOutcome::ProviderUnavailable
-            )
-        );
+        let outcome = snapshot.runtime.last_turn_outcome;
         let working = snapshot.runtime.active_turn_id.is_some()
             || snapshot.runtime_work.iter().any(|work| !work.is_terminal())
             || snapshot.transcript.items.iter().any(|item| item.streaming);
+        let cancelling = working && snapshot.runtime.cancelling;
         if let SessionConnectionViewStatus::Error(message) = &snapshot.connection_status {
+            feed.push(FeedItem::Error(message.clone()));
             return Self {
                 answer,
-                ..Self::failed(message.clone())
+                feed,
+                ..Self::failed_quietly(message.clone())
             };
         }
+        if !working && outcome == Some(bcode_session_models::ModelTurnOutcome::Cancelled) {
+            feed.push(FeedItem::Notice("stopped".to_owned()));
+            return Self {
+                phase: AgentPhase::Answered,
+                status: "stopped".to_owned(),
+                answer,
+                feed,
+                working: false,
+                cancelling: false,
+                disconnected: false,
+            };
+        }
+        let failed = !working
+            && matches!(
+                outcome,
+                Some(
+                    bcode_session_models::ModelTurnOutcome::Error
+                        | bcode_session_models::ModelTurnOutcome::IdleTimeout
+                        | bcode_session_models::ModelTurnOutcome::ProviderUnavailable
+                )
+            );
         if failed {
+            let message = snapshot
+                .runtime
+                .last_turn_message
+                .clone()
+                .unwrap_or_else(|| "linked Bcode turn failed".to_owned());
+            feed.push(FeedItem::Error(message.clone()));
             return Self {
                 answer,
-                ..Self::failed(
-                    snapshot
-                        .runtime
-                        .last_turn_message
-                        .clone()
-                        .unwrap_or_else(|| "linked Bcode turn failed".to_owned()),
-                )
+                feed,
+                ..Self::failed_quietly(message)
             };
         }
-        let (phase, status) =
-            if !snapshot.permissions.is_empty() || !snapshot.interactions.is_empty() {
-                (
-                    AgentPhase::Working,
-                    "action needed in the linked session".to_owned(),
-                )
-            } else if working || answer.is_empty() {
-                (AgentPhase::Working, "working…".to_owned())
-            } else {
-                (AgentPhase::Answered, "answered".to_owned())
-            };
+        let (phase, status) = if feed.permission.is_some() {
+            (AgentPhase::Working, "needs your permission".to_owned())
+        } else if !snapshot.interactions.is_empty() {
+            (
+                AgentPhase::Working,
+                "action needed in the linked session".to_owned(),
+            )
+        } else if cancelling {
+            (AgentPhase::Working, "stopping…".to_owned())
+        } else if working || answer.is_empty() {
+            (AgentPhase::Working, "working…".to_owned())
+        } else {
+            (AgentPhase::Answered, "answered".to_owned())
+        };
         Self {
             phase,
             status,
             answer,
+            feed,
+            working: working || phase == AgentPhase::Working,
+            cancelling,
+            disconnected: false,
+        }
+    }
+
+    /// Failed with `message` as the status, without adding it to the feed.
+    fn failed_quietly(message: String) -> Self {
+        Self {
+            phase: AgentPhase::Failed,
+            status: message,
+            ..Self::waiting()
         }
     }
 }
@@ -409,17 +478,66 @@ const fn projection() -> ProjectionWindowRequest {
         anchor: ProjectionWindowAnchor::Latest,
         direction: ProjectionWindowDirection::Backward,
         target: ProjectionWindowTarget {
-            min_items: Some(16),
-            min_estimated_rows: Some(40),
+            min_items: Some(24),
+            min_estimated_rows: Some(60),
             min_bytes: None,
             width_columns: Some(100),
         },
         limits: ProjectionWindowLimits {
-            max_items: 32,
-            max_events_scanned: 1_024,
-            max_bytes: 256 * 1024,
+            max_items: 64,
+            max_events_scanned: 2_048,
+            max_bytes: 512 * 1024,
         },
     }
+}
+
+/// Keys shown on the feed's buttons (the first key of each feed action), set from the keymap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedKeys {
+    /// Allow the pending permission request once.
+    pub allow: String,
+    /// Allow it and remember the rule.
+    pub always: String,
+    /// Decline it once.
+    pub decline: String,
+    /// Decline it and remember the rule.
+    pub never: String,
+    /// Stop the running turn.
+    pub stop: String,
+    /// Open the session in Bcode.
+    pub open: String,
+}
+
+/// What changed in a session that the reviewer may need to know about while its card is off
+/// screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attention {
+    /// A permission request is waiting; the tool's name.
+    Permission(String),
+    /// A turn finished with an answer.
+    Answered,
+    /// A turn failed; the message.
+    Failed(String),
+}
+
+/// Result of answering a permission request or stopping a turn from an AI card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedOutcome {
+    /// The card's session.
+    pub session: String,
+    /// The answered permission request; `None` for a stop.
+    pub permission_id: Option<String>,
+    /// Why it failed; `None` when it succeeded.
+    pub error: Option<String>,
+}
+
+/// Spinner frames and timing of a working session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiveClock {
+    /// Spinner frames elapsed since the session started working.
+    pub step: u64,
+    /// Whole seconds elapsed since the session started working.
+    pub seconds: u64,
 }
 
 /// Live observation of every linked session of the review.
@@ -428,6 +546,16 @@ pub struct AgentStreams {
     subscriptions: BTreeMap<String, SessionFollow>,
     states: BTreeMap<String, AgentState>,
     failed: BTreeSet<String>,
+    /// Per-session revision: changes when that session's card must be laid out again.
+    revisions: BTreeMap<String, u64>,
+    /// When each working session started working.
+    since: BTreeMap<String, Instant>,
+    clocks: BTreeMap<String, LiveClock>,
+    /// Permission requests answered from the review whose resolution has not arrived yet.
+    answering: BTreeSet<String>,
+    attention: Vec<(String, Attention)>,
+    keys: FeedKeys,
+    keys_revision: u64,
     revision: u64,
 }
 
@@ -438,10 +566,73 @@ impl AgentStreams {
         self.revision
     }
 
+    /// Changes whenever the card of `session_id` must be laid out again: its state, spinner
+    /// frame, elapsed time, a permission answer in flight, or the feed keys changed.
+    #[must_use]
+    pub fn session_revision(&self, session_id: &str) -> u64 {
+        self.revisions
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+            .wrapping_mul(0x2545_f491)
+            ^ self.keys_revision
+    }
+
     /// State of a linked session, once observed.
     #[must_use]
     pub fn state(&self, session_id: &str) -> Option<&AgentState> {
         self.states.get(session_id)
+    }
+
+    /// Spinner and elapsed time of a working session.
+    #[must_use]
+    pub fn clock(&self, session_id: &str) -> LiveClock {
+        self.clocks.get(session_id).copied().unwrap_or_default()
+    }
+
+    /// Keys shown on the feed's buttons.
+    #[must_use]
+    pub const fn keys(&self) -> &FeedKeys {
+        &self.keys
+    }
+
+    /// Use `keys` on the feed's buttons from now on.
+    pub fn set_keys(&mut self, keys: FeedKeys) {
+        if self.keys != keys {
+            self.keys = keys;
+            self.keys_revision = self.keys_revision.wrapping_add(1);
+            self.revision += 1;
+        }
+    }
+
+    /// Whether the answer to `permission_id` was sent and has not been applied yet.
+    #[must_use]
+    pub fn is_answering(&self, permission_id: &str) -> bool {
+        self.answering.contains(permission_id)
+    }
+
+    /// Note that the answer to `permission_id` of `session_id` was sent (`true`) or failed
+    /// (`false`, the prompt shows again).
+    pub fn set_answering(&mut self, session_id: &str, permission_id: &str, answering: bool) {
+        let changed = if answering {
+            self.answering.insert(permission_id.to_owned())
+        } else {
+            self.answering.remove(permission_id)
+        };
+        if changed {
+            self.bump(session_id);
+        }
+    }
+
+    /// Changes noted since the last call, for attention toasts.
+    pub fn take_attention(&mut self) -> Vec<(String, Attention)> {
+        std::mem::take(&mut self.attention)
+    }
+
+    fn bump(&mut self, session_id: &str) {
+        let revision = self.revisions.entry(session_id.to_owned()).or_default();
+        *revision = revision.wrapping_add(1);
+        self.revision += 1;
     }
 
     /// Subscribe to every session in `sessions` not observed yet. Returns whether any state
@@ -463,6 +654,7 @@ impl AgentStreams {
                     session.to_owned(),
                     AgentState::failed("invalid linked session id".to_owned()),
                 );
+                self.bump(session);
                 continue;
             };
             match host.follow_session(
@@ -483,47 +675,129 @@ impl AgentStreams {
                     );
                 }
             }
+            self.bump(session);
         }
-        self.revision += u64::from(changed);
         changed
     }
 
     /// Apply every pending update. Returns whether any state changed.
     pub fn drain(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = Vec::new();
         let mut stopped = Vec::new();
         for (session, subscription) in &mut self.subscriptions {
+            let mut latest = None;
             loop {
-                let next = match subscription.updates.try_recv() {
+                match subscription.updates.try_recv() {
                     Ok(SessionViewFollowUpdate::Snapshot(snapshot)) => {
-                        AgentState::from_snapshot(&snapshot)
+                        latest = Some(AgentState::from_snapshot(&snapshot));
                     }
                     Ok(SessionViewFollowUpdate::Disconnected { message }) => {
                         stopped.push(session.clone());
-                        AgentState::failed(message)
+                        latest = Some(AgentState::failed(message));
+                        break;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         stopped.push(session.clone());
-                        AgentState::failed("session stream disconnected".to_owned())
+                        latest = Some(AgentState::failed("session stream disconnected".to_owned()));
+                        break;
                     }
-                };
-                let finished = next.phase == AgentPhase::Failed;
-                if self.states.get(session) != Some(&next) {
-                    self.states.insert(session.clone(), next);
-                    changed = true;
-                }
-                if finished && stopped.last() == Some(session) {
-                    break;
                 }
             }
+            if let Some(next) = latest
+                && self.states.get(session) != Some(&next)
+            {
+                changed.push((session.clone(), next));
+            }
+        }
+        let any = !changed.is_empty();
+        for (session, next) in changed {
+            self.apply(&session, next);
         }
         for session in stopped {
             self.subscriptions.remove(&session);
             self.failed.insert(session);
         }
-        self.revision += u64::from(changed);
-        changed
+        any
+    }
+
+    /// Replace the state of `session`, noting attention changes and the working clock.
+    fn apply(&mut self, session: &str, next: AgentState) {
+        let previous = self.states.get(session);
+        let previous_permission = previous
+            .and_then(|state| state.feed.permission.as_ref())
+            .map(|permission| permission.permission_id.clone());
+        let previous_phase = previous.map(|state| state.phase);
+        if let Some(permission) = &next.feed.permission
+            && previous_permission.as_deref() != Some(permission.permission_id.as_str())
+        {
+            self.attention.push((
+                session.to_owned(),
+                Attention::Permission(permission.tool.clone()),
+            ));
+        }
+        if previous_phase != Some(next.phase) {
+            match next.phase {
+                AgentPhase::Answered if previous_phase == Some(AgentPhase::Working) => {
+                    self.attention
+                        .push((session.to_owned(), Attention::Answered));
+                }
+                AgentPhase::Failed => self
+                    .attention
+                    .push((session.to_owned(), Attention::Failed(next.status.clone()))),
+                _ => {}
+            }
+        }
+        // An answered request leaves the feed; forget that it was being answered.
+        let pending: BTreeSet<&str> = next
+            .feed
+            .permission
+            .iter()
+            .map(|permission| permission.permission_id.as_str())
+            .collect();
+        if let Some(previous) = previous_permission
+            && !pending.contains(previous.as_str())
+        {
+            self.answering.remove(&previous);
+        }
+        if next.working {
+            self.since
+                .entry(session.to_owned())
+                .or_insert_with(Instant::now);
+        } else {
+            self.since.remove(session);
+            self.clocks.remove(session);
+        }
+        self.states.insert(session.to_owned(), next);
+        self.bump(session);
+    }
+
+    /// Advance the spinners of working sessions to `now`, with frames of `interval`. Returns
+    /// how long until the next frame changes, when any session is working.
+    pub fn tick(&mut self, now: Instant, interval: Duration) -> Option<Duration> {
+        if interval.is_zero() {
+            return None;
+        }
+        let mut next: Option<Duration> = None;
+        let mut moved = Vec::new();
+        for (session, since) in &self.since {
+            let elapsed = now.saturating_duration_since(*since);
+            let clock = LiveClock {
+                step: u64::try_from(elapsed.as_nanos() / interval.as_nanos()).unwrap_or(u64::MAX),
+                seconds: elapsed.as_secs(),
+            };
+            if self.clocks.get(session) != Some(&clock) {
+                moved.push((session.clone(), clock));
+            }
+            let remaining = interval.as_nanos() - elapsed.as_nanos() % interval.as_nanos();
+            let remaining = Duration::from_nanos(u64::try_from(remaining).unwrap_or(u64::MAX));
+            next = Some(next.map_or(remaining, |next| next.min(remaining)));
+        }
+        for (session, clock) in moved {
+            self.clocks.insert(session.clone(), clock);
+            self.bump(&session);
+        }
+        next
     }
 
     /// Forget a stopped observation so the next [`Self::ensure`] subscribes again (retry).
@@ -531,7 +805,9 @@ impl AgentStreams {
         self.failed.remove(session);
         self.subscriptions.remove(session);
         self.states.remove(session);
-        self.revision += 1;
+        self.since.remove(session);
+        self.clocks.remove(session);
+        self.bump(session);
     }
 }
 

@@ -171,10 +171,30 @@ fn run_palette(scenario: &mut Scenario<ReviewSurface>, query: &str) {
     stable(scenario);
 }
 
-/// Answer the only linked session with `answer`.
+/// Answer the first question sent to `session` with `text`.
 fn answer(setup: &mut Setup, session: &str, text: &str) {
     let mut snapshot = bcode_session_view_models::SessionViewSnapshot::empty();
     snapshot.connection_status = bcode_session_view_models::SessionConnectionViewStatus::Attached;
+    let (_, prompt) = setup
+        .backend
+        .messages()
+        .into_iter()
+        .find(|(id, _)| id == session)
+        .expect("a question was sent");
+    snapshot
+        .transcript
+        .items
+        .push(bcode_session_view_models::TranscriptViewItem {
+            id: bcode_session_view_models::TranscriptViewItemId::new("user:1"),
+            revision: 1,
+            sequence: Some(1),
+            timestamp_ms: Some(1),
+            output_location: None,
+            streaming: false,
+            kind: bcode_session_view_models::TranscriptViewItemKind::UserMessage {
+                message: bcode_session_view_models::ChatMessageView::markdown(prompt),
+            },
+        });
     snapshot
         .transcript
         .items

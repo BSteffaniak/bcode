@@ -5,9 +5,10 @@
 //!   (`set_annotations`), so threads appear, change, and disappear before their calls finish.
 //! * The composer is the document's composer item. Opening it moves the cursor and keyboard
 //!   focus there; closing it returns both to the review.
-//! * Asking Bcode records a pending exchange at once; the question is sent from the next poll,
-//!   and when the session is linked the surface opens it (`Action::OpenSession`),
-//!   remembering the exact cursor and scroll position to restore on return.
+//! * Asking Bcode records a pending exchange at once and puts the cursor on its card; the
+//!   question is sent from the next poll and the card follows the linked session live, without
+//!   leaving the review. Opening the session in Bcode (`Action::OpenSession`) remembers the
+//!   exact cursor and scroll position to restore on return.
 
 use super::{Focus, Review, ReviewSurface, TRANSIENT_WORKSPACE_ID, ThreadRows};
 use crate::action::Action;
@@ -125,7 +126,7 @@ impl ReviewSurface {
         self.sync_notes();
     }
 
-    /// A finished question: keep the exchange and open its session.
+    /// A finished question: keep the exchange; its card follows the linked session.
     pub(super) fn finish_ask(
         &mut self,
         result: Result<ReviewAiExchange, Box<(ReviewAiExchange, String)>>,
@@ -139,18 +140,9 @@ impl ReviewSurface {
             self.status = None;
         }
         match result {
-            Ok(exchange) => {
-                let session = exchange.session_id.clone();
-                // A follow-up stays in the review; a new session opens.
-                let follow_up = self.follow_ups.remove(&exchange.exchange_id);
-                self.notes.put_exchange(exchange);
-                if let Some(session) = session.filter(|_| !follow_up) {
-                    self.pending_action = self.open_session(&session);
-                }
-            }
+            Ok(exchange) => self.notes.put_exchange(exchange),
             Err(failed) => {
                 let (exchange, error) = *failed;
-                self.follow_ups.remove(&exchange.exchange_id);
                 self.notes.put_exchange(exchange);
                 self.set_status("could not ask Bcode", StatusSeverity::Error);
                 self.toasts
@@ -586,6 +578,12 @@ impl ReviewSurface {
             AgentAction::Open | AgentAction::Retry | AgentAction::Delete => {
                 return self.exchange_action(action);
             }
+            AgentAction::Allow
+            | AgentAction::Always
+            | AgentAction::Decline
+            | AgentAction::Never
+            | AgentAction::Stop
+            | AgentAction::Toggle(_) => self.feed_action(action),
         }
         None
     }
@@ -649,9 +647,6 @@ impl ReviewSurface {
                     .find_map(|draft| draft.session_id.clone())
             });
         let exchange_id = format!("exchange-{now}-{}", self.next_exchange);
-        if session.is_some() {
-            self.follow_ups.insert(exchange_id.clone());
-        }
         let exchange = ReviewAiExchange {
             schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
             exchange_id,
@@ -691,7 +686,10 @@ impl ReviewSurface {
             question,
         };
         self.notes.put_exchange(exchange.clone());
+        let exchange_id = exchange.exchange_id.clone();
         self.asks.push_back((exchange, agent::prompt(&context)));
+        self.sync_notes();
+        self.focus_card(&exchange_id);
     }
 
     /// Diff lines of a line anchor, `+`/`-`/` ` prefixed (bounded).

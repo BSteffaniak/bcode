@@ -4,6 +4,7 @@
 mod app;
 mod benchmark;
 mod chrome;
+mod feed;
 mod interaction;
 mod parity;
 mod publish;
