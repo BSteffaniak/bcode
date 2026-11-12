@@ -8,15 +8,24 @@
 //! * `.`/`,` (and clicks) step to the next/previous layer. Leaving a layer remembers the cursor
 //!   in it; entering one returns to its remembered position (else its header). The positions
 //!   are kept in the workspace's `presentation.layer_positions`.
+//! * A step-through review (two or more stack-layer sources) shows one layer at a time by
+//!   default: the document is focused on the current layer ([`ReviewDocument::set_focus`]), so
+//!   the diff and the file panel hold that pull request alone. `shift+o` switches to every layer
+//!   in one document, where each layer starts with a banner, the file panel keeps only the
+//!   current layer's group open, and a strip under the rail names the layer the cursor is in.
+//!   The choice is kept in `presentation.all_stack_layers`.
+//!
+//! [`ReviewDocument::set_focus`]: bcode_code_review::document::ReviewDocument::set_focus
 
 use super::ReviewSurface;
 use bcode_code_review::document::{FileRef, ItemKey, ReviewItem};
 use bcode_code_review_models::ReviewSourceKind;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::text::{Line, Span};
+use bmux_tui::text::{Line, Span, Text};
 use bmux_tui_components::status_bar::StatusSeverity;
 use bmux_tui_components::tab_bar::{TabBar, TabBarComponent, TabBarPolicy, TabItem};
 use bmux_tui_components::virtual_list::AnchorPolicy;
@@ -36,7 +45,134 @@ pub struct RailEntry {
     pub labels: [Line; 3],
 }
 
+/// How a step-through stack review is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StackView {
+    /// One layer at a time.
+    #[default]
+    OneLayer,
+    /// Every layer in one document, divided by banners.
+    AllLayers,
+}
+
 impl ReviewSurface {
+    /// Whether the review steps through a stack: two or more stack-layer groups.
+    pub(super) fn steps_through_stack(&self) -> bool {
+        self.review.as_ref().is_some_and(|review| {
+            review
+                .doc
+                .groups()
+                .filter(|group| group.stack.is_some_and(|stack| !stack.whole))
+                .count()
+                >= 2
+        })
+    }
+
+    /// Show the stack as [`Self::stack_view`] says: focus the document on the current layer (the
+    /// one the cursor is in, else the last entered, else the first), or show every layer with
+    /// only the current layer's file group open.
+    pub(super) fn apply_stack_view(&mut self) {
+        self.show_stack_layer(None);
+    }
+
+    /// [`Self::apply_stack_view`] on layer `wanted` (a workspace source id), else the current one.
+    fn show_stack_layer(&mut self, wanted: Option<&str>) {
+        if !self.steps_through_stack() {
+            return;
+        }
+        let entries = self.rail_entries();
+        let current = wanted
+            .and_then(|wanted| entries.iter().position(|entry| entry.source_id == wanted))
+            .or_else(|| self.current_layer(&entries))
+            .or_else(|| {
+                let remembered = self.rail_layer.as_ref()?;
+                entries
+                    .iter()
+                    .position(|entry| &entry.source_id == remembered)
+            })
+            .unwrap_or(0);
+        let Some(target) = entries.get(current) else {
+            return;
+        };
+        let source = target.source_id.clone();
+        let home = target.home.clone();
+        let one_layer = self.stack_view == StackView::OneLayer;
+        let theme = self.theme;
+        let hide_viewed = self.hide_viewed_files;
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let cursor = review.cursor.clone();
+        if review.doc.set_focus(one_layer.then_some(source.as_str())) {
+            review.note_splices();
+            review.rebuild_files(&theme, hide_viewed);
+            let landing = cursor
+                .filter(|key| review.doc.index_of(key).is_some())
+                .unwrap_or(home);
+            if let Some(index) = review.doc.index_of(&landing) {
+                review.set_cursor(index, AnchorPolicy::ItemTopAtTop);
+            }
+        }
+        review.open_only_group(&source);
+        self.rail_layer = Some(source);
+    }
+
+    /// Switch between one layer at a time and every layer.
+    pub(super) fn toggle_stack_view(&mut self) {
+        if !self.steps_through_stack() {
+            self.set_status(
+                "only a review that steps through a stack has layers to show one at a time",
+                StatusSeverity::Info,
+            );
+            return;
+        }
+        self.stack_view = match self.stack_view {
+            StackView::OneLayer => StackView::AllLayers,
+            StackView::AllLayers => StackView::OneLayer,
+        };
+        self.apply_stack_view();
+        let text = match self.stack_view {
+            StackView::OneLayer => "one pull request at a time (shift+o: all)",
+            StackView::AllLayers => "every pull request of the stack (shift+o: one at a time)",
+        };
+        self.set_status(text, StatusSeverity::Info);
+        self.persist_presentation(true);
+    }
+
+    /// After a file of a layer is marked viewed: when that was the layer's last unviewed file,
+    /// say so and how to go on.
+    pub(super) fn note_layer_done(&mut self, file: &FileRef) {
+        if !self.steps_through_stack() {
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let Some(group) = review
+            .doc
+            .groups()
+            .find(|group| group.source.source_id == file.source_id && group.stack.is_some())
+        else {
+            return;
+        };
+        if group.file_count == 0 || group.viewed < group.file_count {
+            return;
+        }
+        let entries = self.rail_entries();
+        let position = entries
+            .iter()
+            .position(|entry| entry.source_id == file.source_id);
+        let text = match position {
+            Some(index) if index + 1 < entries.len() => format!(
+                "every file of this pull request is viewed; . for the next ({} of {})",
+                index + 2,
+                entries.len()
+            ),
+            _ => "every file of the last pull request is viewed".to_owned(),
+        };
+        self.set_status(text, StatusSeverity::Success);
+    }
+
     /// Rail entries: one per stack or stack-layer source group, in document order.
     pub(super) fn rail_entries(&self) -> Vec<RailEntry> {
         let Some(review) = self.review.as_ref() else {
@@ -210,6 +346,9 @@ impl ReviewSurface {
                 .insert(current.source_id.clone(), persisted);
         }
         self.rail_layer = Some(target.source_id.clone());
+        // Show the entered layer (alone, or with only its file group open).
+        let entered = target.source_id.clone();
+        self.show_stack_layer(Some(&entered));
         let remembered = self
             .layer_positions
             .get(&target.source_id)
@@ -236,6 +375,66 @@ impl ReviewSurface {
         let label = target.labels[0].plain_text();
         self.set_status(format!("layer {label}"), StatusSeverity::Info);
         self.persist_presentation(true);
+    }
+
+    /// Whether the strip naming the cursor's layer shows: every layer in one document.
+    pub(super) fn shows_layer_strip(&self) -> bool {
+        self.stack_view == StackView::AllLayers && self.steps_through_stack()
+    }
+
+    /// Paint the strip naming the layer the cursor is in on `area` (one row): its position,
+    /// number and title, branches, and viewed progress.
+    pub(super) fn paint_layer_strip(&self, area: Rect, cx: &mut PaintCx<'_, '_>) {
+        let theme = &self.theme;
+        cx.fill(
+            LocalRect::new(area.x.into(), area.y.into(), area.width, 1),
+            " ",
+            theme.header_bar,
+        );
+        let entries = self.rail_entries();
+        let (Some(index), Some(review)) = (self.current_layer(&entries), self.review.as_ref())
+        else {
+            return;
+        };
+        let Some(group) = review
+            .doc
+            .groups()
+            .find(|group| group.source.source_id == entries[index].source_id)
+        else {
+            return;
+        };
+        let Some(layers) = group.stack.map(|stack| &stack.stack.layers) else {
+            return;
+        };
+        let Some(top) = layers.last() else {
+            return;
+        };
+        // The position in the whole stack, as the layer's banner gives it.
+        let count = self.stack_size(&entries[index].source_id).max(layers.len());
+        let separator = theme.icons.separator;
+        let mut spans = vec![
+            Span::styled(
+                format!(" PR {} of {count} ", layers.len()),
+                theme.badge_open,
+            ),
+            Span::styled(format!(" #{} ", top.number), theme.badge_open),
+            Span::styled(top.title.clone(), theme.text),
+        ];
+        if !top.head_branch.is_empty() {
+            spans.push(Span::styled(separator, theme.muted));
+            spans.push(Span::styled(
+                format!("{} ← {}", top.base_branch, top.head_branch),
+                theme.muted,
+            ));
+        }
+        let complete = group.file_count > 0 && group.viewed == group.file_count;
+        spans.push(Span::styled(separator, theme.muted));
+        spans.push(Span::styled(
+            format!("{}/{} viewed", group.viewed, group.file_count),
+            if complete { theme.viewed } else { theme.muted },
+        ));
+        let line = Line::from_spans(spans).truncate(usize::from(area.width));
+        cx.paint_component(&TextBlock::new(Text::from_lines(vec![line])), area);
     }
 
     /// Tab items for the rail at `width`: the most detailed labels that fit.

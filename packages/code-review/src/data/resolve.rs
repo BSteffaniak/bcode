@@ -336,6 +336,8 @@ fn stack_source(
             title: layer.pull.title.clone(),
             base_oid: base,
             head_oid: head.clone(),
+            base_branch: layer.pull.base_branch.clone(),
+            head_branch: layer.pull.head_branch.clone(),
         });
         below = head;
     }

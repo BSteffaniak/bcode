@@ -16,7 +16,7 @@ use super::theme::{ReviewTheme, status_letter};
 use bcode_code_review::document::{
     FileHeaderItem, FileNoticeItem, FileNoticeKind, GapItem, GapState, HunkHeaderItem, ItemKey,
     LayoutMode, LineContent, LineItem, LineKind, LinePairItem, PairSide, PlaceholderItem,
-    ReviewDocument, ReviewItem, SourceHeaderItem,
+    ReviewDocument, ReviewItem, SourceHeaderItem, StackLayerLabel,
 };
 use bcode_code_review_models::{ReviewIndexFlag, ReviewLineSide};
 use bmux_tui::component::{
@@ -606,6 +606,14 @@ impl RowContext<'_> {
             ReviewItem::Placeholder(placeholder) => u64::from(placeholder.estimated_rows.max(1)),
             ReviewItem::Thread(_) | ReviewItem::AgentThread(_) => self.rows(index, width).height,
             ReviewItem::Composer(_) => self.composer_layout(width)?.height,
+            ReviewItem::SourceHeader(header)
+                if header
+                    .layer
+                    .as_ref()
+                    .is_some_and(|layer| !layer.whole_stack) =>
+            {
+                LAYER_BANNER_ROWS
+            }
             _ => 1,
         };
         Some(height)
@@ -622,7 +630,12 @@ impl RowContext<'_> {
         let styles = &self.params.theme;
         let cells = usize::from(width);
         match item {
-            ReviewItem::SourceHeader(item) => ItemRows::single(source_header(item, styles, cells)),
+            ReviewItem::SourceHeader(item) => match &item.layer {
+                Some(layer) if !layer.whole_stack => {
+                    ItemRows::lines(layer_banner(item, layer, styles, cells), Vec::new())
+                }
+                _ => ItemRows::single(source_header(item, styles, cells)),
+            },
             ReviewItem::FileHeader(item) => ItemRows::single(file_header(item, styles, cells)),
             ReviewItem::Placeholder(item) => placeholder(item, styles, cells),
             ReviewItem::FileNotice(item) => ItemRows::single(file_notice(item, styles, cells)),
@@ -1108,6 +1121,70 @@ fn source_header(item: &SourceHeaderItem, theme: &ReviewTheme, width: usize) -> 
         width,
         Style::new(),
     )
+}
+
+/// Rows of [`layer_banner`].
+const LAYER_BANNER_ROWS: u64 = 3;
+
+/// The banner that starts a stack layer's pull request: a rule naming its position, its number
+/// and title, and its branches, files, and viewed count ([`LAYER_BANNER_ROWS`] rows).
+fn layer_banner(
+    item: &SourceHeaderItem,
+    layer: &StackLayerLabel,
+    theme: &ReviewTheme,
+    width: usize,
+) -> Vec<Line> {
+    let rule = theme.icons.banner_rule;
+    let separator = theme.icons.separator;
+    let lead = Line::from_spans(vec![
+        Span::styled(format!("{rule}{rule} "), theme.accent),
+        Span::styled(
+            format!("PR {} of {}", layer.position, layer.count),
+            theme.badge_open,
+        ),
+        Span::raw(" "),
+    ]);
+    let mut spans = lead.spans.clone();
+    spans.push(Span::styled(
+        rule.repeat(width.saturating_sub(lead.width())),
+        theme.accent,
+    ));
+    let none = Line::from_spans(Vec::new());
+    let title = header_line(
+        &Line::from_spans(vec![
+            Span::styled(format!("#{} ", layer.number), theme.badge_open),
+            Span::styled(layer.title.clone(), theme.source_header),
+        ]),
+        &none,
+        width,
+        Style::new(),
+    );
+    let mut meta = Vec::new();
+    if !layer.head_branch.is_empty() {
+        meta.push(Span::styled(
+            format!("{} ← {}", layer.base_branch, layer.head_branch),
+            theme.muted,
+        ));
+        meta.push(Span::styled(separator, theme.muted));
+    }
+    meta.push(Span::styled(
+        format!(
+            "{} file{}",
+            item.file_count,
+            if item.file_count == 1 { "" } else { "s" }
+        ),
+        theme.muted,
+    ));
+    meta.push(Span::styled(separator, theme.muted));
+    meta.push(Span::styled(
+        format!("{} {} viewed", theme.icons.viewed, item.viewed_count),
+        theme.viewed,
+    ));
+    vec![
+        Line::from_spans(spans).truncate(width),
+        title,
+        header_line(&Line::from_spans(meta), &none, width, Style::new()),
+    ]
 }
 
 fn placeholder(item: &PlaceholderItem, theme: &ReviewTheme, width: usize) -> ItemRows {

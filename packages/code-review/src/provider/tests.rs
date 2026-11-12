@@ -945,12 +945,16 @@ fn attribution_follows_renames_and_maps_lines_through_later_layers() {
                 title: "one".into(),
                 base_oid: base,
                 head_oid: head_1.clone(),
+                base_branch: String::new(),
+                head_branch: String::new(),
             },
             ResolvedStackLayer {
                 number: 2,
                 title: "two".into(),
                 base_oid: head_1,
                 head_oid: head_2,
+                base_branch: String::new(),
+                head_branch: String::new(),
             },
         ],
     };

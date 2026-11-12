@@ -12,7 +12,7 @@ use crate::surface::Modal;
 use crate::testing::backend::TestBackend;
 use crate::testing::fake_provider::{FAKE_PROVIDER, FAKE_REPOSITORY, FakeProvider};
 use crate::testing::fake_publisher::{FAKE_IMPORTER, FakePublisher};
-use crate::testing::fixture::{FixtureSpec, GitFixture};
+use crate::testing::fixture::{FixtureSpec, GitFixture, HEAD_BRANCH, STACK_BRANCHES};
 use crate::testing::harness::Scenario;
 use bcode_code_review::document::{ItemKey, ReviewItem};
 use bcode_code_review_models::{
@@ -166,6 +166,111 @@ fn stack_rail_steps_between_layers_keeping_each_layers_position() {
     let saved = stored(&backend, &fixture, &workspace.id);
     let positions = saved.presentation.expect("presentation").layer_positions;
     assert_eq!(positions.get("source-2"), inside.to_persisted().as_ref());
+}
+
+#[test]
+fn step_through_reviews_show_one_pull_request_at_a_time_or_every_one() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Step through",
+        vec![layer(101), layer(102), layer(103)],
+    );
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    let focus = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .and_then(|review| review.document())
+            .and_then(|doc| doc.focus().map(str::to_owned))
+    };
+    let sources_shown = |scenario: &Scenario<ReviewApp>| {
+        let review = scenario.surface().review().expect("review");
+        let doc = review.document().expect("document");
+        (0..doc.len())
+            .filter_map(|index| match doc.item(index)? {
+                ReviewItem::SourceHeader(header) => Some(header.source_id.clone()),
+                item => item.file().map(|file| file.source_id.clone()),
+            })
+            .collect::<std::collections::BTreeSet<String>>()
+    };
+    // By default one pull request at a time: its banner (its position in the whole stack, which
+    // starts at #100), its branches, and only its files.
+    assert_eq!(focus(&scenario).as_deref(), Some("source-1"));
+    assert_eq!(sources_shown(&scenario), ["source-1".to_owned()].into());
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("PR 2 of 4"), "{}", screen.text());
+    assert!(
+        screen.contains(&format!("{HEAD_BRANCH} ← {}", STACK_BRANCHES[0])),
+        "{}",
+        screen.text()
+    );
+    // The next pull request replaces it.
+    scenario.key(".");
+    settled(&mut scenario);
+    assert_eq!(focus(&scenario).as_deref(), Some("source-2"));
+    assert_eq!(sources_shown(&scenario), ["source-2".to_owned()].into());
+
+    // shift+o shows every pull request, each under its banner, with a strip naming the current
+    // one under the rail.
+    scenario.key("shift+o");
+    let screen = settled(&mut scenario);
+    assert_eq!(focus(&scenario), None);
+    assert_eq!(sources_shown(&scenario).len(), 3);
+    assert!(
+        screen.row_text(2).contains("PR 3 of 4"),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.row_text(2).contains("#102"), "{}", screen.text());
+    // The file panel groups files by pull request, only the current one open.
+    assert!(screen.contains("▸ #101 Layer 101"), "{}", screen.text());
+    assert!(screen.contains("▾ #102 Layer 102"), "{}", screen.text());
+    // And back.
+    scenario.key("shift+o");
+    settled(&mut scenario);
+    assert_eq!(focus(&scenario).as_deref(), Some("source-2"));
+    scenario.key("shift+o");
+    settled(&mut scenario);
+
+    // The choice persists with the review, and reopening keeps it.
+    scenario.key("q");
+    settled(&mut scenario);
+    let saved = stored(&backend, &fixture, &workspace.id);
+    assert!(saved.presentation.expect("presentation").all_stack_layers);
+    let scenario = resume(&fixture, &backend, &workspace.id);
+    assert_eq!(focus(&scenario), None);
+}
+
+#[test]
+fn finishing_a_pull_requests_files_points_to_the_next_one() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Step through",
+        vec![layer(101), layer(102)],
+    );
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    scenario.key("j");
+    settled(&mut scenario);
+    let mut status = String::new();
+    for _ in 0..30 {
+        scenario.key("v");
+        settled(&mut scenario);
+        status = scenario
+            .surface()
+            .review()
+            .and_then(|review| review.status().map(str::to_owned))
+            .unwrap_or_default();
+        if status.contains("every file of this pull request is viewed") {
+            break;
+        }
+    }
+    assert!(status.contains(". for the next"), "{status}");
 }
 
 /// A whole-stack review of the fake stack with comments on lines of layers #102 and #103, a

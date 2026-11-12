@@ -104,10 +104,16 @@ pub struct StackLayerLabel {
     pub title: String,
     /// One-based position from the trunk.
     pub position: usize,
-    /// Layers in the stack (up to the reviewed one).
+    /// Layers in the stack: for a layer of a step-through review, the most any of the review's
+    /// stack-layer sources resolved (the whole stack as far as the review reaches); for a stack
+    /// source, its layers.
     pub count: usize,
     /// Whether this source reviews the whole stack rather than one layer.
     pub whole_stack: bool,
+    /// Branch the layer's pull request goes into (empty when unknown).
+    pub base_branch: String,
+    /// Branch the layer's pull request comes from (empty when unknown).
+    pub head_branch: String,
 }
 
 /// Header of one file.

@@ -82,6 +82,8 @@ pub struct Icons {
     pub minus: &'static str,
     /// Rule drawn around gap labels.
     pub gap_rule: &'static str,
+    /// Rule of the banner that starts each stack layer.
+    pub banner_rule: &'static str,
     /// Reveal lines above.
     pub reveal_up: &'static str,
     /// Reveal lines below.
@@ -133,6 +135,7 @@ impl Icons {
         rename: " → ",
         minus: "−",
         gap_rule: "┄",
+        banner_rule: "━",
         reveal_up: "↑",
         reveal_down: "↓",
         reveal_all: "↕",
@@ -165,6 +168,7 @@ impl Icons {
         rename: " -> ",
         minus: "-",
         gap_rule: "-",
+        banner_rule: "=",
         reveal_up: "^",
         reveal_down: "v",
         reveal_all: "<>",

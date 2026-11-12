@@ -222,6 +222,9 @@ impl ReviewDocument {
         let BlockKind::File(file) = self.blocks[self.block_of_key(key)?].kind else {
             return None;
         };
+        if self.file_hidden(file) {
+            return None;
+        }
         let state = &self.files[file];
         let index = self.block_start(state.block);
         Some(NavTarget {
@@ -337,7 +340,10 @@ impl ReviewDocument {
                 });
             }
         };
-        for state in &self.files {
+        for (index, state) in self.files.iter().enumerate() {
+            if self.file_hidden(index) {
+                continue;
+            }
             let Some(loaded) = state.loaded() else {
                 if state.entry.additions + state.entry.deletions > 0 {
                     results.unsearched.push(state.key.clone());

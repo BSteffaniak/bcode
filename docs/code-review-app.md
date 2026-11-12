@@ -206,6 +206,21 @@ Home's "Updated" column, its order, and `resume` follow when a review last chang
 sources, viewed files, reviewed revisions or archive state, or its comments. Opening or scrolling
 a review records where it was left without making it updated.
 
+### Stacks of pull requests
+
+A review that steps through a stack (one source per pull request, "Step through every layer")
+shows one pull request at a time by default. The diff and the file panel hold only the current
+pull request, under a banner with its position in the stack, number, title, branches, files,
+and viewed count. `.` and `,` (or a click on the rail's tabs) move to the next and previous pull
+request, each returning to where it was left; viewing a pull request's last file says so and
+points to the next one.
+
+`shift+o` (also in the command palette) switches to every pull request in one document: each
+starts with its banner, the file panel groups files under one row per pull request with only
+the current one open, and a strip under the rail names the pull request the cursor is in. The
+choice is kept with the review. A whole-stack review (one source for the entire stack) is one
+diff labeled by layer and is not affected.
+
 ### Finding pull requests
 
 The new-review wizard's pull request and stack steps list the provider's 100 most recently

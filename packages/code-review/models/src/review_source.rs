@@ -389,6 +389,12 @@ pub struct ResolvedStackLayer {
     pub base_oid: String,
     /// Head commit of the layer.
     pub head_oid: String,
+    /// Branch the pull request goes into, when the provider reported it.
+    #[serde(default)]
+    pub base_branch: String,
+    /// Branch the pull request comes from, when the provider reported it.
+    #[serde(default)]
+    pub head_branch: String,
 }
 
 /// A stack source pinned to local commits, returned by `review.sources.resolve` for stack and

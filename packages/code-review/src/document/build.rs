@@ -87,6 +87,17 @@ struct Slots {
 
 impl ReviewDocument {
     pub(super) fn build_block(&self, block: usize) -> Built {
+        let hidden = match self.blocks[block].kind {
+            BlockKind::ReviewNotes => false,
+            BlockKind::SourceHeader(group) => self.groups[group].hidden,
+            BlockKind::File(file) => self.file_hidden(file),
+        };
+        if hidden {
+            return Built {
+                items: Vec::new(),
+                hunk_parent: Vec::new(),
+            };
+        }
         match self.blocks[block].kind {
             BlockKind::ReviewNotes => self.build_review_notes(),
             BlockKind::SourceHeader(group) => self.build_source_header(group),
@@ -126,14 +137,28 @@ impl ReviewDocument {
                 hunk_parent: Vec::new(),
             };
         }
+        let stack_size = self
+            .groups
+            .iter()
+            .filter_map(|group| group.stack.as_ref())
+            .filter(|stack| !stack.whole)
+            .map(|stack| stack.stack.layers.len())
+            .max()
+            .unwrap_or(0);
         let layer = group.stack.as_ref().and_then(|stack| {
             let top = stack.stack.layers.last()?;
             Some(StackLayerLabel {
                 number: top.number,
                 title: top.title.clone(),
                 position: stack.stack.layers.len(),
-                count: stack.stack.layers.len(),
+                count: if stack.whole {
+                    stack.stack.layers.len()
+                } else {
+                    stack_size.max(stack.stack.layers.len())
+                },
                 whole_stack: stack.whole,
+                base_branch: top.base_branch.clone(),
+                head_branch: top.head_branch.clone(),
             })
         });
         let label = group.source.part.as_ref().map_or_else(

@@ -402,6 +402,8 @@ impl ReviewSurface {
             format!("{} viewed · every file is viewed", file.path)
         };
         self.set_status(message, StatusSeverity::Success);
+        // Finishing a stack layer says so, and how to go on.
+        self.note_layer_done(&file);
     }
 
     /// Show the workspace's viewed marks and save them.
@@ -536,6 +538,7 @@ impl ReviewSurface {
         state.expanded_answers.clone_from(&self.folds.expanded);
         state.hide_resolved_threads = self.hide_resolved;
         state.hide_viewed_files = self.hide_viewed_files;
+        state.all_stack_layers = self.stack_view == super::stack::StackView::AllLayers;
         state.layout_mode = self.layout_override.map(|mode| match mode {
             LayoutMode::Unified => ReviewLayoutMode::Unified,
             LayoutMode::SideBySide => ReviewLayoutMode::SideBySide,

@@ -105,12 +105,16 @@ fn stack() -> ResolvedReviewStack {
                 title: "first".into(),
                 base_oid: "b".into(),
                 head_oid: "h1".into(),
+                base_branch: String::new(),
+                head_branch: String::new(),
             },
             ResolvedStackLayer {
                 number: 12,
                 title: "second".into(),
                 base_oid: "h1".into(),
                 head_oid: "h2".into(),
+                base_branch: String::new(),
+                head_branch: String::new(),
             },
         ],
     }
@@ -262,4 +266,68 @@ fn browse_sources_reveal_their_line_range_without_hunks() {
         .count();
     assert_eq!(gaps, 2, "lines outside the range stay expandable");
     assert_eq!(resolved("x").source_id, "x");
+}
+
+#[test]
+fn focusing_a_source_hides_the_others_until_unfocused() {
+    let fake = one_file();
+    let mut doc = ReviewDocument::new(
+        PathBuf::from("/repo"),
+        vec![fake.input("one"), fake.input("two"), fake.input("three")],
+        DocumentConfig::default(),
+    );
+    let _ = doc.take_splices();
+    let all = items(&doc).len();
+    let header = |source: &str| ItemKey::SourceHeader {
+        source_id: source.to_owned(),
+        part: None,
+    };
+    let file = |source: &str| std::sync::Arc::new(FileKey::new(source, None, "s.rs"));
+    assert_eq!(doc.focus(), None);
+
+    assert!(doc.set_focus(Some("two")));
+    doc.assert_consistent("focused");
+    assert_eq!(doc.focus(), Some("two"));
+    let splices = doc.take_splices();
+    assert_ne!(splices.len(), 0, "{splices:?}");
+    let shown: Vec<String> = items(&doc)
+        .iter()
+        .filter_map(|item| match item {
+            ReviewItem::SourceHeader(header) => Some(header.source_id.clone()),
+            ReviewItem::FileHeader(header) => Some(header.file.source_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, ["two", "two"]);
+    // Hidden items do not resolve and cannot be jumped to; the focused ones can.
+    assert_eq!(doc.index_of(&header("one")), None);
+    assert!(doc.jump_to(&ItemKey::FileHeader(file("three"))).is_none());
+    assert_eq!(doc.index_of(&header("two")), Some(0));
+    // Groups keep reporting their files while hidden.
+    let hidden: Vec<(String, bool, usize)> = doc
+        .groups()
+        .map(|group| {
+            (
+                group.source.source_id.clone(),
+                group.hidden,
+                group.file_count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        hidden,
+        [
+            ("one".to_owned(), true, 1),
+            ("two".to_owned(), false, 1),
+            ("three".to_owned(), true, 1),
+        ]
+    );
+    // Focusing the same source again changes nothing.
+    assert!(!doc.set_focus(Some("two")));
+
+    assert!(doc.set_focus(None));
+    doc.assert_consistent("unfocused");
+    assert_eq!(doc.focus(), None);
+    assert_eq!(items(&doc).len(), all);
+    assert!(doc.index_of(&header("one")).is_some());
 }

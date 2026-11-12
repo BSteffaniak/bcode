@@ -43,6 +43,8 @@ fn stack(id: &str) -> ResolvedReviewStack {
                 title: format!("Layer {number}"),
                 base_oid: format!("{number}").repeat(14)[..40].to_string(),
                 head_oid: format!("{}", number + 1).repeat(14)[..40].to_string(),
+                base_branch: String::new(),
+                head_branch: String::new(),
             })
             .collect(),
     }

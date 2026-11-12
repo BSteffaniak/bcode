@@ -429,6 +429,23 @@ impl Review {
         review
     }
 
+    /// Rebuild the file panel from the document (after its focus changed), every directory open.
+    fn rebuild_files(&mut self, theme: &ReviewTheme, hide_viewed: bool) {
+        self.files = FileTree::new(&self.doc, theme);
+        self.files.set_hide_viewed(hide_viewed, theme);
+        self.tree
+            .borrow_mut()
+            .set_expanded_ids(self.files.expandable_ids().map(str::to_owned));
+    }
+
+    /// Open the file panel's group of source `source` and close the other groups.
+    fn open_only_group(&self, source: &str) {
+        let mut tree = self.tree.borrow_mut();
+        for (id, group) in self.files.group_ids() {
+            tree.set_expanded(id, group == source);
+        }
+    }
+
     /// Note every pending document splice on the list, grow the shared gutter for new line
     /// numbers, and remember rebuilt file headers for the tree. Returns whether anything
     /// changed.
@@ -630,6 +647,8 @@ pub struct ReviewSurface {
     hide_resolved: bool,
     /// Viewed files are hidden from the file panel (persisted).
     hide_viewed_files: bool,
+    /// How a step-through stack review is shown (persisted).
+    stack_view: stack::StackView,
     /// Text to copy once the host is at hand, and what it is.
     clipboard: Option<(String, &'static str)>,
     /// Exiting an unsaved review with annotations was asked once (the next exit leaves).
@@ -747,6 +766,7 @@ impl ReviewSurface {
             folds: Folds::default(),
             hide_resolved: false,
             hide_viewed_files: false,
+            stack_view: stack::StackView::default(),
             clipboard: None,
             exit_armed: false,
             edit_requested: false,
@@ -799,6 +819,11 @@ impl ReviewSurface {
             self.folds.expanded.clone_from(&state.expanded_answers);
             self.hide_resolved = state.hide_resolved_threads;
             self.hide_viewed_files = state.hide_viewed_files;
+            self.stack_view = if state.all_stack_layers {
+                stack::StackView::AllLayers
+            } else {
+                stack::StackView::OneLayer
+            };
         }
         self.workspace = Some(workspace);
         self
@@ -1831,6 +1856,8 @@ impl ReviewSurface {
         if previous.is_none() {
             self.restore_presentation();
         }
+        // A refreshed document starts unfocused; show the stack as chosen again.
+        self.apply_stack_view();
         // Annotations are re-applied to the new document (and re-listed by the next poll).
         self.notes_requested = false;
         self.sync_notes();
@@ -2170,6 +2197,7 @@ impl ReviewSurface {
             "unview_all" => self.view_all(false),
             "attention_next" => self.attention_next(),
             "copy_report" => self.copy_report(),
+            "stack_view" => self.toggle_stack_view(),
             "dismiss_notifications" => {
                 if !self.toasts.dismiss_all() {
                     self.set_status("No notifications", StatusSeverity::Info);
@@ -2983,7 +3011,9 @@ impl ReviewSurface {
             && matches!(self.phase, Phase::Ready)
             && area.height >= 9
             && !self.rail_entries().is_empty();
-        let top = u16::from(header) + u16::from(rail);
+        // In the every-layer view of a stack, a strip under the rail names the cursor's layer.
+        let strip = rail && area.height >= 10 && self.shows_layer_strip();
+        let top = u16::from(header) + u16::from(rail) + u16::from(strip);
         let body = Rect::new(
             area.x,
             area.y + top,
@@ -2995,6 +3025,9 @@ impl ReviewSurface {
             cx.with_style(bar, |cx| {
                 self.paint_rail(Rect::new(area.x, area.y + 1, area.width, 1), cx);
             });
+            if strip {
+                self.paint_layer_strip(Rect::new(area.x, area.y + 2, area.width, 1), cx);
+            }
         } else {
             self.rail = None;
         }

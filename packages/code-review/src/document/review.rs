@@ -105,6 +105,8 @@ pub struct GroupInfo<'a> {
     pub viewed: usize,
     /// The group's source header item, when headers are shown.
     pub header: Option<ItemKey>,
+    /// Whether [`ReviewDocument::set_focus`] hides the group.
+    pub hidden: bool,
 }
 
 /// A request the client should issue on the document's behalf.
@@ -394,6 +396,8 @@ pub(super) struct Group {
     pub header_block: usize,
     pub files: std::ops::Range<usize>,
     pub show_header: bool,
+    /// Whether the group is hidden by [`ReviewDocument::set_focus`]: its blocks build no items.
+    pub hidden: bool,
     /// Files of the group shown as viewed.
     pub viewed: usize,
 }
@@ -669,6 +673,7 @@ impl ReviewDocument {
             header_block,
             files: first_file..self.files.len(),
             show_header: show_headers,
+            hidden: false,
             viewed: 0,
         });
     }
@@ -1876,7 +1881,45 @@ impl ReviewDocument {
                     source_id: group.source.source_id.clone(),
                     part: group.source.part.as_ref().map(|part| part.index),
                 }),
+                hidden: group.hidden,
             })
+    }
+
+    /// Show only the groups of source `focus` (every group when `None`). The other groups keep
+    /// their files, viewed state, and annotations but contribute no items, so the review reads as
+    /// that source alone; the change reaches the list as splices. Returns whether anything changed.
+    pub fn set_focus(&mut self, focus: Option<&str>) -> bool {
+        let mut changed = Vec::new();
+        for (index, group) in self.groups.iter_mut().enumerate() {
+            let hidden = focus.is_some_and(|focus| group.source.source_id != focus);
+            if group.hidden != hidden {
+                group.hidden = hidden;
+                changed.push(index);
+            }
+        }
+        for &group in &changed {
+            let header = self.groups[group].header_block;
+            self.rebuild_block(header);
+            for file in self.groups[group].files.clone() {
+                self.rebuild_file(file);
+            }
+        }
+        !changed.is_empty()
+    }
+
+    /// The source shown alone (see [`Self::set_focus`]), when one is.
+    #[must_use]
+    pub fn focus(&self) -> Option<&str> {
+        let mut shown = self.groups.iter().filter(|group| !group.hidden);
+        let first = shown.next()?;
+        let focused = self.groups.iter().any(|group| group.hidden)
+            && shown.all(|group| group.source.source_id == first.source.source_id);
+        focused.then_some(first.source.source_id.as_str())
+    }
+
+    /// Whether file `file` (an index into the files) is in a hidden group.
+    pub(super) fn file_hidden(&self, file: usize) -> bool {
+        self.groups[self.files[file].group].hidden
     }
 
     /// Files of group `index` (see [`GroupInfo::index`]), in document order.

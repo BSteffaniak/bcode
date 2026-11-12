@@ -395,6 +395,10 @@ pub struct ReviewPresentationState {
     /// Viewed files are hidden from the file panel.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_viewed_files: bool,
+    /// A step-through stack review shows every layer in one document instead of one layer at a
+    /// time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all_stack_layers: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -415,6 +419,7 @@ impl Default for ReviewPresentationState {
             expanded_answers: BTreeSet::new(),
             hide_resolved_threads: false,
             hide_viewed_files: false,
+            all_stack_layers: false,
         }
     }
 }

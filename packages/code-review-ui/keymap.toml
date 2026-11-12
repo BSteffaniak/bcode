@@ -247,6 +247,9 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.copy_report", scope = "code-review", description = "Copy a Markdown review report", defaults = [
     ] },
+    { id = "bcode.code_review.stack_view", scope = "code-review", description = "Stack: one pull request at a time, or every pull request", defaults = [
+        "shift+o",
+    ] },
     { id = "bcode.code_review.dismiss_notifications", scope = "code-review", description = "Dismiss notifications", defaults = [
     ] },
     { id = "bcode.code_review.edit_sources", scope = "code-review", description = "Edit the review's sources…", defaults = [

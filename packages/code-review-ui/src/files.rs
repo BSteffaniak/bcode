@@ -109,7 +109,12 @@ impl FileTree {
     #[must_use]
     pub fn new(doc: &ReviewDocument, theme: &ReviewTheme) -> Self {
         let mut groups: Vec<(String, Option<u32>, Vec<FileRow>)> = Vec::new();
+        let focus = doc.focus();
         for file in doc.file_keys() {
+            // One layer at a time: only the focused source's files.
+            if focus.is_some_and(|focus| focus != file.source_id) {
+                continue;
+            }
             let Some(row) = file_row(doc, file) else {
                 continue;
             };
@@ -260,6 +265,17 @@ impl FileTree {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Ids of the group rows (one per source or part when there are several) with their source.
+    pub fn group_ids(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.nodes.iter().filter_map(|node| match node.kind {
+            NodeKind::Group { .. } => {
+                let source = node.id.split(SEP).nth(1)?;
+                Some((node.id.as_str(), source))
+            }
+            _ => None,
+        })
     }
 
     /// Ids of every directory and group, for the initial (fully expanded) state.
@@ -610,6 +626,7 @@ fn file_row(doc: &ReviewDocument, file: &FileRef) -> Option<FileRow> {
     })
 }
 
+/// Label of a source group row: its header label, or a stack layer's pull request.
 fn group_label(doc: &ReviewDocument, source: &str, part: Option<u32>) -> String {
     let key = ItemKey::SourceHeader {
         source_id: source.to_owned(),
@@ -617,7 +634,11 @@ fn group_label(doc: &ReviewDocument, source: &str, part: Option<u32>) -> String 
     };
     doc.index_of(&key)
         .and_then(|index| match doc.item(index) {
-            Some(ReviewItem::SourceHeader(header)) => Some(header.label.clone()),
+            // A stack layer is named by its pull request, the way its banner and tab name it.
+            Some(ReviewItem::SourceHeader(header)) => Some(match &header.layer {
+                Some(layer) if !layer.whole_stack => format!("#{} {}", layer.number, layer.title),
+                _ => header.label.clone(),
+            }),
             _ => None,
         })
         .unwrap_or_else(|| source.to_owned())
