@@ -7,12 +7,13 @@
 use super::fixture::{BASE_BRANCH, HEAD_BRANCH, STACK_BRANCHES};
 use crate::provider::ProviderCallError;
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
-    OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
-    ReviewPullFetchResult, ReviewSourceCapabilities, ReviewSourceProviderManifest,
-    ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
-    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse, ReviewStack,
-    ReviewStackLayer,
+    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_GET,
+    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary,
+    REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, ReviewPullFetchResult, ReviewSourceBatchCapabilities,
+    ReviewSourceCapabilities, ReviewSourceProviderManifest, ReviewSourcePullFetchRequest,
+    ReviewSourcePullsGetRequest, ReviewSourcePullsGetResponse, ReviewSourcePullsListRequest,
+    ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
+    ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +36,7 @@ pub struct FakeProvider {
     repo: PathBuf,
     pulls_error: Option<ProviderCallError>,
     unlisted: Vec<u64>,
+    closed: Mutex<Vec<u64>>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -46,6 +48,7 @@ impl FakeProvider {
             repo: repo.to_path_buf(),
             pulls_error: None,
             unlisted: Vec::new(),
+            closed: Mutex::default(),
             calls: Mutex::default(),
         }
     }
@@ -66,6 +69,41 @@ impl FakeProvider {
     pub fn unlisted(mut self, numbers: &[u64]) -> Self {
         self.unlisted = numbers.to_vec();
         self
+    }
+
+    /// Close pull request `number` from now on: it leaves listings and the stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn close(&self, number: u64) {
+        self.closed.lock().expect("closed lock").push(number);
+    }
+
+    /// Answer `review_source.pulls.get`: the open pull requests among the requested numbers.
+    fn get(&self, operation: &str, payload: &[u8]) -> Vec<u8> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push(operation.to_owned());
+        let request: ReviewSourcePullsGetRequest =
+            serde_json::from_slice(payload).expect("get request");
+        let open = self.summaries();
+        let (pulls, not_open): (Vec<_>, Vec<_>) = request
+            .numbers
+            .iter()
+            .map(|number| {
+                open.iter()
+                    .find(|pull| pull.number == *number)
+                    .ok_or(*number)
+            })
+            .partition(Result::is_ok);
+        serde_json::to_vec(&ReviewSourcePullsGetResponse {
+            repository: FAKE_REPOSITORY.to_owned(),
+            pulls: pulls.into_iter().flatten().cloned().collect(),
+            not_open: not_open.into_iter().filter_map(Result::err).collect(),
+        })
+        .expect("encodes")
     }
 
     /// Answer `review_source.pulls.list`: the recent list (without [`Self::unlisted`] pull
@@ -109,6 +147,7 @@ impl FakeProvider {
     /// The fixture's pull requests, with the commits their branches point at, as a forge reports
     /// them.
     fn summaries(&self) -> Vec<PullRequestSummary> {
+        let closed = self.closed.lock().expect("closed lock").clone();
         let branches = [
             (BASE_BRANCH, HEAD_BRANCH),
             (HEAD_BRANCH, STACK_BRANCHES[0]),
@@ -133,6 +172,7 @@ impl FakeProvider {
                     "https://example.com/{FAKE_REPOSITORY}/pull/{number}"
                 )),
             })
+            .filter(|pull| !closed.contains(&pull.number))
             .collect()
     }
 
@@ -168,13 +208,17 @@ impl FakeProvider {
                             pulls_list: true,
                             stack_resolve: true,
                             pull_fetch: true,
-                            ..ReviewSourceCapabilities::default()
+                            batched: ReviewSourceBatchCapabilities {
+                                pulls_fetch: false,
+                                pulls_get: true,
+                            },
                         },
                     })
                     .expect("manifest"),
                 )
             }
             OP_REVIEW_SOURCE_PULLS_LIST => self.pulls(operation, payload),
+            OP_REVIEW_SOURCE_PULLS_GET => Ok(self.get(operation, payload)),
             OP_REVIEW_SOURCE_STACK_RESOLVE => {
                 let request: ReviewSourceStackResolveRequest =
                     serde_json::from_slice(payload).expect("stack request");

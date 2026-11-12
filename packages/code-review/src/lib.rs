@@ -24,6 +24,7 @@
 //!   review plugin's tools.
 
 pub mod assistant;
+pub mod cache;
 pub mod data;
 pub mod discovery;
 pub mod document;

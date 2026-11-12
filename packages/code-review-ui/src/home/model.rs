@@ -251,6 +251,9 @@ pub struct SuggestionInputs<'a> {
     pub pulls: Option<&'a PullsAnswer>,
     /// The stack containing the current branch's pull request.
     pub stack: Option<&'a ReviewStack>,
+    /// Layers of that stack as discovery sees it, before the provider confirms it (`0`: none
+    /// known).
+    pub provisional_layers: usize,
     /// Listed reviews.
     pub items: &'a [ReviewWorkspaceListItem],
     /// Their stats.
@@ -305,7 +308,7 @@ pub fn suggestions(inputs: &SuggestionInputs<'_>, minus: &str) -> Vec<Suggestion
     if let Some(pulls) = inputs.pulls {
         let provider = pulls.route.manifest.id.clone();
         let branch = inputs.state.and_then(|state| state.branch.as_deref());
-        if let Some(own) = branch_pull(pulls, branch, inputs.stack) {
+        if let Some(own) = branch_pull(pulls, branch, inputs.stack, inputs.provisional_layers) {
             // The branch's own pull request is not suggested twice.
             suggested.extend(
                 pulls
@@ -360,6 +363,7 @@ fn branch_pull(
     pulls: &PullsAnswer,
     branch: Option<&str>,
     stack: Option<&ReviewStack>,
+    provisional_layers: usize,
 ) -> Option<Suggestion> {
     let own = pulls
         .pulls
@@ -377,6 +381,20 @@ fn branch_pull(
                 provider,
                 repository: pulls.repository.clone(),
                 top,
+            },
+        )
+    } else if stack.is_none() && provisional_layers > 1 {
+        // Discovery sees a stack the provider has not confirmed yet: said so, and starting it
+        // reviews only the confirmed pull request.
+        (
+            format!(
+                "Your pull request #{} (stack of {provisional_layers} branches, unconfirmed)",
+                own.number
+            ),
+            ReviewSourceKind::PullRequest {
+                provider,
+                repository: pulls.repository.clone(),
+                number: own.number,
             },
         )
     } else {
@@ -689,6 +707,8 @@ mod tests {
                 state: Some(&state),
                 pulls: Some(&pulls),
                 stack: Some(&stack),
+                // The confirmed stack wins over discovery's count.
+                provisional_layers: 5,
                 items: &listed,
                 stats: Some(&moved),
             },
@@ -730,5 +750,40 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].action, SuggestionAction::New);
+    }
+
+    #[test]
+    fn an_unconfirmed_stack_is_mentioned_and_starts_only_the_pull_request() {
+        let state = ReviewRepoStateResponse {
+            branch: Some("feature".into()),
+            ..ReviewRepoStateResponse::default()
+        };
+        let pulls = PullsAnswer {
+            route: manifest_only_route(),
+            repository: "o/r".into(),
+            pulls: vec![pull(8, "feature", true)],
+        };
+        let out = suggestions(
+            &SuggestionInputs {
+                state: Some(&state),
+                pulls: Some(&pulls),
+                provisional_layers: 4,
+                ..SuggestionInputs::default()
+            },
+            "-",
+        );
+        let own = out
+            .iter()
+            .find(|suggestion| suggestion.kind == SuggestionKind::Stack)
+            .expect("the branch's own pull request");
+        assert_eq!(
+            own.title,
+            "Your pull request #8 (stack of 4 branches, unconfirmed)"
+        );
+        assert!(matches!(
+            &own.action,
+            SuggestionAction::Start(Entry::Sources { sources, .. })
+                if matches!(sources.as_slice(), [ReviewSourceKind::PullRequest { number: 8, .. }])
+        ));
     }
 }

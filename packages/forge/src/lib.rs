@@ -139,6 +139,53 @@ fn branches_query(count: usize) -> String {
     query
 }
 
+/// Pull requests per request of [`GitHub::pull_requests_by_number`]: one node each, so a request stays far
+/// inside GitHub's node limits.
+const NUMBERS_PER_QUERY: usize = 50;
+
+/// The GraphQL query for each of `count` pull requests by number (`p<i>` for `$n<i>`).
+fn numbers_query(count: usize) -> String {
+    use std::fmt::Write as _;
+    let mut query = String::from("query($owner: String!, $name: String!");
+    for index in 0..count {
+        let _ = write!(query, ", $n{index}: Int!");
+    }
+    query.push_str(") {\n  viewer { login }\n  repository(owner: $owner, name: $name) {\n");
+    for index in 0..count {
+        let _ = writeln!(
+            query,
+            "    p{index}: pullRequest(number: $n{index}) {{ {} }}",
+            stack_pull_request_fields!()
+        );
+    }
+    query.push_str("  }\n}");
+    query
+}
+
+/// Run `request` for each chunk of `items` (`size` items each) on its own thread, answers in
+/// chunk order; the first failure fails the call.
+fn each_chunk<T: Sync, A: Send>(
+    items: &[T],
+    size: usize,
+    request: impl Fn(&[T]) -> Result<A, ForgeError> + Sync,
+) -> Result<Vec<A>, ForgeError> {
+    let request = &request;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = items
+            .chunks(size)
+            .map(|chunk| scope.spawn(move || request(chunk)))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| Err(ForgeError::Failed("a GitHub request panicked".into())))
+            })
+            .collect()
+    })
+}
+
 /// A GraphQL variable's value.
 #[derive(Debug, Clone, Copy)]
 enum Variable<'a> {
@@ -233,7 +280,7 @@ pub struct GitHub {
     token_env: Option<String>,
     cwd: PathBuf,
     #[cfg(feature = "http")]
-    sessions: Arc<Mutex<BTreeMap<String, HttpSession>>>,
+    sessions: Arc<Mutex<BTreeMap<String, Arc<HttpSession>>>>,
 }
 
 /// One host's HTTPS client, the runtime it runs on, and its token.
@@ -249,7 +296,10 @@ struct HttpSession {
 impl HttpSession {
     fn new(host: &str, token_env: Option<&str>, cwd: &Path) -> Result<Self, ForgeError> {
         let token = resolve_token(host, token_env, cwd)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // Requests from several threads share the session; a multi-threaded runtime drives their
+        // connections while each caller blocks on its own request.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|error| ForgeError::Failed(format!("could not start HTTP client: {error}")))?;
@@ -405,8 +455,7 @@ impl GitHub {
         repository: &RepositoryRef,
         branches: &[String],
     ) -> Result<BTreeMap<String, BranchPullRequests>, ForgeError> {
-        let mut answers = BTreeMap::new();
-        for chunk in branches.chunks(BRANCHES_PER_QUERY) {
+        let chunks = each_chunk(branches, BRANCHES_PER_QUERY, |chunk| {
             let names: Vec<String> = (0..chunk.len()).map(|index| format!("b{index}")).collect();
             let variables: Vec<(&str, Variable<'_>)> = names
                 .iter()
@@ -414,11 +463,39 @@ impl GitHub {
                 .map(|(name, branch)| (name.as_str(), Variable::Text(branch)))
                 .collect();
             let (value, _) = self.query(repository, &branches_query(chunk.len()), &variables)?;
-            for (index, branch) in chunk.iter().enumerate() {
-                answers.insert(branch.clone(), parse_branch_pull_requests(&value, index)?);
-            }
-        }
-        Ok(answers)
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(index, branch)| {
+                    Ok((branch.clone(), parse_branch_pull_requests(&value, index)?))
+                })
+                .collect::<Result<Vec<_>, ForgeError>>()
+        })?;
+        Ok(chunks.into_iter().flatten().collect())
+    }
+
+    /// Pull requests of `repository` by number, in any state: 50 per GraphQL request, the
+    /// requests in parallel. A number GitHub does not know maps to `None`.
+    ///
+    /// # Errors
+    /// As [`Self::branch_pull_requests`]; the first failing request fails the call.
+    pub fn pull_requests_by_number(
+        &self,
+        repository: &RepositoryRef,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, Option<PullRequest>>, ForgeError> {
+        let chunks = each_chunk(numbers, NUMBERS_PER_QUERY, |chunk| {
+            let names: Vec<String> = (0..chunk.len()).map(|index| format!("n{index}")).collect();
+            let variables: Vec<(&str, Variable<'_>)> = names
+                .iter()
+                .zip(chunk)
+                .map(|(name, number)| (name.as_str(), Variable::Number(*number)))
+                .collect();
+            let (value, _) = self.query(repository, &numbers_query(chunk.len()), &variables)?;
+            let pulls = parse_numbered_pull_requests(&value, chunk.len())?;
+            Ok(chunk.iter().copied().zip(pulls).collect::<Vec<_>>())
+        })?;
+        Ok(chunks.into_iter().flatten().collect())
     }
 
     /// Run `query` against `repository` (its `owner` and `name` are passed as variables) with the
@@ -495,19 +572,29 @@ impl GitHub {
             })
             .collect();
         let body = json!({ "query": query, "variables": variables });
-        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        let session = match sessions.entry(repository.host.clone()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(HttpSession::new(
-                &repository.host,
-                self.token_env.as_deref(),
-                &self.cwd,
-            )?),
+        // The lock covers finding the session only; requests run concurrently on it.
+        let session = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            match sessions.entry(repository.host.clone()) {
+                Entry::Occupied(entry) => Arc::clone(entry.get()),
+                Entry::Vacant(entry) => Arc::clone(entry.insert(Arc::new(HttpSession::new(
+                    &repository.host,
+                    self.token_env.as_deref(),
+                    &self.cwd,
+                )?))),
+            }
         };
         let result = session.post(&endpoint, &body);
         if matches!(result, Err(ForgeError::Unauthenticated(_))) {
-            // A rejected token is resolved again next time (it may have been refreshed).
-            sessions.remove(&repository.host);
+            // A rejected token is resolved again next time (it may have been refreshed), unless
+            // another request already replaced the session.
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            if sessions
+                .get(&repository.host)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                sessions.remove(&repository.host);
+            }
         }
         result
     }
@@ -685,6 +772,49 @@ pub fn parse_branch_pull_requests(
     })
 }
 
+/// The pull requests (`p0` to `p<count - 1>`) of a response to [`numbers_query`]; `None` for a
+/// number GitHub reports it does not know.
+///
+/// # Errors
+/// * [`ForgeError::Failed`] when the response reports other errors, lacks the repository, or
+///   holds an unreadable pull request.
+pub fn parse_numbered_pull_requests(
+    value: &Value,
+    count: usize,
+) -> Result<Vec<Option<PullRequest>>, ForgeError> {
+    if let Some(errors) = response_errors(value) {
+        let not_found = |error: &&Value| {
+            error["type"].as_str() == Some("NOT_FOUND")
+                && error["path"].as_array().is_some_and(|path| {
+                    path.last()
+                        .and_then(Value::as_str)
+                        .is_some_and(|alias| alias.starts_with('p'))
+                })
+        };
+        if !errors.iter().all(not_found) {
+            return Err(answered_with(&errors));
+        }
+    }
+    let repository = &value["data"]["repository"];
+    if !repository.is_object() {
+        return Err(ForgeError::Failed(
+            "GitHub did not return the repository".into(),
+        ));
+    }
+    let viewer = value["data"]["viewer"]["login"].as_str();
+    (0..count)
+        .map(|index| {
+            let node = &repository[format!("p{index}")];
+            if node.is_null() {
+                return Ok(None);
+            }
+            parse_pull_request(node, viewer).map(Some).ok_or_else(|| {
+                ForgeError::Failed("GitHub returned an unreadable pull request".into())
+            })
+        })
+        .collect()
+}
+
 /// The repository's default branch from a GraphQL response to [`PULL_REQUESTS_QUERY`] or
 /// [`PULL_REQUEST_QUERY`], when it reports one (empty repositories have none).
 #[must_use]
@@ -819,6 +949,55 @@ mod tests {
         assert_eq!(second.with_head, Vec::new());
         assert_eq!(second.with_base.len(), 2);
         assert!(parse_branch_pull_requests(&value, 2).is_err());
+    }
+
+    #[test]
+    fn pull_requests_by_number_are_read_per_alias_with_unknown_numbers_absent() {
+        let query = numbers_query(2);
+        for needle in [
+            "$n0: Int!",
+            "$n1: Int!",
+            "p0: pullRequest(number: $n0)",
+            "viewer",
+        ] {
+            assert!(query.contains(needle), "{needle}: {query}");
+        }
+        let value = json!({
+            "data": { "viewer": { "login": "me" }, "repository": {
+                "p0": { "number": 7, "state": "MERGED", "headRefName": "a", "baseRefName": "main" },
+                "p1": null,
+            } },
+            "errors": [{ "type": "NOT_FOUND", "path": ["repository", "p1"], "message": "gone" }],
+        });
+        let pulls = parse_numbered_pull_requests(&value, 2).unwrap();
+        assert_eq!(
+            pulls[0].as_ref().map(|pull| (pull.number, pull.state)),
+            Some((7, PullRequestState::Merged))
+        );
+        assert_eq!(pulls[1], None);
+        // Any other error fails the batch.
+        let failed = json!({ "data": { "repository": {} }, "errors": [{ "type": "RATE_LIMITED", "message": "slow down" }] });
+        assert!(parse_numbered_pull_requests(&failed, 1).is_err());
+    }
+
+    #[test]
+    fn chunks_are_requested_together_and_answered_in_order() {
+        let started = std::sync::Barrier::new(3);
+        let answers = each_chunk(&[1, 2, 3, 4, 5], 2, |chunk| {
+            // Every chunk is in flight before any answers: three at once.
+            started.wait();
+            Ok(chunk.iter().sum::<i32>())
+        })
+        .unwrap();
+        assert_eq!(answers, [3, 7, 5]);
+        let failed = each_chunk(&[1, 2], 1, |chunk| {
+            if chunk[0] == 2 {
+                Err(ForgeError::Failed("no".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(failed.is_err());
     }
 
     #[test]

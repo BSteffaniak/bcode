@@ -19,11 +19,14 @@ use bcode_code_review_models::{
     REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY, ReviewPullFetchResult, ReviewPullFetchTarget,
     ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewSourceProviderManifest,
     ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
-    ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
+    ReviewSourcePullsGetRequest, ReviewSourcePullsGetResponse, ReviewSourcePullsListRequest,
+    ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
     ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer, ReviewStackSibling,
 };
 use bcode_code_review_provider::{ProviderCallError, ProviderResult, ReviewSourceProvider};
-use bcode_forge::models::{ForgeError, PullRequest, PullRequestList, RepositoryRef};
+use bcode_forge::models::{
+    ForgeError, PullRequest, PullRequestList, PullRequestState, RepositoryRef,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -93,7 +96,10 @@ pub fn manifest() -> ReviewSourceProviderManifest {
             pulls_list: true,
             stack_resolve: true,
             pull_fetch: true,
-            batched: ReviewSourceBatchCapabilities { pulls_fetch: true },
+            batched: ReviewSourceBatchCapabilities {
+                pulls_fetch: true,
+                pulls_get: true,
+            },
         },
     }
 }
@@ -127,6 +133,18 @@ impl ReviewSourceProvider for GitHubReviewSource {
                 .map_err(ReviewSourceError::from)?,
         };
         Ok(pulls_list_response(&repository, list))
+    }
+
+    fn get_pulls(
+        &self,
+        request: &ReviewSourcePullsGetRequest,
+    ) -> ProviderResult<ReviewSourcePullsGetResponse> {
+        let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
+        let github = repository.github(&request.repo_path);
+        let found = github
+            .pull_requests_by_number(&repository.0, &request.numbers)
+            .map_err(ReviewSourceError::from)?;
+        Ok(pulls_get_response(&repository, &request.numbers, &found))
     }
 
     fn resolve_stack(
@@ -281,31 +299,52 @@ fn parse_repository(identifier: &str) -> Option<RepositoryRef> {
     })
 }
 
-/// Each repository path's remotes, as [`read_remotes`] answered.
-type RemotesByRepo = BTreeMap<std::path::PathBuf, Vec<(String, String)>>;
+/// Each repository path's remotes as [`read_remotes`] answered, with the modification time of
+/// the git config they were read from.
+type RemotesByRepo = BTreeMap<std::path::PathBuf, (std::time::SystemTime, Vec<(String, String)>)>;
 
-/// Local remotes and their fetch URLs, `origin` first. Read once per repository path for the
-/// process's lifetime: every provider call needs them, and they are two git processes.
+/// Local remotes and their fetch URLs, `origin` first. Every provider call needs them and reading
+/// them takes two git processes, so they are kept per repository path until its git config (where
+/// remotes are stored) changes.
 fn remotes(repo_path: &Path) -> Vec<(String, String)> {
     static REMOTES: std::sync::OnceLock<std::sync::Mutex<RemotesByRepo>> =
         std::sync::OnceLock::new();
+    let Some(modified) = git_config_path(repo_path)
+        .and_then(|config| std::fs::metadata(config).ok())
+        .and_then(|metadata| metadata.modified().ok())
+    else {
+        return read_remotes(repo_path);
+    };
     let cache = REMOTES.get_or_init(std::sync::Mutex::default);
     let known = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(repo_path)
-        .cloned();
+        .filter(|(read_at, _)| *read_at == modified)
+        .map(|(_, remotes)| remotes.clone());
     if let Some(known) = known {
         return known;
     }
     let read = read_remotes(repo_path);
-    if !read.is_empty() {
-        cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(repo_path.to_path_buf(), read.clone());
-    }
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(repo_path.to_path_buf(), (modified, read.clone()));
     read
+}
+
+/// The config file of the repository at `repo_path` (its work tree root): `.git/config`, or for a
+/// linked worktree, the main repository's. `None` when the layout is not one of those.
+fn git_config_path(repo_path: &Path) -> Option<std::path::PathBuf> {
+    let dot_git = repo_path.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("config"));
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir = repo_path.join(pointer.strip_prefix("gitdir:")?.trim());
+    let common = std::fs::read_to_string(git_dir.join("commondir"))
+        .map_or_else(|_| git_dir.clone(), |common| git_dir.join(common.trim()));
+    Some(common.join("config"))
 }
 
 /// [`remotes`], read from git.
@@ -396,6 +435,31 @@ fn parse_pull_query(query: &str) -> PullQuery<'_> {
     PullQuery::Branch(query)
 }
 
+/// The `review_source.pulls.get` answer for `numbers` from what GitHub `found`: open pull
+/// requests (drafts included) as summaries, everything else as not open.
+fn pulls_get_response(
+    repository: &Repository,
+    numbers: &[u64],
+    found: &BTreeMap<u64, Option<PullRequest>>,
+) -> ReviewSourcePullsGetResponse {
+    let mut response = ReviewSourcePullsGetResponse {
+        repository: repository.display(),
+        pulls: Vec::new(),
+        not_open: Vec::new(),
+    };
+    for number in numbers {
+        match found.get(number).and_then(Option::as_ref) {
+            Some(pull)
+                if matches!(pull.state, PullRequestState::Open | PullRequestState::Draft) =>
+            {
+                response.pulls.push(summary(pull));
+            }
+            _ => response.not_open.push(*number),
+        }
+    }
+    response
+}
+
 /// The open pull requests `query` names (see [`parse_pull_query`]), as a list.
 fn lookup_pulls(
     github: &bcode_forge::GitHub,
@@ -454,30 +518,80 @@ fn resolve_stack(
     hints: &[String],
 ) -> Result<ReviewStack, ReviewSourceError> {
     let github = repository.github(repo_path);
-    let lookup = github.pull_request(&repository.0, number)?;
+    // The hinted branches are looked up while the pull request is: neither needs the other, and
+    // each costs a round trip. The default branch (when known from an earlier answer) is left
+    // out, as the walk never looks it up.
+    let remembered_default = default_branch(repository, None);
+    let prefetch: Vec<String> = hints
+        .iter()
+        .filter(|branch| Some(branch.as_str()) != remembered_default.as_deref())
+        .take(LOOKUP_BATCH)
+        .cloned()
+        .collect();
+    let (lookup, prefetched) = std::thread::scope(|scope| {
+        let prefetching = (!prefetch.is_empty())
+            .then(|| scope.spawn(|| github.branches_pull_requests(&repository.0, &prefetch)));
+        let lookup = github.pull_request(&repository.0, number);
+        // A failed prefetch only costs the lookups again during the walk.
+        let prefetched = prefetching
+            .and_then(|worker| worker.join().ok())
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        (lookup, prefetched)
+    });
+    let lookup = lookup?;
     let start = stack_candidates(repository, lookup.pull_request.as_slice())
         .pop()
         .ok_or_else(|| ReviewSourceError::PullNotFound(number, repository.display()))?;
-    let default_branch = lookup.default_branch.as_deref();
+    let default_branch = default_branch(repository, lookup.default_branch.as_deref());
+    let default_branch = default_branch.as_deref();
+    let known: BTreeMap<String, BranchNeighbors> = prefetched
+        .into_iter()
+        .map(|(name, pulls)| {
+            (
+                name,
+                BranchNeighbors {
+                    with_head: stack_candidates(repository, &pulls.with_head),
+                    with_base: stack_candidates(repository, &pulls.with_base),
+                },
+            )
+        })
+        .collect();
     let mut seen = BTreeSet::new();
     let pending = [&start.head_branch, &start.base_branch]
         .into_iter()
         .chain(hints)
-        .filter(|branch| Some(branch.as_str()) != default_branch && seen.insert(*branch))
+        .filter(|branch| {
+            Some(branch.as_str()) != default_branch
+                && !known.contains_key(branch.as_str())
+                && seen.insert(*branch)
+        })
         .cloned()
         .collect();
     let mut branches = ForgeBranches {
         github: &github,
         repository,
-        known: BTreeMap::new(),
+        known,
         pending,
     };
-    walk_stack(
-        &mut branches,
-        &start,
-        lookup.default_branch.as_deref(),
-        max_layers,
-    )
+    walk_stack(&mut branches, &start, default_branch, max_layers)
+}
+
+/// `repository`'s default branch: `answered` (remembered for later) when GitHub just reported
+/// it, else the one it reported before in this process.
+fn default_branch(repository: &Repository, answered: Option<&str>) -> Option<String> {
+    static DEFAULTS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let mut defaults = DEFAULTS
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = format!("{}/{}", repository.0.host, repository.0.full_name());
+    if let Some(answered) = answered {
+        defaults.insert(key, answered.to_owned());
+        return Some(answered.to_owned());
+    }
+    defaults.get(&key).cloned()
 }
 
 /// Open stack candidates next to one branch.
@@ -504,8 +618,10 @@ pub trait StackBranches {
     fn neighbors(&mut self, branch: &str) -> Result<BranchNeighbors, Self::Error>;
 }
 
-/// Most branches looked up in one batch while walking: the forge's per-request batch.
-const LOOKUP_BATCH: usize = 40;
+/// Most branches looked up at once while walking. The forge splits them into requests of 40 that
+/// run in parallel, and each request costs about as much as the next (~1 s for 40 branches), so
+/// looking up every hint at once costs one request's time instead of one per 40 hints.
+const LOOKUP_BATCH: usize = 200;
 
 /// [`StackBranches`] answered by GitHub in batches. A branch the walk needs is looked up together
 /// with the next hinted branches not looked up yet (in the order discovery ranked them), so a

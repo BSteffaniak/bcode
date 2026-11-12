@@ -223,9 +223,10 @@ async fn pull_request(
     let wanted = parse_pull_reference(reference)
         .ok_or_else(|| format!("{reference} is not a pull request number or URL"))?;
     let route = provider(services, |route| route.manifest.capabilities.pull_fetch)?;
-    let (asked, path, query) = (route.clone(), repo.clone(), wanted.number.to_string());
+    let (registry, asked, path) = (services.providers(), route.clone(), repo.clone());
+    let query = wanted.number.to_string();
     let listed = services
-        .blocking(move || lookup_pulls(&asked, &path, None, &query))
+        .blocking(move || lookup_pulls(&registry, &asked, &path, None, &query))
         .await
         .map_err(|error| provider_message(&route.manifest.label, &error))?;
     let pull = listed.pulls.iter().find(|pull| {
@@ -274,9 +275,10 @@ async fn stack(
         let branch = state
             .branch
             .ok_or("HEAD is detached; pass a pull request number")?;
-        let (asked, path, query) = (route.clone(), repo.clone(), branch.clone());
+        let (registry, asked, path) = (services.providers(), route.clone(), repo.clone());
+        let query = branch.clone();
         let listed = services
-            .blocking(move || lookup_pulls(&asked, &path, None, &query))
+            .blocking(move || lookup_pulls(&registry, &asked, &path, None, &query))
             .await
             .map_err(|error| provider_message(label, &error))?;
         let pull = listed

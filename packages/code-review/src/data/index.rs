@@ -1,6 +1,7 @@
 //! Per-source file index (`review.index.get`) from `git diff --raw --numstat -z`.
 
 use super::{DataError, decode_cursor, fingerprint, git, page, page_size};
+use crate::cache::{CacheKind, ReviewCache};
 use bcode_code_review_models::{
     REVIEW_INDEX_DEFAULT_PAGE_SIZE, REVIEW_INDEX_MAX_PAGE_SIZE, ResolvedSource, ResolvedSourceMode,
     ReviewBlobRef, ReviewFileStatus, ReviewIndexEntry, ReviewIndexFlag, ReviewIndexRequest,
@@ -10,14 +11,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Immutable (commit-to-commit) listings kept for paging.
-const MAX_CACHED_LISTINGS: usize = 8;
+/// Immutable (commit-to-commit) listings kept in memory: every layer of a large stack, so a
+/// reopened step-through review lists nothing again. Listings are small (one entry per file).
+const MAX_CACHED_LISTINGS: usize = 256;
 
 const MODE_SYMLINK: &str = "120000";
 const MODE_GITLINK: &str = "160000";
 
 /// A complete listing of one resolved source.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IndexListing {
     fingerprint: String,
     entries: Vec<ReviewIndexEntry>,
@@ -25,13 +27,23 @@ pub struct IndexListing {
     deletions: u64,
 }
 
-/// Bounded cache of listings whose sides are both immutable commits.
+/// Bounded cache of listings whose sides are both immutable commits, backed by the on-disk
+/// cache.
 #[derive(Debug, Default)]
 pub struct IndexCache {
     entries: VecDeque<(String, Arc<IndexListing>)>,
+    disk: Arc<ReviewCache>,
 }
 
 impl IndexCache {
+    /// An empty cache backed by `disk`.
+    pub const fn with_disk(disk: Arc<ReviewCache>) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            disk,
+        }
+    }
+
     fn get(&mut self, key: &str) -> Option<Arc<IndexListing>> {
         let position = self.entries.iter().position(|(cached, _)| cached == key)?;
         let entry = self.entries.remove(position)?;
@@ -79,11 +91,8 @@ pub fn index_page(
     })
 }
 
-fn listing(
-    cache: &Mutex<IndexCache>,
-    root: &Path,
-    source: &ResolvedSource,
-) -> Result<Arc<IndexListing>, DataError> {
+/// The cache key of `source`'s listing, and whether it can be cached (both sides immutable).
+fn listing_key(root: &Path, source: &ResolvedSource) -> Result<(String, bool), DataError> {
     for path in &source.paths {
         git::validate_relative_path(path)?;
     }
@@ -96,8 +105,68 @@ fn listing(
         &source.paths,
     ))
     .map_err(|error| DataError::InvalidRequest(error.to_string()))?;
-    // The cache lock is held only to look up and to store, never while git runs.
+    Ok((key, immutable))
+}
+
+/// The on-disk cache key of a listing key: its digest, so keys stay short.
+fn disk_key(key: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(key.as_bytes()))
+}
+
+/// Load the listings of `sources` the on-disk cache holds into `cache`, in one read, so listing
+/// them runs no git.
+pub fn prefetch(cache: &Mutex<IndexCache>, root: &Path, sources: &[ResolvedSource]) {
+    let disk = Arc::clone(&lock(cache).disk);
+    if !disk.enabled() {
+        return;
+    }
+    let wanted: Vec<String> = {
+        let mut memory = lock(cache);
+        sources
+            .iter()
+            .filter_map(|source| listing_key(root, source).ok())
+            .filter(|(key, immutable)| *immutable && memory.get(key).is_none())
+            .map(|(key, _)| key)
+            .collect()
+    };
+    let by_disk_key: BTreeMap<String, String> = wanted
+        .into_iter()
+        .map(|key| (disk_key(&key), key))
+        .collect();
+    let keys: Vec<String> = by_disk_key.keys().cloned().collect();
+    let found = disk.get_many(CacheKind::Index, &keys);
+    let mut memory = lock(cache);
+    for (stored, entry) in found {
+        if let (Some(key), Ok(listing)) = (
+            by_disk_key.get(&stored),
+            serde_json::from_slice::<IndexListing>(&entry.value),
+        ) {
+            memory.insert(key.clone(), Arc::new(listing));
+        }
+    }
+}
+
+fn listing(
+    cache: &Mutex<IndexCache>,
+    root: &Path,
+    source: &ResolvedSource,
+) -> Result<Arc<IndexListing>, DataError> {
+    let (key, immutable) = listing_key(root, source)?;
+    // The cache lock is held only to look up and to store, never while git or the disk runs.
     if immutable && let Some(listing) = lock(cache).get(&key) {
+        return Ok(listing);
+    }
+    let disk = Arc::clone(&lock(cache).disk);
+    if immutable
+        && let Some(entry) = disk
+            .get_many(CacheKind::Index, &[disk_key(&key)])
+            .into_values()
+            .next()
+        && let Ok(listing) = serde_json::from_slice::<IndexListing>(&entry.value)
+    {
+        let listing = Arc::new(listing);
+        lock(cache).insert(key, Arc::clone(&listing));
         return Ok(listing);
     }
     let (output, entries) = match source.mode {
@@ -129,6 +198,11 @@ fn listing(
         deletions,
     });
     if immutable {
+        if disk.enabled()
+            && let Ok(bytes) = serde_json::to_vec(listing.as_ref())
+        {
+            disk.put_many(CacheKind::Index, &[(disk_key(&key), bytes)]);
+        }
         lock(cache).insert(key, Arc::clone(&listing));
     }
     Ok(listing)

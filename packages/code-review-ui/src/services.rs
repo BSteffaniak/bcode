@@ -268,6 +268,19 @@ impl ReviewServices {
         }
     }
 
+    /// Keep immutable results (file indexes, merge bases) and what providers report (pull
+    /// requests, stacks) in the on-disk `cache` too, so a later run opens from it. Call before
+    /// the services are cloned.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<bcode_code_review::cache::ReviewCache>) -> Self {
+        self.data = Arc::new(ReviewData::with_cache(Arc::clone(&cache)));
+        {
+            let mut providers = lock(&self.providers);
+            *providers = std::mem::take(&mut *providers).with_cache(cache);
+        }
+        self
+    }
+
     /// Use `limit` for stacks: what providers are asked to cut, and when the app warns.
     #[must_use]
     pub const fn with_stack_limit(mut self, limit: ReviewStackLimit) -> Self {

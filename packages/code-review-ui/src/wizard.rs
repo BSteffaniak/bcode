@@ -28,6 +28,7 @@ use super::picker::{Picker, PickerItem, PickerMessage, PickerOutcome};
 use super::theme::ReviewTheme;
 use crate::context::UiContext;
 use crate::services::ReviewServices;
+use bcode_code_review::discovery::ProvisionalLayer;
 use bcode_code_review_models::{
     PullRequestSummary, ReviewCommitEntry, ReviewCommitsPageRequest, ReviewCommitsPageResponse,
     ReviewFilesSearchRequest, ReviewFilesSearchResponse, ReviewRefEntry, ReviewRefKind,
@@ -234,6 +235,11 @@ enum WizardMessage {
         number: u64,
         result: Result<ReviewStack, String>,
     },
+    /// The stack of `number` as discovery sees it, while the provider resolves it.
+    Provisional {
+        number: u64,
+        layers: Vec<ProvisionalLayer>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -321,6 +327,9 @@ pub struct Wizard {
     /// The stack (by the pull request it was resolved for) whose over-limit warning was
     /// dismissed.
     stack_limit_dismissed: Option<u64>,
+    /// The stack being resolved (by its pull request) as discovery sees it: shown, marked as
+    /// unconfirmed, until the provider answers.
+    provisional: Option<(u64, Vec<ProvisionalLayer>)>,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -369,6 +378,7 @@ impl Wizard {
             action_keys: BTreeMap::new(),
             pending_items: true,
             stack_limit_dismissed: None,
+            provisional: None,
         }
     }
 
@@ -652,6 +662,16 @@ impl Wizard {
             .map(|pull| pull.head_branch.clone());
         self.step = Step::Details(Details::Stack(StackStage::Resolving(number)));
         self.pending_items = true;
+        self.provisional = None;
+        if let Some(head) = head_branch.clone() {
+            let (services, repo) = (self.services.clone(), self.repo.clone());
+            self.spawn(host, async move {
+                WizardMessage::Provisional {
+                    number,
+                    layers: super::home::load::provisional(services, repo, head).await,
+                }
+            });
+        }
         self.spawn(host, async move {
             WizardMessage::Stack {
                 number,
@@ -784,6 +804,12 @@ impl Wizard {
             WizardMessage::Pulls(result) => self.pulls = Some(result),
             WizardMessage::PullLookup { query, result } => self.apply_lookup(query, result),
             WizardMessage::Stack { number, result } => self.apply_stack(number, result),
+            WizardMessage::Provisional { number, layers } => {
+                // Only while that stack is still being resolved; the provider's answer wins.
+                if self.step == Step::Details(Details::Stack(StackStage::Resolving(number))) {
+                    self.provisional = Some((number, layers));
+                }
+            }
         }
         self.pending_items = true;
     }
@@ -1240,14 +1266,23 @@ impl Wizard {
             Step::Details(Details::Pull | Details::Stack(StackStage::Pick)) => {
                 self.pull_items(theme, matches!(self.step, Step::Details(Details::Stack(_))))
             }
-            Step::Details(Details::Stack(StackStage::Resolving(number))) => (
-                Vec::new(),
-                message(
-                    &format!("Resolving the stack of #{number}…"),
-                    String::new(),
-                    false,
-                ),
-            ),
+            Step::Details(Details::Stack(StackStage::Resolving(number))) => {
+                match self
+                    .provisional
+                    .as_ref()
+                    .filter(|(of, layers)| of == number && !layers.is_empty())
+                {
+                    Some((_, layers)) => (provisional_items(*number, layers, theme), None),
+                    None => (
+                        Vec::new(),
+                        message(
+                            &format!("Resolving the stack of #{number}…"),
+                            String::new(),
+                            false,
+                        ),
+                    ),
+                }
+            }
             Step::Details(Details::Stack(StackStage::Mode(stack))) => {
                 let limit = self.services.stack_limit();
                 let mut items = Vec::new();
@@ -2086,6 +2121,35 @@ fn split_range(query: &str) -> (&str, Option<(u32, u32)>) {
         (Ok(start), Ok(end)) if start > 0 && end >= start => (path, Some((start, end))),
         _ => (query, None),
     }
+}
+
+/// Rows for a stack being resolved, as discovery sees it: a heading saying it is unconfirmed,
+/// then its branches bottom first. None is selectable; the provider's answer replaces them.
+fn provisional_items(
+    number: u64,
+    layers: &[ProvisionalLayer],
+    theme: &ReviewTheme,
+) -> Vec<PickerItem> {
+    let mut items = vec![PickerItem::section(
+        "provisional",
+        Line::from_spans(vec![
+            Span::styled(format!("Resolving the stack of #{number}…"), theme.title),
+            Span::styled(
+                format!("  {} branches found locally, unconfirmed", layers.len()),
+                theme.muted,
+            ),
+        ]),
+    )];
+    items.extend(layers.iter().map(|layer| {
+        PickerItem::section(
+            format!("provisional-{}", layer.branch),
+            Line::from_spans(vec![
+                Span::styled("unconfirmed  ", theme.notice),
+                Span::styled(format!("{} ← {}", layer.parent, layer.branch), theme.muted),
+            ]),
+        )
+    }));
+    items
 }
 
 #[cfg(test)]

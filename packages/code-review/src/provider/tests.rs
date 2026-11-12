@@ -184,6 +184,7 @@ impl FakeProvider {
                         pull_fetch: true,
                         batched: ReviewSourceBatchCapabilities {
                             pulls_fetch: self.batch_fetch,
+                            pulls_get: false,
                         },
                     },
                 })
@@ -559,6 +560,60 @@ fn discovery_hints_go_to_the_provider_and_its_warnings_onto_the_stack() {
             ),
             "Fake tool: #103 needs a restack".to_owned(),
         ]
+    );
+}
+
+#[test]
+fn a_pull_request_a_provider_reported_before_is_not_looked_up_again_for_discovery() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    let mut provider = FakeProvider::new(repo);
+    provider.discovery = Some(ReviewDiscoveryResponse::default());
+    let registry = registry(&provider);
+    let route = &registry.sources()[0];
+    // A listing (the home screen's, say) reported #103 and its head branch.
+    registry.note_pulls(
+        FAKE_PROVIDER,
+        FAKE_REPOSITORY,
+        &[pull(103, STACK_BRANCHES[1], STACK_BRANCHES[2])],
+    );
+    assert_eq!(
+        registry
+            .known_pull(FAKE_PROVIDER, FAKE_REPOSITORY, 103)
+            .map(|pull| pull.head_branch),
+        Some(STACK_BRANCHES[2].to_owned())
+    );
+    assert_eq!(registry.known_pull(FAKE_PROVIDER, "other/repo", 103), None);
+    crate::discovery::resolve_stack_with_discovery(
+        &registry,
+        route,
+        repo,
+        Some(FAKE_REPOSITORY.into()),
+        103,
+        None,
+        None,
+    )
+    .expect("stack");
+    let calls = provider.calls();
+    // Discovery starts from the noted head branch without asking the provider for it.
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with(OP_REVIEW_SOURCE_PULLS_LIST)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "{OP_REVIEW_DISCOVERY_DISCOVER} {}",
+            STACK_BRANCHES[2]
+        )),
+        "{calls:?}"
+    );
+    // The resolved stack's layers are noted too.
+    assert!(
+        registry
+            .known_pull(FAKE_PROVIDER, FAKE_REPOSITORY, 101)
+            .is_some()
     );
 }
 

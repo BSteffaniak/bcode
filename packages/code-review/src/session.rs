@@ -4,29 +4,31 @@
 //! lands on is ready and fill in the rest without waiting:
 //!
 //! 1. [`OpenEvent::Stage`] `AskingProviders`: pull-request and stack sources are resolved with
-//!    their providers (stacks resolved within [`STACK_REUSE`] are reused, so a review opened from
-//!    the wizard asks nothing) and their commits are made local in one batched fetch.
+//!    their providers and their commits made local in one batched fetch. Only the first source
+//!    is asked about first, and a remembered stack is used as it was, so a review opened from
+//!    the wizard asks nothing before its first frame.
 //! 2. [`OpenEvent::Ready`]: the first source (the one asked for, else the first included one) is
 //!    resolved and fully listed. Every other stack source comes with it as a *pending* source: a
 //!    placeholder built from what the providers already reported (its layers, branches, and
 //!    commits), with no files yet, so the frontend can show the whole stack at once.
-//! 3. [`OpenEvent::Stage`] `Listing`: the other sources are resolved and listed in parallel
-//!    batches, reporting progress.
+//! 3. [`OpenEvent::Stage`] `AskingProviders` again: every source is asked about, confirming a
+//!    remembered stack that is not fresh with one batched request; then `Listing`: the other
+//!    sources (and the first, when confirming moved its commits) are resolved and listed in
+//!    parallel batches, reporting progress.
 //! 4. [`OpenEvent::Rest`]: every source, in workspace order, fully listed.
 //!
 //! A review with one source reports only `Ready`. Everything blocks; callers run it on a blocking
 //! thread. See `docs/review-loading-architecture.md`.
-//!
-//! [`STACK_REUSE`]: crate::provider::STACK_REUSE
 
 use crate::data::{DataError, ReviewData};
-use crate::provider::{ProviderRegistry, gather_provider_resolutions};
+use crate::provider::{Freshness, ProviderRegistry, gather_provider_resolutions};
 use bcode_code_review_models::{
     REVIEW_INDEX_MAX_PAGE_SIZE, ResolveReviewSourcesRequest, ResolvedReviewStack, ResolvedSource,
     ResolvedSourceMode, ResolvedStackLayer, ReviewIndexEntry, ReviewIndexManyRequest,
     ReviewIndexRequest, ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind,
     ReviewSourceProviderOutcome, ReviewSourceProviderResolution, RevisionRef,
 };
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 /// Sources listed per [`ReviewData::index_get_many`] call while listing the rest, so progress is
@@ -97,6 +99,9 @@ pub enum OpenEvent {
 
 /// Open `request`'s sources progressively, reporting through `emit` (see the module docs).
 ///
+/// `emit` answers whether to go on: [`ControlFlow::Break`] (the review was closed, say) stops the
+/// open at the next stage or listing batch, without further events.
+///
 /// # Errors
 ///
 /// * [`DataError::InvalidRequest`] when the repository path is invalid, and git failures that stop
@@ -105,7 +110,7 @@ pub fn open(
     data: &ReviewData,
     registry: &ProviderRegistry,
     request: &OpenRequest,
-    mut emit: impl FnMut(OpenEvent),
+    mut emit: impl FnMut(OpenEvent) -> ControlFlow<()>,
 ) -> Result<(), DataError> {
     let included: Vec<&ReviewSource> = request
         .sources
@@ -124,22 +129,23 @@ pub fn open(
     // Providers are asked about the first source alone first: its stack (reused when recently
     // resolved) and only the layers it reaches, so the first frame does not wait for every
     // layer's commits.
-    let ask = |sources: &[&ReviewSource], emit: &mut dyn FnMut(OpenEvent)| {
-        if !sources
-            .iter()
-            .any(|source| bcode_code_review_models::source_kind_requires_provider(&source.kind))
-        {
-            return Vec::new();
-        }
-        emit(OpenEvent::Stage(OpenStage::AskingProviders));
-        let sources: Vec<ReviewSource> = sources.iter().map(|source| (*source).clone()).collect();
-        gather_provider_resolutions(registry, &request.repo_path, &sources, request.max_layers)
+    // A remembered stack is shown as it was; it is confirmed with the rest.
+    let Some(first_resolutions) = ask(registry, request, &first, Freshness::Remembered, &mut emit)
+    else {
+        return Ok(());
     };
-    let first_resolutions = ask(&first, &mut emit);
-    emit(OpenEvent::Stage(OpenStage::OpeningFirst));
-    let first_opened = resolve_and_list(data, request, &first, &first_resolutions, &mut |_| {})?;
+    if emit(OpenEvent::Stage(OpenStage::OpeningFirst)).is_break() {
+        return Ok(());
+    }
+    let Some(first_opened) =
+        resolve_and_list(data, request, &first, &first_resolutions, &mut |_| {
+            ControlFlow::Continue(())
+        })?
+    else {
+        return Ok(());
+    };
     if rest.is_empty() {
-        emit(OpenEvent::Ready(first_opened));
+        let _ = emit(OpenEvent::Ready(first_opened));
         return Ok(());
     }
     // The other stack sources' placeholders come from their stacks (already known: the first
@@ -153,49 +159,113 @@ pub fn open(
         .iter()
         .filter_map(|source| placeholder(source, &known))
         .collect();
-    emit(OpenEvent::Ready(OpenedSources {
+    if emit(OpenEvent::Ready(OpenedSources {
         ready: first_opened.ready.clone(),
         pending,
         diagnostics: first_opened.diagnostics.clone(),
-    }));
-    let rest_resolutions = ask(&rest, &mut emit);
-    let total = rest.len();
-    emit(OpenEvent::Stage(OpenStage::Listing { done: 0, total }));
-    let rest_opened = resolve_and_list(data, request, &rest, &rest_resolutions, &mut |done| {
-        emit(OpenEvent::Stage(OpenStage::Listing { done, total }));
-    })?;
-    // Every source in workspace order.
+    }))
+    .is_break()
+    {
+        return Ok(());
+    }
+    // Every source is asked again, confirming a remembered stack; the first source is listed
+    // again only when that changed its answer (a layer's commits moved).
+    let Some(mut confirmed) = ask(
+        registry,
+        request,
+        &included,
+        Freshness::Confirmed,
+        &mut emit,
+    ) else {
+        return Ok(());
+    };
+    let first_changed = source_pins(&confirmed, first_id.as_deref())
+        != source_pins(&first_resolutions, first_id.as_deref());
+    let (relist, first_opened) = if first_changed {
+        (included.clone(), OpenedSources::default())
+    } else {
+        confirmed.retain(|resolution| Some(&resolution.source_id) != first_id.as_ref());
+        (rest.clone(), first_opened)
+    };
+    let total = relist.len();
+    if emit(OpenEvent::Stage(OpenStage::Listing { done: 0, total })).is_break() {
+        return Ok(());
+    }
+    let Some(rest_opened) = resolve_and_list(data, request, &relist, &confirmed, &mut |done| {
+        emit(OpenEvent::Stage(OpenStage::Listing { done, total }))
+    })?
+    else {
+        return Ok(());
+    };
+    let _ = emit(OpenEvent::Rest(in_order(
+        &included,
+        first_opened,
+        rest_opened,
+    )));
+    Ok(())
+}
+
+/// Ask `registry`'s providers about `sources` (those that need one), trusting remembered stacks
+/// as `freshness` says. `None` when `emit` says to stop.
+fn ask(
+    registry: &ProviderRegistry,
+    request: &OpenRequest,
+    sources: &[&ReviewSource],
+    freshness: Freshness,
+    emit: &mut dyn FnMut(OpenEvent) -> ControlFlow<()>,
+) -> Option<Vec<ReviewSourceProviderResolution>> {
+    if !sources
+        .iter()
+        .any(|source| bcode_code_review_models::source_kind_requires_provider(&source.kind))
+    {
+        return Some(Vec::new());
+    }
+    if emit(OpenEvent::Stage(OpenStage::AskingProviders)).is_break() {
+        return None;
+    }
+    let sources: Vec<ReviewSource> = sources.iter().map(|source| (*source).clone()).collect();
+    Some(gather_provider_resolutions(
+        registry,
+        &request.repo_path,
+        &sources,
+        request.max_layers,
+        freshness,
+    ))
+}
+
+/// `first` and `rest` together, in the order of `included` (the workspace's).
+fn in_order(
+    included: &[&ReviewSource],
+    first: OpenedSources,
+    rest: OpenedSources,
+) -> OpenedSources {
     let order: Vec<&str> = included.iter().map(|source| source.id.as_str()).collect();
-    let mut ready: Vec<OpenedSource> = first_opened
-        .ready
-        .into_iter()
-        .chain(rest_opened.ready)
-        .collect();
+    let mut ready: Vec<OpenedSource> = first.ready.into_iter().chain(rest.ready).collect();
     ready.sort_by_key(|opened| {
         order
             .iter()
             .position(|id| *id == opened.source.source_id)
             .unwrap_or(usize::MAX)
     });
-    let mut diagnostics = first_opened.diagnostics;
-    diagnostics.extend(rest_opened.diagnostics);
-    emit(OpenEvent::Rest(OpenedSources {
+    let mut diagnostics = first.diagnostics;
+    diagnostics.extend(rest.diagnostics);
+    OpenedSources {
         ready,
         pending: Vec::new(),
         diagnostics,
-    }));
-    Ok(())
+    }
 }
 
 /// Resolve `sources` (with their provider answers) and list every resolved source fully,
-/// reporting the number of sources listed through `progress`.
+/// reporting the number of sources listed through `progress` after each batch. `None` when
+/// `progress` says to stop.
 fn resolve_and_list(
     data: &ReviewData,
     request: &OpenRequest,
     sources: &[&ReviewSource],
     resolutions: &[ReviewSourceProviderResolution],
-    progress: &mut dyn FnMut(usize),
-) -> Result<OpenedSources, DataError> {
+    progress: &mut dyn FnMut(usize) -> ControlFlow<()>,
+) -> Result<Option<OpenedSources>, DataError> {
     let ids: Vec<&str> = sources.iter().map(|source| source.id.as_str()).collect();
     let resolved = data.resolve_sources(&ResolveReviewSourcesRequest {
         repo_path: request.repo_path.clone(),
@@ -238,13 +308,15 @@ fn resolve_and_list(
             }
         }
         done += batch.len();
-        progress(done);
+        if progress(done).is_break() {
+            return Ok(None);
+        }
     }
-    Ok(OpenedSources {
+    Ok(Some(OpenedSources {
         ready,
         pending: Vec::new(),
         diagnostics,
-    })
+    }))
 }
 
 /// Every entry of `source`'s index, from its first page on.
@@ -267,6 +339,39 @@ fn rest_of_index(
         cursor = page.next_cursor;
     }
     Ok(entries)
+}
+
+/// The commits a provider answer pins: each pull request's number, head, and base; or the
+/// failure's code.
+type Pins<'a> = Result<Vec<(u64, &'a str, &'a str)>, &'a str>;
+
+/// [`pins`] of the answer for source `id` among `resolutions`.
+fn source_pins<'a>(
+    resolutions: &'a [ReviewSourceProviderResolution],
+    id: Option<&str>,
+) -> Option<Pins<'a>> {
+    resolutions
+        .iter()
+        .find(|resolution| Some(resolution.source_id.as_str()) == id)
+        .map(pins)
+}
+
+/// The commits a provider answer pins (each pull request's head and base), or its failure: what
+/// decides whether a source must be listed again.
+fn pins(resolution: &ReviewSourceProviderResolution) -> Pins<'_> {
+    match &resolution.outcome {
+        ReviewSourceProviderOutcome::Resolved { fetched, .. } => Ok(fetched
+            .iter()
+            .map(|fetch| {
+                (
+                    fetch.number,
+                    fetch.head_oid.as_str(),
+                    fetch.base_oid.as_str(),
+                )
+            })
+            .collect()),
+        ReviewSourceProviderOutcome::Failed { code, .. } => Err(code.as_str()),
+    }
 }
 
 /// What is already known about stack `source` without asking its provider: its stack (the first
@@ -399,5 +504,7 @@ fn placeholder(
     })
 }
 
+#[cfg(test)]
+mod budgets;
 #[cfg(test)]
 mod tests;

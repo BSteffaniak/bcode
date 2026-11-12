@@ -18,6 +18,7 @@ bcode_git = { workspace = true }
 bcode_path_display = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true, features = ["std", "unicode"] }
+rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

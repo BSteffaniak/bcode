@@ -227,6 +227,9 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     };
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host))
         .with_stack_limit(loaded.stack_limit)
+        // Disposable: a review opens from what an earlier run computed and learned, then confirms
+        // it (`BCODE_CODE_REVIEW_CACHE=off` disables it).
+        .with_cache(Arc::new(bcode_code_review::cache::ReviewCache::for_user()))
         // Built-in providers run in-process; a running Bcode's plugins can add more.
         .with_source(Arc::new(bcode_code_review_github::GitHubReviewSource))
         .with_contributor(Arc::new(bcode_code_review::discovery::git::GitDiscovery))

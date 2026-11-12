@@ -211,6 +211,8 @@ pub struct Home {
     pulls: Option<PullsAnswer>,
     pulls_error: Option<String>,
     stack: Option<ReviewStack>,
+    /// Layers of the current branch's stack as discovery sees it, until the provider confirms.
+    provisional_layers: usize,
     stack_step: StackStep,
     stats: BTreeMap<String, WorkspaceStats>,
     stats_requested: BTreeSet<String>,
@@ -292,6 +294,7 @@ impl Home {
             pulls: None,
             pulls_error: None,
             stack: None,
+            provisional_layers: 0,
             stack_step: StackStep::Idle,
             stats: BTreeMap::new(),
             stats_requested: BTreeSet::new(),
@@ -468,6 +471,7 @@ impl Home {
         self.generation += 1;
         self.stats_requested.clear();
         self.stack_step = StackStep::Idle;
+        self.provisional_layers = 0;
         self.loading += 3;
         let (services, repo) = (self.services.clone(), self.repo.clone());
         self.spawn(host, async move {
@@ -523,6 +527,11 @@ impl Home {
             return;
         };
         self.stack_step = StackStep::Requested;
+        // Discovery answers locally long before the provider: its chain is shown meanwhile.
+        let (services, repo, head) = (self.services.clone(), self.repo.clone(), branch.clone());
+        self.spawn(host, async move {
+            HomeMessage::Provisional(load::provisional(services, repo, head).await)
+        });
         self.loading += 1;
         let services = self.services.clone();
         let (route, repo, repository) = (
@@ -670,6 +679,8 @@ impl Home {
                 self.loading = self.loading.saturating_sub(1);
                 self.stack = result.ok();
             }
+            HomeMessage::Provisional(_) if !current => return,
+            HomeMessage::Provisional(layers) => self.provisional_layers = layers.len(),
             HomeMessage::Stats { id, result } => {
                 self.stats_in_flight = self.stats_in_flight.saturating_sub(1);
                 if let Ok(stats) = result {
@@ -700,6 +711,7 @@ impl Home {
                 state: self.state.as_ref(),
                 pulls: self.pulls.as_ref(),
                 stack: self.stack.as_ref(),
+                provisional_layers: self.provisional_layers,
                 items: &self.items,
                 stats: Some(&self.stats),
             },

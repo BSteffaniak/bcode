@@ -5,7 +5,8 @@ use crate::provider::{JsonReviewSource, ReviewSourceProvider};
 use crate::testing::fake_provider::{FAKE_PROVIDER, FAKE_PULLS, FAKE_REPOSITORY, FakeProvider};
 use crate::testing::fixture::{FixtureSpec, GitFixture};
 use bcode_code_review_models::{
-    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_STACK_RESOLVE, ReviewSourceProviderManifest,
+    OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULLS_GET, OP_REVIEW_SOURCE_STACK_RESOLVE,
+    ReviewSourceProviderManifest,
 };
 use std::sync::Arc;
 
@@ -53,7 +54,11 @@ fn open_all(
     request: &OpenRequest,
 ) -> Vec<OpenEvent> {
     let mut events = Vec::new();
-    open(data, registry, request, |event| events.push(event)).expect("open");
+    open(data, registry, request, |event| {
+        events.push(event);
+        std::ops::ControlFlow::Continue(())
+    })
+    .expect("open");
     events
 }
 
@@ -157,4 +162,107 @@ fn a_recently_resolved_stack_is_not_resolved_again_and_one_source_is_ready_at_on
         matches!(events.as_slice(), [.., OpenEvent::Ready(ready)] if ready.pending.is_empty()),
         "{events:#?}"
     );
+}
+
+#[test]
+fn a_remembered_stack_is_confirmed_in_one_request_and_resolved_again_when_it_changed() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let fake = Arc::new(FakeProvider::new(fixture.root()));
+    // Every remembered stack is past its freshness, so each open confirms it.
+    let registry = registry(&fake).with_stack_freshness(std::time::Duration::ZERO);
+    let data = ReviewData::default();
+    let request = OpenRequest {
+        repo_path: fixture.root().to_path_buf(),
+        sources: layer_sources(),
+        first: Some("layer-101".into()),
+        max_layers: None,
+    };
+    let count = |operation: &str| {
+        fake.calls()
+            .iter()
+            .filter(|call| call.starts_with(operation))
+            .count()
+    };
+    // The first open resolves the stack; with no freshness at all, even that is confirmed when
+    // the rest is asked about.
+    open_all(&data, &registry, &request);
+    assert_eq!(
+        (
+            count(OP_REVIEW_SOURCE_STACK_RESOLVE),
+            count(OP_REVIEW_SOURCE_PULLS_GET)
+        ),
+        (1, 1)
+    );
+
+    // Reopening shows the remembered stack at once, then confirms it with one request.
+    let events = open_all(&data, &registry, &request);
+    assert_eq!(
+        (
+            count(OP_REVIEW_SOURCE_STACK_RESOLVE),
+            count(OP_REVIEW_SOURCE_PULLS_GET)
+        ),
+        (1, 2)
+    );
+    let Some(OpenEvent::Rest(rest)) = events.last() else {
+        panic!("{events:#?}");
+    };
+    assert_eq!(rest.ready.len(), 4);
+    // Nothing moved, so the first layer was not listed again.
+    assert!(events.contains(&OpenEvent::Stage(OpenStage::Listing { done: 0, total: 3 })));
+
+    // The top layer was closed: confirming shows the stack changed, so it is resolved again
+    // (not confirmed twice) and the closed layer's source fails while the others open.
+    fake.close(103);
+    let events = open_all(&data, &registry, &request);
+    assert_eq!(
+        (
+            count(OP_REVIEW_SOURCE_STACK_RESOLVE),
+            count(OP_REVIEW_SOURCE_PULLS_GET)
+        ),
+        // The stack once for the open layers, and once more for the closed layer's own source,
+        // which is no longer in it.
+        (3, 3)
+    );
+    let Some(OpenEvent::Rest(rest)) = events.last() else {
+        panic!("{events:#?}");
+    };
+    assert_eq!(ids(&rest.ready), ["layer-100", "layer-101", "layer-102"]);
+    assert_eq!(rest.diagnostics.len(), 1, "{:#?}", rest.diagnostics);
+}
+
+#[test]
+fn a_stopped_open_reports_nothing_more_and_asks_providers_nothing_more() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let fake = Arc::new(FakeProvider::new(fixture.root()));
+    let registry = registry(&fake);
+    let data = ReviewData::default();
+    let request = OpenRequest {
+        repo_path: fixture.root().to_path_buf(),
+        sources: layer_sources(),
+        first: Some("layer-102".into()),
+        max_layers: None,
+    };
+    // The review closes as soon as its first frame is ready.
+    let mut events = Vec::new();
+    open(&data, &registry, &request, |event| {
+        let ready = matches!(event, OpenEvent::Ready(_));
+        events.push(event);
+        if ready {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+    .expect("open");
+    assert!(
+        matches!(events.last(), Some(OpenEvent::Ready(_))),
+        "{events:#?}"
+    );
+    // Nothing was asked after the first frame: the other layers were never fetched.
+    let fetches = fake
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("review_source.pull.fetch"))
+        .count();
+    assert_eq!(fetches, 3, "{:?}", fake.calls());
 }

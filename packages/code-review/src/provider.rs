@@ -19,13 +19,14 @@ pub use bcode_code_review_provider::{
 };
 
 use bcode_code_review_models::{
-    OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST, REVIEW_DISCOVERY_INTERFACE_ID,
-    REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_INTERFACE_ID,
-    ResolveReviewSourcesRequest, ReviewDiscoveryManifest, ReviewPullFetchResult,
-    ReviewPullFetchTarget, ReviewSource, ReviewSourceKind, ReviewSourceProviderManifest,
-    ReviewSourceProviderOutcome, ReviewSourceProviderResolution, ReviewSourcePullFetchRequest,
-    ReviewSourcePullsFetchRequest, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
-    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse, ReviewStack,
+    OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST, PullRequestSummary,
+    REVIEW_DISCOVERY_INTERFACE_ID, REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
+    REVIEW_SOURCE_INTERFACE_ID, ResolveReviewSourcesRequest, ReviewDiscoveryManifest,
+    ReviewPullFetchResult, ReviewPullFetchTarget, ReviewSource, ReviewSourceKind,
+    ReviewSourceProviderManifest, ReviewSourceProviderOutcome, ReviewSourceProviderResolution,
+    ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsGetRequest,
+    ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
+    ReviewSourceStackResolveResponse, ReviewStack,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -94,74 +95,43 @@ impl std::fmt::Debug for ContributorRoute {
     }
 }
 
-/// How long a resolved stack is reused without asking its provider again.
-pub const STACK_REUSE: std::time::Duration = std::time::Duration::from_mins(10);
+mod known;
 
-/// Stacks resolved recently, by provider and repository, so a review opened right after the
-/// stack was resolved (from the wizard, the home screen, or another open) does not resolve it
-/// again. Shared by every clone of a registry.
-#[derive(Debug, Default)]
-struct KnownStacks(std::sync::Mutex<BTreeMap<StackScope, Vec<KnownStack>>>);
+use known::{KnownPulls, KnownStacks};
+pub use known::{STACK_FRESH, STACK_KEPT, STACK_RECONFIRM};
 
-/// The provider and repository stacks are remembered under.
-type StackScope = (String, String);
-
-/// A stack and when it was resolved.
-#[derive(Debug)]
-struct KnownStack {
-    resolved: std::time::Instant,
-    stack: ReviewStack,
+/// How far a caller trusts a remembered stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Any remembered stack (within [`STACK_KEPT`]), as it was: for showing something at once,
+    /// to be confirmed after.
+    Remembered,
+    /// A remembered stack as it is now: used as it is within the registry's freshness window,
+    /// confirmed with its provider within [`STACK_RECONFIRM`], resolved again past it.
+    Confirmed,
 }
 
-impl KnownStacks {
-    fn remember(&self, provider: &str, repository: &str, stack: &ReviewStack) {
-        let numbers: BTreeSet<u64> = stack.layers.iter().map(|layer| layer.pull.number).collect();
-        let entry = KnownStack {
-            resolved: std::time::Instant::now(),
-            stack: stack.clone(),
-        };
-        let mut known = self.lock();
-        let stacks = known
-            .entry((provider.to_owned(), repository.to_owned()))
-            .or_default();
-        // A newer resolution of any of its layers replaces an older stack.
-        stacks.retain(|old| {
-            !old.stack
-                .layers
-                .iter()
-                .any(|layer| numbers.contains(&layer.pull.number))
-        });
-        stacks.push(entry);
-        drop(known);
-    }
-
-    fn containing(&self, provider: &str, repository: &str, number: u64) -> Option<ReviewStack> {
-        let mut known = self.lock();
-        let stacks = known.get_mut(&(provider.to_owned(), repository.to_owned()))?;
-        stacks.retain(|known| known.resolved.elapsed() < STACK_REUSE);
-        let found = stacks
-            .iter()
-            .rev()
-            .find(|known| known.stack.layer(number).is_some())
-            .map(|known| known.stack.clone());
-        drop(known);
-        found
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<StackScope, Vec<KnownStack>>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-/// The providers and contributors a review asks, in preference order, and the stacks they
-/// resolved recently.
-#[derive(Debug, Clone, Default)]
+/// The providers and contributors a review asks, in preference order, and what they reported
+/// recently: stacks and pull requests.
+#[derive(Debug, Clone)]
 pub struct ProviderRegistry {
     sources: Vec<ProviderRoute>,
     contributors: Vec<ContributorRoute>,
     known_stacks: Arc<KnownStacks>,
+    known_pulls: Arc<KnownPulls>,
+    stack_fresh: std::time::Duration,
+}
+
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            contributors: Vec::new(),
+            known_stacks: Arc::default(),
+            known_pulls: Arc::default(),
+            stack_fresh: STACK_FRESH,
+        }
+    }
 }
 
 impl ProviderRegistry {
@@ -169,6 +139,22 @@ impl ProviderRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep what providers report in `disk` too, so a later run starts from it.
+    #[must_use]
+    pub fn with_cache(mut self, disk: Arc<crate::cache::ReviewCache>) -> Self {
+        self.known_stacks = Arc::new(KnownStacks::with_disk(Arc::clone(&disk)));
+        self.known_pulls = Arc::new(KnownPulls::with_disk(disk));
+        self
+    }
+
+    /// Use remembered stacks as they are for `fresh` (instead of [`STACK_FRESH`]); older ones
+    /// are confirmed with their provider first.
+    #[must_use]
+    pub const fn with_stack_freshness(mut self, fresh: std::time::Duration) -> Self {
+        self.stack_fresh = fresh;
+        self
     }
 
     /// Add `provider` unless a provider with its id is already present. Returns whether it was
@@ -232,12 +218,41 @@ impl ProviderRegistry {
         self.sources.iter().find(|route| route.manifest.id == id)
     }
 
-    /// Remember `stack`, resolved by provider `provider` in `repository`, for [`STACK_REUSE`].
+    /// Remember `stack`, resolved or confirmed just now by provider `provider` in `repository`,
+    /// for [`STACK_KEPT`].
     pub fn remember_stack(&self, provider: &str, repository: &str, stack: &ReviewStack) {
         self.known_stacks.remember(provider, repository, stack);
+        self.note_pulls(
+            provider,
+            repository,
+            stack.layers.iter().map(|layer| &layer.pull),
+        );
     }
 
-    /// A stack resolved within [`STACK_REUSE`] that has pull request `number` as a layer.
+    /// Note pull requests provider `provider` reported in `repository` (see [`Self::known_pull`]).
+    pub fn note_pulls<'a>(
+        &self,
+        provider: &str,
+        repository: &str,
+        pulls: impl IntoIterator<Item = &'a PullRequestSummary>,
+    ) {
+        self.known_pulls.note(provider, repository, pulls);
+    }
+
+    /// Pull request `number` as provider `provider` last reported it in `repository`: a
+    /// suggestion (its head branch, say), not a confirmed fact.
+    #[must_use]
+    pub fn known_pull(
+        &self,
+        provider: &str,
+        repository: &str,
+        number: u64,
+    ) -> Option<PullRequestSummary> {
+        self.known_pulls.get(provider, repository, number)
+    }
+
+    /// A remembered stack that has pull request `number` as a layer, as it was (see
+    /// [`remembered_stack`] to confirm it).
     #[must_use]
     pub fn known_stack(
         &self,
@@ -245,8 +260,80 @@ impl ProviderRegistry {
         repository: &str,
         number: u64,
     ) -> Option<ReviewStack> {
-        self.known_stacks.containing(provider, repository, number)
+        self.known_stacks
+            .containing(provider, repository, number)
+            .map(|(stack, _)| stack)
     }
+}
+
+/// The remembered stack of `route`'s provider in `repository` with pull request `number` as a
+/// layer, trusted as `freshness` says.
+///
+/// [`Freshness::Confirmed`] confirms one older than the registry's freshness window with
+/// [`confirm_stack`] (and remembers the answer). `None` when no stack is remembered, it is too old
+/// to confirm, or confirming it showed the stack changed shape: the caller resolves it.
+#[must_use]
+pub fn remembered_stack(
+    registry: &ProviderRegistry,
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: &str,
+    number: u64,
+    freshness: Freshness,
+) -> Option<ReviewStack> {
+    let (stack, age) = registry
+        .known_stacks
+        .containing(&route.manifest.id, repository, number)?;
+    if freshness == Freshness::Remembered || age < registry.stack_fresh {
+        return Some(stack);
+    }
+    if age >= STACK_RECONFIRM {
+        return None;
+    }
+    let confirmed = confirm_stack(route, repo_path, repository, &stack)?;
+    registry.remember_stack(&route.manifest.id, repository, &confirmed);
+    Some(confirmed)
+}
+
+/// `stack` as its pull requests are now, from one `review_source.pulls.get` for every layer.
+///
+/// Titles and commits are refreshed. `None` when a layer is no longer open or its branches
+/// changed (the stack changed shape and must be resolved again), when the provider cannot get
+/// pull requests by number, or when it fails. Pull requests opened on top of the stack since it
+/// was resolved are not seen; resolving finds them.
+#[must_use]
+pub fn confirm_stack(
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: &str,
+    stack: &ReviewStack,
+) -> Option<ReviewStack> {
+    if !route.manifest.capabilities.batched.pulls_get {
+        return None;
+    }
+    let response = route
+        .provider
+        .get_pulls(&ReviewSourcePullsGetRequest {
+            repo_path: repo_path.to_path_buf(),
+            repository: Some(repository.to_owned()),
+            numbers: stack.layers.iter().map(|layer| layer.pull.number).collect(),
+        })
+        .ok()?;
+    if !response.not_open.is_empty() {
+        return None;
+    }
+    let mut confirmed = stack.clone();
+    for layer in &mut confirmed.layers {
+        let now = response
+            .pulls
+            .iter()
+            .find(|pull| pull.number == layer.pull.number)?;
+        if now.head_branch != layer.pull.head_branch || now.base_branch != layer.pull.base_branch {
+            return None;
+        }
+        layer.pull = now.clone();
+    }
+    Some(confirmed)
 }
 
 /// The providers and contributors a running Bcode's plugins offer, by plugin id.
@@ -318,13 +405,15 @@ pub async fn plugin_manifests<T: ProviderTransport + Sync>(
 ///
 /// Sources whose provider is not in `registry` get no entry. Provider failures become
 /// [`ReviewSourceProviderOutcome::Failed`] entries. Stacks are resolved with `max_layers` (see
-/// [`ReviewSourceStackResolveRequest::max_layers`]).
+/// [`ReviewSourceStackResolveRequest::max_layers`]); remembered stacks are used as `freshness`
+/// says (see [`remembered_stack`]).
 #[must_use]
 pub fn gather_provider_resolutions(
     registry: &ProviderRegistry,
     repo_path: &Path,
     sources: &[ReviewSource],
     max_layers: Option<usize>,
+    freshness: Freshness,
 ) -> Vec<ReviewSourceProviderResolution> {
     // 1. Resolve each source's stack (once per stack) and note the pull requests it needs.
     let mut targets: BTreeMap<(String, String), (Target<'_>, Asked)> = BTreeMap::new();
@@ -360,6 +449,7 @@ pub fn gather_provider_resolutions(
                     repo_path,
                     repository,
                     max_layers,
+                    freshness,
                     batch_fetch: route.manifest.capabilities.batched.pulls_fetch,
                 },
                 Asked::default(),
@@ -430,7 +520,13 @@ pub fn resolve_request_with_providers(
         source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
     });
     let provider_resolutions = if needs_provider {
-        gather_provider_resolutions(registry, repo_path, &sources, max_layers)
+        gather_provider_resolutions(
+            registry,
+            repo_path,
+            &sources,
+            max_layers,
+            Freshness::Confirmed,
+        )
     } else {
         Vec::new()
     };
@@ -442,40 +538,47 @@ pub fn resolve_request_with_providers(
 }
 
 /// The open pull requests of `repository` (detected from the remotes when `None`) through
-/// `route`: review requested from me first, then most recently updated.
+/// `route`: review requested from me first, then most recently updated. `registry` notes them.
 ///
 /// # Errors
 ///
 /// * The provider's error (for example `unauthenticated` or `unsupported_repository`).
 pub fn list_pulls(
+    registry: &ProviderRegistry,
     route: &ProviderRoute,
     repo_path: &Path,
     repository: Option<String>,
 ) -> ProviderResult<ReviewSourcePullsListResponse> {
-    route.provider.list_pulls(&ReviewSourcePullsListRequest {
+    let listed = route.provider.list_pulls(&ReviewSourcePullsListRequest {
         repo_path: repo_path.to_path_buf(),
         repository,
         query: None,
-    })
+    })?;
+    registry.note_pulls(&route.manifest.id, &listed.repository, &listed.pulls);
+    Ok(listed)
 }
 
 /// Look up the open pull requests `query` names through `route`: a number (`123`, `#123`) or URL,
-/// or an exact head branch name (see [`ReviewSourcePullsListRequest::query`]).
+/// or an exact head branch name (see [`ReviewSourcePullsListRequest::query`]). `registry` notes
+/// them.
 ///
 /// # Errors
 ///
 /// * The provider's error (for example `unauthenticated` or `unsupported_repository`).
 pub fn lookup_pulls(
+    registry: &ProviderRegistry,
     route: &ProviderRoute,
     repo_path: &Path,
     repository: Option<String>,
     query: &str,
 ) -> ProviderResult<ReviewSourcePullsListResponse> {
-    route.provider.list_pulls(&ReviewSourcePullsListRequest {
+    let listed = route.provider.list_pulls(&ReviewSourcePullsListRequest {
         repo_path: repo_path.to_path_buf(),
         repository,
         query: Some(query.to_owned()),
-    })
+    })?;
+    registry.note_pulls(&route.manifest.id, &listed.repository, &listed.pulls);
+    Ok(listed)
 }
 
 /// Resolve the stack containing pull request `number` through `route`, cut at `max_layers` when
@@ -510,6 +613,7 @@ struct Target<'a> {
     repo_path: &'a Path,
     repository: &'a str,
     max_layers: Option<usize>,
+    freshness: Freshness,
     batch_fetch: bool,
 }
 
@@ -531,14 +635,21 @@ impl Target<'_> {
             .find(|stack| stack.layer(number).is_some())
             .cloned()
             .or_else(|| {
-                self.registry
-                    .known_stack(&self.route.manifest.id, self.repository, number)
+                remembered_stack(
+                    self.registry,
+                    self.route,
+                    self.repo_path,
+                    self.repository,
+                    number,
+                    self.freshness,
+                )
             });
         let reused = known.is_some();
         let stack = if let Some(stack) = known {
             stack
         } else {
-            let response = crate::discovery::resolve_stack_with_discovery(
+            // Nothing usable is remembered (or confirming it showed it changed).
+            let response = crate::discovery::resolve_new_stack_with_discovery(
                 self.registry,
                 self.route,
                 self.repo_path,

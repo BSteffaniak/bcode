@@ -219,8 +219,13 @@ pub async fn open(
     let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (data, registry) = (services.data(), services.providers());
     let work = services.blocking(move || {
+        // Once the review is closed or reopened, the receiver is gone and the open stops.
         session::open(&data, &registry, &request, |event| {
-            let _ = sender.send(event);
+            if sender.send(event).is_ok() {
+                std::ops::ControlFlow::Continue(())
+            } else {
+                std::ops::ControlFlow::Break(())
+            }
         })
         .map_err(|error| ProviderCallError::new(error.code(), error.to_string()))
     });

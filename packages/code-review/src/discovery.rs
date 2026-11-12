@@ -8,7 +8,8 @@
 pub mod git;
 
 use crate::provider::{
-    ProviderCallError, ProviderRegistry, ProviderRoute, lookup_pulls, resolve_stack,
+    Freshness, ProviderCallError, ProviderRegistry, ProviderRoute, lookup_pulls, remembered_stack,
+    resolve_stack,
 };
 use bcode_code_review_models::{
     AnnotationSeverity, BranchAnnotation, BranchLink, REVIEW_DISCOVERY_MAX_ITEMS,
@@ -19,6 +20,16 @@ use std::path::Path;
 
 /// Most hinted branches sent with one stack resolution.
 pub const MAX_HINTS: usize = 400;
+
+/// One branch of a stack as discovery sees it, before a provider confirms it: shown as
+/// unconfirmed, never used for anything that acts on the forge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalLayer {
+    /// The branch.
+    pub branch: String,
+    /// The branch it is stacked on.
+    pub parent: String,
+}
 
 /// What every contributor said, each item with the label of the contributor that said it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,6 +114,60 @@ impl Discovery {
         hints
     }
 
+    /// The chain through `seed` as the links describe it, bottom first: down through each
+    /// branch's parent until a branch without one (the trunk), then up while exactly one branch
+    /// is stacked on the current one. Contributors that disagree about a branch's parent end the
+    /// chain there. Empty when no link names `seed`; at most [`MAX_HINTS`] layers.
+    #[must_use]
+    pub fn provisional_chain(&self, seed: &str) -> Vec<ProvisionalLayer> {
+        let mut parents: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut children: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (_, link) in &self.links {
+            parents
+                .entry(link.branch.as_str())
+                .or_default()
+                .insert(link.parent.as_str());
+            children
+                .entry(link.parent.as_str())
+                .or_default()
+                .insert(link.branch.as_str());
+        }
+        let only = |set: Option<&BTreeSet<&'_ str>>| -> Option<String> {
+            let set = set?;
+            (set.len() == 1).then(|| set.iter().next().map(|item| (*item).to_owned()))?
+        };
+        let mut visited: BTreeSet<String> = BTreeSet::from([seed.to_owned()]);
+        let mut below = Vec::new();
+        let mut current = seed.to_owned();
+        while let Some(parent) = only(parents.get(current.as_str())) {
+            below.push(ProvisionalLayer {
+                branch: current.clone(),
+                parent: parent.clone(),
+            });
+            if !visited.insert(parent.clone()) || below.len() >= MAX_HINTS {
+                break;
+            }
+            current = parent;
+        }
+        let mut chain: Vec<ProvisionalLayer> = below.into_iter().rev().collect();
+        // A seed without a parent of its own is not part of a chain.
+        if chain.is_empty() {
+            return chain;
+        }
+        let mut current = seed.to_owned();
+        while chain.len() < MAX_HINTS
+            && let Some(child) = only(children.get(current.as_str()))
+            && visited.insert(child.clone())
+        {
+            chain.push(ProvisionalLayer {
+                branch: child.clone(),
+                parent: current,
+            });
+            current = child;
+        }
+        chain
+    }
+
     /// Add the warnings that concern `stack` to it: warning annotations on its layers' branches,
     /// links that disagree with a layer's actual base, and contributors that failed.
     pub fn annotate(&self, stack: &mut ReviewStack) {
@@ -179,10 +244,24 @@ pub fn discover(
     discovery
 }
 
+/// The stack through branch `head` as `registry`'s contributors see it (see
+/// [`Discovery::provisional_chain`]): local and fast, to show before a provider confirms it.
+#[must_use]
+pub fn provisional_stack(
+    registry: &ProviderRegistry,
+    repo_path: &Path,
+    head: &str,
+) -> Vec<ProvisionalLayer> {
+    if registry.contributors().is_empty() {
+        return Vec::new();
+    }
+    discover(registry, repo_path, &[head.to_owned()], None).provisional_chain(head)
+}
+
 /// Resolve the stack containing pull request `number` through `route` with discovery.
 ///
-/// A stack `registry` resolved within [`STACK_REUSE`](crate::provider::STACK_REUSE) that has
-/// `number` as a layer is returned as it is. Otherwise the contributors are asked about its head
+/// A stack `registry` remembers with `number` as a layer is returned, confirmed with the provider
+/// first when it is not fresh (see [`remembered_stack`]). Otherwise the contributors are asked about its head
 /// branch (`head_branch`, else looked up by number when any contributor is registered); their
 /// hints go with the resolution and their warnings onto the stack, which is remembered. Without
 /// contributors this is [`resolve_stack`].
@@ -199,24 +278,68 @@ pub fn resolve_stack_with_discovery(
     max_layers: Option<usize>,
     head_branch: Option<String>,
 ) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
-    // A stack resolved within `STACK_REUSE` (by the home screen, the wizard, or another open) is
-    // reused as it was, warnings included.
+    // A stack resolved before (by the home screen, the wizard, or another open) is reused,
+    // warnings included, once confirmed.
     if let Some(repository) = repository.as_deref()
-        && let Some(stack) = registry.known_stack(&route.manifest.id, repository, number)
+        && let Some(stack) = remembered_stack(
+            registry,
+            route,
+            repo_path,
+            repository,
+            number,
+            Freshness::Confirmed,
+        )
     {
         return Ok(ReviewSourceStackResolveResponse {
             repository: repository.to_owned(),
             stack,
         });
     }
+    resolve_new_stack_with_discovery(
+        registry,
+        route,
+        repo_path,
+        repository,
+        number,
+        max_layers,
+        head_branch,
+    )
+}
+
+/// [`resolve_stack_with_discovery`] without looking for a remembered stack: the provider resolves
+/// it (with the contributors' hints), and the answer is remembered.
+///
+/// # Errors
+///
+/// * The provider's error; discovery failures become warnings instead.
+pub fn resolve_new_stack_with_discovery(
+    registry: &ProviderRegistry,
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: Option<String>,
+    number: u64,
+    max_layers: Option<usize>,
+    head_branch: Option<String>,
+) -> Result<ReviewSourceStackResolveResponse, ProviderCallError> {
     let mut discovery = Discovery::default();
     let mut hints = Vec::new();
     if !registry.contributors().is_empty() {
-        let head = head_branch.or_else(|| {
-            lookup_pulls(route, repo_path, repository.clone(), &number.to_string())
-                .ok()
-                .and_then(|listed| listed.pulls.into_iter().find(|pull| pull.number == number))
-                .map(|pull| pull.head_branch)
+        // The head branch: given, else as a provider reported it before, else looked up.
+        let noted = repository
+            .as_deref()
+            .and_then(|repository| registry.known_pull(&route.manifest.id, repository, number))
+            .map(|pull| pull.head_branch);
+        let head = head_branch.or(noted).or_else(|| {
+            lookup_pulls(
+                registry,
+                route,
+                repo_path,
+                repository.clone(),
+                &number.to_string(),
+            )
+            .ok()
+            .and_then(|listed| listed.pulls.into_iter().find(|pull| pull.number == number))
+            .map(|pull| pull.head_branch)
         });
         if let Some(head) = head {
             discovery = discover(registry, repo_path, std::slice::from_ref(&head), None);
@@ -285,6 +408,61 @@ mod tests {
         assert_eq!(set, BTreeSet::from(["a", "main", "c", "d"]));
         assert_eq!(hints.len(), set.len());
         assert_eq!(hints.last().map(String::as_str), Some("d"));
+    }
+
+    fn chain_of(discovery: &Discovery, seed: &str) -> Vec<(String, String)> {
+        discovery
+            .provisional_chain(seed)
+            .into_iter()
+            .map(|layer| (layer.branch, layer.parent))
+            .collect()
+    }
+
+    #[test]
+    fn the_provisional_chain_runs_from_the_trunk_through_the_seed_while_it_is_linear() {
+        let mut discovery = Discovery::default();
+        discovery.add(
+            "Tool",
+            ReviewDiscoveryResponse {
+                links: vec![
+                    link("a", "main"),
+                    link("b", "a"),
+                    link("c", "b"),
+                    link("d", "c"),
+                    // c has two branches on it: the chain stops at c going up from below.
+                    link("e", "c"),
+                    link("other", "main"),
+                ],
+                related: Vec::new(),
+                annotations: Vec::new(),
+            },
+        );
+        let chain = |seed: &str| chain_of(&discovery, seed);
+        let pairs = |items: &[(&str, &str)]| -> Vec<(String, String)> {
+            items
+                .iter()
+                .map(|(branch, parent)| ((*branch).to_owned(), (*parent).to_owned()))
+                .collect()
+        };
+        assert_eq!(chain("b"), pairs(&[("a", "main"), ("b", "a"), ("c", "b")]));
+        // From the top: everything below it.
+        assert_eq!(
+            chain("d"),
+            pairs(&[("a", "main"), ("b", "a"), ("c", "b"), ("d", "c")])
+        );
+        // The trunk and unknown branches are not chains.
+        assert_eq!(chain("main"), Vec::new());
+        assert_eq!(chain("unknown"), Vec::new());
+        // Contributors that disagree about a parent end the chain below that branch.
+        discovery.add(
+            "Other",
+            ReviewDiscoveryResponse {
+                links: vec![link("b", "x")],
+                related: Vec::new(),
+                annotations: Vec::new(),
+            },
+        );
+        assert_eq!(chain_of(&discovery, "c"), pairs(&[("c", "b")]));
     }
 
     #[test]

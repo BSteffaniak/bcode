@@ -18,6 +18,8 @@ pub const REVIEW_SOURCE_INTERFACE_ID: &str = "bcode.review_source/v1";
 pub const OP_REVIEW_SOURCE_MANIFEST: &str = "review_source.manifest";
 /// Operation that lists a repository's open pull requests.
 pub const OP_REVIEW_SOURCE_PULLS_LIST: &str = "review_source.pulls.list";
+/// Operation that returns several pull requests by number, as they are now.
+pub const OP_REVIEW_SOURCE_PULLS_GET: &str = "review_source.pulls.get";
 /// Operation that resolves the linear stack containing one pull request.
 pub const OP_REVIEW_SOURCE_STACK_RESOLVE: &str = "review_source.stack.resolve";
 /// Operation that fetches a pull request's head and base commits into the local repository.
@@ -116,6 +118,9 @@ pub struct ReviewSourceBatchCapabilities {
     /// `review_source.pulls.fetch` (several pull requests in one call) is supported.
     #[serde(default)]
     pub pulls_fetch: bool,
+    /// `review_source.pulls.get` (several pull requests by number in one call) is supported.
+    #[serde(default)]
+    pub pulls_get: bool,
 }
 
 /// Response payload for `review_source.manifest`.
@@ -176,6 +181,31 @@ pub struct ReviewSourcePullsListRequest {
     /// is bounded, so this finds pull requests that are not in it.
     #[serde(default)]
     pub query: Option<String>,
+}
+
+/// Request payload for `review_source.pulls.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSourcePullsGetRequest {
+    /// Absolute path of the local repository.
+    pub repo_path: PathBuf,
+    /// Provider repository identifier; `None` detects it from the repository's remotes.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// The pull requests to return.
+    pub numbers: Vec<u64>,
+}
+
+/// Response payload for `review_source.pulls.get`: every requested number is in exactly one of
+/// the two lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSourcePullsGetResponse {
+    /// Provider repository identifier the pull requests belong to.
+    pub repository: String,
+    /// The requested pull requests that are open, as they are now.
+    pub pulls: Vec<PullRequestSummary>,
+    /// The requested numbers that are not open pull requests (closed, merged, or unknown).
+    #[serde(default)]
+    pub not_open: Vec<u64>,
 }
 
 /// Response payload for `review_source.pulls.list`.

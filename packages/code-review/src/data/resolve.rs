@@ -1,6 +1,7 @@
 //! Source resolution (`review.sources.resolve`) and change tokens (`review.sources.token`).
 
 use super::{DataError, git};
+use crate::cache::{CacheKind, ReviewCache};
 use bcode_code_review_models::{
     REVIEW_DIAGNOSTIC_PROVIDER_FAILED, REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED,
     REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION, REVIEW_DIAGNOSTIC_UNSUPPORTED_SOURCE,
@@ -14,6 +15,7 @@ use bcode_code_review_models::{
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 /// Default-branch candidates tried when no upstream or `origin/HEAD` exists.
@@ -388,9 +390,12 @@ fn fetched_pull(fetched: &[ReviewPullFetchResult], number: u64) -> Option<&Revie
 const MAX_MERGE_BASES: usize = 50_000;
 
 /// Merge bases between commits, shared by every request: a merge base of two commit ids never
-/// changes, so it is computed once per process. Bounded by [`MAX_MERGE_BASES`].
+/// changes, so it is computed once, kept in memory (bounded by [`MAX_MERGE_BASES`]) and on disk.
 #[derive(Debug, Default)]
-pub struct MergeBases(std::sync::Mutex<BTreeMap<(String, String), MergeBase>>);
+pub struct MergeBases {
+    memory: std::sync::Mutex<BTreeMap<(String, String), MergeBase>>,
+    disk: Arc<ReviewCache>,
+}
 
 /// A known merge base of two commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,25 +420,64 @@ impl MergeBase {
 }
 
 impl MergeBases {
+    /// Merge bases backed by `disk`.
+    pub fn with_disk(disk: Arc<ReviewCache>) -> Self {
+        Self {
+            memory: std::sync::Mutex::default(),
+            disk,
+        }
+    }
+
     fn get(&self, key: &(String, String)) -> Option<MergeBase> {
         self.lock().get(key).cloned()
     }
 
-    fn insert_all(&self, answers: impl IntoIterator<Item = ((String, String), Option<String>)>) {
-        let mut cache = self.lock();
-        for (key, base) in answers {
-            if cache.len() >= MAX_MERGE_BASES {
-                cache.clear();
+    /// Load the merge bases of `pairs` the disk holds into memory, in one read.
+    fn load(&self, pairs: &[(String, String)]) {
+        if !self.disk.enabled() || pairs.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = pairs.iter().map(disk_key).collect();
+        let found = self.disk.get_many(CacheKind::MergeBase, &keys);
+        let mut memory = self.lock();
+        for (pair, key) in pairs.iter().zip(&keys) {
+            if let Some(entry) = found.get(key)
+                && let Ok(base) = String::from_utf8(entry.value.clone())
+            {
+                memory.insert(pair.clone(), MergeBase::Found(base));
             }
-            cache.insert(key, MergeBase::of(base));
         }
     }
 
+    /// Keep `answers` in memory, and the found ones on disk. That two commits share no history
+    /// stays in memory only: a shallow clone may simply lack it.
+    fn insert_all(&self, answers: impl IntoIterator<Item = ((String, String), Option<String>)>) {
+        let mut stored = Vec::new();
+        {
+            let mut memory = self.lock();
+            for (key, base) in answers {
+                if memory.len() >= MAX_MERGE_BASES {
+                    memory.clear();
+                }
+                if let Some(base) = &base {
+                    stored.push((disk_key(&key), base.clone().into_bytes()));
+                }
+                memory.insert(key, MergeBase::of(base));
+            }
+        }
+        self.disk.put_many(CacheKind::MergeBase, &stored);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), MergeBase>> {
-        self.0
+        self.memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// The on-disk key of a pair of commits.
+fn disk_key((left, right): &(String, String)) -> String {
+    format!("{left}\0{right}")
 }
 
 /// Git answers one resolve request reuses: commits checked once per request, merge bases from
@@ -464,6 +508,7 @@ impl<'a> GitMemo<'a> {
     fn prime(&mut self, root: &Path, resolutions: &[ReviewSourceProviderResolution]) {
         let mut oids: BTreeSet<&str> = BTreeSet::new();
         let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut trunks: BTreeSet<String> = BTreeSet::new();
         for resolution in resolutions {
             let ReviewSourceProviderOutcome::Resolved { stack, fetched } = &resolution.outcome
             else {
@@ -491,12 +536,30 @@ impl<'a> GitMemo<'a> {
             else {
                 continue;
             };
+            trunks.insert(trunk.to_owned());
             let mut below = trunk;
             for head in heads {
                 pairs.insert((below.to_owned(), head.to_owned()));
                 pairs.insert((trunk.to_owned(), head.to_owned()));
                 below = head;
             }
+        }
+        let pairs: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|pair| self.merge_bases.get(pair).is_none())
+            .collect();
+        // What an earlier process computed is read back in one go; what one walk of the stacks'
+        // history answers needs no more git; only the rest runs `git merge-base` per pair.
+        self.merge_bases.load(&pairs);
+        let pairs: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|pair| self.merge_bases.get(pair).is_none())
+            .collect();
+        let ancestry = merge_bases_by_ancestry(root, &trunks, &pairs);
+        self.merge_bases.insert_all(ancestry.answers);
+        // The walk proved the commits it named exist; only the others are checked.
+        for oid in ancestry.existing {
+            self.commits.insert(oid.clone(), Some(oid));
         }
         let oids: Vec<&str> = oids
             .into_iter()
@@ -520,6 +583,7 @@ impl<'a> GitMemo<'a> {
                 }
             }
         }
+
         let pairs: Vec<(String, String)> = pairs
             .into_iter()
             .filter(|pair| self.merge_bases.get(pair).is_none())
@@ -567,6 +631,9 @@ impl<'a> GitMemo<'a> {
         right: &str,
     ) -> Result<Option<String>, DataError> {
         let key = (left.to_owned(), right.to_owned());
+        if self.merge_bases.get(&key).is_none() {
+            self.merge_bases.load(std::slice::from_ref(&key));
+        }
         if let Some(known) = self.merge_bases.get(&key) {
             return Ok(known.into_option());
         }
@@ -574,6 +641,108 @@ impl<'a> GitMemo<'a> {
         self.merge_bases.insert_all([(key, found.clone())]);
         Ok(found)
     }
+}
+
+/// Most commits [`merge_bases_by_ancestry`] reads before leaving every pair to `git merge-base`.
+const ANCESTRY_MAX_COMMITS: usize = 50_000;
+
+/// The merge bases of `pairs` that one walk of their history settles (and the commits it proved
+/// exist), read with a single
+/// `git rev-list --parents --boundary` of the right-hand commits, excluding the `trunks`:
+///
+/// * `(left, right)` with `left` an ancestor of `right` (a layer on the layer below it, as stacks
+///   are built): `left`.
+/// * `(trunk, right)` with one trunk, when the history of `right` leaves the trunk's at one
+///   commit: that commit. Several (a merge from the trunk, say) are left to `git merge-base`.
+///
+/// Pairs it does not settle are left out, as is everything when the walk fails or would read
+/// more than [`ANCESTRY_MAX_COMMITS`] commits (an unrelated history, say).
+fn merge_bases_by_ancestry(
+    root: &Path,
+    trunks: &BTreeSet<String>,
+    pairs: &[(String, String)],
+) -> Ancestry {
+    if pairs.is_empty() || trunks.is_empty() {
+        return Ancestry::default();
+    }
+    let rights: BTreeSet<&str> = pairs.iter().map(|(_, right)| right.as_str()).collect();
+    let limit = (ANCESTRY_MAX_COMMITS + 1).to_string();
+    let mut args = vec!["rev-list", "--parents", "--boundary", "--max-count", &limit];
+    let excluded: Vec<String> = trunks.iter().map(|trunk| format!("^{trunk}")).collect();
+    args.extend(rights.iter().copied());
+    args.extend(excluded.iter().map(String::as_str));
+    args.push("--");
+    let Ok(output) = git::output(root, &args) else {
+        return Ancestry::default();
+    };
+    // The walk succeeded, so every commit it was given exists.
+    let existing: Vec<String> = rights
+        .iter()
+        .map(|right| (*right).to_owned())
+        .chain(trunks.iter().cloned())
+        .collect();
+    let output = String::from_utf8_lossy(&output);
+    // Commits between the trunks and the right-hand commits, with their parents; boundary
+    // commits (marked `-`) are where that history meets the trunks'.
+    let mut parents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut boundary: BTreeSet<&str> = BTreeSet::new();
+    for line in output.lines() {
+        if let Some(commit) = line.strip_prefix('-') {
+            boundary.insert(commit.split(' ').next().unwrap_or_default());
+            continue;
+        }
+        let mut ids = line.split(' ');
+        if let Some(commit) = ids.next() {
+            parents.insert(commit, ids.collect());
+        }
+    }
+    if parents.len() > ANCESTRY_MAX_COMMITS {
+        return Ancestry {
+            answers: Vec::new(),
+            existing,
+        };
+    }
+    // Every commit reachable from `start` without crossing the boundary, and the boundary
+    // commits it reaches.
+    let reach = |start: &str| -> (BTreeSet<&str>, BTreeSet<&str>) {
+        let mut seen = BTreeSet::new();
+        let mut met = BTreeSet::new();
+        let mut queue = vec![start];
+        while let Some(commit) = queue.pop() {
+            if let Some((commit, next)) = parents.get_key_value(commit) {
+                if seen.insert(*commit) {
+                    queue.extend(next.iter().copied());
+                }
+            } else if let Some(commit) = boundary.get(commit) {
+                met.insert(*commit);
+            }
+        }
+        (seen, met)
+    };
+    let mut reached: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    let mut answers = Vec::new();
+    for (left, right) in pairs {
+        let (history, met) = reached
+            .entry(right.as_str())
+            .or_insert_with(|| reach(right));
+        if left == right || history.contains(left.as_str()) {
+            answers.push(((left.clone(), right.clone()), Some(left.clone())));
+        } else if trunks.len() == 1
+            && trunks.contains(left)
+            && met.len() == 1
+            && let Some(meets) = met.iter().next()
+        {
+            answers.push(((left.clone(), right.clone()), Some((*meets).to_owned())));
+        }
+    }
+    Ancestry { answers, existing }
+}
+
+/// What [`merge_bases_by_ancestry`] settled, and the commits its walk proved exist.
+#[derive(Debug, Default)]
+struct Ancestry {
+    answers: Vec<((String, String), Option<String>)>,
+    existing: Vec<String>,
 }
 
 /// The full id of commit `oid` when it exists locally.

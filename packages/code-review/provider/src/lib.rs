@@ -18,11 +18,12 @@
 
 use bcode_code_review_models::{
     OP_REVIEW_DISCOVERY_DISCOVER, OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST,
-    OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
-    OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED, ReviewDiscoveryManifest,
-    ReviewDiscoveryRequest, ReviewDiscoveryResponse, ReviewPullFetchResult,
-    ReviewSourceProviderManifest, ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest,
-    ReviewSourcePullsFetchResponse, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
+    OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH, OP_REVIEW_SOURCE_PULLS_GET,
+    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED,
+    ReviewDiscoveryManifest, ReviewDiscoveryRequest, ReviewDiscoveryResponse,
+    ReviewPullFetchResult, ReviewSourceProviderManifest, ReviewSourcePullFetchRequest,
+    ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse, ReviewSourcePullsGetRequest,
+    ReviewSourcePullsGetResponse, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
     ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse,
 };
 use serde::Serialize;
@@ -77,6 +78,26 @@ pub trait ReviewSourceProvider: Send + Sync {
         &self,
         request: &ReviewSourcePullsListRequest,
     ) -> ProviderResult<ReviewSourcePullsListResponse>;
+
+    /// Several pull requests by number, as they are now: one round trip however many, which
+    /// is what confirms a remembered stack.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] when the provider does not
+    /// support it (its manifest says so), which is the default.
+    fn get_pulls(
+        &self,
+        request: &ReviewSourcePullsGetRequest,
+    ) -> ProviderResult<ReviewSourcePullsGetResponse> {
+        let _ = request;
+        Err(ProviderCallError::new(
+            ERROR_UNSUPPORTED_OPERATION,
+            format!(
+                "{} does not get pull requests by number",
+                self.manifest().label
+            ),
+        ))
+    }
 
     /// The stack containing a pull request.
     ///
@@ -144,6 +165,7 @@ pub fn serve_review_source(
     match operation {
         OP_REVIEW_SOURCE_MANIFEST => encode(&provider.manifest()),
         OP_REVIEW_SOURCE_PULLS_LIST => encode(&provider.list_pulls(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_PULLS_GET => encode(&provider.get_pulls(&decode(payload)?)?),
         OP_REVIEW_SOURCE_STACK_RESOLVE => encode(&provider.resolve_stack(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULL_FETCH => encode(&provider.fetch_pull(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULLS_FETCH => encode(&provider.fetch_pulls(&decode(payload)?)?),
@@ -214,6 +236,13 @@ impl ReviewSourceProvider for JsonReviewSource {
         request: &ReviewSourcePullsListRequest,
     ) -> ProviderResult<ReviewSourcePullsListResponse> {
         call(&self.invoke, OP_REVIEW_SOURCE_PULLS_LIST, request)
+    }
+
+    fn get_pulls(
+        &self,
+        request: &ReviewSourcePullsGetRequest,
+    ) -> ProviderResult<ReviewSourcePullsGetResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULLS_GET, request)
     }
 
     fn resolve_stack(

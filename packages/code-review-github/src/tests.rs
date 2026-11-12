@@ -588,3 +588,42 @@ fn the_provider_is_served_as_json_operations() {
     let invalid = serve_review_source(&GitHubReviewSource, OP_REVIEW_SOURCE_PULLS_LIST, b"no");
     assert_eq!(invalid.unwrap_err().code, "invalid_request");
 }
+
+#[test]
+fn the_git_config_of_a_repository_and_of_a_linked_worktree_is_found() {
+    let (dir, _upstream, clone) = upstream_and_clone();
+    assert_eq!(git_config_path(&clone), Some(clone.join(".git/config")));
+    let worktree = dir.path().join("linked");
+    run(
+        &clone,
+        &["worktree", "add", "-q", worktree.to_str().unwrap(), "HEAD"],
+    );
+    let config = git_config_path(&worktree).expect("linked worktree config");
+    assert_eq!(
+        config.canonicalize().unwrap(),
+        clone.join(".git/config").canonicalize().unwrap()
+    );
+    assert_eq!(git_config_path(dir.path()), None);
+}
+
+#[test]
+fn pulls_by_number_answer_open_ones_and_name_the_rest() {
+    let found = BTreeMap::from([
+        (1, Some(forge_pull(1, PullRequestState::Open, "octo/hello"))),
+        (
+            2,
+            Some(forge_pull(2, PullRequestState::Draft, "octo/hello")),
+        ),
+        (
+            3,
+            Some(forge_pull(3, PullRequestState::Merged, "octo/hello")),
+        ),
+        (4, None),
+    ]);
+    let response = pulls_get_response(&octo_hello(), &[2, 1, 3, 4, 5], &found);
+    assert_eq!(response.repository, "octo/hello");
+    let open: Vec<u64> = response.pulls.iter().map(|pull| pull.number).collect();
+    // Requested order; drafts are open; merged, unknown, and unanswered numbers are not.
+    assert_eq!(open, [2, 1]);
+    assert_eq!(response.not_open, [3, 4, 5]);
+}

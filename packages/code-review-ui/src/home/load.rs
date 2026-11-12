@@ -29,6 +29,8 @@ pub enum HomeMessage {
     OwnPull(Result<Vec<bcode_code_review_models::PullRequestSummary>, String>),
     /// The stack containing the current branch's pull request.
     Stack(Result<ReviewStack, String>),
+    /// The current branch's stack as discovery sees it, unconfirmed.
+    Provisional(Vec<bcode_code_review::discovery::ProvisionalLayer>),
     /// Stats of one review.
     Stats {
         /// Workspace id.
@@ -107,9 +109,9 @@ pub async fn pulls(services: ReviewServices, repo: PathBuf) -> Result<Option<Pul
     else {
         return Ok(None);
     };
-    let asked = route.clone();
+    let (registry, asked) = (services.providers(), route.clone());
     let listed = services
-        .blocking(move || list_pulls(&asked, &repo, None))
+        .blocking(move || list_pulls(&registry, &asked, &repo, None))
         .await
         .map_err(|error| provider_message(&route.manifest.label, &error))?;
     Ok(Some(PullsAnswer {
@@ -131,12 +133,30 @@ pub async fn lookup(
     repository: String,
     query: String,
 ) -> Result<Vec<bcode_code_review_models::PullRequestSummary>, String> {
-    let label = route.manifest.label.clone();
+    let (label, registry) = (route.manifest.label.clone(), services.providers());
     services
-        .blocking(move || lookup_pulls(&route, &repo, Some(repository), &query))
+        .blocking(move || lookup_pulls(&registry, &route, &repo, Some(repository), &query))
         .await
         .map(|listed| listed.pulls)
         .map_err(|error| provider_message(&label, &error))
+}
+
+/// The stack through branch `head` as the discovery contributors see it, before any provider
+/// confirms it (see [`bcode_code_review::discovery::provisional_stack`]).
+pub async fn provisional(
+    services: ReviewServices,
+    repo: PathBuf,
+    head: String,
+) -> Vec<bcode_code_review::discovery::ProvisionalLayer> {
+    let registry = services.providers();
+    services
+        .blocking(move || {
+            Ok::<_, bcode_code_review::provider::ProviderCallError>(
+                bcode_code_review::discovery::provisional_stack(&registry, &repo, &head),
+            )
+        })
+        .await
+        .unwrap_or_default()
 }
 
 /// The stack containing pull request `number` (whose head branch is `head_branch`, when known),

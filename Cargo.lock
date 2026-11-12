@@ -1934,6 +1934,7 @@ dependencies = [
  "bcode_path_display",
  "hex",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.1",

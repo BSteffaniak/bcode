@@ -37,7 +37,7 @@ use bcode_code_review_models::{
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Threads one [`ReviewData::index_get_many`] call lists sources on.
@@ -103,6 +103,17 @@ pub struct ReviewData {
 }
 
 impl ReviewData {
+    /// Read state whose immutable results (file indexes, merge bases) are also kept in `disk`, so
+    /// another process (or a later run) reuses them.
+    #[must_use]
+    pub fn with_cache(disk: Arc<crate::cache::ReviewCache>) -> Self {
+        Self {
+            indexes: Mutex::new(index::IndexCache::with_disk(Arc::clone(&disk))),
+            merge_bases: resolve::MergeBases::with_disk(disk),
+            ..Self::default()
+        }
+    }
+
     /// Stop `cat-file` processes that have been idle past their limit. There is no background
     /// timer, so long-lived owners call this between requests.
     pub fn evict_idle(&self) {
@@ -233,6 +244,8 @@ impl ReviewData {
         request: &ReviewIndexManyRequest,
     ) -> Result<ReviewIndexManyResponse, DataError> {
         let root = self.repo_root(&request.repo_path)?;
+        // Listings an earlier run kept on disk are read in one go before any git runs.
+        index::prefetch(&self.indexes, &root, &request.sources);
         let workers = request.sources.len().clamp(1, INDEX_WORKERS);
         let chunk = request.sources.len().div_ceil(workers).max(1);
         let indexes = std::thread::scope(|scope| {
@@ -372,8 +385,12 @@ impl ReviewData {
                 repo_path.display()
             )));
         }
-        let top = git::output(repo_path, &["rev-parse", "--show-toplevel"])?;
-        let root = std::fs::canonicalize(String::from_utf8_lossy(&top).trim())?;
+        let root = if let Some(root) = work_tree_root(repo_path) {
+            root
+        } else {
+            let top = git::output(repo_path, &["rev-parse", "--show-toplevel"])?;
+            std::fs::canonicalize(String::from_utf8_lossy(&top).trim())?
+        };
         {
             let mut roots = lock(&self.roots);
             if roots.len() >= MAX_CACHED_ROOTS {
@@ -383,6 +400,28 @@ impl ReviewData {
         }
         Ok(root)
     }
+}
+
+/// The work tree containing `path` as git finds it in the usual layout: the nearest directory
+/// (symbolic links resolved) holding a `.git` directory or file (a linked worktree's or a
+/// submodule's). `None` when git's environment overrides discovery or nothing is found, so git
+/// is asked instead: this saves a process on every first request, not a rule of its own.
+fn work_tree_root(path: &Path) -> Option<PathBuf> {
+    if [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+    {
+        return None;
+    }
+    let path = std::fs::canonicalize(path).ok()?;
+    path.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 /// Lock `mutex`, recovering the guard when a holder panicked: caches hold only derived data, so a
