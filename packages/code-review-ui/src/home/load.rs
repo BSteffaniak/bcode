@@ -5,7 +5,9 @@
 use super::model::{PullsAnswer, WorkspaceStats};
 use crate::entry::provider_message;
 use crate::services::ReviewServices;
-use bcode_code_review::provider::{ProviderRoute, discover_providers, list_pulls, resolve_stack};
+use bcode_code_review::provider::{
+    ProviderRoute, discover_providers, list_pulls, lookup_pulls, resolve_stack,
+};
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, ListReviewWorkspacesRequest,
     ListReviewWorkspacesResponse, ResolveReviewSourcesRequest, ResolveReviewSourcesResponse,
@@ -113,6 +115,25 @@ pub async fn pulls(services: ReviewServices, repo: PathBuf) -> Result<Option<Pul
         repository: listed.repository,
         pulls: listed.pulls,
     }))
+}
+
+/// The open pull requests `query` names (a number, URL, or exact head branch) in `repository`.
+///
+/// # Errors
+///
+/// Returns the provider's failure as a message.
+pub async fn lookup(
+    services: ReviewServices,
+    route: ProviderRoute,
+    repo: PathBuf,
+    repository: String,
+    query: String,
+) -> Result<Vec<bcode_code_review_models::PullRequestSummary>, String> {
+    let transport = services.transport();
+    lookup_pulls(&transport, &route, &repo, Some(repository), &query)
+        .await
+        .map(|listed| listed.pulls)
+        .map_err(|error| provider_message(&route.manifest.label, &error))
 }
 
 /// The stack containing pull request `number`.

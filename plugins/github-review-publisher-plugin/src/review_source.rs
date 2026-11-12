@@ -98,9 +98,11 @@ pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
         OP_REVIEW_SOURCE_MANIFEST => crate::json_response(&manifest()),
         OP_REVIEW_SOURCE_PULLS_LIST => handle(request, |req: ReviewSourcePullsListRequest| {
             let repository = Repository::resolve(&req.repo_path, req.repository.as_deref())?;
-            let list = repository
-                .github(&req.repo_path)
-                .open_pull_requests(&repository.0)?;
+            let github = repository.github(&req.repo_path);
+            let list = match req.query.as_deref().map(str::trim) {
+                Some(query) if !query.is_empty() => lookup_pulls(&github, &repository, query)?,
+                _ => github.open_pull_requests(&repository.0)?,
+            };
             Ok(pulls_list_response(&repository, list))
         }),
         OP_REVIEW_SOURCE_STACK_RESOLVE => {
@@ -295,6 +297,58 @@ fn pulls_list_response(
         default_branch: list.default_branch,
         pulls,
     }
+}
+
+/// What a pull request lookup names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PullQuery<'a> {
+    /// A pull request number.
+    Number(u64),
+    /// An exact head branch name.
+    Branch(&'a str),
+}
+
+/// Read a lookup: `123`, `#123`, a pull request URL (`…/pull/123`, optionally followed by more
+/// path), or else a branch name.
+fn parse_pull_query(query: &str) -> PullQuery<'_> {
+    let number = query.strip_prefix('#').unwrap_or(query);
+    if let Ok(number) = number.parse::<u64>() {
+        return PullQuery::Number(number);
+    }
+    if let Some((_, rest)) = query.split_once("/pull/")
+        && let Some(number) = rest
+            .split(['/', '?', '#'])
+            .next()
+            .and_then(|number| number.parse::<u64>().ok())
+    {
+        return PullQuery::Number(number);
+    }
+    PullQuery::Branch(query)
+}
+
+/// The open pull requests `query` names (see [`parse_pull_query`]), as a list.
+fn lookup_pulls(
+    github: &bcode_forge::GitHub,
+    repository: &Repository,
+    query: &str,
+) -> Result<PullRequestList, ReviewSourceError> {
+    Ok(match parse_pull_query(query) {
+        PullQuery::Number(number) => {
+            let lookup = github.pull_request(&repository.0, number)?;
+            PullRequestList {
+                pull_requests: lookup.pull_request.into_iter().collect(),
+                via: lookup.via,
+                default_branch: lookup.default_branch,
+            }
+        }
+        PullQuery::Branch(branch) => PullRequestList {
+            pull_requests: github
+                .branch_pull_requests(&repository.0, branch)?
+                .with_head,
+            via: bcode_forge::models::Transport::Auto,
+            default_branch: None,
+        },
+    })
 }
 
 /// Open pull requests whose head branch lives in the repository itself. A fork's head branch

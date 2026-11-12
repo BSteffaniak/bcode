@@ -333,6 +333,30 @@ fn pull_lists_show_open_pulls_with_requested_reviews_first() {
 }
 
 #[test]
+fn lookups_name_numbers_urls_or_branches() {
+    for query in [
+        "49230",
+        "#49230",
+        "https://github.com/o/r/pull/49230",
+        "o/r/pull/49230/files",
+    ] {
+        assert_eq!(parse_pull_query(query), PullQuery::Number(49230), "{query}");
+    }
+    for branch in [
+        "sa-17343-lob-37-mn-branches",
+        "feature/1234",
+        "#feature",
+        "123abc",
+    ] {
+        assert_eq!(
+            parse_pull_query(branch),
+            PullQuery::Branch(branch),
+            "{branch}"
+        );
+    }
+}
+
+#[test]
 fn repository_identifiers_parse_with_optional_hosts() {
     let parsed = |identifier: &str| {
         parse_repository(identifier).map(|repository| {

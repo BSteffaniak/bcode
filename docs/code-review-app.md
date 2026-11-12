@@ -206,6 +206,14 @@ Home's "Updated" column, its order, and `resume` follow when a review last chang
 sources, viewed files, reviewed revisions or archive state, or its comments. Opening or scrolling
 a review records where it was left without making it updated.
 
+### Finding pull requests
+
+The new-review wizard's pull request and stack steps list the provider's 100 most recently
+updated open pull requests, and typing filters that list. When what is typed (a number, `#number`,
+pull request URL, or exact head branch name) is not in it, the last row offers to look it up with
+the provider; `enter` asks, and what it finds joins the list. `bcode review stack` without a
+number looks up the current branch's pull request the same way.
+
 ### Rendering and terminal output
 
 Every frame repaints the whole screen from the app's state; BMUX diffs it against the previous

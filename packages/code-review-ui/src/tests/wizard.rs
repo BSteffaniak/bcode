@@ -491,6 +491,59 @@ fn stacks_over_the_limit_warn_and_the_warnings_can_be_dismissed() {
 }
 
 #[test]
+fn pull_requests_missing_from_the_recent_list_are_looked_up() {
+    use crate::testing::fixture::STACK_BRANCHES;
+    let fixture = fixture();
+    // #103 is too old for the provider's recent list.
+    let backend = Arc::new(
+        TestBackend::default().with_provider(FakeProvider::new(fixture.root()).unlisted(&[103])),
+    );
+    let mut scenario = wizard(&fixture, &backend);
+    let screen = pick_type(&mut scenario, 5);
+    assert!(!screen.contains("#103"), "{}", screen.text());
+    scenario.paste(STACK_BRANCHES[2]);
+    let screen = settled(&mut scenario);
+    let offer = format!("Look up {} on", STACK_BRANCHES[2]);
+    assert!(screen.contains(&offer), "{}", screen.text());
+    assert_eq!(
+        scenario.surface().wizard().unwrap().picker().focused(),
+        Some("pull-lookup")
+    );
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("#103 Layer 103"), "{}", screen.text());
+    assert!(!screen.contains(&offer), "{}", screen.text());
+    assert!(
+        backend
+            .provider()
+            .unwrap()
+            .calls()
+            .contains(&format!("review_source.pulls.list {}", STACK_BRANCHES[2]))
+    );
+    // The found pull request continues like a listed one: its stack resolves.
+    assert_eq!(
+        scenario.surface().wizard().unwrap().picker().focused(),
+        Some("103")
+    );
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("Whole stack"), "{}", screen.text());
+
+    // A lookup that finds nothing says so.
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 5);
+    scenario.paste("no-such-branch");
+    settled(&mut scenario);
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert!(
+        screen.contains("has no open pull request no-such-branch"),
+        "{}",
+        screen.text()
+    );
+}
+
+#[test]
 fn missing_or_failing_providers_are_explained_and_other_types_still_work() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default());

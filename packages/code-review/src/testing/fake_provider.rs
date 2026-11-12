@@ -10,8 +10,9 @@ use bcode_code_review_models::{
     OP_REVIEW_SOURCE_MANIFEST, OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_LIST,
     OP_REVIEW_SOURCE_STACK_RESOLVE, PullRequestSummary, REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
     ReviewPullFetchResult, ReviewSourceCapabilities, ReviewSourceProviderManifest,
-    ReviewSourcePullFetchRequest, ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
-    ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer,
+    ReviewSourcePullFetchRequest, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
+    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse, ReviewStack,
+    ReviewStackLayer,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,6 +34,7 @@ pub const FAKE_REQUESTED: u64 = 102;
 pub struct FakeProvider {
     repo: PathBuf,
     pulls_error: Option<ProviderCallError>,
+    unlisted: Vec<u64>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -43,6 +45,7 @@ impl FakeProvider {
         Self {
             repo: repo.to_path_buf(),
             pulls_error: None,
+            unlisted: Vec::new(),
             calls: Mutex::default(),
         }
     }
@@ -55,6 +58,42 @@ impl FakeProvider {
             message: message.to_owned(),
         });
         self
+    }
+
+    /// Leave `numbers` out of the recent listing, as a busy repository's older pull requests
+    /// are; a lookup by number or head branch still finds them.
+    #[must_use]
+    pub fn unlisted(mut self, numbers: &[u64]) -> Self {
+        self.unlisted = numbers.to_vec();
+        self
+    }
+
+    /// Answer `review_source.pulls.list`: the recent list (without [`Self::unlisted`] pull
+    /// requests), or the pull requests a `query` names.
+    fn pulls(&self, operation: &str, payload: &[u8]) -> Result<Vec<u8>, ProviderCallError> {
+        let record = |entry: String| self.calls.lock().expect("calls lock").push(entry);
+        record(operation.to_owned());
+        if let Some(error) = &self.pulls_error {
+            return Err(error.clone());
+        }
+        let request: ReviewSourcePullsListRequest =
+            serde_json::from_slice(payload).expect("pulls request");
+        let mut pulls = Self::summaries();
+        match request.query.as_deref() {
+            Some(query) => {
+                record(format!("{operation} {query}"));
+                let number = query.strip_prefix('#').unwrap_or(query).parse::<u64>().ok();
+                pulls.retain(|pull| Some(pull.number) == number || pull.head_branch == query);
+            }
+            None => pulls.retain(|pull| !self.unlisted.contains(&pull.number)),
+        }
+        pulls.sort_by_key(|pull| !pull.review_requested_from_me);
+        Ok(serde_json::to_vec(&ReviewSourcePullsListResponse {
+            repository: FAKE_REPOSITORY.to_owned(),
+            default_branch: Some(BASE_BRANCH.to_owned()),
+            pulls,
+        })
+        .expect("encodes"))
     }
 
     /// Operations answered so far (`operation` or `operation #number`).
@@ -132,22 +171,7 @@ impl FakeProvider {
                     .expect("manifest"),
                 )
             }
-            OP_REVIEW_SOURCE_PULLS_LIST => {
-                record(operation.to_owned());
-                if let Some(error) = &self.pulls_error {
-                    return Err(error.clone());
-                }
-                let mut pulls = Self::summaries();
-                pulls.sort_by_key(|pull| !pull.review_requested_from_me);
-                encode(
-                    serde_json::to_value(ReviewSourcePullsListResponse {
-                        repository: FAKE_REPOSITORY.to_owned(),
-                        default_branch: Some(BASE_BRANCH.to_owned()),
-                        pulls,
-                    })
-                    .expect("pulls"),
-                )
-            }
+            OP_REVIEW_SOURCE_PULLS_LIST => self.pulls(operation, payload),
             OP_REVIEW_SOURCE_STACK_RESOLVE => {
                 let request: ReviewSourceStackResolveRequest =
                     serde_json::from_slice(payload).expect("stack request");

@@ -214,6 +214,33 @@ pub async fn list_pulls<T: ProviderTransport + Sync>(
         &ReviewSourcePullsListRequest {
             repo_path: repo_path.to_path_buf(),
             repository,
+            query: None,
+        },
+    )
+    .await
+}
+
+/// Look up the open pull requests `query` names through `route`: a number (`123`, `#123`) or URL,
+/// or an exact head branch name (see [`ReviewSourcePullsListRequest::query`]).
+///
+/// # Errors
+///
+/// * The provider's error (for example `unauthenticated` or `unsupported_repository`).
+pub async fn lookup_pulls<T: ProviderTransport + Sync>(
+    transport: &T,
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: Option<String>,
+    query: &str,
+) -> Result<ReviewSourcePullsListResponse, ProviderCallError> {
+    call(
+        transport,
+        &route.plugin_id,
+        OP_REVIEW_SOURCE_PULLS_LIST,
+        &ReviewSourcePullsListRequest {
+            repo_path: repo_path.to_path_buf(),
+            repository,
+            query: Some(query.to_owned()),
         },
     )
     .await

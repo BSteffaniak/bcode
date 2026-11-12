@@ -127,6 +127,24 @@ impl SourceType {
 }
 
 /// What an input on the wizard asks the app to do.
+/// Picker id of the row that looks a typed pull request up with the provider.
+const PULL_LOOKUP_ID: &str = "pull-lookup";
+
+/// A provider lookup of a typed pull request.
+#[derive(Debug, Clone)]
+struct PullLookup {
+    /// What was typed.
+    query: String,
+    /// How many open pull requests it found; `None` while asking.
+    found: Option<Result<usize, String>>,
+}
+
+/// Whether `pull` is exactly what `query` names: its number (`123`, `#123`) or head branch.
+fn names_pull(query: &str, pull: &PullRequestSummary) -> bool {
+    let number = query.strip_prefix('#').unwrap_or(query);
+    number.parse::<u64>().ok() == Some(pull.number) || pull.head_branch == query
+}
+
 /// Picker id of the stack step's over-limit warning row (`enter` dismisses it).
 const STACK_LIMIT_WARNING_ID: &str = "stack-limit-warning";
 
@@ -208,6 +226,10 @@ enum WizardMessage {
         result: Result<ReviewFilesSearchResponse, String>,
     },
     Pulls(Result<Option<PullsAnswer>, String>),
+    PullLookup {
+        query: String,
+        result: Result<Vec<PullRequestSummary>, String>,
+    },
     Stack {
         number: u64,
         result: Result<ReviewStack, String>,
@@ -277,6 +299,9 @@ pub struct Wizard {
     state_requested: bool,
     pulls: Option<Result<Option<PullsAnswer>, String>>,
     pulls_requested: bool,
+    /// The provider lookup of a typed pull request (number, URL, or head branch) that the
+    /// loaded list does not show.
+    pull_lookup: Option<PullLookup>,
     listing: Listing,
     marked: Vec<String>,
     /// Last explicitly marked id (start of a range mark).
@@ -331,6 +356,7 @@ impl Wizard {
             state_requested: false,
             pulls: None,
             pulls_requested: false,
+            pull_lookup: None,
             listing: Listing::default(),
             marked: Vec::new(),
             anchor: None,
@@ -473,6 +499,56 @@ impl Wizard {
         self.spawn(host, async move {
             WizardMessage::Pulls(super::home::load::pulls(services, repo).await)
         });
+    }
+
+    /// Ask the provider for the open pull requests `query` names.
+    fn request_lookup(&mut self, host: &UiContext, query: String) {
+        let Some(Ok(Some(answer))) = &self.pulls else {
+            return;
+        };
+        let (services, route, repo, repository) = (
+            self.services.clone(),
+            answer.route.clone(),
+            self.repo.clone(),
+            answer.repository.clone(),
+        );
+        self.pull_lookup = Some(PullLookup {
+            query: query.clone(),
+            found: None,
+        });
+        self.pending_items = true;
+        self.spawn(host, async move {
+            let result =
+                super::home::load::lookup(services, route, repo, repository, query.clone()).await;
+            WizardMessage::PullLookup { query, result }
+        });
+    }
+
+    /// Add the pull requests a lookup found to the list, so the typed query shows them.
+    fn apply_lookup(&mut self, query: String, result: Result<Vec<PullRequestSummary>, String>) {
+        if self
+            .pull_lookup
+            .as_ref()
+            .is_none_or(|lookup| lookup.query != query)
+        {
+            return;
+        }
+        let found = result.map(|pulls| {
+            let count = pulls.len();
+            if let Some(Ok(Some(answer))) = self.pulls.as_mut() {
+                for pull in pulls {
+                    if !answer.pulls.iter().any(|known| known.number == pull.number) {
+                        answer.pulls.push(pull);
+                    }
+                }
+            }
+            count
+        });
+        self.pull_lookup = Some(PullLookup {
+            query,
+            found: Some(found),
+        });
+        self.pending_items = true;
     }
 
     /// Request the first page (or, with `append`, the next page) of the step's listing.
@@ -693,30 +769,31 @@ impl Wizard {
                 }
             }
             WizardMessage::Pulls(result) => self.pulls = Some(result),
-            WizardMessage::Stack { number, result } => {
-                if self.step == Step::Details(Details::Stack(StackStage::Resolving(number))) {
-                    match result {
-                        Ok(stack) => {
-                            self.step =
-                                Step::Details(Details::Stack(StackStage::Mode(Box::new(stack))));
-                            self.replace_picker(
-                                Picker::new(
-                                    "wizard.stack.mode",
-                                    "How do you want to review it?",
-                                    None,
-                                ),
-                                "enter choose · esc back",
-                            );
-                        }
-                        Err(error) => {
-                            self.step = Step::Details(Details::Stack(StackStage::Pick));
-                            self.set_status(error, StatusSeverity::Error);
-                        }
-                    }
-                }
-            }
+            WizardMessage::PullLookup { query, result } => self.apply_lookup(query, result),
+            WizardMessage::Stack { number, result } => self.apply_stack(number, result),
         }
         self.pending_items = true;
+    }
+
+    /// Move on to choosing how to review the resolved stack of `number`, when it is still the
+    /// one being resolved.
+    fn apply_stack(&mut self, number: u64, result: Result<ReviewStack, String>) {
+        if self.step != Step::Details(Details::Stack(StackStage::Resolving(number))) {
+            return;
+        }
+        match result {
+            Ok(stack) => {
+                self.step = Step::Details(Details::Stack(StackStage::Mode(Box::new(stack))));
+                self.replace_picker(
+                    Picker::new("wizard.stack.mode", "How do you want to review it?", None),
+                    "enter choose · esc back",
+                );
+            }
+            Err(error) => {
+                self.step = Step::Details(Details::Stack(StackStage::Pick));
+                self.set_status(error, StatusSeverity::Error);
+            }
+        }
     }
 
     /// Note a finished listing request; returns whether its answer is current.
@@ -1349,6 +1426,12 @@ impl Wizard {
             ));
             items.extend(pulls.into_iter().map(item));
         }
+        let query = self.picker.query();
+        let query = query.trim();
+        let lookable = !query.is_empty() && !query.contains(char::is_whitespace);
+        if lookable && !answer.pulls.iter().any(|pull| names_pull(query, pull)) {
+            items.push(self.lookup_item(theme, query, &answer.route.manifest.label));
+        }
         let message = items.is_empty().then(|| PickerMessage {
             title: "No matching pull requests".to_owned(),
             body: format!(
@@ -1358,6 +1441,33 @@ impl Wizard {
             error: false,
         });
         (items, message)
+    }
+
+    /// The row offering to look `query` up with the provider, or saying how that went.
+    fn lookup_item(&self, theme: &ReviewTheme, query: &str, label: &str) -> PickerItem {
+        let found = self
+            .pull_lookup
+            .as_ref()
+            .filter(|lookup| lookup.query == query)
+            .map(|lookup| lookup.found.clone());
+        let note = |text: String| {
+            PickerItem::section(
+                PULL_LOOKUP_ID,
+                Line::from_spans(vec![Span::styled(text, theme.muted)]),
+            )
+        };
+        match found {
+            Some(None) => note(format!("Looking up {query} on {label}…")),
+            Some(Some(Ok(0))) => note(format!("{label} has no open pull request {query}")),
+            Some(Some(Err(error))) => note(format!("Could not look up {query}: {error}")),
+            Some(Some(Ok(_))) | None => PickerItem::new(
+                PULL_LOOKUP_ID,
+                Line::from_spans(vec![
+                    Span::styled(format!("Look up {query} on {label}"), theme.accent),
+                    Span::styled("  pull request number, URL, or head branch", theme.muted),
+                ]),
+            ),
+        }
     }
 
     // ----------------------------------------------------------------------------------------
@@ -1549,6 +1659,11 @@ impl Wizard {
 
     #[allow(clippy::too_many_lines)]
     fn picked(&mut self, id: &str, host: &UiContext) -> WizardOutcome {
+        if id == PULL_LOOKUP_ID {
+            let query = self.picker.query().trim().to_owned();
+            self.request_lookup(host, query);
+            return WizardOutcome::Redraw;
+        }
         match self.step.clone() {
             Step::Type => {
                 if let Some(kind) = SourceType::from_id(id) {

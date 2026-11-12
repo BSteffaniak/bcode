@@ -12,7 +12,7 @@
 
 use crate::services::ReviewServices;
 use bcode_code_review::provider::{
-    ProviderCallError, ProviderRoute, discover_providers, list_pulls, resolve_stack,
+    ProviderCallError, ProviderRoute, discover_providers, lookup_pulls, resolve_stack,
 };
 use bcode_code_review_models::{
     GetReviewWorkspaceRequest, GetReviewWorkspaceResponse, ListReviewWorkspacesRequest,
@@ -227,7 +227,7 @@ async fn pull_request(
         .ok_or_else(|| format!("{reference} is not a pull request number or URL"))?;
     let route = provider(services, |route| route.manifest.capabilities.pull_fetch).await?;
     let transport = services.transport();
-    let listed = list_pulls(&transport, &route, &repo, None)
+    let listed = lookup_pulls(&transport, &route, &repo, None, &wanted.number.to_string())
         .await
         .map_err(|error| provider_message(&route.manifest.label, &error))?;
     let pull = listed.pulls.iter().find(|pull| {
@@ -278,7 +278,7 @@ async fn stack(
         let branch = state
             .branch
             .ok_or("HEAD is detached; pass a pull request number")?;
-        let listed = list_pulls(&transport, &route, &repo, None)
+        let listed = lookup_pulls(&transport, &route, &repo, None, &branch)
             .await
             .map_err(|error| provider_message(label, &error))?;
         let pull = listed

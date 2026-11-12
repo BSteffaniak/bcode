@@ -450,7 +450,7 @@ in `packages/code-review/models` (`review_source.rs`) and carry no provider-spec
 | Operation | Request → response |
 | --- | --- |
 | `review_source.manifest` | → provider id (stored in source kinds), label, capabilities (`pulls_list`, `stack_resolve`, `pull_fetch`) |
-| `review_source.pulls.list` | repository (or detect from remotes) → repository, default branch, the 100 most recently updated open `PullRequestSummary` values (number, title, author, base and head branch, head OID, base OID if known, review requested from me, draft, updated, URL), review-requested-from-me first, then most recently updated |
+| `review_source.pulls.list` | repository (or detect from remotes) and an optional `query` → repository, default branch, the 100 most recently updated open `PullRequestSummary` values; with `query` (a number, `#number`, pull request URL, or exact head branch name), only the open pull requests it names, so pull requests outside the recent list can be found (number, title, author, base and head branch, head OID, base OID if known, review requested from me, draft, updated, URL), review-requested-from-me first, then most recently updated |
 | `review_source.stack.resolve` | pull request number → `ReviewStack`: trunk, whether it is the default branch, layers trunk → top (each a summary plus its parent layer), siblings, warnings |
 | `review_source.pull.fetch` | pull request number and optional base branch → `ReviewPullFetchResult`: local head/base refs and their OIDs |
 

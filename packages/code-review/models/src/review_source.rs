@@ -158,6 +158,11 @@ pub struct ReviewSourcePullsListRequest {
     /// Provider repository identifier; `None` detects it from the repository's remotes.
     #[serde(default)]
     pub repository: Option<String>,
+    /// Look up the open pull requests this names instead of listing recent ones: a pull request
+    /// number (`123`, `#123`) or URL, or an exact head branch name. A repository's recent list
+    /// is bounded, so this finds pull requests that are not in it.
+    #[serde(default)]
+    pub query: Option<String>,
 }
 
 /// Response payload for `review_source.pulls.list`.
