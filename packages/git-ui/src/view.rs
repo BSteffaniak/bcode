@@ -1839,7 +1839,10 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 }
                 TerminalStatus::Exited(Some(0)) => "done".to_owned(),
                 TerminalStatus::Exited(Some(code)) => format!("exit {code}"),
-                TerminalStatus::Exited(None) => "stopped".to_owned(),
+                TerminalStatus::Exited(None)
+                | TerminalStatus::Signaled(_)
+                | TerminalStatus::Cancelled => "stopped".to_owned(),
+                TerminalStatus::TimedOut => "timed out".to_owned(),
             };
             let height = app.size.get().1.saturating_mul(4) / 5;
             Some(modal(
