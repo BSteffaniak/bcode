@@ -795,38 +795,46 @@ impl LiveAppearance {
         state.latest.with_saved(&state.latest.saved, None)
     }
 
-    /// The picker closed without applying. Returns the latest appearance, to present again.
-    #[must_use]
-    pub fn cancel(&self) -> AppearanceResolution {
+    /// The picker closed without applying: `present` shows the latest appearance again, under
+    /// the same lock as [`Self::offer`], so a watched appearance offered meanwhile is never
+    /// replaced by an older one. Returns the presented appearance.
+    pub fn cancel(&self, present: impl FnOnce(&AppearanceResolution)) -> AppearanceResolution {
         let mut state = self.lock();
         state.previewing = false;
+        present(&state.latest);
         state.latest.clone()
     }
 
     /// Save `selection` with `persist`, which receives the app's own choice to write (`None`
     /// removes it, so the app follows Bcode's), and end the preview. Nothing is written when
-    /// the choice is unchanged. Returns the applied appearance, to present; it becomes the
-    /// latest, and resolutions of the previous saved choices are ignored from now on.
+    /// the choice is unchanged. The applied appearance becomes the latest, and resolutions of
+    /// the previous saved choices are ignored from now on. `present` shows the latest
+    /// appearance under the same lock as [`Self::offer`], so a watched appearance offered
+    /// meanwhile is never replaced by an older one. Returns the applied appearance.
     ///
     /// # Errors
     ///
-    /// * The error of `persist`; the preview ends and the latest appearance is kept (present
-    ///   [`Self::current`]).
+    /// * The error of `persist`; the preview ends and `present` shows the latest appearance,
+    ///   which is kept.
     pub fn apply<E>(
         &self,
         selection: &AppearanceSelection,
         persist: impl FnOnce(Option<&SavedAppearance>) -> Result<(), E>,
+        present: impl FnOnce(&AppearanceResolution),
     ) -> Result<AppearanceResolution, E> {
         let mut state = self.lock();
         state.previewing = false;
         let app = state.app_choice(selection);
-        if app == state.latest.app_saved {
-            return Ok(state.latest.clone());
+        if app != state.latest.app_saved {
+            if let Err(error) = persist(app.as_ref()) {
+                present(&state.latest);
+                return Err(error);
+            }
+            let prior = saved_choices(&state.latest);
+            state.latest = state.latest.with_saved(&state.latest.saved, app.as_ref());
+            state.superseded = Some(prior);
         }
-        persist(app.as_ref())?;
-        let prior = saved_choices(&state.latest);
-        state.latest = state.latest.with_saved(&state.latest.saved, app.as_ref());
-        state.superseded = Some(prior);
+        present(&state.latest);
         Ok(state.latest.clone())
     }
 }
@@ -1074,7 +1082,7 @@ mod tests {
         // The watcher resolves meanwhile: recorded, not presented.
         let watched = resolution(dir.path(), "catppuccin-mocha", SavedAppearance::default());
         assert!(!live.offer(watched, |_| panic!("presented during a preview")));
-        assert_eq!(id(&live.cancel()), "catppuccin-mocha");
+        assert_eq!(id(&live.cancel(|_| {})), "catppuccin-mocha");
         assert!(!live.is_previewing());
         let mut presented = None;
         assert!(live.offer(
@@ -1093,7 +1101,7 @@ mod tests {
             .app_selection(AppearanceAxis::Palette, |path| path.display().to_string());
         // Applying an unmoved picker keeps following Bcode and writes nothing.
         assert!(
-            live.apply(&selection, |_| Err("written"))
+            live.apply(&selection, |_| Err("written"), |_| {})
                 .expect("nothing to write")
                 .follows_bcode()
         );
@@ -1101,10 +1109,14 @@ mod tests {
         select(&mut selection, "dracula");
         let mut persisted = None;
         let applied = live
-            .apply(&selection, |app| {
-                persisted = Some(app.cloned());
-                Ok::<(), ()>(())
-            })
+            .apply(
+                &selection,
+                |app| {
+                    persisted = Some(app.cloned());
+                    Ok::<(), ()>(())
+                },
+                |_| {},
+            )
             .expect("persisted");
         assert_eq!(id(&applied), "dracula");
         let own = persisted
@@ -1155,10 +1167,14 @@ mod tests {
         assert_eq!(id(&live.preview(&selection)), "nord");
         let mut persisted = Some(None);
         let applied = live
-            .apply(&selection, |app| {
-                persisted = Some(app.cloned());
-                Ok::<(), ()>(())
-            })
+            .apply(
+                &selection,
+                |app| {
+                    persisted = Some(app.cloned());
+                    Ok::<(), ()>(())
+                },
+                |_| {},
+            )
             .expect("persisted");
         assert_eq!(persisted, Some(None));
         assert!(applied.follows_bcode());
@@ -1177,15 +1193,71 @@ mod tests {
         let own = live.set_following(&mut selection, false);
         assert_eq!(id(&own), "catppuccin-mocha");
         let applied = live
-            .apply(&selection, |app| {
-                assert_eq!(
-                    app.and_then(|app| app.theme.as_deref()),
-                    Some("catppuccin-mocha")
-                );
-                Ok::<(), ()>(())
-            })
+            .apply(
+                &selection,
+                |app| {
+                    assert_eq!(
+                        app.and_then(|app| app.theme.as_deref()),
+                        Some("catppuccin-mocha")
+                    );
+                    Ok::<(), ()>(())
+                },
+                |_| {},
+            )
             .expect("persisted");
         assert!(!applied.follows_bcode());
+    }
+
+    /// Closes the picker, presenting through the given callback.
+    type Close<'a> = &'a dyn Fn(&dyn Fn(&AppearanceResolution));
+
+    #[test]
+    fn a_watched_appearance_offered_while_the_picker_closes_is_presented_last() {
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = LiveAppearance::new(app_resolution(dir.path(), theme("nord"), None));
+        let screen = Mutex::new(Vec::new());
+        // Close the picker with `close`; while it presents, the watcher offers `watched`.
+        let close = |watched: AppearanceResolution, close: Close<'_>| {
+            let watched = Mutex::new(Some(watched));
+            std::thread::scope(|scope| {
+                close(&|resolution| {
+                    screen.lock().expect("screen").push(id(resolution));
+                    let watched = watched.lock().expect("watched").take().expect("once");
+                    scope.spawn(|| {
+                        live.offer(watched, |resolution| {
+                            screen.lock().expect("screen").push(id(resolution));
+                        });
+                    });
+                });
+            });
+            std::mem::take(&mut *screen.lock().expect("screen"))
+        };
+
+        let _ = live.begin_preview();
+        let newer = app_resolution(dir.path(), theme("catppuccin-mocha"), None);
+        assert_eq!(
+            close(newer, &|present| {
+                let _ = live.cancel(present);
+            }),
+            ["nord", "catppuccin-mocha"]
+        );
+        assert_eq!(id(&live.current()), "catppuccin-mocha");
+
+        let mut selection = live
+            .begin_preview()
+            .app_selection(AppearanceAxis::Palette, |path| path.display().to_string());
+        select(&mut selection, "dracula");
+        // Another process saves a different own choice right after this apply.
+        let newer = app_resolution(dir.path(), theme("catppuccin-mocha"), Some(theme("nord")));
+        assert_eq!(
+            close(newer, &|present| {
+                let _ = live.apply(&selection, |_| Ok::<(), ()>(()), present);
+            }),
+            ["dracula", "nord"]
+        );
+        assert_eq!(id(&live.current()), "nord");
     }
 
     #[test]
@@ -1196,10 +1268,17 @@ mod tests {
             .begin_preview()
             .app_selection(AppearanceAxis::Palette, |path| path.display().to_string());
         let _ = selection.step(true);
+        let mut presented = None;
         assert_eq!(
-            live.apply(&selection, |_| Err("read-only")).err(),
+            live.apply(
+                &selection,
+                |_| Err("read-only"),
+                |resolution| presented = Some(id(resolution))
+            )
+            .err(),
             Some("read-only")
         );
+        assert_eq!(presented.as_deref(), Some("nord"));
         assert!(!live.is_previewing());
         assert_eq!(id(&live.current()), "nord");
     }

@@ -243,7 +243,7 @@ impl AppPicker {
     }
 
     /// Save the previewed choice ([`LiveAppearance::apply`]); `persist` receives the app's own
-    /// choice to write, `None` to follow Bcode's.
+    /// choice to write, `None` to follow Bcode's, and `present` shows the resulting appearance.
     ///
     /// # Errors
     ///
@@ -252,14 +252,19 @@ impl AppPicker {
         &self,
         live: &LiveAppearance,
         persist: impl FnOnce(Option<&SavedAppearance>) -> Result<(), E>,
+        present: impl FnOnce(&AppearanceResolution),
     ) -> Result<AppearanceResolution, E> {
-        live.apply(&self.selection, persist)
+        live.apply(&self.selection, persist, present)
     }
 
-    /// Close without saving; returns the appearance to present again.
-    #[must_use]
-    pub fn cancel(&self, live: &LiveAppearance) -> AppearanceResolution {
-        live.cancel()
+    /// Close without saving; `present` shows the latest appearance again
+    /// ([`LiveAppearance::cancel`]), which is returned.
+    pub fn cancel(
+        &self,
+        live: &LiveAppearance,
+        present: impl FnOnce(&AppearanceResolution),
+    ) -> AppearanceResolution {
+        live.cancel(present)
     }
 }
 
@@ -384,7 +389,7 @@ mod tests {
             id(&picker.select(row, &live).expect("selectable")),
             "dracula"
         );
-        assert_eq!(id(&picker.cancel(&live)), "catppuccin-mocha");
+        assert_eq!(id(&picker.cancel(&live, |_| {})), "catppuccin-mocha");
         assert!(!live.is_previewing());
     }
 
@@ -407,10 +412,14 @@ mod tests {
         let profile = previewed.preferences.profile.expect("a profile");
         let mut written = None;
         let applied = picker
-            .apply(&live, |app| {
-                written = Some(app.cloned());
-                Ok::<(), ()>(())
-            })
+            .apply(
+                &live,
+                |app| {
+                    written = Some(app.cloned());
+                    Ok::<(), ()>(())
+                },
+                |_| {},
+            )
             .expect("saved");
         assert_eq!(
             applied.preferences.profile.as_deref(),

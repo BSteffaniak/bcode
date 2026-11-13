@@ -168,7 +168,9 @@ impl AppearanceOverlay {
         }
         match stroke.key {
             KeyCode::Escape => {
-                control.present(&self.picker.cancel(&control.live));
+                let _ = self
+                    .picker
+                    .cancel(&control.live, |resolution| control.present(resolution));
                 AppearanceOutcome::Close
             }
             KeyCode::Enter => self.apply(control),
@@ -225,13 +227,13 @@ impl AppearanceOverlay {
     }
 
     fn apply(&mut self, control: &AppearanceControl) -> AppearanceOutcome {
-        match self.picker.apply(&control.live, |own| control.persist(own)) {
-            Ok(applied) => {
-                control.present(&applied);
-                AppearanceOutcome::Close
-            }
+        match self.picker.apply(
+            &control.live,
+            |own| control.persist(own),
+            |resolution| control.present(resolution),
+        ) {
+            Ok(_) => AppearanceOutcome::Close,
             Err(error) => {
-                control.present(&control.live.current());
                 self.error = Some(format!("could not save the appearance: {error}"));
                 // The preview ended; reopen on what is presented now.
                 self.picker = AppPicker::open("review", &control.live, display_path);

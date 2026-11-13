@@ -123,7 +123,7 @@ pub fn key(
         bcode_keymap::controls::LiteralText::from_stroke(stroke).is_some_and(|text| text.0 == 'f');
     let preview = match action {
         Some(Action::MenuClose) => {
-            let restored = picker.cancel(&live);
+            let restored = picker.cancel(&live, |_| {});
             return Update::redraw().merge(app.present_appearance(&restored));
         }
         Some(Action::MenuConfirm) => {
@@ -132,13 +132,17 @@ pub fn key(
                 .as_ref()
                 .map(|inputs| inputs.state_file.clone())
                 .unwrap_or_default();
-            let saved = picker.apply(&live, |own| {
-                let own = own.map(|own| SavedTuiAppearance {
-                    theme: own.theme.clone(),
-                    profile: own.profile.clone(),
-                });
-                save_app_tui_appearance(&state_file, APPEARANCE_APP, own.as_ref())
-            });
+            let saved = picker.apply(
+                &live,
+                |own| {
+                    let own = own.map(|own| SavedTuiAppearance {
+                        theme: own.theme.clone(),
+                        profile: own.profile.clone(),
+                    });
+                    save_app_tui_appearance(&state_file, APPEARANCE_APP, own.as_ref())
+                },
+                |_| {},
+            );
             return match saved {
                 Ok(applied) => Update::redraw().merge(app.present_appearance(&applied)),
                 Err(error) => {
