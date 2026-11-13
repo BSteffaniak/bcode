@@ -44,6 +44,8 @@ pub struct UnitChrome {
     pub composer: ComposerChrome,
     /// Activity placement, spinner, verbs, and shimmer.
     pub activity: ActivityChrome,
+    /// Decision dialog placement and actions.
+    pub dialogs: bcode_tui_theme::chrome::DialogChrome,
 }
 
 /// Header icon candidates for one tool category, most specific first.
@@ -86,6 +88,7 @@ impl UnitChrome {
             status: theme.chrome.status,
             composer: theme.chrome.composer,
             activity: theme.chrome.activity,
+            dialogs: theme.chrome.dialogs,
         })
     }
 

@@ -456,6 +456,19 @@ pub fn prepare_chrome_with_bottom_dock(
     Some(layout.with_bottom_dock(dock_height))
 }
 
+/// Prepare the shared chat chrome with a dock of `dock_height` rows that replaces the composer,
+/// status line, and activity row (a docked dialog). The composer keeps its content area so
+/// editing state is unchanged when the dock closes.
+pub fn prepare_chrome_with_takeover_dock(
+    app: &mut BmuxApp,
+    area: Rect,
+    dock_height: u16,
+) -> Option<(FrameLayout, Rect)> {
+    let layout = frame_layout(app, area)?;
+    app.set_composer_content_area(layout.composer_content);
+    Some(layout.with_takeover_dock(dock_height))
+}
+
 /// Render one frame of shell chrome (the transcript region is the transcript engine's).
 #[cfg(test)]
 pub fn render(app: &mut BmuxApp, frame: &mut PaintCx<'_, '_>) {
@@ -643,6 +656,38 @@ fn render_header_damage(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, 
 }
 
 impl FrameLayout {
+    /// The layout with a dock of up to `requested_height` rows at the bottom of the frame in
+    /// place of the composer, status line, and activity row (which become empty); the body
+    /// keeps every row above the dock and at least one row.
+    fn with_takeover_dock(self, requested_height: u16) -> (Self, Rect) {
+        let top = self.body.y;
+        let available = self.area.bottom().saturating_sub(top);
+        let height = requested_height.min(available.saturating_sub(1));
+        let dock = Rect::new(
+            self.area.x,
+            self.area.bottom().saturating_sub(height),
+            self.area.width,
+            height,
+        );
+        let empty = Rect::new(self.area.x, dock.bottom(), self.area.width, 0);
+        let body = Rect::new(
+            self.body.x,
+            top,
+            self.body.width,
+            dock.y.saturating_sub(top),
+        );
+        (
+            Self {
+                body,
+                activity: empty,
+                status: empty,
+                composer: empty,
+                ..self
+            },
+            dock,
+        )
+    }
+
     fn with_bottom_dock(self, requested_height: u16) -> (Self, Rect) {
         let full_body = self.body;
         let maximum_height = full_body.height.saturating_sub(1);

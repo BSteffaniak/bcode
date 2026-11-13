@@ -12,6 +12,7 @@ activity      = { placement = "line", spinner = "·✢✳✶✻✽", shimmer = t
 borders       = { panel = "single", dialog = "single", tool = "none", composer = "rules" }
 composer      = { prompt = "❯ ", title = "hidden", placeholder = "", controls = "hidden" }
 density       = "cozy"
+dialogs       = { placement = "docked", actions = "numbered" }
 follow        = "latest"
 header        = "hidden"
 icons         = "unicode"

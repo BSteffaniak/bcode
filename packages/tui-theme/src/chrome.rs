@@ -542,6 +542,38 @@ impl Default for MarkdownChrome {
 /// Widest Markdown list marker gap.
 pub const MAX_MARKER_GAP: u8 = 4;
 
+/// Where decision dialogs (permission requests) appear.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogPlacement {
+    /// A centered modal over a dimmed screen.
+    #[default]
+    Modal,
+    /// Docked at the bottom in place of the composer and status line; the transcript stays
+    /// visible above it.
+    Docked,
+}
+
+/// How a dialog presents its actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogActions {
+    /// A row of buttons.
+    #[default]
+    Buttons,
+    /// A numbered list, one action per row; digits choose an action.
+    Numbered,
+}
+
+/// Decision dialog presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DialogChrome {
+    /// Where dialogs appear.
+    pub placement: DialogPlacement,
+    /// How actions are presented.
+    pub actions: DialogActions,
+}
+
 /// The input composer's chrome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComposerChrome {
@@ -605,6 +637,8 @@ pub struct TuiChrome {
     pub activity: ActivityChrome,
     /// Markdown structure.
     pub markdown: MarkdownChrome,
+    /// Decision dialogs.
+    pub dialogs: DialogChrome,
 }
 
 /// Maximum focus gradient colors.
@@ -661,6 +695,15 @@ pub(crate) struct RawComposer {
     pub placeholder: Option<ChromeText>,
     #[serde(default)]
     pub controls: Option<Visibility>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawDialogs {
+    #[serde(default)]
+    pub placement: Option<DialogPlacement>,
+    #[serde(default)]
+    pub actions: Option<DialogActions>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -741,6 +784,8 @@ pub(crate) struct RawTuiChrome {
     pub activity: Option<RawActivity>,
     #[serde(default)]
     pub markdown: Option<RawMarkdown>,
+    #[serde(default)]
+    pub dialogs: Option<RawDialogs>,
 }
 
 /// `[chrome]` table: the terminal section plus opaque sections for other renderers.
@@ -816,6 +861,7 @@ impl RawTuiChrome {
         overlay!(markers, RawMarkers: user, assistant, bullet, connector);
         overlay!(composer, RawComposer: prompt, title, placeholder, controls);
         overlay!(status, RawStatus: placement, indent, segments);
+        overlay!(dialogs, RawDialogs: placement, actions);
         overlay!(
             markdown,
             RawMarkdown: bullet,

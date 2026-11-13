@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chrome::{
-    ActivityChrome, ComposerChrome, MAX_MARKER_GAP, MAX_STATUS_INDENT, MarkdownChrome,
-    MarkerGlyphs, RawChrome, StatusChrome, TuiBorders, TuiChrome,
+    ActivityChrome, ComposerChrome, DialogChrome, MAX_MARKER_GAP, MAX_STATUS_INDENT,
+    MarkdownChrome, MarkerGlyphs, RawChrome, StatusChrome, TuiBorders, TuiChrome,
 };
 use crate::contrast::ContrastAdjustment;
 use crate::expr::{self, ColorContext, Evaluated};
@@ -1080,6 +1080,13 @@ fn resolve_chrome(
                 quote_bar: markdown.quote_bar,
                 table_headers: markdown.table_headers.unwrap_or_default(),
                 smart_punctuation: markdown.smart_punctuation.unwrap_or(true),
+            }),
+        dialogs: raw
+            .dialogs
+            .as_ref()
+            .map_or_else(DialogChrome::default, |dialogs| DialogChrome {
+                placement: dialogs.placement.unwrap_or_default(),
+                actions: dialogs.actions.unwrap_or_default(),
             }),
     })
 }

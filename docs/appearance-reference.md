@@ -80,7 +80,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 10 | Turn summary row (duration and completion time) | open |
 | 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | done: `markdown` chrome (BMUX `MarkdownPresentation`) |
 | 12 | Activity line: placement, spinner frames, verbs, shimmer | done: `activity`, `activity.*` roles |
-| 13 | Docked permission and question surfaces with numbered option lists | open |
+| 13 | Docked permission and question surfaces with numbered option lists | permission done: `dialogs`; question surface placement is configuration only (open); the awaiting permission unit duplicates a docked dialog (open) |
 | 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
 | 15 | Session banner | open |
 | 16 | Slash menu presentation | open |

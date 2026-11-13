@@ -153,6 +153,7 @@ header    = "shown"         # shown | hidden: the header row at the top of the s
 session_start = "shown"     # shown | hidden: the marker at the start of a session
 status    = { placement = "above_composer", indent = 0, segments = ["activity", "context", "usage", "children", "progress", "plugins", "message", "position", "hints"] }
 activity  = { placement = "status", spinner = "⠋⠙⠹", verbs = [], shimmer = false }
+dialogs   = { placement = "modal", actions = "buttons" }   # modal | docked; buttons | numbered
 markdown  = { bullet = "•", marker_gap = 2, code_blocks = "framed", quote_bar = "│", table_headers = "column", smart_punctuation = true }
 composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls = "shown" }
 ```
@@ -181,6 +182,12 @@ composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls
   "center"`, and `smart_punctuation = false` to keep quotes, dashes, and ellipses as written.
   The `markdown.code.<token>` roles color fenced code, falling back to `syntax.<token>`, so code
   blocks and diffs can use different palettes.
+* `dialogs.placement = "docked"` shows permission requests at the bottom of the screen in place
+  of the composer and status line, with the transcript visible above, instead of a modal:
+  an accent rule, the title, the request's subject between light rules, the question, the
+  actions, and a hint row. `dialogs.actions = "numbered"` lists one action per row with a
+  cursor, chosen with the arrow keys, Enter, a click, or the action's digit. One layout gives
+  the painted rows, the hit regions, and the dock height.
 * `follow = "reply"` holds a new submission's or reply's first row at the viewport top until it
   overflows; `latest` keeps the latest content at the bottom instead. Neither pulls a reader who
   scrolled away from the latest content; a submission returns to it under `latest`.

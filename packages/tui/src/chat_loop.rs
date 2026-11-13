@@ -448,6 +448,9 @@ pub struct ChatLoopState {
     typed_input_task: Option<tokio::task::JoinHandle<()>>,
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
+    /// The dock a docked permission dialog is painted into this frame, when the theme docks
+    /// dialogs and one is shown.
+    pub(super) permission_dock: Option<Rect>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
     appearance_picker: Option<super::appearance_picker::AppearancePickerState>,
     /// Profile to persist once a combined appearance apply has saved its theme.
@@ -554,6 +557,7 @@ impl ChatLoopState {
             typed_input_task: None,
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
+            permission_dock: None,
             thinking_dialog: None,
             appearance_picker: None,
             pending_profile_persist: None,
@@ -6057,9 +6061,22 @@ pub fn draw_chat_frame<W: Write>(
             ))
         })
         .flatten();
-    // The transcript body is the engine's: only the shared chrome layout is derived here.
-    let prepared =
-        render::prepare_chrome_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
+    // The transcript body is the engine's: only the shared chrome layout is derived here. A
+    // docked permission dialog takes the composer's place; other docks sit above it.
+    let docked_permission = docked_permission_dialog(chat, loop_state, terminal.area().width);
+    let prepared = match &docked_permission {
+        Some(dialog) => render::prepare_chrome_with_takeover_dock(
+            &mut chat.app,
+            terminal.area(),
+            dialog.height(),
+        ),
+        None => {
+            render::prepare_chrome_with_bottom_dock(&mut chat.app, terminal.area(), dock_height)
+        }
+    };
+    loop_state.permission_dock = prepared
+        .filter(|_| docked_permission.is_some())
+        .map(|(_, dock)| dock);
     let layout = prepared.map(|(layout, _dock)| layout);
     // Layout-dependent transcript state is synced at this frame's clock (the clock the frame is
     // prepared at, F2). A reservation change made here repaints the transcript region in this
@@ -6231,6 +6248,7 @@ pub fn draw_chat_frame<W: Write>(
     let capabilities = loop_state.markdown_image_capabilities.clone();
     let config = loop_state.markdown_image_config.clone();
     let terminal_area = terminal.area();
+    let permission_docked = loop_state.permission_dock.is_some();
     let draw_result = terminal.draw_damage_with_output_hooks(
         damage,
         |frame| {
@@ -6280,7 +6298,7 @@ pub fn draw_chat_frame<W: Write>(
             // A foreground owning the canvas covers every chat layer, so nothing is painted
             // beneath it: no backdrop buffer is allocated or copied for a full-screen surface.
             if !foreground_owns_canvas {
-                if modal {
+                if modal && !permission_docked {
                     super::foreground::paint_backdrop(area, frame, paint_background);
                 } else {
                     paint_background(frame);
@@ -6475,7 +6493,14 @@ fn paint_foreground(
     if let Some(dialog) = &loop_state.permission_dialog
         && foreground == Some(super::foreground::Foreground::Permission)
     {
-        permission_dialog_render::render_permission_dialog(dialog, frame, theme);
+        if let Some(dock) = loop_state.permission_dock {
+            let numbered = chat.app.presented_theme().unit_chrome.dialogs.actions
+                == bcode_tui_theme::chrome::DialogActions::Numbered;
+            permission_dialog_render::DockedDialog::new(dialog, dock.width, theme, numbered)
+                .paint(dock, frame, theme, numbered);
+        } else {
+            permission_dialog_render::render_permission_dialog(dialog, frame, theme);
+        }
     }
     if let Some(dialog) = &loop_state.thinking_dialog
         && foreground == Some(super::foreground::Foreground::Thinking)
@@ -6537,6 +6562,28 @@ fn paint_foreground(
         );
     }
     paint_launch_dialogs(loop_state, foreground, frame, theme, &effective);
+}
+
+/// The docked layout of the permission dialog in the foreground, when the theme docks dialogs.
+fn docked_permission_dialog(
+    chat: &ActiveChat,
+    loop_state: &ChatLoopState,
+    width: u16,
+) -> Option<permission_dialog_render::DockedDialog> {
+    let theme = render::TuiTheme::for_app(&chat.app);
+    let dialogs = chat.app.presented_theme().unit_chrome.dialogs;
+    if dialogs.placement != bcode_tui_theme::chrome::DialogPlacement::Docked
+        || loop_state.foreground() != Some(super::foreground::Foreground::Permission)
+    {
+        return None;
+    }
+    let dialog = loop_state.permission_dialog.as_ref()?;
+    Some(permission_dialog_render::DockedDialog::new(
+        dialog,
+        width,
+        theme,
+        dialogs.actions == bcode_tui_theme::chrome::DialogActions::Numbered,
+    ))
 }
 
 fn paint_foreground_configurator(

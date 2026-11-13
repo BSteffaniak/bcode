@@ -1077,6 +1077,21 @@ impl BcodeRuntimeModel {
             super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
             return super::invalidation::UiInvalidation::Structural;
         }
+        // Numbered actions are chosen by their digit.
+        let numbered = self.chat.app.presented_theme().unit_chrome.dialogs.actions
+            == bcode_tui_theme::chrome::DialogActions::Numbered;
+        if numbered
+            && stroke.modifiers.is_empty()
+            && let bmux_keyboard::KeyCode::Char(digit @ '1'..='9') = stroke.key
+            && let Some(dialog) = self.loop_state.permission_dialog.as_mut()
+        {
+            let index = usize::from(u8::try_from(digit).unwrap_or(b'1') - b'1');
+            if let Some(resolution) = dialog.activate_action(index) {
+                self.queue_permission_resolution(resolution);
+                return super::invalidation::UiInvalidation::Structural;
+            }
+            return super::invalidation::UiInvalidation::None;
+        }
         let Some(action) = self
             .settings
             .keymap()
