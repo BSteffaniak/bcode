@@ -1,10 +1,13 @@
 # Code Review V2 architecture
 
-Status: implemented (phases 0 to 7). This document is the contract for the Code Review V2
-rewrite. Phases landed in order; each phase was accepted against the criteria in section 11. V2 is
-the only review implementation: V1 was deleted in phase 7 (section 10). Appendix A keeps V1's
-behavior inventory, with its V1 file locations, as the record the parity decisions in Appendix B
-were made against.
+Status: implemented (phases 0 to 14). This document is the contract for the Code Review V2
+rewrite and the record of how it was built. Phases landed in order; each phase was accepted
+against the criteria in section 11. V2 is the only review implementation: V1 was deleted in phase
+7 (section 10), and the review now runs as its own app (13.3). Sections 2.1, 10 and 13 keep
+measurements and implementation notes as they were at each phase; where they name files that
+moved later, section 3 and 13.3 give the current locations. Appendix A keeps V1's behavior
+inventory, with its V1 file locations, as the record the parity decisions in Appendix B were made
+against. The user-facing reference is [`code-review-app.md`](code-review-app.md).
 
 ## 1. Purpose and scope
 
@@ -41,9 +44,10 @@ migrated through Switchy's typed schema APIs (no raw SQL, per `AGENTS.md`).
   projection), it is implemented in BMUX with generic APIs and tests, developed through
   `scripts/bmux-dev.sh` (`docs/bmux-development.md`). Nothing Bcode-specific goes upstream.
 * **Review semantics stay in Bcode.** Review sources, anchors, drafts, threads, stacks, publish
-  mapping, viewed state, and review presentation policy live in `plugins/code-review-plugin`
-  (UI and service) and `packages/code-review/models` (contracts). Pull-request provider behavior
-  stays in provider plugins.
+  mapping, viewed state, and review presentation policy live in `packages/code-review` (data
+  layer and document), `packages/code-review-ui` (the app), `packages/code-review/models`
+  (contracts), and `plugins/code-review-plugin` (service adapters, review tools, and the
+  `bcode review` command). Pull-request provider behavior stays in provider plugins.
 * **The host provides plumbing only.** No code-review routing, outcome types, or product flow in
   `packages/tui` or `packages/cli`.
 
@@ -318,24 +322,29 @@ under the chat host; the tables and their attribution are in 13.2.
 
 ```
  packages/code-review/models     contracts: sources, revisions, index, hunks, blobs, anchors,
-                                 stacks, workspace schema, service + provider interfaces
+ (bcode_code_review_models)      stacks, workspace schema, service + provider interfaces
             ▲
- plugins/code-review-plugin
-   service/   (daemon side)      git access, index/hunk/blob ops, workspace persistence,
-                                 live refresh, stack resolution via provider interface
-   document/  (renderer-neutral) review document: files, sections, gaps, expansion sets,
-                                 threads, anchors, viewed state, navigation targets
-   tui/       (BMUX adapter)     routes (home, wizard, review), components, theme, input
+ packages/code-review            data layer as plain Rust calls: git access, index/hunk/blob
+ (bcode_code_review)             reads, review store, viewed marks, provider routing, publish
+   document/  (renderer-neutral) planning; the review document: files, sections, gaps,
+                                 expansion sets, threads, anchors, viewed state, navigation
             ▲
+ packages/code-review-ui         the BMUX app: routes (home, wizard, review), components, theme
+ (bcode_code_review_ui)          tiers, keymap, AI cards, assistant dock, ReviewHost boundary
+   cli/ (bcode-review binary)
+            ▲
+ plugins/code-review-plugin      bcode.code_review/v1 service adapters, code_review.* agent
+                                 tools, keymap contribution, and the `bcode review` command
  plugins/github-review-publisher-plugin
-                                 publisher + importer + NEW review-source provider (PR list,
+                                 publisher + importer + review-source provider (PR list,
                                  stack graph) built on packages/forge
 ```
 
-* `document/` must not import BMUX, crossterm, or terminal types. It is unit-testable and is the
-  only owner of review structure. `tui/` only adapts it. If mechanical enforcement is wanted, the
-  module can be extracted to a domain crate later; it is not created speculatively now.
-* V2 source lives beside V1 in the plugin (`src/v2/…`) so V1 can be deleted wholesale.
+* `document/` imports no BMUX, crossterm, or terminal types. It is unit-testable and is the
+  only owner of review structure; the app only adapts it.
+* The app calls the data layer directly; the plugin serves the same functions over the same
+  state database to agents and other plugins. `bcode review` and `bcode-review` run the same
+  `bcode_code_review_ui::run` (13.3).
 
 ## 4. Data layer
 
@@ -777,8 +786,10 @@ them in when the same target opens again; saving the review moves them.
 * Mouse: click files, gaps, thread actions; drag across lines to select a range and comment on it;
   hover shows a `+` comment affordance in the gutter; wheel scrolling uses `ScrollMotion`.
 * Composer: inline under the anchor, using the shared prose editor; markdown preview toggle.
-* AI questions keep using `PluginTuiAction::OpenSession`; returning restores the exact position.
-* All keys are declared in the plugin manifest keymap (configurable), as today.
+* AI questions follow their session live in an inline card (13.5); `o` hands the terminal to
+  `bcode tui` for the session, and returning restores the exact position.
+* All keys are declared in `packages/code-review-ui/keymap.toml` (configurable through the
+  bcode keymap configuration; 13.3).
 
 **Implementation (phase 3c).** `packages/code-review-ui/src/` (`notes.rs`, `composer.rs`, `agent.rs`,
 `palette.rs`, `surface/annotate.rs`, `surface/pointer.rs`, `surface/find.rs`):
@@ -1293,6 +1304,10 @@ and so on), and `branch`, `compare`, `commit`, `pr`,
 variable are removed outright: passing `--ui` is a usage error from the argument parser, and the
 environment variable is ignored. `publish-github` is unchanged.
 
+**Implementation (phase 9).** The subcommands no longer open a plugin surface: `bcode review`
+runs the standalone app in process through the plugin's static CLI registration, and the
+`bcode-review` binary takes the same subcommands (13.3, [`code-review-app.md`](code-review-app.md)).
+
 * **Saving transient reviews.** `ctrl+s` (`save_review`, review scope, shown in the hints while
   the review is transient) creates a durable workspace with the same title and sources, copies
   its viewed marks, presentation state, and reviewed revisions, and moves its drafts (saved in the
@@ -1649,7 +1664,7 @@ chat host into its own app, give it a deliberate visual system, make AI work vis
 happens, add a review assistant whose writes are governed by bcode permissions, and define how
 any app embeds real bcode sessions.
 
-### 13.1 Current state that motivates the plan
+### 13.1 State before phase 9 that motivated the plan
 
 * **The review runs inside the chat program.** `bcode review` opens the `code-review` plugin
   surface through `run_prepared_plugin_surface` (`packages/tui/src/runtime.rs`). Its
@@ -2383,6 +2398,79 @@ decisions D1–D8 were written before the build and have not been signed off.
 Re-measure (13.2's sizes and the 2.1 benchmarks), close parity (Appendix B) for everything the
 move touched, update this document and `docs/code-review-plugin-extension-points.md`, and run
 the tmux smoke at narrow, normal, and large sizes.
+
+**Built.**
+
+* **Measurements.** Taken on a shared machine whose load average was 20–57 throughout (other
+  builds running), so absolute times are pessimistic; Criterion B still holds at every size.
+
+  Optimized `screen_benchmark_sizes` (paint p95, unified (side-by-side); bytes per frame
+  average):
+
+  | Measurement | 200×60 | 300×90 | 400×120 | 400×120 after phase 9 |
+  | --- | --- | --- | --- | --- |
+  | 5k-file scroll | 0.96 (1.34) ms | 1.20 (1.25) ms | 1.90 (1.45) ms | 1.14 (1.16) ms |
+  | 40k-line scroll | 0.57 (1.84) ms | 1.46 (0.96) ms | 1.40 (1.35) ms | 0.85 (0.85) ms |
+  | Held `j` | 0.58 (1.82) ms | 3.20 (1.03) ms | 1.52 (1.45) ms | 0.88 (0.87) ms |
+  | Held PageDown | 0.55 (0.88) ms | 1.86 (1.27) ms | 1.63 (1.66) ms | 1.18 (1.23) ms |
+  | 10 queued `j` | 0.63 (1.36) ms | 1.73 (1.29) ms | 1.71 (1.63) ms | 1.17 (1.27) ms |
+  | Bytes, 5k-file scroll | 13 (16) KB | 20 (26) KB | 29 (38) KB | 28 (36) KB |
+  | Bytes, held `j` | 6.2 (11) KB | 7.5 (10) KB | 6.5 (10) KB | 6.3 (9.8) KB |
+
+  The 300×90 held `j` p95 of 3.2 ms comes from a few frames stalled by the machine (its maximum
+  was 63 ms); the same case is 1.0 ms side by side and 1.5 ms at 400×120. Bytes per frame match
+  phase 9: the visual system's surface fills add no steady-state output, since unchanged cells
+  are not rewritten.
+
+  Real app at 400×120 (`debug-release` build, the exported 5k-file fixture, `range
+  fixture/base main`, tmux under `script(1)`, `sample` for 15 s; per presented frame, UI
+  thread):
+
+  | Measurement | `bcode review` | `bcode-review` | `bcode-review` after phase 9 |
+  | --- | --- | --- | --- |
+  | Idle frames | 0 (main thread waiting the whole time) | 0 | 0 |
+  | Held `j`: render / encode / idle preparation | 0.93 / 0.46 / 0.16 ms | 1.18 / 0.47 / 0.17 ms | 0.70 / 0.27 ms / not reported |
+  | Held `j`: bytes per frame | 19.8 KB (scroll regions in 111 of 316 frames) | 19.3 KB (126 of 332) | 18 KB (171 of 375) |
+  | Held PageDown: render / encode / idle preparation | 1.10 / 0.44 / 0.83 ms | 0.87 / 0.49 / 0.70 ms | 0.76 / 0.40 / 1.08 ms |
+  | Held PageDown: bytes per frame | 61 KB | 71 KB | not reported (a page moves every row) |
+  | Main thread busy, held `j` / PageDown | 6% / 13% | 6% / 14% | not reported |
+  | Burst of 100 `j` | stays open; last output 45 ms after the burst | stays open; 69 ms | not reported |
+
+  Both entry points run the same loop, so they measure alike; the write stays on the output
+  thread (no blocking write on the UI thread in either).
+* **Parity.** Appendix B was rechecked against the standalone app. Rows the later phases changed
+  are updated: the entry point and surfaces (INV-ENT-08, INV-ENT-16), composer completion
+  (INV-CMT-06), the live AI card (INV-AI-06, INV-AI-07, INV-AI-11), the theme (INV-HOME-23,
+  INV-DISP-03) and help (INV-HELP-01). Three bugs found on the way are fixed:
+  * On a fresh state directory, `bcode review` could fail to open a review with "database
+    migration failed": the app and the daemon's code review plugin (and concurrent requests of
+    one process) migrated the shared database at the same time and applied a schema change
+    twice. Migrations now run under an exclusive lock file beside the database
+    (`code-review.db.migrate.lock`).
+  * Help had no section for the review assistant's keys, although its scope is declared and
+    rebindable; help now lists it beside the AI card's.
+  * A pane with an empty status (the assistant dock before its first answer) left a blank gap
+    at the end of its title row.
+
+  Section 11's criteria hold: the
+  host crates carry only feature-gated plumbing for the review (D), and the code review and
+  GitHub plugins stay independently disableable.
+* **Intentional removals and open items**, all recorded in their phases' "Not built here":
+  spinners beside each busy item, rail collapse and pane zoom (13.4); the in-review "Show all"
+  transcript panel, a follow-up composer inside the card, and keyboard access to reasoning and
+  tool output (13.5); session-setting chips, publishing to forge publishers from a tool, CI
+  detail beyond the aggregate state, persisted dock state, and field-level viewed updates
+  (13.6); and the app-hosted runtime (13.7).
+* **Documentation.** [`code-review-app.md`](code-review-app.md) is the user reference: commands,
+  every default key by scope (checked against `keymap.toml`), configuration including
+  `viewed_reset`, `[tui.theme]` and `color_depth`, the assistant tools and their permissions,
+  and a pointer to [embedded sessions](embedded-sessions.md). The extension-points document
+  covers session origins and reaching the installed Bcode.
+* **Comments.** Code comments across the workspace no longer cite spec sections, phases or
+  "V1/V2"; persisted keys and identifiers that carry those names (for example `review_v2`) are
+  unchanged.
+* **Smoke.** The review PTY cases pass against a debug build, and the tmux smoke ran at 80×24,
+  200×50 and 400×120 in `bcode-dark` and `bcode-light`.
 
 ## Appendix A. V1 behavior inventory
 
@@ -3324,11 +3412,14 @@ All of `code-review-build` is (replaced: wizard plus source editing; see INV-SRC
 
 ## Appendix B. V2 parity status
 
-Status of every Appendix A item after phase 6 (scope and surface names as renamed in phase 7). **Done**: V2 has the behavior (where the item
+Status of every Appendix A item after phase 6 (scope and surface names as renamed in phase 7),
+rechecked against the standalone app at phase 14; rows the later phases changed say so.
+**Done**: V2 has the behavior (where the item
 names it, with the same keys or the keys given). **Replaced by X**: the spec supersedes the V1
 behavior and X covers its purpose. **Dropped**: V2 deliberately does not reproduce it, with the
 reason. V1 defects and unreachable bindings are dropped by the rule of Appendix A. Keys are V2
-defaults (every action is in the manifest keymap, the palette, and help; 6.2 "Key bindings").
+defaults (every action is in `packages/code-review-ui/keymap.toml`, the palette, and help; 6.2
+"Key bindings").
 Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for the phase 6 part 2 items).
 
 ### B.1 Entry points and CLI
@@ -3342,7 +3433,7 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 | INV-ENT-05 | Done: `last-commit`. |
 | INV-ENT-06 | Done: `range BASE HEAD [--two-dot]`; also `compare` and `commit`. |
 | INV-ENT-07 | Done: `repo` opens a browse source (5.1). |
-| INV-ENT-08 | Done: `publish-github` is a UI-independent CLI command over `review.bundle.get`; unchanged. |
+| INV-ENT-08 | Done: `publish-github` is a UI-independent CLI command; since phase 9 it builds the bundle with the data layer directly (the same function `review.bundle.get` serves) and reaches the publisher through the daemon. |
 | INV-ENT-09 | Done: unchanged (same command). |
 | INV-ENT-10 | Replaced by transient reviews that can be saved (`ctrl+s`) and the new entry points (7.5). |
 | INV-ENT-11 | Replaced by internal routes: leaving a review returns to home (7.1). |
@@ -3350,7 +3441,7 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 | INV-ENT-13 | Done: entries that fail show the opening route's error with a way back (7.1). |
 | INV-ENT-14 | Replaced by `q`/`esc` to leave (after saves finish; `esc` first clears a selection or search; an unsaved review with annotations offers saving, 7.5). `ctrl+d` is the half-page motion. Leaving is safe: everything is saved and home is one key from the review. |
 | INV-ENT-15 | Done: the plugin's `diff.toggle` palette command is unchanged. |
-| INV-ENT-16 | Replaced by the single `code-review` surface with routes (7.1). |
+| INV-ENT-16 | Replaced by one app with internal routes (7.1); since phase 9 it is the standalone app that `bcode review` and `bcode-review` run, and the plugin declares no TUI surface (13.3). |
 | INV-ENT-17 | Done: unchanged disableability features. |
 
 ### B.2 Home
@@ -3379,7 +3470,7 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 | INV-HOME-20 | Done: one change at a time, failures as toasts. |
 | INV-HOME-21 | Done: selection follows the review identity. |
 | INV-HOME-22 | Done: footer hints from the keymap and input prompts. |
-| INV-HOME-23 | Replaced by the shared `ReviewTheme` (6.3). |
+| INV-HOME-23 | Replaced by the shared `ReviewTheme`, derived from the theme tiers since phase 10 (6.3, 13.4). |
 
 ### B.3 Workspace and sources
 
@@ -3475,7 +3566,7 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 | INV-CMT-03 | Done: inline composer with titles per mode and `ctrl+p` preview. |
 | INV-CMT-04 | Done: Save draft, Ask Bcode (switch), preview, cancel buttons; publishing is `shift+p` after saving. |
 | INV-CMT-05 | Done: `enter`/`ctrl+s` submit, `esc` cancels, empty text discarded, paste; `shift+enter` adds a line (V1 defect fixed). |
-| INV-CMT-06 | Done: host completion through `FocusedTextFieldAdapter` (6.2). |
+| INV-CMT-06 | Done: since phase 9, `@path` completion inside the composer through BMUX's completion controller over the data layer's file search (13.3). |
 | INV-CMT-07 | Replaced by saving the comment, then `shift+p`; the checklist shows readiness instead of a second press. |
 | INV-CMT-08 | Done: optimistic, serialized, reconciled by job (6.2). |
 | INV-CMT-09 | Done: `i` edits the thread's latest comment; unsaved comments are refused. |
@@ -3498,12 +3589,12 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 | INV-AI-03 | Done: first questions create and link a session; later questions on the anchor are follow-ups in it. |
 | INV-AI-04 | Done: bounded prompt with review, repository, sources, file, ranges, up to 80 lines, up to 12 other threads, the question, and the service operations. Line kinds are the diff markers; nearby hunk context and the draft being edited are reachable through `review.context.get` and `review.thread.get`, which the prompt names. |
 | INV-AI-05 | Done: persisted exchanges; a failed save is not retried into a second session. |
-| INV-AI-06 | Replaced by live status and the answer preview; tool calls and activity are in the linked session (`o`). |
-| INV-AI-07 | Done: `subscribe_session_view`. |
+| INV-AI-06 | Done since phase 11: the card follows the session live with reasoning, tool lines and their output, the streaming answer, tokens and cost, and inline permission prompts (13.5); the full session is still one key away (`o`). |
+| INV-AI-07 | Done: the session's public follow stream through `BcodeClient` (13.3, 13.5). |
 | INV-AI-08 | Done: Retry button and `retry`. |
 | INV-AI-09 | Done: `z`/More shows the whole answer (persisted); reachable by key now. |
 | INV-AI-10 | Done: `shift+d` on an answer. |
-| INV-AI-11 | Done: `o`; the position is restored on return. |
+| INV-AI-11 | Done: `o` hands the terminal to `bcode tui <session>`; the position is restored on return, in `bcode review` and `bcode-review`. |
 | INV-AI-12 | Done: `m` (`draft_answer`), deduplicated. |
 
 ### B.9 Suggestions
@@ -3736,7 +3827,7 @@ Overlays:
 
 | ID | Status |
 | --- | --- |
-| INV-HELP-01 | Replaced by complete, scrollable help generated from the keymap (review, composer, file panel, threads panel). |
+| INV-HELP-01 | Replaced by complete, scrollable help generated from the keymap (review, composer, AI card, review assistant, file panel, threads panel). |
 | INV-HELP-02 | Done: home help. |
 | INV-HELP-03 | Done: modal footers carry their keys. |
 | INV-HELP-04 | Replaced by status messages for refused actions, key hints, and toasts. |
@@ -3747,7 +3838,7 @@ Overlays:
 | --- | --- |
 | INV-DISP-01 | Replaced by whole-blob highlighting and unified/side-by-side layouts (6.1, 6.4). |
 | INV-DISP-02 | Done: markdown comments and answers. |
-| INV-DISP-03 | Replaced by `ReviewTheme` (6.3). |
+| INV-DISP-03 | Replaced by `ReviewTheme` and the theme tiers (6.3, 13.4). |
 | INV-DISP-04 | Done: empty states for the document, the threads panel, and home. |
 
 ### B.21 Service contracts

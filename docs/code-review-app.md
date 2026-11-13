@@ -18,10 +18,29 @@ bcode-review -C ../repo
 bcode-review --print-config-paths
 ```
 
-Subcommands: `unstaged`, `staged`, `all`, `last-commit`, `range`, `repo`, `branch`, `compare`,
-`commit`, `pr`, `stack`, `resume`, and `publish-github`. Every subcommand except
-`publish-github` opens the app; `publish-github` previews (or with `--submit` submits) a review
-to a GitHub pull request without opening it.
+## Commands
+
+`bcode-review` takes `-C DIR` (run as if started in `DIR`) and `--print-config-paths`. Every
+subcommand takes `--repo PATH` (default `.`). Without a subcommand the app opens the review home.
+
+| Subcommand | Opens |
+|---|---|
+| `unstaged` | A transient review of unstaged working-tree changes. |
+| `staged` | A transient review of the index. |
+| `all` | Staged and unstaged changes together. |
+| `last-commit` | The last commit. |
+| `range BASE HEAD [--two-dot]` | A revision range (merge-base semantics unless `--two-dot`). |
+| `repo` | Browse the repository's files and comment anywhere. |
+| `branch [BASE]` | The current branch against its base (the upstream, else the default branch). |
+| `compare BASE HEAD [--two-dot]` | Two branches or revisions. |
+| `commit REV...` | One or more commits (one range when they form a first-parent chain). |
+| `pr NUMBER\|URL` | A pull request (needs a review-source provider plugin). |
+| `stack [NUMBER\|URL]` | A whole stack of pull requests; without a reference, the stack of the current branch's pull request. |
+| `resume [ID]` | A saved review; without an id, the most recently updated one. |
+| `publish-github` | Does not open the app: previews (or with `--submit` submits) the drafts of `--target` (default `unstaged`) as a GitHub review on `--pr` in `--github-repo`, with `--submit-event comment\|request-changes\|approve`, `--summary`, `--token-env` (default `GITHUB_TOKEN`) and `--fallback-unmapped-to-summary`. |
+
+Transient reviews (every subcommand but `resume`) keep their drafts per target; `ctrl+s` saves one
+to the review home.
 
 ## Architecture
 
@@ -298,6 +317,188 @@ layout are pills.
 `NO_COLOR`, a dumb terminal, or `[tui] color_depth` reduce the colors written to the terminal.
 Without colors, the cursor line and selected ranges are reversed and search matches underlined.
 
+## Keys
+
+These are the default keys, declared in `packages/code-review-ui/keymap.toml`. `?` shows them in
+the app, `:` or `ctrl+p` runs any action by name (including the unbound ones), and
+`[tui.keybindings.scopes."<scope>"]` rebinds them (see Configuration). A count typed before a
+motion repeats it. While a search is active, `n` moves to the next match.
+
+### Home (`code-review-home`)
+
+| Keys | Action |
+|---|---|
+| `j`, `down` | Next review |
+| `k`, `up` | Previous review |
+| `pagedown` | Page down |
+| `pageup` | Page up |
+| `g`, `home` | First review |
+| `shift+g`, `end` | Last review |
+| `enter` | Open the review (fold a group) |
+| `space` | Fold or unfold the group |
+| `n` | New review |
+| `c` | Continue the latest review |
+| `/` | Filter reviews |
+| `r` | Rename the review |
+| `x` | Archive the review |
+| `shift+r` | Restore the archived review |
+| `d` | Show / hide the preview |
+| `tab` | Switch between suggestions and reviews |
+| `ctrl+r` | Reload reviews and suggestions |
+| `?` | Keyboard help |
+| `q` | Quit |
+
+### New-review wizard (`code-review-wizard`)
+
+| Keys | Action |
+|---|---|
+| `tab` | Mark or unmark the commit or file (include or exclude a source when editing) |
+| `shift+tab` | Mark every commit or file from the last mark |
+| `esc` | Back one step |
+
+### Review (`code-review`)
+
+| Keys | Action |
+|---|---|
+| `j`, `down` | Move down |
+| `k`, `up` | Move up |
+| `ctrl+d` | Half page down |
+| `ctrl+u` | Half page up |
+| `pagedown` | Page down |
+| `pageup` | Page up |
+| `g`, `home` | Top of review |
+| `shift+g`, `end` | End of review |
+| `n` | Next file |
+| `p` | Previous file |
+| `}` | Next hunk |
+| `{` | Previous hunk |
+| `]` | Next change |
+| `[` | Previous change |
+| `e` | Reveal context below |
+| `shift+e` | Reveal context above |
+| `x` | Reveal hidden lines |
+| `shift+x` | Reveal whole file |
+| `shift+s` | Toggle unified / side-by-side |
+| `shift+w` | Toggle line wrapping |
+| `r`, `ctrl+r` | Refresh review |
+| `q`, `esc` | Exit review |
+| `tab` | Focus next pane |
+| `t` | Show / hide file panel |
+| `f` | Filter files |
+| `>` | Widen file panel |
+| `<` | Narrow file panel |
+| `shift+t` | Show / hide threads panel |
+| `ctrl+k` | Open, focus, or close the review assistant |
+| `c` | Comment on the line, range, or file (reply on a thread) |
+| `a` | Ask Bcode about the line, range, or file |
+| `shift+f` | Comment on the file |
+| `shift+c` | Comment on the whole review |
+| `shift+v` | Select a range of lines |
+| `y` | Copy the selected lines |
+| `i` | Edit the thread's latest comment |
+| `shift+d` | Delete the latest comment or AI answer |
+| `shift+r` | Resolve or reopen the thread |
+| `shift+k` | Change the thread's kind |
+| `!` | Change the thread's severity |
+| `o` | Open the AI answer's Bcode session |
+| `)` | Next thread |
+| `(` | Previous thread |
+| `v` | Mark the file viewed and go to the next unviewed file |
+| `u` | Next unviewed file |
+| `shift+u` | Previous unviewed file |
+| `/` | Search the review |
+| `shift+n` | Previous search match |
+| `:`, `ctrl+p` | Command palette |
+| `?` | Keyboard help |
+| `ctrl+s` | Save this review to the reviews home |
+| `shift+p` | Publish the review… |
+| `shift+i` | Import an external review… |
+| `.` | Next stack layer |
+| `,` | Previous stack layer |
+| `shift+l` | Show only the changes since your last review (toggle) |
+| `shift+m` | Mark the review pass complete |
+| `enter` | Actions of the thread or AI answer (reveals a gap) |
+| `z` | Collapse or expand the thread (whole or preview AI answer) |
+| `shift+z` | Collapse every thread (expand all when all are collapsed) |
+| `shift+h` | Show / hide resolved threads |
+| `h` | Show / hide viewed files in the file panel |
+| palette only | Next open thread |
+| palette only | Previous open thread |
+| palette only | Next AI answer |
+| palette only | Previous AI answer |
+| palette only | Next unviewed file, else next open thread |
+| `shift+a` | Ask Bcode: review commands… |
+| palette only | Ask Bcode to explain the change |
+| palette only | Ask Bcode to find risks |
+| palette only | Ask Bcode to suggest a review comment |
+| palette only | Ask Bcode to check the tests |
+| palette only | Ask Bcode to summarize the file |
+| `shift+y` | Copy the AI answer |
+| `s` | Turn the AI answer into a suggested comment |
+| `m` | Turn the AI answer into a draft comment |
+| `;` | Accept the suggestion as a draft comment |
+| palette only | Ask Bcode to refine the suggestion |
+| palette only | Reject the suggestion |
+| palette only | Reconnect the AI answer's stream |
+| palette only | Mark every file viewed |
+| palette only | Mark every file unviewed |
+| palette only | Go to a line of this file (type its number in the palette) |
+| palette only | Copy a Markdown review report |
+| palette only | Edit the review's sources… |
+
+### File panel (focused) (`code-review-files`)
+
+| Keys | Action |
+|---|---|
+| `enter` | Open the file (fold a directory) and go to the review |
+| `space` | Fold or unfold the directory |
+| `left` | Collapse the directory, or go to its parent |
+| `right` | Expand the directory |
+| `esc` | Back to the review |
+
+### Threads panel (focused) (`code-review-threads`)
+
+| Keys | Action |
+|---|---|
+| `enter` | Go to the thread in the review |
+| `right` | Next threads filter |
+| `left` | Previous threads filter |
+| `esc` | Back to the review |
+
+### Comment composer (`code-review-composer`)
+
+| Keys | Action |
+|---|---|
+| `ctrl+s` | Save the comment |
+| `ctrl+p` | Toggle markdown preview |
+| `ctrl+t` | Switch between comment and question |
+| `alt+k` | Change the thread kind |
+| `alt+s` | Change the thread severity |
+| `esc` | Cancel the comment |
+
+### AI card with a running turn or a permission request (`code-review-feed`)
+
+| Keys | Action |
+|---|---|
+| `y` | Allow the AI card's permission request once |
+| `a` | Always allow the AI card's permission request |
+| `n` | Decline the AI card's permission request once |
+| `d` | Never allow the AI card's permission request |
+| `esc`, `ctrl+c` | Stop the AI card's running turn |
+
+### Review assistant (focused) (`code-review-assistant`)
+
+| Keys | Action |
+|---|---|
+| `ctrl+k` | Close the assistant |
+| `esc` | Back to the review (the assistant stays open) |
+| `ctrl+c` | Stop the assistant's running turn |
+| `ctrl+x` | Attach or detach the cursor's place as context |
+| `ctrl+n` | Start a new conversation |
+| `ctrl+o` | Open the assistant's session in Bcode |
+| `pageup` | Scroll the conversation up |
+| `pagedown` | Scroll the conversation down |
+
 ## Configuration
 
 Both entry points read the ordinary bcode configuration files, discovered and layered like
@@ -322,7 +523,11 @@ bcode's own (`--print-config-paths` lists them in order):
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.
   `none` or `unbind` removes a default.
-* `[tui.theme]`: the theme, loaded through `bcode_tui_theme` discovery like `bcode-git`.
+* `[tui.theme]`: the theme, shared with the rest of bcode: `name` (a bundled theme such as
+  `bcode-dark`, `bcode-light`, `nord` or `monochrome`, or one from the theme directories),
+  `overlays` applied after it, and extra theme files or directories in `paths`. Themes are
+  discovered through `bcode_tui_theme` like `bcode-git`'s; the visual system above derives every
+  color the app uses from the chosen theme.
 * `[tui] color_depth`: `auto` (the default: no colors under `NO_COLOR` or a dumb terminal, else
   full color), `truecolor`, `ansi256`, `ansi16`, or `none`, as in bcode.
 * `[tui.diff_viewer]`: bcode's diff layout preference, followed unless the review's own table
@@ -337,7 +542,8 @@ them.
 Review state lives in `code-review.db`, shared by the app and the daemon's plugin. It is in
 `code-review/` under the bcode state directory by default, in the repository's
 `.bcode/code-review` with `state_location = "repo"`, in `state_dir` when that is set, and in
-`BCODE_CODE_REVIEW_STATE_DIR` when that environment variable is set.
+`BCODE_CODE_REVIEW_STATE_DIR` when that environment variable is set. Schema migrations of the
+shared database run one at a time under the lock file `code-review.db.migrate.lock` beside it.
 
 ## Testing
 
@@ -348,3 +554,13 @@ Review state lives in `code-review.db`, shared by the app and the daemon's plugi
   `cargo test --release -p <crate> <name> -- --ignored`.
 * The `review-*` cases of `scripts/smoke-continuous-tui-pty.py` drive a real `bcode review`
   in a pseudo-terminal against an isolated fixture repository and state.
+
+## See also
+
+* [Embedded sessions](embedded-sessions.md): how apps such as the review share sessions, tools
+  and origins with Bcode.
+* [Code review plugin extension points](code-review-plugin-extension-points.md): the service,
+  provider, publisher and importer interfaces other plugins implement.
+* [`code-review-v2-architecture.md`](code-review-v2-architecture.md): the design record and
+  measurements.
+* [Permissions](permissions.md): the rules the review tools follow.
