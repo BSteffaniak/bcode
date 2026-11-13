@@ -77,6 +77,14 @@ pub struct SavedTuiAppearance {
 struct StateDocument {
     #[serde(default)]
     theme: ThemeSection,
+    #[serde(default)]
+    apps: std::collections::BTreeMap<String, AppSection>,
+}
+
+#[derive(Default, Deserialize)]
+struct AppSection {
+    #[serde(default)]
+    theme: Option<ThemeSection>,
 }
 
 #[derive(Default, Deserialize)]
@@ -87,6 +95,38 @@ struct ThemeSection {
     profile: Option<String>,
 }
 
+impl From<ThemeSection> for SavedTuiAppearance {
+    fn from(section: ThemeSection) -> Self {
+        Self {
+            theme: section.name,
+            profile: section.profile,
+        }
+    }
+}
+
+fn parse_document(text: &str) -> Result<StateDocument, LayersError> {
+    toml::from_str::<StateDocument>(text).map_err(|error| LayersError::Composition {
+        message: format!("failed to parse TUI state: {error}"),
+    })
+}
+
+fn read_state(path: &Path) -> Result<Option<String>, LayersError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(LayersError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn located(path: &Path, error: &LayersError) -> LayersError {
+    LayersError::Composition {
+        message: format!("{}: {error}", path.display()),
+    }
+}
+
 impl SavedTuiAppearance {
     /// Read the theme choices from state file text. Other sections are ignored.
     ///
@@ -94,14 +134,7 @@ impl SavedTuiAppearance {
     ///
     /// * [`LayersError::Composition`] when the text is not TOML or `[theme]` is malformed.
     pub fn parse(text: &str) -> Result<Self, LayersError> {
-        let document =
-            toml::from_str::<StateDocument>(text).map_err(|error| LayersError::Composition {
-                message: format!("failed to parse TUI state: {error}"),
-            })?;
-        Ok(Self {
-            theme: document.theme.name,
-            profile: document.theme.profile,
-        })
+        Ok(parse_document(text)?.theme.into())
     }
 
     /// Read the theme choices from the state file at `path`; a missing file saves nothing.
@@ -111,22 +144,67 @@ impl SavedTuiAppearance {
     /// * [`LayersError::Io`] when the file exists but cannot be read.
     /// * [`LayersError::Composition`] when it cannot be parsed.
     pub fn load(path: &Path) -> Result<Self, LayersError> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text).map_err(|error| LayersError::Composition {
-                message: format!("{}: {error}", path.display()),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(LayersError::Io {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
+        read_state(path)?.map_or_else(
+            || Ok(Self::default()),
+            |text| Self::parse(&text).map_err(|error| located(path, &error)),
+        )
     }
 }
 
-/// Replace the theme choices in the state file at `path`, keeping every other section and key
-/// as it is. `None` removes a choice, so the configured value applies again. The file is
-/// replaced atomically, so readers see either the previous or the new state.
+/// The appearance choices one app reads from the state file: Bcode's own choice and the app's
+/// own choice (`[apps.<app>.theme]`), which replaces Bcode's for that app while present.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedAppAppearance {
+    /// Bcode's own choice (`[theme]`).
+    pub bcode: SavedTuiAppearance,
+    /// The app's own choice, or `None` when the app follows Bcode's.
+    pub app: Option<SavedTuiAppearance>,
+}
+
+impl SavedAppAppearance {
+    /// The choice the app presents: its own when it has one, else Bcode's.
+    #[must_use]
+    pub fn effective(&self) -> &SavedTuiAppearance {
+        self.app.as_ref().unwrap_or(&self.bcode)
+    }
+
+    /// Read the choices of `app` from state file text. Other sections are ignored.
+    ///
+    /// # Errors
+    ///
+    /// * [`LayersError::Composition`] when the text is not TOML or a theme section is
+    ///   malformed.
+    pub fn parse(text: &str, app: &str) -> Result<Self, LayersError> {
+        let mut document = parse_document(text)?;
+        Ok(Self {
+            bcode: document.theme.into(),
+            app: document
+                .apps
+                .remove(app)
+                .and_then(|section| section.theme)
+                .map(Into::into),
+        })
+    }
+
+    /// Read the choices of `app` from the state file at `path`; a missing file saves nothing.
+    ///
+    /// # Errors
+    ///
+    /// * [`LayersError::Io`] when the file exists but cannot be read.
+    /// * [`LayersError::Composition`] when it cannot be parsed.
+    pub fn load(path: &Path, app: &str) -> Result<Self, LayersError> {
+        read_state(path)?.map_or_else(
+            || Ok(Self::default()),
+            |text| Self::parse(&text, app).map_err(|error| located(path, &error)),
+        )
+    }
+}
+
+/// Replace Bcode's theme choices (`[theme]`) in the state file at `path`.
+///
+/// Every other section and key stays as it is. `None` removes a choice, so the configured value
+/// applies again. The file is replaced atomically, so readers see either the previous or the new
+/// state.
 ///
 /// # Errors
 ///
@@ -137,27 +215,72 @@ pub fn save_tui_appearance(
     path: &Path,
     appearance: &SavedTuiAppearance,
 ) -> Result<(), LayersError> {
-    let mut document = match std::fs::read_to_string(path) {
-        Ok(text) => text
-            .parse::<toml::Table>()
-            .map_err(|error| LayersError::Composition {
-                message: format!("{}: failed to parse TUI state: {error}", path.display()),
-            })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(source) => {
-            return Err(LayersError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
+    edit_state(path, |document| {
+        let theme =
+            table_entry(document, "theme").ok_or_else(|| "[theme] is not a table".to_owned())?;
+        write_choices(theme, appearance);
+        Ok(())
+    })
+}
+
+/// Replace the app's own theme choice (`[apps.<app>.theme]`) in the state file at `path`.
+///
+/// Every other section and key stays as it is. `None` removes it, so the app follows Bcode's
+/// choice again. The file is replaced atomically.
+///
+/// # Errors
+///
+/// * [`LayersError::Io`] when the file cannot be read or written.
+/// * [`LayersError::Composition`] when `app` is empty, the existing file is not TOML or a
+///   section on the way is not a table.
+pub fn save_app_tui_appearance(
+    path: &Path,
+    app: &str,
+    appearance: Option<&SavedTuiAppearance>,
+) -> Result<(), LayersError> {
+    if app.trim().is_empty() {
+        return Err(LayersError::Composition {
+            message: "app name must not be empty".to_owned(),
+        });
+    }
+    edit_state(path, |document| {
+        let not_table = || format!("[apps.{app}] is not a table");
+        let apps =
+            table_entry(document, "apps").ok_or_else(|| "[apps] is not a table".to_owned())?;
+        match appearance {
+            Some(appearance) => {
+                let section = table_entry(apps, app).ok_or_else(not_table)?;
+                let theme = table_entry(section, "theme")
+                    .ok_or_else(|| format!("[apps.{app}.theme] is not a table"))?;
+                theme.clear();
+                write_choices(theme, appearance);
+            }
+            None => {
+                if let Some(section) = apps.get_mut(app) {
+                    let section = section.as_table_mut().ok_or_else(not_table)?;
+                    section.remove("theme");
+                    if section.is_empty() {
+                        apps.remove(app);
+                    }
+                }
+            }
         }
-    };
-    let theme = document
-        .entry("theme")
+        if apps.is_empty() {
+            document.remove("apps");
+        }
+        Ok(())
+    })
+}
+
+/// The table at `key` of `table`, created when absent; `None` when `key` holds another value.
+fn table_entry<'a>(table: &'a mut toml::Table, key: &str) -> Option<&'a mut toml::Table> {
+    table
+        .entry(key)
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
-        .ok_or_else(|| LayersError::Composition {
-            message: format!("{}: [theme] is not a table", path.display()),
-        })?;
+}
+
+fn write_choices(theme: &mut toml::Table, appearance: &SavedTuiAppearance) {
     for (key, value) in [
         ("name", &appearance.theme),
         ("profile", &appearance.profile),
@@ -171,6 +294,25 @@ pub fn save_tui_appearance(
             }
         }
     }
+}
+
+/// Read the state file at `path` as a TOML document (empty when missing), change it with
+/// `edit` and replace the file atomically.
+fn edit_state(
+    path: &Path,
+    edit: impl FnOnce(&mut toml::Table) -> Result<(), String>,
+) -> Result<(), LayersError> {
+    let mut document = match read_state(path)? {
+        Some(text) => text
+            .parse::<toml::Table>()
+            .map_err(|error| LayersError::Composition {
+                message: format!("{}: failed to parse TUI state: {error}", path.display()),
+            })?,
+        None => toml::Table::new(),
+    };
+    edit(&mut document).map_err(|message| LayersError::Composition {
+        message: format!("{}: {message}", path.display()),
+    })?;
     let contents = toml::to_string(&document).map_err(|error| LayersError::Composition {
         message: format!("failed to serialize TUI state: {error}"),
     })?;
@@ -337,5 +479,65 @@ mod tests {
         );
         std::fs::write(&path, "theme = 3\n").expect("write");
         assert!(save_tui_appearance(&path, &SavedTuiAppearance::default()).is_err());
+    }
+
+    #[test]
+    fn an_app_keeps_its_own_choice_apart_from_bcode_and_other_apps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tui.toml");
+        // A file written before apps had their own choice reads as following Bcode.
+        std::fs::write(&path, "[theme]\nname = \"nord\"\n").expect("write");
+        let following = SavedAppAppearance::load(&path, "review").expect("state");
+        assert_eq!(following.app, None);
+        assert_eq!(following.effective().theme.as_deref(), Some("nord"));
+
+        let own = SavedTuiAppearance {
+            theme: Some("dracula".to_owned()),
+            profile: Some("bare".to_owned()),
+        };
+        save_app_tui_appearance(&path, "review", Some(&own)).expect("saved");
+        let review = SavedAppAppearance::load(&path, "review").expect("state");
+        assert_eq!(review.app.as_ref(), Some(&own));
+        assert_eq!(review.effective(), &own);
+        assert_eq!(review.bcode.theme.as_deref(), Some("nord"));
+        assert_eq!(
+            SavedAppAppearance::load(&path, "git").expect("state").app,
+            None
+        );
+
+        // Bcode's own writer leaves the app's choice alone.
+        save_tui_appearance(
+            &path,
+            &SavedTuiAppearance {
+                theme: Some("catppuccin-mocha".to_owned()),
+                profile: None,
+            },
+        )
+        .expect("saved");
+        let review = SavedAppAppearance::load(&path, "review").expect("state");
+        assert_eq!(review.app.as_ref(), Some(&own));
+        assert_eq!(review.bcode.theme.as_deref(), Some("catppuccin-mocha"));
+        assert_eq!(
+            SavedTuiAppearance::load(&path)
+                .expect("state")
+                .theme
+                .as_deref(),
+            Some("catppuccin-mocha")
+        );
+
+        // Clearing the app's choice returns it to following Bcode and leaves no empty tables.
+        save_app_tui_appearance(&path, "review", None).expect("cleared");
+        let review = SavedAppAppearance::load(&path, "review").expect("state");
+        assert_eq!(review.app, None);
+        assert_eq!(
+            review.effective().theme.as_deref(),
+            Some("catppuccin-mocha")
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("apps")
+        );
+        assert!(save_app_tui_appearance(&path, " ", None).is_err());
     }
 }
