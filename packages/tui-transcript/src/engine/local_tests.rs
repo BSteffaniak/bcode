@@ -99,13 +99,20 @@ struct Harness {
 impl Harness {
     /// Attach a session of `events` one-line events with plain rows.
     fn attach(events: u64) -> Self {
+        Self::attach_with(
+            events,
+            TranscriptEngine::with_producer(
+                ViewportGeometry::new(WIDTH, HEIGHT),
+                MotionConfig::INSTANT,
+                Box::new(crate::layout::producers::testing::PlainTextProducer),
+            ),
+        )
+    }
+
+    /// Attach a session of `events` one-line events to `engine`.
+    fn attach_with(events: u64, mut engine: TranscriptEngine) -> Self {
         let session = SessionId::new();
         let at = Instant::now();
-        let mut engine = TranscriptEngine::with_producer(
-            ViewportGeometry::new(WIDTH, HEIGHT),
-            MotionConfig::INSTANT,
-            Box::new(crate::layout::producers::testing::PlainTextProducer),
-        );
         let update = engine.attach(at);
         let HostRequest::Window(issued) = update.requests[0] else {
             panic!("attach requests a window");
@@ -320,4 +327,34 @@ fn lr1_local_rows_render_before_attach() {
             .row_symbols(row)
             .is_some_and(|row| row.trim_end() == "draft text")
     }));
+}
+
+#[test]
+fn turn_summaries_render_as_one_row_led_by_the_theme_glyph() {
+    let mut theme = bcode_tui_theme::definition::ResolvedThemeDefinition::empty("t", "T");
+    theme.chrome.turn_summary.glyph = bcode_tui_theme::chrome::ChromeText::new("✻");
+    let engine = TranscriptEngine::new(ViewportGeometry::new(WIDTH, HEIGHT), MotionConfig::INSTANT)
+        .with_render_config(crate::layout::RenderConfig::for_theme(std::sync::Arc::new(
+            theme,
+        )));
+    let mut harness = Harness::attach_with(2, engine);
+    harness.set(vec![LocalRow::new(
+        LocalKey::Summary(1),
+        LocalPlacement::After {
+            item: Some(TranscriptViewItemId::event(2)),
+            sequence: Some(2),
+        },
+        row_item(TranscriptViewItemKind::SystemMessage {
+            message: message("Baked for 7s · done 9:02 PM", Some("Summary")),
+        }),
+    )]);
+    let rows = harness.present();
+    assert!(
+        row_of(&rows, "✻ Baked for 7s · done 9:02 PM").is_some(),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Summary")),
+        "no heading row: {rows:?}"
+    );
 }

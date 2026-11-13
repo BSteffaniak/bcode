@@ -856,11 +856,22 @@ fn plain_text(source: &str, style: Style) -> SourceText {
 
 /// The one-row-per-source metadata note `· text` (compaction).
 fn meta_note(text: &str, style: Style) -> Box<dyn ItemContent> {
+    led_note(text, "·", style)
+}
+
+/// A metadata note led by `glyph`: the glyph and a space before the first row, continuation
+/// rows indented by the glyph's measured width plus one.
+fn led_note(text: &str, glyph: &str, style: Style) -> Box<dyn ItemContent> {
+    let indent = " ".repeat(display_width(glyph) + 1);
     let lines = text
         .split('\n')
         .enumerate()
         .map(|(index, line)| {
-            let lead = if index == 0 { "· " } else { "  " };
+            let lead = if index == 0 {
+                format!("{glyph} ")
+            } else {
+                indent.clone()
+            };
             Line::from_spans(vec![
                 Span::styled(lead, style),
                 Span::styled(line.to_owned(), style),
@@ -1223,6 +1234,27 @@ impl UnitProducer for LocalRowProducer {
             return ProducedItem::new(common::plain_unit(unit));
         };
         match (&unit.unit.key, &item.kind) {
+            (UnitKey::Local(LocalKey::Summary(_)), _) => {
+                // A turn summary: one metadata row led by the theme's glyph.
+                let glyph = cx
+                    .theme
+                    .chrome
+                    .turn_summary
+                    .glyph
+                    .as_ref()
+                    .map_or("·", |glyph| glyph.as_str());
+                let style = state(cx.theme, "transcript.meta", Styles::of(cx.theme).muted);
+                let spacing = Spacing {
+                    before: 0,
+                    after: 1,
+                };
+                return ProducedItem::boxed(common::spaced(
+                    led_note(message.body.text(), glyph, style),
+                    spacing,
+                    0,
+                    cx.width,
+                ));
+            }
             (UnitKey::Local(LocalKey::Submission(_)), _) => {
                 let focused = state(
                     cx.theme,

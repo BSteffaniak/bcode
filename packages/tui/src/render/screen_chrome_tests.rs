@@ -238,3 +238,47 @@ fn status_segments_select_and_order_the_status_line() {
     assert_eq!(status_row(Some(&[])), "");
     assert!(StatusSegments::new(&[StatusSegment::Hints, StatusSegment::Hints]).is_none());
 }
+
+#[test]
+fn finished_turns_leave_a_summary_only_when_the_theme_asks() {
+    use bcode_tui_theme::chrome::{ChromeList, ChromeText};
+    let finish = |edit: &dyn Fn(&mut TuiChrome)| {
+        let mut app = app_with(edit);
+        app.set_activity_for_test(crate::activity::ActivityState::RunningTool {
+            name: "shell.run".to_owned(),
+        });
+        app.set_activity_for_test(crate::activity::ActivityState::Idle);
+        let summaries: Vec<String> = app
+            .ephemeral_notices()
+            .filter(|notice| notice.source() == crate::ephemeral_notices::TURN_SUMMARY_SOURCE)
+            .map(|notice| notice.text().to_owned())
+            .collect();
+        drop(app);
+        summaries
+    };
+    assert_eq!(finish(&|_| {}), Vec::<String>::new());
+    let summaries = finish(&|chrome| {
+        chrome.turn_summary.template = ChromeText::new("{verb} for {elapsed} · done {time}");
+        chrome.activity.verbs = ChromeList::new(&["Baked"]).expect("verbs");
+    });
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        summaries[0].starts_with("Baked for 0s · done "),
+        "{summaries:?}"
+    );
+}
+
+#[test]
+fn turn_summary_durations_read_in_seconds_then_minutes() {
+    use std::time::Duration;
+    let text = |seconds| {
+        crate::app::turn_summary_text_for_test(
+            "{verb} {elapsed} {time}",
+            "W",
+            Duration::from_secs(seconds),
+            "T",
+        )
+    };
+    assert_eq!(text(7), "W 7s T");
+    assert_eq!(text(65), "W 1m 5s T");
+}

@@ -77,7 +77,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 7 | Section connector (`⎿`) with hanging indent instead of section label rows | done: `section_labels = "connector"` |
 | 8 | Group summary templates with plural forms (`Read {count} file{s}`) | done: group `header.template`, `{plural}`, `group.min = 1` |
 | 9 | Reasoning summary template with duration | template done; reasoning duration needs activity timing in the session view (open) |
-| 10 | Turn summary row (duration and completion time) | open |
+| 10 | Turn summary row (duration and completion time) | done: `turn_summary` (process-local) |
 | 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | done: `markdown` chrome (BMUX `MarkdownPresentation`) |
 | 12 | Activity line: placement, spinner frames, verbs, shimmer | done: `activity`, `activity.*` roles |
 | 13 | Docked permission and question surfaces with numbered option lists | permission done: `dialogs`; question surface placement is configuration only (open); the awaiting permission unit duplicates a docked dialog (open) |

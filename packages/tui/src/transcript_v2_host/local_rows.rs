@@ -100,8 +100,13 @@ pub fn pending_row(pending: &PendingSubmission) -> LocalRow {
 fn notice_rows(app: &BmuxApp) -> impl Iterator<Item = LocalRow> + '_ {
     shown_notices(app).map(|notice| {
         let role = notice.role();
+        let key = if notice.source() == crate::ephemeral_notices::TURN_SUMMARY_SOURCE {
+            LocalKey::Summary(notice.id().get())
+        } else {
+            LocalKey::Notice(notice.id().get())
+        };
         LocalRow::new(
-            LocalKey::Notice(notice.id().get()),
+            key,
             LocalPlacement::After {
                 item: notice.after().cloned(),
                 sequence: notice.after_sequence(),

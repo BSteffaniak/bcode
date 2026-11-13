@@ -155,6 +155,7 @@ status    = { placement = "above_composer", indent = 0, segments = ["activity", 
 activity  = { placement = "status", spinner = "⠋⠙⠹", verbs = [], shimmer = false }
 dialogs   = { placement = "modal", actions = "buttons" }   # modal | docked; buttons | numbered
 menus     = { frame = "framed", marker = "›", tags = "shown", rows = 6 }   # framed | plain
+turn_summary = { template = "{verb} for {elapsed} · done {time}", glyph = "✻" }   # unset: none
 markdown  = { bullet = "•", marker_gap = 2, code_blocks = "framed", quote_bar = "│", table_headers = "column", smart_punctuation = true }
 composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls = "shown" }
 ```
@@ -194,6 +195,10 @@ composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls
   with commands padded to one column; `marker` is the selected-row glyph, `tags` shows or hides
   item kind tags, and `rows` (1..=16) bounds the rows shown. Painting and mouse selection share
   one menu area.
+* `turn_summary` adds a process-local row (styled `transcript.meta`, led by `glyph`) after each
+  finished turn: `{verb}` is the turn's activity verb (else `Worked`), `{elapsed}` its duration
+  (`7s`, `1m 5s`), and `{time}` the local completion time. Like other process-local notices it
+  is not session history.
 * `follow = "reply"` holds a new submission's or reply's first row at the viewport top until it
   overflows; `latest` keeps the latest content at the bottom instead. Neither pulls a reader who
   scrolled away from the latest content; a submission returns to it under `latest`.

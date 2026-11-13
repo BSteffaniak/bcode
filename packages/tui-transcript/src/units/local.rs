@@ -21,6 +21,8 @@ pub enum LocalKey {
     Notice(u64),
     /// A submission the host staged and the session has not accepted yet, by submission id.
     Submission(String),
+    /// A summary of a finished turn, by the host's notice identity.
+    Summary(u64),
 }
 
 impl fmt::Display for LocalKey {
@@ -28,6 +30,7 @@ impl fmt::Display for LocalKey {
         match self {
             Self::Notice(id) => write!(f, "notice:{id}"),
             Self::Submission(id) => write!(f, "submission:{id}"),
+            Self::Summary(id) => write!(f, "summary:{id}"),
         }
     }
 }

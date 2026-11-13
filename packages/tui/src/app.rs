@@ -4309,7 +4309,11 @@ impl BmuxApp {
                     self.busy_since = Some(now);
                     self.busy_periods = self.busy_periods.wrapping_add(1);
                 }
-                (_, ActivityState::Idle) => self.busy_since = None,
+                (_, ActivityState::Idle) => {
+                    if let Some(since) = self.busy_since.take() {
+                        self.summarize_turn(now.saturating_duration_since(since));
+                    }
+                }
                 _ => {}
             }
             self.activity = activity;
@@ -4320,6 +4324,29 @@ impl BmuxApp {
     #[cfg(test)]
     pub(crate) fn set_activity_for_test(&mut self, activity: ActivityState) {
         self.set_activity(activity);
+    }
+
+    /// Record a summary of a turn that took `elapsed`, when the theme shows turn summaries.
+    fn summarize_turn(&mut self, elapsed: Duration) {
+        let chrome = self.presented_theme.unit_chrome;
+        let Some(template) = chrome.turn_summary.template else {
+            return;
+        };
+        let busy_periods = usize::try_from(self.busy_periods).unwrap_or_default();
+        let verb = chrome
+            .activity
+            .verbs
+            .cycled(busy_periods)
+            .unwrap_or("Worked")
+            .to_owned();
+        let text = turn_summary_text(
+            template.as_str(),
+            &verb,
+            elapsed,
+            &chrono::Local::now().format("%-I:%M %p").to_string(),
+        );
+        let boundary = self.notice_boundary();
+        self.notices.push_turn_summary(text, boundary);
     }
 
     /// Start of the current busy period, or `None` while idle.
@@ -6704,4 +6731,37 @@ mod notice_tests {
         assert_eq!(updated.role(), "Activity");
         assert_eq!(remaining, Vec::<String>::new());
     }
+}
+
+/// A turn summary from `template`: `{verb}`, `{elapsed}` (`7s`, `1m 5s`), and `{time}`; other
+/// placeholders render empty.
+fn turn_summary_text(template: &str, verb: &str, elapsed: Duration, time: &str) -> String {
+    use bcode_presentation_policy::TemplateToken;
+    let seconds = elapsed.as_secs();
+    let elapsed = if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    };
+    bcode_presentation_policy::template_parts(template)
+        .into_iter()
+        .map(|token| match token {
+            TemplateToken::Literal(text) => text,
+            TemplateToken::Field("verb") => verb,
+            TemplateToken::Field("elapsed") => &elapsed,
+            TemplateToken::Field("time") => time,
+            TemplateToken::Field(_) => "",
+        })
+        .collect()
+}
+
+/// [`turn_summary_text`] for tests.
+#[cfg(test)]
+pub fn turn_summary_text_for_test(
+    template: &str,
+    verb: &str,
+    elapsed: Duration,
+    time: &str,
+) -> String {
+    turn_summary_text(template, verb, elapsed, time)
 }

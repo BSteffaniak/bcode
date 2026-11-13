@@ -4033,11 +4033,6 @@ fn plain_slash_menus_list_rows_without_chrome_and_mouse_agrees_with_paint() {
             .visible_items(usize::from(area.height))
             .nth(row)
             .unwrap();
-        assert!(
-            buffer
-                .row_symbols(y)
-                .unwrap()
-                .contains(item.item.command())
-        );
+        assert!(buffer.row_symbols(y).unwrap().contains(item.item.command()));
     }
 }

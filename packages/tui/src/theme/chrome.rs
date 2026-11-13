@@ -48,6 +48,8 @@ pub struct UnitChrome {
     pub dialogs: bcode_tui_theme::chrome::DialogChrome,
     /// Completion menu frame, marker, tags, and rows.
     pub menus: bcode_tui_theme::chrome::MenuChrome,
+    /// Summary rows after finished turns.
+    pub turn_summary: bcode_tui_theme::chrome::TurnSummaryChrome,
 }
 
 /// Header icon candidates for one tool category, most specific first.
@@ -92,6 +94,7 @@ impl UnitChrome {
             activity: theme.chrome.activity,
             dialogs: theme.chrome.dialogs,
             menus: theme.chrome.menus,
+            turn_summary: theme.chrome.turn_summary,
         })
     }
 

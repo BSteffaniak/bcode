@@ -1039,6 +1039,7 @@ fn resolve_chrome(
         markdown: resolved(raw.markdown.as_ref()),
         dialogs: resolved(raw.dialogs.as_ref()),
         menus: resolved(raw.menus.as_ref()),
+        turn_summary: resolved(raw.turn_summary.as_ref()),
     })
 }
 

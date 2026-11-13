@@ -25,6 +25,7 @@ markers       = { user = "❯", assistant = "⏺", bullet = "⏺", connector = "
 speaker       = "marker"
 status        = { placement = "below_composer", indent = 2, segments = ["message", "hints"] }
 surfaces      = "flat"
+turn_summary  = { template = "{verb} for {elapsed} · done {time}", glyph = "✻" }
 
 # Tool calls: a status-colored bullet, the tool's display name, and its target in parentheses;
 # bodies hang off a connector instead of labelled sections.

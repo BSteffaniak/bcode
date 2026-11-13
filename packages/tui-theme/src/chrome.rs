@@ -569,6 +569,17 @@ pub struct MenuChrome {
 /// Most rows a completion menu may show at once.
 pub const MAX_MENU_ROWS: u8 = 16;
 
+/// A summary row after each finished turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TurnSummaryChrome {
+    /// Summary text; `{verb}` (the turn's activity verb, else `Worked`), `{elapsed}` (the
+    /// turn's duration), and `{time}` (local completion time) substitute. `None` shows no
+    /// summaries.
+    pub template: Option<ChromeText>,
+    /// Glyph before the summary; `None` keeps the renderer's metadata bullet.
+    pub glyph: Option<ChromeText>,
+}
+
 /// Where decision dialogs (permission requests) appear.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -668,6 +679,8 @@ pub struct TuiChrome {
     pub dialogs: DialogChrome,
     /// Completion menus.
     pub menus: MenuChrome,
+    /// Summary rows after finished turns.
+    pub turn_summary: TurnSummaryChrome,
 }
 
 /// Maximum focus gradient colors.
@@ -724,6 +737,15 @@ pub(crate) struct RawComposer {
     pub placeholder: Option<ChromeText>,
     #[serde(default)]
     pub controls: Option<Visibility>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawTurnSummary {
+    #[serde(default)]
+    pub template: Option<ChromeText>,
+    #[serde(default)]
+    pub glyph: Option<ChromeText>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -830,6 +852,8 @@ pub(crate) struct RawTuiChrome {
     pub dialogs: Option<RawDialogs>,
     #[serde(default)]
     pub menus: Option<RawMenus>,
+    #[serde(default)]
+    pub turn_summary: Option<RawTurnSummary>,
 }
 
 /// A raw nested `[chrome.tui]` table that resolves to its chrome, with defaults for unset
@@ -932,6 +956,17 @@ impl ResolveChrome for RawMenus {
     }
 }
 
+impl ResolveChrome for RawTurnSummary {
+    type Resolved = TurnSummaryChrome;
+
+    fn resolve(&self) -> TurnSummaryChrome {
+        TurnSummaryChrome {
+            template: self.template,
+            glyph: self.glyph,
+        }
+    }
+}
+
 /// `[chrome]` table: the terminal section plus opaque sections for other renderers.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub(crate) struct RawChrome {
@@ -1007,6 +1042,7 @@ impl RawTuiChrome {
         overlay!(status, RawStatus: placement, indent, segments);
         overlay!(dialogs, RawDialogs: placement, actions);
         overlay!(menus, RawMenus: frame, marker, tags, rows);
+        overlay!(turn_summary, RawTurnSummary: template, glyph);
         overlay!(
             markdown,
             RawMarkdown: bullet,

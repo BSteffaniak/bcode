@@ -493,7 +493,7 @@ pub async fn run_quick_onboarding_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
-    run_picker_in_shell(shell, input, false, false).await
+    Box::pin(run_picker_in_shell(shell, input, false, false)).await
 }
 
 /// Select an execution backend without offering provider enrollment.
@@ -504,7 +504,7 @@ pub async fn run_backend_selection_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
-    run_picker_in_shell(shell, input, true, false).await
+    Box::pin(run_picker_in_shell(shell, input, true, false)).await
 }
 
 /// Review an execution preference only after its full bounded review screen is visible.
@@ -514,7 +514,7 @@ pub async fn run_execution_confirmation_in_shell(
     shell: &mut crate::TerminalShell,
     input: QuickOnboardingInput,
 ) -> Result<QuickOnboardingOutcome, TuiError> {
-    run_picker_in_shell(shell, input, true, true).await
+    Box::pin(run_picker_in_shell(shell, input, true, true)).await
 }
 
 async fn run_picker_in_shell(

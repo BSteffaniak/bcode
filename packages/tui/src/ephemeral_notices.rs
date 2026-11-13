@@ -10,6 +10,12 @@ use bcode_session_view_models::{TextFormat, TranscriptViewItemId};
 /// Source of process-local notices raised by the host shell itself.
 pub const HOST_NOTICE_SOURCE: &str = "bcode.tui";
 
+/// Source of finished-turn summaries.
+pub const TURN_SUMMARY_SOURCE: &str = "bcode.tui.turn-summary";
+
+/// Display role of finished-turn summaries.
+pub const TURN_SUMMARY_ROLE: &str = "Summary";
+
 /// Source prefix of plugin activity notices, followed by `<plugin id>:<note id>`.
 pub const PLUGIN_ACTIVITY_SOURCE_PREFIX: &str = "bcode.plugin-activity:";
 
@@ -115,6 +121,18 @@ impl EphemeralNotices {
             role: "System",
             text,
             format,
+            boundary,
+        });
+    }
+
+    /// Append a finished-turn summary at `boundary`.
+    pub fn push_turn_summary(&mut self, text: String, boundary: NoticeBoundary) {
+        self.entries.push(EphemeralNotice {
+            id: NoticeId::next(),
+            source: TURN_SUMMARY_SOURCE.to_owned(),
+            role: TURN_SUMMARY_ROLE,
+            text,
+            format: TextFormat::PlainText,
             boundary,
         });
     }
