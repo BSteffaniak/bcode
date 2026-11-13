@@ -114,9 +114,10 @@ impl ReviewDocument {
             } else {
                 AnchorPlacement::Outdated(OutdatedReason::FileMissing)
             };
-            items.push(self.annotation_item(index, placement));
+            self.push_annotation(index, placement, &mut items);
         }
         if let Some(anchor) = &self.composer
+            && self.composer_after.is_none()
             && anchor
                 .file
                 .as_ref()
@@ -146,13 +147,10 @@ impl ReviewDocument {
             })
         });
         // Annotations on the source as a whole follow the introduction.
-        let notes: Vec<ReviewItem> = self
-            .source_annotations
-            .get(&index)
-            .into_iter()
-            .flatten()
-            .map(|annotation| self.annotation_item(*annotation, AnchorPlacement::Review))
-            .collect();
+        let mut notes: Vec<ReviewItem> = Vec::new();
+        for annotation in self.source_annotations.get(&index).into_iter().flatten() {
+            self.push_annotation(*annotation, AnchorPlacement::Review, &mut notes);
+        }
         if !group.show_header {
             let items: Vec<ReviewItem> = intro.into_iter().chain(notes).collect();
             return Built {
@@ -204,6 +202,23 @@ impl ReviewDocument {
         }
     }
 
+    /// Push the annotation at `index`, and the composer when it shows under it.
+    fn push_annotation(
+        &self,
+        index: usize,
+        placement: AnchorPlacement,
+        items: &mut Vec<ReviewItem>,
+    ) {
+        let item = self.annotation_item(index, placement);
+        let after = self.composer_after.as_ref() == Some(&item.key());
+        items.push(item);
+        if after && let Some(anchor) = &self.composer {
+            items.push(ReviewItem::Composer(ComposerItem {
+                anchor: anchor.clone(),
+            }));
+        }
+    }
+
     fn annotation_item(&self, index: usize, placement: AnchorPlacement) -> ReviewItem {
         let annotation = &self.annotations[index];
         let lines = match &annotation.target {
@@ -246,9 +261,7 @@ impl ReviewDocument {
 
     fn emit(&self, emit: Emit, items: &mut Vec<ReviewItem>) {
         match emit {
-            Emit::Annotation(index, placement) => {
-                items.push(self.annotation_item(index, placement));
-            }
+            Emit::Annotation(index, placement) => self.push_annotation(index, placement, items),
             Emit::Composer => {
                 if let Some(anchor) = &self.composer {
                     items.push(ReviewItem::Composer(ComposerItem {
@@ -456,6 +469,7 @@ impl ReviewDocument {
             place(emit, &annotation.target, &mut slots);
         }
         if let Some(anchor) = &self.composer
+            && self.composer_after.is_none()
             && anchor.file.as_ref() == Some(&state.key)
         {
             place(Emit::Composer, &anchor.target, &mut slots);

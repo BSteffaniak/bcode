@@ -209,7 +209,20 @@ impl ReviewSurface {
         let Some(review) = self.review.as_mut() else {
             return;
         };
-        review.doc.open_composer(anchor.clone());
+        // Replying to, editing in, or asking about a thread or AI answer: under it, wherever
+        // its anchor is (a thread on a pull request as a whole has no line to go to).
+        let on_card = review
+            .cursor
+            .clone()
+            .filter(|key| matches!(key, ItemKey::Thread { .. } | ItemKey::AgentThread { .. }));
+        let about_card = matches!(
+            mode,
+            ComposerMode::Reply { .. } | ComposerMode::Edit { .. } | ComposerMode::Ask
+        );
+        match on_card.filter(|_| about_card) {
+            Some(after) => review.doc.open_composer_after(anchor.clone(), after),
+            None => review.doc.open_composer(anchor.clone()),
+        }
         review.note_splices();
         if let Some(index) = review.doc.index_of(&ItemKey::Composer) {
             review.set_cursor(index, AnchorPolicy::EnsureVisibleFrom(Edge::Bottom));

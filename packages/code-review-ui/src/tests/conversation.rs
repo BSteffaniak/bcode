@@ -519,3 +519,54 @@ fn a_roomy_card_puts_its_header_and_buttons_on_rows_of_their_own() {
         screen.text()
     );
 }
+
+#[test]
+fn asking_about_a_thread_on_the_pull_request_as_a_whole_opens_the_composer_under_it() {
+    let fixture = fixture();
+    let provider = FakeProvider::new(fixture.root()).with_conversation(everything());
+    let mut on_layer = activity();
+    // A file this layer no longer changes: the thread is on the layer as a whole.
+    on_layer.threads[0].anchor.path = "no/longer/changed.rs".to_owned();
+    provider.set_activity(on_layer);
+    let backend = Arc::new(
+        TestBackend::default()
+            .with_provider(provider)
+            .with_conversation_config(ConversationConfig {
+                signals: SignalsConfig {
+                    min_gap_ms: 0,
+                    ..SignalsConfig::default()
+                },
+                ..ConversationConfig::default()
+            }),
+    );
+    let (mut scenario, screen) = open_pull(&backend, &fixture);
+    let header = card_header_row(&screen);
+    let bottom = (header..screen.height())
+        .find(|y| screen.row_text(*y).contains('╰'))
+        .expect("bottom border");
+    let x = screen.column_of(bottom, "Ask Bcode").expect("ask button");
+    scenario.click(x, bottom);
+    settled(&mut scenario);
+    let doc = scenario.surface().review().unwrap().document().unwrap();
+    let composer = doc
+        .index_of(&bcode_code_review::document::ItemKey::Composer)
+        .expect("composer shown");
+    assert!(
+        matches!(
+            doc.item(composer - 1),
+            Some(bcode_code_review::document::ReviewItem::Thread(_))
+        ),
+        "the composer follows its thread"
+    );
+    // Not at the top: the pull request's card comes before it.
+    let card = (0..composer).find(|index| {
+        matches!(
+            doc.item(*index),
+            Some(bcode_code_review::document::ReviewItem::SourceIntro(_))
+        )
+    });
+    assert!(
+        card.is_some(),
+        "the composer is under the pull request's card"
+    );
+}

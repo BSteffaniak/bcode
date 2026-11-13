@@ -475,4 +475,14 @@ fn a_thread_on_a_source_as_a_whole_shows_with_that_source_only() {
     assert!(doc.index_of(&thread("on-review")).is_some());
     doc.set_focus(Some("two"));
     assert!(doc.index_of(&thread("on-two")).is_some());
+    // A composer opened from that thread shows right under it, not at the top of the review.
+    doc.set_focus(None);
+    let _ = doc.take_splices();
+    doc.open_composer_after(super::super::DocAnchor::review(), thread("on-two"));
+    doc.assert_consistent("composer under a source's thread");
+    let on_two = doc.index_of(&thread("on-two")).expect("shown");
+    assert_eq!(doc.index_of(&ItemKey::Composer), Some(on_two + 1));
+    assert!(doc.close_composer().is_some());
+    assert_eq!(doc.index_of(&ItemKey::Composer), None);
+    doc.assert_consistent("composer closed");
 }

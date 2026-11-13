@@ -580,6 +580,9 @@ pub struct ReviewDocument {
     /// Block each thread and agent-thread key is placed in.
     pub(super) annotation_blocks: BTreeMap<ItemKey, usize>,
     pub(super) composer: Option<DocAnchor>,
+    /// The thread or AI answer the composer shows under (a reply, or a question about it),
+    /// wherever its anchor would put it.
+    pub(super) composer_after: Option<ItemKey>,
     /// The annotations last given to [`Self::set_annotations`], to place again after a group
     /// changes (see [`Self::upsert_group`]).
     pub(super) annotations_input: Option<Annotations>,
@@ -642,6 +645,7 @@ impl ReviewDocument {
             file_annotations: Vec::new(),
             annotation_blocks: BTreeMap::new(),
             composer: None,
+            composer_after: None,
             annotations_input: None,
             marks: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -1784,28 +1788,51 @@ impl ReviewDocument {
     /// Show the composer at `anchor` (replacing any open composer).
     pub fn open_composer(&mut self, anchor: DocAnchor) {
         self.close_composer();
-        let file = anchor
-            .file
-            .as_ref()
-            .and_then(|file| self.file_index.get(file).copied());
         self.composer = Some(anchor);
-        match file {
-            Some(file) => self.rebuild_file(file),
-            None => self.rebuild_block(0),
+        self.rebuild_composer_block();
+    }
+
+    /// Show the composer for `anchor` right under the thread or AI answer `after` (a reply to
+    /// it, or a question about it), wherever that is. Falls back to [`Self::open_composer`]
+    /// when `after` is not shown.
+    pub fn open_composer_after(&mut self, anchor: DocAnchor, after: ItemKey) {
+        if self.index_of(&after).is_none() {
+            self.open_composer(anchor);
+            return;
         }
+        self.close_composer();
+        self.composer = Some(anchor);
+        self.composer_after = Some(after);
+        self.rebuild_composer_block();
+    }
+
+    /// The block the open composer is in: its thread's, its file's, or the review's.
+    fn composer_block(&self) -> usize {
+        if let Some(block) = self
+            .composer_after
+            .as_ref()
+            .and_then(|key| self.annotation_blocks.get(key))
+        {
+            return *block;
+        }
+        self.composer
+            .as_ref()
+            .and_then(|anchor| anchor.file.as_ref())
+            .and_then(|file| self.file_index.get(file))
+            .map_or(0, |file| self.files[*file].block)
+    }
+
+    fn rebuild_composer_block(&mut self) {
+        let block = self.composer_block();
+        self.rebuild_block(block);
     }
 
     /// Remove the composer. Returns its anchor.
     pub fn close_composer(&mut self) -> Option<DocAnchor> {
+        let block = self.composer_block();
         let anchor = self.composer.take()?;
-        match anchor
-            .file
-            .as_ref()
-            .and_then(|file| self.file_index.get(file).copied())
-        {
-            Some(file) => self.rebuild_file(file),
-            None => self.rebuild_block(0),
-        }
+        self.composer_after = None;
+        self.rebuild_block(block);
         Some(anchor)
     }
 
@@ -2212,13 +2239,7 @@ impl ReviewDocument {
             ItemKey::Thread { .. } | ItemKey::AgentThread { .. } => {
                 self.annotation_blocks.get(key).copied()
             }
-            ItemKey::Composer => Some(
-                self.composer
-                    .as_ref()
-                    .and_then(|anchor| anchor.file.as_ref())
-                    .and_then(|file| self.file_index.get(file))
-                    .map_or(0, |file| self.files[*file].block),
-            ),
+            ItemKey::Composer => Some(self.composer_block()),
             _ => None,
         }
     }
