@@ -8,7 +8,7 @@ PLAN: {"size": [cols, rows], "env": {...}, "cwd": "...",
        "steps": [{"expect": ["text"], "timeout": 30, "settle": 0.5, "snapshot": "name",
                   "frames": 0, "interval": 0.2, "type": "slow text", "send": "keys"}]}
 Each step waits until every `expect` string is on the rendered screen (BMUX terminal grid, with
-non-breaking spaces read as spaces), waits `settle` seconds for the screen to stop changing,
+non-breaking spaces read as spaces), waits up to `settle` seconds (bounded, for animations) for the screen to stop changing,
 records a snapshot when named plus `frames` further snapshots `interval` seconds apart, then
 types `type` one character at a time and sends `send` as is. While waiting, a screen showing the
 `accept_prompts` marker is snapshotted and answered with its keys. Terminal queries are answered
@@ -97,7 +97,9 @@ class Session:
                 raise TimeoutError(f"timed out waiting for {expect!r}; screen:\n{text}")
         last = self.screen()
         stable_since = time.time()
-        while time.time() - stable_since < settle:
+        # Animations (spinners, shimmer) never settle; stop waiting after a bounded time.
+        settle_deadline = time.time() + max(settle * 4, 3.0)
+        while time.time() - stable_since < settle and time.time() < settle_deadline:
             self.pump(0.1)
             now = self.screen()
             if now != last:

@@ -1,10 +1,4 @@
 {
- "accept_prompts": {
-  "marker": "Do you want",
-  "label": "permission",
-  "keys": "1",
-  "settle": 1.0
- },
  "turns": [
   {
    "delay": 6,
@@ -80,45 +74,97 @@
    ]
   }
  ],
- "steps": [
-  {
-   "expect": [
-    "❯"
-   ],
-   "settle": 2,
-   "snapshot": "start",
-   "type": "Give me a tour of the project"
+ "claude_code": {
+  "accept_prompts": {
+   "marker": "Do you want",
+   "label": "permission",
+   "keys": "1",
+   "settle": 1.0
   },
-  {
-   "expect": [
-    "❯ Give me a tour"
-   ],
-   "settle": 0.5,
-   "send": "\r"
+  "steps": [
+   {
+    "expect": [
+     "❯"
+    ],
+    "settle": 2,
+    "snapshot": "start",
+    "type": "Give me a tour of the project"
+   },
+   {
+    "expect": [
+     "❯ Give me a tour"
+    ],
+    "settle": 0.5,
+    "send": "\r"
+   },
+   {
+    "expect": [
+     "esc to interrupt"
+    ],
+    "settle": 0.0,
+    "snapshot": "working",
+    "frames": 6,
+    "interval": 0.15,
+    "timeout": 20
+   },
+   {
+    "expect": [
+     "Summary",
+     "missing.txt"
+    ],
+    "settle": 2,
+    "snapshot": "final",
+    "timeout": 90,
+    "send": "\u000f"
+   },
+   {
+    "settle": 2,
+    "snapshot": "expanded"
+   }
+  ]
+ },
+ "bcode": {
+  "accept_prompts": {
+   "marker": "Approve",
+   "label": "permission",
+   "keys": "\r",
+   "settle": 1.0
   },
-  {
-   "expect": [
-    "esc to interrupt"
-   ],
-   "settle": 0.0,
-   "snapshot": "working",
-   "frames": 6,
-   "interval": 0.15,
-   "timeout": 20
-  },
-  {
-   "expect": [
-    "Summary",
-    "missing.txt"
-   ],
-   "settle": 2,
-   "snapshot": "final",
-   "timeout": 90,
-   "send": "\u000f"
-  },
-  {
-   "settle": 2,
-   "snapshot": "expanded"
-  }
- ]
+  "steps": [
+   {
+    "expect": [
+     "Ask Bcode"
+    ],
+    "settle": 2,
+    "snapshot": "start",
+    "type": "Give me a tour of the project",
+    "timeout": 90
+   },
+   {
+    "expect": [
+     "Give me a tour"
+    ],
+    "settle": 0.5,
+    "send": "\r"
+   },
+   {
+    "expect": [
+     "Give me a tour"
+    ],
+    "settle": 0.3,
+    "snapshot": "working",
+    "frames": 6,
+    "interval": 0.15
+   },
+   {
+    "expect": [
+     "Summary",
+     "missing.txt"
+    ],
+    "settle": 2,
+    "snapshot": "final",
+    "timeout": 90
+   }
+  ]
+ }
 }

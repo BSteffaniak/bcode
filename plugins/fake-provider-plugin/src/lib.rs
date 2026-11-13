@@ -53,6 +53,9 @@ static FAKE_SCRIPT_GATES: LazyLock<(Mutex<BTreeSet<String>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
 
 const FAKE_EVENT_SCRIPT_SETTING: &str = "fake_event_script";
+/// A JSON array of event scripts, one per model request of a user turn: the request after the
+/// user's message gets the first, and each request after a response that called tools the next.
+const FAKE_EVENT_SCRIPT_TURNS_SETTING: &str = "fake_event_script_turns";
 
 /// One deterministic fake-provider event script.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1088,10 +1091,49 @@ fn selected_event_script(request: &ModelTurnRequest) -> Result<Option<String>, S
         .map_err(|_| "invalid fake prompt script".to_owned())
 }
 
+/// The script of [`FAKE_EVENT_SCRIPT_TURNS_SETTING`] for this request, if configured and not
+/// exhausted.
+fn turn_event_script(request: &ModelTurnRequest) -> Result<Option<String>, String> {
+    let Some(encoded) = request
+        .provider_context
+        .settings
+        .get(FAKE_EVENT_SCRIPT_TURNS_SETTING)
+    else {
+        return Ok(None);
+    };
+    if encoded.len() > 1_048_576 {
+        return Err("fake script turns exceed byte budget".into());
+    }
+    let scripts: Vec<FakeProviderEventScript> = serde_json::from_str(encoded)
+        .map_err(|error| format!("invalid fake script turns: {error}"))?;
+    // Each earlier request of the turn ended in tool calls; hosts may split one response into
+    // several assistant messages, so count the messages carrying calls.
+    let index = request
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+        .filter(|message| {
+            message.role == MessageRole::Assistant
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
+        })
+        .count();
+    scripts
+        .get(index)
+        .map(|script| serde_json::to_string(script).map_err(|error| error.to_string()))
+        .transpose()
+}
+
 fn fake_event_script(
     request: &ModelTurnRequest,
 ) -> Result<Option<FakeProviderEventScript>, String> {
-    let selected = selected_event_script(request)?;
+    let selected = match turn_event_script(request)? {
+        Some(script) => Some(script),
+        None => selected_event_script(request)?,
+    };
     let Some(encoded) = selected.as_ref().or_else(|| {
         request
             .provider_context
@@ -4409,6 +4451,47 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
         });
         assert_eq!(after_gate, expected_after_gate);
         gates.lock().expect("script gates").remove(gate);
+    }
+
+    #[test]
+    fn script_turns_answer_each_request_of_a_user_turn_in_order() {
+        let text = |text: &str| FakeProviderEventScript {
+            steps: vec![FakeProviderEventScriptStep {
+                gate: None,
+                delay_ms: None,
+                event: ProviderTurnEvent::TextDelta {
+                    text: text.to_owned(),
+                },
+            }],
+        };
+        let turns = serde_json::to_string(&[text("first"), text("second")]).unwrap();
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id":"00000000-0000-0000-0000-000000000000", "turn_id":"activation", "model_id":"fake-echo",
+            "provider_context":{"settings":{"fake_event_script_turns": turns}},
+            "messages":[{"role":"user","content":[{"type":"text","text":"go"}]}]
+        }))
+        .unwrap();
+        let message = |role: &str| -> ModelMessage {
+            serde_json::from_value(
+                serde_json::json!({"role":role,"content":[{"type":"text","text":"x"}]}),
+            )
+            .unwrap()
+        };
+        let call = |id: &str| -> ModelMessage {
+            serde_json::from_value(serde_json::json!({"role":"assistant","content":[
+                {"type":"tool_call","call":{"id":id,"name":"read","arguments":{}}}]}))
+            .unwrap()
+        };
+        assert_eq!(fake_event_script(&request).unwrap(), Some(text("first")));
+        // Text the host keeps as its own message does not advance the script.
+        request.messages.push(message("assistant"));
+        request.messages.push(call("call-1"));
+        assert_eq!(fake_event_script(&request).unwrap(), Some(text("second")));
+        request.messages.push(call("call-2"));
+        assert_eq!(fake_event_script(&request).unwrap(), None);
+        // A new user message starts the scripts again.
+        request.messages.push(message("user"));
+        assert_eq!(fake_event_script(&request).unwrap(), Some(text("first")));
     }
 
     #[test]

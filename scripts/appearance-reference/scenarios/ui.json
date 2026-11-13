@@ -1,10 +1,4 @@
 {
- "accept_prompts": {
-  "marker": "Do you want",
-  "label": "permission",
-  "keys": "1",
-  "settle": 1.0
- },
  "turns": [
   {
    "blocks": [
@@ -60,78 +54,185 @@
    ]
   }
  ],
- "steps": [
-  {
-   "expect": [
-    "❯"
-   ],
-   "settle": 2,
-   "snapshot": "start",
-   "type": "/"
+ "claude_code": {
+  "accept_prompts": {
+   "marker": "Do you want",
+   "label": "permission",
+   "keys": "1",
+   "settle": 1.0
   },
-  {
-   "expect": [
-    "/"
-   ],
-   "settle": 1,
-   "snapshot": "slash-menu",
-   "send": "\u001b"
+  "steps": [
+   {
+    "expect": [
+     "❯"
+    ],
+    "settle": 2,
+    "snapshot": "start",
+    "type": "/"
+   },
+   {
+    "expect": [
+     "/"
+    ],
+    "settle": 1,
+    "snapshot": "slash-menu",
+    "send": "\u001b"
+   },
+   {
+    "settle": 0.5,
+    "send": "\u0015"
+   },
+   {
+    "settle": 1,
+    "type": "?"
+   },
+   {
+    "settle": 1,
+    "snapshot": "shortcuts",
+    "send": "\u001b"
+   },
+   {
+    "settle": 1,
+    "send": "\u0015"
+   },
+   {
+    "settle": 0.5,
+    "type": "Run the slow check"
+   },
+   {
+    "expect": [
+     "❯ Run the slow check"
+    ],
+    "settle": 0.5,
+    "send": "\r"
+   },
+   {
+    "expect": [
+     "Running",
+     "esc to interrupt"
+    ],
+    "settle": 0.0,
+    "snapshot": "tool-running",
+    "frames": 3,
+    "interval": 0.5,
+    "timeout": 40
+   },
+   {
+    "expect": [
+     "Which greeting"
+    ],
+    "settle": 1.5,
+    "snapshot": "question",
+    "timeout": 40,
+    "send": "\r"
+   },
+   {
+    "expect": [
+     "use hello"
+    ],
+    "settle": 2,
+    "snapshot": "final",
+    "timeout": 40
+   }
+  ]
+ },
+ "bcode": {
+  "accept_prompts": {
+   "marker": "Approve",
+   "label": "permission",
+   "keys": "\r",
+   "settle": 1.0
   },
-  {
-   "settle": 0.5,
-   "send": "\u0015"
-  },
-  {
-   "settle": 1,
-   "type": "?"
-  },
-  {
-   "settle": 1,
-   "snapshot": "shortcuts",
-   "send": "\u001b"
-  },
-  {
-   "settle": 1,
-   "send": "\u0015"
-  },
-  {
-   "settle": 0.5,
-   "type": "Run the slow check"
-  },
-  {
-   "expect": [
-    "❯ Run the slow check"
-   ],
-   "settle": 0.5,
-   "send": "\r"
-  },
-  {
-   "expect": [
-    "Running",
-    "esc to interrupt"
-   ],
-   "settle": 0.0,
-   "snapshot": "tool-running",
-   "frames": 3,
-   "interval": 0.5,
-   "timeout": 40
-  },
-  {
-   "expect": [
-    "Which greeting"
-   ],
-   "settle": 1.5,
-   "snapshot": "question",
-   "timeout": 40,
-   "send": "\r"
-  },
-  {
-   "expect": [
-    "I'll use"
-   ],
-   "settle": 2,
-   "snapshot": "final",
-   "timeout": 40
-  }
- ]
+  "steps": [
+   {
+    "expect": [
+     "Ask Bcode"
+    ],
+    "settle": 2,
+    "snapshot": "start",
+    "type": "/",
+    "timeout": 90
+   },
+   {
+    "expect": [
+     "/"
+    ],
+    "settle": 1,
+    "snapshot": "slash-menu",
+    "send": "\u001b"
+   },
+   {
+    "settle": 0.5,
+    "send": "\u0015"
+   },
+   {
+    "settle": 1,
+    "type": "?"
+   },
+   {
+    "settle": 1,
+    "snapshot": "shortcuts",
+    "send": "\u001b"
+   },
+   {
+    "settle": 1,
+    "send": "\u0015"
+   },
+   {
+    "settle": 0.5,
+    "type": "Run the slow check"
+   },
+   {
+    "expect": [
+     "Run the slow check"
+    ],
+    "settle": 0.5,
+    "send": "\r"
+   },
+   {
+    "expect": [
+     "step 2"
+    ],
+    "settle": 0.0,
+    "snapshot": "tool-running",
+    "frames": 3,
+    "interval": 0.5,
+    "timeout": 40
+   },
+   {
+    "expect": [
+     "Which greeting"
+    ],
+    "settle": 1.5,
+    "snapshot": "question",
+    "timeout": 40,
+    "send": "\r"
+   },
+   {
+    "settle": 0.5,
+    "send": "\t"
+   },
+   {
+    "settle": 0.5,
+    "send": "\t"
+   },
+   {
+    "settle": 0.5,
+    "snapshot": "question-submit",
+    "send": "\t"
+   },
+   {
+    "settle": 0.5,
+    "send": "\r"
+   },
+   {
+    "expect": [
+     "use hello"
+    ],
+    "settle": 2,
+    "snapshot": "final",
+    "timeout": 40
+   }
+  ]
+ }
 }
