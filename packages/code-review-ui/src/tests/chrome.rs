@@ -710,7 +710,8 @@ fn footer_hints_follow_focus_and_the_cursor_item() {
     let gap = (0..doc.len())
         .find(|index| matches!(doc.item(*index), Some(ReviewItem::Gap(_))))
         .unwrap();
-    for digit in gap.to_string().chars() {
+    let stops = super::stops_between(doc, 0, gap);
+    for digit in stops.to_string().chars() {
         scenario.key(&digit.to_string());
     }
     scenario.key("j");

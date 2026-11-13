@@ -45,11 +45,12 @@ fn file_of(key: &ItemKey) -> Option<String> {
 /// Move the cursor to the item at `index` with a count prefix.
 fn move_to(scenario: &mut Scenario<ReviewSurface>, index: usize) -> Screen {
     let current = cursor_index(scenario);
-    let (count, key) = if index >= current {
-        (index - current, "j")
-    } else {
-        (current - index, "k")
-    };
+    let count = super::stops_between(
+        scenario.surface().document().expect("document"),
+        current,
+        index,
+    );
+    let key = if index >= current { "j" } else { "k" };
     if count > 0 {
         for digit in count.to_string().chars() {
             scenario.key(&digit.to_string());
@@ -241,11 +242,16 @@ fn paging_reaches_the_end_of_the_review() {
     assert!(screen.contains(&last_file), "{}", screen.text());
     // Every file is resident or was loaded on the way; nothing is still loading.
     assert!(!screen.contains("loading"), "{}", screen.text());
-    // `G` lands on the last item.
+    // `G` lands on the last cursor stop: the review ends with the last file's torn edge, which
+    // is for the eye, not the cursor.
     scenario.key("shift+g");
     stable(&mut scenario);
     let doc = scenario.surface().document().unwrap();
-    assert_eq!(cursor_index(&scenario), doc.len() - 1);
+    assert!(matches!(
+        doc.item(doc.len() - 1),
+        Some(ReviewItem::FileEnd(_))
+    ));
+    assert_eq!(cursor_index(&scenario), doc.len() - 2);
 }
 
 #[test]
@@ -657,6 +663,7 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
                 folds: &crate::rows::Folds::default(),
                 composer: None,
                 search: None,
+                cards: None,
             };
             for index in 0..doc.len() {
                 for width in [0_u16, 1, 2, 5, 9, 14, 30, 61, 130] {

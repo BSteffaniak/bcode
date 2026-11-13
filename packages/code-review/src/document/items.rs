@@ -97,6 +97,19 @@ pub struct SourceHeaderItem {
     pub loading: bool,
 }
 
+/// The introduction of a source, before its files.
+///
+/// For a pull request: its description, reviews, and conversation, ending in a break before
+/// the first file. What it shows is the presenter's; the document only places it (see
+/// [`super::ReviewDocument::set_intros`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceIntroItem {
+    /// Workspace source id.
+    pub source_id: String,
+    /// Whether the source's header (banner) is shown above it.
+    pub under_header: bool,
+}
+
 /// Position of a reviewed stack layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackLayerLabel {
@@ -426,6 +439,8 @@ pub struct ComposerItem {
 pub enum ReviewItem {
     /// Source or part header.
     SourceHeader(SourceHeaderItem),
+    /// A source's introduction, before its files.
+    SourceIntro(SourceIntroItem),
     /// File header.
     FileHeader(FileHeaderItem),
     /// Facts and actions under a file header.
@@ -460,6 +475,9 @@ impl ReviewItem {
             Self::SourceHeader(item) => ItemKey::SourceHeader {
                 source_id: item.source_id.clone(),
                 part: item.part,
+            },
+            Self::SourceIntro(item) => ItemKey::SourceIntro {
+                source_id: item.source_id.clone(),
             },
             Self::FileHeader(item) => ItemKey::FileHeader(item.file.clone()),
             Self::FileDetails(item) => ItemKey::FileDetails(item.file.clone()),
@@ -514,9 +532,11 @@ impl ReviewItem {
             | Self::Line(LineItem { file, .. })
             | Self::LinePair(LinePairItem { file, .. })
             | Self::Gap(GapItem { file, .. }) => Some(file),
-            Self::SourceHeader(_) | Self::Thread(_) | Self::AgentThread(_) | Self::Composer(_) => {
-                None
-            }
+            Self::SourceHeader(_)
+            | Self::SourceIntro(_)
+            | Self::Thread(_)
+            | Self::AgentThread(_)
+            | Self::Composer(_) => None,
         }
     }
 

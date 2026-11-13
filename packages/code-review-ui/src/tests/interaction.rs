@@ -111,11 +111,12 @@ pub(super) fn index_of(scenario: &Scenario<ReviewSurface>, key: &ItemKey) -> usi
 
 pub(super) fn move_to(scenario: &mut Scenario<ReviewSurface>, index: usize) -> Screen {
     let current = index_of(scenario, &cursor(scenario));
-    let (count, key) = if index >= current {
-        (index - current, "j")
-    } else {
-        (current - index, "k")
-    };
+    let count = super::stops_between(
+        scenario.surface().document().expect("document"),
+        current,
+        index,
+    );
+    let key = if index >= current { "j" } else { "k" };
     if count > 0 {
         for digit in count.to_string().chars() {
             scenario.key(&digit.to_string());

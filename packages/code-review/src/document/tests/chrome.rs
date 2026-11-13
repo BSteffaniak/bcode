@@ -86,3 +86,30 @@ fn a_collapsed_file_is_its_header_and_loads_nothing() {
     ));
     assert_consistent(&doc, "expanded again");
 }
+
+#[test]
+fn a_source_introduction_comes_before_its_files_and_goes_away_again() {
+    let fake = fake();
+    let mut doc = fake.document(DocumentConfig::default());
+    let plain = keys(&doc);
+    let source = super::support::SOURCE.to_owned();
+    assert!(doc.set_intros(std::collections::BTreeSet::from([source.clone()])));
+    assert!(!doc.set_intros(std::collections::BTreeSet::from([source.clone()])));
+    let _ = doc.take_splices();
+    assert_consistent(&doc, "with an introduction");
+    let intro = ItemKey::SourceIntro {
+        source_id: source.clone(),
+    };
+    let index = doc.index_of(&intro).expect("introduction");
+    let a = std::sync::Arc::new(fake.file("a.rs"));
+    assert!(index < doc.index_of(&ItemKey::FileHeader(a)).expect("first file"));
+    // A single source shows no header, but its introduction still comes first.
+    assert_eq!(index, 0);
+    assert!(matches!(
+        doc.item(index),
+        Some(ReviewItem::SourceIntro(item)) if !item.under_header && item.source_id == source
+    ));
+    assert!(doc.set_intros(std::collections::BTreeSet::new()));
+    let _ = doc.take_splices();
+    assert_eq!(keys(&doc), plain);
+}

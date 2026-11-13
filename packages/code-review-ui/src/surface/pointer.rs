@@ -216,6 +216,12 @@ impl ReviewSurface {
                 self.composer_button(button);
                 None
             }
+            ItemAction::Card(action) => {
+                if let ItemKey::SourceIntro { source_id } = &click.key {
+                    self.talk.card_clicks.push((source_id.clone(), action));
+                }
+                None
+            }
             ItemAction::File(action) => {
                 // On the file's header, so file actions apply to it.
                 if let Some(file) = click.key.file().cloned() {

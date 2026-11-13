@@ -139,8 +139,8 @@ These live in the review's plugin table, `[plugins.config."bcode.code_review".co
 
 * `replies`: `send_now` (the default), where a reply goes out at once with an *Add to review*
   button, or `with_review`, where it is held for your next publish with a *Send now* button.
-* `overview`: `auto` (the default: one line unless something is new), `collapsed` or
-  `expanded`.
+* `overview`: `expanded` (the default), `auto` (folded to its status line unless something is
+  new) or `collapsed`.
 * `signals`:
   * whether provider signals are used at all;
   * a minimum gap between activity reads;
@@ -165,7 +165,9 @@ threads, using the existing compact degradation (`#101 ✓ 2/5 ●1 💬3`). Rea
 rail then answers "what's approved, what's blocked, where's the discussion" without opening
 anything.
 
-**Layer overview.** The first item of each layer is a card, like the top of a pull request's page:
+**Layer overview.** Each pull request's card comes before its files, like the top of a pull
+request's page, and is set apart from them by the same torn edge that separates files. In a
+stack, the cards are what break the document into pull requests. The card holds:
 * title, author, state and base;
 * reviewers, each with their verdict, and *on an older version* when the layer changed in content
   since they reviewed (a rebase-only change keeps an approval current; see stack history);
@@ -174,8 +176,9 @@ anything.
 * the conversation (the newest few, *Show all*);
 * buttons: **Approve**, **Request changes**, **Comment**, **Open on {provider label}**.
 
-The card is one line when nothing is new since you last looked:
-`✓ Approved by ana, raj · checks pass · 3 comments`. Clicking that line expands it.
+The card's status line (`✓ Approved by ana, raj · checks pass · 3 comments`) carries the
+buttons and a ▾/▸ toggle; folded, the card is that line alone. Clicking the toggle, or `z` on
+the card, folds or opens it.
 
 **Inline threads.** Remote threads render like local ones:
 * author, relative time and markdown;
@@ -261,8 +264,8 @@ on #52131"). It has a *Show* button that jumps to the layer or thread.
 3. **Freshness comes from change signals, never review-side polling.** It is configurable
    (`signals`). Where a forge offers no push, the provider's watch does its own cheap
    conditional checks behind the same interface.
-4. **The overview card** is one line unless something is new. This is configurable
-   (`overview`).
+4. **The overview card** sits before the pull request's files. It starts open; folding it
+   leaves its one status line. This is configurable (`overview`).
 
 ## Status
 
@@ -292,7 +295,9 @@ Implemented end to end (not yet committed).
     requests per check, every 30 seconds by default, backing off while GitHub is unavailable.
   * The publisher and importer plugin is now a thin delegate of the provider.
 * **The app:**
-  * The pull request bar (summary, overview, buttons).
+  * The pull request bar: one line (summary and buttons) whose summary goes to the card.
+  * Pull request cards in the document (`SourceIntro` items), before each pull request's files
+    and torn off from them. A whole-stack review's card has one status line per layer.
   * Remote threads with their buttons, and replies sent now or held (configurable).
   * Rail marks, and the threads panel's *on the pull request* and *waiting on you* filters.
   * Provider-backed publishing with a verdict.
@@ -320,6 +325,9 @@ Implemented end to end (not yet committed).
 * GitHub's watch interval is a plain per-check gap: GraphQL has no conditional requests. Measured
   cost is above.
 * Leaving a pull request (moving to another layer) or collapsing its overview marks it seen.
+* The overview is not a panel under the bar but a card in the document, before the files, so it
+  scrolls with the review and separates pull requests in a whole-stack view. The bar stays one
+  line. Its summary goes to the card. The cursor skips a file's details and torn edge.
 
 **Verification:**
 
@@ -331,7 +339,7 @@ Implemented end to end (not yet committed).
   * review marks on the timeline;
   * the GitHub parsers and mappings.
 * Screen tests (`tests/conversation.rs`) against the fake provider:
-  * the bar and its overview;
+  * the bar, and the card before the files with its torn edge, folding and reopening;
   * resolving a thread on the provider;
   * a reply sent now;
   * a held reply submitted with an approval started from the bar;

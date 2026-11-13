@@ -545,6 +545,8 @@ pub struct ReviewDocument {
     pub(super) config: DocumentConfig,
     pub(super) layout: LayoutMode,
     pub(super) chrome: FileChrome,
+    /// Sources that have an introduction before their files.
+    pub(super) intros: BTreeSet<String>,
     pub(super) ignore_whitespace: bool,
     pub(super) groups: Vec<Group>,
     pub(super) files: Vec<FileState>,
@@ -607,6 +609,7 @@ impl ReviewDocument {
             config,
             layout: LayoutMode::Unified,
             chrome: FileChrome::default(),
+            intros: BTreeSet::new(),
             ignore_whitespace: false,
             groups: Vec::new(),
             files: Vec::new(),
@@ -834,6 +837,28 @@ impl ReviewDocument {
         for file in 0..self.files.len() {
             self.rebuild_file(file);
         }
+    }
+
+    /// Give `sources` an introduction before their files (and take it from the others). Their
+    /// header blocks are rebuilt; returns whether any changed.
+    pub fn set_intros(&mut self, sources: BTreeSet<String>) -> bool {
+        if self.intros == sources {
+            return false;
+        }
+        let changed: Vec<usize> = self
+            .groups
+            .iter()
+            .filter(|group| {
+                let id = &group.source.source_id;
+                self.intros.contains(id) != sources.contains(id)
+            })
+            .map(|group| group.header_block)
+            .collect();
+        self.intros = sources;
+        for block in changed {
+            self.rebuild_block(block);
+        }
+        true
     }
 
     /// Files shown only as their header.
@@ -2056,6 +2081,18 @@ impl ReviewDocument {
                 .find(|group| {
                     &group.source.source_id == source_id
                         && group.source.part.as_ref().map(|p| p.index) == *part
+                })
+                .map(|group| group.header_block),
+            ItemKey::SourceIntro { source_id } => self
+                .groups
+                .iter()
+                .find(|group| {
+                    &group.source.source_id == source_id
+                        && group
+                            .source
+                            .part
+                            .as_ref()
+                            .is_none_or(|part| part.index == 0)
                 })
                 .map(|group| group.header_block),
             ItemKey::Thread { .. } | ItemKey::AgentThread { .. } => {

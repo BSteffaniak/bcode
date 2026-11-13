@@ -39,7 +39,7 @@ pub use items::{
     AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileHeaderItem, FileLoad,
     FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayerNumber, LayoutMode, LineContent,
     LineItem, LineKind, LinePairItem, OutdatedReason, PairSide, PlaceholderItem, ReviewItem,
-    SourceHeaderItem, StackLayerLabel, ThreadItem,
+    SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem,
 };
 pub use keys::{FileKey, FileNoticeKind, FileRef, ItemKey};
 pub use navigation::{

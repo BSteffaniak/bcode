@@ -14,7 +14,7 @@
 
 use super::{ActionCells, ItemAction, ItemRows, change_bar, count_spans, header_line};
 use crate::theme::{ReviewTheme, status_letter};
-use bcode_code_review::document::{FileDetailsItem, FileHeaderItem, FileRef};
+use bcode_code_review::document::{FileDetailsItem, FileHeaderItem};
 use bcode_code_review_models::ReviewIndexFlag;
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
@@ -520,12 +520,12 @@ fn noise(path: &str, salt: u64, x: usize) -> u64 {
 
 /// One torn edge of `width` cells from `glyphs` (full, thin, gone): runs of a few cells each,
 /// mostly full, so it reads as a ragged edge rather than noise.
-fn tear_row(glyphs: [&'static str; 3], file: &FileRef, salt: u64, width: usize) -> String {
+fn tear_row(glyphs: [&'static str; 3], seed: &str, salt: u64, width: usize) -> String {
     let mut row = String::with_capacity(width * 3);
     let mut x = 0;
     let mut run = 0;
     while x < width {
-        let value = noise(&file.path, salt, run);
+        let value = noise(seed, salt, run);
         let level = match value % 10 {
             0..=5 => 0,
             6..=8 => 1,
@@ -541,10 +541,11 @@ fn tear_row(glyphs: [&'static str; 3], file: &FileRef, salt: u64, width: usize) 
     row
 }
 
-/// Rows of the break after `file`: torn, a rule, or blank, at `density`.
+/// Rows of a break: torn (by `seed`, so each tears its own way), a rule, or blank, at
+/// `density`.
 #[must_use]
 pub fn end_rows(
-    file: &FileRef,
+    seed: &str,
     separation: Separation,
     density: Density,
     theme: &ReviewTheme,
@@ -570,12 +571,12 @@ pub fn end_rows(
             let style = if desk { theme.files.tear } else { theme.gap };
             let gap = if desk { theme.files.desk } else { Style::new() };
             let bottom = Line::from_spans(vec![Span::styled(
-                tear_row(theme.icons.tear_bottom, file, 1, width),
+                tear_row(theme.icons.tear_bottom, seed, 1, width),
                 style,
             )]);
             // The next page's top edge tears differently from this page's bottom.
             let top = Line::from_spans(vec![Span::styled(
-                tear_row(theme.icons.tear_top, file, 2, width),
+                tear_row(theme.icons.tear_top, seed, 2, width),
                 style,
             )]);
             match density {
@@ -591,11 +592,6 @@ pub fn end_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_code_review::document::FileKey;
-
-    fn file(path: &str) -> FileRef {
-        std::sync::Arc::new(FileKey::new("s".to_owned(), None, path.to_owned()))
-    }
 
     #[test]
     fn densities_follow_the_pane_with_some_slack() {
@@ -633,9 +629,9 @@ mod tests {
     #[test]
     fn a_tear_is_the_same_for_a_file_and_differs_between_files() {
         let glyphs = ["▀", "▔", " "];
-        let one = tear_row(glyphs, &file("a.rs"), 1, 60);
-        assert_eq!(one, tear_row(glyphs, &file("a.rs"), 1, 60));
-        assert_ne!(one, tear_row(glyphs, &file("b.rs"), 1, 60));
+        let one = tear_row(glyphs, "a.rs", 1, 60);
+        assert_eq!(one, tear_row(glyphs, "a.rs", 1, 60));
+        assert_ne!(one, tear_row(glyphs, "b.rs", 1, 60));
         assert_eq!(one.chars().count(), 60);
         // Mostly paper, with ragged bits.
         let full = one.chars().filter(|c| *c == '▀').count();

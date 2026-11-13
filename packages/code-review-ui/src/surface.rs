@@ -162,7 +162,7 @@ mod stack;
 mod stack_files;
 
 pub use annotate::COMPOSER_SCOPE;
-pub use conversation::{BarAction, BarState, ConversationMessage};
+pub use conversation::{BarState, ConversationMessage};
 pub use dock::{ASSISTANT_PANE_ID, ASSISTANT_SCOPE, DockResult};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
@@ -258,6 +258,7 @@ struct Extras<'a> {
     folds: &'a Folds,
     composer: Option<&'a Composer>,
     search: Option<&'a SearchHighlights>,
+    cards: super::rows::card::CardContext<'a>,
 }
 
 const fn row_context<'a>(
@@ -276,6 +277,7 @@ const fn row_context<'a>(
         folds: extras.folds,
         composer: extras.composer,
         search: extras.search,
+        cards: Some(extras.cards),
     }
 }
 
@@ -538,6 +540,52 @@ impl Review {
         self.cursor = self.doc.item(index).map(ReviewItem::key);
         self.reveal = Some(reveal);
         self.follow_viewport = false;
+    }
+
+    /// Whether the cursor may rest on the item at `index`. A file's details and the break after
+    /// it are no stops: they are for the pointer, and the keys act on the header.
+    fn is_stop(&self, index: usize) -> bool {
+        !matches!(
+            self.doc.item(index),
+            Some(ReviewItem::FileDetails(_) | ReviewItem::FileEnd(_))
+        )
+    }
+
+    /// The last item the cursor may rest on (the review usually ends with a file's break).
+    fn last_stop(&self) -> usize {
+        (0..self.doc.len())
+            .rev()
+            .find(|index| self.is_stop(*index))
+            .unwrap_or(0)
+    }
+
+    /// The item `count` cursor stops from the cursor, forward or back.
+    fn step_index(&self, count: usize, forward: bool) -> usize {
+        let stop = |index: usize| self.is_stop(index);
+        let last = self.doc.len().saturating_sub(1);
+        let mut index = self.cursor_index;
+        for _ in 0..count {
+            let mut next = index;
+            loop {
+                let moved = if forward {
+                    (next < last).then(|| next + 1)
+                } else {
+                    next.checked_sub(1)
+                };
+                let Some(moved) = moved else {
+                    break;
+                };
+                next = moved;
+                if stop(next) {
+                    break;
+                }
+            }
+            if !stop(next) || next == index {
+                break;
+            }
+            index = next;
+        }
+        index
     }
 
     /// File of the cursor item.
@@ -843,6 +891,7 @@ impl ReviewSurface {
             folds: &self.folds,
             composer: self.composer.as_ref(),
             search: self.search.as_ref().map(|search| &search.highlights),
+            cards: self.card_context(self.viewed_layers().len()),
         }
     }
 
@@ -2579,12 +2628,16 @@ impl ReviewSurface {
         }
         match action {
             "stack_history" => self.open_history(host),
-            "pull_request" => self.bar_action(BarAction::Toggle, host),
-            "approve_pull_request" => self.bar_action(BarAction::Approve, host),
-            "request_changes" => self.bar_action(BarAction::RequestChanges, host),
-            "pull_request_comment" => self.bar_action(BarAction::Comment, host),
-            "approve_reviewed_layers" => self.bar_action(BarAction::ApproveViewed, host),
-            "refresh_conversation" => self.bar_action(BarAction::Refresh, host),
+            "pull_request" => self.bar_action(super::rows::card::CardAction::Toggle, host),
+            "approve_pull_request" => self.bar_action(super::rows::card::CardAction::Approve, host),
+            "request_changes" => {
+                self.bar_action(super::rows::card::CardAction::RequestChanges, host);
+            }
+            "pull_request_comment" => self.bar_action(super::rows::card::CardAction::Comment, host),
+            "approve_reviewed_layers" => {
+                self.bar_action(super::rows::card::CardAction::ApproveViewed, host);
+            }
+            "refresh_conversation" => self.bar_action(super::rows::card::CardAction::Refresh, host),
             "open_pull_request" => self.open_pull_request_page(host),
             "stack_file" => self.open_file_through_stack(),
             "stack_overlaps" => self.open_stack_overlaps(),
@@ -2671,16 +2724,19 @@ impl ReviewSurface {
         let repeat = count.unwrap_or(1) as usize;
         let viewport = review.viewport_height.max(1);
         match action {
-            "down" => review.set_cursor(
-                review.cursor_index.saturating_add(repeat),
-                AnchorPolicy::EnsureVisibleFrom(Edge::Bottom),
-            ),
-            "up" => review.set_cursor(
-                review.cursor_index.saturating_sub(repeat),
-                AnchorPolicy::EnsureVisibleFrom(Edge::Top),
-            ),
+            "down" => {
+                let index = review.step_index(repeat, true);
+                review.set_cursor(index, AnchorPolicy::EnsureVisibleFrom(Edge::Bottom));
+            }
+            "up" => {
+                let index = review.step_index(repeat, false);
+                review.set_cursor(index, AnchorPolicy::EnsureVisibleFrom(Edge::Top));
+            }
             "first" => review.set_cursor(0, AnchorPolicy::ItemTopAtTop),
-            "last" => review.set_cursor(usize::MAX, AnchorPolicy::EnsureVisibleFrom(Edge::Bottom)),
+            "last" => {
+                let last = review.last_stop();
+                review.set_cursor(last, AnchorPolicy::EnsureVisibleFrom(Edge::Bottom));
+            }
             "half_page_down" | "half_page_up" | "page_down" | "page_up" => {
                 let rows = if action.starts_with("half") {
                     (viewport / 2).max(1)
@@ -3214,9 +3270,7 @@ impl ReviewSurface {
             redraw |= self.scroll_tree(rows, viewport.height);
         }
         let (clicked, host_action) = self.after_list_event(*mouse, in_list);
-        for action in std::mem::take(&mut self.file_ui.actions) {
-            let _ = self.run_action(action, None, host);
-        }
+        self.run_queued_clicks(host);
         redraw |= clicked;
         if let Some(action) = host_action {
             return action;
@@ -3241,6 +3295,16 @@ impl ReviewSurface {
             Action::Redraw
         } else {
             Action::None
+        }
+    }
+
+    /// Run the file and card buttons clicked in the list (they need the host).
+    fn run_queued_clicks(&mut self, host: &UiContext) {
+        for action in std::mem::take(&mut self.file_ui.actions) {
+            let _ = self.run_action(action, None, host);
+        }
+        for (source_id, action) in std::mem::take(&mut self.talk.card_clicks) {
+            self.card_click(&source_id, action, host);
         }
     }
 
@@ -3994,6 +4058,8 @@ impl ReviewSurface {
         }
         refresh_marks(review, &params);
         let constraints = Constraints::tight(size);
+        let viewed = self.viewed_layers().len();
+        let review = self.review.as_mut()?;
         let syntax = &self.syntax;
         let extras = Extras {
             notes: &self.notes,
@@ -4001,6 +4067,15 @@ impl ReviewSurface {
             folds: &self.folds,
             composer: self.composer.as_ref(),
             search: self.search.as_ref().map(|search| &search.highlights),
+            cards: super::rows::card::CardContext {
+                conversations: &self.talk.data,
+                seen: &self.talk.seen,
+                history: self.stack_history.as_ref(),
+                show_all: &self.talk.show_all,
+                viewed_layers: viewed,
+                overview: self.services.conversation_config().overview,
+                revision: self.talk.card_revision(),
+            },
         };
         // Lay out (twice when the cursor must be revealed: the reveal needs the synced index).
         let mut layout = layout_list(review, &params, syntax, extras, constraints);

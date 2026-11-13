@@ -10,7 +10,7 @@ use super::items::{
     AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileHeaderItem,
     FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayoutMode, LineContent, LineItem, LineKind,
     LinePairItem, OutdatedReason, PairSide, PlaceholderItem, ReviewItem, SourceHeaderItem,
-    StackLayerLabel, ThreadItem,
+    SourceIntroItem, StackLayerLabel, ThreadItem,
 };
 use super::keys::{FileNoticeKind, FileRef};
 use super::review::{
@@ -136,10 +136,24 @@ impl ReviewDocument {
 
     fn build_source_header(&self, group: usize) -> Built {
         let group = &self.groups[group];
+        // A source's introduction follows its header, once (on its first part).
+        let intro = (self.intros.contains(&group.source.source_id)
+            && group
+                .source
+                .part
+                .as_ref()
+                .is_none_or(|part| part.index == 0))
+        .then(|| {
+            ReviewItem::SourceIntro(SourceIntroItem {
+                source_id: group.source.source_id.clone(),
+                under_header: group.show_header,
+            })
+        });
         if !group.show_header {
+            let items: Vec<ReviewItem> = intro.into_iter().collect();
             return Built {
-                items: Vec::new(),
-                hunk_parent: Vec::new(),
+                hunk_parent: vec![None; items.len()],
+                items,
             };
         }
         let stack_size = self
@@ -179,9 +193,10 @@ impl ReviewDocument {
             viewed_count: group.viewed,
             loading: group.loading,
         });
+        let items: Vec<ReviewItem> = std::iter::once(item).chain(intro).collect();
         Built {
-            items: vec![item],
-            hunk_parent: vec![None],
+            hunk_parent: vec![None; items.len()],
+            items,
         }
     }
 

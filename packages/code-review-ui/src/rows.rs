@@ -76,6 +76,7 @@ impl fmt::Display for RowKey {
                 f.write_char(SEP)?;
                 file(f, key)
             }
+            ItemKey::SourceIntro { source_id } => write!(f, "si{SEP}{source_id}"),
             ItemKey::FileDetails(key) => {
                 f.write_str("fd")?;
                 f.write_char(SEP)?;
@@ -133,6 +134,7 @@ impl fmt::Display for RowKey {
 use std::fmt::Write as _;
 
 mod agent;
+pub mod card;
 pub mod file;
 
 pub use agent::{dock_key, dock_rows, exchange_turn, is_newest, item_id, open_key};
@@ -266,6 +268,8 @@ pub enum ItemAction {
     Comment,
     /// A button of a file's chrome.
     File(file::FileAction),
+    /// A part of a pull request's card.
+    Card(card::CardAction),
 }
 
 /// Clickable cells on one row of an item.
@@ -563,6 +567,8 @@ pub struct RowContext<'a> {
     pub composer: Option<&'a super::composer::Composer>,
     /// Search matches to highlight.
     pub search: Option<&'a SearchHighlights>,
+    /// What pull request cards are drawn from.
+    pub cards: Option<card::CardContext<'a>>,
 }
 
 impl RowContext<'_> {
@@ -599,6 +605,7 @@ impl RowContext<'_> {
     pub fn annotation_stamp(&self, item: &ReviewItem) -> u64 {
         match item {
             ReviewItem::Thread(_) => self.params.annotation_revision,
+            ReviewItem::SourceIntro(_) => self.cards.map_or(0, |cards| cards.revision),
             ReviewItem::AgentThread(agent) => {
                 let session = agent
                     .exchange_id
@@ -654,9 +661,10 @@ impl RowContext<'_> {
                 self.options(),
             ) as u64,
             ReviewItem::Placeholder(placeholder) => u64::from(placeholder.estimated_rows.max(1)),
-            ReviewItem::Thread(_) | ReviewItem::AgentThread(_) | ReviewItem::FileDetails(_) => {
-                self.rows(index, width).height
-            }
+            ReviewItem::Thread(_)
+            | ReviewItem::AgentThread(_)
+            | ReviewItem::FileDetails(_)
+            | ReviewItem::SourceIntro(_) => self.rows(index, width).height,
             ReviewItem::Composer(_) => self.composer_layout(width)?.height,
             ReviewItem::SourceHeader(header)
                 if header
@@ -690,6 +698,27 @@ impl RowContext<'_> {
                 }
                 _ => ItemRows::single(source_header(item, styles, cells)),
             },
+            ReviewItem::SourceIntro(item) => self.cards.as_ref().map_or_else(
+                || {
+                    file::end_rows(
+                        &item.source_id,
+                        self.params.separation,
+                        self.params.density,
+                        styles,
+                        cells,
+                    )
+                },
+                |cards| {
+                    card::card_rows(
+                        item,
+                        cards,
+                        self.params.density,
+                        self.params.separation,
+                        styles,
+                        cells,
+                    )
+                },
+            ),
             ReviewItem::FileHeader(item) => {
                 file::header_rows(item, self.params.density, styles, cells)
             }
@@ -697,7 +726,7 @@ impl RowContext<'_> {
                 file::details_rows(item, self.params.density, styles, cells)
             }
             ReviewItem::FileEnd(file) => file::end_rows(
-                file,
+                &file.path,
                 self.params.separation,
                 self.params.density,
                 styles,

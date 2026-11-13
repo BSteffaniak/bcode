@@ -4,7 +4,7 @@
 //! ```toml
 //! [plugins.config."bcode.code_review".conversation]
 //! replies = "send_now"     # or "with_review"
-//! overview = "auto"        # or "collapsed", "expanded"
+//! overview = "expanded"    # the pull request cards: or "auto", "collapsed"
 //! notify = "reviews_and_replies"  # or "all", "reviews", "none"
 //! fold_resolved = true
 //! outdated_on_file = true
@@ -32,16 +32,16 @@ pub enum ReplyMode {
     WithReview,
 }
 
-/// How a pull request's overview shows.
+/// How a pull request's card shows before its files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverviewMode {
-    /// One line unless something is new.
-    #[default]
+    /// The status line only, unless something is new.
     Auto,
-    /// One line.
+    /// The status line only.
     Collapsed,
-    /// Open.
+    /// Open: the description, reviews, checks, and conversation.
+    #[default]
     Expanded,
 }
 
@@ -166,13 +166,13 @@ mod tests {
     fn every_setting_has_a_default_and_can_be_changed() {
         assert_eq!(parse(""), (ConversationConfig::default(), None));
         let (config, problem) = parse(
-            "[conversation]\nreplies = \"with_review\"\noverview = \"expanded\"\nnotify = \"none\"\n\
+            "[conversation]\nreplies = \"with_review\"\noverview = \"collapsed\"\nnotify = \"none\"\n\
              [conversation.signals]\nmin_gap_ms = 500\n\
              [conversation.signals.providers.forge]\ninterval_ms = 60000\n",
         );
         assert_eq!(problem, None);
         assert_eq!(config.replies, ReplyMode::WithReview);
-        assert_eq!(config.overview, OverviewMode::Expanded);
+        assert_eq!(config.overview, OverviewMode::Collapsed);
         assert_eq!(config.notify, NotifyMode::None);
         assert_eq!(config.signals.min_gap_ms, 500);
         assert!(config.signals.provider);

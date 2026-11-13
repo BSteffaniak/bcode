@@ -268,12 +268,16 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   stack shows its top layer). One line: the review decision and who approved, checks (failing
   or running first), open threads, *waiting on you*, and what is new since you last looked, with
   buttons for what the provider and your permissions allow: **Approve**, **Request changes**,
-  **Comment**, **Open ↗**, and **↻** to read it again. Clicking the summary (or `ctrl+o`) opens
-  it as the top of the pull request's page: the description, each reviewer's latest verdict (and
-  whether it was given on an older version, or before a rebase that keeps it current), who is
-  still asked, failing checks with links, and the conversation, with **Show all** and
-  **Collapse**. A stack also gets **Approve N reviewed layers**. It opens by itself when something
-  is new (configurable).
+  **Comment**, **Open ↗**, and **↻** to read it again. Clicking the summary (or `ctrl+o`) goes to
+  the pull request's card.
+* **The card** comes before the pull request's files, as the top of its page, torn off from the
+  first file like files are from each other, so a stack reads as one page per pull request. It
+  holds the title, the status line with the same buttons and a ▾/▸ toggle (`z` on the card also
+  folds it), the description, each reviewer's latest verdict (and whether it was given on an
+  older version, or before a rebase that keeps it current), who is still asked, failing checks
+  with links, and the conversation, with **Show all**. A stack also gets **Approve N reviewed
+  layers**, and a whole-stack review gets one status line per layer. Cards start open; the
+  `overview` setting can start them folded, or folded unless something is new.
 * **Threads** from the forge sit on their lines in the diff, placed on the code the review shows:
   exactly, moved with their code when it moved, else on their file (*on an older version*) or on
   the layer. Each has **Reply**, **Resolve**/**Reopen**, **Open ↗** and **Ask Bcode** as far as

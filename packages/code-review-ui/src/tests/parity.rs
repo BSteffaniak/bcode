@@ -141,11 +141,8 @@ fn move_to(scenario: &mut Scenario<ReviewSurface>, index: usize) {
         .cursor()
         .and_then(|key| doc.index_of(key))
         .unwrap_or(0);
-    let (count, key) = if index >= current {
-        (index - current, "j")
-    } else {
-        (current - index, "k")
-    };
+    let count = super::stops_between(doc, current, index);
+    let key = if index >= current { "j" } else { "k" };
     if count > 0 {
         for digit in count.to_string().chars() {
             scenario.key(&digit.to_string());

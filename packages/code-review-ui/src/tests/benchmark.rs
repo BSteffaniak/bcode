@@ -169,7 +169,8 @@ fn screen_benchmark() {
     scenario.key("g");
     scenario.settle();
     scenario.render();
-    for digit in header.to_string().chars() {
+    let stops = super::stops_between(scenario.surface().document().expect("document"), 0, header);
+    for digit in stops.to_string().chars() {
         scenario.key(&digit.to_string());
     }
     scenario.key("j");
@@ -393,7 +394,8 @@ fn sized_case(fixture: &GitFixture, width: u16, height: u16, layout: ConfiguredL
     scenario.key("g");
     let mut ignored = PhaseCosts::default();
     present(&mut scenario, &mut terminal, &mut ignored);
-    for digit in header.to_string().chars() {
+    let stops = super::stops_between(scenario.surface().document().expect("document"), 0, header);
+    for digit in stops.to_string().chars() {
         scenario.key(&digit.to_string());
     }
     scenario.key("j");

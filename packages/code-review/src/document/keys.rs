@@ -57,6 +57,11 @@ pub enum ItemKey {
         /// Part index.
         part: Option<u32>,
     },
+    /// Introduction of one source, before its files.
+    SourceIntro {
+        /// Workspace source id.
+        source_id: String,
+    },
     /// Header of one file.
     FileHeader(FileRef),
     /// Facts and actions under a file's header.
@@ -136,6 +141,7 @@ impl ItemKey {
             | Self::LinePair { file, .. }
             | Self::Gap { file, .. } => Some(file),
             Self::SourceHeader { .. }
+            | Self::SourceIntro { .. }
             | Self::Thread { .. }
             | Self::AgentThread { .. }
             | Self::Composer => None,
@@ -164,9 +170,11 @@ impl ItemKey {
     #[must_use]
     pub fn to_persisted(&self) -> Option<ReviewItemKey> {
         match self {
-            Self::SourceHeader { source_id, .. } => Some(ReviewItemKey::SourceHeader {
-                source_id: source_id.clone(),
-            }),
+            Self::SourceHeader { source_id, .. } | Self::SourceIntro { source_id } => {
+                Some(ReviewItemKey::SourceHeader {
+                    source_id: source_id.clone(),
+                })
+            }
             Self::FileHeader(file)
             | Self::FileDetails(file)
             | Self::FileEnd(file)

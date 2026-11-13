@@ -114,6 +114,20 @@ impl ReviewSurface {
             self.toggle_file_collapsed();
             return;
         }
+        // On a pull request's card: the card folds to its status line.
+        let card = self
+            .review
+            .as_ref()
+            .and_then(|review| match &review.cursor {
+                Some(bcode_code_review::document::ItemKey::SourceIntro { source_id }) => {
+                    Some(source_id.clone())
+                }
+                _ => None,
+            });
+        if let Some(source_id) = card {
+            self.toggle_card(&source_id);
+            return;
+        }
         match self.target() {
             Some(Target::Thread { thread_id, .. }) => {
                 let collapsed = !self.folds.collapsed.remove(&thread_id);

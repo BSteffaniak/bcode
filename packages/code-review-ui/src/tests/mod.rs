@@ -67,3 +67,22 @@ fn open(
     let screen = stable(&mut scenario);
     (scenario, screen)
 }
+
+/// Cursor stops from item `from` to item `to` (the count a `j`/`k` motion needs): a file's
+/// details and the break after it are not stops.
+fn stops_between(
+    doc: &bcode_code_review::document::ReviewDocument,
+    from: usize,
+    to: usize,
+) -> usize {
+    use bcode_code_review::document::ReviewItem;
+    let (low, high) = (from.min(to), from.max(to));
+    (low + 1..=high)
+        .filter(|index| {
+            !matches!(
+                doc.item(*index),
+                Some(ReviewItem::FileDetails(_) | ReviewItem::FileEnd(_))
+            )
+        })
+        .count()
+}

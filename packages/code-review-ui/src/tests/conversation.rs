@@ -178,6 +178,35 @@ fn the_bar_and_threads_show_the_conversation_with_buttons_for_what_is_allowed() 
     for button in ["Approve", "Request changes", "Comment", "Open ↗", "↻"] {
         assert!(bar.contains(button), "{button:?} missing from {bar:?}");
     }
+    // Before the files, the pull request's card: the top of its page, then a torn break.
+    for part in [
+        "Adds the second layer.",
+        "Reviews",
+        "ana approved",
+        "Looks right.",
+        "waiting for raj",
+        "lint failing",
+        "1 passing",
+        "Ship it after the lint fix.",
+    ] {
+        assert!(screen.contains(part), "{part:?}:\n{}", screen.text());
+    }
+    let card = screen.find("Adds the second layer.").expect("card").y;
+    let file = screen.find("stack/layer_2.rs").map_or(u16::MAX, |at| at.y);
+    assert!(card < file, "{}", screen.text());
+    assert!(
+        (card..file).any(|y| screen.row_text(y).contains('▀')),
+        "a torn break between the card and the files:\n{}",
+        screen.text()
+    );
+
+    // Folded, the card is its status line, and the files come up.
+    let screen = click(&mut scenario, "▾ ✓");
+    assert!(
+        !screen.contains("Ship it after the lint fix."),
+        "{}",
+        screen.text()
+    );
     // The thread sits on its line with the provider's actions.
     for part in [
         "raj",
@@ -189,30 +218,19 @@ fn the_bar_and_threads_show_the_conversation_with_buttons_for_what_is_allowed() 
         assert!(screen.contains(part), "{part:?}:\n{}", screen.text());
     }
 
-    // Opened, the bar is the top of the pull request's page.
-    let screen = click(&mut scenario, "Approved");
-    for part in [
-        "Adds the second layer.",
-        "Reviews",
-        "ana approved",
-        "Looks right.",
-        "waiting for raj",
-        "lint failing",
-        "1 passing",
-        "Ship it after the lint fix.",
-        "Collapse",
-    ] {
-        assert!(screen.contains(part), "{part:?}:\n{}", screen.text());
-    }
-    let screen = click(&mut scenario, "Collapse");
-    assert!(!screen.contains("Ship it after the lint fix."));
-
     // Resolving goes to the provider; the thread folds as resolved.
     let screen = click(&mut scenario, "Resolve");
     let provider = backend.provider().expect("provider");
     assert!(provider.activity(PULL).expect("activity").threads[0].resolved);
     assert!(screen.contains("resolved"), "{}", screen.text());
     assert!(!screen.contains("Why this constant?"));
+    // The bar's status goes to the card, open again.
+    let screen = click(&mut scenario, "Approved");
+    assert!(
+        screen.contains("Ship it after the lint fix."),
+        "{}",
+        screen.text()
+    );
     assert!(
         provider
             .calls()
