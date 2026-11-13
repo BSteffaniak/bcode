@@ -124,6 +124,89 @@ impl SavedTuiAppearance {
     }
 }
 
+/// Replace the theme choices in the state file at `path`, keeping every other section and key
+/// as it is. `None` removes a choice, so the configured value applies again. The file is
+/// replaced atomically, so readers see either the previous or the new state.
+///
+/// # Errors
+///
+/// * [`LayersError::Io`] when the file cannot be read or written.
+/// * [`LayersError::Composition`] when the existing file is not TOML or `[theme]` is not a
+///   table.
+pub fn save_tui_appearance(
+    path: &Path,
+    appearance: &SavedTuiAppearance,
+) -> Result<(), LayersError> {
+    let mut document = match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<toml::Table>()
+            .map_err(|error| LayersError::Composition {
+                message: format!("{}: failed to parse TUI state: {error}", path.display()),
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(source) => {
+            return Err(LayersError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let theme = document
+        .entry("theme")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| LayersError::Composition {
+            message: format!("{}: [theme] is not a table", path.display()),
+        })?;
+    for (key, value) in [
+        ("name", &appearance.theme),
+        ("profile", &appearance.profile),
+    ] {
+        match value {
+            Some(value) => {
+                theme.insert(key.to_owned(), toml::Value::String(value.clone()));
+            }
+            None => {
+                theme.remove(key);
+            }
+        }
+    }
+    let contents = toml::to_string(&document).map_err(|error| LayersError::Composition {
+        message: format!("failed to serialize TUI state: {error}"),
+    })?;
+    write_atomically(path, contents.as_bytes()).map_err(|source| LayersError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    sync_directory(parent)
+}
+
+/// Make the rename into `directory` durable where directories can be synced.
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+/// Make the rename into `directory` durable where directories can be synced.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+const fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -209,5 +292,50 @@ mod tests {
             SavedTuiAppearance::load(&dir.path().join("tui.toml")).expect("missing"),
             SavedTuiAppearance::default()
         );
+    }
+
+    #[test]
+    fn saving_the_appearance_replaces_only_the_theme_choices() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state").join("tui.toml");
+        save_tui_appearance(
+            &path,
+            &SavedTuiAppearance {
+                theme: Some("nord".to_owned()),
+                profile: Some("bare".to_owned()),
+            },
+        )
+        .expect("created");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n[presentation.streaming]\nenabled = false\n",
+                std::fs::read_to_string(&path).expect("read")
+            ),
+        )
+        .expect("append");
+        save_tui_appearance(
+            &path,
+            &SavedTuiAppearance {
+                theme: Some("dracula".to_owned()),
+                profile: None,
+            },
+        )
+        .expect("replaced");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            SavedTuiAppearance::parse(&text).expect("state"),
+            SavedTuiAppearance {
+                theme: Some("dracula".to_owned()),
+                profile: None,
+            }
+        );
+        let document = text.parse::<toml::Table>().expect("toml");
+        assert_eq!(
+            document["presentation"]["streaming"]["enabled"],
+            toml::Value::Boolean(false)
+        );
+        std::fs::write(&path, "theme = 3\n").expect("write");
+        assert!(save_tui_appearance(&path, &SavedTuiAppearance::default()).is_err());
     }
 }

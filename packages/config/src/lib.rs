@@ -7040,8 +7040,8 @@ pub fn set_tui_theme_selection(name: &str) -> Result<PathBuf, ConfigError> {
             message: "theme name must not be empty".to_owned(),
         });
     }
-    update_tui_state(&default_tui_state_path(), |state| {
-        state.theme.name = Some(name.to_owned());
+    update_saved_tui_appearance(&default_tui_state_path(), |saved| {
+        saved.theme = Some(name.to_owned());
     })
 }
 
@@ -7086,7 +7086,7 @@ pub fn set_tui_profile_selection_at(
             message: "profile name must not be empty".to_owned(),
         });
     }
-    update_tui_state(path, |state| state.theme.profile = name.map(str::to_owned))
+    update_saved_tui_appearance(path, |saved| saved.profile = name.map(str::to_owned))
 }
 
 /// Clear the globally selected interactive TUI theme.
@@ -7095,7 +7095,7 @@ pub fn set_tui_profile_selection_at(
 ///
 /// Returns an error when the state cannot be written.
 pub fn clear_tui_theme_selection() -> Result<PathBuf, ConfigError> {
-    update_tui_state(&default_tui_state_path(), |state| state.theme.name = None)
+    update_saved_tui_appearance(&default_tui_state_path(), |saved| saved.theme = None)
 }
 
 /// Load the interactive TUI streaming-presentation override.
@@ -7259,6 +7259,23 @@ fn update_tui_state(
     let mut state = load_tui_state_from(path)?;
     update(&mut state);
     write_tui_state(path, &state)
+}
+
+/// Change the appearance saved at `path` through the writer every Bcode program shares
+/// ([`bcode_config_layers::user_state::save_tui_appearance`]), serialized with the other user
+/// state updates of this process.
+fn update_saved_tui_appearance(
+    path: &Path,
+    update: impl FnOnce(&mut SavedTuiAppearance),
+) -> Result<PathBuf, ConfigError> {
+    let _guard = TUI_STATE_UPDATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut saved = SavedTuiAppearance::load(path).map_err(ConfigError::from)?;
+    update(&mut saved);
+    bcode_config_layers::user_state::save_tui_appearance(path, &saved)
+        .map_err(ConfigError::from)?;
+    Ok(path.to_path_buf())
 }
 
 fn write_tui_state(path: &Path, state: &TuiState) -> Result<PathBuf, ConfigError> {
