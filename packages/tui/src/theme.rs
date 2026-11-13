@@ -13,33 +13,7 @@ use super::app::BmuxApp;
 pub mod chrome;
 pub mod effects;
 
-/// One bounded theme catalog row for selection and diagnostics UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThemeCatalogEntry {
-    /// Stable theme id.
-    pub id: String,
-    /// Human-readable display name.
-    pub display_name: String,
-    /// Bundled, user, project, or explicit origin label.
-    pub source: String,
-    /// Whether a dark variant patch is available.
-    pub has_dark_variant: bool,
-    /// Whether a light variant patch is available.
-    pub has_light_variant: bool,
-    /// Validation state for this accepted catalog definition.
-    pub validation: String,
-    /// Whether this is the configured base selection.
-    pub selected: bool,
-}
-
-/// One bounded effective catalog plus rejected-candidate diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThemeCatalogView {
-    /// Selectable, fully validated definitions.
-    pub entries: Vec<ThemeCatalogEntry>,
-    /// Bounded secret-safe rejected candidate summaries.
-    pub diagnostics: Vec<String>,
-}
+pub use bcode_tui_theme::picker::{ProfileCatalogEntry, ThemeCatalogEntry, ThemeCatalogView};
 
 /// Discover the bounded effective theme catalog for an app.
 pub(crate) fn discover_theme_catalog(
@@ -56,7 +30,8 @@ pub(crate) fn discover_theme_catalog(
     discovery::discover_themes(&roots)
 }
 
-/// Return the bounded effective theme catalog for an app.
+/// Return the bounded effective theme catalog for an app, with the configured
+/// palette marked ([`bcode_tui_theme::picker::theme_catalog_view`]).
 #[must_use]
 pub fn catalog_view(app: &mut BmuxApp) -> ThemeCatalogView {
     let selected = app.tui_config().theme.name.clone();
@@ -66,79 +41,22 @@ pub fn catalog_view(app: &mut BmuxApp) -> ThemeCatalogView {
             diagnostics: vec!["bundled theme catalog is invalid".to_owned()],
         };
     };
-    let entries = discovered
-        .catalog
-        .definitions()
-        .filter(|definition| definition.kind() == definition::ThemeKind::Theme)
-        .map(|definition| {
-            let source = discovered.sources.get(definition.id()).map_or_else(
-                || "bundled".to_owned(),
-                |external| match external.kind {
-                    discovery::ThemeSourceKind::User => "user".to_owned(),
-                    discovery::ThemeSourceKind::Project => "project".to_owned(),
-                    discovery::ThemeSourceKind::Explicit => "explicit".to_owned(),
-                },
-            );
-            ThemeCatalogEntry {
-                id: definition.id().to_owned(),
-                display_name: definition.display_name().to_owned(),
-                source,
-                has_dark_variant: definition.has_dark_variant(),
-                has_light_variant: definition.has_light_variant(),
-                validation: "valid".to_owned(),
-                selected: definition.id() == selected,
-            }
-        })
-        .collect();
-    let diagnostics = discovered
-        .diagnostics
-        .iter()
-        .map(|diagnostic| {
-            format!(
-                "{}: {}",
-                bcode_plugin_sdk::path::display_from_current_dir(&diagnostic.path),
-                diagnostic.message
-            )
-        })
-        .collect();
-    ThemeCatalogView {
-        entries,
-        diagnostics,
-    }
+    bcode_tui_theme::picker::theme_catalog_view(
+        &discovered.catalog,
+        &discovered.sources,
+        &discovered.diagnostics,
+        &selected,
+        |path| bcode_plugin_sdk::path::display_from_current_dir(path).to_string(),
+    )
 }
 
-/// One selectable interface profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileCatalogEntry {
-    /// Stable profile id.
-    pub id: String,
-    /// Display name without the `(profile)` suffix.
-    pub display_name: String,
-    /// Optional one-line description.
-    pub description: Option<String>,
-    /// Whether this is the configured profile.
-    pub selected: bool,
-}
-
-/// Return the selectable profiles in stable id order.
+/// Return the selectable profiles in stable id order, with the configured
+/// profile marked ([`bcode_tui_theme::picker::profile_catalog`]).
 #[must_use]
 pub fn profile_catalog(app: &mut BmuxApp) -> Vec<ProfileCatalogEntry> {
     let selected = app.tui_config().theme.profile.clone();
     app.theme_catalog().map_or_else(Vec::new, |discovered| {
-        discovered
-            .catalog
-            .definitions()
-            .filter(|definition| definition.kind() == definition::ThemeKind::Profile)
-            .map(|definition| ProfileCatalogEntry {
-                id: definition.id().to_owned(),
-                display_name: definition
-                    .display_name()
-                    .trim_end_matches(" (profile)")
-                    .to_owned(),
-                description: definition.description().map(str::to_owned),
-                selected: selected.as_deref() == Some(definition.id()),
-            })
-            .collect()
+        bcode_tui_theme::picker::profile_catalog(&discovered.catalog, selected.as_deref())
     })
 }
 

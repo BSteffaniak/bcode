@@ -1,17 +1,23 @@
 //! Combined palette × profile ("appearance") picker state.
 //!
 //! This is the only interactive appearance picker: `/appearance`, `/theme`,
-//! and `/profile` all open it, focused on the axis they name. The picker
-//! composes a [`PaletteAxisState`] and a [`ProfileAxisState`]; one axis is
-//! active at a time: the axis keys switch it, and the selection keys move
-//! within it. Every movement is reported as a preview outcome so the caller
-//! applies it live; cancelling restores both selections the picker opened
-//! with.
+//! and `/profile` all open it, focused on the axis they name. The selection
+//! is the shared [`AppearanceSelection`] every Bcode program's picker uses;
+//! one axis is active at a time: the axis keys switch it, and the selection
+//! keys move within it. Every movement is reported as a preview outcome so
+//! the caller applies it live; cancelling restores both selections the
+//! picker opened with. The column lists ([`PaletteAxisState`],
+//! [`ProfileAxisState`]) follow the selection for scrolling and hit testing.
 
+use bcode_tui_theme::picker::AppearanceSelection;
 use bmux_keyboard::KeyStroke;
 
-use super::appearance_picker_axes::{PaletteAxisState, ProfileAxisState, ProfileRow};
+use super::appearance_picker_axes::{PaletteAxisState, ProfileAxisState};
 use super::theme::{ProfileCatalogEntry, ThemeCatalogEntry};
+
+pub use bcode_tui_theme::picker::AppearanceAxis;
+/// Appearance picker outcome for one input event.
+pub use bcode_tui_theme::picker::AppearanceOutcome as AppearancePickerOutcome;
 
 /// Keymap scope of the appearance picker.
 pub const APPEARANCE_PICKER_SCOPE: &str = "appearance_picker";
@@ -20,44 +26,15 @@ pub const APPEARANCE_PICKER_SCOPE: &str = "appearance_picker";
 /// aliases of [`APPEARANCE_PICKER_SCOPE`] (earlier entries take precedence).
 pub const LEGACY_PICKER_SCOPES: [&str; 2] = ["theme_picker", "profile_picker"];
 
-/// One of the picker's two selection axes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AppearanceAxis {
-    /// Color palette (a complete theme).
-    Palette,
-    /// Interface profile overlay (chrome and structure).
-    Profile,
-}
-
-impl AppearanceAxis {
-    /// Return the other axis.
-    #[must_use]
-    pub const fn other(self) -> Self {
-        match self {
-            Self::Palette => Self::Profile,
-            Self::Profile => Self::Palette,
-        }
-    }
-
-    /// Return the axis a palette route focuses: `profile.select` focuses
-    /// profiles; `theme.select`, `appearance.select`, and any other route
-    /// focus palettes.
-    #[must_use]
-    pub fn for_route(route: &str) -> Self {
-        if route == "profile.select" {
-            Self::Profile
-        } else {
-            Self::Palette
-        }
-    }
-
-    /// Return the axis column label.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Palette => "Palette",
-            Self::Profile => "Profile",
-        }
+/// Return the axis a palette route focuses: `profile.select` focuses
+/// profiles; `theme.select`, `appearance.select`, and any other route focus
+/// palettes.
+#[must_use]
+pub fn axis_for_route(route: &str) -> AppearanceAxis {
+    if route == "profile.select" {
+        AppearanceAxis::Profile
+    } else {
+        AppearanceAxis::Palette
     }
 }
 
@@ -69,44 +46,17 @@ pub struct PendingProfilePersist {
     pub profile: Option<String>,
 }
 
-/// Appearance picker outcome for one input event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppearancePickerOutcome {
-    /// The palette selection moved; preview it without persisting.
-    PreviewPalette(String),
-    /// The profile selection moved; apply it without persisting (`None`
-    /// clears the profile overlay).
-    PreviewProfile(Option<String>),
-    /// The active axis changed; nothing needs to be applied.
-    AxisChanged(AppearanceAxis),
-    /// Persist both selections.
-    Apply {
-        /// Selected palette (theme) id.
-        palette: String,
-        /// Selected profile id (`None` for the theme's own presentation).
-        profile: Option<String>,
-    },
-    /// Close and restore both selections the picker opened with.
-    Cancel,
-    /// The event was ignored.
-    Ignored,
-}
-
 /// Bounded interactive palette × profile picker state.
+///
+/// The selection itself (axes, rows, change tracking, outcomes) is the shared
+/// [`AppearanceSelection`]; this state adds the list scroll state of each
+/// column, the palettes resolved for previewing, and the sample preview.
 #[derive(Debug, Clone)]
 pub struct AppearancePickerState {
+    selection: AppearanceSelection,
     palettes: PaletteAxisState,
     profiles: ProfileAxisState,
     preview: super::appearance_picker_sample::SamplePreview,
-    axis: AppearanceAxis,
-    original_palette: Option<String>,
-    /// Whether the configured profile has a row (`None` always does).
-    original_profile_listed: bool,
-    /// Whether the user selected a row on each axis. An axis whose
-    /// configured value has no row starts on a fallback row the user never
-    /// chose, so only an explicit selection counts as a change there.
-    palette_chosen: bool,
-    profile_chosen: bool,
 }
 
 impl AppearancePickerState {
@@ -123,56 +73,47 @@ impl AppearancePickerState {
         active_profile: Option<String>,
         axis: AppearanceAxis,
     ) -> Self {
-        let original_palette = palettes
-            .iter()
-            .find(|entry| entry.selected)
-            .map(|entry| entry.id.clone());
-        let profiles = ProfileAxisState::new(profiles, active_profile);
-        let original_profile_listed = profiles
-            .entries()
-            .iter()
-            .any(|entry| entry.id.as_deref() == profiles.original());
-        Self {
-            palettes: PaletteAxisState::new(palettes, diagnostics),
-            profiles,
+        let selection =
+            AppearanceSelection::new(palettes, diagnostics, profiles, active_profile, axis);
+        let mut state = Self {
+            palettes: PaletteAxisState::new(selection.palettes()),
+            profiles: ProfileAxisState::new(selection.profiles()),
+            selection,
             preview: super::appearance_picker_sample::SamplePreview::default(),
-            axis,
-            original_palette,
-            original_profile_listed,
-            palette_chosen: false,
-            profile_chosen: false,
-        }
+        };
+        state.sync_lists();
+        state
     }
 
     /// Return the active axis.
     #[must_use]
     pub const fn axis(&self) -> AppearanceAxis {
-        self.axis
+        self.selection.axis()
     }
 
     /// Make `axis` active; returns whether it changed.
     pub fn set_axis(&mut self, axis: AppearanceAxis) -> bool {
-        std::mem::replace(&mut self.axis, axis) != axis
+        self.selection.set_axis(axis)
     }
 
-    /// Return the palette axis state.
+    /// Return the palette list state.
     #[must_use]
     pub const fn palettes(&self) -> &PaletteAxisState {
         &self.palettes
     }
 
-    /// Return the palette axis state mutably (list rendering, preview cache).
+    /// Return the palette list state mutably (list rendering, preview cache).
     pub const fn palettes_mut(&mut self) -> &mut PaletteAxisState {
         &mut self.palettes
     }
 
-    /// Return the profile axis state.
+    /// Return the profile list state.
     #[must_use]
     pub const fn profiles(&self) -> &ProfileAxisState {
         &self.profiles
     }
 
-    /// Return the profile axis state mutably (list rendering).
+    /// Return the profile list state mutably (list rendering).
     pub const fn profiles_mut(&mut self) -> &mut ProfileAxisState {
         &mut self.profiles
     }
@@ -197,62 +138,46 @@ impl AppearancePickerState {
     #[cfg(test)]
     #[must_use]
     pub fn original_palette(&self) -> Option<&str> {
-        self.original_palette.as_deref()
+        self.selection.original_palette()
     }
 
     /// Return the profile active when the picker opened.
     #[must_use]
     pub fn original_profile(&self) -> Option<&str> {
-        self.profiles.original()
+        self.selection.original_profile()
     }
 
     /// Return the selected palette id.
     #[must_use]
     pub fn selected_palette(&self) -> Option<&str> {
-        self.palettes.selected_id()
+        self.selection.selected_palette()
     }
 
     /// Return the selected profile id (`None` for the theme default row).
+    #[cfg(test)]
     #[must_use]
     pub fn selected_profile(&self) -> Option<&str> {
-        self.profiles
-            .selected_entry()
-            .and_then(|entry| entry.id.as_deref())
+        self.selection.selected_profile()
     }
 
-    /// Whether the palette selection differs from the configured theme.
-    ///
-    /// When the configured theme has no catalog row, the picker starts on a
-    /// fallback row; the palette counts as changed only once the user
-    /// selected a row.
+    /// Whether the palette selection differs from the configured theme
+    /// ([`AppearanceSelection::palette_changed`]).
     #[must_use]
     pub fn palette_changed(&self) -> bool {
-        self.original_palette
-            .as_deref()
-            .map_or(self.palette_chosen, |original| {
-                self.selected_palette() != Some(original)
-            })
+        self.selection.palette_changed()
     }
 
-    /// Whether the profile selection differs from the configured profile,
-    /// with the same fallback rule as [`Self::palette_changed`] for a
-    /// configured profile that has no row.
+    /// Whether the profile selection differs from the configured profile
+    /// ([`AppearanceSelection::profile_changed`]).
     #[must_use]
     pub fn profile_changed(&self) -> bool {
-        if self.original_profile_listed {
-            self.selected_profile() != self.original_profile()
-        } else {
-            self.profile_chosen
-        }
+        self.selection.profile_changed()
     }
 
     /// Return the number of rows on `axis`.
     #[must_use]
     pub fn row_count(&self, axis: AppearanceAxis) -> usize {
-        match axis {
-            AppearanceAxis::Palette => self.palettes.entries().len(),
-            AppearanceAxis::Profile => self.profiles.entries().len(),
-        }
+        self.selection.row_count(axis)
     }
 
     /// Return the list scroll offset of `axis` for hit testing.
@@ -266,35 +191,23 @@ impl AppearancePickerState {
 
     /// Make `axis` active and select one absolute row on it.
     pub fn select_row(&mut self, axis: AppearanceAxis, row: usize) -> AppearancePickerOutcome {
-        if row >= self.row_count(axis) {
-            return AppearancePickerOutcome::Ignored;
-        }
-        self.axis = axis;
-        let outcome = match axis {
-            AppearanceAxis::Palette => palette_outcome(self.palettes.select_row(row)),
-            AppearanceAxis::Profile => profile_outcome(self.profiles.select_row(row)),
-        };
-        self.note_choice(&outcome);
+        let outcome = self.selection.select_row(axis, row);
+        self.sync_lists();
         outcome
     }
 
     /// Make `axis` active and move its selection one row, as one mouse
     /// wheel notch over its column does (`forward` is down).
     pub fn scroll(&mut self, axis: AppearanceAxis, forward: bool) -> AppearancePickerOutcome {
-        self.axis = axis;
-        self.step(forward)
+        let outcome = self.selection.scroll(axis, forward);
+        self.sync_lists();
+        outcome
     }
 
     /// Request persistence of both current selections.
     #[must_use]
     pub fn apply(&self) -> AppearancePickerOutcome {
-        self.selected_palette()
-            .map_or(AppearancePickerOutcome::Ignored, |palette| {
-                AppearancePickerOutcome::Apply {
-                    palette: palette.to_owned(),
-                    profile: self.selected_profile().map(str::to_owned),
-                }
-            })
+        self.selection.apply()
     }
 
     /// Handle one picker key.
@@ -312,58 +225,31 @@ impl AppearancePickerState {
         stroke: KeyStroke,
         keymap: &super::keymap::BmuxKeyMap,
     ) -> AppearancePickerOutcome {
-        match keymap.action(APPEARANCE_PICKER_SCOPE, stroke) {
+        let outcome = match keymap.action(APPEARANCE_PICKER_SCOPE, stroke) {
             Some("tui.control.cancel") => AppearancePickerOutcome::Cancel,
             Some("tui.control.submit") => self.apply(),
-            Some("tui.control.up") => self.step(false),
-            Some("tui.control.down") => self.step(true),
-            Some("tui.control.left") => self.switch_to(AppearanceAxis::Palette),
-            Some("tui.control.right") => self.switch_to(AppearanceAxis::Profile),
+            Some("tui.control.up") => self.selection.step(false),
+            Some("tui.control.down") => self.selection.step(true),
+            Some("tui.control.left") => self.selection.switch_to(AppearanceAxis::Palette),
+            Some("tui.control.right") => self.selection.switch_to(AppearanceAxis::Profile),
             Some("tui.control.focus_next" | "tui.control.focus_previous") => {
-                self.switch_to(self.axis.other())
+                self.selection.toggle_axis()
             }
             _ => AppearancePickerOutcome::Ignored,
-        }
-    }
-
-    fn switch_to(&mut self, axis: AppearanceAxis) -> AppearancePickerOutcome {
-        if self.set_axis(axis) {
-            AppearancePickerOutcome::AxisChanged(axis)
-        } else {
-            AppearancePickerOutcome::Ignored
-        }
-    }
-
-    fn step(&mut self, forward: bool) -> AppearancePickerOutcome {
-        let outcome = match self.axis {
-            AppearanceAxis::Palette => palette_outcome(self.palettes.step(forward)),
-            AppearanceAxis::Profile => profile_outcome(self.profiles.step(forward)),
         };
-        self.note_choice(&outcome);
+        self.sync_lists();
         outcome
     }
 
-    /// Record that the user selected a row on the axis `outcome` previews.
-    const fn note_choice(&mut self, outcome: &AppearancePickerOutcome) {
-        match outcome {
-            AppearancePickerOutcome::PreviewPalette(_) => self.palette_chosen = true,
-            AppearancePickerOutcome::PreviewProfile(_) => self.profile_chosen = true,
-            _ => {}
+    /// Move each column's list cursor to the selection's row.
+    const fn sync_lists(&mut self) {
+        if let Some(row) = self.selection.selected_index(AppearanceAxis::Palette) {
+            self.palettes.show_row(row);
+        }
+        if let Some(row) = self.selection.selected_index(AppearanceAxis::Profile) {
+            self.profiles.show_row(row);
         }
     }
-}
-
-fn palette_outcome(selected: Option<String>) -> AppearancePickerOutcome {
-    selected.map_or(
-        AppearancePickerOutcome::Ignored,
-        AppearancePickerOutcome::PreviewPalette,
-    )
-}
-
-fn profile_outcome(selected: Option<&ProfileRow>) -> AppearancePickerOutcome {
-    selected.map_or(AppearancePickerOutcome::Ignored, |row| {
-        AppearancePickerOutcome::PreviewProfile(row.id.clone())
-    })
 }
 
 #[cfg(test)]

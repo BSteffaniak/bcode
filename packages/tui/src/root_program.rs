@@ -2660,7 +2660,7 @@ impl BcodeRuntimeModel {
                     }
                 }
                 route @ ("theme.select" | "profile.select" | "appearance.select") => {
-                    let axis = super::appearance_picker::AppearanceAxis::for_route(route);
+                    let axis = super::appearance_picker::axis_for_route(route);
                     self.loop_state.open_appearance_picker(&mut self.chat, axis);
                 }
                 "transcript.inspect"

@@ -1,18 +1,22 @@
-//! Per-axis list state of the appearance picker.
+//! Per-column list state of the appearance picker.
 //!
-//! Each axis owns its catalog rows and bounded list state. Axis states only
-//! move their selection and report the newly selected id; the combined
-//! [`AppearancePickerState`](super::appearance_picker::AppearancePickerState)
-//! owns input handling, preview outcomes, and change tracking.
+//! The rows and the selection belong to the shared
+//! [`AppearanceSelection`](bcode_tui_theme::picker::AppearanceSelection); each
+//! column here keeps the rows it paints, its bounded list scroll state (moved
+//! to the selected row by the picker), and, for palettes, the themes resolved
+//! for previewing.
 
 use std::collections::BTreeMap;
 
+use bcode_tui_theme::picker::{PaletteAxis, ProfileAxis};
 use bmux_tui_components::selectable_list::SelectableListState as ListState;
 
 use super::filtered_list::FilteredListState;
-use super::theme::{ProfileCatalogEntry, ResolvedTheme, ThemeCatalogEntry};
+use super::theme::{ResolvedTheme, ThemeCatalogEntry};
 
-/// Palette (complete theme) axis: catalog rows, rejected-candidate
+pub use bcode_tui_theme::picker::ProfileRow;
+
+/// Palette (complete theme) column: catalog rows, rejected-candidate
 /// diagnostics, and palettes resolved lazily for previewing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaletteAxisState {
@@ -23,17 +27,17 @@ pub struct PaletteAxisState {
 }
 
 impl PaletteAxisState {
-    /// Create the axis from stable catalog rows, selecting the row marked
-    /// `selected` (or the first row).
+    /// Create the column for the palette axis of a selection.
     #[must_use]
-    pub fn new(entries: Vec<ThemeCatalogEntry>, diagnostics: Vec<String>) -> Self {
-        let selected = entries.iter().position(|entry| entry.selected).unwrap_or(0);
-        let mut list = FilteredListState::new(entries.len());
-        let _selected = list.select_visible(selected);
+    pub fn new(axis: &PaletteAxis) -> Self {
+        let mut list = FilteredListState::new(axis.entries().len());
+        if let Some(row) = axis.selected_index() {
+            let _selected = list.select_visible(row);
+        }
         Self {
-            entries,
+            entries: axis.entries().to_vec(),
             resolved_previews: BTreeMap::new(),
-            diagnostics,
+            diagnostics: axis.diagnostics().to_vec(),
             list,
         }
     }
@@ -78,7 +82,7 @@ impl PaletteAxisState {
         self.list.offset()
     }
 
-    /// Return the selected catalog entry.
+    /// Return the catalog entry under the list cursor.
     #[must_use]
     pub fn selected_entry(&self) -> Option<&ThemeCatalogEntry> {
         self.list
@@ -86,78 +90,28 @@ impl PaletteAxisState {
             .and_then(|selected| self.entries.get(selected))
     }
 
-    /// Return the selected theme id.
-    #[must_use]
-    pub fn selected_id(&self) -> Option<&str> {
-        self.selected_entry().map(|entry| entry.id.as_str())
-    }
-
-    /// Select one absolute row; returns the newly selected id.
-    pub fn select_row(&mut self, row: usize) -> Option<String> {
-        let id = self.entries.get(row)?.id.clone();
+    /// Move the list cursor to `row` (the selection's row).
+    pub const fn show_row(&mut self, row: usize) {
         let _selected = self.list.select_visible(row);
-        Some(id)
-    }
-
-    /// Move the selection one row (`forward` is down); returns the newly
-    /// selected id.
-    pub fn step(&mut self, forward: bool) -> Option<String> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        if forward {
-            self.list.select_next();
-        } else {
-            self.list.select_previous();
-        }
-        self.selected_id().map(str::to_owned)
     }
 }
 
-/// One profile row; `id` is `None` for the theme's own presentation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileRow {
-    /// Profile id, or `None` for no profile overlay.
-    pub id: Option<String>,
-    /// Display name.
-    pub display_name: String,
-    /// One-line description.
-    pub description: Option<String>,
-}
-
-/// Profile (interface overlay) axis: a "Theme default" row followed by the
+/// Profile (interface overlay) column: a "Theme default" row followed by the
 /// profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileAxisState {
     entries: Vec<ProfileRow>,
-    original: Option<String>,
     list: FilteredListState,
 }
 
 impl ProfileAxisState {
-    /// Create the axis from catalog rows; `original` is the active profile.
+    /// Create the column for the profile axis of a selection.
     #[must_use]
-    pub fn new(catalog: Vec<ProfileCatalogEntry>, original: Option<String>) -> Self {
-        let entries = std::iter::once(ProfileRow {
-            id: None,
-            display_name: "Theme default".to_owned(),
-            description: Some("No profile overlay: the theme's own chrome and structure.".into()),
-        })
-        .chain(catalog.into_iter().map(|entry| ProfileRow {
-            id: Some(entry.id),
-            display_name: entry.display_name,
-            description: entry.description,
-        }))
-        .collect::<Vec<_>>();
-        let selected = entries
-            .iter()
-            .position(|entry| entry.id == original)
-            .unwrap_or(0);
-        let mut list = FilteredListState::new(entries.len());
-        let _selected = list.select_visible(selected);
+    pub fn new(axis: &ProfileAxis) -> Self {
+        let mut list = FilteredListState::new(axis.entries().len());
+        let _selected = list.select_visible(axis.selected_index());
         Self {
-            entries,
-            original,
+            entries: axis.entries().to_vec(),
             list,
         }
     }
@@ -166,12 +120,6 @@ impl ProfileAxisState {
     #[must_use]
     pub fn entries(&self) -> &[ProfileRow] {
         &self.entries
-    }
-
-    /// Return the profile active when the picker opened.
-    #[must_use]
-    pub fn original(&self) -> Option<&str> {
-        self.original.as_deref()
     }
 
     /// Synchronize list visibility before rendering and return its render state.
@@ -185,7 +133,7 @@ impl ProfileAxisState {
         self.list.offset()
     }
 
-    /// Return the selected row.
+    /// Return the row under the list cursor.
     #[must_use]
     pub fn selected_entry(&self) -> Option<&ProfileRow> {
         self.list
@@ -193,29 +141,16 @@ impl ProfileAxisState {
             .and_then(|selected| self.entries.get(selected))
     }
 
-    /// Select one absolute row; returns the newly selected row.
-    pub fn select_row(&mut self, row: usize) -> Option<&ProfileRow> {
-        if row >= self.entries.len() {
-            return None;
-        }
+    /// Move the list cursor to `row` (the selection's row).
+    pub const fn show_row(&mut self, row: usize) {
         let _selected = self.list.select_visible(row);
-        self.entries.get(row)
-    }
-
-    /// Move the selection one row (`forward` is down); returns the newly
-    /// selected row.
-    pub fn step(&mut self, forward: bool) -> Option<&ProfileRow> {
-        if forward {
-            self.list.select_next();
-        } else {
-            self.list.select_previous();
-        }
-        self.selected_entry()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bcode_tui_theme::picker::{AppearanceAxis, AppearanceSelection, ProfileCatalogEntry};
+
     use super::*;
 
     fn palette(id: &str, selected: bool) -> ThemeCatalogEntry {
@@ -230,8 +165,8 @@ mod tests {
         }
     }
 
-    fn profiles() -> Vec<ProfileCatalogEntry> {
-        ["bare", "zen"]
+    fn selection(palettes: Vec<ThemeCatalogEntry>, profile: Option<&str>) -> AppearanceSelection {
+        let profiles = ["bare", "zen"]
             .into_iter()
             .map(|id| ProfileCatalogEntry {
                 id: id.to_owned(),
@@ -239,12 +174,20 @@ mod tests {
                 description: None,
                 selected: false,
             })
-            .collect()
+            .collect();
+        AppearanceSelection::new(
+            palettes,
+            Vec::new(),
+            profiles,
+            profile.map(str::to_owned),
+            AppearanceAxis::Palette,
+        )
     }
 
     #[test]
     fn palette_axis_caches_resolved_previews_until_cleared() {
-        let mut axis = PaletteAxisState::new(vec![palette("bcode-dark", true)], Vec::new());
+        let mut axis =
+            PaletteAxisState::new(selection(vec![palette("bcode-dark", true)], None).palettes());
         let catalog =
             super::super::theme::definition::ThemeCatalog::bundled().expect("bundled themes parse");
         let definition = catalog
@@ -264,22 +207,18 @@ mod tests {
     }
 
     #[test]
-    fn no_active_profile_selects_theme_default() {
-        let axis = ProfileAxisState::new(profiles(), None);
+    fn columns_open_on_the_selected_rows() {
+        let selection = selection(vec![palette("one", false), palette("two", true)], None);
+        let palettes = PaletteAxisState::new(selection.palettes());
         assert_eq!(
-            axis.selected_entry().map(|entry| entry.id.clone()),
+            palettes.selected_entry().map(|entry| entry.id.as_str()),
+            Some("two")
+        );
+        let profiles = ProfileAxisState::new(selection.profiles());
+        assert_eq!(
+            profiles.selected_entry().map(|entry| entry.id.clone()),
             Some(None)
         );
-        assert_eq!(axis.entries().len(), 3);
-    }
-
-    #[test]
-    fn rows_outside_the_catalog_are_ignored() {
-        let mut palettes = PaletteAxisState::new(vec![palette("one", true)], Vec::new());
-        assert_eq!(palettes.select_row(1), None);
-        assert_eq!(palettes.selected_id(), Some("one"));
-        let mut profiles = ProfileAxisState::new(profiles(), Some("zen".to_owned()));
-        assert_eq!(profiles.select_row(9), None);
-        assert_eq!(profiles.select_row(0).map(|row| row.id.clone()), Some(None));
+        assert_eq!(profiles.entries().len(), 3);
     }
 }
