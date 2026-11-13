@@ -5,9 +5,10 @@ Usage: drive.py PLAN.json OUT_DIR PROBE -- COMMAND...
 
 PLAN: {"size": [cols, rows], "env": {...}, "cwd": "...",
        "accept_prompts": {"marker": "text", "keys": "1", "label": "permission"},
-       "steps": [{"expect": ["text"], "timeout": 30, "settle": 0.5, "snapshot": "name",
+       "steps": [{"expect": ["text"], "expect_any": ["text"], "timeout": 30, "settle": 0.5, "snapshot": "name",
                   "frames": 0, "interval": 0.2, "type": "slow text", "send": "keys"}]}
-Each step waits until every `expect` string is on the rendered screen (BMUX terminal grid, with
+Each step waits until every `expect` string (and, if given, one `expect_any` string) is on the
+rendered screen (BMUX terminal grid, with
 non-breaking spaces read as spaces), waits up to `settle` seconds (bounded, for animations) for the screen to stop changing,
 records a snapshot when named plus `frames` further snapshots `interval` seconds apart, then
 types `type` one character at a time and sends `send` as is. While waiting, a screen showing the
@@ -83,12 +84,14 @@ class Session:
             args.append("--styled")
         return subprocess.run(args, capture_output=True, check=True, timeout=30).stdout.decode()
 
-    def wait(self, expect, timeout, settle, accept=None):
+    def wait(self, expect, timeout, settle, accept=None, expect_any=None):
         deadline = time.time() + timeout
         while True:
             self.pump(0.2)
             text = self.screen()
-            if all(item in text.replace("\u00a0", " ") for item in expect):
+            plain = text.replace("\u00a0", " ")
+            if all(item in plain for item in expect) and (
+                    not expect_any or any(item in plain for item in expect_any)):
                 break
             if accept and accept(text):
                 deadline = time.time() + timeout
@@ -153,7 +156,7 @@ def main():
     try:
         for step in plan["steps"]:
             text = session.wait(step.get("expect", []), step.get("timeout", 30),
-                                step.get("settle", 0.5), accept)
+                                step.get("settle", 0.5), accept, step.get("expect_any"))
             if step.get("snapshot"):
                 snapshot(step["snapshot"], text)
             for frame in range(step.get("frames", 0)):

@@ -68,7 +68,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 
 | # | Gap | Status |
 |---|---|---|
-| 1 | Markdown code blocks need their own syntax roles (ANSI there, RGB in diffs) | open |
+| 1 | Markdown code blocks need their own syntax roles (ANSI there, RGB in diffs) | done: `markdown.code.*` roles |
 | 2 | Hide the header row and the session-start marker | done: `header`, `session_start` |
 | 3 | Status line placement and alignment; footer row below the input | done: `status` placement, indent, segments |
 | 4 | Composer: rule borders, prompt glyph, no title, placeholder and send control optional | done: `borders.composer = "rules"`, `composer`, `composer.*` roles |
@@ -78,7 +78,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 8 | Group summary templates with plural forms (`Read {count} file{s}`) | done: group `header.template`, `{plural}`, `group.min = 1` |
 | 9 | Reasoning summary template with duration | template done; reasoning duration needs activity timing in the session view (open) |
 | 10 | Turn summary row (duration and completion time) | open |
-| 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | open |
+| 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | done: `markdown` chrome (BMUX `MarkdownPresentation`) |
 | 12 | Activity line: placement, spinner frames, verbs, shimmer | done: `activity`, `activity.*` roles |
 | 13 | Docked permission and question surfaces with numbered option lists | open |
 | 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
@@ -86,5 +86,5 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 16 | Slash menu presentation | open |
 | 17 | Permission records disappear once decided | done: `hidden_marker = false` |
 | 18 | Plugin-drawn tool bodies (file edit card, shell screen) follow header/section presentation | open |
-| 19 | Smart punctuation off (straight quotes) | open |
+| 19 | Smart punctuation off (straight quotes) | done: `markdown.smart_punctuation` |
 | 20 | Status line: "rows below latest" shown while following content shorter than the viewport | fixed |

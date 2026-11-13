@@ -905,7 +905,7 @@ Also rendered identically by: `bcode + claude-code-layout`.
      src/render.rs:412
      src/mouse.rs:57
 
-⏺ The offset is recomputed before layout, so hit rows lag one frame. I’ll move
+⏺ The offset is recomputed before layout, so hit rows lag one frame. I'll move
   it after measurement.
 
 ⏺ bash(cargo check)

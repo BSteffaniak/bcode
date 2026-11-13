@@ -487,6 +487,61 @@ pub struct ActivityChrome {
     pub shimmer: bool,
 }
 
+/// How fenced code blocks are framed in Markdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeBlockFrame {
+    /// A header with the language, a bar before each row, and a footer.
+    #[default]
+    Framed,
+    /// Highlighted rows only.
+    Plain,
+}
+
+/// How Markdown table header cells align.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableHeaders {
+    /// Like their column.
+    #[default]
+    Column,
+    /// Centered.
+    Center,
+}
+
+/// Markdown structure glyphs and options; `None` keeps the renderer's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MarkdownChrome {
+    /// Unordered list bullet.
+    pub bullet: Option<ChromeText>,
+    /// Spaces after a list marker, at most [`MAX_MARKER_GAP`].
+    pub marker_gap: Option<u8>,
+    /// Fenced code block framing.
+    pub code_blocks: CodeBlockFrame,
+    /// Block quote bar.
+    pub quote_bar: Option<ChromeText>,
+    /// Table header alignment.
+    pub table_headers: TableHeaders,
+    /// Typographic quotes, dashes, and ellipses; `false` keeps text as written.
+    pub smart_punctuation: bool,
+}
+
+impl Default for MarkdownChrome {
+    fn default() -> Self {
+        Self {
+            bullet: None,
+            marker_gap: None,
+            code_blocks: CodeBlockFrame::Framed,
+            quote_bar: None,
+            table_headers: TableHeaders::Column,
+            smart_punctuation: true,
+        }
+    }
+}
+
+/// Widest Markdown list marker gap.
+pub const MAX_MARKER_GAP: u8 = 4;
+
 /// The input composer's chrome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComposerChrome {
@@ -548,6 +603,8 @@ pub struct TuiChrome {
     pub follow: FollowPolicy,
     /// Activity presentation.
     pub activity: ActivityChrome,
+    /// Markdown structure.
+    pub markdown: MarkdownChrome,
 }
 
 /// Maximum focus gradient colors.
@@ -604,6 +661,23 @@ pub(crate) struct RawComposer {
     pub placeholder: Option<ChromeText>,
     #[serde(default)]
     pub controls: Option<Visibility>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawMarkdown {
+    #[serde(default)]
+    pub bullet: Option<ChromeText>,
+    #[serde(default)]
+    pub marker_gap: Option<u8>,
+    #[serde(default)]
+    pub code_blocks: Option<CodeBlockFrame>,
+    #[serde(default)]
+    pub quote_bar: Option<ChromeText>,
+    #[serde(default)]
+    pub table_headers: Option<TableHeaders>,
+    #[serde(default)]
+    pub smart_punctuation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -665,6 +739,8 @@ pub(crate) struct RawTuiChrome {
     pub follow: Option<FollowPolicy>,
     #[serde(default)]
     pub activity: Option<RawActivity>,
+    #[serde(default)]
+    pub markdown: Option<RawMarkdown>,
 }
 
 /// `[chrome]` table: the terminal section plus opaque sections for other renderers.
@@ -740,6 +816,15 @@ impl RawTuiChrome {
         overlay!(markers, RawMarkers: user, assistant, bullet, connector);
         overlay!(composer, RawComposer: prompt, title, placeholder, controls);
         overlay!(status, RawStatus: placement, indent, segments);
+        overlay!(
+            markdown,
+            RawMarkdown: bullet,
+            marker_gap,
+            code_blocks,
+            quote_bar,
+            table_headers,
+            smart_punctuation
+        );
     }
 }
 

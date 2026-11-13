@@ -153,6 +153,7 @@ header    = "shown"         # shown | hidden: the header row at the top of the s
 session_start = "shown"     # shown | hidden: the marker at the start of a session
 status    = { placement = "above_composer", indent = 0, segments = ["activity", "context", "usage", "children", "progress", "plugins", "message", "position", "hints"] }
 activity  = { placement = "status", spinner = "⠋⠙⠹", verbs = [], shimmer = false }
+markdown  = { bullet = "•", marker_gap = 2, code_blocks = "framed", quote_bar = "│", table_headers = "column", smart_punctuation = true }
 composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls = "shown" }
 ```
 
@@ -175,6 +176,11 @@ composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls
   busy period followed by the period's elapsed seconds; `shimmer` sweeps a three-cell
   `activity.shimmer` highlight across the text unless motion is `none`. The `activity.spinner`,
   `activity.text`, and `activity.shimmer` roles style the row.
+* `markdown` sets Markdown structure: the unordered list bullet, the spaces after list markers
+  (0..=4), `code_blocks = "plain"` for unframed fenced code, the quote bar, `table_headers =
+  "center"`, and `smart_punctuation = false` to keep quotes, dashes, and ellipses as written.
+  The `markdown.code.<token>` roles color fenced code, falling back to `syntax.<token>`, so code
+  blocks and diffs can use different palettes.
 * `follow = "reply"` holds a new submission's or reply's first row at the viewport top until it
   overflows; `latest` keeps the latest content at the bottom instead. Neither pulls a reader who
   scrolled away from the latest content; a submission returns to it under `latest`.

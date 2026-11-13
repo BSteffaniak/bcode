@@ -132,13 +132,14 @@
   },
   "steps": [
    {
-    "expect": [
-     "ready"
-    ],
-    "settle": 2,
+    "settle": 3,
     "snapshot": "start",
     "type": "Give me a tour of the project",
-    "timeout": 90
+    "timeout": 90,
+    "expect_any": [
+     "ready",
+     "❯"
+    ]
    },
    {
     "expect": [

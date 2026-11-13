@@ -279,6 +279,45 @@ fg = "#66d9ef"
 [styles."syntax.raw"]
 fg = "#e6db74"
 
+[styles."markdown.code.text"]
+fg = "$text"
+
+[styles."markdown.code.comment"]
+fg = "ansi:bright_black"
+
+[styles."markdown.code.keyword"]
+fg = "ansi:blue"
+
+[styles."markdown.code.function"]
+fg = "ansi:yellow"
+
+[styles."markdown.code.variable"]
+fg = "$text"
+
+[styles."markdown.code.string"]
+fg = "ansi:red"
+
+[styles."markdown.code.number"]
+fg = "ansi:magenta"
+
+[styles."markdown.code.type"]
+fg = "ansi:cyan"
+
+[styles."markdown.code.operator"]
+fg = "$text"
+
+[styles."markdown.code.punctuation"]
+fg = "$text"
+
+[styles."markdown.code.heading"]
+fg = "$text"
+
+[styles."markdown.code.link"]
+fg = "ansi:blue"
+
+[styles."markdown.code.raw"]
+fg = "ansi:red"
+
 [styles."source.text"]
 fg = "#f8f8f2"
 

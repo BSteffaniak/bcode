@@ -59,11 +59,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bcode_markdown_render::{
-    MarkdownContributionKind, MarkdownDestination, MarkdownDocumentContext, MarkdownRenderOptions,
-    MarkdownRenderResult, MarkdownSelectionKind, MarkdownTheme, MermaidContributionRendering,
-    render_markdown,
+    MarkdownCodeBlockFrame, MarkdownContributionKind, MarkdownDestination, MarkdownDocumentContext,
+    MarkdownPresentation, MarkdownRenderOptions, MarkdownRenderResult, MarkdownSelectionKind,
+    MarkdownTableHeaderAlignment, MarkdownTheme, MermaidContributionRendering, render_markdown,
 };
 use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
+use bcode_tui_theme::chrome::{CodeBlockFrame, TableHeaders};
 use bcode_tui_theme::definition::ResolvedThemeDefinition;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutNode, LogicalRect,
@@ -538,26 +539,52 @@ pub fn syntax_palette(theme: &ResolvedThemeDefinition) -> SyntaxPalette {
     let info = state("state.info");
     let success = state("state.success");
     let warning = state("state.warning");
-    let color = |name: &str, fallback: SyntaxColor| {
-        theme
-            .style(name)
-            .and_then(|style| style.fg)
+    // Code blocks use `markdown.code.<token>`, falling back to the shared `syntax.<token>`.
+    let color = |token: &str, fallback: SyntaxColor| {
+        [format!("markdown.code.{token}"), format!("syntax.{token}")]
+            .iter()
+            .find_map(|name| theme.style(name).and_then(|style| style.fg))
             .map_or(fallback, SyntaxColor::from_tui)
     };
     SyntaxPalette {
-        text: color("syntax.text", text),
-        comment: color("syntax.comment", muted),
-        keyword: color("syntax.keyword", info),
-        function: color("syntax.function", info),
-        variable: color("syntax.variable", text),
-        string: color("syntax.string", success),
-        number: color("syntax.number", warning),
-        type_name: color("syntax.type", info),
-        operator: color("syntax.operator", text),
-        punctuation: color("syntax.punctuation", text),
-        heading: color("syntax.heading", info),
-        link: color("syntax.link", info),
-        raw: color("syntax.raw", success),
+        text: color("text", text),
+        comment: color("comment", muted),
+        keyword: color("keyword", info),
+        function: color("function", info),
+        variable: color("variable", text),
+        string: color("string", success),
+        number: color("number", warning),
+        type_name: color("type", info),
+        operator: color("operator", text),
+        punctuation: color("punctuation", text),
+        heading: color("heading", info),
+        link: color("link", info),
+        raw: color("raw", success),
+    }
+}
+
+/// BMUX Markdown presentation from the theme's `chrome.markdown`.
+#[must_use]
+pub fn markdown_presentation(theme: &ResolvedThemeDefinition) -> MarkdownPresentation {
+    let chrome = theme.chrome.markdown;
+    let defaults = MarkdownPresentation::default();
+    MarkdownPresentation {
+        list_bullet: chrome
+            .bullet
+            .map_or(defaults.list_bullet, |bullet| bullet.as_str().to_owned()),
+        list_marker_gap: chrome.marker_gap.unwrap_or(defaults.list_marker_gap),
+        code_block_frame: match chrome.code_blocks {
+            CodeBlockFrame::Framed => MarkdownCodeBlockFrame::Framed,
+            CodeBlockFrame::Plain => MarkdownCodeBlockFrame::None,
+        },
+        blockquote_bar: chrome
+            .quote_bar
+            .map_or(defaults.blockquote_bar, |bar| bar.as_str().to_owned()),
+        table_header_alignment: match chrome.table_headers {
+            TableHeaders::Column => MarkdownTableHeaderAlignment::Column,
+            TableHeaders::Center => MarkdownTableHeaderAlignment::Center,
+        },
+        smart_punctuation: chrome.smart_punctuation,
     }
 }
 
@@ -581,6 +608,7 @@ pub fn render_options(
     let mut options = MarkdownRenderOptions::new(width)
         .with_theme(markdown_theme(cx.theme))
         .with_syntax_palette(syntax_palette(cx.theme))
+        .with_presentation(markdown_presentation(cx.theme))
         .with_streaming(request.streaming)
         .with_link_destination_fallbacks(true)
         .with_rich_reserved_rows(image_rows, MERMAID_RESERVED_ROWS);

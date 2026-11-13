@@ -376,3 +376,50 @@ fn l3_accepting_a_visual_changes_only_the_owning_units_fingerprint() {
     );
     assert_ne!(fingerprint(&replaced, &owner), fingerprint(&config, &owner));
 }
+
+#[test]
+fn theme_markdown_chrome_sets_bullets_code_frames_quotes_and_punctuation() {
+    use bcode_tui_theme::chrome::{ChromeText, CodeBlockFrame, TableHeaders};
+    let mut theme = bcode_tui_theme::definition::ResolvedThemeDefinition::empty("t", "T");
+    theme.chrome.markdown.bullet = ChromeText::new("-");
+    theme.chrome.markdown.marker_gap = Some(1);
+    theme.chrome.markdown.code_blocks = CodeBlockFrame::Plain;
+    theme.chrome.markdown.quote_bar = ChromeText::new("▎");
+    theme.chrome.markdown.table_headers = TableHeaders::Center;
+    theme.chrome.markdown.smart_punctuation = false;
+    theme.styles.insert(
+        "markdown.code.keyword".to_owned(),
+        bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Blue),
+    );
+    theme.styles.insert(
+        "syntax.keyword".to_owned(),
+        bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Red),
+    );
+    let config = RenderConfig::for_theme(Arc::new(theme));
+    let source = "- one\n1. two\n\n> I'll quote\n\n```rust\nfn main() {}\n```";
+    let (body, _) = project(&config, &MarkdownRequest::new(source, 40));
+    let node = layout(&body, 40);
+    let rows: Vec<String> = paint(&body, &node)
+        .iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+    assert!(rows.contains(&"- one".to_owned()), "{rows:?}");
+    assert!(rows.contains(&"1. two".to_owned()), "{rows:?}");
+    assert!(
+        rows.contains(&"▎ I'll quote".to_owned()),
+        "straight quote kept: {rows:?}"
+    );
+    assert!(
+        rows.contains(&"fn main() {}".to_owned()),
+        "unframed code: {rows:?}"
+    );
+    assert!(!rows.iter().any(|row| row.contains('┌')), "{rows:?}");
+    let palette = options(&config, &MarkdownRequest::new(source, 40))
+        .syntax
+        .expect("palette");
+    assert_eq!(
+        palette.keyword,
+        bcode_syntax_render::SyntaxColor::from_tui(bmux_tui::style::Color::Blue),
+        "code blocks prefer markdown.code roles over syntax roles"
+    );
+}
