@@ -5,8 +5,17 @@
 //! `profile`, further `overlays`, a light/dark `variant` and extra theme `paths`. The appearance
 //! picker saves a palette and a profile in user state; those replace the configured ones when
 //! the catalog can present them. Every Bcode program (the chat interface, the review app and the
-//! git client) resolves its theme through [`resolve_appearance`] or [`apply_saved_appearance`],
-//! so they all present the same theme.
+//! git client) resolves its theme through [`resolve_appearance`] or [`apply_saved_appearance`].
+//!
+//! An app (the review app, the git client) may keep its own saved choice, which replaces
+//! Bcode's for that app only ([`AppearanceSources::app_saved`]); without one it follows Bcode's.
+//! An app's own configuration may pin its palette ([`AppearanceSources::theme_pinned_by`]),
+//! which then wins over every saved palette. Precedence for an app, highest first:
+//!
+//! * the palette its configuration pins;
+//! * its own saved choice;
+//! * Bcode's saved choice;
+//! * the configured `[tui.theme]` selection and its defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +26,9 @@ use crate::definition::{
     ResolvedThemeDefinition, ResolvedThemeVariant, ThemeCatalog, ThemeError, ThemeKind,
     ThemeSelection,
 };
-use crate::discovery::{ThemeDiscoveryDiagnostic, default_theme_roots, discover_themes};
+use crate::discovery::{
+    ThemeDiscoveryDiagnostic, ThemeExternalSource, default_theme_roots, discover_themes,
+};
 
 /// Palette presented when configuration names none.
 pub const DEFAULT_THEME: &str = "terminal-native";
@@ -209,16 +220,81 @@ pub fn apply_saved_appearance(
 pub struct AppearanceResolution {
     /// Configuration with the saved choices that applied.
     pub preferences: ThemePreferences,
+    /// Configuration the saved choices were applied over.
+    pub configured: ThemePreferences,
+    /// Bcode's choices saved in user state, including any this program ignores.
+    pub saved: SavedAppearance,
+    /// The program's own saved choices, which replace [`Self::saved`] while present.
+    pub app_saved: Option<SavedAppearance>,
+    /// What pins this program's palette, when its configuration does
+    /// ([`AppearanceSources::theme_pinned_by`]).
+    pub theme_pinned_by: Option<String>,
     /// Variant resolved for the terminal.
     pub variant: ResolvedThemeVariant,
     /// The resolved theme, or why [`Self::preferences`] do not resolve.
     pub resolved: Result<ResolvedThemeDefinition, ThemeError>,
     /// The discovered catalog the theme was resolved from.
     pub catalog: ThemeCatalog,
+    /// Where each external theme of [`Self::catalog`] came from; bundled themes are absent.
+    pub sources: std::collections::BTreeMap<String, ThemeExternalSource>,
     /// Saved choices that could not apply.
     pub notices: Vec<AppearanceNotice>,
     /// Theme files skipped during discovery.
     pub diagnostics: Vec<ThemeDiscoveryDiagnostic>,
+}
+
+impl AppearanceResolution {
+    /// The saved choices this appearance presents: the program's own when it has them, else
+    /// Bcode's.
+    #[must_use]
+    pub fn effective_saved(&self) -> &SavedAppearance {
+        self.app_saved.as_ref().unwrap_or(&self.saved)
+    }
+
+    /// Whether the program follows Bcode's saved choices (it has none of its own).
+    #[must_use]
+    pub const fn follows_bcode(&self) -> bool {
+        self.app_saved.is_none()
+    }
+
+    /// The appearance these inputs present with Bcode's saved choices `saved` and the
+    /// program's own `app_saved` instead of [`Self::saved`] and [`Self::app_saved`]: the same
+    /// configuration, catalog and variant, so nothing is discovered again. A pinned palette
+    /// ignores the saved palette, as [`AppearanceSources::resolve`] does.
+    #[must_use]
+    pub fn with_saved(&self, saved: &SavedAppearance, app_saved: Option<&SavedAppearance>) -> Self {
+        let effective_saved =
+            effective_saved(app_saved.unwrap_or(saved), self.theme_pinned_by.as_deref());
+        let (preferences, notices) = apply_saved_appearance(
+            &self.configured,
+            &effective_saved,
+            &self.catalog,
+            self.variant,
+        );
+        let resolved = self.catalog.resolve(&preferences.selection(self.variant));
+        Self {
+            preferences,
+            configured: self.configured.clone(),
+            saved: saved.clone(),
+            app_saved: app_saved.cloned(),
+            theme_pinned_by: self.theme_pinned_by.clone(),
+            variant: self.variant,
+            resolved,
+            catalog: self.catalog.clone(),
+            sources: self.sources.clone(),
+            notices,
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+}
+
+/// The saved choices that apply when `pinned_by` pins the palette: the saved palette is
+/// dropped, the saved profile still applies.
+fn effective_saved(saved: &SavedAppearance, pinned_by: Option<&str>) -> SavedAppearance {
+    SavedAppearance {
+        theme: saved.theme.clone().filter(|_| pinned_by.is_none()),
+        profile: saved.profile.clone(),
+    }
 }
 
 /// Resolve the appearance `configured` and `saved` select for a terminal with `background`.
@@ -238,18 +314,31 @@ pub fn resolve_appearance(
     background: TerminalBackground,
 ) -> AppearanceResolution {
     let roots = default_theme_roots(user_config_dir, project_root, &configured.paths);
-    let (catalog, diagnostics) = match discover_themes(&roots) {
-        Ok(discovered) => (discovered.catalog, discovered.diagnostics),
-        Err(_) => (ThemeCatalog::bundled().unwrap_or_default(), Vec::new()),
+    let (catalog, sources, diagnostics) = match discover_themes(&roots) {
+        Ok(discovered) => (
+            discovered.catalog,
+            discovered.sources,
+            discovered.diagnostics,
+        ),
+        Err(_) => (
+            ThemeCatalog::bundled().unwrap_or_default(),
+            std::collections::BTreeMap::new(),
+            Vec::new(),
+        ),
     };
     let variant = configured.variant.resolve(background);
     let (preferences, notices) = apply_saved_appearance(configured, saved, &catalog, variant);
     let resolved = catalog.resolve(&preferences.selection(variant));
     AppearanceResolution {
         preferences,
+        configured: configured.clone(),
+        saved: saved.clone(),
+        app_saved: None,
+        theme_pinned_by: None,
         variant,
         resolved,
         catalog,
+        sources,
         notices,
         diagnostics,
     }
@@ -260,8 +349,11 @@ pub fn resolve_appearance(
 pub struct AppearanceSources {
     /// Configured `[tui.theme]` selection.
     pub configured: ThemePreferences,
-    /// Choices saved in user state.
+    /// Bcode's choices saved in user state.
     pub saved: SavedAppearance,
+    /// The program's own choices saved in user state, which replace [`Self::saved`] while
+    /// present; `None` follows Bcode's.
+    pub app_saved: Option<SavedAppearance>,
     /// Files whose change may change [`Self::configured`] or [`Self::saved`]: configuration
     /// candidates (present or not) and the user state file.
     pub watched_files: Vec<PathBuf>,
@@ -269,19 +361,28 @@ pub struct AppearanceSources {
     pub user_config_dir: PathBuf,
     /// Project whose `.bcode/themes` holds project themes.
     pub project_root: PathBuf,
+    /// Set when the program's own configuration pins the palette (for example
+    /// `bcode-git.toml [theme] name`): names what pins it. Every saved palette is then
+    /// ignored; the saved profile still applies.
+    pub theme_pinned_by: Option<String>,
 }
 
 impl AppearanceSources {
     /// Resolve these sources for a terminal with `background` ([`resolve_appearance`]).
     #[must_use]
     pub fn resolve(&self, background: TerminalBackground) -> AppearanceResolution {
-        resolve_appearance(
+        let pinned_by = self.theme_pinned_by.as_deref();
+        let mut resolution = resolve_appearance(
             &self.user_config_dir,
             &self.project_root,
             &self.configured,
-            &self.saved,
+            &effective_saved(self.app_saved.as_ref().unwrap_or(&self.saved), pinned_by),
             background,
-        )
+        );
+        resolution.saved.clone_from(&self.saved);
+        resolution.app_saved.clone_from(&self.app_saved);
+        resolution.theme_pinned_by.clone_from(&self.theme_pinned_by);
+        resolution
     }
 
     /// Signature of the current contents of every input: the watched files and the theme files
@@ -490,6 +591,41 @@ mod tests {
                 "saved profile catppuccin-mocha is unavailable",
             ]
         );
+    }
+
+    #[test]
+    fn an_apps_own_choice_replaces_bcodes_and_a_pinned_palette_wins_over_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = |app_saved: Option<SavedAppearance>, pinned: bool| AppearanceSources {
+            configured: configured("name = \"nord\""),
+            saved: SavedAppearance {
+                theme: Some("catppuccin-mocha".to_owned()),
+                profile: Some("structured".to_owned()),
+            },
+            app_saved,
+            user_config_dir: dir.path().to_path_buf(),
+            project_root: dir.path().to_path_buf(),
+            theme_pinned_by: pinned.then(|| "app config".to_owned()),
+            ..AppearanceSources::default()
+        };
+        let following = sources(None, false).resolve(TerminalBackground::Unknown);
+        assert!(following.follows_bcode());
+        assert_eq!(following.preferences.name, "catppuccin-mocha");
+        assert_eq!(following.preferences.profile.as_deref(), Some("structured"));
+
+        let own = SavedAppearance {
+            theme: Some("dracula".to_owned()),
+            profile: None,
+        };
+        let app = sources(Some(own.clone()), false).resolve(TerminalBackground::Unknown);
+        assert!(!app.follows_bcode());
+        assert_eq!(app.effective_saved(), &own);
+        assert_eq!(app.preferences.name, "dracula");
+        // The app's own choice is complete: Bcode's profile does not leak into it.
+        assert_eq!(app.preferences.profile, None);
+
+        let pinned = sources(Some(own), true).resolve(TerminalBackground::Unknown);
+        assert_eq!(pinned.preferences.name, "nord");
     }
 
     #[test]

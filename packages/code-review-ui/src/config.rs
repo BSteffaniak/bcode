@@ -9,7 +9,11 @@
 //!   [`ReviewStackLimit`]), and presentation settings.
 //! * `[tui.keybindings.scopes."code-review*"]` — keybinding overrides of the review scopes.
 //! * `[tui.theme]` — theme selection shared with the rest of bcode, under the palette and profile
-//!   the appearance picker saved in bcode's user state ([`appearance_sources`]).
+//!   saved in user state: the review's own choice (`[apps.review.theme]`, saved by its
+//!   appearance picker) when it has one, else bcode's ([`appearance_sources`]).
+//! * `[plugins.config."bcode.code_review".theme]` — `name`, `profile`, `overlays` and `paths`
+//!   for the review only, over `[tui.theme]`; a `name` here pins the review's palette over
+//!   every saved one.
 //! * `[tui.diff_viewer]` — bcode's diff layout preference, which the review follows unless its
 //!   own table sets a layout ([`view`]).
 //!
@@ -21,7 +25,7 @@ use std::path::{Path, PathBuf};
 use bcode_code_review::CodeReviewConfig;
 use bcode_code_review_models::ReviewStackLimit;
 use bcode_config_layers::user_state::{
-    SavedTuiAppearance, default_tui_state_path_with_environment,
+    SavedAppAppearance, SavedTuiAppearance, default_tui_state_path_with_environment,
 };
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 use bcode_tui_theme::appearance::{AppearanceSources, SavedAppearance, ThemePreferences};
@@ -32,6 +36,9 @@ pub use view::{ConfiguredLayout, DiffLayout, ReviewViewConfig, resolve};
 
 /// Plugin id whose configuration table holds the review settings.
 pub const PLUGIN_ID: &str = "bcode.code_review";
+
+/// Name of the review's own appearance choice in user state (`[apps.review.theme]`).
+pub const APPEARANCE_APP: &str = "review";
 
 /// Prefix of every review keymap scope.
 pub const SCOPE_PREFIX: &str = "code-review";
@@ -109,8 +116,14 @@ pub struct LoadedConfig {
     pub diff_layout: Option<DiffLayout>,
     /// Configured theme selection (`[tui.theme]`).
     pub theme: ThemePreferences,
-    /// Palette and profile the appearance picker saved in bcode's user state.
+    /// Palette and profile bcode's appearance picker saved in user state.
     pub saved_appearance: SavedAppearance,
+    /// The review's own palette and profile saved in user state (`[apps.review.theme]`), which
+    /// replace bcode's while present.
+    pub app_appearance: Option<SavedAppearance>,
+    /// Where the review's own `theme.name` is set, when it is: that palette wins over every
+    /// saved palette.
+    pub theme_pinned_by: Option<String>,
     /// Files whose change may change the theme: configuration candidates, present or not, and
     /// the user state file.
     pub appearance_files: Vec<PathBuf>,
@@ -156,12 +169,10 @@ pub fn load_in(start: &Path, environment: &impl ConfigEnvironment) -> LoadedConf
         },
     };
     let state = default_tui_state_path_with_environment(environment);
-    match SavedTuiAppearance::load(&state) {
+    match SavedAppAppearance::load(&state, APPEARANCE_APP) {
         Ok(saved) => {
-            loaded.saved_appearance = SavedAppearance {
-                theme: saved.theme,
-                profile: saved.profile,
-            };
+            loaded.saved_appearance = saved_appearance(saved.bcode);
+            loaded.app_appearance = saved.app.map(saved_appearance);
         }
         Err(error) => loaded
             .diagnostics
@@ -176,15 +187,25 @@ pub fn load_in(start: &Path, environment: &impl ConfigEnvironment) -> LoadedConf
     loaded
 }
 
+/// A choice read from the state file, as the theme crate takes it.
+fn saved_appearance(saved: SavedTuiAppearance) -> SavedAppearance {
+    SavedAppearance {
+        theme: saved.theme,
+        profile: saved.profile,
+    }
+}
+
 /// The theme inputs of `loaded` for a review of `project_root`, which also holds project themes.
 #[must_use]
 pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> AppearanceSources {
     AppearanceSources {
         configured: loaded.theme.clone(),
         saved: loaded.saved_appearance.clone(),
+        app_saved: loaded.app_appearance.clone(),
         watched_files: loaded.appearance_files.clone(),
         user_config_dir: loaded.config_dir.clone(),
         project_root: project_root.to_path_buf(),
+        theme_pinned_by: loaded.theme_pinned_by.clone(),
     }
 }
 
@@ -281,7 +302,45 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
             Err(error) => loaded.diagnostics.push(format!("tui.theme: {error}")),
         }
     }
+    if let Some(own) = loaded.plugin.get("theme").cloned() {
+        match own.try_into::<ReviewThemeSettings>() {
+            Ok(own) => own.apply(&mut loaded),
+            Err(error) => loaded.diagnostics.push(format!(
+                "plugins.config.\"{PLUGIN_ID}\".theme: {}",
+                first_line(&error.to_string())
+            )),
+        }
+    }
     loaded
+}
+
+/// The review's own theme settings (`[plugins.config."bcode.code_review".theme]`); each set
+/// field replaces the `[tui.theme]` one for the review only.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReviewThemeSettings {
+    name: Option<String>,
+    profile: Option<String>,
+    overlays: Option<Vec<String>>,
+    paths: Option<Vec<PathBuf>>,
+}
+
+impl ReviewThemeSettings {
+    fn apply(self, loaded: &mut LoadedConfig) {
+        if let Some(name) = self.name {
+            loaded.theme.name = name;
+            loaded.theme_pinned_by = Some(format!("plugins.config.\"{PLUGIN_ID}\".theme.name"));
+        }
+        if let Some(profile) = self.profile {
+            loaded.theme.profile = Some(profile);
+        }
+        if let Some(overlays) = self.overlays {
+            loaded.theme.overlays = overlays;
+        }
+        if let Some(paths) = self.paths {
+            loaded.theme.paths = paths;
+        }
+    }
 }
 
 /// The layout of a `[tui.diff_viewer]` table: `layout` (`auto`, `unified`, `side_by_side`) and
@@ -578,6 +637,46 @@ mod tests {
         assert_eq!(
             resolution.variant,
             bcode_tui_theme::definition::ResolvedThemeVariant::Light
+        );
+
+        // The review's own choice replaces bcode's for the review only.
+        bcode_config_layers::user_state::save_app_tui_appearance(
+            &state.join("tui.toml"),
+            APPEARANCE_APP,
+            Some(&SavedTuiAppearance {
+                theme: Some("dracula".to_owned()),
+                profile: None,
+            }),
+        )
+        .expect("app choice");
+        let loaded = load_in(&repo, &environment);
+        let resolution = appearance_sources(&loaded, &repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Unknown);
+        assert_eq!(resolution.preferences.name, "dracula");
+        assert_eq!(resolution.preferences.profile.as_deref(), Some("bare"));
+        assert_eq!(
+            loaded.saved_appearance.theme.as_deref(),
+            Some("catppuccin-mocha")
+        );
+
+        // A palette named in the review's own configuration wins over every saved palette.
+        std::fs::write(
+            repo.join("bcode.toml"),
+            "[plugins.config.\"bcode.code_review\".theme]\nname = \"nord\"\nprofile = \"structured\"\n",
+        )
+        .expect("review config");
+        let loaded = load_in(&repo, &environment);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(
+            loaded.theme_pinned_by.as_deref(),
+            Some("plugins.config.\"bcode.code_review\".theme.name")
+        );
+        let resolution = appearance_sources(&loaded, &repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Unknown);
+        assert_eq!(resolution.preferences.name, "nord");
+        assert_eq!(
+            resolution.preferences.profile.as_deref(),
+            Some("structured")
         );
     }
 

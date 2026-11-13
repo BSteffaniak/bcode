@@ -6,7 +6,9 @@
 //! * `[plugins.config."bcode.git".ui]` — [`GitUiConfig`]
 //! * `[tui.keybindings.scopes."git.*"]` — keybinding overrides
 //! * `[tui.theme]` — theme selection shared with the rest of bcode, under the palette and profile
-//!   the appearance picker saved in bcode's user state ([`appearance_sources`])
+//!   saved in user state: the git UI's own choice (`[apps.git.theme]`, saved by its appearance
+//!   picker) when it has one, else bcode's ([`appearance_sources`]); a `[theme] name` in the git
+//!   UI schema pins the palette over both
 //!
 //! Files are discovered and composed by `bcode_config_layers`, the same policy bcode uses.
 
@@ -15,7 +17,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use bcode_config_layers::user_state::{
-    SavedTuiAppearance, default_tui_state_path_with_environment,
+    SavedAppAppearance, SavedTuiAppearance, default_tui_state_path_with_environment,
 };
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 use bcode_git::models::CommitMessageSource;
@@ -703,6 +705,9 @@ pub struct ThemeSettings {
     pub paths: Option<Vec<PathBuf>>,
 }
 
+/// Name of the git UI's own appearance choice in user state (`[apps.git.theme]`).
+pub const APPEARANCE_APP: &str = "git";
+
 /// Where the git UI settings live inside `bcode.toml`; the dedicated files use the same schema
 /// at their root.
 pub const BCODE_SECTION: [&str; 4] = ["plugins", "config", "bcode.git", "ui"];
@@ -740,8 +745,14 @@ pub struct LoadedConfig {
     pub keybindings: BTreeMap<String, BTreeMap<String, String>>,
     /// Configured theme selection: `[tui.theme]` with the git UI schema's theme fields over it.
     pub theme: ThemePreferences,
-    /// Palette and profile the appearance picker saved in bcode's user state.
+    /// Palette and profile Bcode's appearance picker saved in user state.
     pub saved_appearance: SavedAppearance,
+    /// The git UI's own palette and profile saved in user state (`[apps.git.theme]`), which
+    /// replace Bcode's while present.
+    pub app_appearance: Option<SavedAppearance>,
+    /// Where the git UI schema's `[theme] name` is set, when it is: that palette is chosen
+    /// for the git UI specifically and wins over every saved palette.
+    pub theme_pinned_by: Option<String>,
     /// Files whose change may change the theme: configuration candidates of both families,
     /// present or not, and the user state file.
     pub appearance_files: Vec<PathBuf>,
@@ -984,6 +995,9 @@ pub fn load_in(
             )
     };
     apply(&bcode_table, &ui, &locate, &mut loaded);
+    if loaded.ui.theme.name.is_some() {
+        loaded.theme_pinned_by = Some(locate(&["theme".to_owned(), "name".to_owned()]));
+    }
     load_appearance(&mut loaded, bcode_candidates, git_candidates, environment);
     loaded
 }
@@ -996,13 +1010,10 @@ fn load_appearance(
     environment: &impl ConfigEnvironment,
 ) {
     let state = default_tui_state_path_with_environment(environment);
-    match SavedTuiAppearance::load(&state) {
+    match SavedAppAppearance::load(&state, APPEARANCE_APP) {
         Ok(saved) => {
-            loaded.saved_appearance = SavedAppearance {
-                // A palette named for the git UI is chosen for it specifically.
-                theme: saved.theme.filter(|_| loaded.ui.theme.name.is_none()),
-                profile: saved.profile,
-            };
+            loaded.saved_appearance = saved_appearance(saved.bcode);
+            loaded.app_appearance = saved.app.map(saved_appearance);
         }
         Err(error) => loaded
             .diagnostics
@@ -1018,6 +1029,14 @@ fn load_appearance(
     loaded.appearance_files = files;
 }
 
+/// A choice read from the state file, as the theme crate takes it.
+fn saved_appearance(saved: SavedTuiAppearance) -> SavedAppearance {
+    SavedAppearance {
+        theme: saved.theme,
+        profile: saved.profile,
+    }
+}
+
 /// The theme inputs of `loaded` for a repository at `project_root`, which also holds project
 /// themes.
 #[must_use]
@@ -1025,9 +1044,11 @@ pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> Appeara
     AppearanceSources {
         configured: loaded.theme.clone(),
         saved: loaded.saved_appearance.clone(),
+        app_saved: loaded.app_appearance.clone(),
         watched_files: loaded.appearance_files.clone(),
         user_config_dir: loaded.config_dir.clone(),
         project_root: project_root.to_path_buf(),
+        theme_pinned_by: loaded.theme_pinned_by.clone(),
     }
 }
 
@@ -1423,6 +1444,35 @@ mod tests {
         assert_eq!(
             resolution.preferences.profile.as_deref(),
             Some("structured")
+        );
+        assert!(
+            loaded
+                .theme_pinned_by
+                .as_deref()
+                .is_some_and(|origin| origin.contains("theme.name")),
+            "{:?}",
+            loaded.theme_pinned_by
+        );
+
+        // The git UI's own saved choice replaces bcode's, still under the pinned palette.
+        std::fs::remove_file(repo.join("bcode-git.toml")).expect("unpin");
+        bcode_config_layers::user_state::save_app_tui_appearance(
+            &state,
+            APPEARANCE_APP,
+            Some(&SavedTuiAppearance {
+                theme: Some("dracula".to_owned()),
+                profile: None,
+            }),
+        )
+        .expect("app choice");
+        let loaded = load(repo);
+        let resolution = appearance_sources(&loaded, repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Light);
+        assert_eq!(resolution.preferences.name, "dracula");
+        assert_eq!(resolution.preferences.profile, None);
+        assert_eq!(
+            loaded.saved_appearance.theme.as_deref(),
+            Some("catppuccin-mocha")
         );
     }
 

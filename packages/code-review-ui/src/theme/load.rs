@@ -101,6 +101,7 @@ mod tests {
             watched_files: Vec::new(),
             user_config_dir: dir.to_path_buf(),
             project_root: dir.to_path_buf(),
+            ..AppearanceSources::default()
         }
     }
 

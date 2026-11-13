@@ -17,5 +17,6 @@ pub mod contrast;
 pub mod definition;
 pub mod discovery;
 pub mod expr;
+pub mod picker;
 pub mod roles;
 pub mod selection;
