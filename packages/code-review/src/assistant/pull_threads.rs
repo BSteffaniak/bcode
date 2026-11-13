@@ -169,9 +169,10 @@ pub fn page(
         .threads
         .iter()
         .filter(|record| {
-            query.path.as_deref().is_none_or(|path| {
-                record.thread.anchor.path == path || record.location.starts_with(path)
-            })
+            query
+                .path
+                .as_deref()
+                .is_none_or(|path| record.thread.anchor.path == path || shown_on(record, path))
         })
         .filter(|record| {
             let keep = query.include_resolved || !record.thread.resolved;
@@ -212,6 +213,14 @@ pub fn find(snapshot: &ReviewConversationSnapshot, id: &str) -> Option<PullThrea
         .iter()
         .find(|record| record.id == id)
         .map(|record| view(record, true))
+}
+
+/// Whether the review shows `record` on the file `path` (its location is `path` or `path:line`).
+fn shown_on(record: &PullThreadRecord, path: &str) -> bool {
+    record
+        .location
+        .strip_prefix(path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
 }
 
 fn lines(start: Option<u32>, end: Option<u32>) -> Option<String> {

@@ -556,8 +556,14 @@ fn pull_snapshot(replies: usize) -> bcode_code_review_models::ReviewConversation
     resolved.thread.outdated = false;
     resolved.thread.anchor.path = "README.md".to_owned();
     resolved.location = "README.md".to_owned();
+    let mut moved = resolved.clone();
+    moved.id = pull_thread_ref("o/r", 7, "PRRT_3");
+    moved.thread.id = "PRRT_3".to_owned();
+    moved.thread.anchor.path = "src/old_name.rs".to_owned();
+    moved.location = "src/shown.rs:3".to_owned();
+    moved.placement = ThreadPlacement::Moved;
     ReviewConversationSnapshot {
-        threads: vec![outdated, resolved],
+        threads: vec![outdated, resolved, moved],
         omitted: 0,
         read_at_ms: 42,
     }
@@ -597,7 +603,7 @@ fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
     let listed = harness.json("code_review.list_threads", &json!({}), SESSION);
     let page = &listed["pull_request_threads"];
     assert_eq!(page["total"], 1, "resolved ones are left out: {listed}");
-    assert_eq!(page["omitted_resolved"], 1);
+    assert_eq!(page["omitted_resolved"], 2);
     assert_eq!(page["read_at_ms"], 42);
     let thread = &page["threads"][0];
     assert_eq!(thread["thread_id"], "o/r#7:PRRT_1");
@@ -639,7 +645,7 @@ fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
     let page = &all["pull_request_threads"];
     assert_eq!(
         (page["total"].as_u64(), page["next_offset"].as_u64()),
-        (Some(2), Some(1))
+        (Some(3), Some(1))
     );
     let second = harness.json(
         "code_review.list_threads",
@@ -650,13 +656,32 @@ fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
         second["pull_request_threads"]["threads"][0]["thread_id"],
         "o/r#7:PRRT_2"
     );
-    assert!(second["pull_request_threads"].get("next_offset").is_none());
+    assert_eq!(second["pull_request_threads"]["next_offset"], 2);
     let on_file = harness.json(
         "code_review.list_threads",
         &json!({"include_resolved": true, "path": "README.md"}),
         SESSION,
     );
     assert_eq!(on_file["pull_request_threads"]["total"], 1, "{on_file}");
+    // The file is matched whole, by where it was written or where the review shows it.
+    for (path, total) in [
+        ("README", 0),
+        ("README.md.orig", 0),
+        ("src/retry", 0),
+        ("src/retry.rs", 1),
+        ("src/shown", 0),
+        ("src/shown.rs", 1),
+    ] {
+        let listed = harness.json(
+            "code_review.list_threads",
+            &json!({"include_resolved": true, "path": path}),
+            SESSION,
+        );
+        assert_eq!(
+            listed["pull_request_threads"]["total"], total,
+            "{path}: {listed}"
+        );
+    }
 
     let full = harness.json(
         "code_review.get_thread",
