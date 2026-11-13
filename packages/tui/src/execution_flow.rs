@@ -136,6 +136,22 @@ impl TerminalShell {
                     run_native_setup_in_shell(self, false).await?;
                 }
                 crate::ExecutionPickerOutcome::Selected(selection) => {
+                    let connection = match selection.account_reference.as_deref() {
+                        Some(account) => connection_selection(account).await,
+                        None => None,
+                    };
+                    match connection {
+                        Some(ConnectionSelection::Approve(candidate)) => {
+                            Box::pin(crate::native_setup::approve_external(self, &candidate))
+                                .await?;
+                            continue;
+                        }
+                        Some(ConnectionSelection::Explain(message)) => {
+                            self.show_error_without_retry(&message).await?;
+                            continue;
+                        }
+                        Some(ConnectionSelection::Use) | None => {}
+                    }
                     let resolved = bcode_model_catalog::ModelCatalogResolver::resolve_execution_selection(&models, selection.clone())
                         .map_err(|error| unavailable(&format!("Selected model/backend/account could not be resolved ({error:?}); open Setup")))?;
                     let native_model_id = resolved.target.native_model_id;
@@ -178,11 +194,17 @@ impl TerminalShell {
                             .id
                     }
                 };
+                let connection = selection
+                    .account_reference
+                    .as_deref()
+                    .and_then(|account| account.strip_prefix(CONNECTION_ACCOUNT_PREFIX))
+                    .map(ToOwned::to_owned);
                 client
-                    .set_session_model(
+                    .set_session_model_with_connection(
                         session_id,
                         Some(provider_plugin_id.clone()),
                         selection.model_id,
+                        connection,
                     )
                     .await?;
                 Ok(Some(session_id))
@@ -305,7 +327,10 @@ async fn discover_models() -> Result<(Vec<bcode_model::execution::ExecutionModel
     let config = bcode_config::load_config()?;
     let local_instances = configured_instances().await;
     let registrations_incomplete = local_instances.is_err();
-    let instances = local_instances.unwrap_or_default();
+    let mut instances = local_instances.unwrap_or_default();
+    let discovery_enabled = config
+        .onboarding
+        .credential_discovery_enabled(false, &bcode_config::ProcessConfigEnvironment);
     let client = bcode_client::ManagedSessionClient::default_endpoint();
     let discovered = client
         .discover_candidates(bcode_ipc::harness::ManagedCandidatesRequest {
@@ -321,11 +346,23 @@ async fn discover_models() -> Result<(Vec<bcode_model::execution::ExecutionModel
             } = plugin.kind
             {
                 for candidate in candidates {
-                    if !instances.values().any(|instance| {
+                    if instances.values().any(|instance| {
                         instance.plugin_id == candidate.plugin_id
                             && instance.executable == candidate.executable.invocation()
                             && instance.config_namespace == candidate.config_namespace
                     }) {
+                        continue;
+                    }
+                    // An installation that is already signed in is offered directly: its
+                    // models appear as rows, and choosing one is the decision to run it.
+                    if discovery_enabled
+                        && candidate.readiness
+                            == bcode_harness_models::HarnessCandidateReadiness::ExistingNativeLogin
+                        && let Ok(instance) =
+                            Box::pin(crate::native_setup::auto_register(candidate.clone())).await
+                    {
+                        instances.insert(instance.instance_id.clone(), instance);
+                    } else {
                         setup_labels.insert(format!(
                             "Set up {}",
                             bcode_session_view::external_projection::harness_display_label(
@@ -359,6 +396,7 @@ async fn discover_models() -> Result<(Vec<bcode_model::execution::ExecutionModel
         incomplete |= !inventory.issues.is_empty();
         models.extend(inventory.models);
     }
+    models.extend(connection_models(&models, discovery_enabled).await);
     let status = if incomplete {
         "Some catalogs unavailable; open Setup/sign in"
     } else {
@@ -371,4 +409,223 @@ async fn discover_models() -> Result<(Vec<bcode_model::execution::ExecutionModel
             "{status} · {setup} · Changing backend opens a new conversation; history stays here"
         ),
     ))
+}
+
+/// Account reference of a row that uses an approved external credential connection.
+const CONNECTION_ACCOUNT_PREFIX: &str = "external:";
+/// Account reference of a row offering to connect discovered credentials.
+const CONNECT_ACCOUNT_PREFIX: &str = "connect:";
+
+/// Rows for other agents' credentials: approved connections under their provider, and
+/// discovered credentials that can be connected. Discovery failures add no rows.
+async fn connection_models(
+    models: &[bcode_model::execution::ExecutionModel],
+    discovery_enabled: bool,
+) -> Vec<bcode_model::execution::ExecutionModel> {
+    use bcode_model::execution::{
+        ExecutionBillingRoute, ExecutionModel, ExecutionModelProvenance, ExecutionModelReadiness,
+        ExecutionRoute,
+    };
+    use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+    let client = bcode_client::BcodeClient::default_endpoint();
+    let connections = client.external_auth_status().await.unwrap_or_default();
+    let model_info = |plugin_id: &str, model_id: &str, label: String| {
+        let mut info = models
+            .iter()
+            .find(|entry| {
+                entry.model.model_id == model_id
+                    && entry.route
+                        == ExecutionRoute::ModelProvider {
+                            provider_plugin_id: plugin_id.to_owned(),
+                        }
+            })
+            .map(|entry| entry.model.clone())
+            .or_else(|| crate::model_picker::recommended_model(model_id))?;
+        info.display_name = label;
+        Some(info)
+    };
+    let row = |model: bcode_model::ModelInfo,
+               plugin_id: &str,
+               account: String,
+               readiness: ExecutionModelReadiness| ExecutionModel {
+        native_model_id: model.model_id.clone(),
+        model,
+        route: ExecutionRoute::ModelProvider {
+            provider_plugin_id: plugin_id.to_owned(),
+        },
+        account_reference: Some(account),
+        billing_route: ExecutionBillingRoute::Unknown,
+        confirmed_model_id: None,
+        provenance: ExecutionModelProvenance::ProviderCatalog,
+        readiness,
+    };
+    let mut rows = Vec::new();
+    for connection in &connections {
+        let target = &connection.grant.target;
+        let application = &connection.grant.application;
+        let (readiness, note) = connection_row_state(connection);
+        for model_id in &connection.recommended_models {
+            if let Some(model) = model_info(
+                &target.plugin_id,
+                model_id,
+                format!("{model_id} · via {application}{note}"),
+            ) {
+                rows.push(row(
+                    model,
+                    &target.plugin_id,
+                    format!("{CONNECTION_ACCOUNT_PREFIX}{}", connection.grant.binding_id),
+                    readiness,
+                ));
+            }
+        }
+    }
+    if discovery_enabled {
+        for candidate in client.discover_external_auth().await.unwrap_or_default() {
+            if !candidate.available
+                || connections
+                    .iter()
+                    .any(|connection| connection.grant.binding_id == candidate.binding_id)
+            {
+                continue;
+            }
+            let label = format!("Connect {}", candidate.application);
+            if let Some(model) = crate::model_picker::recommended_model(&label).map(|mut model| {
+                model.display_name = format!("{label} — use these credentials in Bcode");
+                model
+            }) {
+                rows.push(row(
+                    model,
+                    &candidate.target.plugin_id,
+                    format!("{CONNECT_ACCOUNT_PREFIX}{}", candidate.binding_id),
+                    ExecutionModelReadiness::Unavailable,
+                ));
+            }
+        }
+    }
+    rows
+}
+
+/// Readiness and label suffix for an approved connection's rows.
+fn connection_row_state(
+    connection: &bcode_provider_auth_models::external::ExternalAuthConnection,
+) -> (bcode_model::execution::ExecutionModelReadiness, String) {
+    use bcode_model::execution::ExecutionModelReadiness;
+    use bcode_provider_auth_models::external::ExternalConnectionStatus;
+    let application = &connection.grant.application;
+    match connection.status {
+        ExternalConnectionStatus::Ready { .. } => (ExecutionModelReadiness::Unknown, String::new()),
+        ExternalConnectionStatus::Expired => (
+            ExecutionModelReadiness::Unavailable,
+            format!(" — expired, open {application} to renew"),
+        ),
+        ExternalConnectionStatus::AccountChanged => (
+            ExecutionModelReadiness::Unavailable,
+            " — different account, select to approve".to_owned(),
+        ),
+        ExternalConnectionStatus::SourceUnavailable => (
+            ExecutionModelReadiness::Unavailable,
+            format!(" — not found, sign in to {application}"),
+        ),
+        ExternalConnectionStatus::DeclarationChanged => (
+            ExecutionModelReadiness::Unavailable,
+            " — no longer offered".to_owned(),
+        ),
+    }
+}
+
+/// The connection behind a selected row, when it is a connection or connect row.
+enum ConnectionSelection {
+    /// Use the approved connection; its binding is the row's account reference.
+    Use,
+    /// Ask once, then approve this candidate and rediscover.
+    Approve(bcode_provider_auth_models::external::ExternalAuthCandidate),
+    /// Not usable now; the message names the fix.
+    Explain(String),
+}
+
+async fn connection_selection(account: &str) -> Option<ConnectionSelection> {
+    use bcode_provider_auth_models::external::{
+        ExternalAuthApplication as _, ExternalAuthCandidate, ExternalConnectionStatus,
+    };
+    let client = bcode_client::BcodeClient::default_endpoint();
+    if let Some(binding) = account.strip_prefix(CONNECT_ACCOUNT_PREFIX) {
+        let candidate = client
+            .discover_external_auth()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|candidate| candidate.binding_id == binding)?;
+        return Some(ConnectionSelection::Approve(candidate));
+    }
+    let binding = account.strip_prefix(CONNECTION_ACCOUNT_PREFIX)?;
+    let connection = client
+        .external_auth_status()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|connection| connection.grant.binding_id == binding)?;
+    let application = &connection.grant.application;
+    Some(match connection.status {
+        ExternalConnectionStatus::Ready { .. } => ConnectionSelection::Use,
+        ExternalConnectionStatus::AccountChanged => {
+            ConnectionSelection::Approve(ExternalAuthCandidate {
+                binding_id: connection.grant.binding_id.clone(),
+                target: connection.grant.target.clone(),
+                application: application.clone(),
+                available: true,
+            })
+        }
+        ExternalConnectionStatus::Expired => ConnectionSelection::Explain(format!(
+            "{application} sign-in expired. Open {application} to renew it, then choose again."
+        )),
+        ExternalConnectionStatus::SourceUnavailable => ConnectionSelection::Explain(format!(
+            "{application} credentials were not found. Sign in to {application}, then choose again."
+        )),
+        ExternalConnectionStatus::DeclarationChanged => ConnectionSelection::Explain(
+            "This connection is no longer offered. Run `bcode auth disconnect` to remove it."
+                .into(),
+        ),
+    })
+}
+
+#[cfg(test)]
+mod connection_row_tests {
+    use super::*;
+    use bcode_model::execution::ExecutionModelReadiness;
+    use bcode_provider_auth_models::external::{
+        ExternalAuthConnection, ExternalAuthGrant, ExternalAuthTarget, ExternalConnectionStatus,
+    };
+
+    fn connection(status: ExternalConnectionStatus) -> ExternalAuthConnection {
+        ExternalAuthConnection {
+            grant: ExternalAuthGrant {
+                binding_id: "binding".into(),
+                target: ExternalAuthTarget {
+                    plugin_id: "plugin".into(),
+                    provider_id: "provider".into(),
+                    method_id: "chatgpt".into(),
+                    source_id: "source".into(),
+                },
+                application: "Codex".into(),
+                account_fingerprint: None,
+                approved_at_unix: 1,
+            },
+            status,
+            recommended_models: vec!["model".into()],
+        }
+    }
+
+    #[test]
+    fn ready_connections_are_selectable_and_others_name_the_fix() {
+        assert_eq!(
+            connection_row_state(&connection(ExternalConnectionStatus::Ready {
+                expires_at_unix: None
+            })),
+            (ExecutionModelReadiness::Unknown, String::new())
+        );
+        let (readiness, note) =
+            connection_row_state(&connection(ExternalConnectionStatus::Expired));
+        assert_eq!(readiness, ExecutionModelReadiness::Unavailable);
+        assert!(note.contains("open Codex to renew"));
+    }
 }

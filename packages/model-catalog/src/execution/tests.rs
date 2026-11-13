@@ -268,3 +268,49 @@ fn unknown_readiness_and_configuration_are_not_ready() {
             ));
         });
 }
+
+#[test]
+fn provider_listed_models_may_be_attempted_unless_reported_unavailable() {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let catalog = ModelCatalogResolver::embedded();
+            for (readiness, eligible) in [
+                (None, true),
+                (Some(ExecutionModelReadiness::Unavailable), false),
+            ] {
+                let entries = catalog
+                    .resolve_execution_catalog(
+                        vec![ProviderExecutionCatalog {
+                            provider_plugin_id: "test.provider".into(),
+                            list: bcode_model::ModelList {
+                                models: vec![model()],
+                                catalog: bcode_model::ModelCatalogHints::default(),
+                            },
+                            selected_model_id: None,
+                            configured_model_id: None,
+                            account_reference: None,
+                            billing_route: ExecutionBillingRoute::ProviderApi,
+                            readiness: readiness
+                                .map(|readiness| {
+                                    BTreeMap::from([("observed-model".into(), readiness)])
+                                })
+                                .unwrap_or_default(),
+                        }],
+                        vec![],
+                    )
+                    .await;
+                let resolved =
+                    ModelCatalogResolver::resolve_execution_selection(&entries, selection());
+                if eligible {
+                    assert_eq!(
+                        resolved.unwrap().eligibility,
+                        ExecutionAttemptEligibility::EligibleToAttempt
+                    );
+                } else {
+                    assert!(matches!(resolved, Err(ExecutionSelectionError::NotReady)));
+                }
+            }
+        });
+}

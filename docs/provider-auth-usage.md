@@ -80,7 +80,11 @@ using Codex's own sign-in and settings) sits next to "Use Codex credentials in B
 reading the approved document in place). Choosing a connection takes one confirmation: Bcode saves
 the provider's recommended model with it and starts a session; `/model` changes the model later.
 Native installations that are already signed in go straight to choosing a model; otherwise setup
-offers the tool's own sign-in first. Native credentials stay with the native agent. Bcode does not
+offers the tool's own sign-in first. `/model` also needs no setup step: when it finds an installed
+tool that is already signed in, Bcode registers it in its own local registration state (not the
+configuration file) and lists its models alongside provider models, approved connections ("model ·
+via Codex"), and "Connect …" rows for discovered credentials. Choosing a native model is the
+decision to run that tool; connecting credentials still asks once. Native credentials stay with the native agent. Bcode does not
 set `CLAUDE_CONFIG_DIR` for the default `~/.claude` namespace, because Claude Code selects a
 different OS credential-store entry when the variable is set, even to the default path.
 

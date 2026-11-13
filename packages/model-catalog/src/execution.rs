@@ -197,6 +197,13 @@ impl crate::ModelCatalogResolver {
         }
         match target.readiness {
             ExecutionModelReadiness::Ready => Ok(ExecutionAttemptEligibility::ModelAccessConfirmed),
+            // A model the provider itself lists may be attempted; authentication and access are
+            // established when the request is dispatched, not by discovery.
+            ExecutionModelReadiness::Unknown
+                if matches!(&target.route, ExecutionRoute::ModelProvider { .. }) =>
+            {
+                Ok(ExecutionAttemptEligibility::EligibleToAttempt)
+            }
             ExecutionModelReadiness::RouteReady { model_access }
                 if matches!(&target.route, ExecutionRoute::ManagedHarness { .. }) =>
             {

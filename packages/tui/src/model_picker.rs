@@ -126,7 +126,7 @@ fn connection_state(
 }
 
 /// Metadata for a recommended model the provider listing did not include.
-fn recommended_model(model_id: &str) -> Option<ModelInfo> {
+pub fn recommended_model(model_id: &str) -> Option<ModelInfo> {
     serde_json::from_value(serde_json::json!({"model_id": model_id, "display_name": model_id})).ok()
 }
 
@@ -753,13 +753,28 @@ impl ModelPickerApp {
                         bcode_model::execution::ExecutionRoute::ModelProvider {
                             provider_plugin_id,
                         } => {
-                            row.model_id = format!(
-                                "{} · {} / {}",
-                                row.model_id,
-                                provider_plugin_id,
-                                entry.account_reference.as_deref().unwrap_or("unspecified")
-                            );
-                            row.state = execution_readiness_label(entry.readiness).into();
+                            let account =
+                                entry.account_reference.as_deref().unwrap_or("unspecified");
+                            if account.starts_with("connect:") {
+                                // A connect row names the credentials in its display name.
+                                row.model_id.clone_from(&model.display_name);
+                                row.state = "Select to connect".into();
+                            } else if account.starts_with("external:") {
+                                row.model_id.clone_from(&model.display_name);
+                                row.state = if entry.readiness
+                                    == bcode_model::execution::ExecutionModelReadiness::Unavailable
+                                {
+                                    "Unavailable".into()
+                                } else {
+                                    "Ready".into()
+                                };
+                            } else {
+                                row.model_id = format!(
+                                    "{} · {} / {}",
+                                    row.model_id, provider_plugin_id, account
+                                );
+                                row.state = execution_readiness_label(entry.readiness).into();
+                            }
                         }
                         // A native executor runs under its own signed-in account; name the
                         // executor rather than internal instance and account identifiers.
@@ -1786,5 +1801,60 @@ pub mod connection_tests {
             app.selected_connection(),
             Some(ConnectionChoice::Approve(candidate)) if candidate.binding_id == "binding-changed"
         ));
+    }
+}
+
+#[cfg(test)]
+mod execution_connection_label_tests {
+    use super::*;
+    use bcode_model::execution::{
+        ExecutionBillingRoute, ExecutionModel, ExecutionModelProvenance, ExecutionModelReadiness,
+        ExecutionRoute,
+    };
+
+    fn entry(display: &str, account: &str, readiness: ExecutionModelReadiness) -> ExecutionModel {
+        let mut model = recommended_model("model").unwrap();
+        model.display_name = display.into();
+        ExecutionModel {
+            native_model_id: "model".into(),
+            model,
+            route: ExecutionRoute::ModelProvider {
+                provider_plugin_id: "plugin".into(),
+            },
+            account_reference: Some(account.into()),
+            billing_route: ExecutionBillingRoute::Unknown,
+            confirmed_model_id: None,
+            provenance: ExecutionModelProvenance::ProviderCatalog,
+            readiness,
+        }
+    }
+
+    #[test]
+    fn connection_rows_show_their_application_instead_of_internal_references() {
+        let app = ModelPickerApp::from_execution_models(
+            vec![
+                entry(
+                    "model · via Codex",
+                    "external:binding",
+                    ExecutionModelReadiness::Unknown,
+                ),
+                entry(
+                    "Connect Codex — use these credentials in Bcode",
+                    "connect:binding",
+                    ExecutionModelReadiness::Unavailable,
+                ),
+            ],
+            "Select",
+        );
+        let rows = app.row_strings_for_test(160);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("model · via Codex") && row.contains("Ready"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Connect Codex") && row.contains("Select to connect"))
+        );
+        assert!(rows.iter().all(|row| !row.contains("binding")));
     }
 }

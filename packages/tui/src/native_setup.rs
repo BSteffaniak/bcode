@@ -58,7 +58,7 @@ async fn external_candidates() -> Vec<bcode_provider_auth_models::external::Exte
 }
 
 /// Confirm and persist approval for one discovered connection.
-async fn approve_external(
+pub async fn approve_external(
     shell: &mut crate::TerminalShell,
     candidate: &bcode_provider_auth_models::external::ExternalAuthCandidate,
 ) -> Result<bool, CliError> {
@@ -389,14 +389,13 @@ fn friendly_instance_id(config: &BcodeConfig, plugin_id: &str) -> String {
         .unwrap_or_else(|| format!("{base}-{}", uuid::Uuid::new_v4()))
 }
 
-async fn configure(
-    shell: &mut crate::TerminalShell,
-    candidate: HarnessInstallationCandidate,
-) -> Result<bool, CliError> {
-    let signed_in = candidate.readiness == HarnessCandidateReadiness::ExistingNativeLogin;
+/// Effective native catalog as configuration, with the instance already configured for this
+/// exact installation, if any.
+async fn native_catalog_config(
+    candidate: &HarnessInstallationCandidate,
+) -> Result<(BcodeConfig, Option<bcode_harness_models::HarnessInstance>), CliError> {
     let mut config = bcode_config::load_config()?;
     let client = bcode_client::ManagedSessionClient::default_endpoint();
-    let snapshot = client.native_registration_snapshot().await?;
     let resolution = client.native_registration_resolution().await?;
     // Use the effective identity catalog for reuse and collision-free local IDs.
     if resolution
@@ -409,34 +408,84 @@ async fn configure(
             "native registrations are disabled by configuration",
         ));
     }
-    if let Some(generic) = resolution.configurations.get("bcode.harness") {
-        if let Some(entries) = generic
-            .get("instances")
-            .and_then(serde_json::Value::as_object)
-        {
-            for entry in entries.values() {
-                if entry.get("enabled") == Some(&serde_json::json!(false)) {
-                    continue;
-                }
-                if let Some(value) = entry.get("instance") {
-                    let instance: bcode_harness_models::HarnessInstance =
-                        serde_json::from_value(value.clone())?;
-                    if instance.plugin_id == candidate.plugin_id
-                        && instance.executable == candidate.executable.invocation()
-                        && instance.config_namespace == candidate.config_namespace
-                    {
-                        if candidate.readiness != HarnessCandidateReadiness::ExistingNativeLogin {
-                            sign_in(shell, instance).await?;
-                        }
-                        return Ok(true);
-                    }
+    let Some(generic) = resolution.configurations.get("bcode.harness") else {
+        return Ok((config, None));
+    };
+    if let Some(entries) = generic
+        .get("instances")
+        .and_then(serde_json::Value::as_object)
+    {
+        for entry in entries.values() {
+            if entry.get("enabled") == Some(&serde_json::json!(false)) {
+                continue;
+            }
+            if let Some(value) = entry.get("instance") {
+                let instance: bcode_harness_models::HarnessInstance =
+                    serde_json::from_value(value.clone())?;
+                if instance.plugin_id == candidate.plugin_id
+                    && instance.executable == candidate.executable.invocation()
+                    && instance.config_namespace == candidate.config_namespace
+                {
+                    return Ok((config, Some(instance)));
                 }
             }
         }
-        config.plugins.config.insert(
-            "bcode.harness".into(),
-            toml::Value::try_from(generic).map_err(|_| unavailable("invalid native catalog"))?,
-        );
+    }
+    config.plugins.config.insert(
+        "bcode.harness".into(),
+        toml::Value::try_from(generic).map_err(|_| unavailable("invalid native catalog"))?,
+    );
+    Ok((config, None))
+}
+
+/// Register a signed-in installation without prompting, so its models are offered directly.
+///
+/// Registration is Bcode's own local state and grants no execution authority; choosing one of
+/// its models later is the user's decision to run that tool. Returns the registered instance.
+pub async fn auto_register(
+    candidate: HarnessInstallationCandidate,
+) -> Result<bcode_harness_models::HarnessInstance, CliError> {
+    let client = bcode_client::ManagedSessionClient::default_endpoint();
+    let snapshot = client.native_registration_snapshot().await?;
+    let (config, existing) = native_catalog_config(&candidate).await?;
+    if let Some(instance) = existing {
+        return Ok(instance);
+    }
+    let request = HarnessPrepareCandidateRequest {
+        schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        instance_id: friendly_instance_id(&config, &candidate.plugin_id),
+        candidate,
+    };
+    let (prepared, response) = prepare(&config, &request).await?;
+    verify(&prepared, &request, &response)?;
+    let registration = bcode_harness_models::Registration {
+        instance: prepared.native.instance.clone(),
+        adapter_settings: prepared.native.adapter_settings.clone(),
+    };
+    client
+        .commit_native_registration(bcode_ipc::harness::ManagedRegistrationCommitRequest {
+            prepare: request,
+            expected_revision: snapshot.revision,
+            expected_registration: registration,
+        })
+        .await?;
+    Ok(prepared.native.instance)
+}
+
+async fn configure(
+    shell: &mut crate::TerminalShell,
+    candidate: HarnessInstallationCandidate,
+) -> Result<bool, CliError> {
+    let signed_in = candidate.readiness == HarnessCandidateReadiness::ExistingNativeLogin;
+    let client = bcode_client::ManagedSessionClient::default_endpoint();
+    let snapshot = client.native_registration_snapshot().await?;
+    let (config, existing) = native_catalog_config(&candidate).await?;
+    if let Some(instance) = existing {
+        if !signed_in {
+            sign_in(shell, instance).await?;
+        }
+        return Ok(true);
     }
     let request = HarnessPrepareCandidateRequest {
         schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
