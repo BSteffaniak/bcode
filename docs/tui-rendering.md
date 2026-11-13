@@ -186,11 +186,28 @@ selection continues directly; a broken explicit provider selection stays on its 
 instead of being replaced by an installed native account. Missing native instance configuration
 is not evidence of missing provider credentials and does not open a native-observation welcome screen.
 
-When an execution inventory is needed, the picker presents before inspection starts. Inspection
-runs as one runtime-owned, cancellable command with a 15-second UI deadline. Setup, close, and
-filtering remain available during inspection; completion preserves filter/sort state and requires
-a newly presented exact model/account before selection. Failures remain inline and do not launch,
-switch, enroll, or persist anything. Remembered provider choices do not require optional catalog
+Model and execution choice uses one switcher everywhere: `/model` draws it over the
+conversation, and startup and backend changes show it on its own screen. It opens before
+inspection starts; discovery then reports each source (a native tool, an approved credential
+connection, a provider, credentials that could be connected) as it is checked, and a source
+that fails shows its reason under its own heading without affecting the others. Search, close,
+and Setup stay available throughout. Discovery registers native tools that are already signed
+in, so their models can be offered; it selects, launches, and persists nothing else.
+
+The list groups choices under the current model, favorites, recent choices, and then each
+source in a fixed order. Typing ranks matches across sources with the shared completion
+matcher. The selected row's details, reasoning effort (for provider routes, where Bcode sets
+it), and any fix it needs (connect, approve again, set up) appear beside the list, or as a
+two-line summary beneath it when the modal is narrow. A comparison table lists each model once
+with sortable columns. Keys belong to the `model_switcher` keymap scope; pointer input routes
+through the layout the switcher last painted, so hover, wheel, scrollbar, row selection, and
+button hits always match what is on screen.
+
+A choice that changes only the Bcode agent's model applies in place, with its effort applied
+after the model change lands. A choice that needs a native tool or a new conversation, and
+Setup, hand the terminal to the shell, which carries them out and returns to the conversation.
+Recent and favorite choices are runtime state (`model-choices.toml`), keyed by nonsecret route,
+model, and connection identity. Remembered provider choices do not require optional catalog
 discovery; remembered native choices inspect only their selected instance. Existing first-run
 provider enrollment and selected-route recovery remain explicit pre-session journeys.
 

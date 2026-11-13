@@ -345,12 +345,6 @@ pub struct ManagedOpenRequest {
     pub draft: Option<String>,
 }
 
-pub struct RootModelPicker {
-    pub(super) generation: u64,
-    pub(super) provider_plugin_id: Option<String>,
-    pub(super) picker: super::model_picker::ModelPickerApp,
-}
-
 pub enum AuthPoolPickerRootOutcome {
     Continue,
     Cancel,
@@ -430,7 +424,6 @@ pub struct ChatLoopState {
     managed_generation: Option<u64>,
     managed_host: Option<super::effects::ManagedHostAccess>,
     pub(super) managed_interactions: super::managed_controls::ManagedInteractionTracker,
-    pub(super) managed_model_selectors: std::collections::BTreeMap<String, String>,
     pub(super) managed_configure_in_flight: Option<String>,
     managed_open: Option<ManagedOpenRequest>,
     pub(crate) execution_picker: Option<crate::ExecutionPickerRequest>,
@@ -460,10 +453,13 @@ pub struct ChatLoopState {
     milestone_requests: super::timeline_dialog::MilestonePageRequests,
     plugin_surface: Option<RootPluginSurface>,
     parent_plugin_surfaces: Vec<RootPluginSurface>,
-    provider_picker: Option<super::provider_picker::ProviderPickerApp>,
-    pub(super) model_picker: Option<RootModelPicker>,
-    pub(super) model_picker_generation: u64,
-    model_check_in_flight: bool,
+    /// The open model switcher.
+    pub(crate) model_switcher: Option<super::model_switcher_host::ChatModelSwitcher>,
+    pub(crate) model_switcher_generation: u64,
+    /// Switcher work for the root runtime to run.
+    pub(crate) model_switcher_work: Vec<super::model_switcher_host::Work>,
+    /// Effort to apply once a model chosen in the switcher has been applied.
+    pub(crate) pending_switch_effort: Option<(bcode_session_models::SessionId, String)>,
     auth_pool_picker: Option<super::auth_pool_picker::AuthPoolPickerApp>,
     skill_picker: Option<super::skill_picker::SkillPickerApp>,
     working_directory_dialog: Option<super::working_directory_dialog::WorkingDirectoryDialog>,
@@ -544,7 +540,6 @@ impl ChatLoopState {
             managed_generation: None,
             managed_host: None,
             managed_interactions: super::managed_controls::ManagedInteractionTracker::default(),
-            managed_model_selectors: std::collections::BTreeMap::new(),
             managed_configure_in_flight: None,
             managed_open: None,
             execution_picker: None,
@@ -566,10 +561,10 @@ impl ChatLoopState {
             milestone_requests: super::timeline_dialog::MilestonePageRequests::default(),
             plugin_surface: None,
             parent_plugin_surfaces: Vec::new(),
-            provider_picker: None,
-            model_picker: None,
-            model_picker_generation: 0,
-            model_check_in_flight: false,
+            model_switcher: None,
+            model_switcher_generation: 0,
+            model_switcher_work: Vec::new(),
+            pending_switch_effort: None,
             auth_pool_picker: None,
             skill_picker: None,
             working_directory_dialog: None,
@@ -638,8 +633,7 @@ impl ChatLoopState {
         self.cancel_appearance_picker(chat);
         self.timeline_dialog = None;
         self.milestone_requests.cancel();
-        self.provider_picker = None;
-        self.model_picker = None;
+        self.model_switcher = None;
         self.auth_pool_picker = None;
         self.skill_picker = None;
         self.working_directory_dialog = None;
@@ -936,12 +930,6 @@ impl ChatLoopState {
     #[cfg(test)]
     pub(crate) const fn set_managed_generation_for_test(&mut self, generation: u64) {
         self.managed_generation = Some(generation);
-    }
-
-    /// Native model selector for a model picked from the managed model picker.
-    #[must_use]
-    pub fn managed_model_selector(&self, model_id: &str) -> Option<String> {
-        self.managed_model_selectors.get(model_id).cloned()
     }
 
     /// Request from an ordinary root to hand off a session to the managed reattach route.
@@ -1890,7 +1878,7 @@ impl ChatLoopState {
     }
 
     pub const fn has_model_picker(&self) -> bool {
-        self.provider_picker.is_some() || self.model_picker.is_some()
+        self.model_switcher.is_some()
     }
 
     pub const fn has_auth_pool_picker(&self) -> bool {
@@ -1917,93 +1905,6 @@ impl ChatLoopState {
             self.auth_pool_picker = None;
         }
         action
-    }
-
-    pub fn handle_model_picker_event(
-        &mut self,
-        keymap: &super::keymap::BmuxKeyMap,
-        event: &Event,
-    ) -> Option<(Option<String>, super::model_flow::ModelPickerAction)> {
-        if let Some(picker) = self.provider_picker.as_mut() {
-            match picker.handle_event(event, keymap) {
-                super::provider_picker::ProviderPickerOutcome::Continue => return None,
-                super::provider_picker::ProviderPickerOutcome::Cancel => {
-                    self.provider_picker = None;
-                    return Some((None, super::model_flow::ModelPickerAction::Cancel));
-                }
-                super::provider_picker::ProviderPickerOutcome::Select(provider) => {
-                    self.provider_picker = None;
-                    return Some((provider, super::model_flow::ModelPickerAction::Continue));
-                }
-            }
-        }
-        let model = self.model_picker.as_mut()?;
-        if matches!(
-            model.picker.mode(),
-            super::model_picker::ModelPickerMode::Actions
-                | super::model_picker::ModelPickerMode::Filter
-        ) && matches!(event, Event::Key(stroke) if keymap.action("model_picker", *stroke) == Some("tui.control.submit") || keymap.action("model_picker_actions", *stroke) == Some("tui.control.submit"))
-            && let Some(model_id) = model.picker.selected_ignored_model_id()
-        {
-            model.picker.set_status(format!(
-                "{model_id} is ignored; use Unignore to remove state ignore or Show ignored to hide ignored models"
-            ));
-            return None;
-        }
-        let action = match event {
-            Event::Paste(text) => {
-                if matches!(
-                    model.picker.mode(),
-                    super::model_picker::ModelPickerMode::Actions
-                        | super::model_picker::ModelPickerMode::Filter
-                ) {
-                    model.picker.focus_filter();
-                    let _ = super::text_input_flow::handle_paste(model.picker.filter_mut(), text);
-                    model.picker.refresh_filter();
-                }
-                super::model_flow::ModelPickerAction::Continue
-            }
-            Event::Key(stroke) => super::model_flow::handle_model_picker_key(
-                &mut model.picker,
-                keymap,
-                model.provider_plugin_id.as_deref(),
-                *stroke,
-            ),
-            Event::Mouse(mouse) => {
-                if model.picker.select_mouse_row(*mouse).is_some() {
-                    super::model_flow::submit(&mut model.picker)
-                } else {
-                    super::model_flow::ModelPickerAction::Continue
-                }
-            }
-            Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {
-                super::model_flow::ModelPickerAction::Continue
-            }
-        };
-        let provider = model.provider_plugin_id.clone();
-        if matches!(
-            action,
-            super::model_flow::ModelPickerAction::Cancel
-                | super::model_flow::ModelPickerAction::Select(_)
-                | super::model_flow::ModelPickerAction::SelectWithConnection { .. }
-                | super::model_flow::ModelPickerAction::Approve(_)
-        ) {
-            self.model_picker = None;
-        }
-        Some((provider, action))
-    }
-
-    pub fn start_selected_model_check(&mut self) -> Option<u64> {
-        let model = self.model_picker.as_mut()?;
-        if self.model_check_in_flight {
-            model.picker.finish_check(
-                None,
-                "A model check is already running; wait for its bounded outcome before retrying",
-            );
-            return None;
-        }
-        self.model_check_in_flight = true;
-        Some(model.generation)
     }
 
     pub const fn has_skill_picker(&self) -> bool {
@@ -2512,10 +2413,7 @@ impl ChatLoopState {
             ),
             (self.session_picker.is_some(), Foreground::Sessions),
             (self.auth_pool_picker.is_some(), Foreground::AuthPool),
-            (
-                self.provider_picker.is_some() || self.model_picker.is_some(),
-                Foreground::Model,
-            ),
+            (self.model_switcher.is_some(), Foreground::Model),
             (self.skill_picker.is_some(), Foreground::Skill),
             (self.ralph_start_dialog.is_some(), Foreground::Ralph),
             (
@@ -2549,7 +2447,6 @@ impl ChatLoopState {
                 Foreground::Plugin
                     | Foreground::Sessions
                     | Foreground::AuthPool
-                    | Foreground::Model
                     | Foreground::Skill
             )
         )
@@ -4006,23 +3903,6 @@ pub fn apply_effect_result(
                 chat.app.push_ephemeral_system_plain(message);
             }
         }
-        TuiEffectResult::ModelProvidersLoaded { result } => match result {
-            Ok(providers) if providers.len() > 1 => {
-                loop_state.provider_picker =
-                    Some(super::provider_picker::ProviderPickerApp::new(providers));
-                chat.app.set_status("select a model provider".to_owned());
-            }
-            Ok(providers) => {
-                let provider_plugin_id =
-                    providers.first().map(|provider| provider.plugin_id.clone());
-                chat.replace_effect(TuiEffect::LoadModelPicker {
-                    provider_plugin_id,
-                    approve: None,
-                });
-                chat.app.set_status("loading models…".to_owned());
-            }
-            Err(error) => report_nonfatal_client_error(chat, "Model providers unavailable", &error),
-        },
         TuiEffectResult::AuthPoolPickerLoaded { session_id, result } => match result {
             _ if chat.attached_session_id() != Some(session_id) => {}
             Ok(snapshot) => {
@@ -4051,104 +3931,6 @@ pub fn apply_effect_result(
                 report_nonfatal_client_error(chat, "Account update failed", &error);
             }
         },
-        TuiEffectResult::SelectedModelChecked {
-            session_id,
-            provider_plugin_id,
-            generation,
-            result,
-            models,
-        } => {
-            loop_state.model_check_in_flight = false;
-            if chat.attached_session_id() != session_id {
-                return;
-            }
-            let Some(model) = loop_state.model_picker.as_mut().filter(|model| {
-                model.generation == generation && model.provider_plugin_id == provider_plugin_id
-            }) else {
-                return;
-            };
-            let status = result
-                .as_ref()
-                .ok()
-                .and_then(|report| report.results.first())
-                .map_or_else(
-                    || "Check unavailable; retry when the service is available".to_owned(),
-                    |result| {
-                        use bcode_model::ModelCheckStatus;
-                        let outcome = match result.status {
-                            ModelCheckStatus::Working => "Verified: completed provider request",
-                            ModelCheckStatus::Unsupported => {
-                                "Unavailable: serving surface unsupported"
-                            }
-                            ModelCheckStatus::AccountDenied => {
-                                "Unavailable: current account lacks access"
-                            }
-                            ModelCheckStatus::Inconclusive => "Unverified: check inconclusive",
-                            ModelCheckStatus::Timeout => "Unverified: check timed out",
-                            ModelCheckStatus::Cancelled => "Unverified: check cancelled",
-                        };
-                        format!(
-                            "{outcome}{}{}",
-                            if result.evidence_persisted {
-                                " · saved"
-                            } else {
-                                " · not saved"
-                            },
-                            if models.is_err() {
-                                " · list refresh unavailable"
-                            } else {
-                                ""
-                            }
-                        )
-                    },
-                );
-            model.picker.finish_check(models.ok(), status);
-        }
-        TuiEffectResult::ModelPickerLoaded {
-            provider_plugin_id,
-            result,
-            connections,
-            unconnected,
-            reapproval,
-        } => {
-            // A connection can supply models even when the provider's own listing fails,
-            // for example with only another agent's sign-in and no API key.
-            let models = match result {
-                Ok(models) => Some(models),
-                Err(_) if !connections.is_empty() || !unconnected.is_empty() => {
-                    Some(bcode_model::ModelList {
-                        models: Vec::new(),
-                        catalog: bcode_model::ModelCatalogHints::default(),
-                    })
-                }
-                Err(error) => {
-                    report_nonfatal_client_error(chat, "Model list unavailable", &error);
-                    None
-                }
-            };
-            if let Some(models) = models {
-                let status = match &reapproval {
-                    Some(Ok(())) => "Connection approved".to_owned(),
-                    Some(Err(error)) => format!("Connection not approved: {error}"),
-                    None => provider_plugin_id.as_ref().map_or_else(
-                        || "Select a model".to_owned(),
-                        |provider| format!("Select a model from {provider}"),
-                    ),
-                };
-                let mut picker =
-                    super::model_picker::ModelPickerApp::from_model_list(models, status);
-                picker.add_connections(connections);
-                picker.add_unconnected(unconnected);
-                loop_state.model_picker_generation =
-                    loop_state.model_picker_generation.wrapping_add(1);
-                loop_state.model_picker = Some(RootModelPicker {
-                    generation: loop_state.model_picker_generation,
-                    provider_plugin_id,
-                    picker,
-                });
-                chat.app.set_status("select a model".to_owned());
-            }
-        }
         TuiEffectResult::SkillPickerLoaded { result } => match result {
             Ok(skills) if skills.skills.is_empty() => {
                 chat.app.set_status("no skills available".to_owned());
@@ -4316,6 +4098,7 @@ pub fn apply_effect_result(
             model_id,
             result,
         } => {
+            super::model_switcher_host::model_set(chat, loop_state, session_id, result.is_ok());
             apply_set_session_model_result(
                 chat,
                 session_id,
@@ -4414,9 +4197,6 @@ pub fn apply_effect_result(
             &setting,
             &result,
         ),
-        TuiEffectResult::ManagedModelsLoaded { result } => {
-            super::managed_flow::apply_models_result(chat, loop_state, result);
-        }
         TuiEffectResult::ManagedSessionDetected {
             session_id,
             binding,
@@ -6533,22 +6313,13 @@ fn paint_foreground(
             theme,
         );
     }
-    if let Some(picker) = &mut loop_state.provider_picker
+    if let Some(open) = &mut loop_state.model_switcher
         && foreground == Some(super::foreground::Foreground::Model)
     {
-        super::provider_picker_render::render_provider_picker_with_keymap(
-            picker, frame, theme, &effective,
-        );
-    }
-    if let Some(model) = &mut loop_state.model_picker
-        && foreground == Some(super::foreground::Foreground::Model)
-    {
-        super::model_picker_render::render_model_picker_with_keymap(
-            &mut model.picker,
-            frame,
-            theme,
-            &effective,
-        );
+        let switcher_theme =
+            super::model_switcher::SwitcherTheme::from_presented(&chat.app.presented_theme());
+        let area = bmux_tui::geometry::Rect::new(0, 0, frame.area().width, frame.area().height);
+        open.switcher.paint(&switcher_theme, area, frame);
     }
     if let Some(picker) = &mut loop_state.auth_pool_picker
         && foreground == Some(super::foreground::Foreground::AuthPool)
@@ -8830,7 +8601,7 @@ mod scheduler_tests {
 #[path = "appearance_picker_flow_tests.rs"]
 mod appearance_picker_flow_tests;
 
-/// Yield the terminal only after foreground work finishes.
+/// Open the model switcher once foreground work finishes.
 pub fn request_execution_picker(chat: &mut ActiveChat, state: &mut ChatLoopState) {
     if !matches!(chat.app.activity(), super::activity::ActivityState::Idle)
         || (chat.app.managed_execution_session().is_some() && !chat.app.managed_input_ready())
@@ -8840,31 +8611,7 @@ pub fn request_execution_picker(chat: &mut ActiveChat, state: &mut ChatLoopState
             .set_status("Wait for the current turn to finish before changing model/backend".into());
         return;
     }
-    if bcode_config::load_config()
-        .is_ok_and(|config| config.plugins.disabled.contains("bcode.harness"))
-    {
-        chat.replace_effect(if chat.app.managed_execution_session().is_some() {
-            TuiEffect::LoadManagedModels
-        } else {
-            TuiEffect::LoadModelProviders
-        });
-        return;
-    }
-    let Ok(working_directory) = chat
-        .app
-        .working_directory()
-        .map(std::path::Path::to_path_buf)
-        .map_or_else(std::env::current_dir, Ok)
-    else {
-        chat.app
-            .set_status("Workspace unavailable; execution selection was not opened".into());
-        return;
-    };
-    state.execution_picker = Some(crate::ExecutionPickerRequest {
-        session_id: chat.attached_session_id(),
-        draft: chat.app.composer().text().to_owned(),
-        working_directory,
-    });
+    super::model_switcher_host::open(chat, state);
 }
 
 #[cfg(test)]

@@ -33,6 +33,8 @@ pub(crate) mod ephemeral_notices;
 pub mod eval_launcher;
 mod execution_flow;
 mod execution_picker;
+pub mod model_switcher;
+mod model_switcher_host;
 mod native_setup;
 pub use execution_flow::{ExecutionPickerRequest, run_native_setup_in_shell};
 pub use native_setup::NativeSetupOutcome;
@@ -51,15 +53,10 @@ pub(crate) mod markdown_activation;
 pub(crate) mod markdown_image;
 pub(crate) mod markdown_mermaid;
 pub mod metrics_launcher;
-pub(crate) mod model_flow;
-pub(crate) mod model_picker;
-pub(crate) mod model_picker_render;
 pub mod monitor_presentation;
 pub(crate) mod mouse_flow;
 pub mod onboarding;
-pub use execution_picker::{
-    ExecutionPickerOutcome, run_execution_picker_in_shell, run_execution_picker_loading_in_shell,
-};
+pub use execution_picker::{SwitcherExit, run_model_switcher_in_shell};
 mod quick_onboarding;
 mod xray_inspectors;
 pub use quick_onboarding::{
@@ -85,8 +82,6 @@ pub(crate) mod picker_render;
 pub(crate) mod plugin_surface_host;
 pub mod plugin_surface_launcher;
 pub mod plugin_tui;
-pub(crate) mod provider_picker;
-pub(crate) mod provider_picker_render;
 pub(crate) mod ralph_flow;
 pub mod ralph_launcher;
 pub(crate) mod ralph_start_dialog;

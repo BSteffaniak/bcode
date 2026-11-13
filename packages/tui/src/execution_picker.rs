@@ -1,230 +1,242 @@
-//! Pre-session adapter for the normal model picker. Discovery and admission stay application-owned.
+//! The model switcher on its own screen, for choices made outside a conversation: at startup
+//! and when a choice needs a new conversation. Discovery and admission stay application-owned.
 
 use std::io::{self, Write};
 
-use bcode_model::execution::{ExecutionModel, ExecutionModelSelection};
 use bmux_tui::{damage::Damage, event::Event, paint::PaintCx, terminal::Terminal};
 use bmux_tui_runtime::{
-    Command, Invalidation, Lifecycle, PresentReport, Program, RuntimeEvent, Update,
+    Command, Invalidation, PresentReport, Program, RuntimeEvent, Subscription, SubscriptionKey,
+    Update,
 };
 
-use crate::{TuiError, model_flow::ModelPickerAction, model_picker::ModelPickerApp};
+use crate::TuiError;
+use crate::model_switcher::inventory::{CurrentChoice, SourceUpdate};
+use crate::model_switcher::{Choice, ModelSwitcher, Notice, Outcome};
 
-/// Explicit navigation from the startup model inventory.
+/// How the user left the switcher.
 #[derive(Debug)]
-pub enum ExecutionPickerOutcome {
-    /// Exact model, backend and account intent; not execution authority.
-    Selected(ExecutionModelSelection),
-    /// Open existing connection/setup controls.
+pub enum SwitcherExit {
+    /// Use this model. An intent, not execution authority.
+    Chose(Box<Choice>),
+    /// Open native tool setup.
     Setup,
-    /// Close without creating a session or changing defaults.
+    /// Leave without choosing or changing anything.
     Close,
 }
 
-struct ExecutionPicker {
-    picker: ModelPickerApp,
-    theme: crate::render::TuiTheme,
-    keymap: crate::keymap::BmuxKeyMap,
-    outcome: ExecutionPickerOutcome,
-    presented_selection: Option<ExecutionModelSelection>,
-    models: Vec<ExecutionModel>,
-    discovery: Option<Command<Message>>,
+const DISCOVERY: &str = "model-switcher.discovery";
+const ANIMATION: &str = "model-switcher.animation";
+
+struct SwitcherScreen {
+    switcher: ModelSwitcher,
+    theme: crate::model_switcher::SwitcherTheme,
+    exit: SwitcherExit,
+    /// Discovery starts once, after the first frame is on screen.
+    started: bool,
 }
 
 enum Message {
-    Discovered(Result<(Vec<ExecutionModel>, String), TuiError>),
+    Source(Box<SourceUpdate>),
+    Discovered,
+    Approved(Result<(), String>),
+    Tick,
     InputFailed(io::Error),
 }
 
-impl Program for ExecutionPicker {
+fn discovery() -> Subscription<Message> {
+    Subscription::new(SubscriptionKey::new(DISCOVERY), |sender| async move {
+        let (updates, mut received) = tokio::sync::mpsc::channel(16);
+        let discover = tokio::spawn(crate::model_switcher::discovery::discover(updates));
+        while let Some(update) = received.recv().await {
+            if sender
+                .send(Message::Source(Box::new(update)))
+                .await
+                .is_err()
+            {
+                discover.abort();
+                return;
+            }
+        }
+        let _ = sender.send(Message::Discovered).await;
+    })
+}
+
+fn animation() -> Subscription<Message> {
+    Subscription::new(SubscriptionKey::new(ANIMATION), |sender| async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            if sender.send(Message::Tick).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+impl SwitcherScreen {
+    fn act(&mut self, outcome: Outcome) -> Update<Message> {
+        match outcome {
+            Outcome::Ignored => Update::none(),
+            Outcome::Redraw => Update::redraw(),
+            Outcome::Close => Update::exit(),
+            Outcome::Setup => {
+                self.exit = SwitcherExit::Setup;
+                Update::exit()
+            }
+            Outcome::Choose(choice) => {
+                let choices = self.switcher.record_choice(&choice.entry.key);
+                save_choices(choices);
+                self.exit = SwitcherExit::Chose(choice);
+                Update::exit()
+            }
+            Outcome::Connect(candidate) => {
+                self.switcher.notify(Notice {
+                    text: format!("Connecting {}…", candidate.application),
+                    error: false,
+                });
+                Update::redraw().with_command(Command::concurrent(async move {
+                    use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+                    let result = bcode_client::BcodeClient::default_endpoint()
+                        .approve_external_auth(*candidate)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    Some(Message::Approved(result))
+                }))
+            }
+            Outcome::SaveChoices(choices) => {
+                save_choices(choices);
+                Update::redraw()
+            }
+        }
+    }
+}
+
+/// Persist recent and favorite choices off the input path; failure only loses the change.
+fn save_choices(choices: bcode_config::model_choices::ModelChoices) {
+    tokio::task::spawn_blocking(move || {
+        let _ = bcode_config::model_choices::update_at(
+            &bcode_config::model_choices::default_path(),
+            |stored| *stored = choices,
+        );
+    });
+}
+
+impl Program for SwitcherScreen {
     type Message = Message;
     type Error = TuiError;
 
     fn presentation_committed(&mut self, _report: PresentReport) -> Update<Message> {
-        Update {
-            commands: self.discovery.take().into_iter().collect(),
-            ..Update::none()
+        if std::mem::replace(&mut self.started, true) {
+            return Update::none();
         }
+        Update::none()
+            .with_subscription(discovery())
+            .with_subscription(animation())
     }
 
     fn update(&mut self, event: RuntimeEvent<Message>) -> Result<Update<Message>, TuiError> {
-        let mut lifecycle = Lifecycle::Continue;
-        match event {
-            RuntimeEvent::Message(Message::Discovered(result)) => {
-                self.presented_selection = None;
-                match result {
-                    Ok((models, status)) => {
-                        self.picker.replace_execution_models(models.clone());
-                        self.models = models;
-                        self.picker.set_status(picker_status(&status, &self.keymap));
-                    }
-                    Err(_) => self.picker.set_status(picker_status(
-                        "Couldn’t check available models. Open Setup to inspect connections, or close without changes",
-                        &self.keymap,
-                    )),
+        Ok(match event {
+            RuntimeEvent::Message(Message::Source(update)) => {
+                self.switcher.apply(*update);
+                Update::redraw()
+            }
+            RuntimeEvent::Message(Message::Discovered) => Update::redraw()
+                .cancel_subscription(SubscriptionKey::new(DISCOVERY))
+                .cancel_subscription(SubscriptionKey::new(ANIMATION)),
+            RuntimeEvent::Message(Message::Approved(result)) => {
+                self.switcher.notify(match result {
+                    Ok(()) => Notice {
+                        text: "Connected. Its models are listed below.".into(),
+                        error: false,
+                    },
+                    Err(_) => Notice {
+                        text: "Could not connect those credentials. Nothing was changed.".into(),
+                        error: true,
+                    },
+                });
+                // Rediscover so the connection's models replace the offer.
+                Update::redraw()
+                    .with_subscription(discovery())
+                    .with_subscription(animation())
+            }
+            RuntimeEvent::Message(Message::Tick) => {
+                if self.switcher.loading() {
+                    Update::redraw()
+                } else {
+                    Update::none()
                 }
             }
             RuntimeEvent::Message(Message::InputFailed(error)) => return Err(error.into()),
             RuntimeEvent::Terminal(Event::Key(key)) => {
-                if self.keymap.action("quick_onboarding", key) == Some("tui.quick.advanced") {
-                    self.outcome = ExecutionPickerOutcome::Setup;
-                    lifecycle = Lifecycle::Exit;
-                } else {
-                    match crate::model_flow::handle_model_picker_key(
-                        &mut self.picker,
-                        &self.keymap,
-                        None,
-                        key,
-                    ) {
-                        ModelPickerAction::Select(_) => {
-                            if let Some(selection) = self.picker.selected_execution()
-                                && self.presented_selection.as_ref() == Some(&selection)
-                            {
-                                self.outcome = ExecutionPickerOutcome::Selected(selection);
-                                lifecycle = Lifecycle::Exit;
-                            }
-                        }
-                        ModelPickerAction::Cancel => lifecycle = Lifecycle::Exit,
-                        ModelPickerAction::Check(_)
-                        | ModelPickerAction::Continue
-                        | ModelPickerAction::SelectWithConnection { .. }
-                        | ModelPickerAction::Approve(_) => {}
-                    }
-                }
+                let outcome = self.switcher.key(key);
+                self.act(outcome)
             }
-            RuntimeEvent::Terminal(Event::Mouse(mouse)) => {
-                if self.picker.select_mouse_row(mouse).is_some()
-                    && let Some(selection) = self.picker.selected_execution()
-                    && self.presented_selection.as_ref() == Some(&selection)
-                {
-                    self.outcome = ExecutionPickerOutcome::Selected(selection);
-                    lifecycle = Lifecycle::Exit;
-                }
+            RuntimeEvent::Terminal(Event::Paste(text)) => {
+                let outcome = self.switcher.paste(&text);
+                self.act(outcome)
             }
-            _ => {}
-        }
-        Ok(Update {
-            invalidation: Invalidation::Redraw,
-            lifecycle,
-            ..Update::none()
+            RuntimeEvent::Terminal(event @ Event::Mouse(_)) => {
+                let outcome = self.switcher.mouse(&event, &self.theme);
+                self.act(outcome)
+            }
+            RuntimeEvent::Terminal(Event::Resize(_)) => Update {
+                invalidation: Invalidation::Redraw,
+                ..Update::none()
+            },
+            _ => Update::none(),
         })
     }
 }
 
 fn present<W: Write>(
-    program: &mut ExecutionPicker,
+    program: &mut SwitcherScreen,
     terminal: &mut Terminal<W>,
 ) -> Result<PresentReport, io::Error> {
-    let stats = terminal.draw_damage(Damage::Full, |frame: &mut PaintCx<'_, '_>| {
-        crate::model_picker_render::render_model_picker_with_keymap(
-            &mut program.picker,
-            frame,
-            program.theme,
-            &program.keymap,
-        );
+    let stats = terminal.draw_damage(Damage::Full, |cx: &mut PaintCx<'_, '_>| {
+        let local = cx.area();
+        let area = bmux_tui::geometry::Rect::new(0, 0, local.width, local.height);
+        program.switcher.paint(&program.theme, area, cx);
     })?;
-    program.presented_selection = program
-        .picker
-        .has_visible_rows()
-        .then(|| program.picker.selected_execution())
-        .flatten();
     Ok(PresentReport {
         changed_cells: stats.changed_cells,
         full_repaint: stats.full_repaint,
     })
 }
 
-/// Select a model using the ordinary picker without constructing a provider client.
-/// The highlighted preference remains only an intent and is never automatically launched.
+/// Choose a model on its own screen.
+///
+/// The switcher opens at once; sources fill in as they are checked, and Setup and close stay
+/// available meanwhile. Nothing is launched or changed here except approving credentials the
+/// user chose to connect and saving recent and favorite choices.
 /// # Errors
-/// Returns configuration, terminal, or input lifecycle errors without retrying an operation.
-pub async fn run_execution_picker_in_shell(
+/// Returns configuration, terminal, or input lifecycle errors.
+pub async fn run_model_switcher_in_shell(
     shell: &mut crate::TerminalShell,
-    models: Vec<ExecutionModel>,
-    remembered: Option<&ExecutionModelSelection>,
-    status: &str,
-) -> Result<ExecutionPickerOutcome, TuiError> {
+    current: CurrentChoice,
+    current_effort: Option<String>,
+) -> Result<SwitcherExit, TuiError> {
     let config = bcode_config::load_config()?;
     let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
+    crate::render::set_chrome_theme(&theme);
+    let choices =
+        bcode_config::model_choices::load_from(&bcode_config::model_choices::default_path())
+            .unwrap_or_default();
     let keymap = crate::keymap::BmuxKeyMap::from_config(&config.tui);
-    let mut picker = ModelPickerApp::from_execution_models(
-        models,
-        format!(
-            "{status} · {} setup/sign in · Selecting does not verify access",
-            keymap.hint("quick_onboarding", "tui.quick.advanced"),
-        ),
-    );
-    if let Some(selection) = remembered {
-        picker.highlight_execution(selection);
-        if !picker.execution_preference_present(selection) {
-            picker.set_status("Remembered route/model/account is not in this inventory. No replacement was selected automatically; choose explicitly or open Setup.");
-        }
-    }
-    let program = ExecutionPicker {
-        picker,
-        theme: crate::render::TuiTheme::from_presented(&theme),
-        keymap,
-        outcome: ExecutionPickerOutcome::Close,
-        presented_selection: None,
-        models: Vec::new(),
-        discovery: None,
+    let mut switcher = ModelSwitcher::new(current, choices, keymap);
+    switcher.set_current_effort(current_effort);
+    let program = SwitcherScreen {
+        switcher,
+        theme: crate::model_switcher::SwitcherTheme::from_presented(&theme),
+        exit: SwitcherExit::Close,
+        started: false,
     };
-    run_picker(shell, program).await.map(|(outcome, _)| outcome)
+    run(shell, program).await
 }
 
-fn picker_status(status: &str, keymap: &crate::keymap::BmuxKeyMap) -> String {
-    format!(
-        "{status} · {} setup/sign in · Selecting does not verify access",
-        keymap.hint("quick_onboarding", "tui.quick.advanced"),
-    )
-}
-
-/// Open an execution picker immediately and populate it with bounded, cancellable inspection.
-/// Setup and close remain usable while discovery is pending; no route is automatically launched.
-/// # Errors
-/// Returns configuration, terminal, or input lifecycle errors. Discovery failures stay in the picker.
-pub async fn run_execution_picker_loading_in_shell(
+async fn run(
     shell: &mut crate::TerminalShell,
-    discover: impl std::future::Future<Output = Result<(Vec<ExecutionModel>, String), TuiError>>
-    + Send
-    + 'static,
-) -> Result<(ExecutionPickerOutcome, Vec<ExecutionModel>), TuiError> {
-    let config = bcode_config::load_config()?;
-    let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
-    let keymap = crate::keymap::BmuxKeyMap::from_config(&config.tui);
-    let picker = ModelPickerApp::from_execution_models(
-        Vec::new(),
-        picker_status(
-            "Checking available models… You can open Setup or close",
-            &keymap,
-        ),
-    );
-    let program = ExecutionPicker {
-        picker,
-        theme: crate::render::TuiTheme::from_presented(&theme),
-        keymap,
-        outcome: ExecutionPickerOutcome::Close,
-        presented_selection: None,
-        models: Vec::new(),
-        discovery: Some(Command::concurrent(async move {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(15), discover)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(
-                        io::Error::new(io::ErrorKind::TimedOut, "Model inspection timed out")
-                            .into(),
-                    )
-                });
-            Some(Message::Discovered(result))
-        })),
-    };
-    run_picker(shell, program).await
-}
-
-async fn run_picker(
-    shell: &mut crate::TerminalShell,
-    program: ExecutionPicker,
-) -> Result<(ExecutionPickerOutcome, Vec<ExecutionModel>), TuiError> {
+    program: SwitcherScreen,
+) -> Result<SwitcherExit, TuiError> {
     let mut terminal = shell.terminal()?;
     let (runtime, handle) = bmux_tui_runtime::Runtime::new(
         program,
@@ -235,11 +247,11 @@ async fn run_picker(
         bmux_tui_runtime::RuntimeConfig::default(),
     );
     let mut input =
-        bmux_tui_runtime::TerminalInput::start::<ExecutionPicker>(handle, Message::InputFailed);
+        bmux_tui_runtime::TerminalInput::start::<SwitcherScreen>(handle, Message::InputFailed);
     let result = Box::pin(runtime.run()).await;
     input.shutdown().await;
     let result = match result {
-        Ok(output) => Ok((output.program.outcome, output.program.models)),
+        Ok(output) => Ok(output.program.exit),
         Err(bmux_tui_runtime::RuntimeError::Program {
             error,
             cleanup_error,
@@ -260,86 +272,75 @@ async fn run_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::geometry::Rect;
+    use bmux_tui_runtime::Lifecycle;
 
-    fn program() -> ExecutionPicker {
-        let config = bcode_config::BcodeConfig::default();
-        let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
-        ExecutionPicker {
-            picker: ModelPickerApp::from_execution_models(Vec::new(), "Checking models"),
-            theme: crate::render::TuiTheme::from_presented(&theme),
-            keymap: crate::keymap::BmuxKeyMap::from_config(&config.tui),
-            outcome: ExecutionPickerOutcome::Close,
-            presented_selection: None,
-            models: Vec::new(),
-            discovery: Some(Command::concurrent(std::future::pending())),
+    fn program() -> SwitcherScreen {
+        SwitcherScreen {
+            switcher: ModelSwitcher::new(
+                CurrentChoice::default(),
+                bcode_config::model_choices::ModelChoices::default(),
+                crate::keymap::BmuxKeyMap::from_config(&bcode_config::BcodeConfig::default().tui),
+            ),
+            theme: crate::model_switcher::SwitcherTheme::from_presented(
+                &crate::render::semantic_state_theme(),
+            ),
+            exit: SwitcherExit::Close,
+            started: false,
+        }
+    }
+
+    fn report() -> PresentReport {
+        PresentReport {
+            changed_cells: 0,
+            full_repaint: false,
         }
     }
 
     #[test]
-    fn pending_discovery_does_not_block_close_setup_or_filtering() {
-        use bmux_keyboard::{KeyCode, KeyStroke};
+    fn discovery_starts_once_after_the_first_frame_and_never_blocks_close_or_setup() {
         for (key, setup) in [(KeyCode::Escape, false), (KeyCode::F(2), true)] {
             let mut program = program();
-            // Inspection starts once, only after the initial usable frame commits.
-            let report = || PresentReport {
-                changed_cells: 0,
-                full_repaint: false,
-            };
-            assert_eq!(program.presentation_committed(report()).commands.len(), 1);
-            assert!(program.presentation_committed(report()).commands.is_empty());
+            assert_eq!(
+                program.presentation_committed(report()).subscriptions.len(),
+                2
+            );
+            assert!(
+                program
+                    .presentation_committed(report())
+                    .subscriptions
+                    .is_empty()
+            );
             let update = program
                 .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(key))))
                 .unwrap();
             assert_eq!(update.lifecycle, Lifecycle::Exit);
-            assert_eq!(
-                matches!(program.outcome, ExecutionPickerOutcome::Setup),
-                setup
-            );
+            assert_eq!(matches!(program.exit, SwitcherExit::Setup), setup);
         }
-        let mut program = program();
-        program.picker.focus_filter();
-        program
-            .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
-                KeyCode::Char('x'),
-            ))))
-            .unwrap();
-        assert!(program.picker.filter_mut().buffer().text().contains('x'));
     }
 
     #[test]
-    fn discovery_failure_is_inline_and_never_selects_or_launches() {
+    fn failed_connections_are_reported_inline_and_rediscover() {
         let mut program = program();
         let update = program
-            .update(RuntimeEvent::Message(Message::Discovered(Err(
-                io::Error::other("private provider detail").into(),
+            .update(RuntimeEvent::Message(Message::Approved(Err(
+                "private provider detail".into(),
             ))))
             .unwrap();
         assert_eq!(update.lifecycle, Lifecycle::Continue);
-        assert!(program.picker.status().contains("Couldn’t check"));
-        assert!(!program.picker.status().contains("private provider detail"));
-        assert!(program.picker.selected_execution().is_none());
-        assert!(matches!(program.outcome, ExecutionPickerOutcome::Close));
+        assert_eq!(update.subscriptions.len(), 2);
+        assert!(matches!(program.exit, SwitcherExit::Close));
     }
 
     #[test]
-    fn empty_execution_picker_contains_tiny_and_resized_frames() {
-        let config = bcode_config::BcodeConfig::default();
-        let theme = crate::theme::resolve_configured_theme(&config.tui, std::path::Path::new("."));
-        let mut program = ExecutionPicker {
-            picker: ModelPickerApp::from_execution_models(Vec::new(), "No models · setup/sign in"),
-            theme: crate::render::TuiTheme::from_presented(&theme),
-            keymap: crate::keymap::BmuxKeyMap::from_config(&config.tui),
-            outcome: ExecutionPickerOutcome::Close,
-            presented_selection: None,
-            models: Vec::new(),
-            discovery: None,
-        };
+    fn empty_switcher_contains_tiny_and_resized_frames() {
+        let mut program = program();
         for (width, height) in [(0, 0), (1, 1), (2, 3), (12, 5), (80, 24), (1, 1)] {
             let mut output = Vec::new();
             let mut terminal = Terminal::new(&mut output, Rect::new(0, 0, width, height));
             present(&mut program, &mut terminal).unwrap();
-            assert!(program.picker.selected_execution().is_none());
+            assert!(program.switcher.active_entry().is_none());
         }
     }
 }

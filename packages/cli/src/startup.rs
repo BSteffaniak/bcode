@@ -236,6 +236,8 @@ async fn route_backend_selection(
             shell,
             provider_plugin_id.clone(),
             preference.model_id.clone(),
+            None,
+            None,
         )
         .await?;
         return Ok(true);
@@ -290,31 +292,25 @@ async fn route_backend_selection(
             }
             return Ok(true);
         }
-        let (outcome, entries) = bcode_tui::run_execution_picker_loading_in_shell(
-            shell,
-            async move {
-                let inventory = client.discover_execution_catalog(request).await.map_err(bcode_tui::TuiError::from)?;
-                let status = if inventory.issues.is_empty() {
-                    "Choose a model and account"
-                } else {
-                    "Some sources could not be checked. Choose an observed model or open Setup"
-                };
-                Ok((inventory.models, status.to_owned()))
-            },
-        ).await?;
-        match outcome {
-            bcode_tui::ExecutionPickerOutcome::Selected(selection) => {
-                Box::pin(launch_execution_choice(
-                    host, shell, &catalog, &entries, selection, true,
-                ))
-                .await?;
+        let current = bcode_tui::model_switcher::inventory::CurrentChoice {
+            route: config
+                .resolved_model_selection()
+                .provider_plugin_id
+                .map(|provider_plugin_id| bcode_model::execution::ExecutionRoute::ModelProvider {
+                    provider_plugin_id,
+                }),
+            model_id: config.resolved_model_selection().model_id,
+        };
+        match Box::pin(bcode_tui::run_model_switcher_in_shell(shell, current, None)).await? {
+            bcode_tui::SwitcherExit::Chose(choice) => {
+                Box::pin(launch_switcher_choice(host, shell, *choice)).await?;
                 Ok(true)
             }
-            bcode_tui::ExecutionPickerOutcome::Setup => {
+            bcode_tui::SwitcherExit::Setup => {
                 Box::pin(native_setup::run(shell, no_discovery)).await?;
                 Ok(true)
             }
-            bcode_tui::ExecutionPickerOutcome::Close => Ok(true),
+            bcode_tui::SwitcherExit::Close => Ok(true),
         }
     })
     .await;
@@ -324,6 +320,54 @@ async fn route_backend_selection(
         let _ = shell.show_error_without_retry("Execution startup did not complete. Inspect Sessions before starting another session. No provider fallback or billing change was selected.").await;
     }
     result
+}
+
+/// Start a conversation with a model chosen in the switcher.
+async fn launch_switcher_choice(
+    host: &bcode_plugin::PluginHost,
+    shell: &mut bcode_tui::TerminalShell,
+    choice: bcode_tui::model_switcher::Choice,
+) -> Result<(), CliError> {
+    let model = choice.entry.model.clone();
+    if let bcode_model::execution::ExecutionRoute::ModelProvider { provider_plugin_id } =
+        &model.route
+    {
+        let binding = match &choice.entry.access {
+            bcode_tui::model_switcher::inventory::Access::Connection { binding_id, .. } => {
+                Some(binding_id.clone())
+            }
+            _ => None,
+        };
+        return launch_provider_model(
+            shell,
+            provider_plugin_id.clone(),
+            model.model.model_id.clone(),
+            binding,
+            choice.effort,
+        )
+        .await;
+    }
+    // Discovery may have registered a signed-in native tool after the catalog was read.
+    let config = bcode_config::load_config()?;
+    let Some(catalog) = configured_backend_catalog(host, &config, true).await? else {
+        return Err(CliError::InvalidArguments(
+            "Native tools are disabled; enable them in Setup".into(),
+        ));
+    };
+    let selection = bcode_model::execution::ExecutionModelSelection {
+        model_id: model.model.model_id.clone(),
+        route: Some(model.route.clone()),
+        account_reference: model.account_reference.clone(),
+    };
+    Box::pin(launch_execution_choice(
+        host,
+        shell,
+        &catalog,
+        std::slice::from_ref(&model),
+        selection,
+        true,
+    ))
+    .await
 }
 
 async fn launch_execution_choice(
@@ -375,7 +419,7 @@ async fn launch_execution_choice(
                 return Ok(());
             }
             // Ordinary provider selection/readiness remains owned by the existing client path.
-            launch_provider_model(shell, provider_plugin_id, selection.model_id).await
+            launch_provider_model(shell, provider_plugin_id, selection.model_id, None, None).await
         }
         None => Err(CliError::InvalidArguments(
             "An exact execution route is required".into(),
@@ -527,6 +571,8 @@ async fn launch_provider_model(
     shell: &mut bcode_tui::TerminalShell,
     provider: String,
     model: String,
+    connection: Option<String>,
+    effort: Option<String>,
 ) -> Result<(), CliError> {
     let session = Box::pin(shell.wait("Starting your session", async {
         super::ensure_server_running()
@@ -535,8 +581,13 @@ async fn launch_provider_model(
         let client = bcode_client::BcodeClient::default_endpoint();
         let session = client.create_session(None).await?;
         client
-            .set_session_model(session.id, Some(provider), model)
+            .set_session_model_with_connection(session.id, Some(provider), model, connection)
             .await?;
+        if effort.is_some() {
+            client
+                .set_session_reasoning(session.id, effort, None)
+                .await?;
+        }
         Ok::<_, bcode_tui::TuiError>(session)
     }))
     .await?;

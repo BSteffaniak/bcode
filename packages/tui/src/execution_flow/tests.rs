@@ -54,6 +54,9 @@ async fn picker_exit_survives_teardown_and_retains_return_context() {
         session_id: Some(SessionId::new()),
         draft: "unsent input".into(),
         working_directory: "/workspace".into(),
+        current: crate::model_switcher::inventory::CurrentChoice::default(),
+        current_effort: None,
+        pending: None,
     };
     let target = crate::runtime::ManagedJourneyTarget {
         session_id: request.session_id.unwrap(),

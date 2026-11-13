@@ -443,8 +443,7 @@ fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option
                 | "setup_settings"
                 | "setup_auth"
                 | "setup_auth_terminal"
-                | "provider_picker"
-                | "model_picker"
+                | "model_switcher"
                 | "command_palette"
                 | "working_directory"
                 | "worktree_create"
@@ -453,6 +452,12 @@ fn control_defaults<'a>(scope: &str, id: &str, defaults: Vec<&'a str>) -> Option
                 | "session_search"
                 | "slash_palette"
         )
+    {
+        return None;
+    }
+    // Tab switches the model switcher between its list and comparison views.
+    if scope == "model_switcher"
+        && matches!(id, "tui.control.focus_next" | "tui.control.focus_previous")
     {
         return None;
     }
@@ -563,9 +568,7 @@ fn register_control_actions(
 
     for scope in [
         "composer_interaction",
-        "provider_picker",
-        "model_picker_actions",
-        "model_picker",
+        "model_switcher",
         "auth_pool_picker",
         "worktree_picker",
         "appearance_picker",
@@ -642,28 +645,34 @@ fn register_model_actions(
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
     for (id, description, defaults) in [
         (
-            "tui.model.check",
-            "Check selected model (may consume quota/cost)",
-            vec!["c"],
+            "tui.model.favorite",
+            "Add or remove the selected model from favorites",
+            vec!["ctrl+f"],
         ),
-        ("tui.model.filter", "Filter models", vec!["/"]),
         (
-            "tui.model.showIgnored",
-            "Show ignored models",
-            vec!["shift+i"],
+            "tui.model.compare",
+            "Switch between the grouped list and the comparison table",
+            vec!["tab"],
         ),
-        ("tui.model.sort", "Cycle model sort", vec!["s"]),
+        (
+            "tui.model.sort",
+            "Sort the comparison by the next column",
+            vec!["ctrl+s"],
+        ),
         (
             "tui.model.reverseSort",
-            "Reverse model sort",
-            vec!["shift+s"],
+            "Reverse the comparison sort",
+            vec!["ctrl+r"],
         ),
-        ("tui.model.ignore", "Ignore model", vec!["i"]),
-        ("tui.model.unignore", "Unignore model", vec!["u"]),
+        (
+            "tui.model.setup",
+            "Set up or sign in to native tools",
+            vec!["f2"],
+        ),
     ] {
         registry.register(KeymapAction {
             id: id.into(),
-            scope: "model_picker_actions".into(),
+            scope: "model_switcher".into(),
             description: description.into(),
             defaults: defaults.into_iter().map(str::to_owned).collect(),
         })?;
@@ -843,8 +852,6 @@ fn register_form_editor_actions(
         "setup_connection",
         "setup_settings",
         "setup_auth",
-        "provider_picker",
-        "model_picker",
         "command_palette",
         "working_directory",
         "worktree_create",

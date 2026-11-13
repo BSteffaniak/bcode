@@ -83,6 +83,7 @@ bmux_tui_components = { workspace = true, features = [
     "spinner",
     "text-view",
     "stepper",
+    "table",
     "text-input",
 ] }
 bmux_tui_runtime = { workspace = true, features = ["terminal-io"] }

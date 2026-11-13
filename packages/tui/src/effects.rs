@@ -476,38 +476,6 @@ pub struct ManagedSlashContext {
     reasoning_visible: bool,
 }
 
-async fn load_managed_models(
-    commands: &bcode_client::ManagedSessionCommandHandle,
-) -> Result<Vec<bcode_model::execution::ExecutionModel>, ClientError> {
-    let binding = commands.binding().await?;
-    let instance_id = binding.instance.instance_id.clone();
-    let catalog = bcode_client::ManagedSessionClient::default_endpoint()
-        .discover_execution_catalog(bcode_ipc::harness::ManagedExecutionCatalogRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            instances: vec![binding.instance],
-            provider_plugin_id: None,
-        })
-        .await?;
-    Ok(managed_instance_models(catalog.models, &instance_id))
-}
-
-/// Keep only execution entries routed to the attached managed instance.
-fn managed_instance_models(
-    models: Vec<bcode_model::execution::ExecutionModel>,
-    instance_id: &str,
-) -> Vec<bcode_model::execution::ExecutionModel> {
-    models
-        .into_iter()
-        .filter(|entry| {
-            matches!(
-                &entry.route,
-                bcode_model::execution::ExecutionRoute::ManagedHarness { instance_id: routed, .. }
-                    if routed == instance_id
-            )
-        })
-        .collect()
-}
-
 #[allow(clippy::too_many_lines)]
 async fn managed_slash_command(
     commands: &bcode_client::ManagedSessionCommandHandle,
@@ -609,66 +577,6 @@ async fn managed_slash_command(
 
 #[cfg(test)]
 mod managed_model_filter_tests {
-    fn entry(
-        route: bcode_model::execution::ExecutionRoute,
-        id: &str,
-    ) -> bcode_model::execution::ExecutionModel {
-        bcode_model::execution::ExecutionModel {
-            model: bcode_model::ModelInfo {
-                model_id: id.into(),
-                display_name: id.into(),
-                is_default: false,
-                context_window: None,
-                max_output_tokens: None,
-                max_image_input_base64_bytes: None,
-                capabilities: std::collections::BTreeSet::new(),
-                feature_support: bcode_model::ModelFeatureSupport::default(),
-                reasoning: None,
-                cache: bcode_model::ModelCacheInfo::default(),
-                metadata_source: None,
-                pricing: None,
-                api_surface: None,
-                visibility: bcode_model::ModelVisibility::Visible,
-            },
-            route,
-            account_reference: None,
-            billing_route: bcode_model::execution::ExecutionBillingRoute::ProviderApi,
-            native_model_id: id.into(),
-            confirmed_model_id: None,
-            provenance: bcode_model::execution::ExecutionModelProvenance::HarnessDiscovery,
-            readiness: bcode_model::execution::ExecutionModelReadiness::Unknown,
-        }
-    }
-
-    #[test]
-    fn managed_models_keep_only_the_attached_instance_route() {
-        let models = vec![
-            entry(
-                bcode_model::execution::ExecutionRoute::ManagedHarness {
-                    instance_id: "primary".into(),
-                    plugin_id: "claude".into(),
-                },
-                "opus",
-            ),
-            entry(
-                bcode_model::execution::ExecutionRoute::ManagedHarness {
-                    instance_id: "other".into(),
-                    plugin_id: "claude".into(),
-                },
-                "foreign",
-            ),
-            entry(
-                bcode_model::execution::ExecutionRoute::ModelProvider {
-                    provider_plugin_id: "openai".into(),
-                },
-                "provider",
-            ),
-        ];
-        let kept = super::managed_instance_models(models, "primary");
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].native_model_id, "opus");
-    }
-
     #[test]
     fn managed_host_allow_list_excludes_execution_and_model_effects() {
         use super::TuiEffect;
@@ -693,11 +601,6 @@ mod managed_model_filter_tests {
             TuiEffect::CancelTurn { session_id },
             TuiEffect::CompactContext { session_id },
             TuiEffect::ListPermissions,
-            TuiEffect::LoadModelProviders,
-            TuiEffect::LoadModelPicker {
-                provider_plugin_id: None,
-                approve: None,
-            },
             TuiEffect::ResolvePermission {
                 permission_id: "p".into(),
                 approved: true,
@@ -711,13 +614,12 @@ mod managed_model_filter_tests {
                 response_id: "id".into(),
                 value: bcode_harness_models::HarnessResponseValue::Approval { approved: true },
             },
-            TuiEffect::LoadManagedModels,
         ] {
             assert!(!denied.is_managed_host_operation());
         }
         // Local presentation state needs no daemon or host access at all.
         assert!(TuiEffect::ClearThemeSelection.run_local_state().is_ok());
-        assert!(TuiEffect::LoadManagedModels.run_local_state().is_err());
+        assert!(TuiEffect::ListPermissions.run_local_state().is_err());
     }
 }
 
@@ -994,8 +896,6 @@ pub enum TuiEffect {
         /// Active session context.
         session_id: Option<SessionId>,
     },
-    /// Load model providers before opening the root model picker.
-    LoadModelProviders,
     /// Find other agents' credentials not yet connected or announced, and record them as
     /// announced. Presence-only discovery; never reads credentials.
     AnnounceExternalConnections,
@@ -1005,20 +905,6 @@ pub enum TuiEffect {
     SetAuthPoolPreference {
         session_id: SessionId,
         action: super::auth_pool_picker::AccountAction,
-    },
-    /// Explicitly consented, bounded check for exactly one selected model.
-    CheckSelectedModel {
-        session_id: Option<SessionId>,
-        provider_plugin_id: Option<String>,
-        model_id: String,
-        generation: u64,
-    },
-    /// Load models for the selected provider.
-    LoadModelPicker {
-        /// Selected provider plugin, or the default provider.
-        provider_plugin_id: Option<String>,
-        /// Approve this connection before loading, after the user confirmed it.
-        approve: Option<Box<bcode_provider_auth_models::external::ExternalAuthCandidate>>,
     },
     /// Load skills before opening the root skill picker.
     LoadSkillPicker,
@@ -1167,8 +1053,6 @@ pub enum TuiEffect {
         /// Requested setting.
         setting: bcode_harness_models::HarnessSessionSetting,
     },
-    /// Discover the models advertised for the attached managed instance.
-    LoadManagedModels,
     /// Execute one V2 transcript engine history request (W5, W10, W11).
     LoadTranscriptV2History {
         /// The request, its session and the resident tail it was issued against.
@@ -1463,11 +1347,6 @@ pub enum TuiEffectResult {
         /// Applications to mention, or the discovery failure.
         result: Result<Vec<String>, ClientError>,
     },
-    /// Model providers for the root picker loaded.
-    ModelProvidersLoaded {
-        /// Loaded plugin service summaries.
-        result: Result<Vec<bcode_ipc::PluginServiceSummary>, ClientError>,
-    },
     /// Portable auth-pool status loaded.
     AuthPoolPickerLoaded {
         /// Session whose configured context was read.
@@ -1481,27 +1360,6 @@ pub enum TuiEffectResult {
         session_id: SessionId,
         /// Authoritative post-mutation routing snapshot.
         result: Result<bcode_provider_auth_models::AccountRouting, ClientError>,
-    },
-    /// Completed selected check and post-persistence model-list refresh.
-    SelectedModelChecked {
-        session_id: Option<SessionId>,
-        provider_plugin_id: Option<String>,
-        generation: u64,
-        result: Result<bcode_model::ModelCheckReport, ClientError>,
-        models: Result<bcode_model::ModelList, ClientError>,
-    },
-    /// Models for the root picker loaded.
-    ModelPickerLoaded {
-        /// Provider used for the model query.
-        provider_plugin_id: Option<String>,
-        /// Loaded normalized model list.
-        result: Result<bcode_model::ModelList, ClientError>,
-        /// Approved connections for this provider; empty when unavailable.
-        connections: Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
-        /// Discovered, not yet approved credential sources for this provider.
-        unconnected: Vec<bcode_provider_auth_models::external::ExternalAuthCandidate>,
-        /// Outcome of a requested re-approval, if one was requested.
-        reapproval: Option<Result<(), String>>,
     },
     /// Skills for the root skill picker loaded.
     SkillPickerLoaded {
@@ -1651,11 +1509,6 @@ pub enum TuiEffectResult {
         /// Managed application response.
         result: Result<bcode_harness_models::HarnessServiceResponse, ClientError>,
     },
-    /// Models advertised for the attached managed instance.
-    ManagedModelsLoaded {
-        /// Execution entries routed to the attached instance.
-        result: Result<Vec<bcode_model::execution::ExecutionModel>, ClientError>,
-    },
     /// An ordinary open found a managed binding; the root must hand off to managed reattach.
     ManagedSessionDetected {
         /// Session that was being opened.
@@ -1752,7 +1605,6 @@ impl TuiEffectResult {
             Self::RalphAction { result, .. } => DaemonObservation::from_tui_result(result),
             Self::RalphStarted { result } => DaemonObservation::from_tui_result(result),
             Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
-            Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
             Self::ExternalConnectionsAnnounced { result } => {
                 DaemonObservation::from_client_result(result)
             }
@@ -1762,17 +1614,12 @@ impl TuiEffectResult {
             Self::AuthPoolPreferenceSet { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
-            Self::SelectedModelChecked { result, .. } => {
-                DaemonObservation::from_client_result(result)
-            }
-            Self::ModelPickerLoaded { result, .. } => DaemonObservation::from_client_result(result),
             Self::SkillPickerLoaded { result } => DaemonObservation::from_client_result(result),
             Self::SkillDescribed { result, .. } => DaemonObservation::from_client_result(result),
             Self::ManagedInteractionResponded { result, .. }
             | Self::ManagedSessionConfigured { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
-            Self::ManagedModelsLoaded { result } => DaemonObservation::from_client_result(result),
             Self::ManagedSessionDetected { .. } => DaemonObservation::Success,
         }
     }
@@ -1892,10 +1739,7 @@ enum EffectKey {
     RalphAction,
     RalphStart,
     PluginSurface,
-    ModelProviders,
     ExternalConnectionNotice,
-    ModelCheck,
-    ModelPicker,
     AuthPoolPicker,
     AuthPoolPreference,
     SkillPicker,
@@ -1916,7 +1760,6 @@ enum EffectKey {
     ResolvePermission(String),
     ManagedRespond(u64, String),
     ManagedConfigure,
-    ManagedModels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2196,9 +2039,6 @@ impl TuiEffect {
                 plugin_id,
                 result: Err(client_error.into()),
             },
-            Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
-                result: Err(client_error),
-            },
             Self::AnnounceExternalConnections => TuiEffectResult::ExternalConnectionsAnnounced {
                 result: Err(client_error),
             },
@@ -2212,27 +2052,6 @@ impl TuiEffect {
                     result: Err(client_error),
                 }
             }
-            Self::CheckSelectedModel {
-                session_id,
-                provider_plugin_id,
-                generation,
-                ..
-            } => TuiEffectResult::SelectedModelChecked {
-                session_id,
-                provider_plugin_id,
-                generation,
-                models: Err(ClientError::Protocol(client_error.to_string())),
-                result: Err(client_error),
-            },
-            Self::LoadModelPicker {
-                provider_plugin_id, ..
-            } => TuiEffectResult::ModelPickerLoaded {
-                provider_plugin_id,
-                result: Err(client_error),
-                connections: Vec::new(),
-                unconnected: Vec::new(),
-                reapproval: None,
-            },
             Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
                 result: Err(client_error),
             },
@@ -2270,9 +2089,6 @@ impl TuiEffect {
             } => TuiEffectResult::ManagedSessionConfigured {
                 mutation_id,
                 setting,
-                result: Err(client_error),
-            },
-            Self::LoadManagedModels => TuiEffectResult::ManagedModelsLoaded {
                 result: Err(client_error),
             },
         }
@@ -2339,18 +2155,14 @@ impl TuiEffect {
             | Self::RalphAction { .. }
             | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
-            | Self::LoadModelProviders
             | Self::AnnounceExternalConnections
             | Self::LoadAuthPoolPicker { .. }
             | Self::SetAuthPoolPreference { .. }
-            | Self::CheckSelectedModel { .. }
-            | Self::LoadModelPicker { .. }
             | Self::LoadSkillPicker
             | Self::DescribeSkill { .. }
             | Self::LoadThinkingDialog { .. }
             | Self::LoadMilestones { .. }
-            | Self::LoadTranscriptV2History { .. }
-            | Self::LoadManagedModels => EffectDaemonIntent::Background,
+            | Self::LoadTranscriptV2History { .. } => EffectDaemonIntent::Background,
         }
     }
 }
@@ -2624,12 +2436,9 @@ impl TuiEffect {
             Self::RalphAction { .. } => EffectKey::RalphAction,
             Self::RalphStart { .. } => EffectKey::RalphStart,
             Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
-            Self::LoadModelProviders => EffectKey::ModelProviders,
             Self::AnnounceExternalConnections => EffectKey::ExternalConnectionNotice,
             Self::LoadAuthPoolPicker { .. } => EffectKey::AuthPoolPicker,
             Self::SetAuthPoolPreference { .. } => EffectKey::AuthPoolPreference,
-            Self::CheckSelectedModel { .. } => EffectKey::ModelCheck,
-            Self::LoadModelPicker { .. } => EffectKey::ModelPicker,
             Self::LoadSkillPicker => EffectKey::SkillPicker,
             Self::DescribeSkill { .. } => EffectKey::SkillDescription,
             Self::LoadThinkingDialog { .. } => EffectKey::ThinkingDialog,
@@ -2668,7 +2477,6 @@ impl TuiEffect {
                 ..
             } => EffectKey::ManagedRespond(*generation, request_id.clone()),
             Self::ConfigureManagedSession { .. } => EffectKey::ManagedConfigure,
-            Self::LoadManagedModels => EffectKey::ManagedModels,
         }
     }
 
@@ -2898,9 +2706,6 @@ impl TuiEffect {
                     result,
                 }
             }
-            Self::LoadManagedModels => TuiEffectResult::ManagedModelsLoaded {
-                result: load_managed_models(&commands).await,
-            },
             Self::LoadTranscriptV2History { load } if load.session_id == session_id => {
                 TuiEffectResult::TranscriptV2HistoryLoaded {
                     load,
@@ -3077,10 +2882,9 @@ impl TuiEffect {
                 })
             }
             managed @ (Self::RespondManagedInteraction { .. }
-            | Self::ConfigureManagedSession { .. }
-            | Self::LoadManagedModels) => managed.application_access_failed(ClientError::Protocol(
-                "Native controls require a managed conversation".into(),
-            )),
+            | Self::ConfigureManagedSession { .. }) => managed.application_access_failed(
+                ClientError::Protocol("Native controls require a managed conversation".into()),
+            ),
             Self::LoadDraftStatus {
                 launch_working_directory,
             } => Box::pin(load_draft_status(&client, launch_working_directory)).await,
@@ -3387,16 +3191,6 @@ impl TuiEffect {
             Self::AnnounceExternalConnections => TuiEffectResult::ExternalConnectionsAnnounced {
                 result: announce_external_connections(&client).await,
             },
-            Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
-                result: client.plugin_services().await.map(|services| {
-                    services
-                        .into_iter()
-                        .filter(|service| {
-                            service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID
-                        })
-                        .collect()
-                }),
-            },
             Self::LoadAuthPoolPicker { session_id } => TuiEffectResult::AuthPoolPickerLoaded {
                 session_id,
                 result: client.account_routing(session_id).await,
@@ -3414,98 +3208,6 @@ impl TuiEffect {
                     }
                 };
                 TuiEffectResult::AuthPoolPreferenceSet { session_id, result }
-            }
-            Self::CheckSelectedModel {
-                session_id,
-                provider_plugin_id,
-                model_id,
-                generation,
-            } => {
-                let result = client
-                    .check_models(
-                        session_id,
-                        provider_plugin_id.clone(),
-                        vec![model_id],
-                        20,
-                        true,
-                    )
-                    .await;
-                let models = match session_id {
-                    Some(id) => {
-                        client
-                            .session_model_list_for_session(id, provider_plugin_id.clone())
-                            .await
-                    }
-                    None => client.session_model_list(provider_plugin_id.clone()).await,
-                };
-                TuiEffectResult::SelectedModelChecked {
-                    session_id,
-                    provider_plugin_id,
-                    generation,
-                    result,
-                    models,
-                }
-            }
-            Self::LoadModelPicker {
-                provider_plugin_id,
-                approve,
-            } => {
-                use bcode_provider_auth_models::external::ExternalAuthApplication as _;
-                let reapproval = match approve {
-                    Some(candidate) => Some(
-                        client
-                            .approve_external_auth(*candidate)
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                    ),
-                    None => None,
-                };
-                let connections: Vec<_> = match &provider_plugin_id {
-                    Some(provider) => client
-                        .external_auth_status()
-                        .await
-                        .map(|connections| {
-                            connections
-                                .into_iter()
-                                .filter(|connection| connection.grant.target.plugin_id == *provider)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                let discovery_enabled = bcode_config::load_config().is_ok_and(|config| {
-                    config.onboarding.credential_discovery_enabled(
-                        false,
-                        &bcode_config::ProcessConfigEnvironment,
-                    )
-                });
-                let unconnected = match &provider_plugin_id {
-                    Some(provider) if discovery_enabled => client
-                        .discover_external_auth()
-                        .await
-                        .map(|candidates| {
-                            candidates
-                                .into_iter()
-                                .filter(|candidate| {
-                                    candidate.available
-                                        && candidate.target.plugin_id == *provider
-                                        && !connections.iter().any(|connection| {
-                                            connection.grant.binding_id == candidate.binding_id
-                                        })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    _ => Vec::new(),
-                };
-                TuiEffectResult::ModelPickerLoaded {
-                    result: client.session_model_list(provider_plugin_id.clone()).await,
-                    provider_plugin_id,
-                    connections,
-                    unconnected,
-                    reapproval,
-                }
             }
             Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
                 result: client.list_skills().await,

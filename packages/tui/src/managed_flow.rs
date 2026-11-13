@@ -366,38 +366,6 @@ pub fn apply_configure_result(
     chat.app.set_status(status);
 }
 
-/// Present the managed model picker from the attached instance's advertised models.
-pub fn apply_models_result(
-    chat: &mut ActiveChat,
-    loop_state: &mut ChatLoopState,
-    result: Result<Vec<bcode_model::execution::ExecutionModel>, bcode_client::ClientError>,
-) {
-    match result {
-        Ok(models) if models.is_empty() => chat.app.set_status(
-            "The native harness advertises no selectable models; use /set-model <id>".to_owned(),
-        ),
-        Ok(models) => {
-            loop_state.managed_model_selectors = models
-                .iter()
-                .map(|entry| (entry.model.model_id.clone(), entry.native_model_id.clone()))
-                .collect();
-            loop_state.model_picker_generation = loop_state.model_picker_generation.wrapping_add(1);
-            loop_state.model_picker = Some(super::chat_loop::RootModelPicker {
-                generation: loop_state.model_picker_generation,
-                provider_plugin_id: None,
-                picker: super::model_picker::ModelPickerApp::from_execution_models(
-                    models,
-                    "Select a native model for subsequent turns",
-                ),
-            });
-            chat.app.set_status("select a native model".to_owned());
-        }
-        Err(error) => chat
-            .app
-            .set_status(format!("Native models unavailable: {error}")),
-    }
-}
-
 /// Apply managed-specific meanings of slash outcomes; returns the outcome when the ordinary
 /// handler should apply it.
 pub fn intercept_slash_outcome(
@@ -647,10 +615,10 @@ mod tests {
                 .is_none()
         );
         assert!(drained(&mut chat).is_empty());
-        assert_eq!(
-            loop_state.execution_picker.as_ref().unwrap().session_id,
-            Some(owner)
-        );
+        // The switcher opens over the managed conversation; nothing is handed off yet.
+        assert!(loop_state.has_model_picker());
+        assert!(loop_state.execution_picker.is_none());
+        loop_state.model_switcher = None;
         cycle_permission_mode(&mut chat, &mut loop_state);
         let effects = drained(&mut chat);
         let [

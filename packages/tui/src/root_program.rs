@@ -48,6 +48,13 @@ pub enum BcodeRuntimeMessage {
     PluginSurfaceInvalidated,
     /// Completed Bcode-owned background effect.
     EffectCompleted(Box<TuiEffectResult>),
+    /// Model switcher work reported, for the switcher opened as `generation`.
+    ModelSwitcher {
+        /// Switcher the work belongs to.
+        generation: u64,
+        /// What it reported.
+        message: super::model_switcher_host::Message,
+    },
     /// Completed V2 transcript Markdown image or Mermaid worker request.
     TranscriptV2Visual(Box<super::transcript_v2_host::visuals::VisualCompletion>),
     /// Completed attempt to open the next inline interactive surface.
@@ -98,6 +105,7 @@ impl BcodeRuntimeMessage {
             | Self::ComposerSearchCompleted(_)
             | Self::PluginSurfaceInvalidated
             | Self::EffectCompleted(_)
+            | Self::ModelSwitcher { .. }
             | Self::TranscriptV2Visual(_)
             | Self::InteractiveSurfaceOpened(_)
             | Self::InteractiveSurfaceResolved(_)
@@ -1443,103 +1451,7 @@ impl BcodeRuntimeModel {
             return super::invalidation::UiInvalidation::Structural;
         }
         if self.loop_state.has_model_picker() {
-            if let Some((provider_plugin_id, action)) = self
-                .loop_state
-                .handle_model_picker_event(self.settings.keymap(), &event)
-            {
-                match action {
-                    super::model_flow::ModelPickerAction::Continue => {
-                        if self.loop_state.has_model_picker() {
-                            return super::invalidation::UiInvalidation::Structural;
-                        }
-                        self.chat
-                            .replace_effect(super::effects::TuiEffect::LoadModelPicker {
-                                provider_plugin_id,
-                                approve: None,
-                            });
-                        self.chat.app.set_status("loading models…".to_owned());
-                    }
-                    super::model_flow::ModelPickerAction::Approve(candidate) => {
-                        self.chat
-                            .replace_effect(super::effects::TuiEffect::LoadModelPicker {
-                                provider_plugin_id,
-                                approve: Some(candidate),
-                            });
-                        self.chat.app.set_status("approving connection…".to_owned());
-                    }
-                    super::model_flow::ModelPickerAction::SelectWithConnection {
-                        model_id,
-                        binding_id,
-                    } => match self.chat.attached_session_id() {
-                        // A native harness runs under its own account, so connections apply to
-                        // Bcode's own agent only.
-                        Some(_) if self.chat.app.managed_execution_session().is_some() => {
-                            self.chat.app.set_status(
-                                "Connections apply to Bcode's agent, not native harness sessions"
-                                    .to_owned(),
-                            );
-                        }
-                        Some(session_id) => {
-                            self.chat
-                                .start_effect(super::effects::TuiEffect::SetSessionModel {
-                                    session_id,
-                                    provider_plugin_id,
-                                    model_id,
-                                    external_auth_binding: Some(binding_id),
-                                });
-                            self.chat.app.set_status("applying model…".to_owned());
-                        }
-                        None => {
-                            self.chat.app.set_status(
-                                "Start or open a session to use this connection".to_owned(),
-                            );
-                        }
-                    },
-                    super::model_flow::ModelPickerAction::Cancel => {
-                        self.chat.app.set_status("model picker closed".to_owned());
-                    }
-                    super::model_flow::ModelPickerAction::Check(model_id) => {
-                        if let Some(generation) = self.loop_state.start_selected_model_check() {
-                            self.chat
-                                .start_effect(super::effects::TuiEffect::CheckSelectedModel {
-                                    session_id: self.chat.attached_session_id(),
-                                    provider_plugin_id,
-                                    model_id,
-                                    generation,
-                                });
-                        }
-                    }
-                    super::model_flow::ModelPickerAction::Select(model_id)
-                        if self.chat.app.managed_execution_session().is_some() =>
-                    {
-                        let model_id = self
-                            .loop_state
-                            .managed_model_selector(&model_id)
-                            .unwrap_or(model_id);
-                        super::managed_flow::start_configure(
-                            &mut self.chat,
-                            &mut self.loop_state,
-                            bcode_harness_models::HarnessSessionSetting::Model { model_id },
-                        );
-                    }
-                    super::model_flow::ModelPickerAction::Select(model_id) => {
-                        if let Some(session_id) = self.chat.attached_session_id() {
-                            self.chat
-                                .start_effect(super::effects::TuiEffect::SetSessionModel {
-                                    session_id,
-                                    provider_plugin_id,
-                                    model_id,
-                                    external_auth_binding: None,
-                                });
-                            self.chat.app.set_status("applying model…".to_owned());
-                        } else {
-                            self.chat
-                                .app
-                                .apply_local_model_selection(provider_plugin_id, &model_id);
-                        }
-                    }
-                }
-            }
+            super::model_switcher_host::event(&mut self.chat, &mut self.loop_state, &event);
             return super::invalidation::UiInvalidation::Structural;
         }
         if self.loop_state.has_skill_picker() {
@@ -2831,6 +2743,10 @@ impl BcodeRuntimeModel {
         handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
         let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
+        commands.extend(super::model_switcher_host::commands(
+            &mut self.loop_state,
+            handle,
+        ));
         commands.extend(self.transcript_visual_commands());
         if let Some(command) = self.collect_child_watch_work(handle) {
             commands.push(command);
@@ -4119,6 +4035,17 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                         .replace_effect(super::effects::TuiEffect::ListPermissions);
                 }
                 if changed {
+                    super::invalidation::UiInvalidation::Structural
+                } else {
+                    super::invalidation::UiInvalidation::None
+                }
+            }
+            bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::ModelSwitcher {
+                generation,
+                message,
+            }) => {
+                super::model_switcher_host::message(&mut self.loop_state, generation, message);
+                if self.loop_state.has_model_picker() {
                     super::invalidation::UiInvalidation::Structural
                 } else {
                     super::invalidation::UiInvalidation::None
