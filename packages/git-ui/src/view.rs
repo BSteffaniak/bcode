@@ -656,6 +656,14 @@ fn main_items(app: &App, section: usize) -> Vec<SelectableListItem> {
 fn popup_items(app: &App) -> Vec<SelectableListItem> {
     let theme = &app.theme;
     match app.popups.last() {
+        Some(Popup::Menu(crate::popup::Menu {
+            appearance: Some(picker),
+            ..
+        })) => crate::appearance::lines(picker, theme)
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| SelectableListItem::rich(index.to_string(), line))
+            .collect(),
         Some(Popup::Menu(menu)) => menu
             .visible()
             .into_iter()

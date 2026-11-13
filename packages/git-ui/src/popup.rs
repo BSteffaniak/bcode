@@ -121,6 +121,8 @@ pub struct Menu {
     pub list: Cell<SelectableListState>,
     /// Lines shown above the items (for example a color legend).
     pub notes: Vec<Line>,
+    /// The appearance picker these items list: moving previews, confirming applies.
+    pub appearance: Option<Box<bcode_tui_theme::picker::app::AppPicker>>,
 }
 
 impl Menu {
@@ -134,6 +136,7 @@ impl Menu {
             selected: 0,
             list: Cell::new(SelectableListState::new(Some(0))),
             notes: Vec::new(),
+            appearance: None,
         }
     }
 

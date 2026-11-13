@@ -228,6 +228,7 @@ impl App {
             Action::LayoutMenu => self.layout_menu(),
             Action::Help => self.help(),
             Action::Palette => self.palette(),
+            Action::Appearance => self.appearance_picker(),
             Action::Refresh => Update::redraw().maybe(self.refresh_all()),
             Action::Push => self.push_menu(),
             Action::Pull => self.run_ops(vec![Op::Pull { rebase: None }]),
@@ -2277,6 +2278,9 @@ pub fn menu_key(
     stroke: KeyStroke,
     event: &Event,
 ) -> Update<Msg> {
+    if menu.appearance.is_some() {
+        return crate::appearance::key(app, menu, action, stroke);
+    }
     let visible = menu.visible();
     match action {
         Some(Action::MenuClose) => return Update::redraw(),

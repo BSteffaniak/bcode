@@ -159,6 +159,7 @@ actions! {
     PreviousTab => Global, "previous-tab", "Previous tab", ["["];
     Help => Global, "help", "Keybindings for this view", ["?"];
     Palette => Global, "palette", "Command palette", ["ctrl+p"];
+    Appearance => Global, "appearance", "Appearance: the git UI's palette and profile…", ["ctrl+w t"];
     Refresh => Global, "refresh", "Refresh", ["shift+r"];
     Push => Global, "push", "Push", ["shift+p"];
     Pull => Global, "pull", "Pull", ["p"];

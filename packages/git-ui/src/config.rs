@@ -753,6 +753,8 @@ pub struct LoadedConfig {
     /// Where the git UI schema's `[theme] name` is set, when it is: that palette is chosen
     /// for the git UI specifically and wins over every saved palette.
     pub theme_pinned_by: Option<String>,
+    /// The user state file, where the git UI's appearance picker saves its choice.
+    pub state_file: PathBuf,
     /// Files whose change may change the theme: configuration candidates of both families,
     /// present or not, and the user state file.
     pub appearance_files: Vec<PathBuf>,
@@ -1023,10 +1025,11 @@ fn load_appearance(
     files.extend(git_candidates);
     files.extend(loaded.files.iter().cloned());
     files.extend(loaded.git_files.iter().cloned());
-    files.push(state);
+    files.push(state.clone());
     files.sort();
     files.dedup();
     loaded.appearance_files = files;
+    loaded.state_file = state;
 }
 
 /// A choice read from the state file, as the theme crate takes it.

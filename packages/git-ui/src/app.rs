@@ -219,8 +219,11 @@ pub enum Msg {
     Live(Box<bcode_git_live::LiveUpdate>),
     /// Reload the side panels' git metadata (refs, stashes, tags, worktrees, …).
     Metadata,
-    /// bcode's theme selection changed: present this theme.
+    /// Present this theme.
     Theme(Box<GitTheme>),
+    /// The watched appearance changed: present the latest one unless the appearance picker
+    /// previews.
+    Appearance,
     /// Terminal input failed.
     InputFailed(String),
 }
@@ -2824,6 +2827,7 @@ impl App {
             Msg::Live(live) => self.install_live(*live),
             Msg::Metadata => Update::none().maybe(self.reload_metadata()),
             Msg::Theme(theme) => self.set_theme(*theme),
+            Msg::Appearance => self.present_watched_appearance(),
             Msg::Main(generation, content) => {
                 if generation == self.main_generation {
                     self.install_main(*content);

@@ -12,6 +12,7 @@
 mod actions;
 mod activity;
 pub mod app;
+mod appearance;
 pub mod branches;
 pub mod commit_message;
 pub mod config;

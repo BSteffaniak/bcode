@@ -601,23 +601,39 @@ Custom command placeholders are `{file}`, `{branch}`, `{commit}`, `{remote}`, `{
 
 ### Themes
 
-The theme is selected exactly as bcode's chat interface selects it, through
-`bcode_tui_theme::appearance`:
+The theme is selected as bcode's chat interface selects it, through
+`bcode_tui_theme::appearance`, from these inputs, highest precedence first:
 
-* `[tui.theme]` in `bcode.toml`: `name` (the palette or theme; default `terminal-native`),
-  `profile` (applied over the palette before other overlays), `overlays`, `variant` (`auto`,
-  `dark` or `light`) and extra theme files or directories in `paths`.
-* The palette and profile saved by bcode's appearance picker (`[theme]` in bcode's user state:
-  `$BCODE_TUI_STATE`, else `tui.toml` in `$BCODE_STATE_DIR`, `$XDG_STATE_HOME/bcode` or
-  `~/.local/state/bcode`) replace the configured ones when they resolve; one that does not is
-  reported and the configured one is kept.
-* The git UI's own `[theme]` (`name`, `overlays`, `paths`) replaces the matching fields. A `name`
-  here is a theme chosen for the git UI specifically, so it also wins over the saved palette.
+1. The git UI's own `[theme] name`. It is chosen for the git UI specifically in configuration,
+   so it wins over every saved palette; the appearance picker then shows the palette as pinned
+   by that key instead of listing palettes, and only the profile applies.
+2. The git UI's own saved palette and profile (`[apps.git.theme]` in bcode's user state:
+   `$BCODE_TUI_STATE`, else `tui.toml` in `$BCODE_STATE_DIR`, `$XDG_STATE_HOME/bcode` or
+   `~/.local/state/bcode`), written by the git UI's appearance picker.
+3. bcode's saved palette and profile (`[theme]` in the same file), written by bcode's appearance
+   picker. Without a choice of its own the git UI follows these.
+4. `[tui.theme]` in `bcode.toml` (`name`, default `terminal-native`; `profile`, applied over the
+   palette before other overlays; `overlays`; `variant`, `auto`, `dark` or `light`; extra theme
+   files or directories in `paths`), with the git UI's own `overlays` and `paths` replacing the
+   matching fields.
 
-With `variant = "auto"` the UI asks the terminal for its colors and presents the light variant on
-a light background (else `COLORFGBG`, else dark). The theme follows changes while the UI runs:
+A saved choice that does not resolve is reported and the configured one is kept. With
+`variant = "auto"` the UI asks the terminal for its colors and presents the light variant on a
+light background (else `COLORFGBG`, else dark). The theme follows changes while the UI runs:
 configuration files of both families, the user state file and theme files are checked every
-750 ms, so choosing a palette in bcode's appearance picker restyles an open `bcode git`.
+750 ms, so choosing a palette in bcode's appearance picker restyles an open `bcode git` that
+follows bcode, and leaves one with its own choice alone.
+
+#### Appearance picker
+
+`ctrl+w t` (or "Appearance" in the command palette) opens a picker listing **Follow Bcode**
+(with bcode's current palette and profile), the palettes and the profiles; its first line says
+which mode is active. Moving the cursor previews the row on the whole UI without saving; `f`
+jumps to Follow Bcode. `enter` applies: a palette or profile row saves the git UI's own choice
+(`[apps.git.theme]`), the Follow Bcode row removes it. `esc` restores what was presented. The
+appearance watcher's results wait while the picker previews, and results read before an apply
+are dropped, so the applied appearance never flickers back. bcode's own `[theme]` choice is never
+written by the git UI, and bcode's picker never touches `[apps.git.theme]`.
 
 Besides the standard roles the UI reads optional `git.*` roles; see
 [TUI themes](tui-themes.md#git-client-roles).
@@ -696,6 +712,7 @@ currently use `StandaloneHost`, which contributes nothing.
 | `bcode.git.global.previous-tab` | Previous tab | `[` |
 | `bcode.git.global.help` | Keybindings for this view | `?` |
 | `bcode.git.global.palette` | Command palette | `ctrl+p` |
+| `bcode.git.global.appearance` | Appearance: the git UI's palette and profile… | `ctrl+w t` |
 | `bcode.git.global.refresh` | Refresh | `shift+r` |
 | `bcode.git.global.push` | Push | `shift+p` |
 | `bcode.git.global.pull` | Pull | `p` |

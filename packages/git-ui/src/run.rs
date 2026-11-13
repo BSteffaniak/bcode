@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bcode_git::{CommandLog, Repository};
 use bcode_tui_theme::appearance::{AppearanceSources, AppearanceWatcher, VariantPreference};
+use bcode_tui_theme::picker::LiveAppearance;
 use bmux_tui::capabilities::{TerminalBackground, TerminalCapabilities};
 use bmux_tui::component::{Constraints, LayoutCx};
 use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
@@ -54,6 +55,10 @@ pub struct AppearanceInputs {
     pub start: PathBuf,
     /// Command-line configuration layers.
     pub options: crate::config::ConfigOptions,
+    /// The appearance presented, shared by the watcher and the appearance picker.
+    pub live: Arc<LiveAppearance>,
+    /// The user state file, where the appearance picker saves the git UI's own choice.
+    pub state_file: PathBuf,
 }
 
 impl AppearanceInputs {
@@ -76,8 +81,11 @@ impl AppearanceInputs {
         self.watch(handle, root)
     }
 
-    /// Present bcode's theme selection while the session runs: restyle when configuration, the
-    /// saved appearance or theme files change, or when the terminal reports its background.
+    /// Present the git UI's appearance (its own saved choice, else bcode's) while the session
+    /// runs: restyle when configuration, the saved appearance or theme files change, or when
+    /// the terminal reports its background. Results wait while the appearance picker
+    /// previews, and results read before the picker's last apply are dropped
+    /// ([`LiveAppearance::offer`]).
     ///
     /// # Panics
     ///
@@ -87,7 +95,12 @@ impl AppearanceInputs {
         handle: bmux_tui_runtime::RuntimeHandle<Msg>,
         root: PathBuf,
     ) -> AppearanceWatcher {
-        let Self { start, options, .. } = self.clone();
+        let Self {
+            start,
+            options,
+            live,
+            ..
+        } = self.clone();
         let runtime = tokio::runtime::Handle::current();
         AppearanceWatcher::spawn(
             self.sources.clone(),
@@ -100,9 +113,13 @@ impl AppearanceInputs {
                 )
             },
             move |resolution| {
-                let (theme, _) = GitTheme::from_resolution(&resolution);
-                // The watcher thread is outside the runtime, so it may wait for room.
-                let _ = runtime.block_on(handle.send(Msg::Theme(Box::new(theme))));
+                // Recorded under the lock; the app presents the latest appearance itself, so a
+                // message that arrives after a preview started or a choice was applied changes
+                // nothing.
+                if live.offer(resolution, |_| {}) {
+                    // The watcher thread is outside the runtime, so it may wait for room.
+                    let _ = runtime.block_on(handle.send(Msg::Appearance));
+                }
             },
         )
     }
@@ -277,8 +294,8 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let keymap = Keymap::new(extra, loaded.keybindings.clone())
         .map_err(|error| RunError::Keymap(format!("invalid git keybindings: {error}")))?;
     let sources = crate::config::appearance_sources(&loaded, repo.root());
-    let (theme, theme_diagnostics) =
-        GitTheme::load(&sources, TerminalCapabilities::detect().background);
+    let resolution = sources.resolve(TerminalCapabilities::detect().background);
+    let (theme, theme_diagnostics) = GitTheme::from_resolution(&resolution);
     let mut diagnostics = loaded.diagnostics.clone();
     diagnostics.extend(theme_diagnostics);
     let mut app = App::new(repo, loaded.ui, keymap, theme, options.host, diagnostics);
@@ -286,6 +303,8 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         sources,
         start: options.path.clone(),
         options: loaded.options,
+        live: Arc::new(LiveAppearance::new(resolution)),
+        state_file: loaded.state_file,
     });
     app.env_message = options.commit_message;
     let cache = options
