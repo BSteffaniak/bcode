@@ -4467,7 +4467,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -4477,7 +4477,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "lz4_flex 0.14.0",
  "serde",
@@ -4487,7 +4487,7 @@ dependencies = [
 [[package]]
 name = "bmux_color"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "serde",
 ]
@@ -4495,7 +4495,7 @@ dependencies = [
 [[package]]
 name = "bmux_config_composition"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "libc",
  "serde",
@@ -4505,7 +4505,7 @@ dependencies = [
 [[package]]
 name = "bmux_fonts"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -4514,7 +4514,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -4529,7 +4529,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -4544,7 +4544,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "serde",
 ]
@@ -4552,7 +4552,7 @@ dependencies = [
 [[package]]
 name = "bmux_markdown"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
@@ -4570,7 +4570,7 @@ dependencies = [
 [[package]]
 name = "bmux_mermaid_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_fonts",
  "cranelift-codegen",
@@ -4582,7 +4582,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "serde",
  "serde_json",
@@ -4591,7 +4591,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4619,7 +4619,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "serde",
  "serde_json",
@@ -4631,7 +4631,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "serde",
  "sha2 0.11.1",
@@ -4641,7 +4641,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4660,7 +4660,7 @@ dependencies = [
 [[package]]
 name = "bmux_pty"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -4669,7 +4669,7 @@ dependencies = [
 [[package]]
 name = "bmux_syntax_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_tui",
  "syntect",
@@ -4679,7 +4679,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_keyboard",
  "futures-core",
@@ -4690,7 +4690,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_terminal_protocol",
  "serde",
@@ -4702,7 +4702,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "serde",
 ]
@@ -4710,7 +4710,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_keyboard",
  "serde",
@@ -4723,7 +4723,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_color",
  "bmux_keyboard",
@@ -4743,7 +4743,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_color",
  "bmux_keyboard",
@@ -4760,7 +4760,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_image",
  "bmux_keyboard",
@@ -4774,7 +4774,7 @@ dependencies = [
 [[package]]
 name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#e6cd50f866c7672cb2da3adf5f323d934a057176"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#03284d5b21887aad9bd27070c26314d540f22cde"
 dependencies = [
  "bmux_codec",
  "bmux_keyboard",

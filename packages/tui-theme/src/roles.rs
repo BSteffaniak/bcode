@@ -865,6 +865,12 @@ pub const ROLES: &[RoleSpec] = &[
         None,
     ),
     role(
+        "source.thread.background",
+        RoleCategory::Source,
+        "a review thread card's fill (background); unset steps the canvas toward the text",
+        None,
+    ),
+    role(
         "source.thread.border",
         RoleCategory::Source,
         "a review thread card's frame once viewed; unset uses border.default",

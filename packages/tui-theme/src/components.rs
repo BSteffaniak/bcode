@@ -60,6 +60,8 @@ pub struct FileChromeRoles {
 /// The `source.thread.*` roles a theme sets; the review derives the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ThreadCardRoles {
+    /// `source.thread.background`: a thread card's fill.
+    pub background: Option<Style>,
     /// `source.thread.border`: a viewed thread's frame.
     pub border: Option<Style>,
     /// `source.thread.unviewed`: an unviewed thread's frame.
@@ -161,6 +163,7 @@ pub fn component_styles(theme: Option<&ResolvedThemeDefinition>, accent: Color) 
             label: style("source.file.label"),
         },
         threads: ThreadCardRoles {
+            background: style("source.thread.background"),
             border: style("source.thread.border"),
             unviewed: style("source.thread.unviewed"),
             waiting: style("source.thread.waiting"),

@@ -418,6 +418,19 @@ fn a_thread_is_a_card_and_viewing_it_folds_it_until_someone_replies() {
         screen.text()
     );
     assert!(screen.contains("Why this constant?"));
+    // The card is filled, frame and all, apart from the code around it.
+    let body = screen.find("Why this constant?").expect("body");
+    let fill = screen.style_at(body.x, body.y).bg;
+    assert!(fill.is_some());
+    let corner = screen.column_of(header, "╭").expect("corner");
+    assert_eq!(screen.style_at(corner, header).bg, fill);
+    let code = screen.find("@@").expect("hunk header");
+    assert_ne!(
+        screen.style_at(code.x, code.y).bg,
+        fill,
+        "{}",
+        screen.text()
+    );
 
     // Viewed: one row, still unresolved on the forge.
     let screen = click_viewed(&mut scenario);

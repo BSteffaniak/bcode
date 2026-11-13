@@ -31,6 +31,7 @@ bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["terminal-io"] }
 bmux_tui_components = { workspace = true, features = [
     "badge",
+    "card",
     "diff-viewer",
     "empty-state",
     "form",

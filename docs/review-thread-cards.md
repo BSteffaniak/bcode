@@ -118,15 +118,22 @@ The parts:
 * **Narrow and plain:**
   * Under 40 columns the side borders go and only the top and bottom rules stay.
   * The ASCII icon set draws `+`, `-` and `|`.
-* **Themeable:** roles `source.thread.border` (viewed), `source.thread.unviewed`,
+* **Themeable:** roles `source.thread.background` (the fill), `source.thread.border` (viewed),
+  `source.thread.unviewed`,
   `source.thread.waiting` and `source.thread.resolved`. Unset ones are derived as above. Like
   `source.file.*`, they are not derived by the theme seed, so the review's own derivation
   applies.
 * **Roomy** (`threads.card = "roomy"`): plain top and bottom borders, with the header and the
   buttons on rows of their own inside the frame (two more rows per thread).
 
-Your drafts, imported threads, pull request threads and AI answer cards all use the same frame
-(`rows/thread_card.rs`).
+Your drafts, imported threads, pull request threads and AI answer cards all use the same frame:
+BMUX's row-based card (`bmux_tui_components::card`), through the review's adapter
+(`rows/thread_card.rs`). It lays a card out as rows with the cells that act, so cards stay
+cached rows of the review's list.
+
+**The fill:** a card is filled, frame and all, with a surface just off the code's canvas (the
+canvas stepped toward the text color to a 1.12 contrast). The `source.thread.background` role
+sets it, and without colors there is none.
 
 **AI answer cards** are cards like the rest:
 * The header is `✦ Bcode`, its status (with the spinner while it works), its usage, and the

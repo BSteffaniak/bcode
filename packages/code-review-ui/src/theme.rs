@@ -607,6 +607,7 @@ impl ReviewTheme {
                 self.publish.button.normal.add_modifier(Modifier::REVERSED);
             // No colors, no desk: cards fall back to a rule.
             self.files.desk = Style::new();
+            self.threads.background = None;
             // An unviewed or waiting thread's frame is bold instead of colored.
             self.threads.unviewed = self.threads.unviewed.add_modifier(Modifier::BOLD);
             self.threads.waiting = self.threads.waiting.add_modifier(Modifier::BOLD);
@@ -813,9 +814,12 @@ fn modified_status(tiers: &Tiers, taken: [Style; 3]) -> Style {
     }
 }
 
-/// Frames of thread cards, by the thread's state.
+/// Frames of thread cards, by the thread's state, and their fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadStyles {
+    /// The card's fill: a surface just off the code's canvas, so a card stands apart from the
+    /// code around it. None without colors.
+    pub background: Option<Style>,
     /// Viewed.
     pub viewed: Style,
     /// Not viewed (or new comments since).
@@ -830,6 +834,11 @@ impl ThreadStyles {
     fn of(tiers: &Tiers, component: &ComponentTheme, roles: ThreadCardRoles) -> Self {
         let fg = |style: Style| style.fg.map_or(style, |fg| Style::new().fg(fg));
         Self {
+            background: roles
+                .background
+                .and_then(|role| role.bg)
+                .map(|bg| Style::new().bg(bg))
+                .or_else(|| card_fill(tiers)),
             viewed: roles.border.unwrap_or_else(|| fg(component.border)),
             unviewed: roles.unviewed.unwrap_or_else(|| fg(tiers.accent)),
             waiting: roles.waiting.unwrap_or_else(|| fg(component.warning)),
@@ -838,6 +847,25 @@ impl ThreadStyles {
                 .unwrap_or_else(|| fg(component.success).add_modifier(Modifier::DIM)),
         }
     }
+}
+
+/// Contrast of a thread card's fill against the code's canvas.
+const CARD_CONTRAST: f64 = 1.12;
+
+/// A thread card's fill: the canvas stepped toward the text color just far enough to tell
+/// apart ([`CARD_CONTRAST`]), the opposite way from the desk between files.
+fn card_fill(tiers: &Tiers) -> Option<Style> {
+    let (Some(Color::Rgb(r, g, b)), Some(Color::Rgb(tr, tg, tb))) =
+        (tiers.canvas.bg, tiers.text.fg)
+    else {
+        return None;
+    };
+    let canvas = Rgb::new(r, g, b);
+    let text = Rgb::new(tr, tg, tb);
+    (1..=40)
+        .map(|step| bmux_color::mix(text, canvas, f64::from(step) / 100.0))
+        .find(|fill| fill.contrast_ratio(canvas) >= CARD_CONTRAST)
+        .map(|fill| Style::new().bg(Color::from(fill)))
 }
 
 /// Share of the accent mixed into the canvas for file headers.
