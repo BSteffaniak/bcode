@@ -19,7 +19,7 @@
 
 use web_time::Instant;
 
-use super::{NavInput, NavMode, NavState, NavTimer, NavView, UnitRole};
+use super::{FollowPolicy, NavInput, NavMode, NavState, NavTimer, NavView, UnitRole};
 use crate::units::UnitKey;
 use crate::window::WindowMode;
 
@@ -82,13 +82,7 @@ fn submission(item: &UnitKey, view: &NavView<'_>) -> Vec<AutoAction> {
     if matches!(view.window_mode(), WindowMode::Detached) {
         vec![AutoAction::LoadTailForReveal { item }]
     } else if view.is_visible(&item) {
-        vec![
-            AutoAction::Admit(item.clone()),
-            AutoAction::Reveal {
-                item,
-                sticky: false,
-            },
-        ]
+        vec![AutoAction::Admit(item.clone()), reveal(item, false, view)]
     } else {
         vec![AutoAction::QueueReveal { item }]
     }
@@ -214,10 +208,16 @@ fn queued_reveal(cx: &Context<'_, '_, '_>, plan: &mut Plan) {
         .max_by_key(|(_, request)| request.requested);
     if let Some((item, _)) = newest {
         plan.push(AutoAction::Admit(item.clone()));
-        plan.push(AutoAction::Reveal {
-            item: item.clone(),
-            sticky: false,
-        });
+        plan.push(reveal(item.clone(), false, cx.view));
+    }
+}
+
+/// Bring a submission into view under the follow policy: hold its top (T2), or follow the
+/// latest bottom.
+fn reveal(item: UnitKey, sticky: bool, view: &NavView<'_>) -> AutoAction {
+    match view.follow {
+        FollowPolicy::Reply => AutoAction::Reveal { item, sticky },
+        FollowPolicy::Latest => AutoAction::Handoff,
     }
 }
 
@@ -300,7 +300,9 @@ fn reveal_newest_segment(
     if let Some(segment) = eligible {
         let held = matches!(&plan.mode, NavMode::Holding { item, .. } if item == segment);
         plan.push(AutoAction::Admit(segment.clone()));
-        if !held {
+        // Following the latest content needs no reveal: a follower stays at the bottom and a
+        // reader keeps their place.
+        if !held && cx.view.follow == FollowPolicy::Reply {
             plan.push(AutoAction::Reveal {
                 item: segment.clone(),
                 sticky: true,

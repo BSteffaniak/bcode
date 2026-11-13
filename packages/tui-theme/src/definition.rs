@@ -1057,6 +1057,7 @@ fn resolve_chrome(
                 user: markers.user,
                 assistant: markers.assistant,
             }),
+        follow: raw.follow.unwrap_or_default(),
     })
 }
 

@@ -11,6 +11,7 @@ schema_version = 2
 borders       = { panel = "single", dialog = "single", tool = "none", composer = "rules" }
 composer      = { prompt = "❯ ", title = "hidden", placeholder = "", controls = "hidden" }
 density       = "cozy"
+follow        = "latest"
 header        = "hidden"
 icons         = "unicode"
 motion        = "subtle"

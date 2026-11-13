@@ -3,8 +3,8 @@
 use super::{Fixture, OLDER, has_page, unit};
 use crate::focus::FocusTargetId;
 use crate::navigation::{
-    ApproachEdge, Correspondence, JumpGoal, ListPosition, MotionConfig, NavEffect, NavInput,
-    NavIntent, NavMode, NavTimer, PendingJump, PendingMovement, Placement, ReadingAnchor,
+    ApproachEdge, Correspondence, FollowPolicy, JumpGoal, ListPosition, MotionConfig, NavEffect,
+    NavInput, NavIntent, NavMode, NavTimer, PendingJump, PendingMovement, Placement, ReadingAnchor,
     ReadingPosition, RevealRequest, ScrollTarget, UnitRole, VerticalDirection, presented_position,
 };
 use crate::units::UnitKey;
@@ -1000,6 +1000,7 @@ fn d11_streaming_revision_does_not_inspect_every_resident_unit() {
         viewport: f.viewport,
         window: &f.window,
         motion: f.motion,
+        follow: f.follow,
     };
     let input = NavInput::Content {
         changes: bcode_session_view_models::TranscriptChanges::default(),
@@ -1010,5 +1011,50 @@ fn d11_streaming_revision_does_not_inspect_every_resident_unit() {
         facts.lookups.get() <= 4,
         "{} role lookups for one revision",
         facts.lookups.get()
+    );
+}
+
+#[test]
+fn follow_latest_keeps_submissions_and_replies_at_the_bottom() {
+    let mut f = fixture();
+    f.follow = FollowPolicy::Latest;
+    f.admit_all();
+    let height = f.viewport.height;
+    f.role("u", UnitRole::UserMessage);
+    f.append("u", 2);
+    let _ = accept(&mut f, "u", 0);
+    assert_eq!(f.state.mode, NavMode::Following);
+    assert_eq!(f.top(), f.total() - height);
+    f.role("a", UnitRole::AssistantSegment);
+    f.append("a", 3);
+    let _ = f.content(1_000);
+    assert_eq!(
+        f.state.mode,
+        NavMode::Following,
+        "no hold at the reply's top"
+    );
+    assert_eq!(f.top(), f.total() - height);
+    assert_eq!(f.resolved().blank_rows_below(), 0, "no tail space");
+    assert!(f.state.admitted.contains(&unit("a")));
+}
+
+#[test]
+fn follow_latest_returns_a_reader_to_the_bottom_only_on_submission() {
+    let mut f = fixture();
+    f.follow = FollowPolicy::Latest;
+    f.admit_all();
+    let _ = f.scroll(-10, 0);
+    let reading = f.state.mode.clone();
+    f.role("a", UnitRole::AssistantSegment);
+    f.append("a", 3);
+    let _ = f.content(1_000);
+    assert_eq!(f.state.mode, reading, "a reply never pulls a reader");
+    f.role("u", UnitRole::UserMessage);
+    f.append("u", 2);
+    let _ = accept(&mut f, "u", 2_000);
+    assert_eq!(
+        f.state.mode,
+        NavMode::Following,
+        "a submission returns to the latest"
     );
 }

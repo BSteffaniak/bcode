@@ -232,6 +232,18 @@ impl<'de> Deserialize<'de> for ChromeText {
     }
 }
 
+/// What the transcript keeps in view while a reply streams in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowPolicy {
+    /// Hold a new reply's (or submission's) first row at the viewport top, then follow the
+    /// latest content once it overflows.
+    #[default]
+    Reply,
+    /// Keep the latest content at the viewport bottom.
+    Latest,
+}
+
 /// Glyphs of the `marker` speaker treatment; `None` uses the renderer's default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageMarkers {
@@ -298,6 +310,8 @@ pub struct TuiChrome {
     pub composer: ComposerChrome,
     /// Speaker marker glyphs.
     pub markers: MessageMarkers,
+    /// What the transcript keeps in view as replies arrive.
+    pub follow: FollowPolicy,
 }
 
 /// Maximum focus gradient colors.
@@ -392,6 +406,8 @@ pub(crate) struct RawTuiChrome {
     pub composer: Option<RawComposer>,
     #[serde(default)]
     pub markers: Option<RawMarkers>,
+    #[serde(default)]
+    pub follow: Option<FollowPolicy>,
 }
 
 /// `[chrome]` table: the terminal section plus opaque sections for other renderers.
@@ -449,7 +465,8 @@ impl RawTuiChrome {
             surfaces,
             motion,
             header,
-            session_start
+            session_start,
+            follow
         );
         if let Some(status) = &other.status {
             let target = self.status.get_or_insert_with(RawStatus::default);

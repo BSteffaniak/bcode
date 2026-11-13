@@ -13,8 +13,8 @@ use bmux_tui_components::virtual_list::{
 };
 
 use super::{
-    Correspondence, MotionConfig, NavEffect, NavInput, NavIntent, NavState, NavView, RemovedUnits,
-    UnitFacts, UnitRole, presented_position, reduce,
+    Correspondence, FollowPolicy, MotionConfig, NavEffect, NavInput, NavIntent, NavState, NavView,
+    RemovedUnits, UnitFacts, UnitRole, presented_position, reduce,
 };
 use crate::units::{BoundaryEdge, UnitKey};
 use crate::viewport::ViewportGeometry;
@@ -58,6 +58,7 @@ struct Fixture {
     window: ResidentWindow,
     viewport: ViewportGeometry,
     motion: MotionConfig,
+    follow: FollowPolicy,
     state: NavState,
     t0: Instant,
 }
@@ -79,6 +80,7 @@ impl Fixture {
             window,
             viewport: ViewportGeometry::new(WIDTH, height),
             motion: MotionConfig::INSTANT,
+            follow: FollowPolicy::Reply,
             state: NavState::new(),
             t0: Instant::now(),
         }
@@ -124,6 +126,7 @@ impl Fixture {
             viewport: self.viewport,
             window: &self.window,
             motion: self.motion,
+            follow: self.follow,
         };
         f(&view)
     }
@@ -142,6 +145,7 @@ impl Fixture {
             viewport: self.viewport,
             window: &self.window,
             motion: self.motion,
+            follow: self.follow,
         };
         reduce(&mut self.state, input, &view)
     }

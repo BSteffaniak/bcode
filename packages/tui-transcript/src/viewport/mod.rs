@@ -452,6 +452,7 @@ impl TranscriptViewport {
             viewport: context.geometry,
             window: context.window,
             motion: context.motion,
+            follow: context.follow,
         };
         read(&view)
     }
@@ -488,6 +489,8 @@ pub struct NavViewContext<'a> {
     pub window: &'a ResidentWindow,
     /// Motion configuration.
     pub motion: MotionConfig,
+    /// What stays in view as replies arrive.
+    pub follow: crate::navigation::FollowPolicy,
 }
 
 impl std::fmt::Debug for NavViewContext<'_> {

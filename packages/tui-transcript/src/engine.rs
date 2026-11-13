@@ -1065,6 +1065,7 @@ impl TranscriptEngine {
             geometry: self.geometry,
             window: self.window.summary(),
             motion: self.motion,
+            follow: self.render.theme.chrome.follow,
         }
     }
 
@@ -1078,6 +1079,7 @@ impl TranscriptEngine {
             geometry: self.geometry,
             window: self.window.summary(),
             motion: self.motion,
+            follow: self.render.theme.chrome.follow,
         };
         let nav = &mut self.nav;
         self.viewport

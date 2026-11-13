@@ -146,6 +146,7 @@ density   = "comfortable"   # compact | cozy | comfortable
 separators = { status = "powerline" }   # plain | bar | slant | powerline
 speaker   = "gutter"        # prefix | badge | bar | gutter | marker
 markers   = { user = "›", assistant = "•" }   # glyphs of the marker treatment
+follow    = "reply"         # reply | latest: what stays in view as replies arrive
 surfaces  = "layered"       # flat | layered
 motion    = "subtle"        # none | subtle | full
 header    = "shown"         # shown | hidden: the header row at the top of the screen
@@ -165,6 +166,9 @@ composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls
   speaker's marker glyph (styled by its label role) precedes the first body row, and the body
   hangs beside it. The marker column is the glyph's measured width plus one cell; narrower than
   four body cells, and for collapsed or summarized messages, the heading row returns.
+* `follow = "reply"` holds a new submission's or reply's first row at the viewport top until it
+  overflows; `latest` keeps the latest content at the bottom instead. Neither pulls a reader who
+  scrolled away from the latest content; a submission returns to it under `latest`.
 * A container recipe with `layout = "panel"`, `border = "none"`, and `width = "full"` fills its
   rows edge to edge with its role's background.
 * The `composer.border` and `composer.surface` roles style the composer; unset, the composer

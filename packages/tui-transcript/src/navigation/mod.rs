@@ -13,6 +13,7 @@ mod reducer;
 #[cfg(test)]
 mod tests;
 
+pub use bcode_tui_theme::chrome::FollowPolicy;
 pub use facts::{Correspondence, NoUnitFacts, RemovedUnits, UnitFacts, UnitRole};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -600,6 +601,8 @@ pub struct NavView<'a> {
     pub window: &'a ResidentWindow,
     /// Motion configuration.
     pub motion: MotionConfig,
+    /// What stays in view as replies arrive (theme `chrome.follow`).
+    pub follow: FollowPolicy,
 }
 
 impl NavView<'_> {

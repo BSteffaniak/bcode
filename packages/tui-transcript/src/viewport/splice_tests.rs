@@ -291,6 +291,7 @@ fn nav_view_reads_the_measured_index() {
         geometry: ViewportGeometry::new(40, 10),
         window: &fixture.window,
         motion: MotionConfig::INSTANT,
+        follow: crate::navigation::FollowPolicy::Reply,
     };
     let (height, total) = fixture.viewport.with_nav_view(context, |view| {
         (view.unit_height(&key(1)), view.total_height())

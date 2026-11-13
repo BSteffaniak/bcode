@@ -81,6 +81,6 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | open |
 | 12 | Activity line: placement, spinner frames, verbs, shimmer | open |
 | 13 | Docked permission and question surfaces with numbered option lists | open |
-| 14 | Scroll policy: follow newest instead of holding a new reply at the top | open |
+| 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
 | 15 | Session banner | open |
 | 16 | Slash menu presentation | open |
