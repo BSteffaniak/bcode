@@ -188,6 +188,7 @@ impl FakeProvider {
                             pulls_history: false,
                         },
                     },
+                    conversation: bcode_code_review_models::ConversationCapabilities::default(),
                 })
             }
             OP_REVIEW_SOURCE_STACK_RESOLVE => {

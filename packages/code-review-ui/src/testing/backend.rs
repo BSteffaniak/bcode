@@ -79,6 +79,16 @@ impl TestBackend {
         self
     }
 
+    /// Use `config` for pull request conversations.
+    #[must_use]
+    pub fn with_conversation_config(
+        mut self,
+        config: crate::config::conversation::ConversationConfig,
+    ) -> Self {
+        self.services = self.services.with_conversation(config);
+        self
+    }
+
     /// Use `limit` for stacks.
     #[must_use]
     pub fn with_stack_limit(mut self, limit: bcode_code_review_models::ReviewStackLimit) -> Self {

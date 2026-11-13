@@ -40,6 +40,37 @@ impl ReviewSurface {
     // Publish
     // ----------------------------------------------------------------------------------------
 
+    /// Open the publish flow for a review of `targets` with `verdict` (straight to the provider's
+    /// review options).
+    pub(super) fn open_review(
+        &mut self,
+        verdict: bcode_code_review_models::ReviewVerdict,
+        targets: Vec<ReviewPullRequestTarget>,
+        host: &UiContext,
+    ) {
+        if self.review.is_none() || targets.is_empty() {
+            return;
+        }
+        if self.notes.pending() > 0 {
+            self.set_status(
+                "comments are still saving; try again in a moment",
+                StatusSeverity::Warning,
+            );
+            return;
+        }
+        let (flow, outcome) = PublishFlow::for_preset(
+            self.readiness(),
+            self.checklist_threads(),
+            self.pull_targets(),
+            publish::Preset { verdict, targets },
+            &self.theme,
+        );
+        self.modal = Some(Modal::Publish(flow));
+        if let FlowOutcome::Request(request) = outcome {
+            self.run_publish_request(*request, host);
+        }
+    }
+
     /// Open the publish flow at its checklist.
     pub(super) fn open_publish(&mut self) {
         if self.review.is_none() {
@@ -236,6 +267,50 @@ impl ReviewSurface {
                     is_binary: entry.has(bcode_code_review_models::ReviewIndexFlag::Binary),
                 });
         }
+        let target_of = |key: &crate::conversation::PullKey| ReviewPullRequestTarget {
+            provider: key.provider.clone(),
+            repository: key.repository.clone(),
+            number: key.number,
+        };
+        let held = self
+            .notes
+            .held_replies()
+            .into_iter()
+            .filter(|draft| !super::super::notes::is_local(&draft.comment_id))
+            .filter_map(|draft| {
+                let replied =
+                    super::super::notes::replied_thread(draft.anchor.reply_to.as_deref()?);
+                let info = self.notes.remote(&replied)?;
+                let key = self
+                    .talk
+                    .data
+                    .links
+                    .iter()
+                    .find(|link| link.pull.id() == info.pull)?
+                    .pull
+                    .clone();
+                Some(publish::HeldReplyDraft {
+                    target: target_of(&key),
+                    thread_id: info.remote_id.clone(),
+                    body: draft.body.clone(),
+                    comment_id: draft.comment_id.clone(),
+                })
+            })
+            .collect();
+        let heads = self
+            .talk
+            .data
+            .links
+            .iter()
+            .map(|link| (target_of(&link.pull), link.head_oid.clone()))
+            .collect();
+        let preset_targets = match &self.modal {
+            Some(Modal::Publish(flow)) => flow
+                .preset()
+                .map(|preset| preset.targets.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         Some(PrepareContext {
             repo_path: self.repo_path.clone(),
             fallback_target: NoteScope::for_workspace(&workspace).target,
@@ -244,6 +319,9 @@ impl ReviewSurface {
             files,
             old_paths,
             threads,
+            held,
+            heads,
+            preset_targets,
         })
     }
 
@@ -300,6 +378,22 @@ impl ReviewSurface {
         let Some(report) = report else {
             return;
         };
+        // Replies sent with a review are drafts no more; what was reviewed is read again.
+        for comment_id in &report.sent_replies {
+            let _ = self.notes.delete_draft(comment_id);
+        }
+        if !report.reviewed.is_empty() {
+            let keys = report
+                .reviewed
+                .iter()
+                .map(|target| crate::conversation::PullKey {
+                    provider: target.provider.clone(),
+                    repository: target.repository.clone(),
+                    number: target.number,
+                })
+                .collect();
+            self.talk.signals.extend::<Vec<_>>(keys);
+        }
         if !report.done.is_empty() {
             let labels: Vec<String> = report
                 .done

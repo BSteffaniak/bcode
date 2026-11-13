@@ -107,6 +107,72 @@ pub struct ExternalThread {
 /// Prefix of imported thread and comment ids.
 pub const EXTERNAL_PREFIX: &str = "external:";
 
+/// Prefix of the ids of pull request threads the review reads from their provider (followed by
+/// the pull request's key, a `\u{1}`, and the provider's thread id).
+pub const REMOTE_PREFIX: &str = "remote:";
+
+/// The review's id of `thread_id` on the pull request `pull` (a [`crate::conversation::PullKey`]
+/// id).
+#[must_use]
+pub fn remote_thread_id(pull: &str, thread_id: &str) -> String {
+    format!("{REMOTE_PREFIX}{}", reply_target(pull, thread_id))
+}
+
+/// What a held reply's anchor names as the thread it replies to (`DraftAnchor::reply_to`).
+#[must_use]
+pub fn reply_target(pull: &str, thread_id: &str) -> String {
+    format!("{pull}\u{1}{thread_id}")
+}
+
+/// The review's id of the pull request thread a held reply's `reply_to` names.
+#[must_use]
+pub fn replied_thread(reply_to: &str) -> String {
+    format!("{REMOTE_PREFIX}{reply_to}")
+}
+
+/// A pull request thread as the review shows it, besides its comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct RemoteThreadInfo {
+    /// The pull request ([`crate::conversation::PullKey`] id).
+    pub pull: String,
+    /// Provider's display name.
+    pub provider_label: String,
+    /// The provider's thread id.
+    pub remote_id: String,
+    /// Resolved.
+    pub resolved: bool,
+    /// The forge considers its code changed since.
+    pub outdated: bool,
+    /// How it was placed on the review.
+    pub placement: bcode_code_review::conversation::Placement,
+    /// The viewer may reply.
+    pub can_reply: bool,
+    /// The viewer may resolve or reopen it.
+    pub can_resolve: bool,
+    /// Someone else spoke last on something the viewer is part of.
+    pub waiting: bool,
+    /// Something in it arrived since the viewer last looked.
+    pub new: bool,
+    /// Web page.
+    pub url: Option<String>,
+    /// Author and time per comment id.
+    pub authors: std::collections::BTreeMap<String, (String, Option<u64>)>,
+}
+
+/// One remote thread to show: its info and comments (already anchored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteNote {
+    /// The review's thread id ([`remote_thread_id`]).
+    pub thread_id: String,
+    /// Where it shows.
+    pub anchor: DraftAnchor,
+    /// Its info.
+    pub info: RemoteThreadInfo,
+    /// Comments: id, body, created.
+    pub comments: Vec<(String, String, u64)>,
+}
+
 /// One queued service call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mutation {
@@ -194,6 +260,9 @@ pub struct ReviewNotes {
     external_drafts: Vec<DraftComment>,
     external: std::collections::BTreeMap<String, ExternalThread>,
     external_records: Vec<ExternalReviewImportRecord>,
+    /// Pull request threads read from their providers (never persisted).
+    remote_drafts: Vec<DraftComment>,
+    remote: std::collections::BTreeMap<String, RemoteThreadInfo>,
     /// Anchors recorded as published (with revision fields cleared).
     published: Vec<DraftAnchor>,
     exchanges: Vec<ReviewAiExchange>,
@@ -223,7 +292,19 @@ impl ReviewNotes {
             .filter(|draft| is_local(&draft.comment_id))
             .cloned()
             .collect();
+        // Drafts whose deletion is still queued or running stay deleted.
+        let deleting: std::collections::BTreeSet<String> = self
+            .queue
+            .iter()
+            .chain(self.running.iter())
+            .filter_map(|mutation| match mutation {
+                Mutation::Delete { comment, .. } => Some(comment.comment_id.clone()),
+                _ => None,
+            })
+            .collect();
         self.drafts = loaded.drafts;
+        self.drafts
+            .retain(|draft| !deleting.contains(&draft.comment_id));
         self.drafts.extend(local);
         self.exchanges = loaded.exchanges;
         self.suggestions = loaded.suggestions;
@@ -297,6 +378,71 @@ impl ReviewNotes {
         self.set_external(records);
     }
 
+    /// Replace the pull request threads read from providers with `notes`. Returns whether
+    /// anything shown changed.
+    pub fn set_remote(&mut self, notes: Vec<RemoteNote>) -> bool {
+        let mut drafts = Vec::new();
+        let mut remote = std::collections::BTreeMap::new();
+        for note in notes {
+            for (comment_id, body, created) in note.comments {
+                drafts.push(DraftComment {
+                    comment_id,
+                    thread_id: note.thread_id.clone(),
+                    anchor: note.anchor.clone(),
+                    body,
+                    created_at_ms: created,
+                    updated_at_ms: created,
+                    session_id: None,
+                    resolved_at_ms: note.info.resolved.then_some(created),
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
+                });
+            }
+            remote.insert(note.thread_id, note.info);
+        }
+        if drafts == self.remote_drafts && remote == self.remote {
+            return false;
+        }
+        self.remote_drafts = drafts;
+        self.remote = remote;
+        self.touch();
+        true
+    }
+
+    /// The pull request thread `thread_id`, when it is one.
+    #[must_use]
+    pub fn remote(&self, thread_id: &str) -> Option<&RemoteThreadInfo> {
+        self.remote.get(thread_id)
+    }
+
+    /// Every pull request thread shown, by id.
+    #[must_use]
+    pub const fn remote_threads(&self) -> &std::collections::BTreeMap<String, RemoteThreadInfo> {
+        &self.remote
+    }
+
+    /// Mark the pull request thread `thread_id` resolved or open at once (until the next read).
+    pub fn set_remote_resolved(&mut self, thread_id: &str, resolved: bool) {
+        if let Some(info) = self.remote.get_mut(thread_id) {
+            info.resolved = resolved;
+            for draft in &mut self.remote_drafts {
+                if draft.thread_id == thread_id {
+                    draft.resolved_at_ms = resolved.then_some(draft.created_at_ms);
+                }
+            }
+            self.touch();
+        }
+    }
+
+    /// Drafts held as replies to pull request threads (sent with the next review).
+    #[must_use]
+    pub fn held_replies(&self) -> Vec<&DraftComment> {
+        self.drafts
+            .iter()
+            .filter(|draft| draft.anchor.reply_to.is_some())
+            .collect()
+    }
+
     /// The imported thread `thread_id`, when it is one.
     #[must_use]
     pub fn external(&self, thread_id: &str) -> Option<&ExternalThread> {
@@ -343,7 +489,10 @@ impl ReviewNotes {
             drafts: self
                 .drafts
                 .iter()
+                // A held reply shows in its pull request thread, not as a thread of its own.
+                .filter(|draft| draft.anchor.reply_to.is_none())
                 .chain(&self.external_drafts)
+                .chain(&self.remote_drafts)
                 .cloned()
                 .collect(),
             exchanges: self.exchanges.clone(),
@@ -357,21 +506,37 @@ impl ReviewNotes {
         self.drafts
             .iter()
             .chain(&self.external_drafts)
+            .chain(&self.remote_drafts)
             .find(|draft| draft.comment_id == comment_id)
     }
 
     /// Comments of a thread, oldest first.
     #[must_use]
     pub fn thread(&self, thread_id: &str) -> Vec<&DraftComment> {
-        let source = if thread_id.starts_with(EXTERNAL_PREFIX) {
-            &self.external_drafts
+        let mut comments: Vec<&DraftComment> = if thread_id.starts_with(EXTERNAL_PREFIX) {
+            self.external_drafts
+                .iter()
+                .filter(|draft| draft.thread_id == thread_id)
+                .collect()
+        } else if thread_id.starts_with(REMOTE_PREFIX) {
+            // Its comments, then the replies held for the next review.
+            self.remote_drafts
+                .iter()
+                .filter(|draft| draft.thread_id == thread_id)
+                .chain(self.drafts.iter().filter(|draft| {
+                    draft
+                        .anchor
+                        .reply_to
+                        .as_deref()
+                        .is_some_and(|reply_to| replied_thread(reply_to) == thread_id)
+                }))
+                .collect()
         } else {
-            &self.drafts
+            self.drafts
+                .iter()
+                .filter(|draft| draft.thread_id == thread_id)
+                .collect()
         };
-        let mut comments: Vec<&DraftComment> = source
-            .iter()
-            .filter(|draft| draft.thread_id == thread_id)
-            .collect();
         comments.sort_by(|a, b| {
             (a.created_at_ms, &a.comment_id).cmp(&(b.created_at_ms, &b.comment_id))
         });
@@ -788,6 +953,7 @@ fn review_anchor() -> DraftAnchor {
         source_id: None,
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     }
 }
 
@@ -1205,6 +1371,7 @@ mod tests {
             source_id: None,
             head_oid: None,
             blob_oid: None,
+            reply_to: None,
         }
     }
 

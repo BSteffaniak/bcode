@@ -118,6 +118,18 @@ pub struct Icons {
     pub output: &'static str,
     /// An error.
     pub alert: &'static str,
+    /// An approval.
+    pub approved: &'static str,
+    /// A request for changes.
+    pub changes: &'static str,
+    /// A review still needed.
+    pub awaiting: &'static str,
+    /// Checks.
+    pub checks: &'static str,
+    /// Opens a web page.
+    pub external: &'static str,
+    /// Something new since last looked at.
+    pub new: &'static str,
     /// Name of the BMUX spinner preset of busy items (`braille` or `ascii`).
     pub spinner: &'static str,
 }
@@ -153,6 +165,12 @@ impl Icons {
         failed: "✗",
         output: "│",
         alert: "⚠",
+        approved: "✓",
+        changes: "✕",
+        awaiting: "◌",
+        checks: "●",
+        external: "↗",
+        new: "•",
         spinner: "braille",
     };
 
@@ -186,6 +204,12 @@ impl Icons {
         failed: "x",
         output: "|",
         alert: "!",
+        approved: "+",
+        changes: "x",
+        awaiting: "o",
+        checks: "*",
+        external: "->",
+        new: "*",
         spinner: "ascii",
     };
 

@@ -191,6 +191,81 @@ fn histories_query(count: usize) -> String {
     query
 }
 
+/// The GraphQL query for `fields` of each of `count` pull requests by number (`p<i>` for
+/// `$n<i>`), with the viewer's login and permission on the repository.
+fn fields_query(count: usize, fields: &str) -> String {
+    use std::fmt::Write as _;
+    let mut query = String::from("query($owner: String!, $name: String!");
+    for index in 0..count {
+        let _ = write!(query, ", $n{index}: Int!");
+    }
+    query.push_str(
+        ") {\n  viewer { login }\n  repository(owner: $owner, name: $name) {\n    viewerPermission\n",
+    );
+    for index in 0..count {
+        let _ = writeln!(
+            query,
+            "    p{index}: pullRequest(number: $n{index}) {{ {fields} }}"
+        );
+    }
+    query.push_str("  }\n}");
+    query
+}
+
+/// A GraphQL request body.
+fn json_body(query: &str, variables: Value) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("query".to_owned(), Value::String(query.to_owned()));
+    body.insert("variables".to_owned(), variables);
+    Value::Object(body)
+}
+
+/// Pull requests' fields from [`GitHub::pull_request_fields`], as GitHub answered them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullFields {
+    /// The authenticated user's login.
+    pub viewer: Option<String>,
+    /// The authenticated user's permission on the repository (`READ`, `TRIAGE`, `WRITE`,
+    /// `MAINTAIN`, `ADMIN`).
+    pub viewer_permission: Option<String>,
+    /// Each known pull request's fields.
+    pub pulls: BTreeMap<u64, Value>,
+}
+
+/// The pull requests (`p0` to `p<numbers.len() - 1>`) of a response to [`fields_query`]; a
+/// number GitHub does not know is left out.
+///
+/// # Errors
+/// * [`ForgeError::Failed`] (or the error's kind, see [`check_response`]) when the response
+///   reports errors other than unknown pull requests, or lacks the repository.
+pub fn parse_pull_fields(value: &Value, numbers: &[u64]) -> Result<PullFields, ForgeError> {
+    if let Some(errors) = response_errors(value) {
+        let not_found = |error: &&Value| error["type"].as_str() == Some("NOT_FOUND");
+        if !errors.iter().all(not_found) {
+            return Err(answered_with(&errors));
+        }
+    }
+    let repository = &value["data"]["repository"];
+    if !repository.is_object() {
+        return Err(ForgeError::Failed(
+            "GitHub did not return the repository".into(),
+        ));
+    }
+    let pulls = numbers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, number)| {
+            let pull = &repository[format!("p{index}")];
+            pull.is_object().then(|| (*number, pull.clone()))
+        })
+        .collect();
+    Ok(PullFields {
+        viewer: value["data"]["viewer"]["login"].as_str().map(str::to_owned),
+        viewer_permission: repository["viewerPermission"].as_str().map(str::to_owned),
+        pulls,
+    })
+}
+
 /// One push-related item of a pull request's timeline, as GitHub reports it (times are
 /// RFC 3339).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,24 +513,41 @@ impl HttpSession {
                 .json(body)
                 .send()
                 .await
-                .map_err(|error| ForgeError::Failed(format!("{endpoint}: {error}")))?;
+                .map_err(|error| ForgeError::Unavailable(format!("{endpoint}: {error}")))?;
             let status = response.status();
-            let value: Value = response
-                .json()
-                .await
-                .map_err(|error| ForgeError::Failed(format!("{endpoint}: {error}")))?;
+            let value: Value = response.json().await.map_err(|error| {
+                if status.is_server_error() {
+                    ForgeError::Unavailable(format!("{endpoint} answered {status}"))
+                } else {
+                    ForgeError::Failed(format!("{endpoint}: {error}"))
+                }
+            })?;
             match status.as_u16() {
                 200 => Ok(value),
                 401 => Err(ForgeError::Unauthenticated(format!(
                     "GitHub rejected the token from {}",
                     self.token.source
                 ))),
-                code => Err(ForgeError::Failed(format!(
-                    "{endpoint} answered {code}: {}",
-                    value["message"].as_str().unwrap_or("no details")
-                ))),
+                code => {
+                    let message = format!(
+                        "{endpoint} answered {code}: {}",
+                        value["message"].as_str().unwrap_or("no details")
+                    );
+                    Err(http_error(code, message))
+                }
             }
         })
+    }
+}
+
+/// The error of an HTTP answer with `code` (other than 200 and 401).
+#[cfg(feature = "http")]
+fn http_error(code: u16, message: String) -> ForgeError {
+    let limited = message.to_ascii_lowercase().contains("rate limit");
+    match code {
+        403 if !limited => ForgeError::Forbidden(message),
+        403 | 429 | 500..=599 => ForgeError::Unavailable(message),
+        _ => ForgeError::Failed(message),
     }
 }
 
@@ -669,12 +761,10 @@ impl GitHub {
                 Err(http) => match self.cli(repository, query, &all) {
                     Ok(value) => Ok((value, Transport::Cli)),
                     // Report why the preferred way failed, and that the fallback did too.
-                    Err(cli) => Err(match http {
-                        ForgeError::Unauthenticated(message) => {
-                            ForgeError::Unauthenticated(format!("{message}; gh: {cli}"))
-                        }
-                        other => ForgeError::Failed(format!("{other}; gh: {cli}")),
-                    }),
+                    Err(cli) => {
+                        let message = format!("{http}; gh: {cli}");
+                        Err(http.with_message(message))
+                    }
                 },
             },
         }
@@ -700,11 +790,6 @@ impl GitHub {
         query: &str,
         variables: &[(&str, Variable<'_>)],
     ) -> Result<Value, ForgeError> {
-        let endpoint = if repository.host == GITHUB_HOST {
-            "https://api.github.com/graphql".to_owned()
-        } else {
-            format!("https://{}/api/graphql", repository.host)
-        };
         let variables: serde_json::Map<String, Value> = variables
             .iter()
             .map(|(name, value)| {
@@ -716,31 +801,130 @@ impl GitHub {
             })
             .collect();
         let body = json!({ "query": query, "variables": variables });
+        self.http_body(&repository.host, &body)
+    }
+
+    /// Post a GraphQL request `body` (`{query, variables}`) to `host` over HTTPS.
+    #[cfg(feature = "http")]
+    fn http_body(&self, host: &str, body: &Value) -> Result<Value, ForgeError> {
+        let endpoint = if host == GITHUB_HOST {
+            "https://api.github.com/graphql".to_owned()
+        } else {
+            format!("https://{host}/api/graphql")
+        };
         // The lock covers finding the session only; requests run concurrently on it.
         let session = {
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-            match sessions.entry(repository.host.clone()) {
+            match sessions.entry(host.to_owned()) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => Arc::clone(entry.insert(Arc::new(HttpSession::new(
-                    &repository.host,
+                    host,
                     self.token_env.as_deref(),
                     &self.cwd,
                 )?))),
             }
         };
-        let result = session.post(&endpoint, &body);
+        let result = session.post(&endpoint, body);
         if matches!(result, Err(ForgeError::Unauthenticated(_))) {
             // A rejected token is resolved again next time (it may have been refreshed), unless
             // another request already replaced the session.
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if sessions
-                .get(&repository.host)
+                .get(host)
                 .is_some_and(|current| Arc::ptr_eq(current, &session))
             {
-                sessions.remove(&repository.host);
+                sessions.remove(host);
             }
         }
         result
+    }
+
+    #[cfg(not(feature = "http"))]
+    #[allow(clippy::unused_self)] // the same shape as the HTTPS transport
+    fn http_body(&self, _host: &str, _body: &Value) -> Result<Value, ForgeError> {
+        Err(ForgeError::Failed(
+            "the HTTPS transport is not built into this binary (use `gh`)".into(),
+        ))
+    }
+
+    /// Send a GraphQL request `body` (`{query, variables}`) to `host` through `gh`, the body on
+    /// standard input (so variables can be any JSON).
+    fn cli_body(&self, host: &str, body: &Value) -> Result<Value, ForgeError> {
+        let output = run_gh_with_input(
+            &["api", "graphql", "--hostname", host, "--input", "-"],
+            &self.cwd,
+            &body.to_string(),
+        )?;
+        match serde_json::from_str::<Value>(&output.stdout) {
+            Ok(value) if value.get("data").is_some_and(|data| !data.is_null()) => Ok(value),
+            Ok(_) | Err(_) if !output.success => Err(gh_failure(output.stderr)),
+            Ok(value) => Ok(value),
+            Err(error) => Err(ForgeError::Failed(format!("unexpected gh output: {error}"))),
+        }
+    }
+
+    /// Run any GraphQL request (a query or a mutation) on `host` with JSON `variables`, through
+    /// the configured transport. The response is returned as GitHub sent it; a response that
+    /// reports errors is left for the caller to interpret ([`check_response`]).
+    ///
+    /// # Errors
+    /// * [`ForgeError::UnsupportedHost`] for a host this client does not serve.
+    /// * The transport's failure (unauthenticated, forbidden, unavailable, failed).
+    pub fn graphql(&self, host: &str, query: &str, variables: Value) -> Result<Value, ForgeError> {
+        if !self.hosts.iter().any(|served| served == host) {
+            return Err(ForgeError::UnsupportedHost(host.to_owned()));
+        }
+        let body = json_body(query, variables);
+        match self.transport {
+            Transport::Http => self.http_body(host, &body),
+            Transport::Cli => self.cli_body(host, &body),
+            Transport::Auto if !cfg!(feature = "http") => self.cli_body(host, &body),
+            Transport::Auto => match self.http_body(host, &body) {
+                Ok(value) => Ok(value),
+                // Only a request that never reached GitHub is retried through `gh`: a mutation
+                // GitHub answered must not run twice.
+                Err(http @ (ForgeError::Unauthenticated(_) | ForgeError::Unavailable(_))) => {
+                    self.cli_body(host, &body).map_err(|cli| {
+                        let message = format!("{http}; gh: {cli}");
+                        http.with_message(message)
+                    })
+                }
+                Err(other) => Err(other),
+            },
+        }
+    }
+
+    /// The same `fields` of each of pull requests `numbers` of `repository`, `per_query` per
+    /// GraphQL request (aliases `p<i>`), the requests in parallel; with the viewer's login and
+    /// permission on the repository. A number GitHub does not know is left out.
+    ///
+    /// # Errors
+    /// As [`Self::branch_pull_requests`]; the first failing request fails the call.
+    pub fn pull_request_fields(
+        &self,
+        repository: &RepositoryRef,
+        numbers: &[u64],
+        fields: &str,
+        per_query: usize,
+    ) -> Result<PullFields, ForgeError> {
+        let chunks = each_chunk(numbers, per_query.max(1), |chunk| {
+            let names: Vec<String> = (0..chunk.len()).map(|index| format!("n{index}")).collect();
+            let variables: Vec<(&str, Variable<'_>)> = names
+                .iter()
+                .zip(chunk)
+                .map(|(name, number)| (name.as_str(), Variable::Number(*number)))
+                .collect();
+            let (value, _) =
+                self.query(repository, &fields_query(chunk.len(), fields), &variables)?;
+            parse_pull_fields(&value, chunk)
+        })?;
+        let mut all = PullFields::default();
+        for chunk in chunks {
+            all.viewer = all.viewer.or(chunk.viewer);
+            all.viewer_permission = all.viewer_permission.or(chunk.viewer_permission);
+            all.pulls.extend(chunk.pulls);
+        }
+        Ok(all)
     }
 
     fn cli(
@@ -773,7 +957,7 @@ impl GitHub {
         // errors the parsers interpret (a missing pull request is not a failure).
         match serde_json::from_str::<Value>(&output.stdout) {
             Ok(value) if value.get("data").is_some_and(|data| !data.is_null()) => Ok(value),
-            Ok(_) | Err(_) if !output.success => Err(ForgeError::Failed(output.stderr)),
+            Ok(_) | Err(_) if !output.success => Err(gh_failure(output.stderr)),
             Ok(value) => Ok(value),
             Err(error) => Err(ForgeError::Failed(format!("unexpected gh output: {error}"))),
         }
@@ -817,6 +1001,33 @@ fn run_gh(args: &[&str], cwd: &Path) -> Result<GhOutput, ForgeError> {
     })
 }
 
+/// Run `gh` in `cwd` with `input` on its standard input.
+fn run_gh_with_input(args: &[&str], cwd: &Path, input: &str) -> Result<GhOutput, ForgeError> {
+    use std::io::Write as _;
+    let mut child = Command::new("gh")
+        .args(args)
+        .current_dir(cwd)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| ForgeError::Failed(format!("gh is not available: {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|error| ForgeError::Failed(format!("could not write to gh: {error}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ForgeError::Failed(format!("gh did not finish: {error}")))?;
+    Ok(GhOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
 /// Run `gh` in `cwd`, returning its standard output.
 fn gh(args: &[&str], cwd: &Path) -> Result<String, ForgeError> {
     let output = run_gh(args, cwd)?;
@@ -824,6 +1035,18 @@ fn gh(args: &[&str], cwd: &Path) -> Result<String, ForgeError> {
         Ok(output.stdout)
     } else {
         Err(ForgeError::Failed(output.stderr))
+    }
+}
+
+/// The error of a failed `gh` call, from what it printed.
+fn gh_failure(stderr: String) -> ForgeError {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("rate limit") || lower.contains("timeout") || lower.contains("http 5") {
+        ForgeError::Unavailable(stderr)
+    } else if lower.contains("http 403") || lower.contains("forbidden") {
+        ForgeError::Forbidden(stderr)
+    } else {
+        ForgeError::Failed(stderr)
     }
 }
 
@@ -840,7 +1063,28 @@ fn answered_with(errors: &[&Value]) -> ForgeError {
         .iter()
         .filter_map(|error| error["message"].as_str())
         .collect();
-    ForgeError::Failed(format!("GitHub answered: {}", messages.join("; ")))
+    let message = format!("GitHub answered: {}", messages.join("; "));
+    let typed = |kind: &str| {
+        errors
+            .iter()
+            .any(|error| error["type"].as_str() == Some(kind))
+    };
+    if typed("FORBIDDEN") {
+        ForgeError::Forbidden(message)
+    } else if typed("RATE_LIMITED") || typed("SERVICE_UNAVAILABLE") {
+        ForgeError::Unavailable(message)
+    } else {
+        ForgeError::Failed(message)
+    }
+}
+
+/// The error a GraphQL response reports, when it reports any.
+///
+/// # Errors
+/// * [`ForgeError::Forbidden`] for `FORBIDDEN` errors, [`ForgeError::Unavailable`] for rate
+///   limiting, else [`ForgeError::Failed`].
+pub fn check_response(value: &Value) -> Result<(), ForgeError> {
+    response_errors(value).map_or(Ok(()), |errors| Err(answered_with(&errors)))
 }
 
 /// The pull requests of the connection `field` of a GraphQL response's repository.

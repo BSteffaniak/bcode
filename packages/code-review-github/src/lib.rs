@@ -13,15 +13,22 @@
 //! review-owned reference namespace (`refs/bcode-review/pull/<N>/{head,base}`) so they never
 //! touch the user's branches or remote-tracking references.
 
+mod conversation;
+
+pub use conversation::{InlineComment, ReviewDraft, review_body, review_draft};
+
 use bcode_code_review_models::{
-    PullRequestSummary, REVIEW_SOURCE_ERROR_FAILED, REVIEW_SOURCE_ERROR_FETCH_FAILED,
-    REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
+    ConversationCapabilities, PullRequestSummary, REVIEW_SOURCE_ERROR_FAILED,
+    REVIEW_SOURCE_ERROR_FETCH_FAILED, REVIEW_SOURCE_ERROR_NOT_PERMITTED,
+    REVIEW_SOURCE_ERROR_PULL_NOT_FOUND, REVIEW_SOURCE_ERROR_STALE,
+    REVIEW_SOURCE_ERROR_UNAUTHENTICATED, REVIEW_SOURCE_ERROR_UNAVAILABLE,
     REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY, ReviewPullFetchResult, ReviewPullFetchTarget,
     ReviewSourceBatchCapabilities, ReviewSourceCapabilities, ReviewSourceProviderManifest,
     ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
     ReviewSourcePullsGetRequest, ReviewSourcePullsGetResponse, ReviewSourcePullsListRequest,
     ReviewSourcePullsListResponse, ReviewSourceStackResolveRequest,
     ReviewSourceStackResolveResponse, ReviewStack, ReviewStackLayer, ReviewStackSibling,
+    VerdictSupport, WatchMechanism,
 };
 use bcode_code_review_provider::{ProviderCallError, ProviderResult, ReviewSourceProvider};
 use bcode_forge::models::{
@@ -62,6 +69,15 @@ pub enum ReviewSourceError {
     /// The caller stopped wanting the answer.
     #[error("cancelled")]
     Cancelled,
+    /// GitHub refused: the viewer may not do this.
+    #[error("{0}")]
+    Forbidden(String),
+    /// GitHub could not be reached, failed on its side, or is rate limiting.
+    #[error("{0}")]
+    Unavailable(String),
+    /// The pull request moved since it was read.
+    #[error("{0}")]
+    Stale(String),
 }
 
 impl ReviewSourceError {
@@ -76,6 +92,9 @@ impl ReviewSourceError {
             Self::Fetch(_) => REVIEW_SOURCE_ERROR_FETCH_FAILED,
             Self::Failed(_) => REVIEW_SOURCE_ERROR_FAILED,
             Self::Cancelled => bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED,
+            Self::Forbidden(_) => REVIEW_SOURCE_ERROR_NOT_PERMITTED,
+            Self::Unavailable(_) => REVIEW_SOURCE_ERROR_UNAVAILABLE,
+            Self::Stale(_) => REVIEW_SOURCE_ERROR_STALE,
         }
     }
 }
@@ -86,6 +105,8 @@ impl From<ForgeError> for ReviewSourceError {
             ForgeError::UnsupportedHost(_) => Self::UnsupportedRepository(error.to_string()),
             ForgeError::Unauthenticated(message) => Self::Unauthenticated(message),
             ForgeError::Failed(message) => Self::Failed(message),
+            ForgeError::Forbidden(message) => Self::Forbidden(message),
+            ForgeError::Unavailable(message) => Self::Unavailable(message),
         }
     }
 }
@@ -105,6 +126,20 @@ pub fn manifest() -> ReviewSourceProviderManifest {
                 pulls_get: true,
                 pulls_history: true,
             },
+        },
+        conversation: ConversationCapabilities {
+            activity: true,
+            watch: Some(WatchMechanism::Conditional),
+            thread_reply: true,
+            thread_resolve: true,
+            comment_post: true,
+            review_preview: true,
+            verdicts: VerdictSupport {
+                comment: true,
+                approve: true,
+                request_changes: true,
+            },
+            replies_in_review: true,
         },
     }
 }
@@ -195,6 +230,55 @@ impl ReviewSourceProvider for GitHubReviewSource {
             repository: repository.display(),
             histories,
         })
+    }
+
+    fn get_activity(
+        &self,
+        request: &bcode_code_review_models::ReviewSourcePullsActivityRequest,
+    ) -> ProviderResult<bcode_code_review_models::ReviewSourcePullsActivityResponse> {
+        Ok(conversation::get_activity(request)?)
+    }
+
+    fn watch_pulls(
+        &self,
+        request: &bcode_code_review_models::ReviewSourcePullsWatchRequest,
+    ) -> ProviderResult<bcode_code_review_models::ReviewSourcePullsWatchResponse> {
+        Ok(conversation::watch_pulls(request)?)
+    }
+
+    fn reply_to_thread(
+        &self,
+        request: &bcode_code_review_models::ThreadReplyRequest,
+    ) -> ProviderResult<bcode_code_review_models::CommentPostedResponse> {
+        Ok(conversation::reply_to_thread(request)?)
+    }
+
+    fn resolve_thread(
+        &self,
+        request: &bcode_code_review_models::ThreadResolveRequest,
+    ) -> ProviderResult<bcode_code_review_models::ThreadResolveResponse> {
+        Ok(conversation::resolve_thread(request)?)
+    }
+
+    fn post_comment(
+        &self,
+        request: &bcode_code_review_models::CommentPostRequest,
+    ) -> ProviderResult<bcode_code_review_models::CommentPostedResponse> {
+        Ok(conversation::post_comment(request)?)
+    }
+
+    fn preview_review(
+        &self,
+        request: &bcode_code_review_models::ReviewSubmitRequest,
+    ) -> ProviderResult<bcode_code_review_models::ReviewPreviewResponse> {
+        Ok(conversation::preview_review(request)?)
+    }
+
+    fn submit_review(
+        &self,
+        request: &bcode_code_review_models::ReviewSubmitRequest,
+    ) -> ProviderResult<bcode_code_review_models::ReviewSubmitResponse> {
+        Ok(conversation::submit_review(request)?)
     }
 
     fn resolve_stack(

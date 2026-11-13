@@ -512,7 +512,7 @@ mod tests {
             id: "p".into(),
             workspace_id: None,
             review_id: "r".into(),
-            publisher_id: "github".into(),
+            publisher_id: "forge".into(),
             submitted: true,
             published_thread_anchors: Vec::new(),
             output: None,
@@ -637,6 +637,7 @@ mod tests {
             id: "fake".into(),
             label: "Fake".into(),
             capabilities: ReviewSourceCapabilities::default(),
+            conversation: bcode_code_review_models::ConversationCapabilities::default(),
         };
         ProviderRoute {
             manifest: manifest.clone(),

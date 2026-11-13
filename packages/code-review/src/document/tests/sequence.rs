@@ -59,6 +59,7 @@ fn draft(thread: &str, path: &str, new_line: u32) -> DraftComment {
             source_id: None,
             head_oid: None,
             blob_oid: None,
+            reply_to: None,
         },
         body: "body".into(),
         created_at_ms: 1,

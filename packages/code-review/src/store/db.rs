@@ -653,6 +653,7 @@ impl<'a> CodeReviewDb<'a> {
                 "source_id",
                 "head_oid",
                 "blob_oid",
+                "reply_to",
             ])
             .filter(Box::new(where_eq("review_key", review_key)))
             .execute(self.db)
@@ -694,6 +695,7 @@ impl<'a> CodeReviewDb<'a> {
                 source_id: optional_text(&thread, "source_id"),
                 head_oid: optional_text(&thread, "head_oid"),
                 blob_oid: optional_text(&thread, "blob_oid"),
+                reply_to: optional_text(&thread, "reply_to"),
             };
             let comment_rows = self
                 .db
@@ -1029,6 +1031,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("source_id", anchor.source_id.clone())
             .value("head_oid", anchor.head_oid.clone())
             .value("blob_oid", anchor.blob_oid.clone())
+            .value("reply_to", anchor.reply_to.clone())
             .value("resolved_at_ms", Option::<i64>::None)
             .value("created_at_ms", u64_to_i64(now))
             .value("updated_at_ms", u64_to_i64(now))
@@ -1450,6 +1453,12 @@ pub fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(publish_record_thread_anchors_migration());
     source.add_migration(external_review_imports_table_migration());
     source.add_migration(review_ai_exchanges_table_migration());
+    add_later_migrations(&mut source);
+    source
+}
+
+/// Migrations from 016 on, in order.
+fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(workspace_presentation_state_column_migration());
     source.add_migration(workspace_state_columns_migration());
     source.add_migration(thread_head_oid_column_migration());
@@ -1457,7 +1466,21 @@ pub fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(review_assistant_sessions_table_migration());
     source.add_migration(workspace_stack_snapshots_column_migration());
     source.add_migration(super::history::layer_versions_table_migration());
-    source
+    source.add_migration(thread_reply_to_column_migration());
+}
+
+/// The pull request thread a draft thread replies to (see `DraftAnchor::reply_to`).
+pub fn thread_reply_to_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "024_thread_reply_to_column".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "reply_to".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
 }
 
 /// The stacks a review last opened with (see `ReviewWorkspace::stack_snapshots`).

@@ -157,7 +157,7 @@ impl ImportFlow {
                 self.step = ImportStep::Importers;
                 if self.importers.is_empty() {
                     self.error = Some(
-                        "No external review importers are enabled (for example the GitHub plugin)"
+                        "No external review importers are enabled (a provider plugin offers one)"
                             .into(),
                     );
                 }

@@ -85,6 +85,7 @@ fn anchor(
         source_id: source.map(str::to_string),
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     }
 }
 

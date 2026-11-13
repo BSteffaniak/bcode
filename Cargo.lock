@@ -2488,14 +2488,11 @@ dependencies = [
  "bcode_code_review_github",
  "bcode_code_review_models",
  "bcode_code_review_provider",
- "bcode_forge",
  "bcode_plugin_sdk",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

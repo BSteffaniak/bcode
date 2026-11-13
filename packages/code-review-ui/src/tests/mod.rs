@@ -6,6 +6,7 @@ mod appearance;
 mod assistant;
 mod benchmark;
 mod chrome;
+mod conversation;
 mod feed;
 mod interaction;
 mod parity;

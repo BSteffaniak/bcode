@@ -270,13 +270,12 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         appearance.is_some() && loaded.theme.variant == VariantPreference::Auto;
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host))
         .with_stack_limit(loaded.stack_limit)
+        .with_conversation(loaded.conversation.clone())
         // Disposable: a review opens from what an earlier run computed and learned, then confirms
         // it (`BCODE_CODE_REVIEW_CACHE=off` disables it).
         .with_cache(Arc::new(bcode_code_review::cache::ReviewCache::for_user()))
         // Built-in providers run in-process; a running Bcode's plugins can add more.
-        .with_source(Arc::new(bcode_code_review_github::GitHubReviewSource))
-        .with_contributor(Arc::new(bcode_code_review::discovery::git::GitDiscovery))
-        .with_contributor(Arc::new(bcode_code_review_graphite::GraphiteDiscovery));
+        .with_providers(&builtin_providers());
     let mut ui = UiContext::new(host, Arc::new(keymap), loaded.diff_layout);
     if let Some(control) = control_for_ui {
         ui = ui.with_appearance(control);
@@ -460,6 +459,15 @@ impl bmux_tui_runtime::Presenter<App> for AppPresenter {
 
 /// The runtime of the current terminal session, which host redraw requests wake.
 type WakeTarget = Arc<Mutex<Option<RuntimeHandle<Msg>>>>;
+
+/// The providers and contributors built into the review: the one place that names them.
+#[must_use]
+pub fn builtin_providers() -> bcode_code_review::provider::ProviderRegistry {
+    bcode_code_review::provider::ProviderRegistry::new()
+        .with_source(Arc::new(bcode_code_review_github::GitHubReviewSource))
+        .with_contributor(Arc::new(bcode_code_review::discovery::git::GitDiscovery))
+        .with_contributor(Arc::new(bcode_code_review_graphite::GraphiteDiscovery))
+}
 
 /// Run the app until the user quits.
 ///

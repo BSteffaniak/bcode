@@ -43,6 +43,7 @@ use bmux_tui_components::scroll_view::{ScrollExtent, ScrollViewState};
 use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 const FRAME_ID: &str = "review.publish";
@@ -61,6 +62,98 @@ pub struct PublisherEntry {
     pub manifest: ReviewPublisherManifest,
     /// Plugin serving it; `None` for built-in publishers.
     pub plugin_id: Option<String>,
+    /// The review-source provider that publishes it (a review of its own pull request), when
+    /// it is one.
+    pub provider: Option<String>,
+}
+
+/// Id prefix of publishers that are a review-source provider's own reviews.
+pub const PROVIDER_PUBLISHER_PREFIX: &str = "review_source:";
+
+/// A review the flow starts with: its verdict and the pull requests it goes to (the overview's
+/// Approve and Request changes buttons, *Approve reviewed layers*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preset {
+    /// Verdict.
+    pub verdict: bcode_code_review_models::ReviewVerdict,
+    /// Pull requests (each gets a review even without comments).
+    pub targets: Vec<ReviewPullRequestTarget>,
+}
+
+/// The publisher of `manifest`'s provider: its own reviews of its pull requests, with the
+/// verdicts it accepts (`preset` first).
+#[must_use]
+pub fn provider_entry(
+    manifest: &bcode_code_review_models::ReviewSourceProviderManifest,
+    preset: Option<bcode_code_review_models::ReviewVerdict>,
+) -> PublisherEntry {
+    let verdicts: Vec<String> = manifest
+        .conversation
+        .verdicts
+        .verdicts()
+        .into_iter()
+        .map(verdict_value)
+        .collect();
+    let default = preset
+        .filter(|verdict| manifest.conversation.verdicts.supports(*verdict))
+        .map(verdict_value)
+        .or_else(|| verdicts.first().cloned())
+        .unwrap_or_default();
+    PublisherEntry {
+        manifest: ReviewPublisherManifest {
+            id: format!("{PROVIDER_PUBLISHER_PREFIX}{}", manifest.id),
+            label: format!("Review on {}", manifest.label),
+            description: format!(
+                "Comment, approve, or request changes on the {} pull request",
+                manifest.label
+            ),
+            capabilities: bcode_code_review_models::ReviewPublisherCapabilities {
+                preview: manifest.conversation.review_preview,
+                submit: true,
+                update_existing: false,
+                supports_threads: true,
+                supports_ranges: true,
+                supports_inline_comments: true,
+                supports_summary_comment: true,
+            },
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "description": "What the review says",
+                        "default": default,
+                        "enum": verdicts,
+                    },
+                    "summary": { "type": "string", "description": "Summary of the review (markdown)" },
+                }
+            }),
+            route: None,
+            pull_request_provider: Some(manifest.id.clone()),
+        },
+        plugin_id: None,
+        provider: Some(manifest.id.clone()),
+    }
+}
+
+/// How a verdict is written in options.
+#[must_use]
+pub fn verdict_value(verdict: bcode_code_review_models::ReviewVerdict) -> String {
+    match verdict {
+        bcode_code_review_models::ReviewVerdict::Comment => "comment",
+        bcode_code_review_models::ReviewVerdict::Approve => "approve",
+        bcode_code_review_models::ReviewVerdict::RequestChanges => "request_changes",
+    }
+    .to_owned()
+}
+
+/// The verdict of `options` (comment when unset).
+fn options_verdict(options: &serde_json::Value) -> bcode_code_review_models::ReviewVerdict {
+    match options.get("verdict").and_then(serde_json::Value::as_str) {
+        Some("approve") => bcode_code_review_models::ReviewVerdict::Approve,
+        Some("request_changes") => bcode_code_review_models::ReviewVerdict::RequestChanges,
+        _ => bcode_code_review_models::ReviewVerdict::Comment,
+    }
 }
 
 /// Readiness of the review for publishing (the checklist header).
@@ -102,6 +195,10 @@ pub struct PreparedBundle {
     pub anchors: Vec<DraftAnchor>,
     /// The publisher's preview.
     pub preview: String,
+    /// For a provider's own review: the request to submit.
+    pub request: Option<bcode_code_review_models::ReviewSubmitRequest>,
+    /// Draft ids of the replies held for this review (deleted once it is submitted).
+    pub held: Vec<String>,
 }
 
 /// What submitting did.
@@ -113,6 +210,10 @@ pub struct SubmitReport {
     pub failed: Option<(usize, String)>,
     /// Publish records that could not be saved.
     pub record_errors: Vec<String>,
+    /// Draft ids of held replies sent with the published reviews.
+    pub sent_replies: Vec<String>,
+    /// Pull requests reviews went to.
+    pub reviewed: Vec<ReviewPullRequestTarget>,
 }
 
 /// Work the surface runs for the flow.
@@ -188,8 +289,6 @@ pub struct PublishFlow {
     step: Step,
     readiness: Readiness,
     threads: Vec<ChecklistThread>,
-    /// Providers of the review's pull-request sources (publishers for them are preferred).
-    pull_providers: BTreeSet<String>,
     /// Pull requests the review publishes to, per provider (shown in the options step).
     targets: BTreeMap<String, Vec<ReviewPullRequestTarget>>,
     publishers: Option<Vec<PublisherEntry>>,
@@ -202,6 +301,8 @@ pub struct PublishFlow {
     scroll: Cell<ScrollViewState>,
     error: Option<String>,
     painted: Option<(Rect, LayoutNode)>,
+    /// The review the flow was opened for, when it was opened for one.
+    preset: Option<Box<Preset>>,
 }
 
 impl std::fmt::Debug for PublishFlow {
@@ -225,7 +326,6 @@ impl PublishFlow {
             step: Step::Checklist,
             readiness,
             threads,
-            pull_providers: targets.keys().cloned().collect(),
             targets,
             publishers: None,
             publisher: None,
@@ -237,9 +337,31 @@ impl PublishFlow {
             scroll: Cell::new(ScrollViewState::new()),
             error: None,
             painted: None,
+            preset: None,
         };
         flow.checklist_items(theme);
         flow
+    }
+
+    /// A flow for `preset`: straight to its provider's review options.
+    #[must_use]
+    pub fn for_preset(
+        readiness: Readiness,
+        threads: Vec<ChecklistThread>,
+        targets: BTreeMap<String, Vec<ReviewPullRequestTarget>>,
+        preset: Preset,
+        theme: &ReviewTheme,
+    ) -> (Self, FlowOutcome) {
+        let mut flow = Self::new(readiness, threads, targets, theme);
+        flow.preset = Some(Box::new(preset));
+        let outcome = flow.continue_to_publishers(theme);
+        (flow, outcome)
+    }
+
+    /// The review the flow was opened for.
+    #[must_use]
+    pub fn preset(&self) -> Option<&Preset> {
+        self.preset.as_deref()
     }
 
     /// The current step.
@@ -403,7 +525,7 @@ impl PublishFlow {
                     .manifest
                     .pull_request_provider
                     .as_ref()
-                    .is_some_and(|provider| self.pull_providers.contains(provider))
+                    .is_some_and(|provider| self.targets.contains_key(provider))
             })
             .or_else(|| {
                 publishers
@@ -487,9 +609,23 @@ impl PublishFlow {
     pub fn apply(&mut self, result: FlowResult, theme: &ReviewTheme) -> Option<SubmitReport> {
         match result {
             FlowResult::Publishers(publishers) => {
+                // Opened for a review: its provider's publisher, with the verdict chosen.
+                let preset = self.preset.as_ref().and_then(|preset| {
+                    let provider = &preset.targets.first()?.provider;
+                    let index = publishers
+                        .iter()
+                        .position(|entry| entry.provider.as_ref() == Some(provider))?;
+                    Some((index, preset.verdict))
+                });
                 self.publishers = Some(publishers);
                 self.step = Step::Publishers;
                 self.publisher_items(theme);
+                if let Some((index, verdict)) = preset {
+                    let _ = self.choose_publisher(index);
+                    if let Some(form) = self.form.as_mut() {
+                        form.set("verdict", &verdict_value(verdict));
+                    }
+                }
             }
             FlowResult::Prepared(Ok(prepared)) => {
                 self.preview = preview_lines(&prepared, theme);
@@ -855,18 +991,52 @@ pub struct PrepareContext {
     pub threads: Vec<PublishThread>,
     /// Review target used when a bundle's diff has no commit range.
     pub fallback_target: ReviewTarget,
+    /// Replies held for the next review of their pull request.
+    pub held: Vec<HeldReplyDraft>,
+    /// Head commit the review shows of each pull request.
+    pub heads: BTreeMap<ReviewPullRequestTarget, String>,
+    /// Pull requests that get a review even without comments (the flow's preset).
+    pub preset_targets: Vec<ReviewPullRequestTarget>,
+}
+
+/// A reply to a pull request thread, held for the next review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldReplyDraft {
+    /// The pull request.
+    pub target: ReviewPullRequestTarget,
+    /// The provider's thread id.
+    pub thread_id: String,
+    /// Body.
+    pub body: String,
+    /// The draft's id.
+    pub comment_id: String,
 }
 
 /// Discover built-in and external publishers; external publishers that do not answer are
 /// left out.
 pub async fn discover(services: ReviewServices) -> Vec<PublisherEntry> {
-    let mut entries: Vec<PublisherEntry> = bcode_code_review::store::publishers()
-        .into_iter()
-        .map(|manifest| PublisherEntry {
-            manifest,
-            plugin_id: None,
-        })
+    // A provider that reviews its own pull requests comes first; plugin publishers for the same
+    // provider's pull requests are then left out (they publish the same reviews).
+    let mut entries: Vec<PublisherEntry> = services
+        .providers()
+        .sources()
+        .iter()
+        .filter(|route| route.manifest.conversation.verdicts.any())
+        .map(|route| provider_entry(&route.manifest, None))
         .collect();
+    let reviewed: BTreeSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.provider.clone())
+        .collect();
+    entries.extend(
+        bcode_code_review::store::publishers()
+            .into_iter()
+            .map(|manifest| PublisherEntry {
+                manifest,
+                plugin_id: None,
+                provider: None,
+            }),
+    );
     let plugins = services
         .host()
         .plugins_serving(REVIEW_PUBLISHER_INTERFACE_ID.to_owned())
@@ -885,10 +1055,16 @@ pub async fn discover(services: ReviewServices) -> Vec<PublisherEntry> {
         else {
             continue;
         };
-        if let Ok(manifest) = serde_json::from_slice::<ReviewPublisherManifest>(&payload) {
+        if let Ok(manifest) = serde_json::from_slice::<ReviewPublisherManifest>(&payload)
+            && !manifest
+                .pull_request_provider
+                .as_ref()
+                .is_some_and(|provider| reviewed.contains(provider))
+        {
             entries.push(PublisherEntry {
                 manifest,
                 plugin_id: Some(plugin_id),
+                provider: None,
             });
         }
     }
@@ -908,13 +1084,21 @@ pub async fn prepare(
     included: BTreeSet<String>,
 ) -> Result<Vec<PreparedBundle>, String> {
     let provider = publisher.manifest.pull_request_provider.clone();
+    // Held replies go with their pull request's review, not as threads of their own.
     let threads: Vec<PublishThread> = context
         .threads
         .iter()
-        .filter(|thread| included.contains(&thread.thread_id))
+        .filter(|thread| {
+            included.contains(&thread.thread_id)
+                && thread
+                    .anchor()
+                    .is_none_or(|anchor| anchor.reply_to.is_none())
+        })
         .cloned()
         .collect();
-    if threads.is_empty() {
+    let reviews_alone = publisher.provider.is_some()
+        && (!context.held.is_empty() || !context.preset_targets.is_empty());
+    if threads.is_empty() && !reviews_alone {
         return Err("no threads selected to publish".to_owned());
     }
     let sources: Vec<PlanSource<'_>> = context
@@ -955,17 +1139,30 @@ pub async fn prepare(
             attributions.insert((source_id, path), response);
         }
     }
-    let planned = bcode_code_review::publish_plan::plan(
-        threads,
-        &sources,
-        provider.as_deref(),
-        &attributions,
-    );
+    let mut planned = if threads.is_empty() {
+        Vec::new()
+    } else {
+        bcode_code_review::publish_plan::plan(threads, &sources, provider.as_deref(), &attributions)
+    };
+    if publisher.provider.is_some() {
+        add_review_targets(&mut planned, &context);
+    }
     let mut hunks: HunkCache = BTreeMap::new();
     let mut prepared = Vec::new();
     for bundle in planned {
         let built = build_bundle(&services, &context, &bundle, &mut hunks).await;
-        let preview = preview(&services, &publisher, &built, &options).await?;
+        let (preview, request, held) = match (&publisher.provider, &bundle.target) {
+            (Some(provider), Some(target)) => {
+                let (request, held) = provider_request(&context, target, &options, &built);
+                let preview = provider_preview(&services, provider, &request).await?;
+                (preview, Some(request), held)
+            }
+            _ => (
+                preview(&services, &publisher, &built, &options).await?,
+                None,
+                Vec::new(),
+            ),
+        };
         prepared.push(PreparedBundle {
             label: bundle.label.clone(),
             anchors: bundle
@@ -975,9 +1172,126 @@ pub async fn prepare(
                 .collect(),
             bundle: built,
             preview,
+            request,
+            held,
         });
     }
     Ok(prepared)
+}
+
+/// Every pull request with held replies or in the preset gets a review, comments or not.
+fn add_review_targets(planned: &mut Vec<PlannedBundle>, context: &PrepareContext) {
+    let wanted = context
+        .held
+        .iter()
+        .map(|held| &held.target)
+        .chain(&context.preset_targets);
+    for target in wanted {
+        if !planned
+            .iter()
+            .any(|bundle| bundle.target.as_ref() == Some(target))
+        {
+            planned.push(PlannedBundle {
+                target: Some(target.clone()),
+                label: format!("#{}", target.number),
+                source_id: None,
+                threads: Vec::new(),
+            });
+        }
+    }
+}
+
+/// The review of `target` a provider submits: the verdict and summary of `options`, `built`'s
+/// threads, and the replies held for it (with their draft ids).
+fn provider_request(
+    context: &PrepareContext,
+    target: &ReviewPullRequestTarget,
+    options: &serde_json::Value,
+    built: &ReviewBundle,
+) -> (bcode_code_review_models::ReviewSubmitRequest, Vec<String>) {
+    let held: Vec<&HeldReplyDraft> = context
+        .held
+        .iter()
+        .filter(|held| &held.target == target)
+        .collect();
+    let request = bcode_code_review_models::ReviewSubmitRequest {
+        pull: bcode_code_review_models::PullLocator {
+            repo_path: context.repo_path.clone(),
+            repository: Some(target.repository.clone()),
+            number: target.number,
+        },
+        verdict: options_verdict(options),
+        body: options
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        head_oid: context.heads.get(target).cloned(),
+        bundle: (!built.threads.is_empty()).then(|| built.clone()),
+        replies: held
+            .iter()
+            .map(|held| bcode_code_review_models::HeldReply {
+                thread_id: held.thread_id.clone(),
+                body: held.body.clone(),
+            })
+            .collect(),
+        unplaced_into_body: true,
+    };
+    (
+        request,
+        held.iter().map(|held| held.comment_id.clone()).collect(),
+    )
+}
+
+/// A provider's preview of its review, or (when it does not preview) a summary of what goes.
+async fn provider_preview(
+    services: &ReviewServices,
+    provider: &str,
+    request: &bcode_code_review_models::ReviewSubmitRequest,
+) -> Result<String, String> {
+    let previews = services
+        .providers()
+        .source(provider)
+        .is_some_and(|route| route.manifest.conversation.review_preview);
+    if previews {
+        let response = crate::conversation::preview_review(
+            services.clone(),
+            provider.to_owned(),
+            request.clone(),
+        )
+        .await?;
+        let mut preview = response.preview;
+        if response.unplaced > 0 {
+            let _ = write!(
+                preview,
+                "\n\n{} comment{} cannot be placed inline and go into the summary.",
+                response.unplaced,
+                if response.unplaced == 1 { "" } else { "s" }
+            );
+        }
+        return Ok(preview);
+    }
+    let comments = request
+        .bundle
+        .as_ref()
+        .map_or(0, |bundle| bundle.threads.len());
+    Ok(format!(
+        "{} on #{}: {comments} comment{}, {} repl{}{}",
+        verdict_value(request.verdict),
+        request.pull.number,
+        if comments == 1 { "" } else { "s" },
+        request.replies.len(),
+        if request.replies.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        if request.body.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", request.body)
+        }
+    ))
 }
 
 /// Hunks read while building bundles, by diff (source, base, head, part) and path.
@@ -1168,33 +1482,60 @@ pub async fn submit(
         done: Vec::new(),
         failed: None,
         record_errors: Vec::new(),
+        sent_replies: Vec::new(),
+        reviewed: Vec::new(),
     };
     for (index, prepared) in bundles.iter().enumerate() {
         if skip.contains(&index) {
             continue;
         }
-        let result: Result<PublishReviewResponse, String> = match &publisher.plugin_id {
-            None => services
-                .call(SubmitBundle(PublishBundleRequest {
-                    publisher_id: publisher.manifest.id.clone(),
-                    bundle: prepared.bundle.clone(),
-                    options: options.clone(),
-                }))
-                .await
-                .map_err(|error| error.message),
-            Some(plugin) => {
-                invoke(
-                    &services,
-                    plugin,
-                    OP_REVIEW_PUBLISHER_SUBMIT,
-                    &ExternalPublishReviewRequest {
-                        bundle: prepared.bundle.clone(),
-                        options: options.clone(),
-                    },
+        let result: Result<PublishReviewResponse, String> =
+            match (&publisher.provider, &prepared.request, &publisher.plugin_id) {
+                (Some(provider), Some(request), _) => crate::conversation::submit_review(
+                    services.clone(),
+                    provider.clone(),
+                    request.clone(),
                 )
                 .await
-            }
-        };
+                .map(|response| {
+                    report.sent_replies.extend(prepared.held.iter().cloned());
+                    if let Some(target) = &prepared.bundle.pull_request {
+                        report.reviewed.push(target.clone());
+                    } else {
+                        report.reviewed.push(ReviewPullRequestTarget {
+                            provider: provider.clone(),
+                            repository: request.pull.repository.clone().unwrap_or_default(),
+                            number: request.pull.number,
+                        });
+                    }
+                    PublishReviewResponse {
+                        publisher_id: publisher.manifest.id.clone(),
+                        submitted: true,
+                        output: response.url,
+                        message: response.message,
+                    }
+                }),
+                (_, _, None) => services
+                    .call(SubmitBundle(PublishBundleRequest {
+                        publisher_id: publisher.manifest.id.clone(),
+                        bundle: prepared.bundle.clone(),
+                        options: options.clone(),
+                    }))
+                    .await
+                    .map_err(|error| error.message),
+                (_, _, Some(plugin)) => {
+                    invoke(
+                        &services,
+                        plugin,
+                        OP_REVIEW_PUBLISHER_SUBMIT,
+                        &ExternalPublishReviewRequest {
+                            bundle: prepared.bundle.clone(),
+                            options: options.clone(),
+                        },
+                    )
+                    .await
+                }
+            };
         match result {
             Ok(response) => {
                 if let Some(workspace) = &workspace {

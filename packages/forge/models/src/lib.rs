@@ -261,13 +261,34 @@ pub enum ForgeError {
     Unauthenticated(String),
     /// The request failed.
     Failed(String),
+    /// The forge refused: the credentials may not do this.
+    Forbidden(String),
+    /// The forge could not be reached, failed on its side, or is rate limiting.
+    Unavailable(String),
+}
+
+impl ForgeError {
+    /// The same kind of error with `message` in place of its message.
+    #[must_use]
+    pub fn with_message(self, message: String) -> Self {
+        match self {
+            Self::UnsupportedHost(_) => Self::UnsupportedHost(message),
+            Self::Unauthenticated(_) => Self::Unauthenticated(message),
+            Self::Failed(_) => Self::Failed(message),
+            Self::Forbidden(_) => Self::Forbidden(message),
+            Self::Unavailable(_) => Self::Unavailable(message),
+        }
+    }
 }
 
 impl std::fmt::Display for ForgeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedHost(host) => write!(formatter, "{host} is not a supported forge"),
-            Self::Unauthenticated(message) | Self::Failed(message) => formatter.write_str(message),
+            Self::Unauthenticated(message)
+            | Self::Failed(message)
+            | Self::Forbidden(message)
+            | Self::Unavailable(message) => formatter.write_str(message),
         }
     }
 }

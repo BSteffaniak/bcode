@@ -43,6 +43,8 @@ pub enum Message {
     HistoryPanel(Result<bcode_code_review_models::StackTimeline, String>),
     /// A comparison from the history panel: its title and comparisons, or the failure.
     HistoryCompared(Result<(String, Vec<bcode_code_review::history::compare::Comparison>), String>),
+    /// Pull request conversation work finished.
+    Conversation(Box<super::surface::ConversationMessage>),
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

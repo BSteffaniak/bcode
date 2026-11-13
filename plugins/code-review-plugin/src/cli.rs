@@ -35,13 +35,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_publishing_needs_the_daemon_before_the_command_runs() {
+    fn no_review_command_needs_the_daemon_before_it_runs() {
         let registration = registration();
         for (args, daemon) in [
             (vec!["review"], false),
             (vec!["review", "staged", "--repo", "/tmp/review"], false),
             (vec!["review", "pr", "42"], false),
-            (vec!["review", "publish-github", "--submit"], true),
+            (vec!["review", "publish", "--submit"], false),
+            (vec!["review", "publish-github", "--submit"], false),
         ] {
             let matches = (registration.command)()
                 .try_get_matches_from(&args)

@@ -45,6 +45,7 @@ pub mod cli;
 pub mod composer;
 pub mod config;
 pub mod context;
+pub mod conversation;
 pub mod entry;
 pub mod files;
 pub mod history;

@@ -239,8 +239,18 @@ impl ReviewSurface {
         }
     }
 
+    /// Submit the composer the other way: a reply to a pull request thread sent now instead of
+    /// held, or held instead of sent.
+    pub(super) fn submit_composer_alternate(&mut self) {
+        self.submit_with(true);
+    }
+
     /// Submit the composer.
     pub(super) fn submit_composer(&mut self) {
+        self.submit_with(false);
+    }
+
+    fn submit_with(&mut self, alternate: bool) {
         let Some(composer) = self.composer.as_ref() else {
             return;
         };
@@ -253,6 +263,7 @@ impl ReviewSurface {
         let anchor = composer.anchor.clone();
         let mode = composer.mode.clone();
         let classify = (composer.kind, composer.severity);
+        let remote_reply = composer.remote_reply;
         self.close_composer();
         let now = now_ms();
         let result = match mode {
@@ -261,6 +272,13 @@ impl ReviewSurface {
                     .add_draft(anchor.to_draft_anchor(), text, None, Some(classify), now);
                 Ok("draft saved")
             }
+            ComposerMode::Reply { thread_id } if remote_reply.is_some() => {
+                let send_now = (remote_reply
+                    == Some(crate::config::conversation::ReplyMode::SendNow))
+                    != alternate;
+                self.reply_remote(&thread_id, text, send_now)
+            }
+            ComposerMode::Conversation { pull, .. } => self.post_conversation_comment(&pull, text),
             ComposerMode::Reply { thread_id } => {
                 match self
                     .notes
@@ -366,6 +384,7 @@ impl ReviewSurface {
         self.focus = Focus::Composer;
         match button {
             ComposerButton::Submit => self.submit_composer(),
+            ComposerButton::Alternate => self.submit_composer_alternate(),
             ComposerButton::Switch => composer.switch(),
             ComposerButton::Preview => {
                 composer.preview = !composer.preview;
@@ -473,6 +492,11 @@ impl ReviewSurface {
             self.fold();
             return None;
         }
+        if let Some(thread_id) = self.thread_at_cursor()
+            && self.remote_thread_action(&thread_id, action, None)
+        {
+            return None;
+        }
         if self.refuse_external_thread() {
             return None;
         }
@@ -541,6 +565,10 @@ impl ReviewSurface {
             }
             ThreadAction::Reject => {
                 self.decide_suggestion(ReviewSuggestionStatus::Rejected);
+                return None;
+            }
+            ThreadAction::Open => {
+                self.set_status("this thread has no web page", StatusSeverity::Info);
                 return None;
             }
         };
@@ -874,7 +902,8 @@ impl ReviewSurface {
         let mut entries: Vec<(String, u32, ItemKey, Line)> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for draft in self.notes.drafts() {
-            if !seen.insert(draft.thread_id.clone()) {
+            // A held reply is listed with its pull request thread.
+            if draft.anchor.reply_to.is_some() || !seen.insert(draft.thread_id.clone()) {
                 continue;
             }
             let comments = self.notes.thread(&draft.thread_id);
@@ -912,6 +941,7 @@ impl ReviewSurface {
             ));
         }
         entries.extend(self.external_thread_entries());
+        entries.extend(self.remote_thread_entries());
         for exchange in self.notes.exchanges() {
             if !self.threads_filter.matches_exchange(exchange) {
                 continue;
@@ -950,6 +980,61 @@ impl ReviewSurface {
                 .push(TreeViewItem::rich(format!("t{index}"), line, 0));
             rows.keys.push(key);
         }
+    }
+
+    /// Threads panel entries of pull request threads: `(path, line, key, row)`.
+    fn remote_thread_entries(&self) -> Vec<(String, u32, ItemKey, Line)> {
+        let theme = &self.theme;
+        let mut entries = Vec::new();
+        for (thread_id, remote) in self.notes.remote_threads() {
+            if !self.threads_filter.matches_remote(remote) {
+                continue;
+            }
+            let comments = self.notes.thread(thread_id);
+            let Some(first) = comments.first() else {
+                continue;
+            };
+            let author = remote
+                .authors
+                .get(&first.comment_id)
+                .map(|(author, _)| author.clone())
+                .unwrap_or_default();
+            let (state, style) = if remote.resolved {
+                ("resolved", theme.badge_resolved)
+            } else if remote.waiting {
+                ("waiting on you", theme.pill_warning)
+            } else if remote.new {
+                ("new", theme.badge_draft)
+            } else {
+                ("open", theme.badge_open)
+            };
+            let line = first.anchor.new_line.or(first.anchor.old_line).unwrap_or(0);
+            entries.push((
+                first.anchor.file_path.clone(),
+                line,
+                ItemKey::Thread {
+                    thread_id: thread_id.clone(),
+                },
+                Line::from_spans(vec![
+                    Span::styled(theme.icons.thread, theme.thread),
+                    Span::raw(" "),
+                    Span::styled(state, style),
+                    Span::raw(" "),
+                    Span::styled(author, theme.title),
+                    Span::raw(" "),
+                    Span::styled(location_label(&first.anchor), theme.path),
+                    Span::raw(" "),
+                    Span::styled(
+                        comments
+                            .last()
+                            .map(|last| last.body.lines().next().unwrap_or_default().to_owned())
+                            .unwrap_or_default(),
+                        theme.text,
+                    ),
+                ]),
+            ));
+        }
+        entries
     }
 
     /// Threads panel entries of imported threads: `(path, line, key, row)`.

@@ -38,9 +38,307 @@ pub struct FakeProvider {
     unlisted: Vec<u64>,
     closed: Mutex<Vec<u64>>,
     calls: Mutex<Vec<String>>,
+    conversation: Option<Mutex<FakeConversation>>,
+}
+
+/// Conversations the fake serves: kept in memory and changed by the write operations, the
+/// viewer being `me`.
+#[derive(Debug, Default)]
+struct FakeConversation {
+    capabilities: bcode_code_review_models::ConversationCapabilities,
+    activities: std::collections::BTreeMap<u64, bcode_code_review_models::PullActivity>,
+    submitted: Vec<bcode_code_review_models::ReviewSubmitRequest>,
+    next_id: u64,
+}
+
+impl FakeConversation {
+    fn comment(&mut self, body: String) -> bcode_code_review_models::RemoteComment {
+        self.next_id += 1;
+        bcode_code_review_models::RemoteComment {
+            id: format!("posted-{}", self.next_id),
+            author: bcode_code_review_models::Participant {
+                login: "me".to_owned(),
+                is_viewer: true,
+                ..Default::default()
+            },
+            body,
+            created_at_ms: Some(2_000_000_000_000 + self.next_id),
+            updated_at_ms: None,
+            url: None,
+            review_id: None,
+        }
+    }
+
+    fn activity(&mut self, number: u64) -> &mut bcode_code_review_models::PullActivity {
+        self.activities
+            .entry(number)
+            .or_insert_with(|| bcode_code_review_models::PullActivity {
+                number,
+                title: format!("Layer {number}"),
+                head_oid: String::new(),
+                state: bcode_code_review_models::PullState::Open,
+                author: None,
+                description: String::new(),
+                url: None,
+                decision: None,
+                reviews: Vec::new(),
+                requested: Vec::new(),
+                threads: Vec::new(),
+                comments: Vec::new(),
+                checks: bcode_code_review_models::Checks::default(),
+                viewer: bcode_code_review_models::ViewerAbilities::default(),
+                updated_at_ms: None,
+            })
+    }
+
+    fn thread(
+        &mut self,
+        number: u64,
+        thread_id: &str,
+    ) -> &mut bcode_code_review_models::RemoteThread {
+        self.activity(number)
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+            .expect("known thread")
+    }
+
+    /// Preview or submit a review: a submitted one posts its held replies and records its
+    /// verdict as the viewer's review.
+    fn review(&mut self, operation: &str, payload: &[u8]) -> Vec<u8> {
+        use bcode_code_review_models as models;
+        let encode = |value: serde_json::Value| serde_json::to_vec(&value).expect("encodes");
+        let request: models::ReviewSubmitRequest =
+            serde_json::from_slice(payload).expect("review request");
+        if operation == models::OP_REVIEW_SOURCE_REVIEW_PREVIEW {
+            let comments = request
+                .bundle
+                .as_ref()
+                .map_or(0, |bundle| bundle.threads.len());
+            return encode(
+                serde_json::to_value(models::ReviewPreviewResponse {
+                    preview: format!(
+                        "{:?} on #{}: {comments} comments, {} replies",
+                        request.verdict,
+                        request.pull.number,
+                        request.replies.len()
+                    ),
+                    unplaced: 0,
+                })
+                .expect("preview"),
+            );
+        }
+        for reply in &request.replies {
+            let comment = self.comment(reply.body.clone());
+            self.thread(request.pull.number, &reply.thread_id)
+                .comments
+                .push(comment);
+        }
+        let review = self.comment(request.body.clone());
+        self.activity(request.pull.number)
+            .reviews
+            .push(models::PullReview {
+                id: review.id,
+                author: review.author,
+                state: match request.verdict {
+                    models::ReviewVerdict::Approve => models::ReviewState::Approved,
+                    models::ReviewVerdict::RequestChanges => models::ReviewState::ChangesRequested,
+                    models::ReviewVerdict::Comment => models::ReviewState::Commented,
+                },
+                body: request.body.clone(),
+                at_ms: review.created_at_ms,
+                commit_oid: request.head_oid.clone(),
+                url: None,
+            });
+        let number = request.pull.number;
+        self.submitted.push(request);
+        encode(
+            serde_json::to_value(models::ReviewSubmitResponse {
+                url: Some(format!(
+                    "https://example.com/{FAKE_REPOSITORY}/pull/{number}"
+                )),
+                message: format!("Reviewed #{number}"),
+            })
+            .expect("submit"),
+        )
+    }
+
+    fn answer(
+        &mut self,
+        operation: &str,
+        payload: &[u8],
+        heads: &std::collections::BTreeMap<u64, String>,
+    ) -> Vec<u8> {
+        use bcode_code_review_models as models;
+        let encode = |value: serde_json::Value| serde_json::to_vec(&value).expect("encodes");
+        match operation {
+            models::OP_REVIEW_SOURCE_PULLS_ACTIVITY => {
+                let request: models::ReviewSourcePullsActivityRequest =
+                    serde_json::from_slice(payload).expect("activity request");
+                let activities = request
+                    .numbers
+                    .iter()
+                    .map(|number| {
+                        let mut activity = self.activity(*number).clone();
+                        if activity.head_oid.is_empty() {
+                            activity.head_oid = heads.get(number).cloned().unwrap_or_default();
+                        }
+                        activity
+                    })
+                    .collect();
+                encode(
+                    serde_json::to_value(models::ReviewSourcePullsActivityResponse {
+                        repository: FAKE_REPOSITORY.to_owned(),
+                        activities,
+                    })
+                    .expect("activity"),
+                )
+            }
+            models::OP_REVIEW_SOURCE_THREAD_REPLY => {
+                let request: models::ThreadReplyRequest =
+                    serde_json::from_slice(payload).expect("reply request");
+                let comment = self.comment(request.body);
+                self.thread(request.pull.number, &request.thread_id)
+                    .comments
+                    .push(comment.clone());
+                encode(
+                    serde_json::to_value(models::CommentPostedResponse { comment }).expect("reply"),
+                )
+            }
+            models::OP_REVIEW_SOURCE_THREAD_RESOLVE => {
+                let request: models::ThreadResolveRequest =
+                    serde_json::from_slice(payload).expect("resolve request");
+                self.thread(request.pull.number, &request.thread_id)
+                    .resolved = request.resolved;
+                encode(
+                    serde_json::to_value(models::ThreadResolveResponse {
+                        resolved: request.resolved,
+                    })
+                    .expect("resolve"),
+                )
+            }
+            models::OP_REVIEW_SOURCE_COMMENT_POST => {
+                let request: models::CommentPostRequest =
+                    serde_json::from_slice(payload).expect("comment request");
+                let comment = self.comment(request.body);
+                self.activity(request.pull.number)
+                    .comments
+                    .push(comment.clone());
+                encode(
+                    serde_json::to_value(models::CommentPostedResponse { comment })
+                        .expect("comment"),
+                )
+            }
+            _ => self.review(operation, payload),
+        }
+    }
 }
 
 impl FakeProvider {
+    /// The conversation operations it serves.
+    fn conversation_capabilities(&self) -> bcode_code_review_models::ConversationCapabilities {
+        self.conversation
+            .as_ref()
+            .map(|conversation| conversation.lock().expect("conversation lock").capabilities)
+            .unwrap_or_default()
+    }
+
+    /// Serve pull request conversations with `capabilities` (each pull request starts with an
+    /// empty one; see [`Self::set_activity`]).
+    #[must_use]
+    pub fn with_conversation(
+        mut self,
+        capabilities: bcode_code_review_models::ConversationCapabilities,
+    ) -> Self {
+        self.conversation = Some(Mutex::new(FakeConversation {
+            capabilities,
+            ..FakeConversation::default()
+        }));
+        self
+    }
+
+    /// Replace a pull request's conversation (its head is the branch's current commit when
+    /// empty).
+    ///
+    /// # Panics
+    ///
+    /// Panics without [`Self::with_conversation`] or when the lock is poisoned.
+    pub fn set_activity(&self, activity: bcode_code_review_models::PullActivity) {
+        self.conversation
+            .as_ref()
+            .expect("with_conversation")
+            .lock()
+            .expect("conversation lock")
+            .activities
+            .insert(activity.number, activity);
+    }
+
+    /// A pull request's conversation as the fake holds it now.
+    ///
+    /// # Panics
+    ///
+    /// Panics without [`Self::with_conversation`] or when the lock is poisoned.
+    #[must_use]
+    pub fn activity(&self, number: u64) -> Option<bcode_code_review_models::PullActivity> {
+        self.conversation
+            .as_ref()
+            .expect("with_conversation")
+            .lock()
+            .expect("conversation lock")
+            .activities
+            .get(&number)
+            .cloned()
+    }
+
+    /// Reviews submitted so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics without [`Self::with_conversation`] or when the lock is poisoned.
+    #[must_use]
+    pub fn submitted(&self) -> Vec<bcode_code_review_models::ReviewSubmitRequest> {
+        self.conversation
+            .as_ref()
+            .expect("with_conversation")
+            .lock()
+            .expect("conversation lock")
+            .submitted
+            .clone()
+    }
+
+    /// Answer a conversation operation, `None` when `operation` is not one.
+    fn converse(
+        &self,
+        operation: &str,
+        payload: &[u8],
+    ) -> Option<Result<Vec<u8>, ProviderCallError>> {
+        use bcode_code_review_models as models;
+        let conversation = self.conversation.as_ref()?;
+        let known = [
+            models::OP_REVIEW_SOURCE_PULLS_ACTIVITY,
+            models::OP_REVIEW_SOURCE_THREAD_REPLY,
+            models::OP_REVIEW_SOURCE_THREAD_RESOLVE,
+            models::OP_REVIEW_SOURCE_COMMENT_POST,
+            models::OP_REVIEW_SOURCE_REVIEW_PREVIEW,
+            models::OP_REVIEW_SOURCE_REVIEW_SUBMIT,
+        ];
+        if !known.contains(&operation) {
+            return None;
+        }
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push(operation.to_owned());
+        let heads: std::collections::BTreeMap<u64, String> = self
+            .summaries()
+            .into_iter()
+            .map(|pull| (pull.number, pull.head_oid))
+            .collect();
+        let mut state = conversation.lock().expect("conversation lock");
+        Some(Ok(state.answer(operation, payload, &heads)))
+    }
+
+    /// A provider for the fixture at `repo`.
     /// A provider for the fixture at `repo`.
     #[must_use]
     pub fn new(repo: &Path) -> Self {
@@ -50,6 +348,7 @@ impl FakeProvider {
             unlisted: Vec::new(),
             closed: Mutex::default(),
             calls: Mutex::default(),
+            conversation: None,
         }
     }
 
@@ -220,6 +519,9 @@ impl FakeProvider {
     ///
     /// Panics when a request does not decode or the lock is poisoned.
     pub fn answer(&self, operation: &str, payload: &[u8]) -> Result<Vec<u8>, ProviderCallError> {
+        if let Some(answer) = self.converse(operation, payload) {
+            return answer;
+        }
         let encode = |value: serde_json::Value| Ok(serde_json::to_vec(&value).expect("encodes"));
         let record = |call: String| self.calls.lock().expect("calls lock").push(call);
         match operation {
@@ -239,6 +541,7 @@ impl FakeProvider {
                                 pulls_history: false,
                             },
                         },
+                        conversation: self.conversation_capabilities(),
                     })
                     .expect("manifest"),
                 )

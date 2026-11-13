@@ -30,6 +30,7 @@ use bcode_config_layers::user_state::{
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 use bcode_tui_theme::appearance::{AppearanceSources, SavedAppearance, ThemePreferences};
 
+pub mod conversation;
 pub mod view;
 
 pub use view::{ConfiguredLayout, DiffLayout, ReviewViewConfig, resolve};
@@ -112,6 +113,8 @@ pub struct LoadedConfig {
     pub view: ReviewViewConfig,
     /// Stack layer limit from the plugin table's `stack` table.
     pub stack_limit: ReviewStackLimit,
+    /// Pull request conversations, from the plugin table's `conversation` table.
+    pub conversation: conversation::ConversationConfig,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
     /// Configured theme selection (`[tui.theme]`).
@@ -216,6 +219,41 @@ pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> Appeara
     }
 }
 
+/// Read the review's plugin table into `loaded`, reporting what is invalid.
+fn read_plugin_table(table: &toml::Table, loaded: &mut LoadedConfig) {
+    loaded.plugin = table.clone();
+    loaded.view = ReviewViewConfig::from_plugin_table(table);
+    let (conversation, problem) = conversation::ConversationConfig::from_plugin_table(table);
+    loaded.conversation = conversation;
+    loaded.diagnostics.extend(problem);
+    if let Some(stack) = table.get("stack") {
+        match stack.clone().try_into::<ReviewStackLimit>() {
+            Ok(limit) => loaded.stack_limit = limit,
+            Err(error) => loaded.diagnostics.push(format!(
+                "plugins.config.\"{PLUGIN_ID}\".stack: {}",
+                first_line(&error.to_string())
+            )),
+        }
+    }
+    if let Some(reset) = table.get("viewed_reset")
+        && reset
+            .clone()
+            .try_into::<bcode_code_review::viewed::ViewedReset>()
+            .is_err()
+    {
+        loaded.diagnostics.push(format!(
+            "plugins.config.\"{PLUGIN_ID}\".viewed_reset must be \"diff\" or \"file\""
+        ));
+    }
+    match toml::Value::Table(table.clone()).try_into::<CodeReviewConfig>() {
+        Ok(store) => loaded.store = store,
+        Err(error) => loaded.diagnostics.push(format!(
+            "plugins.config.\"{PLUGIN_ID}\": {}",
+            first_line(&error.to_string())
+        )),
+    }
+}
+
 /// Interpret an already-merged `bcode.toml` table.
 #[must_use]
 pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
@@ -228,36 +266,7 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
         .any(|id| id == PLUGIN_ID);
     if let Some(value) = lookup(bcode, &["plugins", "config", PLUGIN_ID]) {
         match value.as_table() {
-            Some(table) => {
-                loaded.plugin = table.clone();
-                loaded.view = ReviewViewConfig::from_plugin_table(table);
-                if let Some(stack) = table.get("stack") {
-                    match stack.clone().try_into::<ReviewStackLimit>() {
-                        Ok(limit) => loaded.stack_limit = limit,
-                        Err(error) => loaded.diagnostics.push(format!(
-                            "plugins.config.\"{PLUGIN_ID}\".stack: {}",
-                            first_line(&error.to_string())
-                        )),
-                    }
-                }
-                if let Some(reset) = table.get("viewed_reset")
-                    && reset
-                        .clone()
-                        .try_into::<bcode_code_review::viewed::ViewedReset>()
-                        .is_err()
-                {
-                    loaded.diagnostics.push(format!(
-                        "plugins.config.\"{PLUGIN_ID}\".viewed_reset must be \"diff\" or \"file\""
-                    ));
-                }
-                match toml::Value::Table(table.clone()).try_into::<CodeReviewConfig>() {
-                    Ok(store) => loaded.store = store,
-                    Err(error) => loaded.diagnostics.push(format!(
-                        "plugins.config.\"{PLUGIN_ID}\": {}",
-                        first_line(&error.to_string())
-                    )),
-                }
-            }
+            Some(table) => read_plugin_table(table, &mut loaded),
             None => loaded
                 .diagnostics
                 .push(format!("plugins.config.\"{PLUGIN_ID}\" must be a table")),

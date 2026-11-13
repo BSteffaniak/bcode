@@ -31,6 +31,7 @@ fn anchor(path: &str, kind: ReviewLineKind, old: Option<u32>, new: Option<u32>) 
         source_id: None,
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     }
 }
 

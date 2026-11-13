@@ -4,23 +4,27 @@
 
 //! GitHub review publisher plugin for Bcode.
 //!
-//! Serves three interfaces: the review publisher (`bcode.review_publisher/v1`), the read-only
-//! review importer (`bcode.review_importer/v1`), and the review-source provider
-//! (`bcode.review_source/v1`), the last a thin adapter over `bcode_code_review_github`, which the
-//! review itself links and calls in-process.
+//! Serves three interfaces as thin adapters over `bcode_code_review_github`, which the review
+//! itself links and calls in-process: the review publisher (`bcode.review_publisher/v1`, which
+//! submits through the provider's `review_source.review.submit`), the read-only review importer
+//! (`bcode.review_importer/v1`, which reads the provider's `review_source.pulls.activity`), and
+//! the review-source provider (`bcode.review_source/v1`) itself.
 
+use bcode_code_review_github::{GitHubReviewSource, review_draft};
 use bcode_code_review_models::{
-    ExternalAnchorMappingStatus, ExternalPublishReviewRequest, ExternalReviewAnchorMapping,
-    ExternalReviewComment, ExternalReviewIdentity, ExternalReviewImportRequest,
-    ExternalReviewImportResponse, ExternalReviewThread, ExternalReviewThreadState,
-    OP_REVIEW_IMPORTER_IMPORT, OP_REVIEW_IMPORTER_MANIFEST, OP_REVIEW_PUBLISHER_MANIFEST,
-    OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, PublishReviewPreviewResponse,
-    PublishReviewResponse, REVIEW_IMPORTER_INTERFACE_ID, REVIEW_PUBLISHER_INTERFACE_ID,
-    REVIEW_SOURCE_INTERFACE_ID, ReviewBundle, ReviewBundleLine, ReviewBundleThread,
-    ReviewImporterManifest, ReviewLineKind, ReviewPublisherCapabilities, ReviewPublisherManifest,
+    DraftAnchor, ExternalAnchorMappingStatus, ExternalPublishReviewRequest,
+    ExternalReviewAnchorMapping, ExternalReviewComment, ExternalReviewIdentity,
+    ExternalReviewImportRequest, ExternalReviewImportResponse, ExternalReviewThread,
+    ExternalReviewThreadState, OP_REVIEW_IMPORTER_IMPORT, OP_REVIEW_IMPORTER_MANIFEST,
+    OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT,
+    PublishReviewPreviewResponse, PublishReviewResponse, PullLocator, REVIEW_IMPORTER_INTERFACE_ID,
+    REVIEW_PUBLISHER_INTERFACE_ID, REVIEW_SOURCE_INTERFACE_ID, RemoteAnchor, RemoteThread,
+    ReviewAnchorKind, ReviewBundle, ReviewImporterManifest, ReviewPublisherCapabilities,
+    ReviewPublisherManifest, ReviewSourcePullsActivityRequest, ReviewSubmitRequest, ReviewVerdict,
 };
+use bcode_code_review_provider::{ProviderCallError, ReviewSourceProvider};
 use bcode_plugin_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::env;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -28,7 +32,6 @@ use std::process::Command;
 use thiserror::Error;
 
 const PUBLISHER_ID: &str = "github_pr_review";
-const DEFAULT_TOKEN_ENV: &str = "GITHUB_TOKEN";
 const DEFAULT_SUBMIT_EVENT: &str = "COMMENT";
 
 /// GitHub review publisher plugin.
@@ -56,7 +59,7 @@ impl RustPlugin for GitHubReviewPublisherPlugin {
                 ),
             },
             REVIEW_SOURCE_INTERFACE_ID => match bcode_code_review_provider::serve_review_source(
-                &bcode_code_review_github::GitHubReviewSource,
+                &GitHubReviewSource,
                 &context.request.operation,
                 &context.request.payload,
             ) {
@@ -80,8 +83,7 @@ fn github_importer_manifest() -> ReviewImporterManifest {
             "type": "object",
             "properties": {
                 "repository": { "type": "string", "description": "GitHub repository, owner/repo. Defaults to gh repo view, then origin remote." },
-                "pull_request": { "type": "string", "description": "Pull request number. Defaults to gh pr view, then branch patterns like pr/123." },
-                "token_env": { "type": "string", "description": "GitHub token env var", "default": "GITHUB_TOKEN" }
+                "pull_request": { "type": "string", "description": "Pull request number. Defaults to gh pr view, then branch patterns like pr/123." }
             }
         }),
     }
@@ -101,35 +103,180 @@ fn import(request: &ServiceRequest) -> ServiceResponse {
 fn import_for_request(
     request: &ExternalReviewImportRequest,
 ) -> Result<ExternalReviewImportResponse, GitHubPublisherError> {
-    let options = GitHubImportOptions::from_json(
+    let options = GitHubPublishOptions::for_import(
         &request.options,
         &request.repo_root,
         request.pull_request.as_ref(),
     )?;
-    let resolved = options.resolve()?;
-    let (imported, thread_states) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let comments = fetch_github_review_comments(
-                &resolved.repository.value,
-                resolved.pull_request.value,
-                &resolved.auth.token,
-            )
-            .await?;
-            let states = fetch_github_review_thread_states(
-                &resolved.repository.value,
-                resolved.pull_request.value,
-                &resolved.auth.token,
-            )
-            .await?;
-            Ok::<_, GitHubPublisherError>((comments, states))
-        })?;
-    Ok(map_github_review_comments(
-        request,
-        imported,
-        &thread_states,
-    ))
+    let repository = options.resolve_repository()?;
+    let number = options.resolve_pull_request()?;
+    let activity = GitHubReviewSource.get_activity(&ReviewSourcePullsActivityRequest {
+        repo_path: request.repo_root.clone(),
+        repository: Some(repository.value),
+        numbers: vec![number.value],
+    })?;
+    let threads = activity
+        .activities
+        .into_iter()
+        .find(|activity| activity.number == number.value)
+        .ok_or(GitHubPublisherError::MissingPullRequest)?
+        .threads;
+    Ok(import_threads(request, &threads))
+}
+
+/// GitHub's threads as imported threads, mapped onto the request's files.
+fn import_threads(
+    request: &ExternalReviewImportRequest,
+    threads: &[RemoteThread],
+) -> ExternalReviewImportResponse {
+    let mut warnings = Vec::new();
+    let threads = threads
+        .iter()
+        .map(|thread| {
+            let mut mapping = map_anchor(request, &thread.anchor);
+            if thread.outdated && mapping.status == ExternalAnchorMappingStatus::Exact {
+                mapping.status = ExternalAnchorMappingStatus::Approximate;
+                mapping.message = Some(
+                    "GitHub marks this thread outdated; the anchor matches historical coordinates"
+                        .to_string(),
+                );
+            }
+            if mapping.status == ExternalAnchorMappingStatus::Unmappable {
+                warnings.push(format!(
+                    "GitHub thread {} at {} could not be mapped to the current review",
+                    thread.id, thread.anchor.path
+                ));
+            }
+            let state = if thread.outdated || thread.anchor.line.is_none() {
+                ExternalReviewThreadState::Outdated
+            } else if thread.resolved {
+                ExternalReviewThreadState::Resolved
+            } else {
+                ExternalReviewThreadState::Open
+            };
+            ExternalReviewThread {
+                identity: github_identity(
+                    "thread",
+                    &thread.id,
+                    thread
+                        .comments
+                        .first()
+                        .and_then(|comment| comment.url.clone()),
+                ),
+                state,
+                mapping,
+                comments: thread
+                    .comments
+                    .iter()
+                    .map(|comment| ExternalReviewComment {
+                        identity: github_identity("comment", &comment.id, comment.url.clone()),
+                        author: Some(github_identity(
+                            "user",
+                            &comment.author.login,
+                            comment.author.url.clone(),
+                        )),
+                        author_label: Some(comment.author.login.clone()),
+                        body: comment.body.clone(),
+                        created_at_ms: comment.created_at_ms,
+                        updated_at_ms: comment.updated_at_ms,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    ExternalReviewImportResponse {
+        importer_id: PUBLISHER_ID.to_string(),
+        threads,
+        warnings,
+    }
+}
+
+fn github_identity(kind: &str, id: &str, url: Option<String>) -> ExternalReviewIdentity {
+    ExternalReviewIdentity {
+        provider_id: bcode_code_review_github::PROVIDER_ID.to_string(),
+        external_id: format!("{kind}:{id}"),
+        url,
+    }
+}
+
+/// Map a thread's anchor onto the one line of the request's files it names.
+fn map_anchor(
+    request: &ExternalReviewImportRequest,
+    anchor: &RemoteAnchor,
+) -> ExternalReviewAnchorMapping {
+    let unmappable = |message: &str| ExternalReviewAnchorMapping {
+        status: ExternalAnchorMappingStatus::Unmappable,
+        anchor: None,
+        message: Some(message.to_string()),
+    };
+    let Some(file) = request
+        .files
+        .iter()
+        .find(|file| file.display_path() == anchor.path)
+    else {
+        return unmappable("file is not present in the current review");
+    };
+    // Where GitHub places it now, else where it was written (an outdated thread).
+    let Some(line) = anchor.line.or(anchor.original_line) else {
+        return unmappable("GitHub marks this diff position as outdated");
+    };
+    let old_side = anchor.side == bcode_code_review_models::DiffSide::Old;
+    let matching: Vec<_> = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter(|candidate| {
+            if old_side {
+                candidate.old_line == Some(line)
+            } else {
+                candidate.new_line == Some(line)
+            }
+        })
+        .collect();
+    let [only] = matching.as_slice() else {
+        return unmappable("diff line is absent or ambiguous in the current review");
+    };
+    let start = anchor
+        .start_line
+        .or(anchor.original_start_line)
+        .or(Some(line));
+    let start_old = anchor.start_side.map_or(old_side, |side| {
+        side == bcode_code_review_models::DiffSide::Old
+    });
+    let (old_line, new_line) = if old_side {
+        (Some(line), None)
+    } else {
+        (None, Some(line))
+    };
+    let (old_start, new_start) = if start_old {
+        (start, None)
+    } else {
+        (None, start)
+    };
+    ExternalReviewAnchorMapping {
+        status: ExternalAnchorMappingStatus::Exact,
+        anchor: Some(DraftAnchor {
+            kind: ReviewAnchorKind::Range,
+            file_path: anchor.path.clone(),
+            diff_row: 0,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start,
+            old_end: old_line,
+            new_start,
+            new_end: new_line,
+            old_line,
+            new_line,
+            line_kind: only.kind,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+            head_oid: None,
+            blob_oid: None,
+            reply_to: None,
+        }),
+        message: None,
+    }
 }
 
 fn github_manifest() -> ReviewPublisherManifest {
@@ -152,7 +299,6 @@ fn github_manifest() -> ReviewPublisherManifest {
             "properties": {
                 "repository": { "type": "string", "description": "GitHub repository, owner/repo. Defaults to gh repo view, then origin remote." },
                 "pull_request": { "type": "string", "description": "Pull request number. Defaults to gh pr view, then branch patterns like pr/123." },
-                "token_env": { "type": "string", "description": "GitHub token env var", "default": "GITHUB_TOKEN" },
                 "submit_event": { "type": "string", "description": "GitHub review event", "default": "COMMENT", "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"] },
                 "summary": { "type": "string", "description": "Optional review summary body" },
                 "fallback_file_comments_to_summary": { "type": "boolean", "description": "Summarize file/context comments instead of failing inline submit", "default": true },
@@ -185,14 +331,48 @@ fn submit(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
+/// The provider request publishing `bundle` with `options` to `repository`'s pull request
+/// `number`.
+fn submit_request(
+    options: &GitHubPublishOptions,
+    bundle: &ReviewBundle,
+    repository: &str,
+    number: u64,
+) -> ReviewSubmitRequest {
+    let verdict = options.verdict();
+    let mut body = options.summary.clone().unwrap_or_default();
+    // A comment-only review needs a body when it has nothing else.
+    if body.is_empty() && verdict != ReviewVerdict::Approve {
+        body = "Bcode review".to_string();
+    }
+    ReviewSubmitRequest {
+        pull: PullLocator {
+            repo_path: bundle.repo_root.clone(),
+            repository: Some(repository.to_string()),
+            number,
+        },
+        verdict,
+        body,
+        head_oid: None,
+        bundle: Some(bundle.clone()),
+        replies: Vec::new(),
+        unplaced_into_body: options.fallback_unmapped_to_summary,
+    }
+}
+
 fn preview_for_request(
     request: &ExternalPublishReviewRequest,
 ) -> Result<PublishReviewPreviewResponse, GitHubPublisherError> {
     let options = GitHubPublishOptions::from_json(&request.options, &request.bundle)?;
     let repository = options.resolve_repository()?;
     let pull_request = options.resolve_pull_request()?;
-    let auth_source = options.auth_source_for_preview();
-    let draft = github_review_draft(&request.bundle, &options);
+    let draft = review_draft(&request.bundle);
+    let provider = GitHubReviewSource.preview_review(&submit_request(
+        &options,
+        &request.bundle,
+        &repository.value,
+        pull_request.value,
+    ))?;
     let mut output = String::new();
     output.push_str("# GitHub PR review preview\n\n");
     let _ = writeln!(
@@ -205,41 +385,30 @@ fn preview_for_request(
         "* Pull request: `#{}` ({})",
         pull_request.value, pull_request.source
     );
-    let _ = writeln!(output, "* Auth: {auth_source}");
+    let _ = writeln!(output, "* Auth: {}", options.auth_source_for_preview());
     let _ = writeln!(output, "* Event: `{}`", options.submit_event);
-    let _ = writeln!(output, "* Inline comments: `{}`", draft.comments.len());
+    let _ = writeln!(output, "* Inline comments: `{}`", draft.inline.len());
     let _ = write!(
         output,
         "* Repository comments in summary: `{}`\n\n",
-        draft.summary_comments.len()
+        draft.summarized.len()
     );
-    if let Some(summary) = &draft.body {
-        output.push_str("## Summary\n\n");
-        output.push_str(summary);
-        output.push_str("\n\n");
-    }
-    if !draft.summary_comments.is_empty() {
-        output.push_str("## Repository comments\n\n");
-        for comment in &draft.summary_comments {
-            let _ = writeln!(output, "* {comment}");
-        }
-        output.push('\n');
-    }
-    if !draft.warnings.is_empty() {
+    if !draft.unplaced.is_empty() || draft.skipped_resolved > 0 {
         output.push_str("## Warnings\n\n");
-        for warning in &draft.warnings {
-            let _ = writeln!(output, "* {warning}");
+        for unplaced in &draft.unplaced {
+            let _ = writeln!(output, "* not on a diff line: {unplaced}");
+        }
+        if draft.skipped_resolved > 0 {
+            let _ = writeln!(
+                output,
+                "* skipped {} resolved Bcode review thread{}",
+                draft.skipped_resolved,
+                if draft.skipped_resolved == 1 { "" } else { "s" }
+            );
         }
         output.push('\n');
     }
-    output.push_str("## Inline comments\n\n");
-    for comment in &draft.comments {
-        let _ = write!(
-            output,
-            "* `{}` line `{}` side `{}`\n\n{}\n\n",
-            comment.path, comment.line, comment.side, comment.body
-        );
-    }
+    output.push_str(&provider.preview);
     Ok(PublishReviewPreviewResponse {
         publisher_id: PUBLISHER_ID.to_string(),
         preview: output,
@@ -250,243 +419,28 @@ fn submit_for_request(
     request: &ExternalPublishReviewRequest,
 ) -> Result<PublishReviewResponse, GitHubPublisherError> {
     let options = GitHubPublishOptions::from_json(&request.options, &request.bundle)?;
-    let resolved = options.resolve()?;
-    let token = resolved.auth.token;
-    let mut draft = github_review_draft(&request.bundle, &options);
-    if !draft.warnings.is_empty() && !options.fallback_unmapped_to_summary {
-        return Err(GitHubPublisherError::UnmappableComments(draft.warnings));
+    let repository = options.resolve_repository()?;
+    let pull_request = options.resolve_pull_request()?;
+    let draft = review_draft(&request.bundle);
+    if !draft.summarized.is_empty() && !options.fallback_file_comments_to_summary {
+        return Err(GitHubPublisherError::UnmappableComments(draft.summarized));
     }
-    if !draft.summary_comments.is_empty() && !options.fallback_file_comments_to_summary {
-        return Err(GitHubPublisherError::UnmappableComments(
-            draft.summary_comments.clone(),
-        ));
-    }
-    if (options.fallback_unmapped_to_summary && !draft.warnings.is_empty())
-        || (options.fallback_file_comments_to_summary && !draft.summary_comments.is_empty())
-    {
-        append_unmapped_to_summary(&mut draft);
-    }
-    let payload = GitHubCreateReviewRequest {
-        body: draft.body.unwrap_or_else(|| "Bcode review".to_string()),
-        event: options.submit_event,
-        comments: draft.comments,
-    };
-    let response = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(create_github_review(
-            &resolved.repository.value,
-            resolved.pull_request.value,
-            &token,
-            &payload,
-        ))?;
+    let response = GitHubReviewSource.submit_review(&submit_request(
+        &options,
+        &request.bundle,
+        &repository.value,
+        pull_request.value,
+    ))?;
     Ok(PublishReviewResponse {
         publisher_id: PUBLISHER_ID.to_string(),
         submitted: true,
-        output: response.html_url,
+        output: response.url,
         message: format!(
             "published {} review comments to GitHub PR #{}",
-            payload.comments.len(),
-            resolved.pull_request.value
+            draft.inline.len(),
+            pull_request.value
         ),
     })
-}
-
-async fn create_github_review(
-    repository: &str,
-    pull_request: u64,
-    token: &str,
-    payload: &GitHubCreateReviewRequest,
-) -> Result<GitHubCreateReviewResponse, GitHubPublisherError> {
-    let url = format!("https://api.github.com/repos/{repository}/pulls/{pull_request}/reviews");
-    let response = reqwest::Client::new()
-        .post(url)
-        .bearer_auth(token)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "bcode-github-review-publisher")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(payload)
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(GitHubPublisherError::Api(format!(
-            "GitHub API returned {status}: {body}"
-        )));
-    }
-    serde_json::from_str(&body).map_err(GitHubPublisherError::Json)
-}
-
-fn github_review_draft(bundle: &ReviewBundle, options: &GitHubPublishOptions) -> GitHubReviewDraft {
-    let mut comments = Vec::new();
-    let mut warnings = Vec::new();
-    let mut summary_comments = Vec::new();
-    let mut skipped_resolved_count = 0usize;
-    for thread in &bundle.threads {
-        if thread.resolved_at_ms.is_some() {
-            skipped_resolved_count = skipped_resolved_count.saturating_add(1);
-            continue;
-        }
-        if should_summarize_thread(thread) {
-            summary_comments.push(summary_comment_for_thread(thread));
-            continue;
-        }
-        match github_comment_for_thread(thread) {
-            Some(mut comment) => {
-                comment.body = thread_body(thread);
-                comments.push(comment);
-            }
-            None => warnings.push(format!(
-                "thread {} at {} could not be mapped to a GitHub review line",
-                thread.thread_id, thread.anchor.file_path
-            )),
-        }
-    }
-    if skipped_resolved_count > 0 {
-        warnings.push(format!(
-            "skipped {skipped_resolved_count} resolved Bcode review thread{}",
-            if skipped_resolved_count == 1 { "" } else { "s" }
-        ));
-    }
-    GitHubReviewDraft {
-        body: options.summary.clone(),
-        comments,
-        warnings,
-        summary_comments,
-    }
-}
-
-fn should_summarize_thread(thread: &ReviewBundleThread) -> bool {
-    thread.summary_only
-        || thread.anchor.is_file_anchor
-        || thread
-            .selected_lines
-            .iter()
-            .any(|line| line.surface_id.is_some() && line.kind == ReviewLineKind::Context)
-}
-
-fn summary_comment_for_thread(thread: &ReviewBundleThread) -> String {
-    let line = thread
-        .anchor
-        .new_line
-        .or(thread.anchor.new_start)
-        .or(thread.anchor.old_line)
-        .or(thread.anchor.old_start)
-        .map_or_else(String::new, |line| format!(":{line}"));
-    format!(
-        "{}{} — {}",
-        thread.anchor.file_path,
-        line,
-        thread_body(thread).replace('\n', " ")
-    )
-}
-
-fn append_unmapped_to_summary(draft: &mut GitHubReviewDraft) {
-    let mut body = draft
-        .body
-        .take()
-        .unwrap_or_else(|| "Bcode review".to_string());
-    body.push_str("\n\n## Unmapped Bcode comments\n\n");
-    for warning in &draft.warnings {
-        let _ = writeln!(body, "* {warning}");
-    }
-    if !draft.summary_comments.is_empty() {
-        body.push_str("\n## Repository Bcode comments\n\n");
-        for comment in &draft.summary_comments {
-            let _ = writeln!(body, "* {comment}");
-        }
-    }
-    draft.body = Some(body);
-}
-
-fn github_comment_for_thread(thread: &ReviewBundleThread) -> Option<GitHubReviewComment> {
-    let line = best_anchor_line(thread)?;
-    let side = side_for_line(&line)?.to_string();
-    let line_number = github_line_number(&line)?;
-    let range = github_range_for_thread(thread, &side);
-    let (start_line, start_side) = range.map_or((None, None), |range| {
-        (Some(range.start_line), Some(range.start_side))
-    });
-    Some(GitHubReviewComment {
-        path: line.file_path,
-        body: String::new(),
-        line: line_number,
-        side,
-        start_line,
-        start_side,
-    })
-}
-
-fn github_range_for_thread(
-    thread: &ReviewBundleThread,
-    end_side: &str,
-) -> Option<GitHubReviewRange> {
-    let first = thread
-        .selected_lines
-        .iter()
-        .find(|line| side_for_line(line).is_some_and(|side| side == end_side))?;
-    let last = thread
-        .selected_lines
-        .iter()
-        .rev()
-        .find(|line| side_for_line(line).is_some_and(|side| side == end_side))?;
-    let start_line = github_line_number(first)?;
-    let end_line = github_line_number(last)?;
-    (start_line != end_line).then(|| GitHubReviewRange {
-        start_line,
-        start_side: end_side.to_string(),
-    })
-}
-
-fn side_for_line(line: &ReviewBundleLine) -> Option<&'static str> {
-    match line.kind {
-        ReviewLineKind::Added | ReviewLineKind::Context => line.new_line.map(|_| "RIGHT"),
-        ReviewLineKind::Removed => line.old_line.map(|_| "LEFT"),
-    }
-}
-
-const fn github_line_number(line: &ReviewBundleLine) -> Option<u32> {
-    match line.kind {
-        ReviewLineKind::Added | ReviewLineKind::Context => line.new_line,
-        ReviewLineKind::Removed => line.old_line,
-    }
-}
-
-fn best_anchor_line(thread: &ReviewBundleThread) -> Option<ReviewBundleLine> {
-    thread
-        .selected_lines
-        .iter()
-        .rev()
-        .find(|line| line.new_line.is_some() || line.old_line.is_some())
-        .cloned()
-}
-
-fn thread_body(thread: &ReviewBundleThread) -> String {
-    let mut body = thread
-        .comments
-        .iter()
-        .map(|comment| comment.body.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-    if let Some(surface_id) = &thread.anchor.surface_id {
-        let _ = write!(body, "\n\n_Bcode surface: `{surface_id}`_");
-    }
-    if let Some(source_id) = &thread.anchor.source_id {
-        let _ = write!(body, "\n\n_Bcode source: `{source_id}`_");
-    }
-    if let Some(session_id) = &thread.session_id {
-        let _ = write!(body, "\n\n_Bcode session: `{session_id}`_");
-    }
-    body
-}
-
-#[derive(Debug, Clone)]
-struct GitHubImportOptions {
-    repository: Option<String>,
-    pull_request: Option<u64>,
-    repo_root: std::path::PathBuf,
-    token_env: String,
 }
 
 /// Repository and pull request from the options, else from the request's pull request target
@@ -517,43 +471,11 @@ fn target_options(
     Ok((repository, pull_request))
 }
 
-impl GitHubImportOptions {
-    fn from_json(
-        value: &serde_json::Value,
-        repo_root: &Path,
-        target: Option<&bcode_code_review_models::ReviewPullRequestTarget>,
-    ) -> Result<Self, GitHubPublisherError> {
-        let (repository, pull_request) = target_options(value, target)?;
-        Ok(Self {
-            repository,
-            pull_request,
-            repo_root: repo_root.to_path_buf(),
-            token_env: string_option(value, "token_env")
-                .unwrap_or_else(|| DEFAULT_TOKEN_ENV.to_string()),
-        })
-    }
-
-    fn resolve(&self) -> Result<ResolvedGitHubPublishOptions, GitHubPublisherError> {
-        GitHubPublishOptions {
-            repository: self.repository.clone(),
-            pull_request: self.pull_request,
-            repo_root: self.repo_root.clone(),
-            token_env: self.token_env.clone(),
-            submit_event: DEFAULT_SUBMIT_EVENT.to_string(),
-            summary: None,
-            fallback_file_comments_to_summary: false,
-            fallback_unmapped_to_summary: false,
-        }
-        .resolve()
-    }
-}
-
 #[derive(Debug, Clone)]
 struct GitHubPublishOptions {
     repository: Option<String>,
     pull_request: Option<u64>,
     repo_root: std::path::PathBuf,
-    token_env: String,
     submit_event: String,
     summary: Option<String>,
     fallback_file_comments_to_summary: bool,
@@ -565,9 +487,7 @@ impl GitHubPublishOptions {
         value: &serde_json::Value,
         bundle: &ReviewBundle,
     ) -> Result<Self, GitHubPublisherError> {
-        let (repository, pull_request) = target_options(value, bundle.pull_request.as_ref())?;
-        let token_env =
-            string_option(value, "token_env").unwrap_or_else(|| DEFAULT_TOKEN_ENV.to_string());
+        let mut options = Self::for_import(value, &bundle.repo_root, bundle.pull_request.as_ref())?;
         let submit_event = string_option(value, "submit_event")
             .unwrap_or_else(|| DEFAULT_SUBMIT_EVENT.to_string())
             .to_uppercase();
@@ -579,28 +499,40 @@ impl GitHubPublishOptions {
                 "submit_event must be COMMENT, REQUEST_CHANGES, or APPROVE".to_string(),
             ));
         }
+        options.submit_event = submit_event;
+        options.summary = string_option(value, "summary");
+        options.fallback_file_comments_to_summary =
+            string_option(value, "fallback_file_comments_to_summary")
+                .is_none_or(|value| matches_bool_true(&value));
+        options.fallback_unmapped_to_summary = bool_option(value, "fallback_unmapped_to_summary");
+        Ok(options)
+    }
+
+    /// The options an import reads (the target only).
+    fn for_import(
+        value: &serde_json::Value,
+        repo_root: &Path,
+        target: Option<&bcode_code_review_models::ReviewPullRequestTarget>,
+    ) -> Result<Self, GitHubPublisherError> {
+        let (repository, pull_request) = target_options(value, target)?;
         Ok(Self {
             repository,
             pull_request,
-            repo_root: bundle.repo_root.clone(),
-            token_env,
-            submit_event,
-            summary: string_option(value, "summary"),
-            fallback_file_comments_to_summary: string_option(
-                value,
-                "fallback_file_comments_to_summary",
-            )
-            .is_none_or(|value| matches_bool_true(&value)),
-            fallback_unmapped_to_summary: bool_option(value, "fallback_unmapped_to_summary"),
+            repo_root: repo_root.to_path_buf(),
+            submit_event: DEFAULT_SUBMIT_EVENT.to_string(),
+            summary: None,
+            fallback_file_comments_to_summary: true,
+            fallback_unmapped_to_summary: false,
         })
     }
 
-    fn resolve(&self) -> Result<ResolvedGitHubPublishOptions, GitHubPublisherError> {
-        Ok(ResolvedGitHubPublishOptions {
-            repository: self.resolve_repository()?,
-            pull_request: self.resolve_pull_request()?,
-            auth: self.resolve_auth()?,
-        })
+    /// The neutral verdict of the GitHub event the options name.
+    fn verdict(&self) -> ReviewVerdict {
+        match self.submit_event.as_str() {
+            "APPROVE" => ReviewVerdict::Approve,
+            "REQUEST_CHANGES" => ReviewVerdict::RequestChanges,
+            _ => ReviewVerdict::Comment,
+        }
     }
 
     fn resolve_repository(&self) -> Result<ResolvedValue<String>, GitHubPublisherError> {
@@ -648,11 +580,9 @@ impl GitHubPublishOptions {
             .ok_or(GitHubPublisherError::MissingPullRequest)
     }
 
+    /// Where submitting would take its credentials from (the provider's lookup order).
     fn auth_source_for_preview(&self) -> String {
-        if env_token(&self.token_env).is_some() {
-            return format!("{} env var", self.token_env);
-        }
-        if self.token_env != DEFAULT_TOKEN_ENV && env_token(DEFAULT_TOKEN_ENV).is_some() {
+        if env_token("GITHUB_TOKEN").is_some() {
             return "GITHUB_TOKEN env var".to_string();
         }
         if env_token("GH_TOKEN").is_some() {
@@ -661,27 +591,8 @@ impl GitHubPublishOptions {
         if gh_output(&["auth", "status"], &self.repo_root).is_ok() {
             return "GitHub CLI".to_string();
         }
-        "unresolved; submit requires token_env, GITHUB_TOKEN, GH_TOKEN, or gh auth login"
-            .to_string()
+        "unresolved; submit requires GITHUB_TOKEN, GH_TOKEN, or gh auth login".to_string()
     }
-
-    fn resolve_auth(&self) -> Result<ResolvedAuth, GitHubPublisherError> {
-        // The shared lookup: the configured variable, GITHUB_TOKEN, GH_TOKEN, then gh.
-        bcode_forge::resolve_token(
-            bcode_forge::GITHUB_HOST,
-            Some(&self.token_env),
-            &self.repo_root,
-        )
-        .map(|token| ResolvedAuth::new(token.value().to_owned()))
-        .map_err(|_| GitHubPublisherError::MissingToken)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedGitHubPublishOptions {
-    repository: ResolvedValue<String>,
-    pull_request: ResolvedValue<u64>,
-    auth: ResolvedAuth,
 }
 
 #[derive(Debug, Clone)]
@@ -693,17 +604,6 @@ struct ResolvedValue<T> {
 impl<T> ResolvedValue<T> {
     const fn new(value: T, source: &'static str) -> Self {
         Self { value, source }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedAuth {
-    token: String,
-}
-
-impl ResolvedAuth {
-    const fn new(token: String) -> Self {
-        Self { token }
     }
 }
 
@@ -784,443 +684,6 @@ fn bool_option(value: &serde_json::Value, key: &'static str) -> bool {
     })
 }
 
-#[derive(Debug)]
-struct GitHubReviewDraft {
-    body: Option<String>,
-    comments: Vec<GitHubReviewComment>,
-    warnings: Vec<String>,
-    summary_comments: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitHubReviewRange {
-    start_line: u32,
-    start_side: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct GitHubCreateReviewRequest {
-    body: String,
-    event: String,
-    comments: Vec<GitHubReviewComment>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct GitHubReviewComment {
-    path: String,
-    body: String,
-    line: u32,
-    side: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start_line: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start_side: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct GitHubCreateReviewResponse {
-    html_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct GitHubReviewCommentResponse {
-    id: u64,
-    node_id: String,
-    body: String,
-    path: String,
-    line: Option<u32>,
-    original_line: Option<u32>,
-    side: Option<String>,
-    start_line: Option<u32>,
-    original_start_line: Option<u32>,
-    start_side: Option<String>,
-    #[serde(default)]
-    in_reply_to_id: Option<u64>,
-    #[serde(default)]
-    html_url: Option<String>,
-    user: GitHubReviewUser,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct GitHubReviewUser {
-    id: u64,
-    login: String,
-    #[serde(default)]
-    html_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitHubReviewThreadState {
-    thread_id: String,
-    comment_ids: Vec<u64>,
-    comment_node_ids: Vec<String>,
-    resolved: bool,
-    outdated: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlResponse {
-    data: Option<GitHubGraphQlData>,
-    #[serde(default)]
-    errors: Vec<GitHubGraphQlError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlError {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlData {
-    repository: Option<GitHubGraphQlRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlRepository {
-    #[serde(rename = "pullRequest")]
-    pull_request: Option<GitHubGraphQlPullRequest>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlPullRequest {
-    #[serde(rename = "reviewThreads")]
-    review_threads: GitHubGraphQlThreadConnection,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlThreadConnection {
-    nodes: Vec<GitHubGraphQlThread>,
-    #[serde(rename = "pageInfo")]
-    page_info: GitHubGraphQlPageInfo,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlPageInfo {
-    #[serde(rename = "hasNextPage")]
-    has_next_page: bool,
-    #[serde(rename = "endCursor")]
-    end_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlThread {
-    id: String,
-    #[serde(rename = "isResolved")]
-    is_resolved: bool,
-    #[serde(rename = "isOutdated")]
-    is_outdated: bool,
-    comments: GitHubGraphQlCommentConnection,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlCommentConnection {
-    nodes: Vec<GitHubGraphQlComment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubGraphQlComment {
-    id: String,
-    #[serde(rename = "databaseId")]
-    database_id: Option<u64>,
-}
-
-async fn fetch_github_review_thread_states(
-    repository: &str,
-    pull_request: u64,
-    token: &str,
-) -> Result<Vec<GitHubReviewThreadState>, GitHubPublisherError> {
-    let (owner, name) = repository.split_once('/').ok_or_else(|| {
-        GitHubPublisherError::InvalidOption("repository must be owner/repo".to_string())
-    })?;
-    let client = reqwest::Client::new();
-    let mut states = Vec::new();
-    let mut cursor: Option<String> = None;
-    for _ in 0..100_u16 {
-        let response = client
-            .post("https://api.github.com/graphql")
-            .bearer_auth(token)
-            .header(reqwest::header::USER_AGENT, "bcode-github-review-importer")
-            .json(&serde_json::json!({
-                "query": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated comments(first:100){nodes{id databaseId}}} pageInfo{hasNextPage endCursor}}}}}",
-                "variables": {
-                    "owner": owner,
-                    "name": name,
-                    "number": pull_request,
-                    "cursor": cursor,
-                }
-            }))
-            .send()
-            .await?;
-        let http_status = response.status();
-        let body = response.text().await?;
-        if !http_status.is_success() {
-            return Err(GitHubPublisherError::Api(format!(
-                "GraphQL status {http_status}: {}",
-                body.trim()
-            )));
-        }
-        let response: GitHubGraphQlResponse = serde_json::from_str(&body)?;
-        if !response.errors.is_empty() {
-            return Err(GitHubPublisherError::Api(
-                response
-                    .errors
-                    .into_iter()
-                    .map(|error| error.message)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
-        let connection = response
-            .data
-            .and_then(|data| data.repository)
-            .and_then(|repository| repository.pull_request)
-            .ok_or(GitHubPublisherError::MissingPullRequest)?
-            .review_threads;
-        states.extend(connection.nodes.into_iter().map(|thread| {
-            GitHubReviewThreadState {
-                thread_id: thread.id,
-                comment_ids: thread
-                    .comments
-                    .nodes
-                    .iter()
-                    .filter_map(|comment| comment.database_id)
-                    .collect(),
-                comment_node_ids: thread
-                    .comments
-                    .nodes
-                    .into_iter()
-                    .map(|comment| comment.id)
-                    .collect(),
-                resolved: thread.is_resolved,
-                outdated: thread.is_outdated,
-            }
-        }));
-        if !connection.page_info.has_next_page {
-            return Ok(states);
-        }
-        cursor = connection.page_info.end_cursor;
-        if cursor.is_none() {
-            return Err(GitHubPublisherError::Api(
-                "GitHub review thread pagination omitted an end cursor".to_string(),
-            ));
-        }
-    }
-    Err(GitHubPublisherError::ImportLimitExceeded)
-}
-
-async fn fetch_github_review_comments(
-    repository: &str,
-    pull_request: u64,
-    token: &str,
-) -> Result<Vec<GitHubReviewCommentResponse>, GitHubPublisherError> {
-    let client = reqwest::Client::new();
-    let mut comments = Vec::new();
-    for page in 1..=100_u16 {
-        let url = format!(
-            "https://api.github.com/repos/{repository}/pulls/{pull_request}/comments?per_page=100&page={page}"
-        );
-        let response = client
-            .get(url)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "bcode-github-review-importer")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(GitHubPublisherError::Api(format!(
-                "status {status}: {}",
-                body.trim()
-            )));
-        }
-        let mut page_comments: Vec<GitHubReviewCommentResponse> =
-            serde_json::from_str(&body).map_err(GitHubPublisherError::Json)?;
-        let exhausted = page_comments.len() < 100;
-        comments.append(&mut page_comments);
-        if exhausted {
-            return Ok(comments);
-        }
-    }
-    Err(GitHubPublisherError::ImportLimitExceeded)
-}
-
-fn map_github_review_comments(
-    request: &ExternalReviewImportRequest,
-    comments: Vec<GitHubReviewCommentResponse>,
-    thread_states: &[GitHubReviewThreadState],
-) -> ExternalReviewImportResponse {
-    let mut grouped = std::collections::BTreeMap::<u64, Vec<GitHubReviewCommentResponse>>::new();
-    for comment in comments {
-        grouped
-            .entry(comment.in_reply_to_id.unwrap_or(comment.id))
-            .or_default()
-            .push(comment);
-    }
-    let mut warnings = Vec::new();
-    let threads = grouped
-        .into_iter()
-        .filter_map(|(root_id, mut comments)| {
-            comments.sort_by_key(|comment| comment.id);
-            let root = comments
-                .iter()
-                .find(|comment| comment.id == root_id)
-                .or_else(|| comments.first())?;
-            let mut mapping = map_external_anchor(request, root);
-            let provider_state = thread_states.iter().find(|state| {
-                state.comment_ids.contains(&root_id)
-                    || state.comment_node_ids.contains(&root.node_id)
-            });
-            if provider_state.is_some_and(|state| state.outdated)
-                && mapping.status == ExternalAnchorMappingStatus::Exact
-            {
-                mapping.status = ExternalAnchorMappingStatus::Approximate;
-                mapping.message = Some(
-                    "GitHub marks this thread outdated; the anchor matches historical coordinates"
-                        .to_string(),
-                );
-            }
-            if mapping.status == ExternalAnchorMappingStatus::Unmappable {
-                warnings.push(format!(
-                    "GitHub thread {root_id} at {} could not be mapped to the current review",
-                    root.path
-                ));
-            }
-            let state = if provider_state.is_some_and(|state| state.outdated) || root.line.is_none()
-            {
-                ExternalReviewThreadState::Outdated
-            } else if provider_state.is_some_and(|state| state.resolved) {
-                ExternalReviewThreadState::Resolved
-            } else {
-                ExternalReviewThreadState::Open
-            };
-            let identity = provider_state.map_or_else(
-                || github_identity("thread", root_id, root.html_url.clone()),
-                |state| ExternalReviewIdentity {
-                    provider_id: "github".to_string(),
-                    external_id: format!("thread:{}", state.thread_id),
-                    url: root.html_url.clone(),
-                },
-            );
-            Some(ExternalReviewThread {
-                identity,
-                state,
-                mapping,
-                comments: comments
-                    .into_iter()
-                    .map(|comment| ExternalReviewComment {
-                        identity: github_identity("comment", comment.id, comment.html_url),
-                        author: Some(github_identity(
-                            "user",
-                            comment.user.id,
-                            comment.user.html_url,
-                        )),
-                        author_label: Some(comment.user.login),
-                        body: comment.body,
-                        created_at_ms: None,
-                        updated_at_ms: None,
-                    })
-                    .collect(),
-            })
-        })
-        .collect();
-    ExternalReviewImportResponse {
-        importer_id: PUBLISHER_ID.to_string(),
-        threads,
-        warnings,
-    }
-}
-
-fn github_identity(kind: &str, id: u64, url: Option<String>) -> ExternalReviewIdentity {
-    ExternalReviewIdentity {
-        provider_id: "github".to_string(),
-        external_id: format!("{kind}:{id}"),
-        url,
-    }
-}
-
-fn map_external_anchor(
-    request: &ExternalReviewImportRequest,
-    comment: &GitHubReviewCommentResponse,
-) -> ExternalReviewAnchorMapping {
-    let line = comment.line.or(comment.original_line);
-    let start_line = comment.start_line.or(comment.original_start_line).or(line);
-    let Some(file) = request
-        .files
-        .iter()
-        .find(|file| file.display_path() == comment.path)
-    else {
-        return ExternalReviewAnchorMapping {
-            status: ExternalAnchorMappingStatus::Unmappable,
-            anchor: None,
-            message: Some("file is not present in the current review".to_string()),
-        };
-    };
-    let Some(line) = line else {
-        return ExternalReviewAnchorMapping {
-            status: ExternalAnchorMappingStatus::Unmappable,
-            anchor: None,
-            message: Some("GitHub marks this diff position as outdated".to_string()),
-        };
-    };
-    let side = comment.side.as_deref().unwrap_or("RIGHT");
-    let start_side = comment.start_side.as_deref().unwrap_or(side);
-    let matching_lines = file
-        .hunks
-        .iter()
-        .flat_map(|hunk| &hunk.lines)
-        .filter(|candidate| {
-            if side == "LEFT" {
-                candidate.old_line == Some(line)
-            } else {
-                candidate.new_line == Some(line)
-            }
-        })
-        .collect::<Vec<_>>();
-    if matching_lines.len() != 1 {
-        return ExternalReviewAnchorMapping {
-            status: ExternalAnchorMappingStatus::Unmappable,
-            anchor: None,
-            message: Some("diff line is absent or ambiguous in the current review".to_string()),
-        };
-    }
-    let line_kind = matching_lines[0].kind;
-    let (old_line, new_line) = if side == "LEFT" {
-        (Some(line), None)
-    } else {
-        (None, Some(line))
-    };
-    let (old_start, new_start) = if start_side == "LEFT" {
-        (start_line, None)
-    } else {
-        (None, start_line)
-    };
-    ExternalReviewAnchorMapping {
-        status: ExternalAnchorMappingStatus::Exact,
-        anchor: Some(bcode_code_review_models::DraftAnchor {
-            kind: bcode_code_review_models::ReviewAnchorKind::Range,
-            file_path: comment.path.clone(),
-            diff_row: 0,
-            start_diff_row: None,
-            end_diff_row: None,
-            old_start,
-            old_end: old_line,
-            new_start,
-            new_end: new_line,
-            old_line,
-            new_line,
-            line_kind,
-            is_file_anchor: false,
-            surface_id: None,
-            source_id: None,
-            head_oid: None,
-            blob_oid: None,
-        }),
-        message: None,
-    }
-}
-
 #[derive(Debug, Error)]
 enum GitHubPublisherError {
     #[error(
@@ -1231,24 +694,16 @@ enum GitHubPublisherError {
         "missing GitHub pull request; pass pull_request option or run from a PR branch with gh/git configured"
     )]
     MissingPullRequest,
-    #[error("missing GitHub token; set token_env/GITHUB_TOKEN/GH_TOKEN or run gh auth login")]
-    MissingToken,
     #[error("invalid option: {0}")]
     InvalidOption(String),
     #[error("command failed to start: {0}")]
     Command(#[from] std::io::Error),
     #[error("command {program} failed: {stderr}")]
     CommandFailed { program: String, stderr: String },
-    #[error("unmappable comments: {0:?}")]
+    #[error("comments outside the diff (fallback_file_comments_to_summary is off): {0:?}")]
     UnmappableComments(Vec<String>),
-    #[error("GitHub import exceeded the bounded 10,000-comment discovery limit")]
-    ImportLimitExceeded,
-    #[error("GitHub API error: {0}")]
-    Api(String),
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("serialization failed: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Provider(#[from] ProviderCallError),
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
@@ -1277,8 +732,8 @@ bcode_plugin_sdk::export_plugin!(
 mod tests {
     use super::*;
     use bcode_code_review_models::{
-        DraftAnchor, DraftComment, ReviewAnchorKind, ReviewTarget, ReviewThreadKind,
-        ReviewThreadSeverity,
+        DiffSide, DraftComment, Participant, RemoteComment, ReviewBundleLine, ReviewBundleThread,
+        ReviewLineKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity,
     };
     use std::path::PathBuf;
 
@@ -1304,8 +759,51 @@ mod tests {
 
         assert_eq!(options.repository.as_deref(), Some("owner/repo"));
         assert_eq!(options.pull_request, Some(123));
-        assert_eq!(options.token_env, DEFAULT_TOKEN_ENV);
         assert_eq!(options.submit_event, DEFAULT_SUBMIT_EVENT);
+        assert_eq!(options.verdict(), ReviewVerdict::Comment);
+    }
+
+    #[test]
+    fn submit_events_map_to_neutral_verdicts() {
+        let verdict = |event: &str| {
+            GitHubPublishOptions::from_json(
+                &serde_json::json!({ "submit_event": event }),
+                &empty_bundle(),
+            )
+            .expect("options")
+            .verdict()
+        };
+        assert_eq!(verdict("approve"), ReviewVerdict::Approve);
+        assert_eq!(verdict("REQUEST_CHANGES"), ReviewVerdict::RequestChanges);
+        assert_eq!(verdict("COMMENT"), ReviewVerdict::Comment);
+        assert!(
+            GitHubPublishOptions::from_json(
+                &serde_json::json!({ "submit_event": "MERGE" }),
+                &empty_bundle()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn submissions_carry_the_body_and_the_unplaced_policy() {
+        let options = GitHubPublishOptions::from_json(
+            &serde_json::json!({ "submit_event": "APPROVE", "fallback_unmapped_to_summary": true }),
+            &empty_bundle(),
+        )
+        .expect("options");
+        let request = submit_request(&options, &empty_bundle(), "owner/repo", 9);
+        assert_eq!(request.verdict, ReviewVerdict::Approve);
+        assert_eq!(request.body, "", "an approval needs no body");
+        assert!(request.unplaced_into_body);
+        assert_eq!(request.pull.repository.as_deref(), Some("owner/repo"));
+        assert_eq!(request.pull.number, 9);
+
+        let options = GitHubPublishOptions::from_json(&serde_json::json!({}), &empty_bundle())
+            .expect("options");
+        let request = submit_request(&options, &empty_bundle(), "owner/repo", 9);
+        assert_eq!(request.body, "Bcode review");
+        assert!(!request.unplaced_into_body);
     }
 
     #[test]
@@ -1319,22 +817,14 @@ mod tests {
     }
 
     #[test]
-    fn imported_comment_maps_exactly_to_current_diff_line() {
-        let request = import_request(vec![bcode_code_review_models::ReviewLine {
-            kind: ReviewLineKind::Added,
-            old_line: None,
-            new_line: Some(42),
-            content: "added".to_string(),
-        }]);
-        let response = map_github_review_comments(
-            &request,
-            vec![github_import_comment(1, None, Some(42))],
-            &[],
-        );
+    fn imported_thread_maps_exactly_to_current_diff_line() {
+        let request = import_request(vec![added(42)]);
+        let response = import_threads(&request, &[remote_thread("T1", Some(42), 1)]);
 
-        assert_eq!(response.warnings, [] as [std::string::String; 0]);
+        assert_eq!(response.warnings, [] as [String; 0]);
         let thread = response.threads.first().expect("imported thread");
         assert_eq!(thread.state, ExternalReviewThreadState::Open);
+        assert_eq!(thread.identity.external_id, "thread:T1");
         assert_eq!(thread.mapping.status, ExternalAnchorMappingStatus::Exact);
         assert_eq!(
             thread
@@ -1344,59 +834,35 @@ mod tests {
                 .and_then(|anchor| anchor.new_line),
             Some(42)
         );
+        assert_eq!(thread.comments[0].author_label.as_deref(), Some("reviewer"));
+        assert_eq!(thread.comments[0].created_at_ms, Some(1));
     }
 
     #[test]
-    fn provider_thread_state_restores_resolved_and_graphql_identity() {
-        let request = import_request(vec![bcode_code_review_models::ReviewLine {
-            kind: ReviewLineKind::Added,
-            old_line: None,
-            new_line: Some(42),
-            content: "added".to_string(),
-        }]);
-        let response = map_github_review_comments(
-            &request,
-            vec![github_import_comment(1, None, Some(42))],
-            &[GitHubReviewThreadState {
-                thread_id: "PRRT_graphql".to_string(),
-                comment_ids: vec![1],
-                comment_node_ids: vec!["PRRC_1".to_string()],
-                resolved: true,
-                outdated: false,
-            }],
-        );
-
-        let thread = response.threads.first().expect("thread");
-        assert_eq!(thread.state, ExternalReviewThreadState::Resolved);
-        assert_eq!(thread.identity.external_id, "thread:PRRT_graphql");
-    }
-
-    #[test]
-    fn provider_outdated_state_takes_precedence_over_resolved() {
-        let request = import_request(vec![bcode_code_review_models::ReviewLine {
-            kind: ReviewLineKind::Added,
-            old_line: None,
-            new_line: Some(42),
-            content: "added".to_string(),
-        }]);
-        let response = map_github_review_comments(
-            &request,
-            vec![github_import_comment(1, None, Some(42))],
-            &[GitHubReviewThreadState {
-                thread_id: "PRRT_graphql".to_string(),
-                comment_ids: vec![1],
-                comment_node_ids: vec!["PRRC_1".to_string()],
-                resolved: true,
-                outdated: true,
-            }],
-        );
+    fn resolved_threads_import_resolved() {
+        let request = import_request(vec![added(42)]);
+        let mut thread = remote_thread("T1", Some(42), 1);
+        thread.resolved = true;
+        let response = import_threads(&request, &[thread]);
 
         assert_eq!(
             response.threads.first().expect("thread").state,
-            ExternalReviewThreadState::Outdated
+            ExternalReviewThreadState::Resolved
         );
+    }
+
+    #[test]
+    fn outdated_state_takes_precedence_over_resolved() {
+        let request = import_request(vec![added(42)]);
+        let mut thread = remote_thread("T1", Some(42), 1);
+        thread.resolved = true;
+        thread.outdated = true;
+        let response = import_threads(&request, &[thread]);
+
+        let thread = response.threads.first().expect("thread");
+        assert_eq!(thread.state, ExternalReviewThreadState::Outdated);
         assert_eq!(
-            response.threads.first().expect("thread").mapping.status,
+            thread.mapping.status,
             ExternalAnchorMappingStatus::Approximate
         );
     }
@@ -1404,14 +870,7 @@ mod tests {
     #[test]
     fn outdated_import_is_preserved_as_unmappable_without_losing_replies() {
         let request = import_request(Vec::new());
-        let response = map_github_review_comments(
-            &request,
-            vec![
-                github_import_comment(1, None, None),
-                github_import_comment(2, Some(1), None),
-            ],
-            &[],
-        );
+        let response = import_threads(&request, &[remote_thread("T1", None, 2)]);
 
         assert_eq!(response.threads.len(), 1);
         let thread = response.threads.first().expect("imported thread");
@@ -1422,6 +881,45 @@ mod tests {
         );
         assert_eq!(thread.comments.len(), 2);
         assert_eq!(response.warnings.len(), 1);
+    }
+
+    fn added(line: u32) -> bcode_code_review_models::ReviewLine {
+        bcode_code_review_models::ReviewLine {
+            kind: ReviewLineKind::Added,
+            old_line: None,
+            new_line: Some(line),
+            content: "added".to_string(),
+        }
+    }
+
+    fn remote_thread(id: &str, line: Option<u32>, comments: u64) -> RemoteThread {
+        RemoteThread {
+            id: id.to_string(),
+            anchor: RemoteAnchor {
+                path: "src/lib.rs".to_string(),
+                side: DiffSide::New,
+                line,
+                ..RemoteAnchor::default()
+            },
+            resolved: false,
+            outdated: false,
+            can_reply: true,
+            can_resolve: true,
+            comments: (1..=comments)
+                .map(|index| RemoteComment {
+                    id: format!("C{index}"),
+                    author: Participant {
+                        login: "reviewer".to_string(),
+                        ..Participant::default()
+                    },
+                    body: format!("comment {index}"),
+                    created_at_ms: Some(index),
+                    updated_at_ms: Some(index),
+                    url: Some(format!("https://github.test/comment/{index}")),
+                    review_id: None,
+                })
+                .collect(),
+        }
     }
 
     fn import_request(
@@ -1450,75 +948,19 @@ mod tests {
         }
     }
 
-    fn github_import_comment(
-        id: u64,
-        in_reply_to_id: Option<u64>,
-        line: Option<u32>,
-    ) -> GitHubReviewCommentResponse {
-        GitHubReviewCommentResponse {
-            id,
-            node_id: format!("PRRC_{id}"),
-            body: format!("comment {id}"),
-            path: "src/lib.rs".to_string(),
-            line,
-            original_line: line,
-            side: Some("RIGHT".to_string()),
-            start_line: line,
-            original_start_line: line,
-            start_side: Some("RIGHT".to_string()),
-            in_reply_to_id,
-            html_url: Some(format!("https://github.test/comment/{id}")),
-            user: GitHubReviewUser {
-                id: 7,
-                login: "reviewer".to_string(),
-                html_url: Some("https://github.test/reviewer".to_string()),
-            },
-        }
-    }
-
     #[test]
-    fn maps_added_line_to_right_side_comment() {
-        let thread = review_thread(bundle_line(
-            "src/lib.rs",
+    fn preview_is_local_and_does_not_require_submit_auth_or_http() {
+        let mut bundle = empty_bundle();
+        bundle.threads = vec![review_thread(bundle_line(
             ReviewLineKind::Added,
             None,
             Some(42),
-            1,
-            "added",
-        ));
-
-        let comment = github_comment_for_thread(&thread).expect("comment");
-
-        assert_eq!(comment.path, "src/lib.rs");
-        assert_eq!(comment.line, 42);
-        assert_eq!(comment.side, "RIGHT");
-    }
-
-    #[test]
-    fn preview_is_local_and_does_not_require_submit_auth_or_http() {
+        ))];
         let request = ExternalPublishReviewRequest {
-            bundle: ReviewBundle {
-                pull_request: None,
-                review_id: "review".to_string(),
-                title: "Review".to_string(),
-                repo_root: PathBuf::from("/repo"),
-                target: ReviewTarget::WorkingTreeUnstaged,
-                surfaces: Vec::new(),
-                files: Vec::new(),
-                threads: vec![review_thread(bundle_line(
-                    "src/lib.rs",
-                    ReviewLineKind::Added,
-                    None,
-                    Some(42),
-                    1,
-                    "added",
-                ))],
-                generated_at_ms: 1,
-            },
+            bundle,
             options: serde_json::json!({
                 "repository": "owner/repo",
                 "pull_request": "123",
-                "token_env": "INTENTIONALLY_MISSING_GITHUB_TOKEN"
             }),
         };
 
@@ -1527,19 +969,12 @@ mod tests {
         assert_eq!(response.publisher_id, PUBLISHER_ID);
         assert!(response.preview.contains("GitHub PR review preview"));
         assert!(response.preview.contains("owner/repo"));
-        assert!(response.preview.contains("src/lib.rs"));
+        assert!(response.preview.contains("`src/lib.rs` line 42"));
     }
 
     #[test]
     fn preview_targets_the_bundles_pull_request_and_summarizes_summary_only_threads() {
-        let mut summary_only = review_thread(bundle_line(
-            "src/lib.rs",
-            ReviewLineKind::Context,
-            None,
-            Some(7),
-            0,
-            "context",
-        ));
+        let mut summary_only = review_thread(bundle_line(ReviewLineKind::Context, None, Some(7)));
         summary_only.summary_only = true;
         summary_only.thread_id = "whole-stack".to_string();
         let mut bundle = empty_bundle();
@@ -1549,19 +984,12 @@ mod tests {
             number: 42,
         });
         bundle.threads = vec![
-            review_thread(bundle_line(
-                "src/lib.rs",
-                ReviewLineKind::Added,
-                None,
-                Some(3),
-                1,
-                "added",
-            )),
+            review_thread(bundle_line(ReviewLineKind::Added, None, Some(3))),
             summary_only,
         ];
         let request = ExternalPublishReviewRequest {
             bundle: bundle.clone(),
-            options: serde_json::json!({ "token_env": "INTENTIONALLY_MISSING_GITHUB_TOKEN" }),
+            options: serde_json::json!({}),
         };
         let response = preview_for_request(&request).expect("offline preview");
         assert!(
@@ -1591,25 +1019,14 @@ mod tests {
     }
 
     #[test]
-    fn preview_reports_unmappable_comments() {
-        let bundle = ReviewBundle {
-            pull_request: None,
-            review_id: "review".to_string(),
-            title: "Review".to_string(),
-            repo_root: PathBuf::from("/repo"),
-            target: ReviewTarget::WorkingTreeUnstaged,
-            surfaces: Vec::new(),
-            files: Vec::new(),
-            threads: vec![review_thread(bundle_line(
-                "src/lib.rs",
-                ReviewLineKind::Context,
-                None,
-                None,
-                0,
-                "@@",
-            ))],
-            generated_at_ms: 1,
-        };
+    fn preview_reports_unmappable_and_resolved_comments() {
+        let mut resolved = review_thread(bundle_line(ReviewLineKind::Added, None, Some(42)));
+        resolved.resolved_at_ms = Some(123);
+        let mut bundle = empty_bundle();
+        bundle.threads = vec![
+            review_thread(bundle_line(ReviewLineKind::Context, None, None)),
+            resolved,
+        ];
         let request = ExternalPublishReviewRequest {
             bundle,
             options: serde_json::json!({
@@ -1620,99 +1037,10 @@ mod tests {
 
         let response = preview_for_request(&request).expect("preview");
 
-        assert!(response.preview.contains("Warnings"));
-    }
-
-    #[test]
-    fn resolved_threads_are_not_published() {
-        let mut thread = review_thread(bundle_line(
-            "src/lib.rs",
-            ReviewLineKind::Added,
-            None,
-            Some(42),
-            1,
-            "added",
-        ));
-        thread.resolved_at_ms = Some(123);
-        let bundle = ReviewBundle {
-            pull_request: None,
-            review_id: "review".to_string(),
-            title: "Review".to_string(),
-            repo_root: PathBuf::from("/repo"),
-            target: ReviewTarget::WorkingTreeUnstaged,
-            surfaces: Vec::new(),
-            files: Vec::new(),
-            threads: vec![thread],
-            generated_at_ms: 1,
-        };
-        let options = GitHubPublishOptions::from_json(
-            &serde_json::json!({
-                "repository": "owner/repo",
-                "pull_request": "123"
-            }),
-            &bundle,
-        )
-        .expect("options");
-
-        let draft = github_review_draft(&bundle, &options);
-
-        assert_eq!(draft.comments, [] as [GitHubReviewComment; 0]);
-        assert!(
-            draft
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("skipped 1 resolved"))
-        );
-    }
-
-    #[test]
-    fn maps_range_to_github_start_line() {
-        let thread = review_thread_with_lines(vec![
-            bundle_line(
-                "src/lib.rs",
-                ReviewLineKind::Added,
-                None,
-                Some(40),
-                1,
-                "first",
-            ),
-            bundle_line(
-                "src/lib.rs",
-                ReviewLineKind::Added,
-                None,
-                Some(42),
-                2,
-                "last",
-            ),
-        ]);
-
-        let comment = github_comment_for_thread(&thread).expect("comment");
-
-        assert_eq!(comment.line, 42);
-        assert_eq!(comment.start_line, Some(40));
-        assert_eq!(comment.start_side.as_deref(), Some("RIGHT"));
-    }
-
-    #[test]
-    fn serializes_github_payload_for_comment_event() {
-        let payload = GitHubCreateReviewRequest {
-            body: "summary".to_string(),
-            event: "COMMENT".to_string(),
-            comments: vec![GitHubReviewComment {
-                path: "src/lib.rs".to_string(),
-                body: "body".to_string(),
-                line: 42,
-                side: "RIGHT".to_string(),
-                start_line: Some(40),
-                start_side: Some("RIGHT".to_string()),
-            }],
-        };
-
-        let value = serde_json::to_value(&payload).expect("payload json");
-
-        assert_eq!(value["event"], "COMMENT");
-        assert_eq!(value["comments"][0]["start_line"], 40);
-        assert_eq!(value["comments"][0]["side"], "RIGHT");
+        assert!(response.preview.contains("## Warnings"));
+        assert!(response.preview.contains("not on a diff line"));
+        assert!(response.preview.contains("skipped 1 resolved"));
+        assert!(response.preview.contains("Inline comments: `0`"));
     }
 
     #[test]
@@ -1763,75 +1091,51 @@ mod tests {
     }
 
     fn bundle_line(
-        file_path: &str,
         kind: ReviewLineKind,
         old_line: Option<u32>,
         new_line: Option<u32>,
-        diff_row: u64,
-        content: &str,
     ) -> ReviewBundleLine {
         ReviewBundleLine {
-            file_path: file_path.to_string(),
+            file_path: "src/lib.rs".to_string(),
             kind,
             old_line,
             new_line,
-            diff_row,
-            content: content.to_string(),
+            diff_row: 1,
+            content: String::new(),
             surface_id: None,
             source_id: None,
         }
     }
 
     fn review_thread(line: ReviewBundleLine) -> ReviewBundleThread {
-        review_thread_with_lines(vec![line])
-    }
-
-    fn review_thread_with_lines(lines: Vec<ReviewBundleLine>) -> ReviewBundleThread {
-        let line = lines.first().expect("at least one line").clone();
+        let anchor = DraftAnchor {
+            kind: ReviewAnchorKind::Range,
+            file_path: line.file_path.clone(),
+            diff_row: line.diff_row,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start: None,
+            old_end: None,
+            new_start: line.new_line,
+            new_end: line.new_line,
+            old_line: line.old_line,
+            new_line: line.new_line,
+            line_kind: line.kind,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+            head_oid: None,
+            blob_oid: None,
+            reply_to: None,
+        };
         ReviewBundleThread {
             summary_only: false,
             thread_id: "thread".to_string(),
-            anchor: DraftAnchor {
-                kind: ReviewAnchorKind::Range,
-                file_path: line.file_path.clone(),
-                diff_row: line.diff_row,
-                start_diff_row: None,
-                end_diff_row: None,
-                old_start: None,
-                old_end: None,
-                new_start: line.new_line,
-                new_end: line.new_line,
-                old_line: line.old_line,
-                new_line: line.new_line,
-                line_kind: line.kind,
-                is_file_anchor: false,
-                surface_id: None,
-                source_id: None,
-                head_oid: None,
-                blob_oid: None,
-            },
+            anchor: anchor.clone(),
             comments: vec![DraftComment {
                 comment_id: "comment".to_string(),
                 thread_id: "thread".to_string(),
-                anchor: DraftAnchor {
-                    kind: ReviewAnchorKind::Range,
-                    file_path: line.file_path.clone(),
-                    diff_row: line.diff_row,
-                    start_diff_row: None,
-                    end_diff_row: None,
-                    old_start: None,
-                    old_end: None,
-                    new_start: line.new_line,
-                    new_end: line.new_line,
-                    old_line: line.old_line,
-                    new_line: line.new_line,
-                    line_kind: line.kind,
-                    is_file_anchor: false,
-                    surface_id: None,
-                    source_id: None,
-                    head_oid: None,
-                    blob_oid: None,
-                },
+                anchor,
                 body: "comment body".to_string(),
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -1842,7 +1146,7 @@ mod tests {
             }],
             session_id: None,
             resolved_at_ms: None,
-            selected_lines: lines,
+            selected_lines: vec![line],
             selected_diff_lines: Vec::new(),
             hunk_context: Vec::new(),
         }

@@ -5,12 +5,14 @@
 //! Shared code review models for Bcode.
 
 mod assistant;
+mod conversation;
 mod data;
 mod history;
 mod review_discovery;
 mod review_source;
 
 pub use assistant::*;
+pub use conversation::*;
 pub use data::*;
 pub use history::*;
 pub use review_discovery::*;
@@ -419,6 +421,11 @@ pub struct ReviewPresentationState {
     /// time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub all_stack_layers: bool,
+    /// The newest conversation activity seen on each pull request (by
+    /// `provider/repository#number`), in milliseconds since the Unix epoch: what arrived after
+    /// it is new.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conversation_seen: BTreeMap<String, u64>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -440,6 +447,7 @@ impl Default for ReviewPresentationState {
             hide_resolved_threads: false,
             hide_viewed_files: false,
             all_stack_layers: false,
+            conversation_seen: BTreeMap::new(),
         }
     }
 }
@@ -1398,6 +1406,11 @@ pub struct DraftAnchor {
     /// Omitted when absent, so anchors without it serialize (and hash) exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_oid: Option<String>,
+    /// The pull request thread a draft replies to (`provider/repository#number`, a `\u{1}`, and
+    /// the provider's thread id): the draft is held for the next review of that pull request
+    /// instead of starting a thread. Omitted when absent, so other anchors hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// Local review thread kind.
@@ -3122,6 +3135,7 @@ mod tests {
                 source_id: Some("source-1".to_string()),
                 head_oid: None,
                 blob_oid: None,
+                reply_to: None,
             },
             question: "Why is this safe?".to_string(),
             session_id: Some("session-1".to_string()),
@@ -3164,6 +3178,7 @@ mod tests {
                 source_id: Some("source-1".to_string()),
                 head_oid: None,
                 blob_oid: None,
+                reply_to: None,
             },
             body: "Handle the error explicitly.".to_string(),
             session_id: Some("session-1".to_string()),

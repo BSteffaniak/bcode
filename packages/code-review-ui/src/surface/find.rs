@@ -51,6 +51,11 @@ pub enum ThreadsFilter {
     General,
     /// Resolved threads.
     Resolved,
+    /// Threads on the pull request (read from its provider).
+    PullRequest,
+    /// Pull request threads waiting on the viewer: someone else spoke last on something they
+    /// are part of.
+    WaitingOnYou,
 }
 
 impl ThreadsFilter {
@@ -62,7 +67,9 @@ impl ThreadsFilter {
             Self::Open => Self::Attention,
             Self::Attention => Self::General,
             Self::General => Self::Resolved,
-            Self::Resolved => Self::All,
+            Self::Resolved => Self::PullRequest,
+            Self::PullRequest => Self::WaitingOnYou,
+            Self::WaitingOnYou => Self::All,
         }
     }
 
@@ -70,7 +77,9 @@ impl ThreadsFilter {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::All => Self::Resolved,
+            Self::All => Self::WaitingOnYou,
+            Self::WaitingOnYou => Self::PullRequest,
+            Self::PullRequest => Self::Resolved,
             Self::Resolved => Self::General,
             Self::Open => Self::All,
             Self::Attention => Self::Open,
@@ -87,6 +96,8 @@ impl ThreadsFilter {
             Self::Attention => "needs attention",
             Self::General => "general",
             Self::Resolved => "resolved",
+            Self::PullRequest => "on the pull request",
+            Self::WaitingOnYou => "waiting on you",
         }
     }
 
@@ -108,6 +119,23 @@ impl ThreadsFilter {
             }
             Self::General => first.anchor.kind == ReviewAnchorKind::Review,
             Self::Resolved => !open,
+            Self::PullRequest | Self::WaitingOnYou => false,
+        }
+    }
+
+    /// Whether a pull request thread is listed.
+    #[must_use]
+    pub const fn matches_remote(self, remote: &crate::notes::RemoteThreadInfo) -> bool {
+        match self {
+            Self::All | Self::PullRequest => true,
+            Self::Open => !remote.resolved,
+            Self::Attention => !remote.resolved && (remote.waiting || remote.new),
+            Self::General => matches!(
+                remote.placement,
+                bcode_code_review::conversation::Placement::OnLayer
+            ),
+            Self::Resolved => remote.resolved,
+            Self::WaitingOnYou => remote.waiting,
         }
     }
 
@@ -118,7 +146,7 @@ impl ThreadsFilter {
             Self::All | Self::Open => true,
             Self::Attention => exchange.status == ReviewAiExchangeStatus::Failed,
             Self::General => exchange.anchor.kind == ReviewAnchorKind::Review,
-            Self::Resolved => false,
+            Self::Resolved | Self::PullRequest | Self::WaitingOnYou => false,
         }
     }
 }
@@ -539,6 +567,7 @@ impl ReviewSurface {
         state.hide_resolved_threads = self.hide_resolved;
         state.hide_viewed_files = self.hide_viewed_files;
         state.all_stack_layers = self.stack_view == super::stack::StackView::AllLayers;
+        state.conversation_seen.clone_from(&self.talk.seen);
         state.layout_mode = self.layout_override.map(|mode| match mode {
             LayoutMode::Unified => ReviewLayoutMode::Unified,
             LayoutMode::SideBySide => ReviewLayoutMode::SideBySide,
@@ -631,6 +660,7 @@ impl ReviewSurface {
         else {
             return;
         };
+        self.talk.seen.clone_from(&state.conversation_seen);
         self.layout_override = match state.layout_mode {
             Some(ReviewLayoutMode::Unified) => Some(LayoutMode::Unified),
             Some(ReviewLayoutMode::SideBySide) => Some(LayoutMode::SideBySide),

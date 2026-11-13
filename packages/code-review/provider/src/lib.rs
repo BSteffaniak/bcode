@@ -17,15 +17,22 @@
 //! See `docs/review-loading-architecture.md`.
 
 use bcode_code_review_models::{
-    OP_REVIEW_DISCOVERY_DISCOVER, OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST,
-    OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH, OP_REVIEW_SOURCE_PULLS_GET,
-    OP_REVIEW_SOURCE_PULLS_HISTORY, OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE,
+    CommentPostRequest, CommentPostedResponse, OP_REVIEW_DISCOVERY_DISCOVER,
+    OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_COMMENT_POST, OP_REVIEW_SOURCE_MANIFEST,
+    OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_ACTIVITY, OP_REVIEW_SOURCE_PULLS_FETCH,
+    OP_REVIEW_SOURCE_PULLS_GET, OP_REVIEW_SOURCE_PULLS_HISTORY, OP_REVIEW_SOURCE_PULLS_LIST,
+    OP_REVIEW_SOURCE_PULLS_WATCH, OP_REVIEW_SOURCE_REVIEW_PREVIEW, OP_REVIEW_SOURCE_REVIEW_SUBMIT,
+    OP_REVIEW_SOURCE_STACK_RESOLVE, OP_REVIEW_SOURCE_THREAD_REPLY, OP_REVIEW_SOURCE_THREAD_RESOLVE,
     REVIEW_SOURCE_ERROR_FAILED, ReviewDiscoveryManifest, ReviewDiscoveryRequest,
-    ReviewDiscoveryResponse, ReviewPullFetchResult, ReviewSourceProviderManifest,
-    ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
-    ReviewSourcePullsGetRequest, ReviewSourcePullsGetResponse, ReviewSourcePullsHistoryRequest,
-    ReviewSourcePullsHistoryResponse, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
-    ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse,
+    ReviewDiscoveryResponse, ReviewPreviewResponse, ReviewPullFetchResult,
+    ReviewSourceProviderManifest, ReviewSourcePullFetchRequest, ReviewSourcePullsActivityRequest,
+    ReviewSourcePullsActivityResponse, ReviewSourcePullsFetchRequest,
+    ReviewSourcePullsFetchResponse, ReviewSourcePullsGetRequest, ReviewSourcePullsGetResponse,
+    ReviewSourcePullsHistoryRequest, ReviewSourcePullsHistoryResponse,
+    ReviewSourcePullsListRequest, ReviewSourcePullsListResponse, ReviewSourcePullsWatchRequest,
+    ReviewSourcePullsWatchResponse, ReviewSourceStackResolveRequest,
+    ReviewSourceStackResolveResponse, ReviewSubmitRequest, ReviewSubmitResponse,
+    ThreadReplyRequest, ThreadResolveRequest, ThreadResolveResponse,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -169,6 +176,87 @@ pub trait ReviewSourceProvider: Send + Sync {
         ))
     }
 
+    /// Several pull requests' conversations (state, reviews, threads, comments, checks), in one
+    /// call however many.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] when the provider does not
+    /// support it (its manifest says so), which is the default.
+    fn get_activity(
+        &self,
+        request: &ReviewSourcePullsActivityRequest,
+    ) -> ProviderResult<ReviewSourcePullsActivityResponse> {
+        let _ = request;
+        Err(unsupported(self, "report pull request conversations"))
+    }
+
+    /// Wait until some pull requests' conversations change (or the request's wait runs out),
+    /// however the provider learns of changes. Checks [`cancelled`] while waiting.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] by default.
+    fn watch_pulls(
+        &self,
+        request: &ReviewSourcePullsWatchRequest,
+    ) -> ProviderResult<ReviewSourcePullsWatchResponse> {
+        let _ = request;
+        Err(unsupported(self, "watch pull requests"))
+    }
+
+    /// Reply to an inline thread now.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] by default.
+    fn reply_to_thread(
+        &self,
+        request: &ThreadReplyRequest,
+    ) -> ProviderResult<CommentPostedResponse> {
+        let _ = request;
+        Err(unsupported(self, "reply to threads"))
+    }
+
+    /// Resolve or reopen an inline thread.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] by default.
+    fn resolve_thread(
+        &self,
+        request: &ThreadResolveRequest,
+    ) -> ProviderResult<ThreadResolveResponse> {
+        let _ = request;
+        Err(unsupported(self, "resolve threads"))
+    }
+
+    /// Post a conversation comment.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] by default.
+    fn post_comment(&self, request: &CommentPostRequest) -> ProviderResult<CommentPostedResponse> {
+        let _ = request;
+        Err(unsupported(self, "post comments"))
+    }
+
+    /// What submitting `request` would send, without sending it.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] by default.
+    fn preview_review(
+        &self,
+        request: &ReviewSubmitRequest,
+    ) -> ProviderResult<ReviewPreviewResponse> {
+        let _ = request;
+        Err(unsupported(self, "preview reviews"))
+    }
+
+    /// Submit a review.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] by default.
+    fn submit_review(&self, request: &ReviewSubmitRequest) -> ProviderResult<ReviewSubmitResponse> {
+        let _ = request;
+        Err(unsupported(self, "submit reviews"))
+    }
+
     /// The stack containing a pull request.
     ///
     /// # Errors
@@ -212,6 +300,14 @@ pub trait DiscoveryContributor: Send + Sync {
     -> ProviderResult<ReviewDiscoveryResponse>;
 }
 
+/// The error of an operation `provider` does not serve.
+fn unsupported<P: ReviewSourceProvider + ?Sized>(provider: &P, what: &str) -> ProviderCallError {
+    ProviderCallError::new(
+        ERROR_UNSUPPORTED_OPERATION,
+        format!("{} does not {what}", provider.manifest().label),
+    )
+}
+
 fn decode<T: DeserializeOwned>(payload: &[u8]) -> ProviderResult<T> {
     serde_json::from_slice(payload)
         .map_err(|error| ProviderCallError::new(ERROR_INVALID_REQUEST, error.to_string()))
@@ -240,6 +336,13 @@ pub fn serve_review_source(
         OP_REVIEW_SOURCE_STACK_RESOLVE => encode(&provider.resolve_stack(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULL_FETCH => encode(&provider.fetch_pull(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULLS_FETCH => encode(&provider.fetch_pulls(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_PULLS_ACTIVITY => encode(&provider.get_activity(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_PULLS_WATCH => encode(&provider.watch_pulls(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_THREAD_REPLY => encode(&provider.reply_to_thread(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_THREAD_RESOLVE => encode(&provider.resolve_thread(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_COMMENT_POST => encode(&provider.post_comment(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_REVIEW_PREVIEW => encode(&provider.preview_review(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_REVIEW_SUBMIT => encode(&provider.submit_review(&decode(payload)?)?),
         _ => Err(ProviderCallError::new(
             ERROR_UNSUPPORTED_OPERATION,
             format!("unsupported review-source operation {operation}"),
@@ -343,6 +446,49 @@ impl ReviewSourceProvider for JsonReviewSource {
     ) -> ProviderResult<ReviewSourcePullsFetchResponse> {
         call(&self.invoke, OP_REVIEW_SOURCE_PULLS_FETCH, request)
     }
+
+    fn get_activity(
+        &self,
+        request: &ReviewSourcePullsActivityRequest,
+    ) -> ProviderResult<ReviewSourcePullsActivityResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULLS_ACTIVITY, request)
+    }
+
+    fn watch_pulls(
+        &self,
+        request: &ReviewSourcePullsWatchRequest,
+    ) -> ProviderResult<ReviewSourcePullsWatchResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULLS_WATCH, request)
+    }
+
+    fn reply_to_thread(
+        &self,
+        request: &ThreadReplyRequest,
+    ) -> ProviderResult<CommentPostedResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_THREAD_REPLY, request)
+    }
+
+    fn resolve_thread(
+        &self,
+        request: &ThreadResolveRequest,
+    ) -> ProviderResult<ThreadResolveResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_THREAD_RESOLVE, request)
+    }
+
+    fn post_comment(&self, request: &CommentPostRequest) -> ProviderResult<CommentPostedResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_COMMENT_POST, request)
+    }
+
+    fn preview_review(
+        &self,
+        request: &ReviewSubmitRequest,
+    ) -> ProviderResult<ReviewPreviewResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_REVIEW_PREVIEW, request)
+    }
+
+    fn submit_review(&self, request: &ReviewSubmitRequest) -> ProviderResult<ReviewSubmitResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_REVIEW_SUBMIT, request)
+    }
 }
 
 /// A discovery contributor reached through JSON operations (for example a Bcode plugin's).
@@ -443,6 +589,7 @@ mod tests {
             id: "x".into(),
             label: "X".into(),
             capabilities: ReviewSourceCapabilities::default(),
+            conversation: bcode_code_review_models::ConversationCapabilities::default(),
         };
         let source = JsonReviewSource::new(
             manifest,

@@ -199,14 +199,7 @@ impl ReviewSurface {
                 .filter(|(source, _)| *source == Some(source_id.as_str()))
                 .map(|(_, thread)| *thread)
                 .collect();
-            let home = group.header.clone().or_else(|| {
-                review
-                    .doc
-                    .group_files(group.index)
-                    .next()
-                    .map(|file| ItemKey::FileHeader(file.clone()))
-            });
-            let Some(home) = home else {
+            let Some(home) = group_home(&review.doc, &group) else {
                 continue;
             };
             let layers = &stack.stack.layers;
@@ -262,6 +255,12 @@ impl ReviewSurface {
                 full.push(count.clone());
                 compact.push(count);
             }
+            // The pull request's review decision, open threads, and whether something is new.
+            Self::extend_both(
+                &mut full,
+                &mut compact,
+                self.conversation_tab_spans(&source_id),
+            );
             entries.push(RailEntry {
                 source_id,
                 home,
@@ -273,6 +272,12 @@ impl ReviewSurface {
             });
         }
         entries
+    }
+
+    /// Append `spans` to both labels.
+    fn extend_both(full: &mut Vec<Span>, compact: &mut Vec<Span>, spans: Vec<Span>) {
+        full.extend(spans.iter().cloned());
+        compact.extend(spans);
     }
 
     /// Layers in the whole stack of a stack-layer source (its workspace kind does not say).
@@ -605,6 +610,18 @@ fn progress_cells(viewed: usize, total: usize, theme: &super::ReviewTheme) -> Ve
             theme.bar_empty,
         ),
     ]
+}
+
+/// Where entering a layer's group lands first: its header, else its first file.
+fn group_home(
+    doc: &bcode_code_review::document::ReviewDocument,
+    group: &bcode_code_review::document::GroupInfo<'_>,
+) -> Option<ItemKey> {
+    group.header.clone().or_else(|| {
+        doc.group_files(group.index)
+            .next()
+            .map(|file| ItemKey::FileHeader(file.clone()))
+    })
 }
 
 #[cfg(test)]

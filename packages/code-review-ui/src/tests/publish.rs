@@ -51,6 +51,7 @@ fn line_anchor(source: &str, path: &str, line: u32, kind: ReviewLineKind) -> Dra
         source_id: Some(source.to_owned()),
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     }
 }
 

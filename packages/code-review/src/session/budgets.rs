@@ -179,6 +179,7 @@ impl ReviewSourceProvider for ChainProvider {
                     pulls_history: false,
                 },
             },
+            conversation: bcode_code_review_models::ConversationCapabilities::default(),
         }
     }
 

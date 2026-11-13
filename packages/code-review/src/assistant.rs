@@ -967,6 +967,7 @@ impl<'a> ReviewTools<'a> {
             source_id: None,
             head_oid: None,
             blob_oid: None,
+            reply_to: None,
         };
         let Some(path) = location
             .path

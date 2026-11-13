@@ -3,18 +3,16 @@
 //! * Without a subcommand the app opens on the review home of the current directory's
 //!   repository; each review subcommand opens a transient review (or resolves a pull request,
 //!   stack, or saved review first) in the app.
-//! * `publish-github` previews or submits a review to a GitHub pull request without opening the
-//!   app. It is the only subcommand that needs the Bcode daemon.
+//! * `publish` previews or submits a review of a pull request to its review-source provider
+//!   without opening the app, through the built-in providers in-process (no daemon).
+//!   `publish-github` is an alias kept for existing scripts.
 
 use crate::entry::Entry;
-use bcode_client::BcodeClient;
 use bcode_code_review_models::{
-    ExternalPublishReviewRequest, OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT,
-    PublishReviewRequest, REVIEW_PUBLISHER_INTERFACE_ID, ReviewBundle, ReviewSourceKind,
-    ReviewTarget,
+    PublishReviewRequest, PullLocator, ReviewBundle, ReviewSourceKind,
+    ReviewSourcePullsListRequest, ReviewSubmitRequest, ReviewTarget, ReviewVerdict,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,11 +59,12 @@ pub enum CliError {
     App(#[from] crate::RunError),
 }
 
-/// Whether `command` needs the Bcode daemon before it runs (only `publish-github` does; the app
-/// starts without one and reaches it only for AI questions and plugin services).
+/// Whether `command` needs the Bcode daemon before it runs. None does: the app reaches it only
+/// for AI questions and plugin services, and `publish` uses the built-in providers.
 #[must_use]
 pub const fn requires_daemon(command: Option<&ReviewCommand>) -> bool {
-    matches!(command, Some(ReviewCommand::PublishGithub { .. }))
+    let _ = command;
+    false
 }
 
 /// What a command line asks for.
@@ -78,8 +77,8 @@ pub enum Invocation {
         /// What the app opens first.
         entry: Entry,
     },
-    /// Publish to GitHub without opening the app.
-    PublishGithub(Box<GithubPublishCliRequest>),
+    /// Publish to a pull request without opening the app.
+    Publish(Box<PublishCliRequest>),
 }
 
 /// Resolve `command` into what it asks for, with its repository path made absolute.
@@ -99,7 +98,7 @@ pub fn invocation(command: Option<ReviewCommand>) -> Result<Invocation, CliError
             repo: resolve_repo_argument(&repo)?,
             entry,
         }),
-        Err(request) => Ok(Invocation::PublishGithub(request)),
+        Err(request) => Ok(Invocation::Publish(request)),
     }
 }
 
@@ -132,9 +131,7 @@ pub async fn run(
             .await?;
             Ok(())
         }
-        Invocation::PublishGithub(request) => {
-            publish_github_review(*request, bcode_program.is_some()).await
-        }
+        Invocation::Publish(request) => publish_review(*request).await,
     }
 }
 
@@ -249,41 +246,47 @@ pub enum ReviewCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// Publish a review to GitHub without opening the TUI.
-    PublishGithub {
-        /// GitHub repository in owner/repo form.
+    /// Preview (or, with `--submit`, submit) a review of a pull request on its provider,
+    /// without opening the app.
+    #[command(alias = "publish-github")]
+    Publish {
+        /// Review-source provider id; when absent, the one built-in provider that submits
+        /// reviews.
         #[arg(long)]
-        github_repo: Option<String>,
-        /// GitHub pull request number.
-        #[arg(long)]
-        pr: Option<u64>,
+        provider: Option<String>,
+        /// Provider repository (detected from the remotes when absent).
+        #[arg(long, alias = "github-repo")]
+        repository: Option<String>,
+        /// Pull request number (the current branch's pull request when absent).
+        #[arg(long, alias = "pr")]
+        pull: Option<u64>,
         /// Repository path.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// GitHub token environment variable.
-        #[arg(long, default_value = "GITHUB_TOKEN")]
-        token_env: String,
-        /// GitHub review event.
-        #[arg(long, value_enum, default_value_t = GithubSubmitEvent::Comment)]
-        submit_event: GithubSubmitEvent,
+        /// What the review says.
+        #[arg(long, value_enum, alias = "submit-event", default_value_t = VerdictArg::Comment)]
+        verdict: VerdictArg,
         /// Optional review summary body.
         #[arg(long)]
         summary: Option<String>,
-        /// Include unmappable comments in summary instead of failing submit.
-        #[arg(long)]
-        fallback_unmapped_to_summary: bool,
+        /// Put comments that cannot be placed inline into the summary instead of failing.
+        #[arg(long, alias = "fallback-unmapped-to-summary")]
+        unplaced_into_summary: bool,
         /// Submit the review. Defaults to preview-only.
         #[arg(long)]
         submit: bool,
         /// Target to publish.
         #[arg(long, value_enum, default_value_t = ReviewTargetArg::Unstaged)]
         target: ReviewTargetArg,
+        /// Accepted for older scripts and ignored: providers find their own credentials.
+        #[arg(long, hide = true)]
+        token_env: Option<String>,
     },
 }
 
-/// GitHub review event of `publish-github`.
+/// Verdict of `publish`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum GithubSubmitEvent {
+pub enum VerdictArg {
     /// A comment-only review.
     Comment,
     /// Request changes.
@@ -292,17 +295,17 @@ pub enum GithubSubmitEvent {
     Approve,
 }
 
-impl GithubSubmitEvent {
-    const fn as_github_event(self) -> &'static str {
-        match self {
-            Self::Comment => "COMMENT",
-            Self::RequestChanges => "REQUEST_CHANGES",
-            Self::Approve => "APPROVE",
+impl From<VerdictArg> for ReviewVerdict {
+    fn from(value: VerdictArg) -> Self {
+        match value {
+            VerdictArg::Comment => Self::Comment,
+            VerdictArg::RequestChanges => Self::RequestChanges,
+            VerdictArg::Approve => Self::Approve,
         }
     }
 }
 
-/// Target of `publish-github`.
+/// Target of `publish`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ReviewTargetArg {
     /// Unstaged working-tree changes.
@@ -326,8 +329,8 @@ impl From<ReviewTargetArg> for ReviewTarget {
     }
 }
 
-/// The entry an interactive subcommand opens, or the publish request of `publish-github`.
-fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Entry), Box<GithubPublishCliRequest>> {
+/// The entry an interactive subcommand opens, or the publish request of `publish`.
+fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Entry), Box<PublishCliRequest>> {
     Ok(match command {
         ReviewCommand::Unstaged { repo } => (repo, sources(ReviewSourceKind::WorkingTreeUnstaged)),
         ReviewCommand::Staged { repo } => (repo, sources(ReviewSourceKind::IndexStaged)),
@@ -373,25 +376,26 @@ fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Entry), Box<GithubPublis
         ReviewCommand::Pr { reference, repo } => (repo, Entry::PullRequest { reference }),
         ReviewCommand::Stack { reference, repo } => (repo, Entry::Stack { reference }),
         ReviewCommand::Resume { id, repo } => (repo, Entry::Resume { workspace_id: id }),
-        ReviewCommand::PublishGithub {
-            github_repo,
-            pr,
+        ReviewCommand::Publish {
+            provider,
+            repository,
+            pull,
             repo,
-            token_env,
-            submit_event,
+            verdict,
             summary,
-            fallback_unmapped_to_summary,
+            unplaced_into_summary,
             submit,
             target,
+            token_env: _,
         } => {
-            return Err(Box::new(GithubPublishCliRequest {
-                github_repo,
-                pr,
+            return Err(Box::new(PublishCliRequest {
+                provider,
+                repository,
+                pull,
                 repo,
-                token_env,
-                submit_event,
+                verdict: verdict.into(),
                 summary,
-                fallback_unmapped_to_summary,
+                unplaced_into_summary,
                 submit,
                 target: target.into(),
             }));
@@ -407,88 +411,154 @@ fn sources(source: ReviewSourceKind) -> Entry {
     }
 }
 
-/// A `publish-github` request.
+/// A `publish` request.
 #[derive(Debug)]
-pub struct GithubPublishCliRequest {
-    github_repo: Option<String>,
-    pr: Option<u64>,
+pub struct PublishCliRequest {
+    provider: Option<String>,
+    repository: Option<String>,
+    pull: Option<u64>,
     repo: PathBuf,
-    token_env: String,
-    submit_event: GithubSubmitEvent,
+    verdict: ReviewVerdict,
     summary: Option<String>,
-    fallback_unmapped_to_summary: bool,
+    unplaced_into_summary: bool,
     submit: bool,
     target: ReviewTarget,
 }
 
-/// Build the review's bundle from the stored state, then preview or submit it through the
-/// daemon's review publisher. Inside Bcode that is the running Bcode's daemon; the standalone app
-/// uses the installed Bcode's. Either starts its daemon when needed.
-async fn publish_github_review(
-    request: GithubPublishCliRequest,
-    inside_bcode: bool,
-) -> Result<(), CliError> {
+/// Build the review's bundle from the stored state, then preview or submit it with the pull
+/// request's provider (a built-in one, in-process).
+async fn publish_review(request: PublishCliRequest) -> Result<(), CliError> {
     let repo = resolve_repo_argument(&request.repo)?;
-    let bundle = review_bundle(&repo, request.target.clone()).await?;
-    let client = if inside_bcode {
-        BcodeClient::default_endpoint()
-            .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart)
-    } else {
-        BcodeClient::for_installed_bcode(bcode_client::InstalledDaemonStart::IfNeeded)
-            .await?
-            .into_client()
-    };
-    let repository = match request.github_repo {
-        Some(repository) => repository,
-        None => detect_github_repository(&repo)?,
-    };
-    let pull_request = match request.pr {
-        Some(pull_request) => pull_request,
-        None => detect_pull_request_number(&repo)?,
-    };
-    let mut options = serde_json::json!({
-        "repository": repository,
-        "pull_request": pull_request.to_string(),
-        "token_env": request.token_env,
-        "submit_event": request.submit_event.as_github_event(),
-    });
-    if let Some(summary) = request.summary {
-        options["summary"] = serde_json::Value::String(summary);
-    }
-    if request.fallback_unmapped_to_summary {
-        options["fallback_unmapped_to_summary"] = serde_json::Value::Bool(true);
-    }
-    let publish_payload = serde_json::to_vec(&ExternalPublishReviewRequest { bundle, options })?;
-    let operation = if request.submit {
-        OP_REVIEW_PUBLISHER_SUBMIT
-    } else {
-        OP_REVIEW_PUBLISHER_PREVIEW
-    };
-    let response = client
-        .call_plugin_service(
-            REVIEW_PUBLISHER_INTERFACE_ID.to_string(),
-            operation.to_string(),
-            publish_payload,
-        )
-        .await
-        .map_err(daemon_error)?;
-    let value = plugin_response_json::<serde_json::Value>(response)?;
-    if request.submit {
-        println!("{}", value["message"].as_str().unwrap_or("submitted"));
-        if let Some(output) = value["output"].as_str() {
-            println!("{output}");
+    let registry = crate::run::builtin_providers();
+    let route = publishing_provider(&registry, request.provider.as_deref())?;
+    let provider = std::sync::Arc::clone(&route.provider);
+    let publisher_id = format!(
+        "{}{}",
+        crate::publish::PROVIDER_PUBLISHER_PREFIX,
+        route.manifest.id
+    );
+    let bundle = review_bundle(&repo, request.target.clone(), publisher_id).await?;
+    let submit = request.submit;
+    let output = tokio::task::spawn_blocking(move || -> Result<String, CliError> {
+        let failed = |error: bcode_code_review::provider::ProviderCallError| {
+            CliError::Review(crate::conversation::error_text(&error.code, &error.message))
+        };
+        let number = match request.pull {
+            Some(number) => number,
+            None => current_pull(&*provider, &repo, request.repository.as_deref())?,
+        };
+        let review = ReviewSubmitRequest {
+            pull: PullLocator {
+                repo_path: repo,
+                repository: request.repository,
+                number,
+            },
+            verdict: request.verdict,
+            body: request.summary.unwrap_or_default(),
+            head_oid: None,
+            bundle: Some(bundle),
+            replies: Vec::new(),
+            unplaced_into_body: request.unplaced_into_summary,
+        };
+        if submit {
+            let response = provider.submit_review(&review).map_err(failed)?;
+            Ok(response.url.map_or_else(
+                || response.message.clone(),
+                |url| format!("{}\n{url}", response.message),
+            ))
+        } else {
+            Ok(provider.preview_review(&review).map_err(failed)?.preview)
         }
-    } else if let Some(preview) = value["preview"].as_str() {
-        println!("{preview}");
-    } else {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    }
+    })
+    .await
+    .map_err(|error| CliError::Review(format!("publishing did not finish: {error}")))??;
+    println!("{output}");
     Ok(())
+}
+
+/// The provider `id` names, else the one provider that submits reviews.
+fn publishing_provider<'a>(
+    registry: &'a bcode_code_review::provider::ProviderRegistry,
+    id: Option<&str>,
+) -> Result<&'a bcode_code_review::provider::ProviderRoute, CliError> {
+    let reviewing: Vec<&bcode_code_review::provider::ProviderRoute> = registry
+        .sources()
+        .iter()
+        .filter(|route| route.manifest.conversation.verdicts.any())
+        .collect();
+    let names = || {
+        reviewing
+            .iter()
+            .map(|route| route.manifest.id.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    id.map_or_else(
+        || match reviewing.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(CliError::Review(
+                "no review-source provider submits reviews".to_owned(),
+            )),
+            _ => Err(CliError::Review(format!(
+                "pass --provider (one of: {})",
+                names()
+            ))),
+        },
+        |id| {
+            reviewing
+                .iter()
+                .copied()
+                .find(|route| route.manifest.id == id)
+                .ok_or_else(|| {
+                    CliError::Review(format!(
+                        "no provider {id} submits reviews (available: {})",
+                        names()
+                    ))
+                })
+        },
+    )
+}
+
+/// The open pull request of the current branch, as `provider` finds it.
+fn current_pull(
+    provider: &dyn bcode_code_review::provider::ReviewSourceProvider,
+    repo: &Path,
+    repository: Option<&str>,
+) -> Result<u64, CliError> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo)
+        .output()?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !output.status.success() || branch.is_empty() {
+        return Err(CliError::Review(
+            "no current branch to find the pull request of; pass --pull".to_owned(),
+        ));
+    }
+    let listed = provider
+        .list_pulls(&ReviewSourcePullsListRequest {
+            repo_path: repo.to_path_buf(),
+            repository: repository.map(str::to_owned),
+            query: Some(branch.clone()),
+        })
+        .map_err(|error| {
+            CliError::Review(crate::conversation::error_text(&error.code, &error.message))
+        })?;
+    listed
+        .pulls
+        .iter()
+        .find(|pull| pull.head_branch == branch)
+        .map(|pull| pull.number)
+        .ok_or_else(|| CliError::Review(format!("no open pull request for {branch}; pass --pull")))
 }
 
 /// The provider-neutral bundle of `target`'s drafts in the repository at `repo`, read with the
 /// repository's configured review state.
-async fn review_bundle(repo: &Path, target: ReviewTarget) -> Result<ReviewBundle, CliError> {
+async fn review_bundle(
+    repo: &Path,
+    target: ReviewTarget,
+    publisher_id: String,
+) -> Result<ReviewBundle, CliError> {
     let config = crate::config::load(repo);
     if config.plugin_disabled {
         return Err(CliError::Review(
@@ -501,7 +571,7 @@ async fn review_bundle(repo: &Path, target: ReviewTarget) -> Result<ReviewBundle
         target,
         workspace: None,
         excluded_thread_anchors: Vec::new(),
-        publisher_id: GITHUB_PUBLISHER_ID.to_owned(),
+        publisher_id,
         options: serde_json::Value::Null,
     };
     tokio::task::spawn_blocking(move || store.review_bundle(request))
@@ -510,113 +580,10 @@ async fn review_bundle(repo: &Path, target: ReviewTarget) -> Result<ReviewBundle
         .map_err(|error| CliError::Review(error.to_string()))
 }
 
-/// Publisher id of the GitHub pull request review publisher.
-const GITHUB_PUBLISHER_ID: &str = "github_pr_review";
-
-fn daemon_error(error: bcode_client::ClientError) -> CliError {
-    if error.is_daemon_unavailable() {
-        CliError::BcodeNotRunning
-    } else {
-        CliError::Client(error)
-    }
-}
-
-fn plugin_response_json<T: for<'de> Deserialize<'de>>(
-    response: bcode_ipc::PluginServiceResponse,
-) -> Result<T, CliError> {
-    if let Some(error) = response.error {
-        return Err(CliError::PluginService {
-            code: error.code,
-            message: error.message,
-        });
-    }
-    serde_json::from_slice(&response.payload).map_err(CliError::Json)
-}
-
-fn detect_github_repository(repo: &Path) -> Result<String, CliError> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo)
-        .output()?;
-    if !output.status.success() {
-        return Err(CliError::Review(
-            "failed to detect GitHub repository from origin remote; pass --github-repo".to_string(),
-        ));
-    }
-    let remote = String::from_utf8_lossy(&output.stdout);
-    parse_github_remote_url(remote.trim()).ok_or_else(|| {
-        CliError::Review(
-            "origin remote is not a GitHub owner/repo URL; pass --github-repo".to_string(),
-        )
-    })
-}
-
-fn parse_github_remote_url(remote: &str) -> Option<String> {
-    let trimmed = remote.trim().trim_end_matches(".git");
-    if let Some(path) = trimmed.strip_prefix("git@github.com:") {
-        return owner_repo_from_path(path);
-    }
-    if let Some(path) = trimmed.strip_prefix("https://github.com/") {
-        return owner_repo_from_path(path);
-    }
-    if let Some(path) = trimmed.strip_prefix("ssh://git@github.com/") {
-        return owner_repo_from_path(path);
-    }
-    None
-}
-
-fn owner_repo_from_path(path: &str) -> Option<String> {
-    let mut parts = path.split('/');
-    let owner = parts.next()?.trim();
-    let repo = parts.next()?.trim();
-    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
-}
-
-fn detect_pull_request_number(repo: &Path) -> Result<u64, CliError> {
-    let output = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(repo)
-        .output()?;
-    if !output.status.success() {
-        return Err(CliError::Review(
-            "failed to detect current branch; pass --pr".to_string(),
-        ));
-    }
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_pull_request_from_branch(&branch).ok_or_else(|| {
-        CliError::Review("failed to detect pull request number from branch; pass --pr".to_string())
-    })
-}
-
-fn parse_pull_request_from_branch(branch: &str) -> Option<u64> {
-    branch
-        .strip_prefix("pull/")
-        .and_then(|rest| rest.split('/').next())
-        .or_else(|| branch.strip_prefix("pr/"))
-        .and_then(|value| value.parse().ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
-
-    #[test]
-    fn missing_daemon_reports_that_bcode_is_not_running() {
-        let missing = bcode_client::ClientError::Transport(bcode_ipc::IpcTransportError::Io(
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        ));
-        let error = daemon_error(missing);
-        assert!(matches!(error, CliError::BcodeNotRunning), "{error}");
-        assert_eq!(
-            error.to_string(),
-            "Bcode is not running; start bcode and try again"
-        );
-        let other = bcode_client::ClientError::Transport(bcode_ipc::IpcTransportError::Io(
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        ));
-        assert!(matches!(daemon_error(other), CliError::Client(_)));
-    }
 
     fn parse(args: &[&str]) -> Result<Option<ReviewCommand>, clap::Error> {
         let matches = ReviewCli::command().try_get_matches_from(args)?;
@@ -810,19 +777,42 @@ mod tests {
     }
 
     #[test]
-    fn github_preview_and_submit_require_daemon_before_invocation() {
-        for args in [
-            vec!["review", "publish-github"],
-            vec!["review", "publish-github", "--submit"],
-            vec!["review", "publish-github", "--target", "staged"],
-        ] {
-            let command = parse(&args).unwrap();
-            assert!(requires_daemon(command.as_ref()), "{args:?}");
-        }
+    fn publish_needs_no_daemon_and_publishes_instead_of_opening_the_review() {
+        let command = parse(&[
+            "review",
+            "publish",
+            "--provider",
+            "forge",
+            "--repository",
+            "owner/repo",
+            "--pull",
+            "7",
+            "--target",
+            "last-commit",
+            "--verdict",
+            "request-changes",
+            "--summary",
+            "LGTM",
+            "--unplaced-into-summary",
+            "--submit",
+        ])
+        .unwrap();
+        assert!(!requires_daemon(command.as_ref()));
+        let Invocation::Publish(request) = invocation(command).expect("command resolves") else {
+            panic!("publish must not open the app");
+        };
+        assert_eq!(request.provider.as_deref(), Some("forge"));
+        assert_eq!(request.repository.as_deref(), Some("owner/repo"));
+        assert_eq!(request.pull, Some(7));
+        assert_eq!(request.target, ReviewTarget::LastCommit);
+        assert_eq!(request.verdict, ReviewVerdict::RequestChanges);
+        assert_eq!(request.summary.as_deref(), Some("LGTM"));
+        assert!(request.unplaced_into_summary);
+        assert!(request.submit);
     }
 
     #[test]
-    fn publish_github_publishes_instead_of_opening_the_review() {
+    fn the_old_publish_github_command_line_still_reads() {
         let command = parse(&[
             "review",
             "publish-github",
@@ -830,28 +820,22 @@ mod tests {
             "owner/repo",
             "--pr",
             "7",
-            "--target",
-            "last-commit",
+            "--token-env",
+            "GITHUB_TOKEN",
             "--submit-event",
-            "request-changes",
-            "--summary",
-            "LGTM",
+            "approve",
             "--fallback-unmapped-to-summary",
-            "--submit",
         ])
         .unwrap();
-        let Invocation::PublishGithub(request) = invocation(command).expect("command resolves")
-        else {
+        let Invocation::Publish(request) = invocation(command).expect("command resolves") else {
             panic!("publish-github must not open the app");
         };
-        assert_eq!(request.github_repo.as_deref(), Some("owner/repo"));
-        assert_eq!(request.pr, Some(7));
-        assert_eq!(request.target, ReviewTarget::LastCommit);
-        assert_eq!(request.submit_event.as_github_event(), "REQUEST_CHANGES");
-        assert_eq!(request.summary.as_deref(), Some("LGTM"));
-        assert!(request.fallback_unmapped_to_summary);
-        assert!(request.submit);
-        assert_eq!(request.token_env, "GITHUB_TOKEN");
+        assert_eq!(request.provider, None);
+        assert_eq!(request.repository.as_deref(), Some("owner/repo"));
+        assert_eq!(request.pull, Some(7));
+        assert_eq!(request.verdict, ReviewVerdict::Approve);
+        assert!(request.unplaced_into_summary);
+        assert!(!request.submit);
     }
 
     #[test]

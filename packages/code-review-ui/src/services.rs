@@ -233,6 +233,7 @@ pub struct ReviewServices {
     host: Arc<dyn ReviewHost>,
     execution: Execution,
     stack_limit: ReviewStackLimit,
+    conversation: Arc<crate::config::conversation::ConversationConfig>,
     /// Providers and contributors: built-in ones, plus plugin-backed ones once found.
     providers: Arc<Mutex<ProviderRegistry>>,
     /// Whether plugin-backed providers were looked for (once, in the background).
@@ -263,6 +264,7 @@ impl ReviewServices {
             host,
             execution: Execution::Pool,
             stack_limit: ReviewStackLimit::default(),
+            conversation: Arc::default(),
             providers: Arc::default(),
             plugins_sought: Arc::default(),
             #[cfg(test)]
@@ -297,6 +299,21 @@ impl ReviewServices {
     #[must_use]
     pub fn with_source(self, provider: Arc<dyn ReviewSourceProvider>) -> Self {
         lock(&self.providers).add_source(provider);
+        self
+    }
+
+    /// Register every provider and contributor of `registry` (called in-process).
+    #[must_use]
+    pub fn with_providers(self, registry: &ProviderRegistry) -> Self {
+        {
+            let mut providers = lock(&self.providers);
+            for route in registry.sources() {
+                providers.add_source(Arc::clone(&route.provider));
+            }
+            for route in registry.contributors() {
+                providers.add_contributor(Arc::clone(&route.contributor));
+            }
+        }
         self
     }
 
@@ -389,6 +406,22 @@ impl ReviewServices {
     #[must_use]
     pub const fn stack_limit(&self) -> ReviewStackLimit {
         self.stack_limit
+    }
+
+    /// How pull request conversations show and stay current.
+    #[must_use]
+    pub fn conversation_config(&self) -> Arc<crate::config::conversation::ConversationConfig> {
+        Arc::clone(&self.conversation)
+    }
+
+    /// Use `config` for pull request conversations.
+    #[must_use]
+    pub fn with_conversation(
+        mut self,
+        config: crate::config::conversation::ConversationConfig,
+    ) -> Self {
+        self.conversation = Arc::new(config);
+        self
     }
 
     /// Services that answer on the calling task, so scenario tests observe completions in a

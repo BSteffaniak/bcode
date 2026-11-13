@@ -46,6 +46,7 @@ impl ReviewSurface {
             return;
         };
         let mut panel = HistoryPanel::loading();
+        panel.set_reviews(self.review_marks());
         if let Some(timeline) = self.stack_history.clone() {
             panel.set_timeline(timeline);
             panel.set_note("Checking the forge for more history…");
@@ -56,6 +57,35 @@ impl ReviewSurface {
             let result = history::load(services, scope, true).await;
             inbox.push(Message::HistoryPanel(result));
         }));
+    }
+
+    /// Each layer's approvals and requests for changes, from its conversation.
+    fn review_marks(&self) -> std::collections::BTreeMap<u64, Vec<history::ReviewMark>> {
+        use bcode_code_review_models::ReviewState;
+        self.talk
+            .data
+            .links
+            .iter()
+            .filter_map(|link| {
+                let activity = self.talk.data.activity(&link.pull)?;
+                let marks = activity
+                    .latest_reviews()
+                    .into_iter()
+                    .filter(|review| {
+                        matches!(
+                            review.state,
+                            ReviewState::Approved | ReviewState::ChangesRequested
+                        )
+                    })
+                    .map(|review| history::ReviewMark {
+                        login: review.author.login.clone(),
+                        approved: review.state == ReviewState::Approved,
+                        commit: review.commit_oid.clone(),
+                    })
+                    .collect();
+                Some((link.pull.number, marks))
+            })
+            .collect()
     }
 
     /// Load the history as recorded (no forge), for the layer strip's summary of the last push.

@@ -37,7 +37,7 @@ subcommand takes `--repo PATH` (default `.`). Without a subcommand the app opens
 | `pr NUMBER\|URL` | A pull request (needs a review-source provider plugin). |
 | `stack [NUMBER\|URL]` | A whole stack of pull requests; without a reference, the stack of the current branch's pull request. |
 | `resume [ID]` | A saved review; without an id, the most recently updated one. |
-| `publish-github` | Does not open the app: previews (or with `--submit` submits) the drafts of `--target` (default `unstaged`) as a GitHub review on `--pr` in `--github-repo`, with `--submit-event comment\|request-changes\|approve`, `--summary`, `--token-env` (default `GITHUB_TOKEN`) and `--fallback-unmapped-to-summary`. |
+| `publish` | Does not open the app: previews (or with `--submit` submits) the drafts of `--target` (default `unstaged`) as a review of pull request `--pull` (default: the current branch's) on `--provider` (default: the one built-in provider that submits reviews), in `--repository` (default: detected), with `--verdict comment\|request-changes\|approve`, `--summary` and `--unplaced-into-summary`. Runs the provider in-process; no daemon. `publish-github` is an alias that still reads its old flags (`--pr`, `--github-repo`, `--submit-event`, `--fallback-unmapped-to-summary`; `--token-env` is ignored, since providers find their own credentials). |
 
 Transient reviews (every subcommand but `resume`) keep their drafts per target; `ctrl+s` saves one
 to the review home.
@@ -259,6 +259,40 @@ the current one open, and a strip under the rail names the pull request the curs
 choice is kept with the review. A whole-stack review (one source for the entire stack) is one
 diff labeled by layer and is not affected.
 
+### Pull request conversations
+
+A pull request (or stack layer, or whole stack) shows its conversation as its forge has it,
+without importing anything. See [`review-forge-conversation.md`](review-forge-conversation.md).
+
+* **The pull request bar**, under the rail, is about the pull request the cursor is in (a whole
+  stack shows its top layer). One line: the review decision and who approved, checks (failing
+  or running first), open threads, *waiting on you*, and what is new since you last looked, with
+  buttons for what the provider and your permissions allow: **Approve**, **Request changes**,
+  **Comment**, **Open ↗**, and **↻** to read it again. Clicking the summary (or `ctrl+o`) opens
+  it as the top of the pull request's page: the description, each reviewer's latest verdict (and
+  whether it was given on an older version, or before a rebase that keeps it current), who is
+  still asked, failing checks with links, and the conversation, with **Show all** and
+  **Collapse**. A stack also gets **Approve N reviewed layers**. It opens by itself when something
+  is new (configurable).
+* **Threads** from the forge sit on their lines in the diff, placed on the code the review shows:
+  exactly, moved with their code when it moved, else on their file (*on an older version*) or on
+  the layer. Each has **Reply**, **Resolve**/**Reopen**, **Open ↗** and **Ask Bcode** as far as
+  allowed; resolved ones fold. **Reply** sends at once and offers **Add to review**, which holds
+  the reply as a draft under the thread until the next review of that pull request is submitted
+  (the default is configurable).
+* **The rail** marks each layer approved (✓) or changes requested (✕), with its open threads
+  and a dot when something is new.
+* **The threads panel** lists pull request threads too, and filters them: *on the pull request*
+  and *waiting on you* (the filter key cycles).
+* **Publishing** offers **Review on {provider}** first: its options are the verdict (only those
+  the provider accepts) and a summary, and held replies go with it. Approve and Request changes
+  in the bar open it directly at that verdict for that pull request.
+* **The history panel** (`shift+b`) names each layer's reviews and whether they still apply.
+* Conversations stay current without polling: they are read when the review opens, when it is
+  focused again, after your own changes, when the review's heads change, from **↻**, and when
+  the provider's watch says they changed (GitHub's checks cheaply on its own schedule). New
+  reviews and replies make a toast.
+
 ### Finding pull requests
 
 The new-review wizard's pull request and stack steps list the provider's 100 most recently
@@ -445,6 +479,14 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | palette only | Go to a line of this file (type its number in the palette) |
 | palette only | Copy a Markdown review report |
 | palette only | Edit the review's sources… |
+| `ctrl+o` | Pull request: open or close its overview (reviews, checks, conversation) |
+| palette only | Pull request: approve… |
+| palette only | Pull request: request changes… |
+| palette only | Pull request: comment in its conversation |
+| palette only | Pull request: open its web page |
+| palette only | Pull request: read its conversation again |
+| palette only | Stack: approve every fully viewed layer… |
+| `shift+b` | Stack history: how each pull request changed in each push |
 
 ### File panel (focused) (`code-review-files`)
 
@@ -519,6 +561,17 @@ bcode's own (`--print-config-paths` lists them in order):
   that stays until its `×` is clicked or the "Dismiss notifications" command runs. `"stop"` asks
   the provider to cut the stack at the limit, with a warning in the stack step. Invalid values
   are reported and the defaults are used.
+* `[plugins.config."bcode.code_review".conversation]`: pull request conversations.
+  `enabled` (default true); `replies` (`"send_now"`, the default, or `"with_review"`: where a
+  reply to a pull request thread goes, the other way being a button); `overview` (`"auto"`, the
+  default: one line unless something is new, `"collapsed"` or `"expanded"`); `notify` (which new
+  activity makes a toast: `"reviews_and_replies"`, the default, `"all"`, `"reviews"` or
+  `"none"`); `fold_resolved` (default true); `outdated_on_file` (default true: threads whose code
+  could not be followed show on their file). Its `signals` table: `provider` (default true: use
+  the provider's watch), `min_gap_ms` (default 2000: reads closer together are merged),
+  `pause_unfocused` (default true), and `providers.<id>`, passed to that provider's watch as is
+  (GitHub reads `interval_ms`, default 30000, at least 10000). Invalid values are reported and
+  the defaults are used.
 * `[tui.keybindings.scopes."code-review*"]`: keybinding overrides of the review scopes
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.

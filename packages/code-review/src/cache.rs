@@ -61,16 +61,19 @@ pub enum CacheKind {
     Hunks,
     /// A discovery contributor's answer, with the refs it read.
     Discovery,
+    /// A pull request's conversation as a provider reported it.
+    Activity,
 }
 
 impl CacheKind {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::MergeBase,
         Self::Index,
         Self::Pull,
         Self::Stack,
         Self::Hunks,
         Self::Discovery,
+        Self::Activity,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -81,6 +84,7 @@ impl CacheKind {
             Self::Stack => "stack",
             Self::Hunks => "hunks",
             Self::Discovery => "discovery",
+            Self::Activity => "activity",
         }
     }
 
@@ -92,7 +96,7 @@ impl CacheKind {
             Self::Index => 4_000,
             Self::Pull | Self::Hunks => 20_000,
             Self::Stack => 1_000,
-            Self::Discovery => 2_000,
+            Self::Discovery | Self::Activity => 2_000,
         }
     }
 
@@ -105,6 +109,8 @@ impl CacheKind {
                 Duration::from_hours(30 * 24)
             }
             Self::Stack => crate::provider::STACK_KEPT,
+            // A conversation is shown at once and refreshed; older than this is not worth it.
+            Self::Activity => Duration::from_hours(7 * 24),
         }
     }
 }

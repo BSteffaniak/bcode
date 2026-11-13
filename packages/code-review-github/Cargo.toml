@@ -15,11 +15,11 @@ bcode_code_review_models   = { workspace = true }
 bcode_code_review_provider = { workspace = true }
 bcode_forge                = { workspace = true, features = ["http"] }
 chrono                     = { workspace = true }
+serde_json                 = { workspace = true }
 thiserror                  = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
-tempfile   = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default          = []

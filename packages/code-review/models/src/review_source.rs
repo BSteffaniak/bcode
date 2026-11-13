@@ -138,6 +138,9 @@ pub struct ReviewSourceProviderManifest {
     /// Supported operations.
     #[serde(default)]
     pub capabilities: ReviewSourceCapabilities,
+    /// Conversation operations (reviews, threads, comments, checks) it serves.
+    #[serde(default)]
+    pub conversation: crate::ConversationCapabilities,
 }
 
 /// A pull request as a review source.

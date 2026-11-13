@@ -123,6 +123,7 @@ impl DocAnchor {
             source_id,
             head_oid: self.head_oid.clone(),
             blob_oid: self.blob_oid.clone(),
+            reply_to: None,
         };
         match &self.target {
             AnchorTarget::Review => {}
@@ -340,6 +341,7 @@ mod tests {
             source_id: None,
             head_oid: None,
             blob_oid: None,
+            reply_to: None,
         }
     }
 

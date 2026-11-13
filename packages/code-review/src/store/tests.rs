@@ -293,6 +293,7 @@ fn publish_record_thread_membership_round_trips() {
         source_id: None,
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     };
     let request = SavePublishRecordRequest {
         workspace: workspace.clone(),
@@ -353,6 +354,7 @@ fn review_bundle_excludes_requested_thread_anchors() {
         source_id: None,
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     };
     save_draft_for_request(
         SaveDraftRequest {
@@ -416,6 +418,7 @@ fn ai_exchange_delete_is_explicit_and_idempotent() {
             source_id: None,
             head_oid: None,
             blob_oid: None,
+            reply_to: None,
         },
         question: "delete me".to_string(),
         session_id: None,
@@ -646,6 +649,7 @@ fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
         source_id: None,
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     };
     let exchange = ReviewAiExchange {
         schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
@@ -734,6 +738,7 @@ fn suggestion_persistence_round_trips_and_updates_lifecycle() {
         source_id: None,
         head_oid: None,
         blob_oid: None,
+        reply_to: None,
     };
     let scope = Some(ReviewScope::Workspace {
         workspace_id: "workspace-1".to_string(),
@@ -971,6 +976,7 @@ fn local_markdown_publisher_preview_is_local_review_report() {
                 source_id: None,
                 head_oid: None,
                 blob_oid: None,
+                reply_to: None,
             },
             comments: vec![DraftComment {
                 comment_id: "comment-1".to_string(),
@@ -993,6 +999,7 @@ fn local_markdown_publisher_preview_is_local_review_report() {
                     source_id: None,
                     head_oid: None,
                     blob_oid: None,
+                    reply_to: None,
                 },
                 body: "Needs local follow-up".to_string(),
                 created_at_ms: 1,
@@ -1055,6 +1062,7 @@ fn local_markdown_groups_review_level_threads() {
                 source_id: None,
                 head_oid: None,
                 blob_oid: None,
+                reply_to: None,
             },
             comments: vec![DraftComment {
                 comment_id: "comment-review".to_string(),
@@ -1077,6 +1085,7 @@ fn local_markdown_groups_review_level_threads() {
                     source_id: None,
                     head_oid: None,
                     blob_oid: None,
+                    reply_to: None,
                 },
                 body: "Overall review summary".to_string(),
                 created_at_ms: 1,
@@ -1185,6 +1194,7 @@ fn markdown_export_writes_selected_publish_bundle_to_requested_file() {
                 source_id: None,
                 head_oid: None,
                 blob_oid: None,
+                reply_to: None,
             },
             comments: vec![DraftComment {
                 comment_id: "comment-1".to_string(),
@@ -1207,6 +1217,7 @@ fn markdown_export_writes_selected_publish_bundle_to_requested_file() {
                     source_id: None,
                     head_oid: None,
                     blob_oid: None,
+                    reply_to: None,
                 },
                 body: "Selected actionable comment".to_string(),
                 created_at_ms: 1,

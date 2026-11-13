@@ -320,6 +320,19 @@ pub struct HistoryPanel {
     from: Option<usize>,
     include_rebased: bool,
     note: Option<String>,
+    /// Each layer's reviews (approvals and requests for changes), from its conversation.
+    reviews: BTreeMap<u64, Vec<ReviewMark>>,
+}
+
+/// A review shown on the timeline: who, what, and on which head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewMark {
+    /// Reviewer.
+    pub login: String,
+    /// Approved (else changes requested).
+    pub approved: bool,
+    /// The head it was given on.
+    pub commit: Option<String>,
 }
 
 impl HistoryPanel {
@@ -333,7 +346,50 @@ impl HistoryPanel {
             from: None,
             include_rebased: false,
             note: Some("Reading the stack's history…".to_owned()),
+            reviews: BTreeMap::new(),
         }
+    }
+
+    /// Show each layer's reviews against its versions.
+    pub fn set_reviews(&mut self, reviews: BTreeMap<u64, Vec<ReviewMark>>) {
+        self.reviews = reviews;
+    }
+
+    /// The selected layer's reviews, and whether each still applies to its newest version.
+    fn review_line(&self, timeline: &StackTimeline, theme: &ReviewTheme) -> Option<Line> {
+        use bcode_code_review::conversation::{Currency, review_currency};
+        let layer = timeline.layers.get(self.layer)?;
+        let marks = self
+            .reviews
+            .get(&layer.number)
+            .filter(|marks| !marks.is_empty())?;
+        let head = layer.versions.last()?.version.head_oid.as_str();
+        let mut spans = vec![Span::styled(
+            format!("#{} reviews: ", layer.number),
+            theme.title,
+        )];
+        for (index, mark) in marks.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(theme.icons.separator, theme.muted));
+            }
+            let (glyph, style) = if mark.approved {
+                (theme.icons.approved, theme.badge_resolved)
+            } else {
+                (theme.icons.changes, theme.error)
+            };
+            spans.push(Span::styled(format!("{glyph} {}", mark.login), style));
+            let currency = mark.commit.as_deref().map_or(Currency::Unknown, |commit| {
+                review_currency(layer, commit, head)
+            });
+            let (text, style) = match currency {
+                Currency::Current => (" on the newest version", theme.muted),
+                Currency::Rebased => (" before a rebase; still applies", theme.muted),
+                Currency::Outdated => (" on an older version", theme.badge_outdated),
+                Currency::Unknown => ("", theme.muted),
+            };
+            spans.push(Span::styled(text, style));
+        }
+        Some(Line::from_spans(spans))
     }
 
     /// Show `timeline`, the cursor on the newest column.
@@ -548,6 +604,9 @@ impl HistoryPanel {
             lines.push(Line::from_spans(spans).truncate(width));
         }
         lines.push(Line::from_spans(Vec::new()));
+        if let Some(reviews) = self.review_line(timeline, theme) {
+            lines.push(reviews.truncate(width));
+        }
         lines.push(Line::from_spans(vec![Span::styled(
             "● changed  + commits added  ○ rebased only  ⇄ retargeted  ? unavailable  · no change  \
              green: reviewed",
@@ -678,6 +737,41 @@ mod tests {
         assert_eq!(cells(1), ["●", "○", "+"]);
         // Before any push, both layers are as first reviewed.
         assert!(HistoryPanel::cell(&timeline, &timeline.layers[0], 0).1);
+    }
+
+    #[test]
+    fn the_selected_layer_says_which_reviews_still_apply() {
+        let theme = crate::theme::ReviewTheme::derive(None, crate::theme::IconStyle::Unicode);
+        let mut panel = HistoryPanel::loading();
+        panel.set_timeline(timeline());
+        let mark = |login: &str, approved: bool, commit: &str| ReviewMark {
+            login: login.to_owned(),
+            approved,
+            commit: Some(commit.to_owned()),
+        };
+        panel.set_reviews(BTreeMap::from([
+            (1, vec![mark("ana", true, "a")]),
+            (2, vec![mark("raj", false, "d"), mark("li", true, "e")]),
+        ]));
+        let text = |panel: &HistoryPanel| {
+            panel
+                .lines(&theme, 200)
+                .iter()
+                .map(Line::plain_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Layer 1 changed in content after ana approved it.
+        assert!(
+            text(&panel).contains("#1 reviews: ✓ ana on an older version"),
+            "{}",
+            text(&panel)
+        );
+        panel.layer = 1;
+        // Layer 2 gained commits since raj's request: it no longer reads as current.
+        let shown = text(&panel);
+        assert!(shown.contains("✕ raj on an older version"), "{shown}");
+        assert!(shown.contains("✓ li on the newest version"), "{shown}");
     }
 
     #[test]

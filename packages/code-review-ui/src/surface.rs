@@ -151,6 +151,7 @@ enum Phase {
 
 mod annotate;
 mod assist;
+mod conversation;
 mod dock;
 mod feed;
 mod find;
@@ -161,6 +162,7 @@ mod stack;
 mod stack_files;
 
 pub use annotate::COMPOSER_SCOPE;
+pub use conversation::{BarAction, BarState, ConversationMessage};
 pub use dock::{ASSISTANT_PANE_ID, ASSISTANT_SCOPE, DockResult};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
@@ -689,6 +691,8 @@ pub struct ReviewSurface {
     stack_news: Option<bcode_code_review::session::StackNews>,
     /// The stack's history, once read.
     stack_history: Option<bcode_code_review_models::StackTimeline>,
+    /// The review's pull request conversations and their bar.
+    talk: conversation::ConversationUi,
     /// The open running now: cancelled when another starts or the surface goes away.
     opening: OpenInFlight,
     /// Text to copy once the host is at hand, and what it is.
@@ -816,6 +820,7 @@ impl ReviewSurface {
             failed_sources: BTreeSet::new(),
             stack_news: None,
             stack_history: None,
+            talk: conversation::ConversationUi::default(),
             opening: OpenInFlight::default(),
             clipboard: None,
             exit_armed: false,
@@ -1756,7 +1761,10 @@ impl ReviewSurface {
                     *stage = text;
                 }
             }
-            Message::Opened(opened) => self.apply_opened(*opened),
+            Message::Opened(opened) => {
+                self.apply_opened(*opened);
+                self.refresh_conversations(host);
+            }
             Message::Arrived(arrived) => self.apply_arrived(*arrived),
             Message::SourceFailed(diagnostic) => self.apply_source_failed(diagnostic),
             Message::StackConfirmed(news) => self.apply_stack_news(*news),
@@ -1773,7 +1781,9 @@ impl ReviewSurface {
                 }
                 // Every layer is in: how the stack changed lately is read for the layer strip.
                 self.load_history_quietly(host);
+                self.refresh_conversations(host);
             }
+            Message::Conversation(message) => self.apply_conversation(*message, host),
             Message::History(result) => self.apply_history(result),
             Message::HistoryPanel(result) => self.apply_history_panel(result),
             Message::HistoryCompared(result) => self.apply_history_compared(result),
@@ -2436,6 +2446,13 @@ impl ReviewSurface {
         }
         match action {
             "stack_history" => self.open_history(host),
+            "pull_request" => self.bar_action(BarAction::Toggle, host),
+            "approve_pull_request" => self.bar_action(BarAction::Approve, host),
+            "request_changes" => self.bar_action(BarAction::RequestChanges, host),
+            "pull_request_comment" => self.bar_action(BarAction::Comment, host),
+            "approve_reviewed_layers" => self.bar_action(BarAction::ApproveViewed, host),
+            "refresh_conversation" => self.bar_action(BarAction::Refresh, host),
+            "open_pull_request" => self.open_pull_request_page(host),
             "stack_file" => self.open_file_through_stack(),
             "stack_overlaps" => self.open_stack_overlaps(),
             "fold" => self.fold(),
@@ -2999,14 +3016,13 @@ impl ReviewSurface {
             let outcome = overlay.mouse(event, &self.theme);
             return self.overlay_outcome(outcome, host);
         }
-        if let Some(action) = self.side_mouse(event, *mouse) {
+        if let Some(action) = self
+            .side_mouse(event, *mouse)
+            .or_else(|| self.bar_mouse(event, host))
+        {
             return action;
         }
-        let wheel = match mouse.kind {
-            MouseEventKind::ScrollDown => 3,
-            MouseEventKind::ScrollUp => -3,
-            _ => 0,
-        };
+        let wheel = wheel_rows(mouse.kind);
         if wheel != 0
             && self
                 .list_area()
@@ -3287,7 +3303,14 @@ impl ReviewSurface {
             && !self.rail_entries().is_empty();
         // In the every-layer view of a stack, a strip under the rail names the cursor's layer.
         let strip = rail && area.height >= 10 && self.shows_layer_strip();
-        let top = u16::from(header) + u16::from(rail) + u16::from(strip);
+        let above = u16::from(header) + u16::from(rail) + u16::from(strip);
+        // The pull request bar, under the rail and strip.
+        let bar = if header && matches!(self.phase, Phase::Ready) {
+            self.bar_height(area.height, area.width)
+        } else {
+            0
+        };
+        let top = above + bar;
         let body = Rect::new(
             area.x,
             area.y + top,
@@ -3304,6 +3327,11 @@ impl ReviewSurface {
             }
         } else {
             self.rail = None;
+        }
+        if bar > 0 {
+            self.paint_bar(Rect::new(area.x, area.y + above, area.width, bar), cx);
+        } else {
+            self.talk.bar.area = None;
         }
         if matches!(self.phase, Phase::Ready) {
             self.render_body(body, cx);
@@ -4786,6 +4814,11 @@ impl View for ReviewSurface {
             }
             Event::Focus(FocusEvent::Gained) => {
                 self.request_token(host, false);
+                self.conversation_focus(true, host);
+                Action::None
+            }
+            Event::Focus(FocusEvent::Lost) => {
+                self.conversation_focus(false, host);
                 Action::None
             }
             _ => Action::None,
@@ -4805,6 +4838,16 @@ impl View for ReviewSurface {
         }
         let mut changed = self.drain(host);
         changed |= self.flush_clipboard(host);
+        changed |= self.flush_conversations(host);
+        for url in std::mem::take(&mut self.talk.urls) {
+            if let Err(error) = host.host().open_external(&url) {
+                self.set_status(
+                    format!("Could not open {url}: {}", error.message),
+                    StatusSeverity::Warning,
+                );
+            }
+            changed = true;
+        }
         if let Some(action) = self.pending_action.take() {
             return action;
         }
@@ -4850,5 +4893,14 @@ impl View for ReviewSurface {
         } else {
             Action::None
         }
+    }
+}
+
+/// Rows a wheel event over the review scrolls (zero for other events).
+const fn wheel_rows(kind: MouseEventKind) -> i64 {
+    match kind {
+        MouseEventKind::ScrollDown => 3,
+        MouseEventKind::ScrollUp => -3,
+        _ => 0,
     }
 }

@@ -49,6 +49,13 @@ pub enum ComposerMode {
     },
     /// Ask Bcode about the anchor.
     Ask,
+    /// A comment in a pull request's conversation.
+    Conversation {
+        /// The pull request ([`crate::conversation::PullKey`] id).
+        pull: String,
+        /// Its number, for the title.
+        number: u64,
+    },
 }
 
 /// A clickable composer button.
@@ -58,6 +65,8 @@ pub enum ComposerButton {
     Submit,
     /// Switch between saving a comment and asking Bcode.
     Switch,
+    /// The other way to send a reply to a pull request thread (held for the review, or now).
+    Alternate,
     /// Toggle the markdown preview.
     Preview,
     /// Cancel.
@@ -116,6 +125,8 @@ pub struct Composer {
     pub severity: ReviewThreadSeverity,
     /// Open `@path` completion.
     pub completion: Option<PathCompletion>,
+    /// Where a reply to a pull request thread goes by default (`None` for other composers).
+    pub remote_reply: Option<crate::config::conversation::ReplyMode>,
     policy: TextInputPolicy,
     revision: u64,
     completion_generation: u64,
@@ -139,6 +150,7 @@ impl Composer {
             kind: ReviewThreadKind::Note,
             severity: ReviewThreadSeverity::Info,
             completion: None,
+            remote_reply: None,
             policy,
             revision: 0,
             completion_generation: 0,
@@ -308,6 +320,7 @@ impl Composer {
         match self.mode {
             ComposerMode::Ask => "Ask Bcode about this code…",
             ComposerMode::Reply { .. } => "Write a reply (markdown)…",
+            ComposerMode::Conversation { .. } => "Write a comment on the pull request (markdown)…",
             _ => "Write a comment (markdown)…",
         }
     }
@@ -319,6 +332,13 @@ impl Composer {
             ComposerMode::Reply { .. } => (icons.thread, theme.badge_open, "Reply on"),
             ComposerMode::Edit { .. } => (icons.draft, theme.badge_draft, "Edit comment on"),
             ComposerMode::Ask => (icons.ai, theme.badge_ai, "Ask Bcode about"),
+            ComposerMode::Conversation { number, .. } => {
+                return Line::from_spans(vec![
+                    Span::styled(icons.thread, theme.badge_open),
+                    Span::raw(" "),
+                    Span::styled(format!("Comment on #{number}"), theme.title),
+                ]);
+            }
         };
         let mut spans = vec![
             Span::styled(icon, style),
@@ -429,14 +449,29 @@ impl Composer {
         width: u16,
         indent: u16,
     ) -> (Line, Vec<ActionCells<ComposerButton>>) {
-        let submit = match self.mode {
-            ComposerMode::Comment => " Save draft ",
-            ComposerMode::Reply { .. } => " Reply ",
-            ComposerMode::Edit { .. } => " Save edit ",
-            ComposerMode::Ask => " Ask Bcode ",
+        use crate::config::conversation::ReplyMode;
+        let submit = match (&self.mode, self.remote_reply) {
+            (ComposerMode::Reply { .. }, Some(ReplyMode::WithReview)) => " Add to review ",
+            (ComposerMode::Comment, _) => " Save draft ",
+            (ComposerMode::Reply { .. }, _) => " Reply ",
+            (ComposerMode::Edit { .. }, _) => " Save edit ",
+            (ComposerMode::Ask, _) => " Ask Bcode ",
+            (ComposerMode::Conversation { .. }, _) => " Comment ",
         };
         let mut parts: Vec<(String, Option<ComposerButton>)> =
             vec![(submit.to_owned(), Some(ComposerButton::Submit))];
+        match self.remote_reply {
+            Some(ReplyMode::SendNow) => {
+                parts.push((
+                    " Add to review ".to_owned(),
+                    Some(ComposerButton::Alternate),
+                ));
+            }
+            Some(ReplyMode::WithReview) => {
+                parts.push((" Send now ".to_owned(), Some(ComposerButton::Alternate)));
+            }
+            None => {}
+        }
         let switch = match self.mode {
             ComposerMode::Comment => Some(" Ask Bcode instead "),
             ComposerMode::Ask => Some(" Comment instead "),

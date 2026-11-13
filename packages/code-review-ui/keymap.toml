@@ -250,6 +250,21 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.copy_report", scope = "code-review", description = "Copy a Markdown review report", defaults = [
     ] },
+    { id = "bcode.code_review.pull_request", scope = "code-review", description = "Pull request: open or close its overview (reviews, checks, conversation)", defaults = [
+        "ctrl+o",
+    ] },
+    { id = "bcode.code_review.approve_pull_request", scope = "code-review", description = "Pull request: approve…", defaults = [
+    ] },
+    { id = "bcode.code_review.request_changes", scope = "code-review", description = "Pull request: request changes…", defaults = [
+    ] },
+    { id = "bcode.code_review.pull_request_comment", scope = "code-review", description = "Pull request: comment in its conversation", defaults = [
+    ] },
+    { id = "bcode.code_review.approve_reviewed_layers", scope = "code-review", description = "Stack: approve every fully viewed layer…", defaults = [
+    ] },
+    { id = "bcode.code_review.open_pull_request", scope = "code-review", description = "Pull request: open its web page", defaults = [
+    ] },
+    { id = "bcode.code_review.refresh_conversation", scope = "code-review", description = "Pull request: read its conversation again", defaults = [
+    ] },
     { id = "bcode.code_review.stack_history", scope = "code-review", description = "Stack history: how each pull request changed in each push", defaults = [
         "shift+b",
     ] },

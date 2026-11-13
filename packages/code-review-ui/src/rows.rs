@@ -179,6 +179,8 @@ pub enum ThreadAction {
     Refine,
     /// Reject the latest pending suggestion.
     Reject,
+    /// Open the thread's web page.
+    Open,
 }
 
 /// An action on an AI answer item.
@@ -1459,6 +1461,12 @@ fn indented(lines: Vec<Line>, prefix: &str, width: usize) -> Vec<Line> {
 }
 
 /// Markdown rendered at `width` cells, at most `max` rows (an ellipsis row marks elided rows).
+/// `text` rendered as markdown in `width` cells, at most `max` rows.
+#[must_use]
+pub fn markdown_lines(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Line> {
+    markdown(text, width, max, theme)
+}
+
 fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Line> {
     markdown_rows(text, width, max, false, theme)
 }
@@ -1633,6 +1641,10 @@ fn thread_rows(
 ) -> ItemRows {
     if let Some(external) = notes.external(&thread.thread_id) {
         return external_thread_rows(thread, external, notes, theme, width, indent);
+    }
+    if let Some(remote) = notes.remote(&thread.thread_id) {
+        let collapsed = folds.collapsed.contains(&thread.thread_id);
+        return remote_thread_rows(thread, remote, notes, collapsed, theme, width, indent);
     }
     let comments = notes.thread(&thread.thread_id);
     let collapsed = folds.collapsed.contains(&thread.thread_id);
@@ -1866,6 +1878,158 @@ fn external_thread_rows(
         }
     }
     ItemRows::lines(lines, Vec::new())
+}
+
+/// Rows of a pull request thread read from its provider: who said what and when, how it sits
+/// on this review, and Reply, Resolve or Reopen, and Open buttons for what the provider and the
+/// viewer's permissions allow. Replies held for the next review show as drafts under it.
+fn remote_thread_rows(
+    thread: &bcode_code_review::document::ThreadItem,
+    remote: &super::notes::RemoteThreadInfo,
+    notes: &super::notes::ReviewNotes,
+    collapsed: bool,
+    theme: &ReviewTheme,
+    width: usize,
+    indent: usize,
+) -> ItemRows {
+    let comments = notes.thread(&thread.thread_id);
+    let held = comments
+        .iter()
+        .filter(|comment| !comment.comment_id.starts_with(super::notes::REMOTE_PREFIX))
+        .count();
+    let header = remote_thread_header(thread, remote, &comments, held, theme, indent);
+    let mut lines = vec![Line::from_spans(header).truncate(width)];
+    let fold = header_fold(indent, width);
+    if collapsed {
+        return ItemRows::lines(lines, fold.into_iter().collect());
+    }
+    let body_indent = indent + 2;
+    let body_width = width.saturating_sub(body_indent);
+    let pad = " ".repeat(body_indent.min(width));
+    if !remote.resolved {
+        for comment in &comments {
+            let (author, at) = remote.authors.get(&comment.comment_id).map_or_else(
+                || ("you · held for your review".to_owned(), None),
+                |(author, at)| (author.clone(), *at),
+            );
+            let mut byline = vec![Span::raw(pad.clone()), Span::styled(author, theme.title)];
+            let age = crate::conversation::ago(at);
+            if !age.is_empty() {
+                byline.push(Span::styled(format!(" {age}"), theme.muted));
+            }
+            lines.push(Line::from_spans(byline).truncate(width));
+            let rows = markdown(&comment.body, body_width, MAX_COMMENT_ROWS, theme);
+            lines.extend(indented(rows, &pad, width));
+        }
+    }
+    let mut buttons: Vec<(&str, ItemAction)> = Vec::new();
+    if remote.can_reply && !remote.resolved {
+        buttons.push(("Reply", ItemAction::Thread(ThreadAction::Reply)));
+    }
+    if remote.can_resolve {
+        buttons.push((
+            if remote.resolved { "Reopen" } else { "Resolve" },
+            ItemAction::Thread(ThreadAction::Resolve),
+        ));
+    }
+    if remote.url.is_some() {
+        buttons.push(("Open ↗", ItemAction::Thread(ThreadAction::Open)));
+    }
+    if !remote.resolved {
+        buttons.push(("Ask Bcode", ItemAction::Thread(ThreadAction::Ask)));
+    }
+    let mut actions: Vec<ActionCells<ItemAction>> = fold.into_iter().collect();
+    let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let (rows, placed) = action_row(&buttons, row, body_indent.min(width), width, theme);
+    lines.extend(rows);
+    actions.extend(placed);
+    ItemRows::lines(lines, actions)
+}
+
+/// The header of a pull request thread: who started it, where, its state, and how it sits on
+/// the review.
+fn remote_thread_header(
+    thread: &bcode_code_review::document::ThreadItem,
+    remote: &super::notes::RemoteThreadInfo,
+    comments: &[&bcode_code_review_models::DraftComment],
+    held: usize,
+    theme: &ReviewTheme,
+    indent: usize,
+) -> Vec<Span> {
+    use bcode_code_review::conversation::Placement;
+    let icons = &theme.icons;
+    let first_author = comments
+        .first()
+        .and_then(|comment| remote.authors.get(&comment.comment_id))
+        .map(|(author, _)| author.clone());
+    let mut header = vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(icons.thread, theme.thread),
+        Span::raw(" "),
+    ];
+    if let Some(author) = first_author {
+        header.push(Span::styled(author, theme.title));
+        header.push(Span::raw(" "));
+    }
+    header.push(Span::styled(
+        format!("on {}", remote.provider_label),
+        theme.muted,
+    ));
+    header.push(Span::styled(icons.separator, theme.muted));
+    let remote_count = comments.len() - held;
+    header.push(Span::styled(
+        format!(
+            "{remote_count} comment{}",
+            if remote_count == 1 { "" } else { "s" }
+        ),
+        theme.thread,
+    ));
+    let mut badge = |text: &str, style: Style| {
+        header.push(Span::raw(" "));
+        header.push(Span::styled(text.to_owned(), style));
+    };
+    if remote.new {
+        badge(&format!("{} new", icons.new), theme.badge_draft);
+    }
+    if remote.waiting {
+        badge("waiting on you", theme.pill_warning);
+    }
+    if remote.resolved {
+        badge("resolved", theme.badge_resolved);
+    } else if remote.outdated {
+        badge("outdated", theme.badge_outdated);
+    }
+    match remote.placement {
+        Placement::Exact => {}
+        Placement::Moved => badge("moved with its code", theme.badge_outdated),
+        Placement::OnFile => badge("on an older version", theme.badge_outdated),
+        Placement::OnLayer => badge(
+            "on a file this layer no longer changes",
+            theme.badge_outdated,
+        ),
+    }
+    if held > 0 {
+        badge(
+            &format!(
+                "{} {held} {} held for your review",
+                icons.draft,
+                if held == 1 { "reply" } else { "replies" }
+            ),
+            theme.badge_draft,
+        );
+    }
+    if let Some((_, start, end)) = thread.lines {
+        header.push(Span::styled(icons.separator, theme.muted));
+        header.push(Span::styled(
+            if start == end {
+                format!("L{end}")
+            } else {
+                format!("L{start}-{end}")
+            },
+            theme.muted,
+        ));
+    }
+    header
 }
 
 /// Component of one document item.

@@ -207,7 +207,24 @@ fn metadata_command(target: &str) -> Command {
     command
 }
 
+/// Crates of a particular forge or stacking tool. The review's own data layer and interfaces
+/// stay provider-neutral: providers are reached through `bcode_code_review_provider`, and only
+/// the app's composition root (`bcode_code_review_ui`) and plugins name them.
+fn review_provider(name: &str) -> bool {
+    matches!(
+        name,
+        "bcode_code_review_github" | "bcode_code_review_graphite" | "bcode_forge"
+    )
+}
+
 fn forbidden_dependency(owner: &str, dependency: &str) -> bool {
+    if matches!(
+        owner,
+        "bcode_code_review" | "bcode_code_review_models" | "bcode_code_review_provider"
+    ) && review_provider(dependency)
+    {
+        return true;
+    }
     if let Some(parent) = owner.strip_suffix("_models") {
         return dependency == parent || implementation(dependency);
     }
@@ -663,6 +680,34 @@ mod tests {
         assert!(graph.path("a", |name| name == "dev_only").is_none());
         assert!(graph.path("a", |name| name == "absent").is_none());
         assert!(graph.root("absent").is_err());
+    }
+
+    #[test]
+    fn the_review_core_names_no_provider_and_the_app_may() {
+        for owner in [
+            "bcode_code_review",
+            "bcode_code_review_models",
+            "bcode_code_review_provider",
+        ] {
+            for provider in [
+                "bcode_code_review_github",
+                "bcode_code_review_graphite",
+                "bcode_forge",
+            ] {
+                assert!(
+                    forbidden_dependency(owner, provider),
+                    "{owner} -> {provider}"
+                );
+            }
+        }
+        assert!(!forbidden_dependency(
+            "bcode_code_review_ui",
+            "bcode_code_review_github"
+        ));
+        assert!(!forbidden_dependency(
+            "bcode_code_review",
+            "bcode_code_review_provider"
+        ));
     }
 
     #[test]
