@@ -219,6 +219,34 @@ fn reads_are_read_only_and_changes_ask_for_permission() {
 }
 
 #[test]
+fn the_default_agents_are_offered_every_review_tool_they_may_use() {
+    let mut harness = Harness::new();
+    let list: ToolList = harness
+        .service(OP_LIST_TOOLS, &json!({}))
+        .payload_json()
+        .expect("list");
+    let config = bcode_default_agents_plugin::default_config();
+    let active = |agent: &str| {
+        bcode_agent_policy::active_tools_for(&bcode_agent_policy::agent_config(&config, agent))
+    };
+    let (build, plan) = (
+        active(bcode_agent_policy::BUILD_AGENT),
+        active(bcode_agent_policy::PLAN_AGENT),
+    );
+    assert!(
+        list.tools
+            .iter()
+            .any(|tool| tool.name == "code_review.get_thread")
+    );
+    for tool in &list.tools {
+        let name = &tool.name;
+        assert!(build.contains(name), "build agent is offered {name}");
+        let read_only = list.discovery.get(name).expect("discovery").read_only;
+        assert_eq!(plan.contains(name), read_only, "plan agent and {name}");
+    }
+}
+
+#[test]
 fn a_bound_session_reads_the_review_it_assists() {
     let mut harness = Harness::new();
     harness.bind(SESSION);

@@ -57,6 +57,7 @@ build_tools = [
     "code_review.file_diff",
     "code_review.file_content",
     "code_review.list_threads",
+    "code_review.get_thread",
     "code_review.pull_request",
     "code_review.navigate",
     "code_review.add_comment",

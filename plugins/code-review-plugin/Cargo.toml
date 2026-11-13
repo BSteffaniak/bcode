@@ -27,8 +27,10 @@ serde                    = { workspace = true, features = ["derive", "std"] }
 serde_json               = { workspace = true }
 
 [dev-dependencies]
-bcode_code_review = { workspace = true, features = ["testing"] }
-tempfile          = { workspace = true }
+bcode_agent_policy          = { workspace = true }
+bcode_code_review           = { workspace = true, features = ["testing"] }
+bcode_default_agents_plugin = { workspace = true, features = ["static-bundled"] }
+tempfile                    = { workspace = true }
 
 [features]
 default          = []
