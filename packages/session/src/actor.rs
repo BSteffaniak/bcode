@@ -5096,7 +5096,7 @@ impl SessionActor {
             PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionTarget, TurnAdmission,
             TurnReceipt,
         };
-        admission.validate()?;
+        admission.validate_durable()?;
         self.ensure_ownership()?;
         if self.store.is_some() {
             self.ensure_session_db_for_write().await?;
@@ -5198,7 +5198,7 @@ impl SessionActor {
         admission: bcode_session_models::TurnAdmissionMetadata,
         activity_timestamp_ms: u64,
     ) -> Result<TurnAdmissionResult, SessionError> {
-        admission.validate()?;
+        admission.validate_durable()?;
         if let Some((producer, idempotency_key)) = admission.idempotency_identity() {
             let identity = (producer.to_owned(), idempotency_key.to_owned());
             if let Some(receipt) = self.state.turn_receipts.get(&identity) {

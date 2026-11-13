@@ -17,18 +17,18 @@ use bcode_tool::client_tool::{ClientToolDescriptor, ClientToolOutcome, ClientToo
 
 use crate::{ServerState, SubmittedModelTurn};
 
-struct Fixture {
-    state: Arc<ServerState>,
-    client: bcode_client::BcodeClient,
-    endpoint: bcode_ipc::IpcEndpoint,
+pub struct Fixture {
+    pub state: Arc<ServerState>,
+    pub client: bcode_client::BcodeClient,
+    pub endpoint: bcode_ipc::IpcEndpoint,
     _server: tokio::task::JoinHandle<()>,
-    workspace: tempfile::TempDir,
+    pub workspace: tempfile::TempDir,
     _socket_dir: tempfile::TempDir,
 }
 
 /// Build the daemon state and serve it on a private socket. The accept loop ends with the
 /// test's runtime.
-fn fixture() -> Fixture {
+pub fn fixture() -> Fixture {
     let workspace = tempfile::tempdir().expect("workspace");
     let sessions = SessionManager::persistent(workspace.path().join("sessions")).expect("sessions");
     let provider = bcode_plugin::StaticBundledPlugin::new(
@@ -76,7 +76,7 @@ fn fixture() -> Fixture {
 }
 
 /// A client that supplies a runtime context, as installed Bcode clients do.
-fn client(endpoint: &bcode_ipc::IpcEndpoint) -> bcode_client::BcodeClient {
+pub fn client(endpoint: &bcode_ipc::IpcEndpoint) -> bcode_client::BcodeClient {
     bcode_client::BcodeClient::new(endpoint.clone())
         .with_runtime_context(Some(bcode_ipc::ClientRuntimeContext::default()))
 }

@@ -1462,8 +1462,31 @@ fn server_failure(error: &crate::ServerError) -> SessionApplicationFailure {
     }
 }
 
+/// Admission failures an application acts on, with their own code and specific message.
+fn turn_admission_failure(
+    error: &bcode_session::SessionError,
+) -> Option<SessionApplicationFailure> {
+    use bcode_session_models::TurnAdmissionMetadataError;
+    let bcode_session::SessionError::TurnAdmission(admission) = error else {
+        return None;
+    };
+    let code = match admission {
+        TurnAdmissionMetadataError::AgentProfileUnavailable(_) => "agent_profile_unavailable",
+        TurnAdmissionMetadataError::InvalidContext(_)
+        | TurnAdmissionMetadataError::UnretainedRequestOnlyContext => "invalid_turn_context",
+        TurnAdmissionMetadataError::RequestOnlyContextUnavailable => {
+            "request_only_context_unavailable"
+        }
+        _ => return None,
+    };
+    Some(failure(code, &admission.to_string()))
+}
+
 fn session_failure(error: &bcode_session::SessionError) -> SessionApplicationFailure {
     use bcode_session::SessionError;
+    if let Some(failure) = turn_admission_failure(error) {
+        return failure;
+    }
     let (code, message) = match error {
         SessionError::Lease(bcode_session::lease::SessionLeaseError::OwnedByOtherDaemon {
             ..

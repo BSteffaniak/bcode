@@ -22355,6 +22355,7 @@ async fn send_message_observed_inner(
                         idempotency_key,
                         activity: None,
                         execution: launch_options.turn_execution_options(),
+                        context: bcode_session_models::TurnContext::default(),
                     },
                 )
                 .await

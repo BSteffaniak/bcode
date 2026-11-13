@@ -1093,6 +1093,9 @@ pub enum PermissionInteractionRequest {
         invocation_id: String,
         outcome: bcode_tool::client_tool::ClientToolOutcome,
     },
+    RegisterClientAgentProfiles {
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    },
 }
 
 /// Requests owned by the `AgentSkillPlugin` dispatcher (14 variants).
@@ -2505,6 +2508,9 @@ impl RoutedRequest {
                 invocation_id,
                 outcome,
             }),
+            Request::RegisterClientAgentProfiles { profiles } => Self::PermissionInteraction(
+                PermissionInteractionRequest::RegisterClientAgentProfiles { profiles },
+            ),
             Request::RuntimeStatus => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::RuntimeStatus))
             }

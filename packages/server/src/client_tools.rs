@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use bcode_agent_profile::client_profile::{ClientAgentProfile, validate_client_agent_profiles};
 use bcode_ipc::Event;
 use bcode_session_models::{ClientId, SessionId};
 use bcode_tool::client_tool::{
@@ -41,6 +42,7 @@ pub struct OfferedClientTool {
 struct ProviderConnection {
     provider_id: String,
     tools: BTreeMap<String, ClientToolDescriptor>,
+    profiles: BTreeMap<String, ClientAgentProfile>,
     sink: ClientEventSink,
 }
 
@@ -152,6 +154,11 @@ impl ClientToolRegistry {
             ));
         }
         let count = tools.len();
+        let profiles = registry
+            .providers
+            .remove(&client_id)
+            .map(|previous| previous.profiles)
+            .unwrap_or_default();
         registry.providers.insert(
             client_id,
             ProviderConnection {
@@ -160,11 +167,73 @@ impl ClientToolRegistry {
                     .into_iter()
                     .map(|tool| (tool.name.clone(), tool))
                     .collect(),
+                profiles,
                 sink,
             },
         );
         drop(registry);
         Ok(count)
+    }
+
+    /// Replace the agent profiles one provider connection contributes.
+    ///
+    /// The connection must have registered tools first, which fixes its provider id. The
+    /// registration is rejected whole when it is out of bounds or an id collides with a plugin
+    /// agent.
+    pub fn register_profiles(
+        &self,
+        client_id: ClientId,
+        profiles: Vec<ClientAgentProfile>,
+        plugin_agent_ids: &BTreeSet<String>,
+    ) -> Result<usize, String> {
+        let mut registry = self.lock();
+        let Some(provider) = registry.providers.get_mut(&client_id) else {
+            return Err("register client tools before contributing agent profiles".to_owned());
+        };
+        validate_client_agent_profiles(&provider.provider_id, &profiles)
+            .map_err(|error| error.to_string())?;
+        let collisions = profiles
+            .iter()
+            .filter(|profile| plugin_agent_ids.contains(&profile.id))
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>();
+        if !collisions.is_empty() {
+            return Err(format!(
+                "agent profile ids collide with configured agents: {}",
+                collisions.join(", ")
+            ));
+        }
+        let count = profiles.len();
+        provider.profiles = profiles
+            .into_iter()
+            .map(|profile| (profile.id.clone(), profile))
+            .collect();
+        drop(registry);
+        Ok(count)
+    }
+
+    /// The contributed profile `agent_id`, while a connection of its provider is registered.
+    pub fn agent_profile(&self, agent_id: &str) -> Option<ClientAgentProfile> {
+        self.lock()
+            .providers
+            .values()
+            .rev()
+            .find_map(|provider| provider.profiles.get(agent_id).cloned())
+    }
+
+    /// Every contributed profile of the registered connections, one per id.
+    pub fn agent_profiles(&self) -> Vec<ClientAgentProfile> {
+        let registry = self.lock();
+        let mut profiles = BTreeMap::new();
+        for provider in registry.providers.values() {
+            for (id, profile) in &provider.profiles {
+                profiles
+                    .entry(id.clone())
+                    .or_insert_with(|| profile.clone());
+            }
+        }
+        drop(registry);
+        profiles.into_values().collect()
     }
 
     /// Route the session's client tools to this connection.
@@ -531,6 +600,21 @@ pub async fn handle_request(
         PermissionInteractionRequest::ReleaseClientToolSession { session_id } => {
             state.client_tools.release(client_id, session_id);
             Response::Ok(ResponsePayload::ClientToolSessionReleased { session_id })
+        }
+        PermissionInteractionRequest::RegisterClientAgentProfiles { profiles } => {
+            let plugin_agents = crate::plugin_agent_ids(state).await;
+            match state
+                .client_tools
+                .register_profiles(client_id, profiles, &plugin_agents)
+            {
+                Ok(profile_count) => {
+                    Response::Ok(ResponsePayload::ClientAgentProfilesRegistered { profile_count })
+                }
+                Err(message) => Response::Err(ErrorResponse::new(
+                    "client_agent_profiles_rejected",
+                    message,
+                )),
+            }
         }
         PermissionInteractionRequest::ClientToolResult {
             invocation_id,

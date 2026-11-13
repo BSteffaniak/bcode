@@ -152,7 +152,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 64 adds client-provided tools, session claims and their invocation events.
 /// Version 65 adds importing a named source file with an origin.
 /// Version 66 adds explicit external credential connection operations.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 66;
+/// Version 67 adds application turn context blocks and contributed agent profiles.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 67;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1865,6 +1866,12 @@ pub enum Request {
         #[serde(default)]
         origin: Option<bcode_session_models::SessionOrigin>,
     },
+    /// Contribute agent profiles under the provider id this connection registered tools as,
+    /// replacing its previous profiles. Rejected whole when out of bounds or when an id
+    /// collides with a plugin agent.
+    RegisterClientAgentProfiles {
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    },
 }
 
 /// Server stop request policy.
@@ -3413,6 +3420,10 @@ pub enum ResponsePayload {
     ClientToolResultAccepted {
         invocation_id: String,
     },
+    /// The connection's agent profiles are registered.
+    ClientAgentProfilesRegistered {
+        profile_count: usize,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -4944,7 +4955,8 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 66);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 67);
+        assert_ne!(ProtocolVersion(66), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(65), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(59), ProtocolVersion::current());

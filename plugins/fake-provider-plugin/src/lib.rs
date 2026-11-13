@@ -789,7 +789,8 @@ impl FakeProviderPlugin {
                 .flatten()
             });
         let has_tool_result = tool_result.is_some();
-        let text = fake_response_text(&request, tool_result.as_deref(), &user_text);
+        let text = echo_all_response(&request, tool_result.as_deref(), &user_text)
+            .unwrap_or_else(|| fake_response_text(&request, tool_result.as_deref(), &user_text));
         let turn = FakeTurn::default();
         if positioned_output {
             turn.enable_positioned_output();
@@ -3084,6 +3085,38 @@ fn last_user_text(messages: &[ModelMessage]) -> String {
                 ContentBlock::Image { image } => Some(format!("[image: {}]", image.mime_type)),
                 _ => None,
             })
+        })
+        .unwrap_or_default()
+}
+
+/// `echo-all` answers with every text part of the last user message, so tests can see what the
+/// model received beyond the message text itself.
+fn echo_all_response(
+    request: &ModelTurnRequest,
+    tool_result: Option<&str>,
+    user_text: &str,
+) -> Option<Result<String, ProviderError>> {
+    (tool_result.is_none()
+        && request.structured_output.is_none()
+        && user_text.starts_with("echo-all"))
+    .then(|| Ok(format!("fake: {}", last_user_text_parts(&request.messages))))
+}
+
+fn last_user_text_parts(messages: &[ModelMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         })
         .unwrap_or_default()
 }

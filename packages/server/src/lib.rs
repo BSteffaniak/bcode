@@ -86,6 +86,8 @@ mod xray_projection;
 mod xray_tools;
 mod xray_workflow;
 pub use session_observation::{SessionObservation, SessionObservationDelivery};
+#[cfg(all(test, unix))]
+mod client_profiles_tests;
 mod client_tools;
 #[cfg(all(test, unix))]
 mod client_tools_tests;
@@ -102,6 +104,9 @@ mod submission_recovery_tests;
 mod tool_catalog;
 mod tool_host_retry;
 mod trace_operations;
+mod turn_context;
+#[cfg(all(test, unix))]
+mod turn_context_tests;
 #[cfg(test)]
 mod workflow_admission_tests;
 mod workflow_contributor_events;
@@ -481,6 +486,7 @@ pub struct ServerState {
     contextual_plugin_invocations: StdMutex<plugin_context::InvocationRegistry>,
     tool_catalog: tool_catalog::ToolCatalogCache,
     client_tools: client_tools::ClientToolRegistry,
+    request_only_contexts: turn_context::RequestOnlyContexts,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
     session_search_enabled: bool,
@@ -2671,6 +2677,7 @@ impl ServerState {
             advisory_categorizations: StdMutex::new(BTreeMap::new()),
             tool_catalog: tool_catalog::ToolCatalogCache::default(),
             client_tools: client_tools::ClientToolRegistry::default(),
+            request_only_contexts: turn_context::RequestOnlyContexts::default(),
             startup_plugin_selection: init.startup_plugin_selection,
             default_plugin_ids: init.default_plugin_ids,
             session_search_enabled: init.session_search_enabled,
@@ -6884,6 +6891,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ClaimClientToolSession { .. } => "claim_client_tool_session",
         Request::ReleaseClientToolSession { .. } => "release_client_tool_session",
         Request::ClientToolResult { .. } => "client_tool_result",
+        Request::RegisterClientAgentProfiles { .. } => "register_client_agent_profiles",
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::RuntimeWorkObservations { .. } => "runtime_work_observations",
         Request::RuntimeWorkPage { .. } => "runtime_work_page",
@@ -11915,7 +11923,8 @@ async fn handle_permission_interaction_request(
         request @ (PermissionInteractionRequest::RegisterClientTools { .. }
         | PermissionInteractionRequest::ClaimClientToolSession { .. }
         | PermissionInteractionRequest::ReleaseClientToolSession { .. }
-        | PermissionInteractionRequest::ClientToolResult { .. }) => {
+        | PermissionInteractionRequest::ClientToolResult { .. }
+        | PermissionInteractionRequest::RegisterClientAgentProfiles { .. }) => {
             Box::pin(client_tools::handle_request(
                 request, request_id, client_id, state, writer,
             ))
@@ -16860,6 +16869,13 @@ async fn prepare_submission_admission(
     if admission.execution.agent_profile.is_none() {
         admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
     }
+    if let Some(agent) = &admission.execution.agent_profile {
+        ensure_agent_profile_available(state, agent).await?;
+    }
+    state
+        .request_only_contexts
+        .retain(session_id, admission)
+        .map_err(bcode_session::SessionError::from)?;
     admission
         .validate()
         .map_err(bcode_session::SessionError::from)
@@ -16890,17 +16906,21 @@ async fn enqueue_prompt_submission_inner(
             .await;
     apply_turn_model_selection(&mut requested_selection, &admission.execution);
     let config = submission_admission_config(state, runtime_context.as_ref())?;
-    let execution_descriptor = capture_submission_execution_descriptor(
-        state,
-        session_id,
-        &requested_selection,
-        &config,
-        &admission.execution,
-        runtime_context
-            .as_ref()
-            .and_then(|context| context.config_launch.as_deref()),
-    )
-    .await;
+    let execution_descriptor = if admission.context.request_only_handle.is_some() {
+        None
+    } else {
+        capture_submission_execution_descriptor(
+            state,
+            session_id,
+            &requested_selection,
+            &config,
+            &admission.execution,
+            runtime_context
+                .as_ref()
+                .and_then(|context| context.config_launch.as_deref()),
+        )
+        .await
+    };
     let handle = live_submission_runtime(state, session_id).await;
     let admission_lock = turn_admission_lock(state, session_id).await;
     let admission_guard = admission_lock.lock().await;
@@ -17074,6 +17094,9 @@ async fn admit_turn_inner(
 > {
     let diagnostic_labels = turn_admission_diagnostic_labels(session_id, &admission);
     let mut admission = admission;
+    state
+        .request_only_contexts
+        .retain(session_id, &mut admission)?;
     observe_turn_admission_result(
         state,
         &diagnostic_labels,
@@ -17092,6 +17115,9 @@ async fn admit_turn_inner(
             .await,
         );
     }
+    if let Some(agent) = &admission.execution.agent_profile {
+        ensure_agent_profile_available(state, agent).await?;
+    }
     let mut selection = observe_turn_admission_phase(
         state,
         &diagnostic_labels,
@@ -17101,17 +17127,23 @@ async fn admit_turn_inner(
     .await;
     apply_turn_model_selection(&mut selection, &admission.execution);
     let config = submission_admission_config(state, runtime_context.as_ref())?;
-    let descriptor = capture_submission_execution_descriptor(
-        state,
-        session_id,
-        &selection,
-        &config,
-        &admission.execution,
-        runtime_context
-            .as_ref()
-            .and_then(|context| context.config_launch.as_deref()),
-    )
-    .await;
+    // Request-only context lives in daemon memory, so a recovery descriptor could not
+    // reproduce the turn.
+    let descriptor = if admission.context.request_only_handle.is_some() {
+        None
+    } else {
+        capture_submission_execution_descriptor(
+            state,
+            session_id,
+            &selection,
+            &config,
+            &admission.execution,
+            runtime_context
+                .as_ref()
+                .and_then(|context| context.config_launch.as_deref()),
+        )
+        .await
+    };
     let (admission, events) = observe_turn_admission_result(
         state,
         &diagnostic_labels,
@@ -28638,7 +28670,60 @@ fn append_missing_enabled_tool_diagnostics(
     }
 }
 
+/// Agent profiles from plugins and from connected client applications.
 async fn list_profiles(
+    state: &ServerState,
+    config: Option<&bcode_config::BcodeConfig>,
+) -> Vec<AgentInfo> {
+    let mut profiles = plugin_profiles(state, config).await;
+    for profile in state.client_tools.agent_profiles() {
+        if profiles.iter().any(|agent| agent.id == profile.id) {
+            continue;
+        }
+        profiles.push(AgentInfo {
+            id: profile.id,
+            name: profile.name,
+            description: profile.description,
+            badge: None,
+            accent: None,
+            aliases: Vec::new(),
+            is_default: false,
+        });
+    }
+    profiles
+}
+
+/// Ids and aliases of the agents plugins provide.
+async fn plugin_agent_ids(state: &ServerState) -> BTreeSet<String> {
+    plugin_profiles(state, None)
+        .await
+        .into_iter()
+        .flat_map(|agent| std::iter::once(agent.id).chain(agent.aliases))
+        .collect()
+}
+
+/// Fail closed when `agent_id` names a contributed profile whose application is not connected.
+///
+/// Ids shaped like `<provider_id>.<name>` that no plugin and no connected application provides
+/// are unavailable contributed profiles; other ids keep the agent provider's own handling.
+async fn ensure_agent_profile_available(
+    state: &ServerState,
+    agent_id: &str,
+) -> Result<(), bcode_session_models::TurnAdmissionMetadataError> {
+    if !bcode_agent_profile::client_profile::is_client_agent_profile_id(agent_id)
+        || state.client_tools.agent_profile(agent_id).is_some()
+        || plugin_agent_ids(state).await.contains(agent_id)
+    {
+        return Ok(());
+    }
+    Err(
+        bcode_session_models::TurnAdmissionMetadataError::AgentProfileUnavailable(
+            agent_id.to_owned(),
+        ),
+    )
+}
+
+async fn plugin_profiles(
     state: &ServerState,
     config: Option<&bcode_config::BcodeConfig>,
 ) -> Vec<AgentInfo> {
@@ -28735,16 +28820,25 @@ async fn agent_context_with_tools(
             available_tools.push(tool.definition);
         }
     }
+    let profile = state.client_tools.agent_profile(agent_id);
+    let available_names = available_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
     let request = AgentContextRequest {
         session_id,
-        agent_id: agent_id.to_string(),
+        // A contributed profile narrows its base agent, which the agent provider knows.
+        agent_id: profile.as_ref().map_or_else(
+            || agent_id.to_string(),
+            |profile| profile.base_agent.clone(),
+        ),
         available_tools,
         effective_config_toml: bcode_config::encode_effective_config(&config)
             .ok()
             .map(Box::new),
         claimed_tools,
     };
-    state
+    let response = state
         .plugins
         .invoke_service_by_interface_json::<_, AgentContextResponse>(
             AGENT_PROFILE_INTERFACE_ID,
@@ -28752,7 +28846,36 @@ async fn agent_context_with_tools(
             &request,
         )
         .await
-        .ok()
+        .ok();
+    match profile {
+        Some(profile) => Some(narrow_agent_context(response, &profile, available_names)),
+        None => response,
+    }
+}
+
+/// The base agent's context narrowed by a contributed profile: only tools both expose, and the
+/// profile's instructions after the base agent's.
+fn narrow_agent_context(
+    base: Option<AgentContextResponse>,
+    profile: &bcode_agent_profile::client_profile::ClientAgentProfile,
+    available: Vec<String>,
+) -> AgentContextResponse {
+    let base = base.unwrap_or_default();
+    let exposed = base.enabled_tools.unwrap_or(available);
+    let enabled_tools = exposed
+        .into_iter()
+        .filter(|tool| profile.tools.contains(tool))
+        .collect();
+    let system_prompt_suffix = match (base.system_prompt_suffix, profile.instructions.trim()) {
+        (base, "") => base,
+        (Some(base), instructions) => Some(format!("{base}\n\n{instructions}")),
+        (None, instructions) => Some(instructions.to_owned()),
+    };
+    AgentContextResponse {
+        system_prompt_suffix,
+        operating_mode: base.operating_mode,
+        enabled_tools: Some(enabled_tools),
+    }
 }
 
 async fn session_model_selection_with_runtime_context(
@@ -29631,6 +29754,36 @@ fn execution_turn_id(trigger_event: &bcode_session_models::SessionEvent) -> Stri
     }
 }
 
+/// The request-only context of the turn `trigger_event` starts, read back from daemon memory.
+///
+/// Fails closed when the turn was submitted with request-only context the daemon no longer
+/// holds, such as after a restart: the turn must not run without context it was given.
+fn request_only_turn_context(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+) -> Result<
+    Option<(String, Vec<bcode_session_models::TurnContextBlock>)>,
+    bcode_session::SessionError,
+> {
+    let admission = match &trigger_event.kind {
+        SessionEventKind::UserMessage { admission, .. }
+        | SessionEventKind::SubmissionActivated { admission, .. } => admission,
+        SessionEventKind::SubmissionAccepted { submission } => &submission.admission,
+        _ => return Ok(None),
+    };
+    let Some(handle) = &admission.context.request_only_handle else {
+        return Ok(None);
+    };
+    state
+        .request_only_contexts
+        .blocks(session_id, handle)
+        .map(|blocks| Some((handle.clone(), blocks)))
+        .ok_or_else(|| {
+            bcode_session_models::TurnAdmissionMetadataError::RequestOnlyContextUnavailable.into()
+        })
+}
+
 fn turn_execution_options(
     trigger_event: &bcode_session_models::SessionEvent,
 ) -> bcode_session_models::TurnExecutionOptions {
@@ -29764,6 +29917,8 @@ async fn prepare_static_model_turn_context_inner(
         .agent_profile
         .clone()
         .unwrap_or(session_agent_selection(state, session_id).await);
+    // A queued turn whose contributed profile went away while it waited fails closed.
+    ensure_agent_profile_available(state, &agent_id).await?;
     let agent_tools = if let Some(snapshot) = &prepared_catalog {
         snapshot
             .discovery()
@@ -30353,6 +30508,7 @@ async fn assemble_model_turn_request(
         .as_ref()
         .and_then(|capabilities| capabilities.context_format.as_ref());
     let convert_timer = state.metrics.timer();
+    let request_only = request_only_turn_context(state, session_id, trigger_event)?;
     let mut messages = session_events_to_model_messages_with_turn_context(
         history,
         config.model.tool_output.context_chars,
@@ -30363,6 +30519,9 @@ async fn assemble_model_turn_request(
         context_format.map(|format| format.compatibility_key.as_str()),
         config.model.tool_output.fallback_argument_chars.get(),
         Some((trigger_event.sequence, &static_context.system_messages)),
+        request_only
+            .as_ref()
+            .map(|(handle, blocks)| (handle.as_str(), blocks.as_slice())),
     );
     if projection_only
         && !history
@@ -38774,9 +38933,24 @@ async fn evaluate_agent_tool_policy_with_metadata(
         .offered_tools(session_id)
         .iter()
         .any(|tool| tool.definition.name == call.name);
+    // A contributed profile only removes tools; every remaining call is decided by its base
+    // agent's policy, so the profile can never grant a permission.
+    let profile = state.client_tools.agent_profile(agent_id);
+    if let Some(profile) = &profile
+        && !profile.tools.contains(&call.name)
+    {
+        return EvaluateToolCallResponse {
+            decision: AgentDecision::Deny,
+            reason: Some(format!(
+                "tool `{}` is not available to agent profile `{}`",
+                call.name, profile.id
+            )),
+            shell: None,
+        };
+    }
     let request = EvaluateToolCallRequest {
         session_id,
-        agent_id: agent_id.to_string(),
+        agent_id: profile.map_or_else(|| agent_id.to_string(), |profile| profile.base_agent),
         tool_name: call.name.clone(),
         operation: metadata.operation.clone(),
         aliases,
@@ -39230,8 +39404,12 @@ fn session_events_to_model_messages_for_target_with_limits(
         compatibility_key,
         fallback_tool_argument_chars,
         None,
+        None,
     )
 }
+
+/// Request-only context of the turn being assembled: its daemon-memory handle and blocks.
+type RequestOnlyProjection<'a> = (&'a str, &'a [bcode_session_models::TurnContextBlock]);
 
 #[allow(clippy::too_many_arguments)]
 fn session_events_to_model_messages_with_turn_context(
@@ -39244,6 +39422,7 @@ fn session_events_to_model_messages_with_turn_context(
     compatibility_key: Option<&str>,
     fallback_tool_argument_chars: usize,
     turn_context: Option<(u64, &[ModelMessage])>,
+    request_only: Option<RequestOnlyProjection<'_>>,
 ) -> Vec<ModelMessage> {
     let history = compact_attach_history(history.to_vec());
     let latest_compaction =
@@ -39288,6 +39467,7 @@ fn session_events_to_model_messages_with_turn_context(
         compatibility_key,
         fallback_tool_argument_chars,
         turn_context,
+        request_only,
     )
 }
 
@@ -39348,6 +39528,7 @@ fn session_events_to_sanitized_model_messages(
     compatibility_key: Option<&str>,
     fallback_tool_argument_chars: usize,
     turn_context: Option<(u64, &[ModelMessage])>,
+    request_only: Option<RequestOnlyProjection<'_>>,
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -39376,7 +39557,7 @@ fn session_events_to_sanitized_model_messages(
                     }
                     previous_agent = Some(agent);
                 }
-                messages.push(plain_context_message(text.clone()));
+                messages.push(user_message_model_message(text, admission, request_only));
             }
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
@@ -39599,14 +39780,36 @@ fn plain_context_message(text: String) -> ModelMessage {
     }
 }
 
+/// A user message as the model reads it: the text, then its durable context blocks, then the
+/// request-only blocks when this is the message of the turn being assembled.
+fn user_message_model_message(
+    text: &str,
+    admission: &bcode_session_models::TurnAdmissionMetadata,
+    request_only: Option<RequestOnlyProjection<'_>>,
+) -> ModelMessage {
+    let mut message = plain_context_message(text.to_owned());
+    if let Some(rendered) =
+        bcode_session_models::render_turn_context_blocks(&admission.context.blocks)
+    {
+        message.content.push(ContentBlock::Text { text: rendered });
+    }
+    if let (Some(handle), Some((current, blocks))) =
+        (&admission.context.request_only_handle, request_only)
+        && handle == current
+        && let Some(rendered) = bcode_session_models::render_turn_context_blocks(blocks)
+    {
+        message.content.push(ContentBlock::Text { text: rendered });
+    }
+    message
+}
+
 fn non_tool_session_event_to_model_message(
     event: &bcode_session_models::SessionEvent,
 ) -> Option<ModelMessage> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, .. } => Some(ModelMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: text.clone() }],
-        }),
+        SessionEventKind::UserMessage {
+            text, admission, ..
+        } => Some(user_message_model_message(text, admission, None)),
         SessionEventKind::AssistantMessage { text }
         | SessionEventKind::AssistantResponseSegment { text, .. }
         | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => Some(ModelMessage {
@@ -43699,6 +43902,7 @@ where
             }),
             ..TurnExecutionOptions::default()
         },
+        context: bcode_session_models::TurnContext::default(),
     };
     #[cfg(test)]
     let stage_timer = workflow_representation::fanout_stages::StageTimer::new(
@@ -61501,6 +61705,7 @@ library = "test"
                 None,
                 1000,
                 Some((2, &context.system_messages)),
+                None,
             )
         };
         let messages = project();
@@ -66706,7 +66911,7 @@ library = "test"
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(
-                invoke_prepared_tool_for_test(
+                Box::pin(invoke_prepared_tool_for_test(
                     state,
                     session_id,
                     call,
@@ -66714,7 +66919,7 @@ library = "test"
                     preparation,
                     &metadata,
                     &cancel
-                ),
+                )),
                 decide
             )
         })
@@ -88119,6 +88324,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             idempotency_key: Some(dispatch_identity),
             activity: None,
             execution: TurnExecutionOptions::default(),
+            context: bcode_session_models::TurnContext::default(),
         };
         let first = submit_session_model_turn_with_admission(
             &state,
@@ -105378,6 +105584,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     }],
                 }],
             )),
+            None,
         );
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert!(

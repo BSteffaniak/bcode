@@ -9089,6 +9089,7 @@ mod tests {
                 tools: bcode_session_models::TurnToolPolicy::Disabled,
                 ..bcode_session_models::TurnExecutionOptions::default()
             },
+            context: bcode_session_models::TurnContext::default(),
         };
 
         let first = manager

@@ -102,6 +102,32 @@ impl ClientToolProvider {
         }
     }
 
+    /// Contribute agent profiles under this provider id, replacing earlier ones.
+    ///
+    /// A profile narrows a base agent: it adds instructions and may only remove tools, and every
+    /// call is still decided by the base agent's permission policy. Profiles exist while this
+    /// connection is open; turns of sessions that selected one fail closed with
+    /// `agent_profile_unavailable` after it closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport fails or the daemon rejects the profiles: ids outside
+    /// `<provider_id>.`, out-of-bounds fields, or ids that collide with configured agents
+    /// (`client_agent_profiles_rejected`).
+    pub async fn register_agent_profiles(
+        &mut self,
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    ) -> Result<(), ClientError> {
+        match self
+            .connection
+            .send_request(Request::RegisterClientAgentProfiles { profiles })
+            .await?
+        {
+            ResponsePayload::ClientAgentProfilesRegistered { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Offer this provider's tools in `session_id` from the next turn on.
     ///
     /// # Errors

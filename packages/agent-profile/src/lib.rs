@@ -9,6 +9,7 @@
 //! agents, along with prompt context and tool-call policy decisions.
 
 pub mod application;
+pub mod client_profile;
 
 use bcode_session_models::SessionId;
 use bcode_tool::{

@@ -162,7 +162,7 @@ async fn retained_status_fixture(
 #[tokio::test]
 async fn constrained_status_only_readiness_crosses_real_ipc_without_login_or_submission() {
     let root = tempfile::tempdir().unwrap();
-    let (sessions, session_id) = retained_status_fixture(root.path()).await;
+    let (sessions, session_id) = Box::pin(retained_status_fixture(root.path())).await;
     let bundle = bcode_plugin::StaticBundledPlugin::new(
         MANIFEST,
         bcode_plugin_sdk::static_plugin_vtable!(StatusOnly, MANIFEST),

@@ -278,6 +278,13 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Context blocks an application supplies with one submission.
+pub mod turn_context;
+pub use turn_context::{
+    MAX_TURN_CONTEXT_BLOCKS, MAX_TURN_CONTEXT_BYTES, MAX_TURN_CONTEXT_LABEL_BYTES, TurnContext,
+    TurnContextBlock, TurnContextError, render_turn_context_blocks,
+};
+
 /// Descriptive record of the application that created a session.
 pub mod origin;
 pub use origin::{
@@ -2916,6 +2923,9 @@ pub struct TurnAdmissionMetadata {
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub execution: TurnExecutionOptions,
+    /// Context blocks supplied with the submission; omitted from durable JSON when empty.
+    #[serde(default, skip_serializing_if = "TurnContext::is_empty")]
+    pub context: TurnContext,
 }
 
 const MAX_TURN_PRODUCER_BYTES: usize = 256;
@@ -3015,6 +3025,14 @@ pub enum TurnAdmissionMetadataError {
     InvalidSkillContextLength,
     EmptySkillContext,
     TruncatedSkillContext,
+    /// Supplied turn context is out of bounds.
+    InvalidContext(TurnContextError),
+    /// Request-only context reached durable admission instead of daemon memory.
+    UnretainedRequestOnlyContext,
+    /// The daemon no longer holds the turn's request-only context.
+    RequestOnlyContextUnavailable,
+    /// The selected agent profile is contributed by an application that is not connected.
+    AgentProfileUnavailable(String),
 }
 
 impl Display for TurnAdmissionMetadataError {
@@ -3070,6 +3088,19 @@ impl Display for TurnAdmissionMetadataError {
             Self::EmptySkillContext => "turn skill context must contain at least one byte",
             Self::TruncatedSkillContext => {
                 "turn skill context must be complete rather than truncated"
+            }
+            Self::InvalidContext(error) => return Display::fmt(error, f),
+            Self::UnretainedRequestOnlyContext => {
+                "request-only turn context must be retained by the daemon, never persisted"
+            }
+            Self::RequestOnlyContextUnavailable => {
+                "the turn's request-only context is no longer available; submit it again"
+            }
+            Self::AgentProfileUnavailable(profile) => {
+                return write!(
+                    f,
+                    "agent profile `{profile}` is unavailable: the application that provides it is not connected; choose another agent"
+                );
             }
         })
     }
@@ -3289,7 +3320,27 @@ impl TurnAdmissionMetadata {
             validate_structured_output_request(request)?;
         }
         validate_skill_contexts(&self.execution.skill_contexts)?;
+        self.context
+            .validate()
+            .map_err(TurnAdmissionMetadataError::InvalidContext)?;
         Ok(())
+    }
+
+    /// Validate metadata about to be persisted: [`Self::validate`], and no request-only context
+    /// blocks, which the daemon must have moved into memory first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::validate`] errors, or
+    /// [`TurnAdmissionMetadataError::UnretainedRequestOnlyContext`] when request-only blocks are
+    /// still present.
+    pub fn validate_durable(&self) -> Result<(), TurnAdmissionMetadataError> {
+        self.validate()?;
+        if self.context.request_only.is_empty() {
+            Ok(())
+        } else {
+            Err(TurnAdmissionMetadataError::UnretainedRequestOnlyContext)
+        }
     }
 
     /// Return the producer/key pair used for idempotency lookup.

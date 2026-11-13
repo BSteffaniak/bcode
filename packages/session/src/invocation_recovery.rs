@@ -222,7 +222,11 @@ impl SessionManager {
         else {
             return Ok(None);
         };
-        if admission.validate().is_err() || admission.execution.request_context_id.is_some() {
+        // Request-only context lives in daemon memory and does not survive recovery.
+        if admission.validate().is_err()
+            || admission.execution.request_context_id.is_some()
+            || admission.context.request_only_handle.is_some()
+        {
             return Ok(None);
         }
         let permission = events.iter().find(|event| matches!(&event.kind,
