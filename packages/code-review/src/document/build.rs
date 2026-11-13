@@ -7,10 +7,10 @@
 use super::anchors::{AnchorLines, AnchorTarget, AnnotationBody};
 use super::gaps::{self, Region};
 use super::items::{
-    AgentThreadItem, AnchorPlacement, ComposerItem, FileHeaderItem, FileNoticeItem, GapItem,
-    GapState, HunkHeaderItem, LayoutMode, LineContent, LineItem, LineKind, LinePairItem,
-    OutdatedReason, PairSide, PlaceholderItem, ReviewItem, SourceHeaderItem, StackLayerLabel,
-    ThreadItem,
+    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileHeaderItem,
+    FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayoutMode, LineContent, LineItem, LineKind,
+    LinePairItem, OutdatedReason, PairSide, PlaceholderItem, ReviewItem, SourceHeaderItem,
+    StackLayerLabel, ThreadItem,
 };
 use super::keys::{FileNoticeKind, FileRef};
 use super::review::{
@@ -18,6 +18,11 @@ use super::review::{
     ReviewDocument,
 };
 use bcode_code_review_models::{ReviewIndexFlag, ReviewLineKind, ReviewLineSide};
+
+/// The file key of `state`.
+fn key_of(state: &super::review::FileState) -> FileRef {
+    state.key.clone()
+}
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -238,26 +243,15 @@ impl ReviewDocument {
     fn build_file(&self, file: usize) -> Built {
         let state = &self.files[file];
         let key = state.key.clone();
-        let attribution = match &state.attribution {
-            AttributionState::Loaded(attribution) => Some(attribution),
-            _ => None,
-        };
-        let mut items = vec![ReviewItem::FileHeader(FileHeaderItem {
-            file: key.clone(),
-            status: state.entry.status,
-            old_path: state.entry.old_path.clone(),
-            additions: state.entry.additions,
-            deletions: state.entry.deletions,
-            flags: state.entry.flags.clone(),
-            viewed: state.viewed.is_viewed(),
-            load: state.load_state(),
-            layers: attribution
-                .map(super::review::Attribution::layers)
-                .unwrap_or_default(),
-            thread_count: self.file_annotations[file].len(),
-            carried_over: state.carried_over,
-        })];
-        let mut parents = vec![None];
+        let mut items = self.file_head(file);
+        let mut parents = vec![None; items.len()];
+        if state.collapsed {
+            self.end_file(&key, &mut items, &mut parents);
+            return Built {
+                items,
+                hunk_parent: parents,
+            };
+        }
         let regions = state.regions();
         let slots = self.slots(file, &regions);
         for emit in &slots.file_level {
@@ -298,15 +292,79 @@ impl ReviewDocument {
                     slots,
                 };
                 builder.content(&regions);
+                let (mut items, mut parents) = (builder.items, builder.parents);
+                self.end_file(&key_of(state), &mut items, &mut parents);
                 return Built {
-                    items: builder.items,
-                    hunk_parent: builder.parents,
+                    items,
+                    hunk_parent: parents,
                 };
             }
         }
+        self.end_file(&key_of(state), &mut items, &mut parents);
         Built {
             items,
             hunk_parent: parents,
+        }
+    }
+
+    /// A file's header, and its details when the document has them.
+    fn file_head(&self, file: usize) -> Vec<ReviewItem> {
+        let state = &self.files[file];
+        let key = state.key.clone();
+        let attribution = match &state.attribution {
+            AttributionState::Loaded(attribution) => Some(attribution),
+            _ => None,
+        };
+        let layers = attribution
+            .map(super::review::Attribution::layers)
+            .unwrap_or_default();
+        let group = &self.groups[state.group];
+        let mut items = vec![ReviewItem::FileHeader(FileHeaderItem {
+            file: key.clone(),
+            status: state.entry.status,
+            old_path: state.entry.old_path.clone(),
+            additions: state.entry.additions,
+            deletions: state.entry.deletions,
+            flags: state.entry.flags.clone(),
+            viewed: state.viewed.is_viewed(),
+            load: state.load_state(),
+            layers: layers.clone(),
+            thread_count: self.file_annotations[file].len(),
+            carried_over: state.carried_over,
+            position: u32::try_from(file - group.files.start + 1).unwrap_or(u32::MAX),
+            count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),
+            collapsed: state.collapsed,
+        })];
+        if self.chrome.details {
+            items.push(ReviewItem::FileDetails(FileDetailsItem {
+                file: key,
+                status: state.entry.status,
+                old_path: state.entry.old_path.clone(),
+                flags: state.entry.flags.clone(),
+                layers,
+                thread_count: self.file_annotations[file].len(),
+                line_count: state.line_count,
+                hunks: state
+                    .loaded()
+                    .map(|loaded| u32::try_from(loaded.hunks.len()).unwrap_or(u32::MAX)),
+                viewed: state.viewed.is_viewed(),
+                collapsed: state.collapsed,
+                in_stack: group.stack.is_some(),
+            }));
+        }
+        items
+    }
+
+    /// The break after `file`'s content, when the document has them.
+    fn end_file(
+        &self,
+        file: &FileRef,
+        items: &mut Vec<ReviewItem>,
+        parents: &mut Vec<Option<u32>>,
+    ) {
+        if self.chrome.ends {
+            items.push(ReviewItem::FileEnd(file.clone()));
+            parents.push(None);
         }
     }
 

@@ -332,11 +332,11 @@ bcode_read_plugin                       = { version = "0.0.1-alpha.0", default-f
 bcode_sdk_session_import_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/sdk-session-import-plugin" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
-bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }
-bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
 bcode_session_bridge                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge" }
 bcode_session_bridge_models             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/models" }
 bcode_session_bridge_server             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/server" }
+bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }
+bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
 bcode_session_migration                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration" }
 bcode_session_migration_target          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration-target" }
 bcode_session_milestones_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-milestones-plugin" }
@@ -399,6 +399,7 @@ bmux_plugin_schema = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_sdk = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_pty = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_syntax_render = { default-features = false, version = "0.0.1-alpha.4" }
+bmux_terminal = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal_grid = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal_protocol = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_text_edit = { default-features = false, version = "0.0.1-alpha.4" }
@@ -448,9 +449,6 @@ chrono = { version = "0.4.45", default-features = false, features = [
 ] }
 clap = { version = "4.5.40", default-features = false }
 cmake = { version = "0.1.54", default-features = false }
-crossterm = { version = "0.29.0", default-features = false, features = [
-    "windows",
-] }
 devicons = { version = "0.6.12", default-features = false }
 dunce = { version = "1.0.5", default-features = false }
 flate2 = { version = "1.1.10", default-features = false, features = [
@@ -690,6 +688,7 @@ bmux_plugin_schema                 = { git = "https://github.com/BSteffaniak/bmu
 bmux_plugin_sdk                    = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_pty                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_syntax_render                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_terminal                      = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_terminal_grid                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_terminal_protocol             = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 bmux_text_edit                     = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }

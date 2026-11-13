@@ -568,6 +568,14 @@ impl ReviewSurface {
         state.hide_viewed_files = self.hide_viewed_files;
         state.all_stack_layers = self.stack_view == super::stack::StackView::AllLayers;
         state.conversation_seen.clone_from(&self.talk.seen);
+        if let Some(review) = &self.review {
+            state.collapsed_files = review
+                .doc
+                .collapsed_files()
+                .iter()
+                .map(|file| format!("{}\u{1}{}", file.source_id, file.path))
+                .collect();
+        }
         state.layout_mode = self.layout_override.map(|mode| match mode {
             LayoutMode::Unified => ReviewLayoutMode::Unified,
             LayoutMode::SideBySide => ReviewLayoutMode::SideBySide,
@@ -673,6 +681,19 @@ impl ReviewSurface {
             review.doc.set_layout(mode);
         }
         review.doc.restore_expansions(&state.expansions);
+        let collapsed: Vec<bcode_code_review::document::FileRef> = review
+            .doc
+            .file_keys()
+            .filter(|file| {
+                state
+                    .collapsed_files
+                    .contains(&format!("{}\u{1}{}", file.source_id, file.path))
+            })
+            .cloned()
+            .collect();
+        for file in collapsed {
+            review.doc.set_collapsed(&file, true);
+        }
         review.note_splices();
         let Some(anchor) = state.scroll_anchor else {
             return;

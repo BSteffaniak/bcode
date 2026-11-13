@@ -51,6 +51,17 @@ pub struct ReviewViewConfig {
     /// Tab stop interval of diff text, in cells (default [`DEFAULT_TAB_WIDTH`]).
     #[serde(default)]
     pub tab_width: Option<u16>,
+    /// How much a file's header shows: `auto` (by the pane's size), `compact`, `comfortable`,
+    /// or `spacious`.
+    #[serde(default)]
+    pub file_header: FileHeaderDensity,
+    /// What separates files: `torn` pages, a `rule`, `space`, or `none`.
+    #[serde(default)]
+    pub file_separator: FileSeparator,
+    /// Whether files read as pages on a desk: `auto` (when the theme gives a desk color), `on`,
+    /// or `off`.
+    #[serde(default)]
+    pub file_page: FilePage,
     /// What makes a viewed file stale (`viewed_reset` in the plugin table, not `review_v2`).
     #[serde(skip)]
     pub viewed_reset: bcode_code_review::viewed::ViewedReset,
@@ -58,6 +69,49 @@ pub struct ReviewViewConfig {
     /// and the environment; `None` (tests, previews) means full color.
     #[serde(skip)]
     pub color_depth: Option<bmux_tui::capabilities::TerminalColorDepth>,
+}
+
+/// How much a file's header shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileHeaderDensity {
+    /// By the review pane's size.
+    #[default]
+    Auto,
+    /// One header row.
+    Compact,
+    /// A header row and a row of details and buttons.
+    Comfortable,
+    /// Two header rows and up to two rows of details.
+    Spacious,
+}
+
+/// What separates files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSeparator {
+    /// The previous page torn off, the next one's edge torn.
+    #[default]
+    Torn,
+    /// A plain rule.
+    Rule,
+    /// Blank rows.
+    Space,
+    /// Nothing.
+    None,
+}
+
+/// Whether files read as pages on a desk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePage {
+    /// When the theme gives a desk color.
+    #[default]
+    Auto,
+    /// Always (a theme without a desk color falls back to a rule).
+    On,
+    /// Never: tears are drawn as lines.
+    Off,
 }
 
 /// Configured layout choice.

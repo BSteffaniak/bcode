@@ -1,10 +1,10 @@
 use std::io::{self, IsTerminal as _, Write};
 
+use bmux_terminal::event::{Event, KeyEventKind};
+#[cfg(unix)]
+use bmux_terminal::event::{KeyCode as TerminalKeyCode, KeyEvent, KeyModifiers};
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::Terminal;
-use crossterm::event::{Event, KeyEventKind};
-#[cfg(unix)]
-use crossterm::event::{KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
 
 use crate::pager::Pager;
 
@@ -28,12 +28,12 @@ pub(crate) fn run(markdown: String, styled: bool) -> io::Result<()> {
     ensure_controlling_terminal()?;
 
     let input = if std::io::stdin().is_terminal() {
-        EventInput::Crossterm
+        EventInput::Terminal
     } else {
         EventInput::controlling_terminal()?
     };
     let mut guard = TerminalGuard::enter()?;
-    let (width, height) = crossterm::terminal::size()?;
+    let (width, height) = bmux_terminal::terminal::size()?;
     let mut terminal = Terminal::new(
         guard
             .writer_mut()
@@ -48,7 +48,7 @@ pub(crate) fn run(markdown: String, styled: bool) -> io::Result<()> {
             Event::Key(event)
                 if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
             {
-                let Some(key) = bmux_tui::crossterm::key_from_crossterm(event) else {
+                let Some(key) = bmux_tui::terminal_io::key_from_terminal(event) else {
                     continue;
                 };
                 if pager.handle_key(key) {
@@ -119,7 +119,7 @@ fn ensure_controlling_terminal() -> io::Result<()> {
 }
 
 enum EventInput {
-    Crossterm,
+    Terminal,
     #[cfg(unix)]
     Unix {
         terminal: std::fs::File,
@@ -135,7 +135,7 @@ impl EventInput {
                 .read(true)
                 .write(true)
                 .open("/dev/tty")?;
-            let size = crossterm::terminal::size().unwrap_or((1, 1));
+            let size = bmux_terminal::terminal::size().unwrap_or((1, 1));
             Ok(Self::Unix {
                 terminal,
                 last_size: std::cell::Cell::new(size),
@@ -143,7 +143,7 @@ impl EventInput {
         }
         #[cfg(windows)]
         {
-            Ok(Self::Crossterm)
+            Ok(Self::Terminal)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -155,7 +155,7 @@ impl EventInput {
 
     fn read_event(&self) -> io::Result<Event> {
         match self {
-            Self::Crossterm => crossterm::event::read(),
+            Self::Terminal => bmux_terminal::event::read(),
             #[cfg(unix)]
             Self::Unix {
                 terminal,
@@ -187,7 +187,7 @@ fn read_unix_event(
             }
             return Err(error);
         }
-        let size = crossterm::terminal::size().unwrap_or_else(|_| last_size.get());
+        let size = bmux_terminal::terminal::size().unwrap_or_else(|_| last_size.get());
         if size != last_size.get() {
             last_size.set(size);
             return Ok(Event::Resize(size.0, size.1));
@@ -206,13 +206,13 @@ fn read_unix_event(
 fn parse_unix_key(first: u8, terminal: &mut impl std::io::Read) -> io::Result<Event> {
     let event = match first {
         b'\x1b' => parse_unix_escape(terminal)?,
-        b'\r' | b'\n' => KeyEvent::new(CrosstermKeyCode::Enter, KeyModifiers::NONE),
-        0x03 => KeyEvent::new(CrosstermKeyCode::Char('c'), KeyModifiers::CONTROL),
-        0x04 => KeyEvent::new(CrosstermKeyCode::Char('d'), KeyModifiers::CONTROL),
+        b'\r' | b'\n' => KeyEvent::new(TerminalKeyCode::Enter, KeyModifiers::NONE),
+        0x03 => KeyEvent::new(TerminalKeyCode::Char('c'), KeyModifiers::CONTROL),
+        0x04 => KeyEvent::new(TerminalKeyCode::Char('d'), KeyModifiers::CONTROL),
         byte if byte.is_ascii() => {
-            KeyEvent::new(CrosstermKeyCode::Char(char::from(byte)), KeyModifiers::NONE)
+            KeyEvent::new(TerminalKeyCode::Char(char::from(byte)), KeyModifiers::NONE)
         }
-        _ => KeyEvent::new(CrosstermKeyCode::Null, KeyModifiers::NONE),
+        _ => KeyEvent::new(TerminalKeyCode::Null, KeyModifiers::NONE),
     };
     Ok(Event::Key(event))
 }
@@ -228,7 +228,7 @@ fn parse_unix_escape(terminal: &mut impl std::io::Read) -> io::Result<KeyEvent> 
         Err(error) => return Err(error),
     };
     if read == 0 || sequence[0] != b'[' {
-        return Ok(KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE));
+        return Ok(KeyEvent::new(TerminalKeyCode::Esc, KeyModifiers::NONE));
     }
     terminal.read_exact(&mut sequence[1..2])?;
     let length = if matches!(sequence[1], b'5' | b'6') {
@@ -238,13 +238,13 @@ fn parse_unix_escape(terminal: &mut impl std::io::Read) -> io::Result<KeyEvent> 
         2
     };
     let code = match &sequence[..length] {
-        b"[A" => CrosstermKeyCode::Up,
-        b"[B" => CrosstermKeyCode::Down,
-        b"[H" => CrosstermKeyCode::Home,
-        b"[F" => CrosstermKeyCode::End,
-        b"[5~" => CrosstermKeyCode::PageUp,
-        b"[6~" => CrosstermKeyCode::PageDown,
-        _ => CrosstermKeyCode::Null,
+        b"[A" => TerminalKeyCode::Up,
+        b"[B" => TerminalKeyCode::Down,
+        b"[H" => TerminalKeyCode::Home,
+        b"[F" => TerminalKeyCode::End,
+        b"[5~" => TerminalKeyCode::PageUp,
+        b"[6~" => TerminalKeyCode::PageDown,
+        _ => TerminalKeyCode::Null,
     };
     Ok(KeyEvent::new(code, KeyModifiers::NONE))
 }
@@ -262,20 +262,20 @@ impl TerminalGuard<std::io::Stdout> {
             raw_mode: false,
             alternate_screen: false,
         };
-        crossterm::terminal::enable_raw_mode()?;
+        bmux_terminal::terminal::enable_raw_mode()?;
         guard.raw_mode = true;
 
         let stdout = guard
             .stdout
             .as_mut()
             .ok_or_else(|| io::Error::other("terminal writer is unavailable"))?;
-        crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+        bmux_terminal::execute!(stdout, bmux_terminal::terminal::EnterAlternateScreen)?;
         guard.alternate_screen = true;
-        crossterm::execute!(
+        bmux_terminal::execute!(
             stdout,
-            crossterm::terminal::DisableLineWrap,
-            crossterm::cursor::Hide,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            bmux_terminal::terminal::DisableLineWrap,
+            bmux_terminal::cursor::Hide,
+            bmux_terminal::terminal::Clear(bmux_terminal::terminal::ClearType::All)
         )?;
         Ok(guard)
     }
@@ -310,13 +310,13 @@ fn leave_terminal_state<W: Write>(
     let mut first_error = None;
     if *alternate_screen {
         if let Some(writer) = writer {
-            if let Err(error) = crossterm::execute!(
+            if let Err(error) = bmux_terminal::execute!(
                 writer,
-                crossterm::style::ResetColor,
-                crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
-                crossterm::cursor::Show,
-                crossterm::terminal::EnableLineWrap,
-                crossterm::terminal::LeaveAlternateScreen
+                bmux_terminal::style::ResetColor,
+                bmux_terminal::style::SetAttribute(bmux_terminal::style::Attribute::Reset),
+                bmux_terminal::cursor::Show,
+                bmux_terminal::terminal::EnableLineWrap,
+                bmux_terminal::terminal::LeaveAlternateScreen
             ) {
                 first_error = Some(error);
             } else if let Err(error) = writer.flush() {
@@ -326,7 +326,7 @@ fn leave_terminal_state<W: Write>(
         *alternate_screen = false;
     }
     if *raw_mode {
-        if let Err(error) = crossterm::terminal::disable_raw_mode()
+        if let Err(error) = bmux_terminal::terminal::disable_raw_mode()
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -362,7 +362,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_controlling_terminal_parser_supports_pager_keys() {
-        use crossterm::event::KeyCode;
+        use bmux_terminal::event::KeyCode;
 
         for (bytes, expected) in [
             (&b"q"[..], KeyCode::Char('q')),
@@ -486,7 +486,7 @@ mod tests {
         let Event::Key(event) = parse(&[0x03]) else {
             panic!("expected key event");
         };
-        assert_eq!(event.code, CrosstermKeyCode::Char('c'));
+        assert_eq!(event.code, TerminalKeyCode::Char('c'));
         assert!(event.modifiers.contains(KeyModifiers::CONTROL));
     }
 }

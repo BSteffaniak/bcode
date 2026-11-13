@@ -28,7 +28,7 @@ bcode_tui_theme = { workspace = true, features = ["components"] }
 bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui = { workspace = true, features = ["terminal-io"] }
 bmux_tui_components = { workspace = true, features = [
     "badge",
     "diff-viewer",
@@ -55,7 +55,7 @@ bmux_tui_components = { workspace = true, features = [
     "tree-view",
     "virtual-list",
 ] }
-bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
+bmux_tui_runtime = { workspace = true, features = ["terminal-io"] }
 clap = { workspace = true, features = ["derive", "std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

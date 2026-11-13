@@ -12490,7 +12490,9 @@ fn reset_credit_output_should_use_blocks() -> bool {
 }
 
 fn terminal_width() -> Option<u16> {
-    crossterm::terminal::size().ok().map(|(columns, _)| columns)
+    bmux_terminal::terminal::size()
+        .ok()
+        .map(|(columns, _)| columns)
 }
 
 fn next_reset_credit_expiry(profile: &AuthResetsProfileReport) -> Option<&str> {

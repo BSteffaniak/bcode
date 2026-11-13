@@ -177,10 +177,10 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bcode_session_models::SessionId;
-use bmux_tui::crossterm::CrosstermTerminalGuard;
+use bmux_terminal::terminal::size;
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
-use crossterm::terminal::size;
+use bmux_tui::terminal_io::TerminalGuard;
 
 fn terminal_area() -> io::Result<Rect> {
     let (width, height) = size()?;
@@ -666,7 +666,7 @@ pub async fn run_with_static_bundled_and_options(
 #[allow(clippy::future_not_send)]
 pub async fn run_eval_viewer_picker(repo_path: std::path::PathBuf) -> Result<(), TuiError> {
     let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let mut guard = TerminalGuard::enter(stdout)?;
     let result = {
         let mut terminal = Terminal::new(
             guard.writer_mut().ok_or_else(|| {
@@ -690,7 +690,7 @@ pub async fn run_metrics_dashboard(
     metrics_path: Option<std::path::PathBuf>,
 ) -> Result<(), TuiError> {
     let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let mut guard = TerminalGuard::enter(stdout)?;
     let result = {
         let mut terminal = Terminal::new(
             guard.writer_mut().ok_or_else(|| {
@@ -721,7 +721,7 @@ pub async fn run_eval_viewer(
     run: Option<std::path::PathBuf>,
 ) -> Result<(), TuiError> {
     let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let mut guard = TerminalGuard::enter(stdout)?;
     let result = {
         let mut terminal = Terminal::new(
             guard.writer_mut().ok_or_else(|| {

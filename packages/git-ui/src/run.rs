@@ -9,9 +9,9 @@ use bcode_tui_theme::appearance::{AppearanceSources, AppearanceWatcher, VariantP
 use bcode_tui_theme::picker::LiveAppearance;
 use bmux_tui::capabilities::{TerminalBackground, TerminalCapabilities};
 use bmux_tui::component::{Constraints, LayoutCx};
-use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui_runtime::{Runtime, RuntimeConfig, TerminalPresenter};
 
 use crate::app::{App, Msg};
@@ -412,7 +412,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunError> {
 /// One terminal session; returns when the user quits or an external program is requested.
 async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     let terminal_error = |error: std::io::Error| RunError::Terminal(error.to_string());
-    let guard = CrosstermTerminalGuard::enter(std::io::stdout()).map_err(terminal_error)?;
+    let guard = TerminalGuard::enter(std::io::stdout()).map_err(terminal_error)?;
     let size = terminal_size().map_err(terminal_error)?;
     let terminal = Terminal::new(std::io::stdout(), Rect::new(0, 0, size.width, size.height));
     let presenter: Presenter = TerminalPresenter::with_commit(terminal, paint, commit);

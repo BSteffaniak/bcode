@@ -99,7 +99,7 @@ fn run<T>(
     let mut terminal = InlineTerminal::enter(io::stderr())?;
     let mut previous_size = None;
     loop {
-        let size = bmux_tui::crossterm::terminal_size()?;
+        let size = bmux_tui::terminal_io::terminal_size()?;
         if previous_size != Some(size) {
             terminal.clear()?;
             previous_size = Some(size);
@@ -113,7 +113,7 @@ fn run<T>(
                 &theme,
             ))?;
         }
-        let Some(event) = bmux_tui::crossterm::read_event()? else {
+        let Some(event) = bmux_tui::terminal_io::read_event()? else {
             terminal.finish()?;
             return Ok(cancelled);
         };

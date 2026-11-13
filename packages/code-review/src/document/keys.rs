@@ -59,6 +59,10 @@ pub enum ItemKey {
     },
     /// Header of one file.
     FileHeader(FileRef),
+    /// Facts and actions under a file's header.
+    FileDetails(FileRef),
+    /// The end of a file (the break before the next).
+    FileEnd(FileRef),
     /// Estimated-height placeholder of a file whose content is not resident.
     Placeholder(FileRef),
     /// A notice about a file's content.
@@ -123,6 +127,8 @@ impl ItemKey {
     pub const fn file(&self) -> Option<&FileRef> {
         match self {
             Self::FileHeader(file)
+            | Self::FileDetails(file)
+            | Self::FileEnd(file)
             | Self::Placeholder(file)
             | Self::FileNotice { file, .. }
             | Self::HunkHeader { file, .. }
@@ -161,13 +167,15 @@ impl ItemKey {
             Self::SourceHeader { source_id, .. } => Some(ReviewItemKey::SourceHeader {
                 source_id: source_id.clone(),
             }),
-            Self::FileHeader(file) | Self::Placeholder(file) | Self::FileNotice { file, .. } => {
-                Some(ReviewItemKey::FileHeader {
-                    source_id: file.source_id.clone(),
-                    path: file.path.clone(),
-                    part: file.part,
-                })
-            }
+            Self::FileHeader(file)
+            | Self::FileDetails(file)
+            | Self::FileEnd(file)
+            | Self::Placeholder(file)
+            | Self::FileNotice { file, .. } => Some(ReviewItemKey::FileHeader {
+                source_id: file.source_id.clone(),
+                path: file.path.clone(),
+                part: file.part,
+            }),
             Self::HunkHeader {
                 file, new_start, ..
             } => Some(ReviewItemKey::HunkHeader {

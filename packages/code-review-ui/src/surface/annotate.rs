@@ -446,6 +446,48 @@ impl ReviewSurface {
 
     /// A file-level or review-level comment.
     pub(super) fn start_scoped_comment(&mut self, file: bool) {
+        self.start_scoped(file, ComposerMode::Comment);
+    }
+
+    /// Ask Bcode about the cursor's file.
+    pub(super) fn ask_about_file(&mut self) {
+        self.start_scoped(true, ComposerMode::Ask);
+    }
+
+    /// Show only the cursor file's header, or its content again.
+    pub(super) fn toggle_file_collapsed(&mut self) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let Some(file) = review.cursor_file() else {
+            self.set_status("move into a file to collapse it", StatusSeverity::Warning);
+            return;
+        };
+        let collapsed = !review.doc.is_collapsed(&file);
+        review.doc.set_collapsed(&file, collapsed);
+        review.note_splices();
+        let header = ItemKey::FileHeader(file);
+        if let Some(index) = review.doc.index_of(&header) {
+            review.set_cursor(index, AnchorPolicy::EnsureVisibleFrom(Edge::Top));
+        }
+        self.persist_presentation(true);
+    }
+
+    /// Copy the cursor file's path.
+    pub(super) fn copy_file_path(&mut self) {
+        let Some(path) = self
+            .review
+            .as_ref()
+            .and_then(super::Review::cursor_file)
+            .map(|file| file.path.clone())
+        else {
+            self.set_status("move into a file to copy its path", StatusSeverity::Warning);
+            return;
+        };
+        self.clipboard = Some((path, "path"));
+    }
+
+    fn start_scoped(&mut self, file: bool, mode: ComposerMode) {
         let Some(review) = self.review.as_ref() else {
             return;
         };
@@ -463,7 +505,7 @@ impl ReviewSurface {
         } else {
             DocAnchor::review()
         };
-        self.open_composer(anchor, ComposerMode::Comment, "");
+        self.open_composer(anchor, mode, "");
     }
 
     // ----------------------------------------------------------------------------------------

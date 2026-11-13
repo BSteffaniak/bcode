@@ -426,6 +426,9 @@ pub struct ReviewPresentationState {
     /// it is new.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub conversation_seen: BTreeMap<String, u64>,
+    /// Files shown collapsed to their header, by `source id`, a `\u{1}`, and the path.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub collapsed_files: BTreeSet<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -448,6 +451,7 @@ impl Default for ReviewPresentationState {
             hide_viewed_files: false,
             all_stack_layers: false,
             conversation_seen: BTreeMap::new(),
+            collapsed_files: BTreeSet::new(),
         }
     }
 }

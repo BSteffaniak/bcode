@@ -13,7 +13,7 @@ use bcode_session_models::SessionId;
 use bcode_worktree_models::{WorktreeBaseRef, WorktreeCreateRequest, WorktreeCreateResponse};
 use bmux_tui::prelude::{
     Color, Constraint, Direction, Event, Insets, Line, Modifier, Rect, Size, Span, Style, Terminal,
-    event_from_crossterm, split,
+    event_from_terminal, split,
 };
 use bmux_tui_components::key_hint_bar::{KeyHint, KeyHintBarComponent, KeyHintBarStyles};
 use bmux_tui_components::modal_frame::{
@@ -1144,7 +1144,7 @@ async fn should_show_world_picker() -> Result<bool, CliError> {
 }
 
 fn blims_terminal_area() -> Result<Rect, CliError> {
-    let (width, height) = crossterm::terminal::size()?;
+    let (width, height) = bmux_terminal::terminal::size()?;
     Ok(Rect::new(0, 0, width, height))
 }
 
@@ -1156,14 +1156,14 @@ struct BlimsTerminalGuard {
 impl BlimsTerminalGuard {
     fn enter() -> Result<Self, CliError> {
         let mut stdout = std::io::stdout();
-        crossterm::terminal::enable_raw_mode()?;
-        if let Err(error) = crossterm::execute!(
+        bmux_terminal::terminal::enable_raw_mode()?;
+        if let Err(error) = bmux_terminal::execute!(
             stdout,
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::terminal::DisableLineWrap,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            bmux_terminal::terminal::EnterAlternateScreen,
+            bmux_terminal::terminal::DisableLineWrap,
+            bmux_terminal::terminal::Clear(bmux_terminal::terminal::ClearType::All)
         ) {
-            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = bmux_terminal::terminal::disable_raw_mode();
             return Err(error.into());
         }
         Ok(Self {
@@ -1186,16 +1186,16 @@ impl BlimsTerminalGuard {
 
     fn leave_inner(&mut self) -> Result<(), CliError> {
         if let Some(stdout) = &mut self.stdout {
-            crossterm::execute!(
+            bmux_terminal::execute!(
                 stdout,
-                crossterm::style::ResetColor,
-                crossterm::cursor::Show,
-                crossterm::terminal::EnableLineWrap,
-                crossterm::terminal::LeaveAlternateScreen
+                bmux_terminal::style::ResetColor,
+                bmux_terminal::cursor::Show,
+                bmux_terminal::terminal::EnableLineWrap,
+                bmux_terminal::terminal::LeaveAlternateScreen
             )?;
             stdout.flush()?;
         }
-        crossterm::terminal::disable_raw_mode()?;
+        bmux_terminal::terminal::disable_raw_mode()?;
         Ok(())
     }
 }
@@ -1209,10 +1209,10 @@ impl Drop for BlimsTerminalGuard {
 }
 
 fn blims_poll_event(timeout: Duration) -> Result<Option<Event>, CliError> {
-    if !crossterm::event::poll(timeout)? {
+    if !bmux_terminal::event::poll(timeout)? {
         return Ok(None);
     }
-    Ok(event_from_crossterm(crossterm::event::read()?))
+    Ok(event_from_terminal(bmux_terminal::event::read()?))
 }
 
 #[derive(Debug, Default)]

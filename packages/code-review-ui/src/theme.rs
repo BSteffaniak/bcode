@@ -130,6 +130,12 @@ pub struct Icons {
     pub external: &'static str,
     /// Something new since last looked at.
     pub new: &'static str,
+    /// Cells a page's bottom edge is torn with (the page hangs into the row).
+    pub tear_bottom: [&'static str; 3],
+    /// Cells a page's top edge is torn with (the page rises into the row).
+    pub tear_top: [&'static str; 3],
+    /// A plain rule between files.
+    pub file_rule: &'static str,
     /// Name of the BMUX spinner preset of busy items (`braille` or `ascii`).
     pub spinner: &'static str,
 }
@@ -171,6 +177,9 @@ impl Icons {
         checks: "●",
         external: "↗",
         new: "•",
+        tear_bottom: ["▀", "▔", " "],
+        tear_top: ["▄", "▁", " "],
+        file_rule: "┄",
         spinner: "braille",
     };
 
@@ -210,6 +219,9 @@ impl Icons {
         checks: "*",
         external: "->",
         new: "*",
+        tear_bottom: ["~", "^", " "],
+        tear_top: ["~", "_", " "],
+        file_rule: "-",
         spinner: "ascii",
     };
 
@@ -309,8 +321,8 @@ pub struct ReviewTheme {
     pub hunk: Style,
     /// Hunk header row fill (it stays pinned below the file header).
     pub hunk_fill: Style,
-    /// File header row fill (it stays pinned at the top).
-    pub file_header: Style,
+    /// File headers, the breaks between files, and the pinned headers' edge.
+    pub files: FileStyles,
     /// Source and stack-layer header.
     pub source_header: Style,
     /// Gap row text.
@@ -532,7 +544,7 @@ impl ReviewTheme {
             gutter,
             hunk: diff.hunk,
             hunk_fill: tiers.canvas.patch(diff.hunk),
-            file_header: tiers.surface_alt,
+            files: FileStyles::of(&tiers),
             source_header: bold(tiers.accent),
             gap: tiers.dim,
             gap_action: bold(component.link),
@@ -625,7 +637,28 @@ impl ReviewTheme {
         Line::from_spans(vec![Span::styled(format!(" {status} "), self.muted)])
     }
 
-    /// Style of a file status.
+    /// Whether the theme has a desk color (torn pages need one).
+    #[must_use]
+    pub const fn has_desk(&self) -> bool {
+        self.files.desk.bg.is_some()
+    }
+
+    /// The status letter as a pill: the status color as fill.
+    #[must_use]
+    pub fn status_pill(&self, status: ReviewFileStatus) -> Style {
+        let style = self.status(status);
+        style.fg.map_or_else(
+            || style.add_modifier(Modifier::REVERSED),
+            |fill| {
+                Style::new()
+                    .bg(fill)
+                    .fg(on(fill, &self.tiers))
+                    .add_modifier(Modifier::BOLD)
+            },
+        )
+    }
+
+    /// Style of a status.
     #[must_use]
     pub const fn status(&self, status: ReviewFileStatus) -> Style {
         match status {
@@ -766,6 +799,73 @@ fn modified_status(tiers: &Tiers, taken: [Style; 3]) -> Style {
         tiers.strong
     } else {
         tiers.accent.add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Share of the accent mixed into the canvas for file headers.
+const FILE_HEADER_TINT: f64 = 0.16;
+/// Share of black mixed into a canvas for the desk between files.
+const DESK_SHADE: f64 = 0.38;
+/// Share of black mixed into a light canvas for the desk.
+const DESK_SHADE_LIGHT: f64 = 0.10;
+/// Share of the text color mixed into a canvas too dark to shade.
+const DESK_LIFT: f64 = 0.07;
+
+/// Styles of files' chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStyles {
+    /// File header row fill (it stays pinned at the top): the accent mixed into the canvas, so
+    /// it differs from the header and footer bars and from content.
+    pub header: Style,
+    /// The desk between files: what shows where a page is torn off. No fill when the theme
+    /// has no RGB canvas to derive one from (see [`ReviewTheme::has_desk`]).
+    pub desk: Style,
+    /// A page's torn edge drawn over the desk: the canvas color as foreground.
+    pub tear: Style,
+    /// The edge under the pinned headers.
+    pub pinned_edge: Style,
+}
+
+impl FileStyles {
+    fn of(tiers: &Tiers) -> Self {
+        Self {
+            header: file_header_fill(tiers),
+            desk: desk_fill(tiers),
+            tear: tear_style(tiers),
+            pinned_edge: Style::new().add_modifier(Modifier::UNDERLINE),
+        }
+    }
+}
+
+/// The file header fill: the accent mixed into the canvas, else the raised surface.
+fn file_header_fill(tiers: &Tiers) -> Style {
+    mixed(tiers.accent.fg, tiers.canvas.bg, FILE_HEADER_TINT)
+        .map_or(tiers.surface_alt, |bg| tiers.text.bg(bg))
+}
+
+/// The desk between files: the canvas shaded (or, when it is nearly black, lifted).
+fn desk_fill(tiers: &Tiers) -> Style {
+    let Some(Color::Rgb(r, g, b)) = tiers.canvas.bg else {
+        return Style::new();
+    };
+    let canvas = Rgb::new(r, g, b);
+    let black = Some(Color::Rgb(0, 0, 0));
+    let shade = if canvas.contrast_ratio(Rgb::BLACK) < 1.25 {
+        mixed(tiers.text.fg, tiers.canvas.bg, DESK_LIFT)
+    } else if canvas.contrast_ratio(Rgb::BLACK) > 10.0 {
+        mixed(black, tiers.canvas.bg, DESK_SHADE_LIGHT)
+    } else {
+        mixed(black, tiers.canvas.bg, DESK_SHADE)
+    };
+    shade.map_or_else(Style::new, |bg| Style::new().bg(bg))
+}
+
+/// A torn edge: the page (canvas) color drawn over the desk.
+fn tear_style(tiers: &Tiers) -> Style {
+    let desk = desk_fill(tiers);
+    match (tiers.canvas.bg, desk.bg) {
+        (Some(page), Some(_)) => desk.fg(page),
+        _ => tiers.dim,
     }
 }
 

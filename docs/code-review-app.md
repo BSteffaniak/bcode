@@ -479,6 +479,9 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | palette only | Go to a line of this file (type its number in the palette) |
 | palette only | Copy a Markdown review report |
 | palette only | Edit the review's sources… |
+| palette only | Ask Bcode about this file |
+| palette only | Collapse this file to its header (or expand it); `z` on a file's header |
+| palette only | Copy this file's path |
 | `ctrl+o` | Pull request: open or close its overview (reviews, checks, conversation) |
 | palette only | Pull request: approve… |
 | palette only | Pull request: request changes… |
@@ -561,6 +564,10 @@ bcode's own (`--print-config-paths` lists them in order):
   that stays until its `×` is clicked or the "Dismiss notifications" command runs. `"stop"` asks
   the provider to cut the stack at the limit, with a warning in the stack step. Invalid values
   are reported and the defaults are used.
+* `[plugins.config."bcode.code_review".review_v2]` `file_header` (`auto`, the default, by the
+  review pane's size; `compact`, `comfortable` or `spacious`), `file_separator` (`torn`, the
+  default; `rule`, `space` or `none`) and `file_page` (`auto`, `on` or `off`: whether torn files
+  read as pages over a desk color). See [`review-file-separation.md`](review-file-separation.md).
 * `[plugins.config."bcode.code_review".conversation]`: pull request conversations.
   `enabled` (default true); `replies` (`"send_now"`, the default, or `"with_review"`: where a
   reply to a pull request thread goes, the other way being a button); `overview` (`"auto"`, the

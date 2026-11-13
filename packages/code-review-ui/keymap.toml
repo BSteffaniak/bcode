@@ -189,7 +189,7 @@ keymap_actions = [
     { id = "bcode.code_review.activate", scope = "code-review", description = "Actions of the thread or AI answer (reveals a gap)", defaults = [
         "enter",
     ] },
-    { id = "bcode.code_review.fold", scope = "code-review", description = "Collapse or expand the thread (whole or preview AI answer)", defaults = [
+    { id = "bcode.code_review.fold", scope = "code-review", description = "Collapse or expand the thread, AI answer, or file (on its header)", defaults = [
         "z",
     ] },
     { id = "bcode.code_review.fold_all", scope = "code-review", description = "Collapse every thread (expand all when all are collapsed)", defaults = [
@@ -249,6 +249,12 @@ keymap_actions = [
     { id = "bcode.code_review.goto_line", scope = "code-review", description = "Go to a line of this file (type its number in the palette)", defaults = [
     ] },
     { id = "bcode.code_review.copy_report", scope = "code-review", description = "Copy a Markdown review report", defaults = [
+    ] },
+    { id = "bcode.code_review.ask_file", scope = "code-review", description = "Ask Bcode about this file", defaults = [
+    ] },
+    { id = "bcode.code_review.collapse_file", scope = "code-review", description = "Collapse this file to its header (or expand it)", defaults = [
+    ] },
+    { id = "bcode.code_review.copy_path", scope = "code-review", description = "Copy this file's path", defaults = [
     ] },
     { id = "bcode.code_review.pull_request", scope = "code-review", description = "Pull request: open or close its overview (reviews, checks, conversation)", defaults = [
         "ctrl+o",

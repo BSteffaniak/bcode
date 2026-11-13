@@ -27,7 +27,6 @@ use bcode_session_models::SessionId;
 use bcode_tui_theme::appearance::{AppearanceWatcher, VariantPreference};
 use bcode_tui_theme::components::ComponentStyles;
 use bmux_tui::capabilities::{TerminalCapabilities, TerminalColorDepth};
-use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::event::EventOutcome;
 use bmux_tui::focus::FocusTrap;
 use bmux_tui::geometry::Rect;
@@ -36,6 +35,7 @@ use bmux_tui::paint::PaintCx;
 #[cfg(unix)]
 use bmux_tui::terminal::TtyOutput;
 use bmux_tui::terminal::{ScrollRegionAcceleration, Terminal};
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui_runtime::{Program, RuntimeEvent, RuntimeHandle, Update};
 
 use crate::action::Action;
@@ -504,7 +504,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunError> {
 /// One terminal session; returns when the user quits or a session is opened.
 async fn session(app: App, target: &WakeTarget) -> Result<App, RunError> {
     let terminal_error = |error: std::io::Error| RunError::Terminal(error.to_string());
-    let guard = CrosstermTerminalGuard::enter(std::io::stdout()).map_err(terminal_error)?;
+    let guard = TerminalGuard::enter(std::io::stdout()).map_err(terminal_error)?;
     let size = terminal_size().map_err(terminal_error)?;
     let presenter = AppPresenter::new(Rect::new(0, 0, size.width, size.height), app.color_depth);
     app.wake_pending.store(false, Ordering::Release);

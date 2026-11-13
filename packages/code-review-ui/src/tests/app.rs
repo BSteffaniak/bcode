@@ -877,15 +877,23 @@ fn commits_that_are_not_a_chain_show_each_part_label_once() {
             revs: vec![first, last],
         }],
     );
-    let (scenario, screen) = open(
-        &fixture,
-        &backend,
-        Entry::Resume {
-            workspace_id: Some(workspace.id),
-        },
-        200,
-        50,
-    );
+    // Compact file headers, so both parts fit on one screen.
+    let config = ReviewViewConfig {
+        file_header: crate::config::view::FileHeaderDensity::Compact,
+        ..ReviewViewConfig::default()
+    };
+    let entry = Entry::Resume {
+        workspace_id: Some(workspace.id),
+    };
+    let app = ReviewApp::new(
+        backend.services(),
+        fixture.root().to_path_buf(),
+        config,
+        entry,
+    )
+    .with_scroll_motion(Duration::ZERO);
+    let mut scenario = Scenario::new(app, 200, 50);
+    let screen = settled(&mut scenario);
     let doc = scenario
         .surface()
         .review()

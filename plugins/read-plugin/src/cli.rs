@@ -67,7 +67,7 @@ fn run(cli: ReadCli) -> io::Result<()> {
     }
 
     let width = if stdout_is_terminal {
-        crossterm::terminal::size().map_or(80, |(width, _)| width.max(1))
+        bmux_terminal::terminal::size().map_or(80, |(width, _)| width.max(1))
     } else {
         80
     };

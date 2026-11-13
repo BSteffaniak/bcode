@@ -641,6 +641,8 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
                 layout_revision: 0,
                 paint_revision: 0,
                 annotation_revision: 0,
+                density: crate::rows::file::Density::Compact,
+                separation: crate::rows::file::Separation::Rule,
             };
             let cache = RefCell::new(RowCache::default());
             let notes = crate::notes::ReviewNotes::default();

@@ -99,6 +99,21 @@ impl ReviewSurface {
 
     /// Fold the cursor's thread, or show the whole (or the preview of the) cursor's AI answer.
     pub(super) fn fold(&mut self) {
+        // On a file's header, details, or end: the file folds to its header.
+        let on_file = self.review.as_ref().is_some_and(|review| {
+            matches!(
+                review.cursor,
+                Some(
+                    bcode_code_review::document::ItemKey::FileHeader(_)
+                        | bcode_code_review::document::ItemKey::FileDetails(_)
+                        | bcode_code_review::document::ItemKey::FileEnd(_)
+                )
+            )
+        });
+        if on_file {
+            self.toggle_file_collapsed();
+            return;
+        }
         match self.target() {
             Some(Target::Thread { thread_id, .. }) => {
                 let collapsed = !self.folds.collapsed.remove(&thread_id);

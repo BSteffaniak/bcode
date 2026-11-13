@@ -57,9 +57,9 @@ bcode_worktree_models = { workspace = true }
 bcode_xray = { workspace = true }
 bcode_xray_inspector = { workspace = true }
 bcode_xray_models = { workspace = true }
+bmux_terminal = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
-crossterm = { workspace = true, features = ["events"] }
 libc = { workspace = true }
 open = { workspace = true }
 rand = { workspace = true }

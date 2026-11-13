@@ -31,12 +31,12 @@ bcode_openai_compatible_provider_plugin = { workspace = true, features = [
 bcode_plugin.workspace = true
 bcode_recap.workspace = true
 bmux_image = { workspace = true, optional = true }
-bmux_keyboard = { workspace = true, optional = true, features = ["crossterm"] }
+bmux_keyboard = { workspace = true, optional = true }
 bmux_text_edit = { workspace = true, optional = true, features = [
     "keyboard",
     "serde",
 ] }
-bmux_tui = { workspace = true, optional = true, features = ["crossterm"] }
+bmux_tui = { workspace = true, optional = true, features = ["terminal-io"] }
 bmux_tui_components = { workspace = true, optional = true, features = [
     "action-row",
     "badge",
@@ -62,7 +62,7 @@ bmux_tui_components = { workspace = true, optional = true, features = [
     "virtual-list",
 ] }
 bmux_tui_runtime = { workspace = true, optional = true, features = [
-    "crossterm",
+    "terminal-io",
     "all-protocols",
 ] }
 clap = { workspace = true, features = [

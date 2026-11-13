@@ -64,8 +64,9 @@ bmux_color = { workspace = true }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
 bmux_keyboard = { workspace = true }
 bmux_mermaid_render = { workspace = true }
+bmux_terminal = { workspace = true }
 bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm"] }
+bmux_tui = { workspace = true, features = ["terminal-io"] }
 bmux_tui_components = { workspace = true, features = [
     "action-row",
     "button",
@@ -84,8 +85,8 @@ bmux_tui_components = { workspace = true, features = [
     "stepper",
     "text-input",
 ] }
-bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
-crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
+bmux_tui_runtime = { workspace = true, features = ["terminal-io"] }
+chrono = { workspace = true }
 image = { workspace = true }
 open = { workspace = true }
 png = { workspace = true }
@@ -96,7 +97,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 toml = { workspace = true }
-chrono = { workspace = true }
 tracing = { workspace = true }
 unicode-segmentation = { workspace = true }
 url = { workspace = true }

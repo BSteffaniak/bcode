@@ -36,7 +36,7 @@ impl AuthStatus {
     /// # Errors
     /// Returns terminal dimension or output errors.
     pub fn show(&mut self, title: &str, detail: &str) -> io::Result<()> {
-        let size = bmux_tui::crossterm::terminal_size()?;
+        let size = bmux_tui::terminal_io::terminal_size()?;
         let size = Size::new(
             size.width.saturating_sub(1),
             size.height.saturating_sub(1).min(10),
@@ -67,7 +67,7 @@ impl AuthStatus {
     /// Returns terminal input errors.
     pub fn cancelled(&mut self) -> io::Result<bool> {
         Ok(
-            matches!(bmux_tui::crossterm::poll_event(std::time::Duration::ZERO)?,
+            matches!(bmux_tui::terminal_io::poll_event(std::time::Duration::ZERO)?,
             Some(Event::Key(key)) if key.modifiers.ctrl && matches!(key.key, KeyCode::Char('c' | 'd'))),
         )
     }

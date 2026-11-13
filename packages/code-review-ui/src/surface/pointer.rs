@@ -216,6 +216,18 @@ impl ReviewSurface {
                 self.composer_button(button);
                 None
             }
+            ItemAction::File(action) => {
+                // On the file's header, so file actions apply to it.
+                if let Some(file) = click.key.file().cloned() {
+                    let header = ItemKey::FileHeader(file);
+                    if let Some(index) = review.doc.index_of(&header) {
+                        review.cursor_index = index;
+                        review.cursor = Some(header);
+                    }
+                }
+                self.file_ui.actions.push(action.action());
+                None
+            }
             ItemAction::Comment => {
                 let anchor = review.doc.anchor_for(&click.key)?;
                 review.selection = None;

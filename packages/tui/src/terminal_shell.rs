@@ -4,13 +4,13 @@ use std::future::Future;
 use std::io::{self, Stdout};
 
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::crossterm::CrosstermTerminalGuard;
 use bmux_tui::damage::Damage;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::LocalRect;
 use bmux_tui::prelude::{Style, TextBlock, TextWrap};
 use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal_io::TerminalGuard;
 
 use crate::{TuiError, TuiLaunchOptions};
 
@@ -30,7 +30,7 @@ pub enum TerminalRecoveryAction {
 /// Screens borrow its writer sequentially and await input shutdown before returning.
 /// Dropping the shell restores the terminal, including on errors.
 pub struct TerminalShell {
-    guard: Option<CrosstermTerminalGuard<Stdout>>,
+    guard: Option<TerminalGuard<Stdout>>,
     stop_requested: bool,
     // Retain a failed wait's presentation/cleanup independently from its operation result.
     // No fresh terminal may replace uncertain output authority.
@@ -42,7 +42,7 @@ pub struct TerminalShell {
 // auth channel but must not leave a surviving shell without terminal ownership.
 #[cfg(unix)]
 struct YieldedTerminal<'a> {
-    slot: &'a mut Option<CrosstermTerminalGuard<Stdout>>,
+    slot: &'a mut Option<TerminalGuard<Stdout>>,
     writer: Option<Stdout>,
 }
 
@@ -50,7 +50,7 @@ struct YieldedTerminal<'a> {
 impl YieldedTerminal<'_> {
     fn restore(&mut self) -> io::Result<()> {
         if let Some(writer) = self.writer.take() {
-            *self.slot = Some(CrosstermTerminalGuard::enter(writer)?);
+            *self.slot = Some(TerminalGuard::enter(writer)?);
         }
         Ok(())
     }
@@ -92,7 +92,7 @@ impl TerminalShell {
     /// Returns terminal setup errors.
     pub fn enter() -> Result<Self, TuiError> {
         Ok(Self {
-            guard: Some(CrosstermTerminalGuard::enter(io::stdout())?),
+            guard: Some(TerminalGuard::enter(io::stdout())?),
             stop_requested: false,
             screen_error: None,
             handoff_blocked: false,

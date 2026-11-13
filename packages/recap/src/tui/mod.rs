@@ -15,11 +15,11 @@ use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::{
     component::{Constraints, EventCx, LayoutCx, LayoutNode},
-    crossterm::{CrosstermTerminalGuard, terminal_size},
     event::Event,
     geometry::{Rect, Size},
     interaction::InteractionRouter,
     terminal::Terminal,
+    terminal_io::{TerminalGuard, terminal_size},
 };
 use bmux_tui_components::{
     button::ButtonState,
@@ -992,7 +992,7 @@ fn presenter(
 /// # Errors
 /// Returns terminal setup, input, runtime or restoration errors.
 pub async fn run(options: TuiOptions) -> Result<(), String> {
-    let guard = CrosstermTerminalGuard::enter(std::io::stdout()).map_err(|e| e.to_string())?;
+    let guard = TerminalGuard::enter(std::io::stdout()).map_err(|e| e.to_string())?;
     let size = terminal_size().map_err(|e| e.to_string())?;
     let mut app = App::new(options);
     let capabilities = bmux_image::host_caps::detect_from_env();

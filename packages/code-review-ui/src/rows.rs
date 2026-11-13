@@ -12,13 +12,13 @@
 //!   bytes or characters.
 
 use super::syntax::SyntaxStore;
-use super::theme::{ReviewTheme, status_letter};
+use super::theme::ReviewTheme;
 use bcode_code_review::document::{
-    FileHeaderItem, FileNoticeItem, FileNoticeKind, GapItem, GapState, HunkHeaderItem, ItemKey,
-    LayoutMode, LineContent, LineItem, LineKind, LinePairItem, PairSide, PlaceholderItem,
-    ReviewDocument, ReviewItem, SourceHeaderItem, StackLayerLabel,
+    FileNoticeItem, FileNoticeKind, GapItem, GapState, HunkHeaderItem, ItemKey, LayoutMode,
+    LineContent, LineItem, LineKind, LinePairItem, PairSide, PlaceholderItem, ReviewDocument,
+    ReviewItem, SourceHeaderItem, StackLayerLabel,
 };
-use bcode_code_review_models::{ReviewIndexFlag, ReviewLineSide};
+use bcode_code_review_models::ReviewLineSide;
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
 };
@@ -76,6 +76,16 @@ impl fmt::Display for RowKey {
                 f.write_char(SEP)?;
                 file(f, key)
             }
+            ItemKey::FileDetails(key) => {
+                f.write_str("fd")?;
+                f.write_char(SEP)?;
+                file(f, key)
+            }
+            ItemKey::FileEnd(key) => {
+                f.write_str("fe")?;
+                f.write_char(SEP)?;
+                file(f, key)
+            }
             ItemKey::FileNotice { file: key, kind } => {
                 write!(f, "fn{SEP}{kind:?}{SEP}")?;
                 file(f, key)
@@ -123,6 +133,7 @@ impl fmt::Display for RowKey {
 use std::fmt::Write as _;
 
 mod agent;
+pub mod file;
 
 pub use agent::{dock_key, dock_rows, exchange_turn, is_newest, item_id, open_key};
 
@@ -145,6 +156,10 @@ pub struct ViewParams {
     pub paint_revision: u64,
     /// Changes whenever annotation content (threads, AI answers) changes.
     pub annotation_revision: u64,
+    /// How much of each file's chrome shows.
+    pub density: file::Density,
+    /// How files are separated.
+    pub separation: file::Separation,
 }
 
 /// What a gap segment does when clicked.
@@ -249,6 +264,8 @@ pub enum ItemAction {
     Composer(super::composer::ComposerButton),
     /// The gutter's comment affordance on a hovered line.
     Comment,
+    /// A button of a file's chrome.
+    File(file::FileAction),
 }
 
 /// Clickable cells on one row of an item.
@@ -314,13 +331,19 @@ pub struct ItemFlags {
     pub selected: bool,
     /// Under the pointer (shows the gutter comment affordance on diff rows).
     pub hovered: bool,
+    /// The deepest pinned section header: an edge under it sets the pinned headers apart from
+    /// the content scrolling under them.
+    pub pinned_edge: bool,
 }
 
 impl ItemFlags {
     /// Bits for paint revisions.
     #[must_use]
     pub const fn bits(self) -> u64 {
-        (self.cursor as u64) | ((self.selected as u64) << 1) | ((self.hovered as u64) << 2)
+        (self.cursor as u64)
+            | ((self.selected as u64) << 1)
+            | ((self.hovered as u64) << 2)
+            | ((self.pinned_edge as u64) << 3)
     }
 }
 
@@ -429,6 +452,17 @@ enum ContentStamp {
     Lines([Option<(TextState, Option<u64>)>; 2]),
     /// A gap: its last hidden line, whether it is open-ended, and its hidden threads.
     Gap(Option<u32>, bool, usize),
+    /// A file's header or details: what changes them without a new key.
+    File {
+        /// Viewed, collapsed, carried over, loaded.
+        flags: u8,
+        /// Threads in the file.
+        threads: usize,
+        /// Lines and hunks, when known.
+        counts: (Option<u32>, Option<u32>),
+        /// Layers that change the file.
+        layers: usize,
+    },
 }
 
 impl ContentStamp {
@@ -446,6 +480,20 @@ impl ContentStamp {
                 gap.state == GapState::OpenEnded,
                 gap.hidden_threads,
             ),
+            ReviewItem::FileHeader(header) => Self::File {
+                flags: u8::from(header.viewed)
+                    | u8::from(header.collapsed) << 1
+                    | u8::from(header.carried_over) << 2,
+                threads: header.thread_count,
+                counts: (None, None),
+                layers: header.layers.len(),
+            },
+            ReviewItem::FileDetails(details) => Self::File {
+                flags: u8::from(details.viewed) | u8::from(details.collapsed) << 1,
+                threads: details.thread_count,
+                counts: (details.line_count, details.hunks),
+                layers: details.layers.len(),
+            },
             _ => Self::Fixed,
         }
     }
@@ -606,7 +654,9 @@ impl RowContext<'_> {
                 self.options(),
             ) as u64,
             ReviewItem::Placeholder(placeholder) => u64::from(placeholder.estimated_rows.max(1)),
-            ReviewItem::Thread(_) | ReviewItem::AgentThread(_) => self.rows(index, width).height,
+            ReviewItem::Thread(_) | ReviewItem::AgentThread(_) | ReviewItem::FileDetails(_) => {
+                self.rows(index, width).height
+            }
             ReviewItem::Composer(_) => self.composer_layout(width)?.height,
             ReviewItem::SourceHeader(header)
                 if header
@@ -616,6 +666,8 @@ impl RowContext<'_> {
             {
                 LAYER_BANNER_ROWS
             }
+            ReviewItem::FileHeader(_) => self.params.density.header_rows(),
+            ReviewItem::FileEnd(_) => self.params.density.end_rows(),
             _ => 1,
         };
         Some(height)
@@ -638,7 +690,19 @@ impl RowContext<'_> {
                 }
                 _ => ItemRows::single(source_header(item, styles, cells)),
             },
-            ReviewItem::FileHeader(item) => ItemRows::single(file_header(item, styles, cells)),
+            ReviewItem::FileHeader(item) => {
+                file::header_rows(item, self.params.density, styles, cells)
+            }
+            ReviewItem::FileDetails(item) => {
+                file::details_rows(item, self.params.density, styles, cells)
+            }
+            ReviewItem::FileEnd(file) => file::end_rows(
+                file,
+                self.params.separation,
+                self.params.density,
+                styles,
+                cells,
+            ),
             ReviewItem::Placeholder(item) => placeholder(item, styles, cells),
             ReviewItem::FileNotice(item) => ItemRows::single(file_notice(item, styles, cells)),
             ReviewItem::HunkHeader(item) => {
@@ -1015,79 +1079,6 @@ pub fn change_bar(additions: u64, deletions: u64, theme: &ReviewTheme) -> Vec<Sp
         ));
     }
     spans
-}
-
-fn file_header(item: &FileHeaderItem, theme: &ReviewTheme, width: usize) -> Line {
-    let icons = &theme.icons;
-    let mut content = vec![
-        Span::styled(icons.accent_bar, theme.accent),
-        Span::styled(status_letter(item.status), theme.status(item.status)),
-        Span::raw(" "),
-    ];
-    if let Some(old) = &item.old_path {
-        content.push(Span::styled(old.clone(), theme.muted));
-        content.push(Span::styled(icons.rename, theme.muted));
-    }
-    content.push(Span::styled(
-        item.file.path.clone(),
-        if item.viewed || item.carried_over {
-            theme.path_viewed
-        } else {
-            theme.path
-        },
-    ));
-    let mut trailing = Vec::new();
-    if item.carried_over {
-        trailing.push(Span::styled(
-            "unchanged since last review",
-            theme.badge_outdated,
-        ));
-        trailing.push(Span::raw(" "));
-    }
-    for (flag, label, style) in [
-        (ReviewIndexFlag::Binary, "binary", theme.status_binary),
-        (ReviewIndexFlag::ModeChanged, "mode", theme.muted),
-        (ReviewIndexFlag::Symlink, "symlink", theme.muted),
-        (ReviewIndexFlag::Submodule, "submodule", theme.muted),
-    ] {
-        if item.flags.contains(&flag) {
-            trailing.push(Span::styled(label, style));
-            trailing.push(Span::raw(" "));
-        }
-    }
-    if !item.layers.is_empty() {
-        let layers: Vec<String> = item
-            .layers
-            .iter()
-            .map(|layer| format!("#{layer}"))
-            .collect();
-        trailing.push(Span::styled(layers.join(" "), theme.badge_open));
-        trailing.push(Span::raw(" "));
-    }
-    if item.thread_count > 0 {
-        trailing.push(Span::styled(
-            format!("{}{}", icons.thread, item.thread_count),
-            theme.badge_open,
-        ));
-        trailing.push(Span::raw(" "));
-    }
-    let (additions, deletions) = (u64::from(item.additions), u64::from(item.deletions));
-    trailing.extend(count_spans(additions, deletions, theme));
-    trailing.push(Span::raw(" "));
-    trailing.extend(change_bar(additions, deletions, theme));
-    trailing.push(Span::raw(" "));
-    trailing.push(if item.viewed {
-        Span::styled(icons.viewed, theme.viewed)
-    } else {
-        Span::styled(icons.unviewed, theme.muted)
-    });
-    trailing.push(Span::raw(" "));
-    header_line(
-        &Line::from_spans(content),
-        &Line::from_spans(trailing),
-        width,
-        theme.file_header,
-    )
 }
 
 fn source_header(item: &SourceHeaderItem, theme: &ReviewTheme, width: usize) -> Line {
@@ -2283,6 +2274,13 @@ impl Component for ItemView<'_> {
         }
         if self.flags.cursor {
             cx.restyle(LocalRect::new(0, 0, width, height), theme.cursor);
+        }
+        if self.flags.pinned_edge {
+            // The bottom row of the pinned stack is underlined: content scrolls under the line.
+            cx.restyle(
+                LocalRect::new(0, i64::from(height - 1), width, 1),
+                theme.files.pinned_edge,
+            );
         }
         self.paint_matches(&rows, width, cx);
         self.register_selection(&rows, height, cx);

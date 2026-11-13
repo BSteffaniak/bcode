@@ -162,7 +162,12 @@ fn terminal(name: &str) -> bool {
     name.starts_with("bmux_tui")
         || matches!(
             name,
-            "bcode_tui" | "bcode_tui_components" | "ratatui" | "crossterm" | "termion"
+            "bcode_tui"
+                | "bcode_tui_components"
+                | "bmux_terminal"
+                | "ratatui"
+                | "crossterm"
+                | "termion"
         )
 }
 
@@ -352,6 +357,7 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
             "bmux_keyboard",
             "bmux_text_edit",
             "bmux_image",
+            "bmux_terminal",
             "crossterm",
         ],
     ),
@@ -444,6 +450,7 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
             "bmux_tui",
             "bmux_tui_components",
             "bmux_tui_runtime",
+            "bmux_terminal",
             "crossterm",
             "bcode_client",
             "bcode_plugin",

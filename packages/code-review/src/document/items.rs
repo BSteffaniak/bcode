@@ -144,6 +144,39 @@ pub struct FileHeaderItem {
     /// Whether the file's patch is unchanged since the last review pass (a re-review after a
     /// rebase): shown de-emphasized.
     pub carried_over: bool,
+    /// Position of the file in its group (1-based).
+    pub position: u32,
+    /// Files in its group.
+    pub count: u32,
+    /// The file's content is collapsed (only its header shows).
+    pub collapsed: bool,
+}
+
+/// The facts and actions under a file's header (see [`super::FileChrome::details`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDetailsItem {
+    /// File.
+    pub file: FileRef,
+    /// File status.
+    pub status: ReviewFileStatus,
+    /// Old path for renames and copies.
+    pub old_path: Option<String>,
+    /// Index flags.
+    pub flags: BTreeSet<ReviewIndexFlag>,
+    /// Stack layers that wrote or removed lines of this file (whole-stack reviews).
+    pub layers: Vec<LayerNumber>,
+    /// Threads anchored in this file.
+    pub thread_count: usize,
+    /// Lines of the file's new side, when known.
+    pub line_count: Option<u32>,
+    /// Hunks of the file's diff, once its content is resident.
+    pub hunks: Option<u32>,
+    /// Whether the file shows as viewed.
+    pub viewed: bool,
+    /// The file's content is collapsed.
+    pub collapsed: bool,
+    /// The file belongs to a stack source.
+    pub in_stack: bool,
 }
 
 /// Estimated-height stand-in for a file whose content is not resident.
@@ -395,6 +428,10 @@ pub enum ReviewItem {
     SourceHeader(SourceHeaderItem),
     /// File header.
     FileHeader(FileHeaderItem),
+    /// Facts and actions under a file header.
+    FileDetails(FileDetailsItem),
+    /// The end of a file: the break before the next one.
+    FileEnd(FileRef),
     /// Placeholder for non-resident content.
     Placeholder(PlaceholderItem),
     /// File notice.
@@ -425,6 +462,8 @@ impl ReviewItem {
                 part: item.part,
             },
             Self::FileHeader(item) => ItemKey::FileHeader(item.file.clone()),
+            Self::FileDetails(item) => ItemKey::FileDetails(item.file.clone()),
+            Self::FileEnd(file) => ItemKey::FileEnd(file.clone()),
             Self::Placeholder(item) => ItemKey::Placeholder(item.file.clone()),
             Self::FileNotice(item) => ItemKey::FileNotice {
                 file: item.file.clone(),
@@ -467,6 +506,8 @@ impl ReviewItem {
     pub const fn file(&self) -> Option<&FileRef> {
         match self {
             Self::FileHeader(FileHeaderItem { file, .. })
+            | Self::FileDetails(FileDetailsItem { file, .. })
+            | Self::FileEnd(file)
             | Self::Placeholder(PlaceholderItem { file, .. })
             | Self::FileNotice(FileNoticeItem { file, .. })
             | Self::HunkHeader(HunkHeaderItem { file, .. })

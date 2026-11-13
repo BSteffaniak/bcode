@@ -588,6 +588,8 @@ pub struct ReviewSurface {
     layout_override: Option<LayoutMode>,
     overflow: DiffRowOverflow,
     layout_revision: u64,
+    /// Files' chrome: how much shows, and buttons clicked.
+    file_ui: FileUi,
     paint_revision: u64,
     syntax: SyntaxStore,
     queue: VecDeque<DocumentNeed>,
@@ -729,10 +731,6 @@ impl ReviewSurface {
         config: ReviewViewConfig,
     ) -> Self {
         let icons = config.icons.unwrap_or_default();
-        let mut filter_policy = TextInputPolicy::chat_composer();
-        filter_policy.keyboard.shift_enter = None;
-        filter_policy.viewport.max_rows = Some(1);
-        filter_policy.edge = EdgePolicy::disabled();
         Self {
             services,
             repo_path,
@@ -753,6 +751,7 @@ impl ReviewSurface {
             layout_override: None,
             overflow: DiffRowOverflow::Wrap,
             layout_revision: 0,
+            file_ui: FileUi::default(),
             paint_revision: 0,
             syntax: SyntaxStore::default(),
             queue: VecDeque::new(),
@@ -773,7 +772,7 @@ impl ReviewSurface {
             tree_reveal: true,
             synced_file: None,
             filter: RefCell::new(TextInputState::new(bmux_text_edit::TextEditBuffer::new())),
-            filter_policy,
+            filter_policy: filter_policy(),
             toasts: Toasts::default(),
             publish: SplitButtonState::new(),
             header: None,
@@ -1149,7 +1148,80 @@ impl ReviewSurface {
             paint_revision: self.paint_revision,
             annotation_revision: self.notes.revision().wrapping_mul(1_000_003)
                 ^ self.folds.revision.wrapping_mul(0x5851_f42d),
+            density: self.file_ui.density,
+            separation: self.separation(),
         }
+    }
+
+    /// How files are separated, from the configuration and the theme.
+    const fn separation(&self) -> super::rows::file::Separation {
+        use super::config::view::{FilePage, FileSeparator};
+        use super::rows::file::Separation;
+        match self.config.file_separator {
+            FileSeparator::Torn => match self.config.file_page {
+                FilePage::Off => Separation::Torn { desk: false },
+                FilePage::Auto | FilePage::On if self.theme.has_desk() => {
+                    Separation::Torn { desk: true }
+                }
+                // A theme without a desk color cannot tear a page over it.
+                FilePage::Auto | FilePage::On => Separation::Rule,
+            },
+            FileSeparator::Rule | FileSeparator::None => Separation::Rule,
+            FileSeparator::Space => Separation::Space,
+        }
+    }
+
+    /// Which items files have and how much they show, for a review list of `size`. Returns
+    /// whether row geometry changed.
+    fn sync_file_chrome(&mut self, size: Size) -> bool {
+        use super::config::view::{FileHeaderDensity, FileSeparator};
+        use super::rows::file::Density;
+        let density = match self.config.file_header {
+            FileHeaderDensity::Auto => {
+                Density::for_size(size.width, size.height, self.file_ui.density)
+            }
+            FileHeaderDensity::Compact => Density::Compact,
+            FileHeaderDensity::Comfortable => Density::Comfortable,
+            FileHeaderDensity::Spacious => Density::Spacious,
+        };
+        let chrome = bcode_code_review::document::FileChrome {
+            details: density != Density::Compact,
+            ends: self.config.file_separator != FileSeparator::None,
+        };
+        let changed = density != self.file_ui.density;
+        self.file_ui.density = density;
+        if let Some(review) = self.review.as_mut()
+            && review.doc.file_chrome() != chrome
+        {
+            let top = review
+                .list
+                .borrow()
+                .position()
+                .anchor()
+                .map(|anchor| anchor.key.0.clone());
+            review.doc.set_file_chrome(chrome);
+            review.note_splices();
+            // Details and ends come and go; the top stays on its file.
+            if let Some(key) = top.map(|key| match key {
+                ItemKey::FileDetails(file) | ItemKey::FileEnd(file) => ItemKey::FileHeader(file),
+                key => key,
+            }) && review.doc.index_of(&key).is_some()
+            {
+                review
+                    .list
+                    .borrow_mut()
+                    .set_position(ListPosition::Anchored(ListAnchor::row(RowKey(key), 0)));
+            }
+            if let Some(cursor) = review.cursor.clone()
+                && review.doc.index_of(&cursor).is_none()
+                && let Some(file) = cursor.file()
+            {
+                review.cursor = Some(ItemKey::FileHeader(file.clone()));
+                review.fix_cursor();
+            }
+            return true;
+        }
+        changed
     }
 
     fn policy(&self) -> DiffLayout {
@@ -2367,6 +2439,18 @@ impl ReviewSurface {
                 self.start_scoped_comment(action == "file_comment");
                 Action::Redraw
             }
+            "ask_file" => {
+                self.ask_about_file();
+                Action::Redraw
+            }
+            "collapse_file" => {
+                self.toggle_file_collapsed();
+                Action::Redraw
+            }
+            "copy_path" => {
+                self.copy_file_path();
+                Action::Redraw
+            }
             "edit" | "delete" | "resolve" => {
                 let on_agent = self.review.as_ref().is_some_and(|review| {
                     matches!(review.cursor, Some(ItemKey::AgentThread { .. }))
@@ -3080,6 +3164,9 @@ impl ReviewSurface {
             redraw |= self.scroll_tree(rows, viewport.height);
         }
         let (clicked, host_action) = self.after_list_event(*mouse, in_list);
+        for action in std::mem::take(&mut self.file_ui.actions) {
+            let _ = self.run_action(action, None, host);
+        }
         redraw |= clicked;
         if let Some(action) = host_action {
             return action;
@@ -3844,6 +3931,9 @@ impl ReviewSurface {
             self.layout_revision += 1;
         }
         review.note_splices();
+        if self.sync_file_chrome(size) {
+            self.layout_revision += 1;
+        }
         let review = self.review.as_ref()?;
         let params = self.params(review);
         let height = u64::from(size.height);
@@ -4903,4 +4993,22 @@ const fn wheel_rows(kind: MouseEventKind) -> i64 {
         MouseEventKind::ScrollUp => -3,
         _ => 0,
     }
+}
+
+/// Files' chrome on the review screen.
+#[derive(Debug, Default)]
+struct FileUi {
+    /// How much of each file's chrome shows (by the list's size, unless configured).
+    density: super::rows::file::Density,
+    /// File buttons clicked, to run once the host is at hand.
+    actions: Vec<&'static str>,
+}
+
+/// Editing policy of the file filter: one row, enter submits.
+const fn filter_policy() -> TextInputPolicy {
+    let mut policy = TextInputPolicy::chat_composer();
+    policy.keyboard.shift_enter = None;
+    policy.viewport.max_rows = Some(1);
+    policy.edge = EdgePolicy::disabled();
+    policy
 }

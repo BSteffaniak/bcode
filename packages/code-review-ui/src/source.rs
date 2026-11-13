@@ -8,7 +8,7 @@
 use super::rows::{Interaction, ItemFlags, ItemView, RowContext, RowKey};
 use bcode_code_review::document::{ItemKey, ReviewItem};
 use bmux_tui::component::{Element, LayoutId};
-use bmux_tui_components::virtual_list::VirtualItemSource;
+use bmux_tui_components::virtual_list::{PinnedPlacement, VirtualItemSource};
 
 /// Node id of every row component.
 const ROW_ID: &str = "review.row";
@@ -57,6 +57,7 @@ impl<'a> DocumentSource<'a> {
                 .selected
                 .is_some_and(|(first, last)| (first..=last).contains(&index)),
             hovered: self.decor.hovered == Some(key),
+            pinned_edge: false,
         }
     }
 }
@@ -142,6 +143,24 @@ impl VirtualItemSource<RowKey> for DocumentSource<'_> {
     ) -> Option<u64> {
         self.context
             .height(index, u16::try_from(width).unwrap_or(u16::MAX))
+    }
+
+    fn build_pinned(&self, index: usize, placement: PinnedPlacement) -> Element<'_> {
+        let key = self
+            .context
+            .doc
+            .item(index)
+            .map_or(ItemKey::Composer, ReviewItem::key);
+        let mut flags = self.flags(index, &key);
+        flags.pinned_edge = placement.deepest;
+        Element::new(ItemView::new(
+            LayoutId::new(ROW_ID),
+            key,
+            index,
+            self.context,
+            self.interaction,
+            flags,
+        ))
     }
 
     fn section_header_level(&self, index: usize) -> Option<u16> {

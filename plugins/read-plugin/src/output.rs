@@ -1,11 +1,11 @@
 use std::io::{self, Write};
 
-use bmux_tui::prelude::{Color, Line, Modifier, Style};
-use crossterm::QueueableCommand as _;
-use crossterm::style::{
-    Attribute, Color as CrosstermColor, ResetColor, SetAttribute, SetBackgroundColor,
+use bmux_terminal::QueueableCommand as _;
+use bmux_terminal::style::{
+    Attribute, Color as TerminalColor, ResetColor, SetAttribute, SetBackgroundColor,
     SetForegroundColor,
 };
+use bmux_tui::prelude::{Color, Line, Modifier, Style};
 
 pub(crate) fn write_lines(writer: &mut impl Write, lines: &[Line], styled: bool) -> io::Result<()> {
     let result = if styled {
@@ -50,10 +50,10 @@ fn write_styled_lines(writer: &mut impl Write, lines: &[Line]) -> io::Result<()>
 fn queue_style(writer: &mut impl Write, style: Style) -> io::Result<()> {
     queue_reset(writer)?;
     if let Some(foreground) = style.fg {
-        writer.queue(SetForegroundColor(to_crossterm_color(foreground)))?;
+        writer.queue(SetForegroundColor(to_terminal_color(foreground)))?;
     }
     if let Some(background) = style.bg {
-        writer.queue(SetBackgroundColor(to_crossterm_color(background)))?;
+        writer.queue(SetBackgroundColor(to_terminal_color(background)))?;
     }
     for (modifier, attribute) in [
         (Modifier::BOLD, Attribute::Bold),
@@ -78,27 +78,27 @@ fn queue_reset(writer: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-const fn to_crossterm_color(color: Color) -> CrosstermColor {
+const fn to_terminal_color(color: Color) -> TerminalColor {
     match color {
-        Color::Default => CrosstermColor::Reset,
-        Color::Black => CrosstermColor::Black,
-        Color::Red => CrosstermColor::DarkRed,
-        Color::Green => CrosstermColor::DarkGreen,
-        Color::Yellow => CrosstermColor::DarkYellow,
-        Color::Blue => CrosstermColor::DarkBlue,
-        Color::Magenta => CrosstermColor::DarkMagenta,
-        Color::Cyan => CrosstermColor::DarkCyan,
-        Color::White => CrosstermColor::Grey,
-        Color::BrightBlack => CrosstermColor::DarkGrey,
-        Color::BrightRed => CrosstermColor::Red,
-        Color::BrightGreen => CrosstermColor::Green,
-        Color::BrightYellow => CrosstermColor::Yellow,
-        Color::BrightBlue => CrosstermColor::Blue,
-        Color::BrightMagenta => CrosstermColor::Magenta,
-        Color::BrightCyan => CrosstermColor::Cyan,
-        Color::BrightWhite => CrosstermColor::White,
-        Color::Indexed(index) => CrosstermColor::AnsiValue(index),
-        Color::Rgb(red, green, blue) => CrosstermColor::Rgb {
+        Color::Default => TerminalColor::Reset,
+        Color::Black => TerminalColor::Black,
+        Color::Red => TerminalColor::DarkRed,
+        Color::Green => TerminalColor::DarkGreen,
+        Color::Yellow => TerminalColor::DarkYellow,
+        Color::Blue => TerminalColor::DarkBlue,
+        Color::Magenta => TerminalColor::DarkMagenta,
+        Color::Cyan => TerminalColor::DarkCyan,
+        Color::White => TerminalColor::Grey,
+        Color::BrightBlack => TerminalColor::DarkGrey,
+        Color::BrightRed => TerminalColor::Red,
+        Color::BrightGreen => TerminalColor::Green,
+        Color::BrightYellow => TerminalColor::Yellow,
+        Color::BrightBlue => TerminalColor::Blue,
+        Color::BrightMagenta => TerminalColor::Magenta,
+        Color::BrightCyan => TerminalColor::Cyan,
+        Color::BrightWhite => TerminalColor::White,
+        Color::Indexed(index) => TerminalColor::AnsiValue(index),
+        Color::Rgb(red, green, blue) => TerminalColor::Rgb {
             r: red,
             g: green,
             b: blue,

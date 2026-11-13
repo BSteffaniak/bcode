@@ -8,6 +8,7 @@ mod benchmark;
 mod chrome;
 mod conversation;
 mod feed;
+mod files;
 mod interaction;
 mod parity;
 mod publish;

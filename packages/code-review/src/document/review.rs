@@ -304,6 +304,8 @@ pub(super) struct FileState {
     pub resident_bytes: usize,
     /// Patch unchanged since the last review pass.
     pub carried_over: bool,
+    /// Only the file's header shows.
+    pub collapsed: bool,
 }
 
 impl FileState {
@@ -527,12 +529,22 @@ pub(super) enum Pending {
 /// Path persisted for review-level anchors (the spelling stored reviews use).
 pub const REVIEW_LEVEL_PATH: &str = "<review>";
 
+/// Which items besides its header and content each file has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileChrome {
+    /// A [`super::FileDetailsItem`] under the header.
+    pub details: bool,
+    /// A [`super::ReviewItem::FileEnd`] after the content: the break before the next file.
+    pub ends: bool,
+}
+
 /// The renderer-neutral review document.
 #[derive(Debug, Clone)]
 pub struct ReviewDocument {
     pub(super) repo_path: PathBuf,
     pub(super) config: DocumentConfig,
     pub(super) layout: LayoutMode,
+    pub(super) chrome: FileChrome,
     pub(super) ignore_whitespace: bool,
     pub(super) groups: Vec<Group>,
     pub(super) files: Vec<FileState>,
@@ -594,6 +606,7 @@ impl ReviewDocument {
             repo_path,
             config,
             layout: LayoutMode::Unified,
+            chrome: FileChrome::default(),
             ignore_whitespace: false,
             groups: Vec::new(),
             files: Vec::new(),
@@ -674,6 +687,7 @@ impl ReviewDocument {
                 last_used: 0,
                 resident_bytes: 0,
                 carried_over: false,
+                collapsed: false,
             });
             self.blocks.push(Block::new(BlockKind::File(index)));
             self.file_annotations.push(Vec::new());
@@ -802,6 +816,55 @@ impl ReviewDocument {
         for file in 0..self.files.len() {
             self.rebuild_file(file);
         }
+    }
+
+    /// Which items besides its header and content each file has.
+    #[must_use]
+    pub const fn file_chrome(&self) -> FileChrome {
+        self.chrome
+    }
+
+    /// Change which items besides its header and content each file has. Every file is rebuilt;
+    /// keys of headers, lines, and threads are unchanged.
+    pub fn set_file_chrome(&mut self, chrome: FileChrome) {
+        if self.chrome == chrome {
+            return;
+        }
+        self.chrome = chrome;
+        for file in 0..self.files.len() {
+            self.rebuild_file(file);
+        }
+    }
+
+    /// Files shown only as their header.
+    #[must_use]
+    pub fn collapsed_files(&self) -> Vec<FileRef> {
+        self.files
+            .iter()
+            .filter(|state| state.collapsed)
+            .map(|state| state.key.clone())
+            .collect()
+    }
+
+    /// Whether `file` shows only its header.
+    #[must_use]
+    pub fn is_collapsed(&self, file: &FileKey) -> bool {
+        self.file_index
+            .get(file)
+            .is_some_and(|index| self.files[*index].collapsed)
+    }
+
+    /// Show only `file`'s header (or its content again). Returns whether it changed.
+    pub fn set_collapsed(&mut self, file: &FileKey, collapsed: bool) -> bool {
+        let Some(&index) = self.file_index.get(file) else {
+            return false;
+        };
+        if self.files[index].collapsed == collapsed {
+            return false;
+        }
+        self.files[index].collapsed = collapsed;
+        self.rebuild_file(index);
+        true
     }
 
     /// Whether hunks are requested ignoring whitespace.
