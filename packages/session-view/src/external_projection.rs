@@ -22,6 +22,7 @@ use bcode_session_models::external_harness::{
 };
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionTokenUsage};
 use bcode_session_view_models::external::{ExternalInteractionView, ExternalProvenanceView};
+use std::fmt::Write as _;
 
 use crate::external::{ExternalInteractionAvailability, external_interaction};
 
@@ -565,7 +566,18 @@ fn interaction_notice(label: &str, interaction: &HarnessInteraction) -> String {
             },
             |tool| format!("{label} is asking for approval to run {tool}"),
         ),
-        HarnessInteractionKind::Question => format!("{label} asked a question: {prompt}"),
+        HarnessInteractionKind::Question => {
+            let mut notice = format!("{label} asks: {prompt}");
+            for (index, choice) in interaction.choices.iter().take(9).enumerate() {
+                let _ = write!(notice, "\n  {}. {}", index + 1, excerpt(&choice.label));
+            }
+            notice.push_str(if interaction.choices.is_empty() {
+                "\nType your answer and send it."
+            } else {
+                "\nPick an option, or type your own answer and send it."
+            });
+            notice
+        }
         HarnessInteractionKind::Assistance => format!("{label} needs assistance: {prompt}"),
     }
 }

@@ -28692,6 +28692,7 @@ async fn list_profiles(
             accent: None,
             aliases: Vec::new(),
             is_default: false,
+            read_only: false,
         });
     }
     profiles
@@ -28777,6 +28778,7 @@ fn default_profiles() -> Vec<AgentInfo> {
         accent: None,
         aliases: vec!["build".to_string()],
         is_default: true,
+        read_only: false,
     }]
 }
 

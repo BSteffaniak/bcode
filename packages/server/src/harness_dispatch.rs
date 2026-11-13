@@ -137,6 +137,17 @@ pub trait ManagedSessionBackend: Send + Sync {
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
     }
 
+    /// Send the oldest input queued for `session_id` if its native agent is idle. Returns
+    /// whether one was sent (or retired), so the caller can look again promptly.
+    fn release_queued_input<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+    ) -> Task<'a, bool> {
+        let _ = (caller, session_id);
+        Box::pin(async { Ok(false) })
+    }
+
     /// Retain an explicitly recovered current owner for normal shutdown cleanup.
     /// Implementations without canonical runtime ownership must reject this operation.
     fn retain_recovery_owner(&self, owner: HarnessOwner) -> Task<'_, ()> {
@@ -435,10 +446,23 @@ struct CanonicalBackend<S, A> {
     owners: tokio::sync::Mutex<std::collections::BTreeMap<SessionId, HarnessOwner>>,
     tool_queues: crate::harness::ToolQueueHost,
     watches: crate::harness::ObservationWatches,
+    /// Queued inputs being sent now; their own delivery must not be held again.
+    releasing: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Sessions whose stored queue was last seen empty; any hold clears the mark. Absent
+    /// sessions (including every session after a restart) are read from storage.
+    empty_queues: std::sync::Mutex<std::collections::BTreeSet<SessionId>>,
 }
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
     for CanonicalBackend<S, A>
 {
+    fn release_queued_input<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+    ) -> Task<'a, bool> {
+        Box::pin(self.release_queued(caller, session_id))
+    }
+
     fn execute_selected<'a>(
         &'a self,
         caller: &'a ManagedCaller,
@@ -963,7 +987,220 @@ fn log_admitted_failure(
                     revoke_submit_scope, "managed admitted operation failed");
 }
 
+/// Times one queued input may be refused as busy before it is given up.
+const MAX_QUEUED_INPUT_ATTEMPTS: usize = 3;
+
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> {
+    /// Hold next-turn input while the native agent is mid-turn, or while earlier input still
+    /// waits, so input is taken in order instead of being refused as a conflict. A held
+    /// submission claims nothing yet: its later delivery claims exactly these identities.
+    async fn hold_while_busy(
+        &self,
+        state: &Arc<crate::ServerState>,
+        owner: &HarnessOwner,
+        request_id: &str,
+        submission: &bcode_harness_models::HarnessSubmission,
+    ) -> Result<Option<HarnessServiceResponse>, ManagedHarnessError> {
+        if !matches!(
+            submission.placement,
+            bcode_harness_models::HarnessPlacement::NextTurn
+        ) || self.releasing.lock().map_or(true, |releasing| {
+            releasing.contains(&submission.submission_id)
+        }) {
+            return Ok(None);
+        }
+        let held = state
+            .sessions
+            .native_input_queue(
+                owner.session_id,
+                bcode_session::NativeInputQueueChange::List,
+            )
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        if !held
+            .iter()
+            .any(|input| input.submission_id == submission.submission_id)
+        {
+            if held.is_empty() && !self.runtime.native_turn_running(owner.session_id) {
+                return Ok(None);
+            }
+            if let Ok(mut empty) = self.empty_queues.lock() {
+                empty.remove(&owner.session_id);
+            }
+            let queued_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                });
+            state
+                .sessions
+                .native_input_queue(
+                    owner.session_id,
+                    bcode_session::NativeInputQueueChange::Queue(
+                        bcode_session_models::external_harness::QueuedNativeInput {
+                            submission_id: submission.submission_id.clone(),
+                            attempt_id: submission.attempt_id.clone(),
+                            text: submission.text.clone(),
+                            queued_at_ms,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?;
+        }
+        Ok(Some(HarnessServiceResponse {
+            schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+            request_id: request_id.to_owned(),
+            operation: bcode_harness_models::HarnessOperation::Submit,
+            kind: bcode_harness_models::HarnessServiceResponseKind::Receipt(
+                bcode_harness_models::HarnessReceipt {
+                    submission_id: submission.submission_id.clone(),
+                    attempt_id: submission.attempt_id.clone(),
+                    session_id: submission.session_id.clone(),
+                    generation: submission.generation,
+                    state: bcode_harness_models::HarnessDeliveryState::Accepted,
+                    native_request_id: None,
+                },
+            ),
+        }))
+    }
+
+    /// Retire a released input, re-queuing it under fresh identities if it was refused as busy.
+    async fn settle_released(
+        &self,
+        session_id: SessionId,
+        next: bcode_session_models::external_harness::QueuedNativeInput,
+        retry: bool,
+    ) -> Result<(), ManagedHarnessError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ManagedHarnessError::Unavailable)?;
+        state
+            .sessions
+            .native_input_queue(
+                session_id,
+                bcode_session::NativeInputQueueChange::Remove(next.submission_id.clone()),
+            )
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        let attempts = next.submission_id.matches(".retry").count() + 1;
+        if retry && attempts < MAX_QUEUED_INPUT_ATTEMPTS {
+            state
+                .sessions
+                .native_input_queue(
+                    session_id,
+                    bcode_session::NativeInputQueueChange::Queue(
+                        bcode_session_models::external_harness::QueuedNativeInput {
+                            submission_id: format!("{}.retry", next.submission_id),
+                            attempt_id: uuid::Uuid::new_v4().to_string(),
+                            text: next.text,
+                            queued_at_ms: next.queued_at_ms,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?;
+        }
+        drop(state);
+        Ok(())
+    }
+
+    /// The submit call that delivers `next` to the session's current native target.
+    async fn queued_submit_call(
+        state: &Arc<crate::ServerState>,
+        session_id: SessionId,
+        next: &bcode_session_models::external_harness::QueuedNativeInput,
+    ) -> Result<ManagedSessionCall, ManagedHarnessError> {
+        let canonical = state
+            .sessions
+            .session_external_harness_state(session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?
+            .ok_or(ManagedHarnessError::StaleOwner)?;
+        let target = canonical.target.ok_or(ManagedHarnessError::Unavailable)?;
+        let submission = bcode_harness_models::HarnessSubmission {
+            submission_id: next.submission_id.clone(),
+            attempt_id: next.attempt_id.clone(),
+            session_id: session_id.to_string(),
+            generation: canonical.owner.generation,
+            text: next.text.clone(),
+            placement: bcode_harness_models::HarnessPlacement::NextTurn,
+        };
+        let call = ManagedSessionCall {
+            session_id: Some(session_id),
+            parent_session_id: None,
+            assistance_destination_session_id: None,
+            harness: bcode_harness_models::HarnessRequest {
+                schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                request_id: next.submission_id.clone(),
+                instance: canonical.instance,
+                kind: HarnessRequestKind::Submit { target, submission },
+            },
+        };
+        Ok(call)
+    }
+
+    /// Send the oldest queued input once the native agent is idle, through the same admission
+    /// and canonical claim as any submit. A refusal as busy re-queues it under fresh
+    /// identities (the refused ones are already recorded); an uncertain outcome is never
+    /// re-sent.
+    async fn release_queued(
+        &self,
+        caller: &ManagedCaller,
+        session_id: SessionId,
+    ) -> Result<bool, ManagedHarnessError> {
+        if self.runtime.native_turn_running(session_id)
+            || self
+                .empty_queues
+                .lock()
+                .is_ok_and(|empty| empty.contains(&session_id))
+        {
+            return Ok(false);
+        }
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ManagedHarnessError::Unavailable)?;
+        let held = state
+            .sessions
+            .native_input_queue(session_id, bcode_session::NativeInputQueueChange::List)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?;
+        let Some(next) = held.into_iter().next() else {
+            if let Ok(mut empty) = self.empty_queues.lock() {
+                empty.insert(session_id);
+            }
+            return Ok(false);
+        };
+        let call = Self::queued_submit_call(&state, session_id, &next).await?;
+        drop(state);
+        if let Ok(mut releasing) = self.releasing.lock() {
+            releasing.insert(next.submission_id.clone());
+        }
+        let outcome = self.execute(caller, call).await;
+        if let Ok(mut releasing) = self.releasing.lock() {
+            releasing.remove(&next.submission_id);
+        }
+        let retry = match &outcome {
+            // Admission failed before any claim: keep it queued and try again later.
+            Err(
+                ManagedHarnessError::StaleOwner
+                | ManagedHarnessError::Unavailable
+                | ManagedHarnessError::Storage
+                | ManagedHarnessError::Deadline,
+            ) => return Ok(false),
+            Ok(response) => matches!(
+                response.kind,
+                bcode_harness_models::HarnessServiceResponseKind::Failure(
+                    bcode_harness_models::HarnessFailure::Conflict
+                )
+            ),
+            Err(_) => false,
+        };
+        self.settle_released(session_id, next, retry).await?;
+        Ok(true)
+    }
     /// Admit the delegated child's current owner exactly as an Observe call, then drain one
     /// bounded native page through the observer guard under credential admission.
     async fn drain_delegated(
@@ -1167,6 +1404,13 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
             }
             HarnessRequestKind::Submit { submission, .. } => {
                 check(&submission.session_id, submission.generation)?;
+                if application.is_some()
+                    && let Some(held) = self
+                        .hold_while_busy(state, owner, &request_id, &submission)
+                        .await?
+                {
+                    return Ok(held);
+                }
                 if let Some(app) = &application {
                     app.submit(owner.session_id, submission).await
                 } else {
@@ -1256,6 +1500,8 @@ impl crate::ServerState {
             owners: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
             tool_queues: crate::harness::ToolQueueHost::default(),
             watches: crate::harness::ObservationWatches::default(),
+            releasing: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            empty_queues: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         };
         self.managed_sessions
             .set(Arc::new(backend))

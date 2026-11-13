@@ -778,6 +778,22 @@ impl ExternalHarnessRecovery {
     }
 }
 
+/// User input the native agent could not take yet, held with its session until it can be sent.
+///
+/// Not canonical history: it becomes history when its delivery is claimed under these exact
+/// identities, after which the row is removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedNativeInput {
+    /// Submission identity the delivery will claim.
+    pub submission_id: String,
+    /// Attempt identity the delivery will claim.
+    pub attempt_id: String,
+    /// The message.
+    pub text: String,
+    /// When it was queued.
+    pub queued_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExternalHarnessOperationRecord {

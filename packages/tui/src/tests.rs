@@ -233,6 +233,7 @@ fn agent_infos_with_accents(items: &[(&str, bool, Option<&str>)]) -> Vec<AgentIn
             accent: accent.map(ToOwned::to_owned),
             aliases: Vec::new(),
             is_default: *is_default,
+            read_only: false,
         })
         .collect()
 }

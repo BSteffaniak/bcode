@@ -854,10 +854,11 @@ impl PluginManifest {
     /// everything dropped (see [`PluginPresentationDeclaration::effective`]).
     #[must_use]
     pub fn presentation_declaration(&self) -> PluginPresentationDeclaration {
-        let provides_tools = self
-            .services
-            .iter()
-            .any(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID);
+        // Native harnesses produce tool units too: the native agent's own tools.
+        let provides_tools = self.services.iter().any(|service| {
+            service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID
+                || service.interface_id.starts_with("bcode.harness/")
+        });
         self.presentation.effective(&self.id, provides_tools)
     }
 }

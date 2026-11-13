@@ -110,7 +110,8 @@ pub mod working_document;
 
 use actor::{AttachMode, SessionHandle};
 pub use actor::{
-    SessionOwnershipGuard, SessionOwnershipKind, SessionOwnershipRelease, SessionOwnershipSnapshot,
+    NativeInputQueueChange, SessionOwnershipGuard, SessionOwnershipKind, SessionOwnershipRelease,
+    SessionOwnershipSnapshot,
 };
 pub use attachment::{
     SessionAttachment, SessionEventSubscription, SessionMutationCommitted,
@@ -2079,6 +2080,21 @@ impl SessionManager {
     ) -> Result<Option<String>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.composer_draft().await
+    }
+
+    /// Queue, remove, or list native input held with a session until its native agent can
+    /// take it. Returns what remains held, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session does not exist or the queue cannot be read or written.
+    pub async fn native_input_queue(
+        &self,
+        session_id: SessionId,
+        change: actor::NativeInputQueueChange,
+    ) -> Result<Vec<bcode_session_models::external_harness::QueuedNativeInput>, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.native_input_queue(change).await
     }
 
     /// Set or clear a launch-cwd-scoped draft-session composer draft.

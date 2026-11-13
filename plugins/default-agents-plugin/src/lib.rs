@@ -155,6 +155,7 @@ fn agent_list_with_config(effective_config_toml: Option<&str>) -> AgentList {
                 accent: plan.accent,
                 aliases: vec!["plan".to_string()],
                 is_default: false,
+                read_only: true,
             },
             AgentInfo {
                 id: BUILD_AGENT.to_string(),
@@ -165,6 +166,7 @@ fn agent_list_with_config(effective_config_toml: Option<&str>) -> AgentList {
                 accent: build.accent,
                 aliases: vec!["build".to_string()],
                 is_default: true,
+                read_only: false,
             },
         ],
     }

@@ -192,6 +192,7 @@ pub fn session_migrations() -> CurrentMigrationSource {
     add_milestone_migrations(&mut source);
     add_submission_recovery_migrations(&mut source);
     add_external_connection_migrations(&mut source);
+    add_native_input_queue_migrations(&mut source);
     if crate::durable_interaction::PUBLICATION_ENABLED {
         add_durable_interaction_migrations(&mut source);
     }
@@ -481,6 +482,23 @@ fn add_external_connection_migrations(source: &mut CurrentMigrationSource) {
             None,
         ),
         alter_table("session_state").drop_column("external_auth_binding".into()),
+    );
+}
+
+/// Native input accepted while the native agent was busy, held until it can be delivered.
+/// Rows are not canonical history: a row becomes history only when its delivery is claimed.
+fn add_native_input_queue_migrations(source: &mut CurrentMigrationSource) {
+    add_migration(
+        source,
+        "082_native_input_queue",
+        create_table("native_input_queue")
+            .if_not_exists(true)
+            .column(schema_column("submission_id", DataType::Text, false))
+            .primary_key("submission_id")
+            .column(schema_column("attempt_id", DataType::Text, false))
+            .column(schema_column("text", DataType::Text, false))
+            .column(schema_column("queued_at_ms", DataType::Int, false)),
+        drop_table("native_input_queue").if_exists(true),
     );
 }
 

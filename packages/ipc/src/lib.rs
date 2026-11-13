@@ -153,7 +153,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 65 adds importing a named source file with an origin.
 /// Version 66 adds explicit external credential connection operations.
 /// Version 67 adds application turn context blocks and contributed agent profiles.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 67;
+/// Version 68 marks read-only agent profiles.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 68;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -4955,7 +4956,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 67);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 68);
         assert_ne!(ProtocolVersion(66), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(65), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());

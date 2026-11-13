@@ -60,6 +60,11 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         self.activity.busy_sessions()
     }
 
+    /// Whether a native foreground turn is running for `session`.
+    pub fn native_turn_running(&self, session: SessionId) -> bool {
+        self.activity.foreground(session)
+    }
+
     /// Verify an admitted full owner while retaining a real canonical lease for the check.
     /// Every operation reacquires and holds that lease through native I/O and commit.
     /// # Errors

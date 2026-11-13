@@ -2510,6 +2510,7 @@ impl TuiEffect {
                 | Self::WaitSearchIndexing { .. }
                 | Self::LoadMilestones { .. }
                 | Self::OpenXray { .. }
+                | Self::LoadAgentCatalog
         )
     }
 

@@ -104,16 +104,6 @@ pub fn stage_session_message(
     if !managed_input_available(chat, session_id) {
         return false;
     }
-    if let Some(session_id) = session_id {
-        let unresolved = chat.app.managed_composer.requests.values().any(|request| {
-            let (owner, _) = request.target();
-            owner == session_id.to_string()
-        });
-        if unresolved {
-            chat.app.set_status("Native input remains unresolved. Use /native retry <submission-id> for the retained attempt; no new input was sent".into());
-            return false;
-        }
-    }
     let message = chat.app.take_pending_submission();
     if message.trim().is_empty() {
         chat.app.clear_pending_submission(&message);

@@ -5123,47 +5123,74 @@ fn apply_managed_composer_receipt(
     response: &bcode_session_models::ExternalHarnessResponse,
 ) {
     use bcode_session_models::ExternalHarnessResponseKind;
+    let label = chat
+        .app
+        .managed_label()
+        .unwrap_or("The native agent")
+        .to_owned();
+    let retained = chat.app.managed_composer.requests.remove(&submission_id.0);
     let status = match &response.kind {
         ExternalHarnessResponseKind::Receipt(receipt) => {
-            let recorded = chat
-                .app
-                .managed_composer
-                .requests
-                .get(&receipt.submission_id);
-            let exact = recorded.is_some_and(|request| matches!(&request.kind,
+            let exact = retained.as_ref().is_some_and(|request| matches!(&request.kind,
                 bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. }
                 if submission.submission_id == receipt.submission_id && submission.attempt_id == receipt.attempt_id
                     && submission.generation == receipt.generation && submission.session_id == receipt.session_id));
-            if !exact {
-                chat.app
-                    .set_status("Native receipt mismatch; retained unresolved input".into());
-                return;
-            }
-            // A completed write is delivered input: the canonical submission item now shows it
-            // and the adapter's retained receipt refuses duplicate delivery. Only an uncertain
-            // outcome keeps the exact attempt for an explicit retry.
-            if receipt.state == bcode_harness_models::HarnessDeliveryState::Uncertain {
-                format!(
-                    "Delivery to the native session is uncertain; /native retry {} resends the same attempt",
-                    receipt.submission_id
-                )
-            } else {
+            if receipt.state != bcode_harness_models::HarnessDeliveryState::Uncertain {
                 chat.app.acknowledge_managed_composer(submission_id);
-                chat.app
-                    .managed_composer
-                    .requests
-                    .remove(&receipt.submission_id);
+            }
+            if exact {
+                match receipt.state {
+                    // Held by the daemon with this session: it goes out when the turn ends.
+                    bcode_harness_models::HarnessDeliveryState::Accepted => {
+                        if let Some(text) = retained.as_ref().and_then(submitted_text) {
+                            chat.app.push_ephemeral_system_plain(format!(
+                                "Queued: {text}\nIt will be sent when {label} finishes its current turn."
+                            ));
+                        }
+                        format!("Queued; {label} gets it when its current turn ends")
+                    }
+                    // The native record of what arrived settles this. The exact attempt is
+                    // kept for an explicit retry, but nothing else waits on it.
+                    bcode_harness_models::HarnessDeliveryState::Uncertain => {
+                        if let Some(request) = retained.clone() {
+                            chat.app
+                                .managed_composer
+                                .requests
+                                .insert(submission_id.0.clone(), request);
+                        }
+                        format!(
+                            "Delivery to {label} is uncertain; its reply will show whether it arrived"
+                        )
+                    }
+                    _ => "Sent".to_owned(),
+                }
+            } else {
                 "Sent".to_owned()
             }
         }
-        ExternalHarnessResponseKind::Failure(failure) => format!(
-            "Native delivery {failure:?}; request retained. /native retry {}",
-            submission_id.0
-        ),
-        _ => "Unexpected native response; retained unresolved input".into(),
+        // Definitely not delivered: give the text back so it can be sent again.
+        ExternalHarnessResponseKind::Failure(failure) => {
+            if let Some(text) = retained.as_ref().and_then(submitted_text)
+                && chat.app.composer().text().is_empty()
+            {
+                chat.app.replace_composer_with(text);
+            }
+            format!("{label} did not take that message ({failure:?}); it is back in the composer")
+        }
+        _ => "Sent".to_owned(),
     };
     chat.app.set_status(status);
     ensure_session_stream_after_foreground_wake(chat);
+}
+
+/// The text of a retained native submission.
+const fn submitted_text(request: &bcode_session_models::ExternalHarnessRequest) -> Option<&str> {
+    match &request.kind {
+        bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } => {
+            Some(submission.text.as_str())
+        }
+        _ => None,
+    }
 }
 
 fn apply_submit_message_result(
@@ -5235,7 +5262,10 @@ fn apply_submit_message_result(
                 .requests
                 .contains_key(&submission_id.0)
             {
-                chat.app.set_status(format!("Native delivery unresolved; exact request retained. /native retry {}. Do not send the draft as a new attempt.", submission_id.0));
+                // Whether it arrived shows in the native reply; input stays open meanwhile.
+                chat.app.set_status(
+                    "Delivery is unconfirmed; the reply will show whether it arrived".into(),
+                );
                 return;
             }
             daemon_issue::report_client_issue(
@@ -7314,6 +7344,93 @@ mod scheduler_tests {
             "uncertainty never auto-resends"
         );
         assert_managed_capture_rejects_conflicts_and_overflow(&mut chat, &identity, &retained);
+        chat.event_task.take().unwrap().abort();
+    }
+
+    fn managed_receipt_result(
+        chat: &ActiveChat,
+        identity: &bcode_session_models::SubmissionId,
+        retained: &bcode_session_models::ExternalHarnessRequest,
+        kind: bcode_harness_models::HarnessServiceResponseKind,
+    ) -> super::super::effects::SubmitMessageResult {
+        let response = bcode_session_models::ExternalHarnessResponse::from_response(
+            &retained.request().unwrap(),
+            &bcode_harness_models::HarnessServiceResponse {
+                schema_version: 1,
+                request_id: identity.0.clone(),
+                operation: bcode_harness_models::HarnessOperation::Submit,
+                kind,
+            },
+        )
+        .unwrap();
+        super::super::effects::SubmitMessageResult {
+            session_id: chat.attached_session_id().unwrap(),
+            created_session: None,
+            submission: Ok(None),
+            receipt: Some(super::super::effects::ComposerReceipt::Managed(Box::new(
+                response,
+            ))),
+            prepared_request: None,
+            committed_agent_id: None,
+            committed_reasoning_effort_generation: None,
+            event_task: None,
+            event_stream_release: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_and_refused_native_input_never_blocks_the_next_message() {
+        let mut chat = managed_test_chat();
+        chat.event_task = Some(tokio::spawn(std::future::pending()));
+        let session_id = chat.attached_session_id().unwrap();
+        for (state, refused) in [
+            (
+                Some(bcode_harness_models::HarnessDeliveryState::Accepted),
+                false,
+            ),
+            (None, true),
+        ] {
+            chat.app.replace_composer_with("native input");
+            chat.app.stage_submission();
+            let identity = chat.app.pending_submissions().last().unwrap().id().clone();
+            let request = managed_test_request(&chat, &identity.0);
+            let retained = request.managed.clone().unwrap();
+            chat.app
+                .managed_composer
+                .requests
+                .insert(identity.0.clone(), retained.clone());
+            let kind = state.map_or(
+                bcode_harness_models::HarnessServiceResponseKind::Failure(
+                    bcode_harness_models::HarnessFailure::Conflict,
+                ),
+                |state| {
+                    bcode_harness_models::HarnessServiceResponseKind::Receipt(
+                        bcode_harness_models::HarnessReceipt {
+                            submission_id: identity.0.clone(),
+                            attempt_id: format!("attempt-{}", identity.0),
+                            session_id: session_id.to_string(),
+                            generation: 3,
+                            state,
+                            native_request_id: None,
+                        },
+                    )
+                },
+            );
+            let result = managed_receipt_result(&chat, &identity, &retained, kind);
+            apply_submit_message_result(&mut chat, &identity, "native input", Ok(result));
+            assert!(chat.app.managed_composer.requests.is_empty());
+            if refused {
+                // Not delivered: the text comes back so it can simply be sent again.
+                assert_eq!(chat.app.composer().text(), "native input");
+                chat.app.replace_composer_with("");
+            } else {
+                assert!(
+                    chat.app.status().contains("Queued"),
+                    "{}",
+                    chat.app.status()
+                );
+            }
+        }
         chat.event_task.take().unwrap().abort();
     }
 

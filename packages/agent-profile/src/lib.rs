@@ -141,6 +141,10 @@ pub struct AgentInfo {
     /// Whether this profile is the provider's default.
     #[serde(default)]
     pub is_default: bool,
+    /// Whether the profile only reads and plans, never changing files or running edits.
+    /// Native agents run such a profile in their own read-only (plan) mode.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

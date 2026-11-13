@@ -535,6 +535,15 @@ impl SessionHandle {
         self.send(SessionCommand::ComposerDraft).await?
     }
 
+    /// Queue, remove, or list native input held until the native agent can take it.
+    pub async fn native_input_queue(
+        &self,
+        change: NativeInputQueueChange,
+    ) -> Result<Vec<bcode_session_models::external_harness::QueuedNativeInput>, SessionError> {
+        self.send(|reply| SessionCommand::NativeInputQueue { change, reply })
+            .await?
+    }
+
     /// Validate that the next append can begin on the actor-owned database connection.
     ///
     /// # Errors
@@ -1564,6 +1573,17 @@ enum SubmissionMutation {
     Cancel(bcode_session_models::SubmissionId),
 }
 
+/// A change to a session's held native input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeInputQueueChange {
+    /// Hold this input.
+    Queue(bcode_session_models::external_harness::QueuedNativeInput),
+    /// Stop holding the input with this submission identity.
+    Remove(String),
+    /// Change nothing; report what is held.
+    List,
+}
+
 enum SessionCommand {
     CompleteInteractionContinuation {
         interaction: Box<bcode_session_models::DurableInteractionOperation>,
@@ -1810,6 +1830,12 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
     ComposerDraft(oneshot::Sender<Result<Option<String>, SessionError>>),
+    NativeInputQueue {
+        change: NativeInputQueueChange,
+        reply: oneshot::Sender<
+            Result<Vec<bcode_session_models::external_harness::QueuedNativeInput>, SessionError>,
+        >,
+    },
     ValidateWriteReadiness(oneshot::Sender<Result<(), SessionError>>),
     ReloadStateAndValidateWriteReadiness(oneshot::Sender<Result<(), SessionError>>),
     Health {
@@ -2236,12 +2262,9 @@ impl SessionActor {
                 self.handle_attach_reply(client_id, mode, queued_at, reply)
                     .await;
             }
-            SessionCommand::SetComposerDraft {
-                text,
-                updated_at_ms,
-                reply,
-            } => {
-                let _ = reply.send(self.set_composer_draft(&text, updated_at_ms).await);
+            command @ (SessionCommand::SetComposerDraft { .. }
+            | SessionCommand::NativeInputQueue { .. }) => {
+                self.handle_composer_storage_command(command).await;
             }
             command => return Box::pin(self.handle_permission_command(command)).await,
         }
@@ -2414,7 +2437,8 @@ impl SessionActor {
             | SessionCommand::AppendToolInvocationResult { .. }
             | SessionCommand::AppendUserMessage { .. }
             | SessionCommand::Attach { .. }
-            | SessionCommand::SetComposerDraft { .. } => {
+            | SessionCommand::SetComposerDraft { .. }
+            | SessionCommand::NativeInputQueue { .. } => {
                 unreachable!("write commands are handled before read commands")
             }
             SessionCommand::AdmitQueuedTurn {
@@ -3541,6 +3565,56 @@ impl SessionActor {
         let _write_guard = crate::lease::acquire_session_write_lock(&root_path, session_id)?;
         db.set_session_composer_draft(text, updated_at_ms).await?;
         Ok(())
+    }
+
+    /// Composer drafts and held native input: per-session state outside canonical history.
+    async fn handle_composer_storage_command(&mut self, command: SessionCommand) {
+        match command {
+            SessionCommand::SetComposerDraft {
+                text,
+                updated_at_ms,
+                reply,
+            } => {
+                let _ = reply.send(self.set_composer_draft(&text, updated_at_ms).await);
+            }
+            SessionCommand::NativeInputQueue { change, reply } => {
+                let _ = reply.send(self.change_native_input_queue(change).await);
+            }
+            _ => {}
+        }
+    }
+
+    async fn change_native_input_queue(
+        &mut self,
+        change: NativeInputQueueChange,
+    ) -> Result<Vec<bcode_session_models::external_harness::QueuedNativeInput>, SessionError> {
+        let session_id = self.state.summary.id;
+        let writes = !matches!(change, NativeInputQueueChange::List);
+        let root_path = if writes {
+            self.ensure_ownership()?;
+            Some(
+                self.store
+                    .as_ref()
+                    .ok_or(SessionError::NotFound(session_id))?
+                    .root_path(),
+            )
+        } else {
+            None
+        };
+        let Some(db) = self.existing_session_db().await? else {
+            return Ok(Vec::new());
+        };
+        if let Some(root_path) = root_path {
+            let _write_guard = crate::lease::acquire_session_write_lock(&root_path, session_id)?;
+            match &change {
+                NativeInputQueueChange::Queue(input) => db.queue_native_input(input).await?,
+                NativeInputQueueChange::Remove(submission_id) => {
+                    db.remove_queued_native_input(submission_id).await?;
+                }
+                NativeInputQueueChange::List => {}
+            }
+        }
+        Ok(db.queued_native_input().await?)
     }
 
     async fn composer_draft(&mut self) -> Result<Option<String>, SessionError> {

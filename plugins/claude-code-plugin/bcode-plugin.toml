@@ -50,6 +50,75 @@ description  = "Optional independently negotiated evidence; Close acknowledgemen
 interface_id = "bcode.harness.recovery/v1"
 name         = "Exact constrained resume and physical transport release evidence"
 
+# Native tool rows show their main argument, as the native tool itself does.
+[[presentation.tools]]
+target_fields = ["file_path"]
+tool_name     = "Read"
+
+[[presentation.tools]]
+target_fields = ["file_path"]
+tool_name     = "Write"
+
+[[presentation.tools]]
+target_fields = ["file_path"]
+tool_name     = "Edit"
+
+[[presentation.tools]]
+target_fields = ["file_path"]
+tool_name     = "MultiEdit"
+
+[[presentation.tools]]
+target_fields = ["notebook_path"]
+tool_name     = "NotebookEdit"
+
+[[presentation.tools]]
+target_fields = ["command"]
+tool_name     = "Bash"
+
+[[presentation.tools]]
+target_fields = ["bash_id"]
+tool_name     = "BashOutput"
+
+[[presentation.tools]]
+target_fields = ["shell_id"]
+tool_name     = "KillShell"
+
+[[presentation.tools]]
+target_fields = ["pattern", "path"]
+tool_name     = "Grep"
+
+[[presentation.tools]]
+target_fields = ["pattern", "path"]
+tool_name     = "Glob"
+
+[[presentation.tools]]
+target_fields = ["url"]
+tool_name     = "WebFetch"
+
+[[presentation.tools]]
+target_fields = ["query"]
+tool_name     = "WebSearch"
+
+[[presentation.tools]]
+target_fields = ["description"]
+tool_name     = "Task"
+
+[[presentation.tools]]
+target_fields = ["description"]
+tool_name     = "Agent"
+
+[[presentation.tools]]
+target_fields = ["skill", "command"]
+tool_name     = "Skill"
+
+[[presentation.tools]]
+target_fields = ["command"]
+tool_name     = "SlashCommand"
+
+[[presentation.tools]]
+target_fields = ["query"]
+tool_name     = "ToolSearch"
+
 [concurrency]
 # Operations still serialize on retained plugin state; only a waiting observe
 # releases that lock while it waits for native output.

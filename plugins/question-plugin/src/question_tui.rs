@@ -1367,6 +1367,11 @@ impl QuestionTerminalRenderer {
             }
             return self.custom_input(event, snapshot, host);
         }
+        if action.is_none()
+            && let Some(input) = self.start_custom_answer(event, snapshot, host)
+        {
+            return input;
+        }
         let input = match event {
             Event::Mouse(mouse) => self.mouse_input(mouse),
             Event::Key(_) => question_action_input(action.as_deref(), snapshot),
@@ -1376,6 +1381,61 @@ impl QuestionTerminalRenderer {
             TerminalInteractionInput::Ignored,
             TerminalInteractionInput::Semantic,
         )
+    }
+
+    /// Typing (or pasting) while an option is focused starts this question's own answer, so
+    /// text never leaks to whatever lies behind the question. `None` when the event is not
+    /// text or the question takes no typed answer.
+    fn start_custom_answer(
+        &mut self,
+        event: &Event,
+        snapshot: &QuestionSnapshot,
+        host: &dyn QuestionInputPort,
+    ) -> Option<TerminalInteractionInput> {
+        let QuestionFocusTarget::Option { question_index, .. } = snapshot.focus else {
+            return None;
+        };
+        let question = snapshot.request.questions.get(question_index)?;
+        if !(question.custom || question.options.is_empty()) {
+            return None;
+        }
+        let text_event = match event {
+            Event::Key(stroke) => {
+                matches!(stroke.key, KeyCode::Char(_))
+                    && !stroke.modifiers.ctrl
+                    && !stroke.modifiers.alt
+                    && !stroke.modifiers.super_key
+            }
+            Event::Paste(text) => !text.is_empty(),
+            Event::Mouse(_) | Event::Resize(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
+                false
+            }
+        };
+        if !text_event {
+            return None;
+        }
+        let value = snapshot.answers[question_index]
+            .custom
+            .as_deref()
+            .unwrap_or_default();
+        let state = self.sync_custom_input(question_index, value);
+        match event {
+            Event::Key(stroke) => {
+                if !host.edit_key(state, *stroke) {
+                    return None;
+                }
+            }
+            Event::Paste(text) => {
+                TextInputControl::new(&TextInputPolicy::chat_composer()).handle_paste(state, text);
+            }
+            _ => return None,
+        }
+        Some(TerminalInteractionInput::Semantic(
+            InteractionInput::Change {
+                control_id: custom_control_id(question_index),
+                value: InteractionValue::String(state.buffer().text().to_owned()),
+            },
+        ))
     }
 }
 
@@ -1888,6 +1948,42 @@ mod tests {
             TerminalInteractionInput::Consumed => InteractionOutput::Redraw,
             TerminalInteractionInput::Semantic(input) => controller.handle_input(input),
         }
+    }
+
+    #[test]
+    fn typing_on_an_option_writes_the_answer_instead_of_leaking() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question(
+                "What should I plan?",
+                &[("Just testing", None), ("Review work", None)],
+                true,
+                true,
+            )],
+        });
+        let mut renderer = QuestionTerminalRenderer::default();
+        assert!(matches!(
+            controller.snapshot().focus,
+            QuestionFocusTarget::Option { .. }
+        ));
+        for character in "what model are you?".chars() {
+            let output = render_then_apply_event(
+                &mut renderer,
+                &mut controller,
+                &key(KeyCode::Char(character)),
+            );
+            assert_ne!(output, InteractionOutput::None, "{character:?} leaked");
+        }
+        let snapshot = controller.snapshot();
+        assert_eq!(
+            snapshot.focus,
+            QuestionFocusTarget::Custom { question_index: 0 }
+        );
+        assert_eq!(
+            snapshot.answers[0].custom.as_deref(),
+            Some("what model are you?")
+        );
+        // Typing chose no option; the typed text is the answer.
+        assert_eq!(snapshot.selected_option_indices[0], Vec::<usize>::new());
     }
 
     fn completion_edit(field: FocusedTextFieldSnapshot, replacement: &str) -> FocusedTextFieldEdit {

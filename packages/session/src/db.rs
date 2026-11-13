@@ -1747,6 +1747,77 @@ impl SessionDb {
         Ok(())
     }
 
+    /// Hold native input until the native agent can take it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails or the identity is already queued.
+    pub async fn queue_native_input(
+        &self,
+        input: &bcode_session_models::external_harness::QueuedNativeInput,
+    ) -> SessionDbResult<()> {
+        validate_storage_writer_contract(&**self.db).await?;
+        self.db
+            .insert("native_input_queue")
+            .value("submission_id", input.submission_id.clone())
+            .value("attempt_id", input.attempt_id.clone())
+            .value("text", input.text.clone())
+            .value("queued_at_ms", seq_to_value(input.queued_at_ms))
+            .execute(&**self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Native input waiting to be sent, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or a row is malformed.
+    pub async fn queued_native_input(
+        &self,
+    ) -> SessionDbResult<Vec<bcode_session_models::external_harness::QueuedNativeInput>> {
+        if !self.db.table_exists("native_input_queue").await? {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .db
+            .select("native_input_queue")
+            .columns(&["submission_id", "attempt_id", "text", "queued_at_ms"])
+            .execute(&**self.db)
+            .await?;
+        let mut queued = rows
+            .iter()
+            .map(|row| {
+                Ok(bcode_session_models::external_harness::QueuedNativeInput {
+                    submission_id: required_string(row, "submission_id")?,
+                    attempt_id: required_string(row, "attempt_id")?,
+                    text: required_string(row, "text")?,
+                    queued_at_ms: required_non_negative_u64(row, "queued_at_ms")?,
+                })
+            })
+            .collect::<SessionDbResult<Vec<_>>>()?;
+        queued.sort_by(|left, right| {
+            (left.queued_at_ms, &left.submission_id)
+                .cmp(&(right.queued_at_ms, &right.submission_id))
+        });
+        Ok(queued)
+    }
+
+    /// Stop holding one queued input: it was sent, or the user withdrew it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn remove_queued_native_input(&self, submission_id: &str) -> SessionDbResult<()> {
+        validate_storage_writer_contract(&**self.db).await?;
+        self.db
+            .delete("native_input_queue")
+            .where_eq("submission_id", submission_id.to_owned())
+            .execute(&**self.db)
+            .await?;
+        Ok(())
+    }
+
     /// Return tool-run projection rows with `running` status.
     ///
     /// # Errors
@@ -11710,6 +11781,49 @@ mod tests {
                 .expect("model context")
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_native_input_persists_in_order_until_removed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open");
+        let input = |id: &str, at: u64| bcode_session_models::external_harness::QueuedNativeInput {
+            submission_id: id.into(),
+            attempt_id: format!("{id}-attempt"),
+            text: format!("message {id}"),
+            queued_at_ms: at,
+        };
+        db.queue_native_input(&input("later", 2))
+            .await
+            .expect("queue");
+        db.queue_native_input(&input("first", 1))
+            .await
+            .expect("queue");
+        // An identity is held once.
+        assert!(db.queue_native_input(&input("first", 3)).await.is_err());
+        db.close().await.expect("close");
+
+        let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("reopen");
+        let held = reopened.queued_native_input().await.expect("list");
+        assert_eq!(
+            held.iter()
+                .map(|input| input.submission_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        reopened
+            .remove_queued_native_input("first")
+            .await
+            .expect("remove");
+        assert_eq!(
+            reopened.queued_native_input().await.expect("list"),
+            vec![input("later", 2)]
         );
     }
 

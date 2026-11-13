@@ -237,6 +237,48 @@ pub fn resolve_surface(
     true
 }
 
+/// A message sent while the native agent's question is open answers that question, as in the
+/// native tool. Returns whether `text` was used as an answer; the open question's inline box
+/// closes because the question is now answered.
+pub fn answer_open_question(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    text: &str,
+) -> bool {
+    if chat.app.managed_execution_session().is_none() || text.trim().is_empty() {
+        return false;
+    }
+    let Some(view) = current_pending(chat, loop_state).into_iter().find(|view| {
+        view.interaction_kind == ExternalInteractionKind::Question
+            && loop_state.managed_interactions.presented() == Some(&interaction_key(view))
+    }) else {
+        return false;
+    };
+    let key = interaction_key(&view);
+    if loop_state.managed_interactions.is_in_flight(&key) {
+        return false;
+    }
+    let surface_id = managed_controls::surface_interaction_id(&key);
+    if loop_state
+        .interactive_surface
+        .as_ref()
+        .is_some_and(|surface| surface.interaction_id() == surface_id)
+    {
+        loop_state.interactive_surface = None;
+    }
+    loop_state.interactive_surface_queue.remove(&surface_id);
+    dispatch_response(
+        chat,
+        loop_state,
+        &key,
+        bcode_harness_models::HarnessResponseValue::Answer {
+            choice_id: None,
+            text: text.to_owned(),
+        },
+    );
+    true
+}
+
 /// Apply one managed response outcome without retrying it.
 pub fn apply_response_result(
     chat: &mut ActiveChat,
@@ -308,18 +350,42 @@ pub fn start_configure(
 }
 
 /// Cycle the native permission mode: Default → `AcceptEdits` → Plan → Default.
-pub fn cycle_permission_mode(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
-    let current = chat
+/// Cycle Bcode's agents in a native conversation, as in any Bcode conversation. The native
+/// agent runs a read-only Bcode agent in its plan mode and any other agent in its default mode.
+pub fn cycle_native_agent(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
+    if chat.agents.is_empty() {
+        chat.replace_effect(TuiEffect::LoadAgentCatalog);
+        chat.app.set_status("Agents are still loading".to_owned());
+        return;
+    }
+    let Some(agent) = chat.agents.next_agent(chat.app.current_agent_id()).cloned() else {
+        chat.app.set_status("No agents available".to_owned());
+        return;
+    };
+    let mode = if agent.read_only {
+        bcode_harness_models::HarnessPermissionMode::Plan
+    } else {
+        bcode_harness_models::HarnessPermissionMode::Default
+    };
+    chat.agents
+        .apply_agent_to_app(&mut chat.app, agent.id.clone());
+    let label = chat
         .app
-        .managed_settings()
-        .permission_mode
-        .unwrap_or(bcode_harness_models::HarnessPermissionMode::Default);
+        .managed_label()
+        .unwrap_or("The native agent")
+        .to_owned();
+    chat.app.push_ephemeral_system_plain(if agent.read_only {
+        format!(
+            "Switched to the {} agent: {label} plans without changing files.",
+            agent.name
+        )
+    } else {
+        format!("Switched to the {} agent.", agent.name)
+    });
     start_configure(
         chat,
         loop_state,
-        HarnessSessionSetting::PermissionMode {
-            mode: managed_controls::next_permission_mode(current),
-        },
+        HarnessSessionSetting::PermissionMode { mode },
     );
 }
 
@@ -455,6 +521,19 @@ mod tests {
         }
     }
 
+    fn agent(id: &str, read_only: bool) -> bcode_agent_profile::AgentInfo {
+        bcode_agent_profile::AgentInfo {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            badge: None,
+            accent: None,
+            aliases: Vec::new(),
+            is_default: !read_only,
+            read_only,
+        }
+    }
+
     fn drained(chat: &mut ActiveChat) -> Vec<TuiEffect> {
         chat.pending_effects
             .drain_runtime()
@@ -548,6 +627,38 @@ mod tests {
     }
 
     #[test]
+    fn a_message_sent_while_a_question_is_open_answers_it() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut chat = chat(owner);
+        let mut loop_state = ChatLoopState::new_access(None, None, None, false);
+        loop_state.set_managed_generation_for_test(1);
+        // Nothing is open: the message is ordinary input.
+        assert!(!answer_open_question(&mut chat, &mut loop_state, "hello"));
+        chat.app
+            .set_pending_external_interactions_for_test(vec![interaction(
+                ExternalInteractionKind::Question,
+                "q",
+            )]);
+        assert!(reconcile_interactions(&mut chat, &mut loop_state));
+        assert!(!answer_open_question(&mut chat, &mut loop_state, "   "));
+        assert!(answer_open_question(
+            &mut chat,
+            &mut loop_state,
+            "what model are you?"
+        ));
+        assert!(loop_state.next_surface_open_request().is_none());
+        let effects = drained(&mut chat);
+        assert!(matches!(
+            &effects[..],
+            [TuiEffect::RespondManagedInteraction {
+                value: bcode_harness_models::HarnessResponseValue::Answer { choice_id: None, text },
+                ..
+            }] if text == "what model are you?"
+        ));
+        drop(chat);
+    }
+
+    #[test]
     fn questions_open_the_question_surface_and_dismissal_sends_nothing() {
         let owner = bcode_session_models::SessionId::new();
         let mut chat = chat(owner);
@@ -619,7 +730,14 @@ mod tests {
         assert!(loop_state.has_model_picker());
         assert!(loop_state.execution_picker.is_none());
         loop_state.model_switcher = None;
-        cycle_permission_mode(&mut chat, &mut loop_state);
+        // Tab cycles Bcode's own agents; the read-only one runs as the native plan mode.
+        chat.agents = crate::session_flow::AgentCatalog::from_agents(vec![
+            agent("build", false),
+            agent("plan", true),
+        ]);
+        chat.agents.apply_agent_to_app(&mut chat.app, "build");
+        cycle_native_agent(&mut chat, &mut loop_state);
+        assert_eq!(chat.app.current_agent_id(), "plan");
         let effects = drained(&mut chat);
         let [
             TuiEffect::ConfigureManagedSession {
@@ -634,7 +752,7 @@ mod tests {
         assert_eq!(
             setting,
             &HarnessSessionSetting::PermissionMode {
-                mode: bcode_harness_models::HarnessPermissionMode::AcceptEdits
+                mode: bcode_harness_models::HarnessPermissionMode::Plan
             }
         );
         // A second change waits for the first outcome instead of racing it.
@@ -662,20 +780,15 @@ mod tests {
         );
         assert_eq!(
             chat.app.managed_settings().permission_mode,
-            Some(bcode_harness_models::HarnessPermissionMode::AcceptEdits)
+            Some(bcode_harness_models::HarnessPermissionMode::Plan)
         );
-        assert!(
-            chat.app
-                .execution_mode_indicator()
-                .unwrap()
-                .contains("accept-edits")
-        );
-        cycle_permission_mode(&mut chat, &mut loop_state);
+        cycle_native_agent(&mut chat, &mut loop_state);
+        assert_eq!(chat.app.current_agent_id(), "build");
         assert!(matches!(
             &drained(&mut chat)[..],
             [TuiEffect::ConfigureManagedSession {
                 setting: HarnessSessionSetting::PermissionMode {
-                    mode: bcode_harness_models::HarnessPermissionMode::Plan
+                    mode: bcode_harness_models::HarnessPermissionMode::Default
                 },
                 ..
             }]

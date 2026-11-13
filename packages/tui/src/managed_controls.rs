@@ -166,16 +166,6 @@ pub fn managed_slash_completions() -> Vec<(&'static str, &'static str)> {
     completions
 }
 
-/// Next permission mode for the agent-cycle key: Default → `AcceptEdits` → Plan → Default.
-#[must_use]
-pub const fn next_permission_mode(current: HarnessPermissionMode) -> HarnessPermissionMode {
-    match current {
-        HarnessPermissionMode::Default => HarnessPermissionMode::AcceptEdits,
-        HarnessPermissionMode::AcceptEdits => HarnessPermissionMode::Plan,
-        HarnessPermissionMode::Plan => HarnessPermissionMode::Default,
-    }
-}
-
 /// Short user-facing label for a native permission mode.
 #[must_use]
 pub const fn permission_mode_label(mode: HarnessPermissionMode) -> &'static str {
@@ -748,21 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_cycle_and_commands() {
-        let mut mode = HarnessPermissionMode::Default;
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            mode = next_permission_mode(mode);
-            seen.push(mode);
-        }
-        assert_eq!(
-            seen,
-            [
-                HarnessPermissionMode::AcceptEdits,
-                HarnessPermissionMode::Plan,
-                HarnessPermissionMode::Default
-            ]
-        );
+    fn permission_mode_commands() {
         assert_eq!(
             permission_mode_command(&["/plan"]),
             Ok(HarnessPermissionMode::Plan)

@@ -1324,11 +1324,8 @@ impl BcodeRuntimeModel {
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if action == Some("tui.agent.cycle") {
-                    // The agent cycle selects native permission modes in a managed chat.
-                    super::managed_flow::cycle_permission_mode(
-                        &mut self.chat,
-                        &mut self.loop_state,
-                    );
+                    // The agent cycle selects Bcode agents, which the native agent follows.
+                    super::managed_flow::cycle_native_agent(&mut self.chat, &mut self.loop_state);
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if action.is_some_and(managed_blocked_chat_action) {
@@ -2388,6 +2385,13 @@ impl BcodeRuntimeModel {
     }
 
     fn stage_root_submission(&mut self, placement: bcode_ipc::PromptPlacement) {
+        let pending = self.chat.app.composer().text().to_owned();
+        if super::managed_flow::answer_open_question(&mut self.chat, &mut self.loop_state, &pending)
+        {
+            self.chat.app.replace_composer_with("");
+            self.draft_autosave.mark_dirty_now();
+            return;
+        }
         let launch_working_directory = self.settings.launch_working_directory().to_path_buf();
         match super::composer_flow::stage_root_submission(
             &launch_working_directory,
@@ -3743,10 +3747,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     && self.settings.keymap().action("chat", *stroke) == Some("tui.agent.cycle")
                     && !self.loop_state.modal_foreground()
                 {
-                    super::managed_flow::cycle_permission_mode(
-                        &mut self.chat,
-                        &mut self.loop_state,
-                    );
+                    super::managed_flow::cycle_native_agent(&mut self.chat, &mut self.loop_state);
                     return Ok(bmux_tui_runtime::Update::redraw());
                 }
                 if self.chat.app.managed_execution_session().is_some()
@@ -7624,19 +7625,11 @@ mod tests {
             ));
             let effects = model.chat.pending_effects.drain_runtime().0;
             match key {
-                // The agent cycle selects the next native permission mode only.
+                // The agent cycle selects Bcode agents; until they load, it only asks the host
+                // for them and changes nothing.
                 bmux_keyboard::KeyCode::F(6) => assert!(matches!(
                     &effects[..],
-                    [(
-                        _,
-                        crate::effects::TuiEffect::ConfigureManagedSession {
-                            generation: 1,
-                            setting: bcode_harness_models::HarnessSessionSetting::PermissionMode {
-                                mode: bcode_harness_models::HarnessPermissionMode::AcceptEdits
-                            },
-                            ..
-                        }
-                    )]
+                    [(_, crate::effects::TuiEffect::LoadAgentCatalog)]
                 )),
                 // Host navigation may load host data, never model or plugin execution.
                 bmux_keyboard::KeyCode::F(8) => assert!(

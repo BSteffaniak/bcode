@@ -194,6 +194,7 @@ fn policy(context: &NativeServiceContext) -> ServiceResponse {
                 accent: None,
                 aliases: vec![],
                 is_default: true,
+                read_only: false,
             }],
         })
     } else if context.request.operation == bcode_agent_profile::OP_RESOLVE_POLICY_PROFILE_IDENTITY {

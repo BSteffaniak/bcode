@@ -135,6 +135,16 @@ impl NativeActivity {
         self.update(session, SessionActivity::settle);
     }
 
+    /// Whether `session` has a native foreground turn running, so new input must wait for it.
+    /// A poisoned tracker cannot prove the turn ended.
+    pub fn foreground(&self, session: SessionId) -> bool {
+        self.sessions.lock().map_or(true, |sessions| {
+            sessions
+                .get(&session)
+                .is_some_and(|activity| activity.foreground)
+        })
+    }
+
     /// Number of managed sessions with live foreground or unsettled background work.
     #[must_use]
     pub fn busy_sessions(&self) -> usize {
@@ -194,6 +204,28 @@ mod tests {
                 notification: bcode_harness_models::HarnessNotificationState::Unknown,
             },
         })
+    }
+
+    #[test]
+    fn foreground_turn_holds_new_input_until_its_result_arrives() {
+        let activity = NativeActivity::default();
+        let session = SessionId::new();
+        let other = SessionId::new();
+        let caps = capabilities(HarnessSupportLevel::Supported);
+        assert!(!activity.foreground(session));
+        activity.submitted(session);
+        assert!(activity.foreground(session));
+        assert!(!activity.foreground(other));
+        activity.observed(
+            session,
+            &caps,
+            &[observation(HarnessObservationKind::Result {
+                text: "done".into(),
+            })],
+        );
+        // Awaiting settlement or background work does not hold the next message.
+        assert!(!activity.foreground(session));
+        assert_eq!(activity.busy_sessions(), 1);
     }
 
     #[test]
