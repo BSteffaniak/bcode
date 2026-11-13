@@ -386,7 +386,8 @@ fn scan(
             reach: 0,
         });
         let min = usize::try_from(inputs[leader].group.min).unwrap_or(usize::MAX);
-        if members.len() >= min.max(2) {
+        let floor = usize::try_from(crate::models::MIN_GROUP_SIZE).unwrap_or(1);
+        if members.len() >= min.max(floor) {
             groups.push(build_group(inputs, members, bridged, attached));
         }
         position = last + 1;

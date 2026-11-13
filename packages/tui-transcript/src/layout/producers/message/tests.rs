@@ -478,6 +478,7 @@ fn header_fields_summary_templates_spacing_and_indent_apply() {
         presentation.disclosure = Disclosure::Summary;
         presentation.header = Some(HeaderSpec {
             fields: vec!["marker".to_owned(), "label".to_owned(), "status".to_owned()],
+            template: None,
         });
         presentation.summary = SummarySpec {
             source: vec![SummarySource::Template],

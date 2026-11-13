@@ -145,7 +145,7 @@ icons     = "nerd"          # none | unicode | nerd
 density   = "comfortable"   # compact | cozy | comfortable
 separators = { status = "powerline" }   # plain | bar | slant | powerline
 speaker   = "gutter"        # prefix | badge | bar | gutter | marker
-markers   = { user = "›", assistant = "•" }   # glyphs of the marker treatment
+markers   = { user = "›", assistant = "•", bullet = "●", connector = "└" }
 follow    = "reply"         # reply | latest: what stays in view as replies arrive
 surfaces  = "layered"       # flat | layered
 motion    = "subtle"        # none | subtle | full
@@ -397,6 +397,25 @@ set   = { disclosure = "collapsed", reveal = ["running", "waiting", "failed", "t
 * `spacing` — `{ before, after }` blank rows, each 0..=2. Default `{ before = 0, after = 1 }`.
 * `indent` — extra columns, 0..=8; members inside an expanded group get the group's indent plus
   two columns.
+
+* `header.template` — a header row from a template instead of `fields`: the same registered
+  names in braces, other text literal, at most 256 bytes. Template headers place fields with no
+  joiner and style each field by its role: `bullet` and `icon` by the unit's status title,
+  `tool` and `label` by `tool.label`, `target` by `tool.argument`, `count` by `tool.count`
+  (bold `tool.metadata` when unset), and everything else, literals included, by
+  `tool.metadata`.
+* Header fields added for templates and field lists: `bullet` (the `markers.bullet` glyph in
+  the status title style), `elapsed` (a finished unit's bare duration, `1.5s`), and, for groups,
+  `plural` (`s` unless the group has one member).
+* `display_name` — the name `{tool}` presents (at most 64 bytes); unset presents the tool name.
+* `section_labels` — `rows` (default) gives each section a label row; `connector` drops label
+  rows and paints the `markers.connector` glyph before the first body row, with every body row
+  hanging after it. Paint, hit regions, and source mapping share the hanging column; where the
+  connector does not fit, it is not painted.
+* `hidden_marker` — `false` makes a hidden unit leave no count marker row. The visibility floor
+  still keeps decisions and failures visible.
+* `group.min` may be 1: a run of one unit is presented through its group header, so a group
+  header template can phrase single calls (`Read {count} file{plural}`). Unset, `min` is 2.
 
 All properties merge per property (later rules win). `sections` merge per section and per field.
 

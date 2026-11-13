@@ -17,10 +17,62 @@ icons         = "unicode"
 motion        = "subtle"
 separators    = { status = "plain" }
 session_start = "hidden"
-markers       = { user = "❯", assistant = "⏺" }
+markers       = { user = "❯", assistant = "⏺", bullet = "⏺", connector = "⎿" }
 speaker       = "marker"
 status        = { placement = "below_composer", indent = 2 }
 surfaces      = "flat"
+
+# Tool calls: a status-colored bullet, the tool's display name, and its target in parentheses;
+# bodies hang off a connector instead of labelled sections.
+[[presentation.rules]]
+match = { kind = "tool" }
+set = { header = { template = "{bullet} {tool}({target})" }, section_labels = "connector", sections = { arguments = { visible = false } }, preview = { lines = 4, keep = "head" } }
+
+[[presentation.rules]]
+match = { kind = "tool", tool = "filesystem.read" }
+set   = { display_name = "Read" }
+
+[[presentation.rules]]
+match = { kind = "tool", tool = ["filesystem.edit", "filesystem.multi_edit"] }
+set   = { display_name = "Update" }
+
+[[presentation.rules]]
+match = { kind = "tool", tool = "filesystem.write" }
+set   = { display_name = "Write" }
+
+[[presentation.rules]]
+match = { kind = "tool", tool = "shell.run" }
+set   = { display_name = "Bash" }
+
+[[presentation.rules]]
+match = { kind = "tool", tool = ["filesystem.grep", "filesystem.find", "filesystem.list"] }
+set   = { display_name = "Search" }
+
+# Successful reads and shell commands fold into one summary row per run.
+[[presentation.rules]]
+match = { kind = "tool", tool = ["filesystem.read", "shell.run"], status = "succeeded" }
+set   = { group = { by = "same_tool", min = 1 } }
+
+[[presentation.rules]]
+match = { kind = "group" }
+set   = { disclosure = "collapsed", header = { template = "{count} {tool} call{plural}" }, indent = 2 }
+
+[[presentation.rules]]
+match = { kind = "group", tool = "filesystem.read" }
+set   = { header = { template = "Read {count} file{plural}" } }
+
+[[presentation.rules]]
+match = { kind = "group", tool = "shell.run" }
+set   = { header = { template = "Ran {count} shell command{plural}" } }
+
+# A decided permission leaves no record in the transcript.
+[[presentation.rules]]
+match = { kind = "permission" }
+set   = { disclosure = "hidden", hidden_marker = false }
+
+[[presentation.rules]]
+match = { kind = "reasoning" }
+set   = { disclosure = "collapsed", header = { template = "Thought" } }
 
 # User messages fill their rows edge to edge; no border or padding.
 [containers."transcript.user"]

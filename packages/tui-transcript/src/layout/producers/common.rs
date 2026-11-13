@@ -332,6 +332,46 @@ pub fn header_row(line: Line) -> TextBlock {
     TextBlock::new(Text::from_lines(vec![line])).wrap(TextWrap::None)
 }
 
+/// One header row from a header `template`.
+///
+/// Literal text takes `literal`; each registered header field takes the text and style `field`
+/// returns for it. Unregistered names and fields without a value render empty, and control
+/// characters render as spaces, so the row is always one line.
+#[must_use]
+pub fn template_line(
+    template: &str,
+    literal: Style,
+    field: impl Fn(&str) -> Option<(String, Style)>,
+) -> Line {
+    let single_line = |text: &str| -> String {
+        text.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect()
+    };
+    let mut spans = Vec::new();
+    for token in bcode_presentation_policy::template_parts(template) {
+        match token {
+            bcode_presentation_policy::TemplateToken::Literal(text) => {
+                spans.push(span(single_line(text), literal));
+            }
+            bcode_presentation_policy::TemplateToken::Field(name) => {
+                if bcode_presentation_policy::models::HEADER_FIELDS.contains(&name)
+                    && let Some((text, style)) = field(name)
+                {
+                    spans.push(span(single_line(&text), style));
+                }
+            }
+        }
+    }
+    Line::from_spans(spans)
+}
+
 /// A styled span (re-exported convenience for producers).
 #[must_use]
 pub fn span(text: impl Into<String>, style: Style) -> Span {
@@ -507,6 +547,69 @@ impl ItemContent for Wrapped {
                     .geometry(&child.node)
                     .translated(child.x, child.y)
             })
+    }
+}
+
+/// Inset content with a prefix line painted on its first row, in the columns before the
+/// content's child placement.
+///
+/// The prefix is painted only when it fits those columns, so it never overlaps the content: an
+/// inset [`inset`] drops at narrow widths drops the prefix with it. Geometry, events, and
+/// revisions are the inset content's.
+pub struct Prefixed {
+    inner: Box<dyn ItemContent>,
+    prefix: Line,
+}
+
+impl std::fmt::Debug for Prefixed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prefixed").finish_non_exhaustive()
+    }
+}
+
+impl Prefixed {
+    /// `content` inset by `left` columns at `width`, with `prefix` before its first row.
+    #[must_use]
+    pub fn new(content: Box<dyn ItemContent>, left: u64, width: u64, prefix: Line) -> Self {
+        Self {
+            inner: inset(content, LogicalInsets::new(0, 0, 0, left), width),
+            prefix,
+        }
+    }
+}
+
+impl Component for Prefixed {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        self.inner.layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.inner.paint(layout, cx);
+        let Some(child) = layout.children.first() else {
+            return;
+        };
+        let width = u64::try_from(self.prefix.width()).unwrap_or(u64::MAX);
+        if width == 0 || width > child.x {
+            return;
+        }
+        let (Ok(columns), Ok(row)) = (u16::try_from(child.x), i64::try_from(child.y)) else {
+            return;
+        };
+        cx.write_line(LocalRect::new(0, row, columns, 1), &self.prefix);
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        self.inner.event(event, layout, cx)
+    }
+
+    fn revision(&self) -> ComponentRevision {
+        self.inner.revision()
+    }
+}
+
+impl ItemContent for Prefixed {
+    fn geometry(&self, layout: &LayoutNode) -> ItemGeometry {
+        self.inner.geometry(layout)
     }
 }
 

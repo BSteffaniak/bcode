@@ -80,6 +80,9 @@ pub fn hash_presentation(presentation: &ResolvedPresentation, state: &mut impl H
     presentation.summary.hash(state);
     presentation.spacing.hash(state);
     presentation.indent.hash(state);
+    presentation.display_name.hash(state);
+    presentation.section_labels.hash(state);
+    presentation.hidden_marker.hash(state);
     presentation.plugin.hash(state);
 }
 

@@ -244,13 +244,17 @@ pub enum FollowPolicy {
     Latest,
 }
 
-/// Glyphs of the `marker` speaker treatment; `None` uses the renderer's default.
+/// Marker glyphs; `None` uses the renderer's default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MessageMarkers {
-    /// Before user messages.
+pub struct MarkerGlyphs {
+    /// Before user messages (the `marker` speaker treatment).
     pub user: Option<ChromeText>,
-    /// Before assistant messages.
+    /// Before assistant messages (the `marker` speaker treatment).
     pub assistant: Option<ChromeText>,
+    /// The `bullet` header field, styled by the unit's status.
+    pub bullet: Option<ChromeText>,
+    /// Before the first body row of units whose `section_labels` is `connector`.
+    pub connector: Option<ChromeText>,
 }
 
 /// The input composer's chrome.
@@ -309,7 +313,7 @@ pub struct TuiChrome {
     /// The input composer.
     pub composer: ComposerChrome,
     /// Speaker marker glyphs.
-    pub markers: MessageMarkers,
+    pub markers: MarkerGlyphs,
     /// What the transcript keeps in view as replies arrive.
     pub follow: FollowPolicy,
 }
@@ -375,6 +379,10 @@ pub(crate) struct RawMarkers {
     pub user: Option<ChromeText>,
     #[serde(default)]
     pub assistant: Option<ChromeText>,
+    #[serde(default)]
+    pub bullet: Option<ChromeText>,
+    #[serde(default)]
+    pub connector: Option<ChromeText>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -484,6 +492,12 @@ impl RawTuiChrome {
             }
             if markers.assistant.is_some() {
                 target.assistant = markers.assistant;
+            }
+            if markers.bullet.is_some() {
+                target.bullet = markers.bullet;
+            }
+            if markers.connector.is_some() {
+                target.connector = markers.connector;
             }
         }
         if let Some(composer) = &other.composer {

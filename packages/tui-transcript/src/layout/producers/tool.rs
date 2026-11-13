@@ -42,8 +42,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bcode_presentation_policy::models::{
-    DEFAULT_UNIT_HEADER, Disclosure, Preview, PreviewKeep, ResolvedPresentation, SummarySource,
-    UnitFacts, UnitStatus,
+    DEFAULT_UNIT_HEADER, Disclosure, Preview, PreviewKeep, ResolvedPresentation, SectionLabels,
+    SummarySource, UnitFacts, UnitStatus,
 };
 use bcode_presentation_policy::{host_defaults, render_summary_template};
 use bcode_session_models::ToolContributionPlacement;
@@ -89,6 +89,8 @@ const SUMMARY_SECTIONS: [&str; 3] = ["output", "result", "visual"];
 const DIFF_SNIFF_LINES: usize = 64;
 /// Columns section label rows are indented inside the unit.
 const LABEL_INDENT: u64 = 2;
+/// [`LABEL_INDENT`] as a repeat count.
+const LABEL_INDENT_CELLS: usize = 2;
 /// Columns section bodies are indented inside the unit.
 const BODY_INDENT: u64 = 4;
 
@@ -115,6 +117,8 @@ pub struct HeaderData {
     pub timing: Option<String>,
     /// Start of a running call, for the elapsed paint slot.
     pub started_at_ms: Option<u64>,
+    /// Duration of a finished call (`elapsed` field).
+    pub duration_ms: Option<u64>,
     /// Producer title replacing the `label`, `tool`, `status` and `title` fields (plugin
     /// transcript-block visuals).
     pub title_override: Option<String>,
@@ -432,6 +436,13 @@ const fn invocation_status(tool: &ToolInvocationView) -> UnitStatus {
     }
 }
 
+/// Duration of a finished call.
+fn finished_duration(timing: &ToolTimingView) -> Option<u64> {
+    timing
+        .duration_ms
+        .or_else(|| Some(timing.finished_at_ms?.saturating_sub(timing.started_at_ms?)))
+}
+
 /// Static timing phrase: `timed out`, `timeout 10s` while active (or never finished), and
 /// `duration 42ms` once finished. Elapsed time is a paint slot, never laid out (L5).
 pub(super) fn timing_text(timing: &ToolTimingView, active: bool) -> Option<String> {
@@ -444,13 +455,8 @@ pub(super) fn timing_text(timing: &ToolTimingView, active: bool) -> Option<Strin
     {
         parts.push(format!("timeout {}", common::elapsed_label(timeout_ms)));
     }
-    if !active {
-        let duration = timing
-            .duration_ms
-            .or_else(|| Some(timing.finished_at_ms?.saturating_sub(timing.started_at_ms?)));
-        if let Some(duration) = duration {
-            parts.push(format!("duration {}", common::elapsed_label(duration)));
-        }
+    if !active && let Some(duration) = finished_duration(timing) {
+        parts.push(format!("duration {}", common::elapsed_label(duration)));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
@@ -601,6 +607,7 @@ fn invocation_anatomy(
             title: None,
             timing: timing_text(&tool.timing, active),
             started_at_ms: tool.timing.started_at_ms.filter(|_| active),
+            duration_ms: finished_duration(&tool.timing).filter(|_| !active),
             ..HeaderData::default()
         },
         summary: None,
@@ -772,6 +779,7 @@ fn permission_anatomy(permission: &PermissionView, facts: Option<&UnitFacts>) ->
             title: permission.title.clone(),
             timing: None,
             started_at_ms: None,
+            duration_ms: None,
             ..HeaderData::default()
         },
         summary: None,
@@ -854,6 +862,7 @@ fn interaction_anatomy(
             title: interaction.title.clone(),
             timing: None,
             started_at_ms: None,
+            duration_ms: None,
             ..HeaderData::default()
         },
         summary: None,
@@ -1017,7 +1026,52 @@ struct Composer<'a> {
     item: &'a TranscriptViewItemId,
     /// Columns the unit's shell screen is scrolled by (C39).
     shell_columns: u64,
+    /// Section presentation: label rows, or a connector before the first body row.
+    connector: Option<Connector>,
 }
+
+/// The connector of a unit whose `section_labels` is `connector`.
+struct Connector {
+    /// Painted before the first body row; taken by the first body pushed.
+    pending: Option<Line>,
+    /// Columns every body row hangs at.
+    indent: u64,
+}
+
+impl Connector {
+    /// The connector glyph after the label indent with two cells before the body.
+    fn new(theme: &ResolvedThemeDefinition) -> Self {
+        let glyph = theme
+            .chrome
+            .markers
+            .connector
+            .as_ref()
+            .map_or(DEFAULT_CONNECTOR, |glyph| glyph.as_str());
+        let text = format!("{}{glyph}  ", " ".repeat(LABEL_INDENT_CELLS));
+        let line = Line::from_spans(vec![common::span(text, role_style(theme, "tool.metadata"))]);
+        let indent = u64::try_from(line.width()).unwrap_or(BODY_INDENT);
+        Self {
+            pending: Some(line),
+            indent,
+        }
+    }
+}
+
+/// Values of a tool header that both field and template headers present.
+struct HeaderValues {
+    /// The display name, else the tool name (`tool`).
+    tool_name: Option<String>,
+    /// The theme's bullet glyph (`bullet`).
+    bullet: String,
+    /// Duration of a finished call (`elapsed`).
+    elapsed_text: Option<String>,
+}
+
+/// Connector glyph when the theme sets none.
+pub const DEFAULT_CONNECTOR: &str = "└";
+
+/// Header bullet glyph when the theme sets none.
+pub const DEFAULT_BULLET: &str = "●";
 
 impl Composer<'_> {
     fn style(&self, role: &str) -> Style {
@@ -1036,6 +1090,28 @@ impl Composer<'_> {
         self.push(Box::new(common::header_row(line)), left);
     }
 
+    /// Columns body rows start at: `rows_indent` under label rows, or the connector's.
+    fn body_indent(&self, rows_indent: u64) -> u64 {
+        self.connector
+            .as_ref()
+            .map_or(rows_indent, |connector| connector.indent)
+    }
+
+    /// Push body content at its indent; under a connector, the first body pushed carries it.
+    fn push_body(&mut self, content: Box<dyn ItemContent>, rows_indent: u64) {
+        let left = self.body_indent(rows_indent);
+        match self
+            .connector
+            .as_mut()
+            .and_then(|connector| connector.pending.take())
+        {
+            Some(prefix) => self.stack.push(Box::new(common::Prefixed::new(
+                content, left, self.width, prefix,
+            ))),
+            None => self.push(content, left),
+        }
+    }
+
     fn hidden_marker(&mut self) {
         let text = common::hidden_marker_text(1, self.theme.chrome.icons);
         let line = Line::from_spans(vec![common::span(text, self.style("tool.metadata"))]);
@@ -1050,6 +1126,47 @@ impl Composer<'_> {
         target: DisclosureTarget,
         collapsible: bool,
     ) {
+        if let Some(template) = presentation
+            .header
+            .as_ref()
+            .and_then(|header| header.template.as_deref())
+        {
+            self.template_header(
+                template,
+                header,
+                presentation,
+                disclosure,
+                target,
+                collapsible,
+            );
+            return;
+        }
+        let (marker, segments, elapsed) = self.field_segments(header, presentation, disclosure);
+        let activity = ActivitySlots {
+            spinner: header.active(),
+            elapsed_from: header.started_at_ms.filter(|_| elapsed && header.active()),
+        };
+        let line = marker_header_line(
+            marker,
+            segments,
+            self.width
+                .saturating_sub(activity.reserved_cells(self.width)),
+        );
+        self.stack.push(Box::new(
+            DisclosureRow::new(common::header_row(line), Some(target))
+                .interactive(collapsible)
+                .with_activity(activity),
+        ));
+    }
+
+    /// The leading marker, header segments, and whether the elapsed slot is shown, for a
+    /// field-list header.
+    fn field_segments(
+        &self,
+        header: &HeaderData,
+        presentation: &ResolvedPresentation,
+        disclosure: Disclosure,
+    ) -> (Option<(&'static str, Style)>, Vec<HeaderSegment>, bool) {
         let icons = self.theme.chrome.icons;
         let meta = self.style("tool.metadata");
         let title = self.style(&status_title_role(header.status, header.is_error));
@@ -1057,6 +1174,11 @@ impl Composer<'_> {
         let title_style = title;
         let overridden = header.title_override.is_some();
         let timing_visible = presentation.part_visible("timing");
+        let HeaderValues {
+            tool_name,
+            bullet,
+            elapsed_text,
+        } = self.header_values(header, presentation);
         let fields: Vec<&str> = presentation.header.as_ref().map_or_else(
             || DEFAULT_UNIT_HEADER.to_vec(),
             |header| header.fields.iter().map(String::as_str).collect(),
@@ -1078,6 +1200,7 @@ impl Composer<'_> {
                     title,
                     5,
                 )),
+                "bullet" => segments.push(HeaderSegment::required(bullet.clone(), title)),
                 "label" => {
                     if let Some(title) = &header.title_override {
                         segments.push(
@@ -1093,7 +1216,7 @@ impl Composer<'_> {
                 }
                 "tool" | "status" | "title" if overridden => {}
                 "tool" => {
-                    if let Some(tool) = &header.tool {
+                    if let Some(tool) = &tool_name {
                         segments.push(HeaderSegment::required(tool.clone(), title).truncatable());
                     }
                 }
@@ -1120,19 +1243,91 @@ impl Composer<'_> {
                         segments.push(HeaderSegment::optional(timing.clone(), meta, 1));
                     }
                 }
+                "elapsed" if timing_visible => {
+                    elapsed = true;
+                    if let Some(text) = &elapsed_text {
+                        segments.push(HeaderSegment::optional(text.clone(), meta, 1));
+                    }
+                }
                 _ => {}
             }
         }
+        (marker, segments, elapsed)
+    }
+
+    /// Header values shared by field and template headers.
+    fn header_values(
+        &self,
+        header: &HeaderData,
+        presentation: &ResolvedPresentation,
+    ) -> HeaderValues {
+        HeaderValues {
+            tool_name: presentation
+                .display_name
+                .clone()
+                .or_else(|| header.tool.clone()),
+            bullet: self
+                .theme
+                .chrome
+                .markers
+                .bullet
+                .as_ref()
+                .map_or(DEFAULT_BULLET, |glyph| glyph.as_str())
+                .to_owned(),
+            elapsed_text: header.duration_ms.map(common::elapsed_label),
+        }
+    }
+
+    /// A header row from the presentation's header `template`, each field in its role.
+    fn template_header(
+        &mut self,
+        template: &str,
+        header: &HeaderData,
+        presentation: &ResolvedPresentation,
+        disclosure: Disclosure,
+        target: DisclosureTarget,
+        collapsible: bool,
+    ) {
+        let icons = self.theme.chrome.icons;
+        let meta = self.style("tool.metadata");
+        let title = self.style(&status_title_role(header.status, header.is_error));
+        let label_style = self.style("tool.label");
+        let timing_visible = presentation.part_visible("timing");
+        let HeaderValues {
+            tool_name,
+            bullet,
+            elapsed_text,
+        } = self.header_values(header, presentation);
+        let field = |name: &str| -> Option<(String, Style)> {
+            match name {
+                "marker" => Some((
+                    common::disclosure_marker(disclosure, icons).to_owned(),
+                    meta,
+                )),
+                "bullet" => Some((bullet.clone(), title)),
+                "icon" => Some((common::status_glyph(header.status, icons).to_owned(), title)),
+                "label" => header
+                    .title_override
+                    .clone()
+                    .or_else(|| header.label.clone())
+                    .map(|text| (sanitize(&text), label_style)),
+                "tool" => tool_name.clone().map(|text| (sanitize(&text), label_style)),
+                "target" => header
+                    .target
+                    .as_ref()
+                    .map(|text| (sanitize(text), self.style("tool.argument"))),
+                "title" => header.title.as_ref().map(|text| (sanitize(text), meta)),
+                "status" => header.status_text.clone().map(|text| (text, meta)),
+                "timing" if timing_visible => header.timing.clone().map(|text| (text, meta)),
+                "elapsed" if timing_visible => elapsed_text.clone().map(|text| (text, meta)),
+                _ => None,
+            }
+        };
+        let line = common::template_line(template, meta, field);
         let activity = ActivitySlots {
             spinner: header.active(),
-            elapsed_from: header.started_at_ms.filter(|_| elapsed && header.active()),
+            elapsed_from: None,
         };
-        let line = marker_header_line(
-            marker,
-            segments,
-            self.width
-                .saturating_sub(activity.reserved_cells(self.width)),
-        );
         self.stack.push(Box::new(
             DisclosureRow::new(common::header_row(line), Some(target))
                 .interactive(collapsible)
@@ -1142,8 +1337,13 @@ impl Composer<'_> {
 
     fn summary(&mut self, summary: Option<String>) {
         if let Some(summary) = summary {
-            let line = Line::from_spans(vec![common::span(summary, self.style("tool.metadata"))]);
-            self.clipped_line(line, LABEL_INDENT);
+            let style = if self.connector.is_some() {
+                self.style("tool.output")
+            } else {
+                self.style("tool.metadata")
+            };
+            let line = Line::from_spans(vec![common::span(summary, style)]);
+            self.push_body(Box::new(common::header_row(line)), LABEL_INDENT);
         }
     }
 
@@ -1194,24 +1394,30 @@ impl Composer<'_> {
         let count: usize = run.iter().map(|section| section.body.row_count()).sum();
         let unit = if count == 1 { "row" } else { "rows" };
         let marker = common::disclosure_marker(Disclosure::Collapsed, self.theme.chrome.icons);
-        self.label_row(
-            vec![
-                common::span(format!("{marker} "), meta),
-                common::span(label, self.style("tool.label")),
-                common::span(format!(" · {count} {unit}"), meta),
-            ],
-            Some(self.section_target(name)),
-        );
+        let spans = vec![
+            common::span(format!("{marker} "), meta),
+            common::span(label, self.style("tool.label")),
+            common::span(format!(" · {count} {unit}"), meta),
+        ];
+        if self.connector.is_some() {
+            let row = DisclosureRow::new(
+                common::header_row(Line::from_spans(spans)),
+                Some(self.section_target(name)),
+            );
+            self.push_body(Box::new(row), LABEL_INDENT);
+        } else {
+            self.label_row(spans, Some(self.section_target(name)));
+        }
         if disclosure == Disclosure::Summary
             && let Some(line) = run.iter().find_map(|section| section.body.first_line())
         {
             let line = Line::from_spans(vec![common::span(line, self.style("tool.output"))]);
-            self.clipped_line(line, BODY_INDENT);
+            self.push_body(Box::new(common::header_row(line)), BODY_INDENT);
         }
     }
 
     fn expanded_section(&mut self, section: Section, first: bool, preview: Preview) {
-        if let Some(label) = &section.label {
+        if let Some(label) = section.label.as_ref().filter(|_| self.connector.is_none()) {
             let marker = common::disclosure_marker(Disclosure::Expanded, self.theme.chrome.icons);
             let mut spans = Vec::new();
             if first {
@@ -1245,7 +1451,7 @@ impl Composer<'_> {
                     common::span(sanitize(&text), self.style(role.role())),
                 ])]))
                 .wrap(TextWrap::Word);
-                self.push(Box::new(VisualRows::new(block)), LABEL_INDENT);
+                self.push_body(Box::new(VisualRows::new(block)), LABEL_INDENT);
             }
             SectionBody::Diff { text } => self.diff_body(&label, &text, preview),
             SectionBody::Rows {
@@ -1264,7 +1470,7 @@ impl Composer<'_> {
                 common::span(format!("… {hidden} {label} rows hidden …"), style),
             ])]))
             .wrap(TextWrap::Word);
-            self.push(Box::new(block), BODY_INDENT);
+            self.push_body(Box::new(block), BODY_INDENT);
         }
     }
 
@@ -1274,9 +1480,10 @@ impl Composer<'_> {
         let (ranges, hidden) = preview_ranges(lines.len(), preview);
         // A shell screen scrolls horizontally on its own (C39), by at most the columns its
         // widest shown line overflows the body.
+        let indent = self.body_indent(BODY_INDENT);
         let scroll = shell.map(|_| {
-            let body = if self.width > BODY_INDENT {
-                self.width - BODY_INDENT
+            let body = if self.width > indent {
+                self.width - indent
             } else {
                 self.width
             };
@@ -1328,7 +1535,7 @@ impl Composer<'_> {
                 ),
                 _ => content,
             };
-            self.push(content, BODY_INDENT);
+            self.push_body(content, BODY_INDENT);
         }
         self.hidden_rows(label, hidden);
     }
@@ -1343,7 +1550,7 @@ impl Composer<'_> {
                 .map(|(_, line)| Line::from_spans(vec![common::span(sanitize(line), style)]))
                 .collect::<Vec<_>>();
             let block = TextBlock::new(Text::from_lines(rows)).wrap(TextWrap::None);
-            self.push(Box::new(VisualRows::new(block)), BODY_INDENT);
+            self.push_body(Box::new(VisualRows::new(block)), BODY_INDENT);
         }
         self.hidden_rows(label, hidden);
     }
@@ -1379,7 +1586,7 @@ impl Composer<'_> {
                     Line::from_spans(vec![common::span(sanitize(line), self.diff_style(line))])
                 })
                 .collect::<Vec<_>>();
-            self.push(
+            self.push_body(
                 Box::new(
                     SourceText::from_lines(
                         rows,
@@ -1553,6 +1760,8 @@ pub fn compose(
         theme,
         item,
         shell_columns: cx.shell_columns,
+        connector: (presentation.section_labels == SectionLabels::Connector)
+            .then(|| Connector::new(theme)),
     };
     let disclosure = cx.disclosure.disclosure;
     let target = cx

@@ -45,30 +45,41 @@ pub const MAX_SUMMARY_TEMPLATE_BYTES: usize = 256;
 pub const MAX_SPACING: u8 = 2;
 /// Largest accepted extra indent, in columns.
 pub const MAX_INDENT: u8 = 8;
-/// Smallest run of units that forms a group.
-pub const MIN_GROUP_SIZE: u32 = 2;
+/// Smallest run of units that may form a group: a group of one presents a single unit through
+/// its group's header.
+pub const MIN_GROUP_SIZE: u32 = 1;
+/// Smallest run that forms a group when a rule does not set `min`.
+pub const DEFAULT_GROUP_SIZE: u32 = 2;
+/// Longest display name, in bytes.
+pub const MAX_DISPLAY_NAME_BYTES: usize = 64;
 
 /// Registered unit and group header field names.
-pub const HEADER_FIELDS: [&str; 10] = [
-    "marker", "icon", "label", "tool", "target", "status", "timing", "count", "title", "tools",
+pub const HEADER_FIELDS: [&str; 13] = [
+    "marker", "bullet", "icon", "label", "tool", "target", "status", "timing", "elapsed", "count",
+    "plural", "title", "tools",
 ];
 /// Header fields that apply to non-group units.
-pub const UNIT_HEADER_FIELDS: [&str; 9] = [
-    "marker", "icon", "label", "tool", "target", "status", "timing", "count", "title",
+pub const UNIT_HEADER_FIELDS: [&str; 11] = [
+    "marker", "bullet", "icon", "label", "tool", "target", "status", "timing", "elapsed", "count",
+    "title",
 ];
 /// Header fields that apply to group units.
-pub const GROUP_HEADER_FIELDS: [&str; 5] = ["marker", "count", "tools", "status", "timing"];
+pub const GROUP_HEADER_FIELDS: [&str; 9] = [
+    "marker", "bullet", "count", "plural", "tool", "tools", "status", "timing", "elapsed",
+];
 /// Header used for non-group units when no rule sets `header`.
 pub const DEFAULT_UNIT_HEADER: [&str; 5] = ["marker", "label", "tool", "status", "timing"];
 /// Header used for group units when no rule sets `header`.
 pub const DEFAULT_GROUP_HEADER: [&str; 5] = ["marker", "count", "tools", "status", "timing"];
 /// Field names that summary templates may substitute.
-pub const TEMPLATE_FIELDS: [&str; 7] = [
+pub const TEMPLATE_FIELDS: [&str; 9] = [
     "tool",
     "target",
     "status",
     "timing",
+    "elapsed",
     "count",
+    "plural",
     "title",
     "first_line",
 ];
@@ -507,14 +518,15 @@ pub enum GroupBy {
 /// Deserializes from a legacy string (`none`, `consecutive_tools`,
 /// `consecutive_same_tool`) or a `{ by, bridge, min }` table; serializes as a
 /// table. Omitted table fields take the defaults of [`GroupSpec::new`], and
-/// `min` is raised to [`MIN_GROUP_SIZE`].
+/// `min` defaults to [`DEFAULT_GROUP_SIZE`] and is raised to [`MIN_GROUP_SIZE`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct GroupSpec {
     /// Grouping key.
     pub by: GroupBy,
     /// Unit kinds that may sit between members without ending the group.
     pub bridge: Vec<UnitKind>,
-    /// Smallest run that forms a group; at least [`MIN_GROUP_SIZE`].
+    /// Smallest run that forms a group; at least [`MIN_GROUP_SIZE`]. A run of one presents
+    /// its unit through the group header.
     pub min: u32,
 }
 
@@ -526,7 +538,7 @@ impl GroupSpec {
         Self {
             by,
             bridge: Self::default_bridge(by),
-            min: MIN_GROUP_SIZE,
+            min: DEFAULT_GROUP_SIZE,
         }
     }
 
@@ -536,7 +548,7 @@ impl GroupSpec {
         Self {
             by: GroupBy::None,
             bridge: Vec::new(),
-            min: MIN_GROUP_SIZE,
+            min: DEFAULT_GROUP_SIZE,
         }
     }
 
@@ -605,7 +617,7 @@ impl<'de> Deserialize<'de> for GroupSpec {
                 bridge: table
                     .bridge
                     .unwrap_or_else(|| Self::default_bridge(table.by)),
-                min: table.min.unwrap_or(MIN_GROUP_SIZE).max(MIN_GROUP_SIZE),
+                min: table.min.unwrap_or(DEFAULT_GROUP_SIZE).max(MIN_GROUP_SIZE),
                 by: table.by,
             },
         })
@@ -678,12 +690,34 @@ impl ResolvedSection {
     }
 }
 
-/// Ordered header fields; names come from [`HEADER_FIELDS`].
+/// A unit's header: ordered fields, or a template.
+///
+/// Field names come from [`HEADER_FIELDS`]. A `template` (at most
+/// [`MAX_SUMMARY_TEMPLATE_BYTES`]) substitutes the same names in braces and replaces `fields`;
+/// renderers style each substituted field by its role and literal text as metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderSpec {
     /// Field names, in display order.
+    #[serde(default)]
     pub fields: Vec<String>,
+    /// Header template; replaces `fields` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+/// How a unit's body sections are introduced.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionLabels {
+    /// Each section has a label row (`▾ output`).
+    #[default]
+    Rows,
+    /// No label rows: a connector glyph precedes the first body row and the body hangs beside
+    /// it.
+    Connector,
 }
 
 /// Source of a unit's one-line summary.
@@ -828,6 +862,15 @@ pub struct PropertyPatch {
     /// Extra indent, in columns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent: Option<u8>,
+    /// Name presented for the unit's tool (`{tool}`); at most [`MAX_DISPLAY_NAME_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// How body sections are introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_labels: Option<SectionLabels>,
+    /// Whether a hidden unit leaves a count marker row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_marker: Option<bool>,
     /// Plugin-namespaced properties (keys contain a `.`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin: BTreeMap<String, FactValue>,
@@ -874,6 +917,15 @@ impl PropertyPatch {
         }
         if other.indent.is_some() {
             self.indent = other.indent;
+        }
+        if other.display_name.is_some() {
+            self.display_name.clone_from(&other.display_name);
+        }
+        if other.section_labels.is_some() {
+            self.section_labels = other.section_labels;
+        }
+        if other.hidden_marker.is_some() {
+            self.hidden_marker = other.hidden_marker;
         }
         self.plugin.extend(
             other
@@ -941,8 +993,21 @@ pub struct ResolvedPresentation {
     pub spacing: Spacing,
     /// Extra indent in columns, at most [`MAX_INDENT`].
     pub indent: u8,
+    /// Name presented for the unit's tool, when a rule set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// How body sections are introduced.
+    #[serde(default)]
+    pub section_labels: SectionLabels,
+    /// Whether a hidden unit leaves a count marker row.
+    #[serde(default = "default_hidden_marker")]
+    pub hidden_marker: bool,
     /// Plugin-namespaced properties.
     pub plugin: BTreeMap<String, FactValue>,
+}
+
+const fn default_hidden_marker() -> bool {
+    true
 }
 
 impl ResolvedPresentation {
@@ -1450,7 +1515,7 @@ mod tests {
             Some(GroupSpec {
                 by: GroupBy::SameProducer,
                 bridge: Vec::new(),
-                min: 2
+                min: MIN_GROUP_SIZE
             })
         );
         assert_eq!(
@@ -1604,6 +1669,9 @@ mod tests {
             summary: SummarySpec::default(),
             spacing: Spacing::default(),
             indent: 0,
+            display_name: None,
+            section_labels: SectionLabels::Rows,
+            hidden_marker: true,
             plugin: BTreeMap::new(),
         };
         assert_eq!(

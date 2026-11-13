@@ -880,67 +880,41 @@ Also rendered identically by: `bcode + claude-code-layout`.
 ```text
 ❯ Where is the picker drawn?
 
-▾ Tool result · glob · finished · duration 9ms
-  ▾ pattern
-    src/**/picker*.rs
-  ▾ output
-    src/picker.rs
-    src/picker_render.rs
+⏺ glob(src/**/picker*.rs)
+  ⎿  src/picker.rs
+     src/picker_render.rs
 
 ⏺ In src/picker_render.rs.
 
 ❯ Why does the picker lose its selection after a resize?
 
-▾ Tool result · read · finished · duration 42ms
-  ▾ path
-    src/picker.rs
-  ▾ output
-      let row = 1
-      let row = 2
-      let row = 3
-      let row = 4
-      let row = 5
-      let row = 6
-      let row = 7
-      let row = 8
-      let row = 9
-      let row = 10
-      let row = 11
-      let row = 12
-      let row = 13
-      let row = 14
+⏺ read(src/picker.rs)
+  ⎿    let row = 1
+       let row = 2
+       let row = 3
+       let row = 4
+     … 10 output rows hidden …
 
-▾ Tool result · read · finished · duration 27ms
-  ▾ path
-    src/render.rs
-  ▾ output
-      let offset = 1
-      let offset = 2
-      let offset = 3
+⏺ read(src/render.rs)
+  ⎿    let offset = 1
+       let offset = 2
+       let offset = 3
 
-▾ Tool result · grep · finished · duration 18ms
-  ▾ pattern
-    list_offset
-  ▾ output
-    src/picker.rs:88
-    src/render.rs:412
-    src/mouse.rs:57
+⏺ grep(list_offset)
+  ⎿  src/picker.rs:88
+     src/render.rs:412
+     src/mouse.rs:57
 
 ⏺ The offset is recomputed before layout, so hit rows lag one frame. I’ll move
   it after measurement.
 
-▾ Tool result · bash · failed · duration 2s
-  ▾ command
-    cargo check
-  ▾ output
-    error[E0599]: no method named `offset` found
-      --> src/picker.rs:91:18
-    error: could not compile
-  tool failed
+⏺ bash(cargo check)
+  ⎿  error[E0599]: no method named `offset` found
+       --> src/picker.rs:91:18
+     error: could not compile
+     tool failed
 
-▾ Tool · bash · running                                                        ⠋
-  ▾ command
-    cargo test picker
+⏺ bash(cargo test picker)                                                      ⠋
 
 ▾ Permission required · edit · awaiting decision                               ⠋
   ▾ new

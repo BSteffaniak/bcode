@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use bcode_presentation_policy::models::{DEFAULT_GROUP_HEADER, Spacing, UnitStatus};
+use bcode_presentation_policy::models::{DEFAULT_GROUP_HEADER, Disclosure, Spacing, UnitStatus};
 use bcode_tui_components::transcript::{
     TranscriptContainerBorder, TranscriptContainerLayout, TranscriptContainerRecipe,
     TranscriptContainerStyle, TranscriptContainerWidth,
@@ -40,7 +40,7 @@ use crate::layout::geometry::{
     SourceRows,
 };
 use crate::units::UnitKind;
-use crate::units::structure::{DisclosureTarget, ResolvedUnitPresentation};
+use crate::units::structure::{DisclosureTarget, GroupStructure, ResolvedUnitPresentation};
 
 /// Cells reserved for an elapsed label (`59m59s` plus one spare cell).
 pub const ELAPSED_CELLS: u64 = 7;
@@ -522,6 +522,26 @@ impl UnitProducer for GroupHeaderProducer {
             UnitKind::GroupHeader { members, .. } => usize::try_from(members).unwrap_or(0),
             _ => group.members.len(),
         };
+        if let Some(template) = presentation
+            .header
+            .as_ref()
+            .and_then(|header| header.template.as_deref())
+        {
+            let line = group_template_line(
+                template,
+                GroupTemplate {
+                    group,
+                    count,
+                    disclosure,
+                    meta,
+                    title,
+                    theme,
+                },
+            );
+            return ProducedItem::boxed(finish_group_header(
+                line, group, activity, width, theme, cx.width,
+            ));
+        }
         let mut marker = None;
         let mut segments = Vec::new();
         for field in fields {
@@ -567,22 +587,104 @@ impl UnitProducer for GroupHeaderProducer {
             segments,
             width.saturating_sub(activity.reserved_cells(width)),
         );
-        let row = DisclosureRow::new(common::header_row(line), Some(group.target.clone()))
-            .with_activity(activity);
-        let mut content: Box<dyn ItemContent> = Box::new(row);
-        if let Some(raised) = raised_surface(theme) {
-            content = common::framed(content, raised, width);
-        }
-        // The group's closing spacing follows its last rendered row. Rendered members (full
-        // or header rows, including members revealed in a collapsed group) carry it
-        // themselves; only a group whose header is its last row ends with it here.
-        let spacing = presentation.spacing.clamped();
-        let spacing = Spacing {
-            before: spacing.before,
-            after: if group.closes { spacing.after } else { 0 },
-        };
-        ProducedItem::boxed(place(content, spacing, presentation.indent, cx.width))
+        ProducedItem::boxed(finish_group_header(
+            line, group, activity, width, theme, cx.width,
+        ))
     }
+}
+
+/// The inputs a group header template substitutes.
+#[derive(Clone, Copy)]
+struct GroupTemplate<'a> {
+    group: &'a GroupStructure,
+    count: usize,
+    disclosure: Disclosure,
+    meta: Style,
+    title: Style,
+    theme: &'a ResolvedThemeDefinition,
+}
+
+/// A group header row from a template: `{count}` in `tool.count` (or bold metadata), `{plural}`
+/// as `s` unless the group has one member, `{tool}` as the shared tool's display name, and the
+/// other group fields as in field headers.
+fn group_template_line(template: &str, inputs: GroupTemplate<'_>) -> Line {
+    let GroupTemplate {
+        group,
+        count,
+        disclosure,
+        meta,
+        title,
+        theme,
+    } = inputs;
+    let presentation = &group.presentation;
+    let icons = theme.chrome.icons;
+    let count_style = theme
+        .style("tool.count")
+        .unwrap_or_else(|| meta.add_modifier(bmux_tui::style::Modifier::BOLD));
+    let bullet = theme
+        .chrome
+        .markers
+        .bullet
+        .as_ref()
+        .map_or(super::tool::DEFAULT_BULLET, |glyph| glyph.as_str())
+        .to_owned();
+    let timing_visible = presentation.part_visible("timing");
+    common::template_line(template, meta, |name| match name {
+        "marker" => Some((
+            common::disclosure_marker(disclosure, icons).to_owned(),
+            meta,
+        )),
+        "bullet" => Some((bullet.clone(), title)),
+        "count" => Some((count.to_string(), count_style)),
+        "plural" => Some(((if count == 1 { "" } else { "s" }).to_owned(), meta)),
+        "tool" => presentation
+            .display_name
+            .clone()
+            .or_else(|| group.facts.tool.clone())
+            .map(|tool| (tool, role_style(theme, "tool.label"))),
+        "tools" => (!group.tools.is_empty()).then(|| (tools_text(&group.tools), meta)),
+        "status" => group
+            .facts
+            .status
+            .map(|status| (status_text(status).to_owned(), meta)),
+        "timing" if timing_visible => group.duration_ms.map(|duration| {
+            (
+                format!("duration {}", common::elapsed_label(duration)),
+                meta,
+            )
+        }),
+        "elapsed" if timing_visible => group
+            .duration_ms
+            .map(|duration| (common::elapsed_label(duration), meta)),
+        _ => None,
+    })
+}
+
+/// The group header row in its surface, placed with the group's spacing and indent.
+fn finish_group_header(
+    line: Line,
+    group: &GroupStructure,
+    activity: ActivitySlots,
+    width: u64,
+    theme: &ResolvedThemeDefinition,
+    full_width: u64,
+) -> Box<dyn ItemContent> {
+    let presentation = &group.presentation;
+    let row = DisclosureRow::new(common::header_row(line), Some(group.target.clone()))
+        .with_activity(activity);
+    let mut content: Box<dyn ItemContent> = Box::new(row);
+    if let Some(raised) = raised_surface(theme) {
+        content = common::framed(content, raised, width);
+    }
+    // The group's closing spacing follows its last rendered row. Rendered members (full or
+    // header rows, including members revealed in a collapsed group) carry it themselves; only
+    // a group whose header is its last row ends with it here.
+    let spacing = presentation.spacing.clamped();
+    let spacing = Spacing {
+        before: spacing.before,
+        after: if group.closes { spacing.after } else { 0 },
+    };
+    place(content, spacing, presentation.indent, full_width)
 }
 
 /// Hidden-items marker units: `▸ N hidden` on one clipped row (A16).

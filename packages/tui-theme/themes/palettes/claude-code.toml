@@ -143,6 +143,10 @@ fg = "$red"
 [styles."tool.label"]
 modifiers = ["bold"]
 
+[styles."tool.count"]
+fg        = "$muted"
+modifiers = ["bold"]
+
 [styles."tool.argument"]
 fg = "$text"
 

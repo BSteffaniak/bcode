@@ -484,6 +484,12 @@ pub const ROLES: &[RoleSpec] = &[
         None,
     ),
     role(
+        "tool.count",
+        RoleCategory::Tool,
+        "counts in header templates; unset uses tool.metadata in bold",
+        None,
+    ),
+    role(
         "tool.metadata",
         RoleCategory::Tool,
         "tool timing and metadata",

@@ -73,10 +73,10 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 3 | Status line placement and alignment; footer row below the input | placement and indent done (`status`); segment selection open |
 | 4 | Composer: rule borders, prompt glyph, no title, placeholder and send control optional | done: `borders.composer = "rules"`, `composer`, `composer.*` roles |
 | 5 | Message markers: per-speaker prefix glyph and style, full-row user background, no heading row | done: `speaker = "marker"`, `markers`, full-width panel containers |
-| 6 | Tool header template (`{tool}({target})`), per-tool display names, status-colored marker | open |
-| 7 | Section connector (`⎿`) with hanging indent instead of section label rows | open |
-| 8 | Group summary templates with plural forms (`Read {count} file{s}`) | open |
-| 9 | Reasoning summary template with duration | open |
+| 6 | Tool header template (`{tool}({target})`), per-tool display names, status-colored marker | done: `header.template`, `display_name`, `bullet` |
+| 7 | Section connector (`⎿`) with hanging indent instead of section label rows | done: `section_labels = "connector"` |
+| 8 | Group summary templates with plural forms (`Read {count} file{s}`) | done: group `header.template`, `{plural}`, `group.min = 1` |
+| 9 | Reasoning summary template with duration | template done; reasoning duration needs activity timing in the session view (open) |
 | 10 | Turn summary row (duration and completion time) | open |
 | 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | open |
 | 12 | Activity line: placement, spinner frames, verbs, shimmer | open |
@@ -84,3 +84,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
 | 15 | Session banner | open |
 | 16 | Slash menu presentation | open |
+| 17 | Permission records disappear once decided | done: `hidden_marker = false` |
+| 18 | Plugin-drawn tool bodies (file edit card, shell screen) follow header/section presentation | open |
+| 19 | Smart punctuation off (straight quotes) | open |
+| 20 | Status line: "rows below latest" shown while following content shorter than the viewport | open (bug) |

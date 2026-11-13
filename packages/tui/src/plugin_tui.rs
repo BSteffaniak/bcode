@@ -2832,6 +2832,7 @@ library = "libcomposer_fixture.dylib"
         );
         resolved.header = Some(HeaderSpec {
             fields: vec!["marker".to_owned(), "tool".to_owned()],
+            template: None,
         });
         let plain = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
             80,

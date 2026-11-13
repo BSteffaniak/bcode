@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chrome::{
-    ComposerChrome, MAX_STATUS_INDENT, MessageMarkers, RawChrome, StatusChrome, TuiBorders,
-    TuiChrome,
+    ComposerChrome, MAX_STATUS_INDENT, MarkerGlyphs, RawChrome, StatusChrome, TuiBorders, TuiChrome,
 };
 use crate::contrast::ContrastAdjustment;
 use crate::expr::{self, ColorContext, Evaluated};
@@ -1053,9 +1052,11 @@ fn resolve_chrome(
         markers: raw
             .markers
             .as_ref()
-            .map_or_else(MessageMarkers::default, |markers| MessageMarkers {
+            .map_or_else(MarkerGlyphs::default, |markers| MarkerGlyphs {
                 user: markers.user,
                 assistant: markers.assistant,
+                bullet: markers.bullet,
+                connector: markers.connector,
             }),
         follow: raw.follow.unwrap_or_default(),
     })

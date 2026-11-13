@@ -265,3 +265,42 @@ fn nested_stacks_renumber_focus_targets_under_the_first() {
         ]
     );
 }
+
+#[test]
+fn single_member_groups_and_header_templates_phrase_runs_of_one_tool() {
+    let rules = json!([
+        { "match": { "kind": "tool" },
+          "set": { "group": { "by": "same_tool", "min": 1 } } },
+        { "match": { "kind": "group" },
+          "set": { "disclosure": "collapsed", "header": { "template": "Read {count} file{plural}" } } }
+    ]);
+    let one = Fixture::new(
+        config(rules.clone()),
+        vec![user("u"), tool("a", ToolInvocationViewStatus::Finished)],
+    );
+    let header = UnitKey::GroupHeader(id("a"));
+    assert!(one.keys().contains(&header), "{:?}", one.keys());
+    assert_eq!(one.render(&header, 40).rows[0].trim_end(), "Read 1 file");
+    let three = Fixture::new(
+        config(rules),
+        three_reads(ToolInvocationViewStatus::Finished),
+    );
+    let rendered = three.render(&header, 40);
+    assert_eq!(rendered.rows[0].trim_end(), "Read 3 files");
+    assert_eq!(
+        rendered.focus_row(&DisclosureTarget::Group(id("a"))),
+        Some(0)
+    );
+    for width in [0_u16, 1, 4, 11, 40] {
+        assert_geometry_inside(&three.render(&header, width), width);
+    }
+}
+
+#[test]
+fn groups_default_to_runs_of_two() {
+    let fixture = Fixture::new(
+        config(grouped("collapsed")),
+        vec![user("u"), tool("a", ToolInvocationViewStatus::Finished)],
+    );
+    assert!(!fixture.keys().contains(&UnitKey::GroupHeader(id("a"))));
+}

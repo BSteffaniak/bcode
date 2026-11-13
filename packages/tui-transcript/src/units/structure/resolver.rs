@@ -643,18 +643,19 @@ impl StructureResolver {
             }
             let presentation = self.effective(entry);
             let reserved_rows = self.tools.reserved_rows(entry.inline.interaction());
-            let placement = if presentation.disclosure == Disclosure::Hidden
-                && reserved_rows.is_none()
-            {
-                if self.config.reasoning_suppressed && entry.facts.kind == Some(UnitKind::Reasoning)
-                {
-                    ItemPlacement::Suppressed
+            let placement =
+                if presentation.disclosure == Disclosure::Hidden && reserved_rows.is_none() {
+                    if !presentation.hidden_marker
+                        || self.config.reasoning_suppressed
+                            && entry.facts.kind == Some(UnitKind::Reasoning)
+                    {
+                        ItemPlacement::Suppressed
+                    } else {
+                        ItemPlacement::Hidden
+                    }
                 } else {
-                    ItemPlacement::Hidden
-                }
-            } else {
-                ItemPlacement::Visible
-            };
+                    ItemPlacement::Visible
+                };
             placements.insert(entry.id.clone(), placement);
             structures.insert(
                 entry.id.clone(),

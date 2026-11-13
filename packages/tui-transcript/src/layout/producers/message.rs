@@ -672,6 +672,21 @@ fn header_text(
         let marker = (disclosure != Disclosure::Expanded).then_some(glyph);
         return (marker, message.title.clone());
     };
+    if let Some(template) = header.template.as_deref() {
+        let line = common::template_line(template, Style::new(), |name| {
+            if name == "marker" {
+                Some((glyph.to_owned(), Style::new()))
+            } else {
+                field_value(message, facts, name).map(|value| (value, Style::new()))
+            }
+        });
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        return (None, text);
+    }
     let mut marker = None;
     let mut text = String::new();
     let mut previous_marker = false;
@@ -970,7 +985,7 @@ fn heading(inputs: &ColumnInputs<'_, '_>, cx: &ItemRenderContext<'_>) -> Heading
 /// The `marker` treatment's glyph for a speaker message.
 fn marker_glyph<'a>(
     message: &Message<'_>,
-    markers: &'a bcode_tui_theme::chrome::MessageMarkers,
+    markers: &'a bcode_tui_theme::chrome::MarkerGlyphs,
 ) -> &'a str {
     if message.container == Some("transcript.user") {
         markers

@@ -1087,6 +1087,9 @@ mod presentation_tests {
             summary: bcode_presentation_policy_models::SummarySpec::default(),
             spacing: bcode_presentation_policy_models::Spacing::default(),
             indent: 0,
+            display_name: None,
+            section_labels: bcode_presentation_policy_models::SectionLabels::Rows,
+            hidden_marker: true,
             plugin: BTreeMap::new(),
         };
         let presentation = TuiVisualPresentation::from(&resolved);
@@ -1110,6 +1113,7 @@ mod presentation_tests {
         );
         resolved.header = Some(HeaderSpec {
             fields: vec!["marker".to_owned(); MAX_TUI_VISUAL_PRESENTATION_ENTRIES + 1],
+            template: None,
         });
         assert_eq!(
             TuiVisualPresentation::from(&resolved).header_fields.len(),

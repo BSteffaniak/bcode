@@ -24,11 +24,12 @@ use std::sync::Mutex;
 pub use bcode_presentation_policy_models as models;
 use models::{
     DEFAULT_REVEAL, Detail, Disclosure, FactCondition, FactMatcher, FactType, FactValue,
-    GROUP_HEADER_FIELDS, GroupSpec, HEADER_FIELDS, HOST_SECTIONS, LayerSource, MAX_INDENT,
-    MAX_PATCH_ENTRIES, MAX_PREVIEW_LINES, MAX_RULES_PER_LAYER, MAX_SUMMARY_TEMPLATE_BYTES,
-    Placement, PluginFactSchema, PluginPresentationSchemas, PluginPropertySchema, PresentationRule,
-    Preview, PreviewKeep, PropertyPatch, ResolvedPresentation, ResolvedSection, RuleLayer, Spacing,
-    SummarySpec, TEMPLATE_FIELDS, UNIT_HEADER_FIELDS, UnitFacts, UnitKind, UnitStatus,
+    GROUP_HEADER_FIELDS, GroupSpec, HEADER_FIELDS, HOST_SECTIONS, LayerSource,
+    MAX_DISPLAY_NAME_BYTES, MAX_INDENT, MAX_PATCH_ENTRIES, MAX_PREVIEW_LINES, MAX_RULES_PER_LAYER,
+    MAX_SUMMARY_TEMPLATE_BYTES, Placement, PluginFactSchema, PluginPresentationSchemas,
+    PluginPropertySchema, PresentationRule, Preview, PreviewKeep, PropertyPatch,
+    ResolvedPresentation, ResolvedSection, RuleLayer, SectionLabels, Spacing, SummarySpec,
+    TEMPLATE_FIELDS, UNIT_HEADER_FIELDS, UnitFacts, UnitKind, UnitStatus,
 };
 
 pub use grouping::{
@@ -78,6 +79,9 @@ pub fn host_defaults() -> ResolvedPresentation {
             after: 1,
         },
         indent: 0,
+        display_name: None,
+        section_labels: SectionLabels::Rows,
+        hidden_marker: true,
         plugin: BTreeMap::new(),
     }
 }
@@ -690,8 +694,11 @@ fn apply_patch(
     if patch.container.is_some() {
         presentation.container = patch.container;
     }
-    if patch.header.is_some() {
-        presentation.header = patch.header;
+    if let Some(mut header) = patch.header {
+        if let Some(template) = &mut header.template {
+            truncate_to_boundary(template, MAX_SUMMARY_TEMPLATE_BYTES);
+        }
+        presentation.header = Some(header);
     }
     if let Some(mut summary) = patch.summary {
         if let Some(template) = &mut summary.template {
@@ -704,6 +711,16 @@ fn apply_patch(
     }
     if let Some(indent) = patch.indent {
         presentation.indent = indent.min(MAX_INDENT);
+    }
+    if let Some(mut display_name) = patch.display_name {
+        truncate_to_boundary(&mut display_name, MAX_DISPLAY_NAME_BYTES);
+        presentation.display_name = Some(display_name);
+    }
+    if let Some(section_labels) = patch.section_labels {
+        presentation.section_labels = section_labels;
+    }
+    if let Some(hidden_marker) = patch.hidden_marker {
+        presentation.hidden_marker = hidden_marker;
     }
     presentation.plugin.extend(patch.plugin);
     presentation
@@ -774,6 +791,55 @@ fn invalid_rule(rule: &PresentationRule, source: &LayerSource) -> Option<String>
     None
 }
 
+/// Unknown, misplaced, or oversized header fields and templates in `rule`.
+fn header_warnings(rule: &PresentationRule) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(header) = &rule.set.header {
+        let kinds = &rule.matcher.kind.0;
+        let groups_only = !kinds.is_empty() && kinds.iter().all(|kind| *kind == UnitKind::Group);
+        let units_only = !kinds.is_empty() && !kinds.contains(&UnitKind::Group);
+        let template_fields = header
+            .template
+            .as_deref()
+            .map_or_else(Vec::new, |template| {
+                template_tokens(template)
+                    .filter_map(|token| match token {
+                        TemplateToken::Field(name) => Some(name),
+                        TemplateToken::Literal(_) => None,
+                    })
+                    .collect()
+            });
+        if header
+            .template
+            .as_ref()
+            .is_some_and(|template| template.len() > MAX_SUMMARY_TEMPLATE_BYTES)
+        {
+            warnings.push(format!(
+                "header template exceeds {MAX_SUMMARY_TEMPLATE_BYTES} bytes and is truncated"
+            ));
+        }
+        for field in header
+            .fields
+            .iter()
+            .map(String::as_str)
+            .chain(template_fields)
+        {
+            if !HEADER_FIELDS.contains(&field) {
+                warnings.push(format!("unknown header field {field:?}"));
+            } else if groups_only && !GROUP_HEADER_FIELDS.contains(&field) {
+                warnings.push(format!(
+                    "header field {field:?} does not apply to group units"
+                ));
+            } else if units_only && !UNIT_HEADER_FIELDS.contains(&field) {
+                warnings.push(format!(
+                    "header field {field:?} applies only to group units"
+                ));
+            }
+        }
+    }
+    warnings
+}
+
 fn suspicious_rule(rule: &PresentationRule, registry: &PolicyRegistry) -> Vec<String> {
     let mut warnings = Vec::new();
     for key in rule.set.plugin.keys() {
@@ -799,25 +865,7 @@ fn suspicious_rule(rule: &PresentationRule, registry: &PolicyRegistry) -> Vec<St
             }
         }
     }
-    if let Some(header) = &rule.set.header {
-        let kinds = &rule.matcher.kind.0;
-        let groups_only = !kinds.is_empty() && kinds.iter().all(|kind| *kind == UnitKind::Group);
-        let units_only = !kinds.is_empty() && !kinds.contains(&UnitKind::Group);
-        for field in &header.fields {
-            let field = field.as_str();
-            if !HEADER_FIELDS.contains(&field) {
-                warnings.push(format!("unknown header field {field:?}"));
-            } else if groups_only && !GROUP_HEADER_FIELDS.contains(&field) {
-                warnings.push(format!(
-                    "header field {field:?} does not apply to group units"
-                ));
-            } else if units_only && !UNIT_HEADER_FIELDS.contains(&field) {
-                warnings.push(format!(
-                    "header field {field:?} applies only to group units"
-                ));
-            }
-        }
-    }
+    warnings.extend(header_warnings(rule));
     if let Some(template) = rule
         .set
         .summary
@@ -925,9 +973,9 @@ fn floor_crossings(rule: &PresentationRule) -> Vec<String> {
 /// Longest placeholder name recognized in a summary template.
 const MAX_TEMPLATE_FIELD_NAME: usize = 32;
 
-/// One piece of a summary template.
+/// One piece of a header or summary template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TemplateToken<'a> {
+pub enum TemplateToken<'a> {
     /// Text copied as is.
     Literal(&'a str),
     /// A `{name}` placeholder.
@@ -984,6 +1032,20 @@ fn push_single_line(out: &mut String, text: &str) -> bool {
     true
 }
 
+/// The literals and `{name}` placeholders of a header or summary `template`.
+///
+/// Reads at most [`MAX_SUMMARY_TEMPLATE_BYTES`]. A placeholder name is 1 to 32 ASCII letters,
+/// digits, or underscores; any other brace is literal text. Renderers substitute registered
+/// names and render other names empty, as [`render_summary_template`] does.
+#[must_use]
+pub fn template_parts(template: &str) -> Vec<TemplateToken<'_>> {
+    let mut end = template.len().min(MAX_SUMMARY_TEMPLATE_BYTES);
+    while !template.is_char_boundary(end) {
+        end -= 1;
+    }
+    template_tokens(&template[..end]).collect()
+}
+
 /// Render a summary `template`, substituting `{name}` placeholders.
 ///
 /// Only registered names ([`TEMPLATE_FIELDS`]) substitute; unregistered names
@@ -1033,6 +1095,9 @@ fn set_properties(patch: &PropertyPatch) -> Vec<String> {
         (patch.summary.is_some(), "summary"),
         (patch.spacing.is_some(), "spacing"),
         (patch.indent.is_some(), "indent"),
+        (patch.display_name.is_some(), "display_name"),
+        (patch.section_labels.is_some(), "section_labels"),
+        (patch.hidden_marker.is_some(), "hidden_marker"),
     ] {
         if set {
             properties.push(name.to_owned());
@@ -1599,6 +1664,38 @@ mod tests {
         let truncated = resolved.summary.template.unwrap();
         assert_eq!(truncated.len(), MAX_SUMMARY_TEMPLATE_BYTES);
         assert!(template.starts_with(&truncated));
+    }
+
+    #[test]
+    fn header_templates_validate_field_names_and_display_names_are_bounded() {
+        let long = "é".repeat(MAX_DISPLAY_NAME_BYTES);
+        let (policy, diagnostics) = CompiledPolicy::compile(
+            &[layer(
+                LayerSource::Config,
+                &format!(
+                    "[[rules]]\nset = {{ header = {{ template = \"{{bullet}} {{tool}}({{target}}) {{nope}}\" }}, display_name = {long:?}, section_labels = \"connector\", hidden_marker = false }}"
+                ),
+            )],
+            &PolicyRegistry::default(),
+        );
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(messages, ["unknown header field \"nope\""]);
+        let resolved = policy.resolve(&tool("x", UnitStatus::Running));
+        let name = resolved.display_name.expect("display name");
+        assert!(name.len() <= MAX_DISPLAY_NAME_BYTES && long.starts_with(&name));
+        assert_eq!(resolved.section_labels, SectionLabels::Connector);
+        assert!(!resolved.hidden_marker);
+        assert_eq!(
+            template_parts("{bullet} {tool}"),
+            [
+                TemplateToken::Field("bullet"),
+                TemplateToken::Literal(" "),
+                TemplateToken::Field("tool")
+            ]
+        );
     }
 
     #[test]

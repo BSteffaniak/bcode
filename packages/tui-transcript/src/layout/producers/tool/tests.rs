@@ -651,3 +651,92 @@ fn producers_are_pure_in_unit_and_context() {
     assert_eq!(first.geometry, second.geometry);
     assert_eq!(first.key, UnitKey::Item(id("t")));
 }
+
+#[test]
+fn header_templates_render_display_names_bullets_and_literals_without_joiners() {
+    let rules = json!([{
+        "match": { "kind": "tool", "tool": "read" },
+        "set": { "display_name": "Read", "header": { "template": "{bullet} {tool}({status})" } }
+    }]);
+    let mut fixture = single(config(rules), read_with("first"));
+    fixture.render.theme = theme_with(|theme| {
+        theme.chrome.markers.bullet = bcode_tui_theme::chrome::ChromeText::new("⏺");
+        theme.styles.insert(
+            "tool.succeeded.title".to_owned(),
+            Style::new().fg(bmux_tui::style::Color::Green),
+        );
+        theme.styles.insert(
+            "tool.label".to_owned(),
+            Style::new().add_modifier(bmux_tui::style::Modifier::BOLD),
+        );
+    });
+    let rendered = fixture.render_item("t", 40);
+    assert_eq!(trimmed(&rendered)[0], "⏺ Read(finished)");
+    // The header row is still the unit's disclosure target.
+    assert_eq!(rendered.focus_row(&unit_target("t")), Some(0));
+    assert_geometry_inside(&rendered, 40);
+    for width in WIDTHS {
+        let rendered = fixture.render_item("t", width);
+        assert_geometry_inside(&rendered, width);
+    }
+}
+
+#[test]
+fn connector_sections_hang_bodies_beside_one_connector_glyph() {
+    let rules = json!([{
+        "match": { "kind": "tool" },
+        "set": { "section_labels": "connector",
+                 "sections": { "arguments": { "visible": false } } }
+    }]);
+    let mut fixture = single(config(rules), read_with("first\nsecond"));
+    fixture.render.theme = theme_with(|theme| {
+        theme.chrome.markers.connector = bcode_tui_theme::chrome::ChromeText::new("⎿");
+    });
+    let rendered = fixture.render_item("t", 40);
+    let rows = trimmed(&rendered);
+    assert_eq!(rows[1], "  ⎿  first", "{rows:?}");
+    assert_eq!(rows[2], "     second", "{rows:?}");
+    assert!(
+        !rendered.text().contains("output"),
+        "no label rows: {rows:?}"
+    );
+    // The first body row still maps to its source byte under the connector.
+    assert_eq!(
+        rendered.geometry.source_map.source_for_row(1),
+        Some((SourcePosition::ShellByte(0), 1))
+    );
+    // At widths the connector does not fit, the body keeps its columns and no glyph overlaps.
+    for width in WIDTHS {
+        let rendered = fixture.render_item("t", width);
+        assert_geometry_inside(&rendered, width);
+        for row in &rendered.rows {
+            assert!(display_width(row) <= usize::from(width), "{width}: {row:?}");
+        }
+    }
+}
+
+#[test]
+fn hidden_units_without_a_marker_leave_no_row() {
+    let rules = json!([{
+        "match": { "kind": "tool" },
+        "set": { "disclosure": "hidden", "hidden_marker": false }
+    }]);
+    let fixture = single(config(rules), read_with("first"));
+    assert!(
+        !fixture.keys().contains(&UnitKey::Item(id("t"))),
+        "{:?}",
+        fixture.keys()
+    );
+    let marked = single(
+        config(json!([{ "match": { "kind": "tool" }, "set": { "disclosure": "hidden" } }])),
+        read_with("first"),
+    );
+    assert!(
+        marked
+            .keys()
+            .iter()
+            .any(|key| *key == UnitKey::HiddenMarker(id("t")) || *key == UnitKey::Item(id("t"))),
+        "{:?}",
+        marked.keys()
+    );
+}
