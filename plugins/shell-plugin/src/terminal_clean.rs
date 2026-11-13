@@ -1,9 +1,23 @@
 //! Streaming terminal-output normalization for shell model artifacts.
+//!
+//! Output is interpreted by a real terminal emulator (`bmux_terminal_grid`), so the text the
+//! model reads is what the terminal showed: progress bars that redraw in place leave their
+//! final state, full-screen programs leave what they returned to, wide characters and tab
+//! stops line up, and lines the terminal soft-wrapped read as the logical lines the program
+//! printed. Lines are written as they scroll off the screen, where nothing can change them;
+//! what the screen still shows is written when the output ends.
+//!
+//! One departure from a terminal: a line feed without a carriage return (output a program
+//! wrote with newline translation off) starts a new line rather than only moving down, so the
+//! text reads as lines instead of a staircase.
 
-use std::collections::VecDeque;
 use std::io::{self, Write};
 
-const TAB_WIDTH: usize = 8;
+use bmux_terminal_grid::{GridLimits, TerminalGridStream, content_text};
+
+/// History rows the emulator keeps. None: a program cannot move its cursor above the screen,
+/// so a line that scrolls off is final and is written at once.
+const RETAINED_HISTORY_ROWS: usize = 0;
 
 /// Summary of a completed normalized terminal transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,434 +32,97 @@ pub struct TerminalCleanSummary {
 
 /// Streaming terminal normalizer that writes only stable, cleaned text to `writer`.
 pub struct TerminalCleanWriter<W> {
-    parser: vte::Parser,
-    performer: TerminalCleanPerformer<W>,
+    writer: W,
+    stream: TerminalGridStream,
+    tail: ByteTail,
+    bytes_written: u64,
+    /// The previous byte was a carriage return.
+    after_return: bool,
 }
 
 impl<W: Write> TerminalCleanWriter<W> {
     /// Create a streaming terminal normalizer.
     pub fn new(writer: W, columns: u16, rows: u16, max_tail_bytes: usize) -> Self {
+        let mut stream = TerminalGridStream::new(
+            columns.max(1),
+            rows.max(1),
+            GridLimits {
+                scrollback_rows: RETAINED_HISTORY_ROWS,
+            },
+        )
+        .unwrap_or_else(|_| unreachable!("non-zero terminal dimensions are valid"));
+        stream.grid_mut().collect_evicted_text(true);
         Self {
-            parser: vte::Parser::new(),
-            performer: TerminalCleanPerformer::new(writer, columns, rows, max_tail_bytes),
+            writer,
+            stream,
+            tail: ByteTail::new(max_tail_bytes),
+            bytes_written: 0,
+            after_return: false,
         }
     }
 
     /// Consume a raw PTY chunk and append newly stable cleaned text to the writer.
     pub fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.parser.advance(&mut self.performer, bytes);
-        self.performer.take_error()?;
-        Ok(())
+        let mut start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' && !self.after_return {
+                self.stream.process(&bytes[start..index]);
+                self.stream.process(b"\r");
+                start = index;
+            }
+            self.after_return = *byte == b'\r';
+        }
+        self.stream.process(&bytes[start..]);
+        let evicted = self.stream.grid_mut().take_evicted_text();
+        self.emit(evicted.as_bytes())
     }
 
     /// Capture a bounded semantic preview without consuming or flushing live state.
     /// Terminal parsing remains producer-native; consumers receive plain text only.
     pub fn snapshot(&self) -> TerminalCleanSummary {
-        let mut tail = ByteTail::new(self.performer.tail.max_bytes);
-        tail.push(self.performer.tail.text().as_bytes());
-        let mut bytes = self.performer.bytes_written;
-        let last = self
-            .performer
-            .lines
-            .iter()
-            .rposition(|line| !line.is_empty());
-        for line in self.performer.lines.iter().take(last.map_or(0, |i| i + 1)) {
-            let text = line.text();
-            tail.push(text.as_bytes());
-            tail.push(b"\n");
-            bytes = bytes.saturating_add(text.len() as u64).saturating_add(1);
-        }
+        let mut tail = self.tail.clone();
+        let remaining = self.remaining_text();
+        tail.push(remaining.as_bytes());
         TerminalCleanSummary {
-            bytes_written: bytes,
+            bytes_written: self
+                .bytes_written
+                .saturating_add(u64::try_from(remaining.len()).unwrap_or(u64::MAX)),
             tail: tail.text(),
-            tail_truncated: self.performer.tail.truncated || tail.truncated,
+            tail_truncated: tail.truncated,
         }
     }
 
     /// Flush all remaining visible terminal state and return the normalized summary.
     pub fn finish(mut self) -> io::Result<TerminalCleanSummary> {
-        self.performer.flush_all()?;
-        self.performer.writer.flush()?;
-        Ok(self.performer.summary())
-    }
-}
-
-struct TerminalCleanPerformer<W> {
-    writer: W,
-    columns: usize,
-    rows: usize,
-    lines: VecDeque<TerminalLine>,
-    cursor_row: usize,
-    cursor_col: usize,
-    saved_cursor: Option<(usize, usize)>,
-    tail: ByteTail,
-    bytes_written: u64,
-    error: Option<io::Error>,
-}
-
-impl<W: Write> TerminalCleanPerformer<W> {
-    fn new(writer: W, columns: u16, rows: u16, max_tail_bytes: usize) -> Self {
-        let mut lines = VecDeque::new();
-        lines.push_back(TerminalLine::default());
-        Self {
-            writer,
-            columns: usize::from(columns).max(1),
-            rows: usize::from(rows).max(1),
-            lines,
-            cursor_row: 0,
-            cursor_col: 0,
-            saved_cursor: None,
-            tail: ByteTail::new(max_tail_bytes),
-            bytes_written: 0,
-            error: None,
-        }
+        let remaining = self.remaining_text();
+        self.emit(remaining.as_bytes())?;
+        self.writer.flush()?;
+        Ok(TerminalCleanSummary {
+            bytes_written: self.bytes_written,
+            tail: self.tail.text(),
+            tail_truncated: self.tail.truncated,
+        })
     }
 
-    fn take_error(&mut self) -> io::Result<()> {
-        self.error.take().map_or(Ok(()), Err)
-    }
-
-    fn record_result(&mut self, result: io::Result<()>) {
-        if self.error.is_none()
-            && let Err(error) = result
-        {
-            self.error = Some(error);
-        }
-    }
-
-    fn print_char(&mut self, ch: char) {
-        if ch == '\n' {
-            self.newline();
-            return;
-        }
-        if ch == '\r' {
-            self.carriage_return();
-            return;
-        }
-        if ch == '\t' {
-            self.tab();
-            return;
-        }
-        if ch.is_control() {
-            return;
-        }
-        self.ensure_cursor_line();
-        if let Some(line) = self.lines.get_mut(self.cursor_row) {
-            line.put(self.cursor_col, ch);
-        }
-        self.cursor_col = self.cursor_col.saturating_add(1);
-        if self.cursor_col >= self.columns {
-            self.cursor_col = 0;
-            self.advance_row_with_scroll();
-        }
-    }
-
-    fn execute_byte(&mut self, byte: u8) {
-        match byte {
-            b'\n' | 0x0b | 0x0c => self.newline(),
-            b'\r' => self.carriage_return(),
-            b'\t' => self.tab(),
-            0x08 => self.backspace(),
-            _ => {}
-        }
-    }
-
-    fn newline(&mut self) {
-        self.cursor_col = 0;
-        self.advance_row_with_scroll();
-    }
-
-    fn advance_row_with_scroll(&mut self) {
-        if self.cursor_row.saturating_add(1) >= self.rows {
-            self.scroll_up_one();
-        } else {
-            self.cursor_row = self.cursor_row.saturating_add(1);
-            self.ensure_cursor_line();
-        }
-    }
-
-    const fn carriage_return(&mut self) {
-        self.cursor_col = 0;
-    }
-
-    fn tab(&mut self) {
-        let next_stop = (self.cursor_col / TAB_WIDTH).saturating_add(1) * TAB_WIDTH;
-        self.cursor_col = next_stop.min(self.columns.saturating_sub(1));
-    }
-
-    const fn backspace(&mut self) {
-        self.cursor_col = self.cursor_col.saturating_sub(1);
-    }
-
-    fn cursor_up(&mut self, count: usize) {
-        self.cursor_row = self.cursor_row.saturating_sub(count.max(1));
-    }
-
-    fn cursor_down(&mut self, count: usize) {
-        self.cursor_row = self
-            .cursor_row
-            .saturating_add(count.max(1))
-            .min(self.rows.saturating_sub(1));
-        self.ensure_cursor_line();
-    }
-
-    fn cursor_forward(&mut self, count: usize) {
-        self.cursor_col = self
-            .cursor_col
-            .saturating_add(count.max(1))
-            .min(self.columns.saturating_sub(1));
-    }
-
-    fn cursor_back(&mut self, count: usize) {
-        self.cursor_col = self.cursor_col.saturating_sub(count.max(1));
-    }
-
-    fn cursor_column(&mut self, column: usize) {
-        self.cursor_col = column.saturating_sub(1).min(self.columns.saturating_sub(1));
-    }
-
-    fn cursor_position(&mut self, row: usize, column: usize) {
-        self.cursor_row = row.saturating_sub(1).min(self.rows.saturating_sub(1));
-        self.cursor_col = column.saturating_sub(1).min(self.columns.saturating_sub(1));
-        self.ensure_cursor_line();
-    }
-
-    const fn save_cursor(&mut self) {
-        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
-    }
-
-    fn restore_cursor(&mut self) {
-        if let Some((row, column)) = self.saved_cursor {
-            self.cursor_row = row.min(self.rows.saturating_sub(1));
-            self.cursor_col = column.min(self.columns.saturating_sub(1));
-            self.ensure_cursor_line();
-        }
-    }
-
-    fn erase_line(&mut self, mode: usize) {
-        self.ensure_cursor_line();
-        if let Some(line) = self.lines.get_mut(self.cursor_row) {
-            match mode {
-                1 => line.clear_to_left(self.cursor_col),
-                2 => line.clear(),
-                _ => line.clear_to_right(self.cursor_col),
-            }
-        }
-    }
-
-    fn erase_display(&mut self, mode: usize) {
-        match mode {
-            1 => {
-                for row in 0..self.cursor_row {
-                    if let Some(line) = self.lines.get_mut(row) {
-                        line.clear();
-                    }
-                }
-                self.erase_line(1);
-            }
-            2 | 3 => {
-                for line in &mut self.lines {
-                    line.clear();
-                }
-                self.cursor_row = 0;
-                self.cursor_col = 0;
-            }
-            _ => {
-                self.erase_line(0);
-                for row in self.cursor_row.saturating_add(1)..self.lines.len() {
-                    if let Some(line) = self.lines.get_mut(row) {
-                        line.clear();
-                    }
-                }
-            }
-        }
-    }
-
-    fn ensure_cursor_line(&mut self) {
-        while self.lines.len() < self.rows {
-            self.lines.push_back(TerminalLine::default());
-        }
-        while self.cursor_row >= self.lines.len() {
-            self.lines.push_back(TerminalLine::default());
-        }
-    }
-
-    fn scroll_up_one(&mut self) {
-        if let Some(line) = self.lines.pop_front() {
-            let result = self.write_line(&line);
-            self.record_result(result);
-        }
-        self.lines.push_back(TerminalLine::default());
-        self.cursor_row = self.rows.saturating_sub(1);
-    }
-
-    fn flush_all(&mut self) -> io::Result<()> {
-        let last_content_row = self.lines.iter().rposition(|line| !line.is_empty());
-        let lines = self
-            .lines
-            .drain(..)
-            .take(last_content_row.map_or(0, |row| row.saturating_add(1)))
-            .collect::<Vec<_>>();
-        for line in lines {
-            self.write_line(&line)?;
-        }
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        Ok(())
-    }
-
-    fn write_line(&mut self, line: &TerminalLine) -> io::Result<()> {
-        let text = line.text();
+    /// What the terminal still shows, as lines each ending in a newline.
+    fn remaining_text(&self) -> String {
+        let mut text = content_text(self.stream.grid());
         if !text.is_empty() {
-            self.write_bytes(text.as_bytes())?;
+            text.push('\n');
         }
-        self.write_bytes(b"\n")
+        text
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+    fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         self.writer.write_all(bytes)?;
         self.tail.push(bytes);
         self.bytes_written = self
             .bytes_written
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         Ok(())
-    }
-
-    fn summary(&self) -> TerminalCleanSummary {
-        TerminalCleanSummary {
-            bytes_written: self.bytes_written,
-            tail: self.tail.text(),
-            tail_truncated: self.tail.truncated,
-        }
-    }
-}
-
-impl<W: Write> vte::Perform for TerminalCleanPerformer<W> {
-    fn print(&mut self, ch: char) {
-        self.print_char(ch);
-    }
-
-    fn execute(&mut self, byte: u8) {
-        self.execute_byte(byte);
-    }
-
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
-    }
-
-    fn put(&mut self, _byte: u8) {}
-
-    fn unhook(&mut self) {}
-
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
-
-    fn csi_dispatch(
-        &mut self,
-        params: &vte::Params,
-        _intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
-        let first = first_param(params);
-        let second = second_param(params);
-        match action {
-            'A' => self.cursor_up(first),
-            'B' => self.cursor_down(first),
-            'C' => self.cursor_forward(first),
-            'D' => self.cursor_back(first),
-            'E' => {
-                self.cursor_down(first);
-                self.carriage_return();
-            }
-            'F' => {
-                self.cursor_up(first);
-                self.carriage_return();
-            }
-            'G' | '`' => self.cursor_column(first),
-            'H' | 'f' => self.cursor_position(first, second),
-            'J' => self.erase_display(first_param_or_zero(params)),
-            'K' => self.erase_line(first_param_or_zero(params)),
-            's' => self.save_cursor(),
-            'u' => self.restore_cursor(),
-            _ => {}
-        }
-    }
-
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
-        match byte {
-            b'D' => self.newline(),
-            b'E' => {
-                self.newline();
-                self.carriage_return();
-            }
-            b'7' => self.save_cursor(),
-            b'8' => self.restore_cursor(),
-            b'M' => self.cursor_up(1),
-            b'c' => self.erase_display(2),
-            _ => {}
-        }
-    }
-}
-
-fn first_param(params: &vte::Params) -> usize {
-    nth_param(params, 0).unwrap_or(1).max(1)
-}
-
-fn first_param_or_zero(params: &vte::Params) -> usize {
-    nth_param(params, 0).unwrap_or(0)
-}
-
-fn second_param(params: &vte::Params) -> usize {
-    nth_param(params, 1).unwrap_or(1).max(1)
-}
-
-fn nth_param(params: &vte::Params, index: usize) -> Option<usize> {
-    params
-        .iter()
-        .nth(index)
-        .and_then(|param| param.first().copied())
-        .map(usize::from)
-}
-
-#[derive(Debug, Clone, Default)]
-struct TerminalLine {
-    cells: Vec<char>,
-}
-
-impl TerminalLine {
-    fn put(&mut self, column: usize, ch: char) {
-        if self.cells.len() <= column {
-            self.cells.resize(column.saturating_add(1), ' ');
-        }
-        self.cells[column] = ch;
-    }
-
-    fn clear(&mut self) {
-        self.cells.clear();
-    }
-
-    fn clear_to_right(&mut self, column: usize) {
-        if column < self.cells.len() {
-            self.cells.truncate(column);
-        }
-    }
-
-    fn clear_to_left(&mut self, column: usize) {
-        let end = column.saturating_add(1).min(self.cells.len());
-        for cell in self.cells.iter_mut().take(end) {
-            *cell = ' ';
-        }
-    }
-
-    fn text(&self) -> String {
-        let mut end = self.cells.len();
-        while end > 0 && self.cells[end - 1] == ' ' {
-            end = end.saturating_sub(1);
-        }
-        self.cells.iter().take(end).collect()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.cells.iter().all(|cell| *cell == ' ')
     }
 }
 
@@ -664,9 +341,67 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_at_last_column_scrolls_viewport() {
-        let summary = clean_with_size(&[b"abcdef"], 3, 2);
+    fn lines_the_terminal_wrapped_read_as_printed() {
+        // Wrapped at three columns, scrolled off a two-row screen, and still one line.
+        let summary = clean_with_size(&[b"abcdef\r\nabc def ghi\r\nend"], 3, 2);
 
-        assert_eq!(summary.tail, "abc\ndef\n");
+        assert_eq!(summary.tail, "abcdef\nabc def ghi\nend\n");
+    }
+
+    #[test]
+    fn spaces_where_the_terminal_wrapped_are_kept() {
+        // "word word" wraps after "word " at five columns, on the screen and once scrolled off.
+        for rows in [5, 1] {
+            let summary = clean_with_size(&[b"word word word\r\nend"], 5, rows);
+
+            assert_eq!(summary.tail, "word word word\nend\n", "{rows} rows");
+        }
+    }
+
+    #[test]
+    fn line_feeds_without_returns_start_lines() {
+        let summary = clean(&[b"a\nb\n", b"\nc\r\nd"]);
+
+        assert_eq!(summary.tail, "a\nb\n\nc\nd\n");
+    }
+
+    #[test]
+    fn full_screen_programs_leave_what_the_terminal_returns_to() {
+        let summary = clean(&[
+            b"before\r\n\x1b[?1049h\x1b[H\x1b[2Jpager page\r\n~",
+            b"\x1b[?1049lafter\r\n",
+        ]);
+
+        assert_eq!(summary.tail, "before\nafter\n");
+    }
+
+    #[test]
+    fn wide_characters_and_tabs_line_up() {
+        let summary = clean(&["日本\tx\r\nab\tx\r\n".as_bytes()]);
+
+        assert_eq!(summary.tail, "日本    x\nab      x\n");
+    }
+
+    #[test]
+    fn output_beyond_the_screen_is_complete_however_chunked() {
+        use std::fmt::Write as _;
+        let bytes: Vec<u8> = (1..=500)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect();
+        let expected = (1..=500).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "line {n}");
+            text
+        });
+        for chunk in [1, 13, 4096] {
+            let mut log = Vec::new();
+            let mut cleaner = TerminalCleanWriter::new(&mut log, 20, 5, 64);
+            for piece in bytes.chunks(chunk) {
+                cleaner.write_chunk(piece).expect("chunk cleans");
+            }
+            let summary = cleaner.finish().expect("cleaner finishes");
+            assert_eq!(String::from_utf8(log).unwrap(), expected, "{chunk}");
+            assert_eq!(summary.bytes_written, expected.len() as u64);
+            assert!(summary.tail_truncated && expected.ends_with(&summary.tail));
+        }
     }
 }

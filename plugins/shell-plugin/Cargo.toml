@@ -45,7 +45,6 @@ tree-sitter                         = { workspace = true, optional = true }
 tree-sitter-javascript              = { workspace = true, optional = true }
 tree-sitter-python                  = { workspace = true, optional = true }
 url                                 = { workspace = true, optional = true }
-vte                                 = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 portable-pty = { workspace = true, optional = true }
@@ -77,13 +76,13 @@ native = [
     "dep:dunce",
     "dep:hex",
     "dep:bmux_pty",
+    "dep:bmux_terminal_grid",
     "dep:libc",
     "dep:portable-pty",
     "dep:sha2",
     "dep:tempfile",
     "dep:tokio",
     "dep:url",
-    "dep:vte",
 ]
 presentation = [
     "embedded-languages",
