@@ -1,4 +1,4 @@
-//! Process-local transcript rows (spec section 3.3, LR1–LR7): pending submissions and
+//! Process-local transcript rows: pending submissions and
 //! process-local notices of the host shell are visible in committed frames, in presentation
 //! order, and leave when the shell forgets them.
 //!

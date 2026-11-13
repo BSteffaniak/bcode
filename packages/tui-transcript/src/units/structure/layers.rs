@@ -1,10 +1,10 @@
 //! Rule-layer assembly and policy compilation for structure resolution (U5, X3, X4).
 //!
-//! The host (phase 4) and headless drivers build a [`StructureConfig`] from the same inputs the
+//! The host and headless drivers build a [`StructureConfig`] from the same inputs the
 //! presentation specification layers: the theme's chrome density as a host-default layer, plugin
 //! manifest defaults, the theme and profile `[presentation]` layers, declarative configuration
 //! (including the reasoning-visibility rule) and interactive user state. Layer order comes from
-//! `bcode_tui_theme::selection::structure_layers`, so V2 stacks exactly the layers the theme
+//! `bcode_tui_theme::selection::structure_layers`, so the engine stacks exactly the layers the theme
 //! tooling explains.
 
 use std::sync::Arc;

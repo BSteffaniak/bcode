@@ -1,4 +1,4 @@
-//! Latest-content bar (spec rules F6, C18–C21).
+//! Latest-content bar (rules F6, C18–C21).
 //!
 //! Visibility is a pure function of units, the measured index (through the viewport frame),
 //! navigation state, latest activity and the full transcript-region height ([`evaluate`]). The
@@ -57,7 +57,7 @@ impl LatestBarState {
     }
 }
 
-/// What [`evaluate`] reads (spec F6).
+/// What [`evaluate`] reads (F6).
 #[derive(Debug, Clone, Copy)]
 pub struct LatestBarInputs<'a> {
     /// Current units in document order.

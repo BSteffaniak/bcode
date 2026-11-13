@@ -9,7 +9,7 @@ use super::{ItemRenderContext, ProducedItem, UnitProducer, UnitView, common};
 use crate::units::{UnitKey, UnitKind};
 use crate::window::BoundaryStatus;
 
-/// Plain text rows for every unit (the phase-2 rendering): word-wrapped message lines, kind
+/// Plain text rows for every unit (the plain fixture rendering): word-wrapped message lines, kind
 /// labels, one-row boundaries, headers and markers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlainTextProducer;

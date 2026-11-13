@@ -1,4 +1,4 @@
-//! Window manager tests, one or more per rule (W1–W13, W7a, SD1–SD3), plus the phase-5
+//! Window manager tests, one or more per rule (W1–W13, W7a, SD1–SD3), plus the
 //! work counters (no full rebuild on paging).
 
 use bcode_session_models::{
@@ -1039,7 +1039,7 @@ fn sd2_unaligned_page_falls_back_to_one_replacement() {
     );
 }
 
-// ---- review regressions (phase 5) ----
+// ---- paging regressions ----
 
 fn stream_delta(history: &History, text: &str) -> LiveInput {
     LiveInput::Stream(Box::new(bcode_session_models::SessionLiveEvent {
@@ -1388,7 +1388,7 @@ fn tool_history(turns: u64) -> History {
     history
 }
 
-/// Phase 5 exit over tool-heavy content: after a jump away from a region and back to the tail,
+/// Paging over tool-heavy content: after a jump away from a region and back to the tail,
 /// paging up through the previously resident region stays incremental (no SD2 fallback) and
 /// equals a rebuild of the resident range after every page.
 #[test]

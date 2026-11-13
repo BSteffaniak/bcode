@@ -1,4 +1,4 @@
-//! Markdown contribution activation scenarios (TUI V2 phase 7 parity): `<details>` clicks,
+//! Markdown contribution activation scenarios: `<details>` clicks,
 //! the `tui.markdown.*` keys with footnote jumps, `#fragment` navigation, link opening and
 //! destination copy, all observed in committed frames (status row included).
 //!

@@ -1,5 +1,5 @@
-//! History requests of the V2 engine executed as host effects (spec sections 3.2 and 5,
-//! rules W5, W6, W10 and W11).
+//! History requests of the V2 engine executed as host effects (rules
+//! W5, W6, W10 and W11).
 //!
 //! The engine issues [`HostRequest`]s as data. The host turns each into one
 //! [`crate::effects::TuiEffect::LoadTranscriptV2History`] effect carrying a [`HistoryLoad`],

@@ -1,4 +1,4 @@
-//! Engine-neutral transcript scenario suite (TUI V2 phase 0).
+//! Engine-neutral transcript scenario suite.
 //!
 //! Scenarios describe user-visible transcript behavior once and run against every engine
 //! through a [`driver::TranscriptScenarioDriver`]. Each scenario is a generic function in
@@ -304,7 +304,7 @@ macro_rules! transcript_scenarios {
 }
 pub(crate) use transcript_scenarios;
 
-/// Scenario instantiation for the V2 engine in the application (phase 4): the root model with its
+/// Scenario instantiation for the V2 engine in the application: the root model with its
 /// transcript host, driven through `update` and the root presenter ([`v2::V2Driver`]).
 /// Ignored entries need a later phase's deliverable or a driver capability and fail when run
 /// (confirmed with `--ignored`); `docs/tui-v2-scenarios.md` records each status.
@@ -351,7 +351,7 @@ mod v2_headless_engine {
     }
 }
 
-/// Resident window and paging scenarios in [`paging`] (phase 5) for the V2 engine in the
+/// Resident window and paging scenarios in [`paging`] for the V2 engine in the
 /// application: the scenarios check the window-operation counters and resident ceiling.
 mod v2_paging {
     super::transcript_scenarios! { super::v2::V2Driver; in paging;
@@ -489,7 +489,7 @@ mod v2_local_rows {
     }
 }
 
-/// Frame pipeline, damage and transcript tooling scenarios in [`pipeline`] (phase 6) for the V2
+/// Frame pipeline, damage and transcript tooling scenarios in [`pipeline`] for the V2
 /// engine in the application: the scenarios read the terminal's committed damage, the host's
 /// command routes and inspector, and the inline interaction and shell tooling.
 mod v2_pipeline {
@@ -512,7 +512,7 @@ mod v2_pipeline {
     }
 }
 
-/// Plugin visual scenarios in [`plugin_visuals`] (phase 7 parity) for the V2 engine in the
+/// Plugin visual scenarios in [`plugin_visuals`] for the V2 engine in the
 /// application: bundled plugins loaded through the production plugin host present tool results
 /// through their visual adapters, and copies use the adapters' source rows.
 mod v2_plugin_visuals {
@@ -522,7 +522,7 @@ mod v2_plugin_visuals {
     }
 }
 
-/// Markdown contribution activation scenarios in [`markdown`] (phase 7 parity). Link opening and
+/// Markdown contribution activation scenarios in [`markdown`]. Link opening and
 /// destination copy use the driver's test opener, which records destinations.
 mod v2_markdown {
     super::transcript_scenarios! { super::v2::V2Driver; in markdown;

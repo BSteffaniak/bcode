@@ -58,7 +58,7 @@ struct Harness {
 
 impl Harness {
     /// Attach with the newest `resident` events of a `turns`-turn session. Navigation tests
-    /// use the plain phase-2 rows (one row per message line, no chrome) so their geometry does
+    /// use the plain fixture rows (one row per message line, no chrome) so their geometry does
     /// not depend on content producers.
     fn attach(turns: u64, resident: usize, motion: MotionConfig) -> Self {
         Self::attach_with(
@@ -414,7 +414,7 @@ fn d4_scroll_frames_measure_nothing_and_a_page_measures_only_its_units() {
     assert_eq!(work.producer_builds, work.measurements);
 }
 
-// ---- item layout, structure and render configuration (phase 3) ------------------------------
+// ---- item layout, structure and render configuration ----------------------------------------
 
 fn event(sequence: u64, kind: SessionEventKind) -> SessionEvent {
     SessionEvent {

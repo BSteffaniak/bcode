@@ -1,4 +1,4 @@
-//! Resident window manager (spec sections 3.2 and 5, rules W1–W13 and W7a).
+//! Resident window manager.
 //!
 //! The window decides which contiguous range of whole turns is resident, reports page and
 //! window requests as data for the host to execute, and plans eviction. It performs no I/O.
@@ -7,8 +7,8 @@
 //! * [`turns`]: turn alignment of event ranges (W4).
 //! * [`loader`]: the bounded history reads every host executes for [`crate::engine::HostRequest`]s.
 //!
-//! `TranscriptChanges` come from the `SessionView` window operations themselves (spec 3.1); the
-//! phase-4 keyed document diff (SD5) is gone.
+//! `TranscriptChanges` come from the `SessionView` window operations themselves; no keyed
+//! document diff is computed.
 
 pub mod loader;
 #[cfg(test)]
@@ -241,7 +241,7 @@ pub struct HistoryWindowResult {
     pub last_available_sequence: Option<u64>,
 }
 
-/// Resident window bookkeeping (spec section 3.2).
+/// Resident window bookkeeping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResidentWindow {
     /// Live or detached.

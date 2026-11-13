@@ -1,4 +1,4 @@
-//! Engine history requests executed over the browser feed (spec section 3.2, W5, W6, W10, W11).
+//! Engine history requests executed over the browser feed.
 //!
 //! The engine issues [`HostRequest`]s as data. Each one runs the shared bounded loader
 //! ([`bcode_tui_transcript::window::load_history`]), the same implementation the native host

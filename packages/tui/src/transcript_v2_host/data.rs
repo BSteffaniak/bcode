@@ -1,4 +1,4 @@
-//! Session data into the V2 engine (spec sections 3.2, 4.4 and 5; W2, W3, W10, W11, T2, T27).
+//! Session data into the V2 engine.
 //!
 //! Maps host inputs to engine inputs:
 //!

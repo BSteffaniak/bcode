@@ -1,6 +1,6 @@
-//! Frame pipeline, damage and transcript tooling scenarios (TUI V2 phase 6).
+//! Frame pipeline, damage and transcript tooling scenarios.
 //!
-//! The phase-6 exit criteria (spec section 12) that the kept-behavior suites do not already
+//! The pipeline requirements that the kept-behavior suites do not already
 //! cover: the single-snapshot frame (F1, F4), paint purity and the frame clock (F2, F3),
 //! regional and scroll damage (F5, D6, BMUX 11 and 15b), activity labels on accepted
 //! invalidations (F7, D7), no layout work for focus and selection (D4), the structure inspector,
@@ -375,7 +375,7 @@ pub fn d6_transcript_changes_repaint_the_transcript_region<D: TranscriptScenario
     });
 }
 
-/// D4 (spec 9.2): focus traversal and drag selection over resident content are paint-only
+/// D4: focus traversal and drag selection over resident content are paint-only
 /// (L5): no parse, highlight, projection, build or measurement work.
 pub fn d4_focus_and_selection_do_no_layout_work<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_all::<D>(tool_session(), WIDTH, TALL);

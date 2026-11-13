@@ -1,4 +1,4 @@
-//! Resident window manager (spec section 5, rules W1–W13 and W7a).
+//! Resident window manager.
 //!
 //! [`WindowManager`] owns the resident canonical events, BMUX `resident_window` bookkeeping
 //! keyed by event sequence (weight one event each), and the public [`ResidentWindow`] summary
@@ -7,7 +7,7 @@
 //! page is in flight (W11), and evicts whole turns outside the protected band (W7). It performs
 //! no I/O and reads no clock.
 //!
-//! Results are incorporated with the `SessionView` window operations (spec 3.1, SD1–SD7): an
+//! Results are incorporated with the `SessionView` window operations: an
 //! `Older` page is prepended from an isolated sub-projection, a `Newer` page is appended, eviction
 //! removes whole turns, and only window replacements (and the SD2 fallback for a page that cannot
 //! be spliced) reduce a whole window. Every operation reports its own [`TranscriptChanges`];
@@ -33,8 +33,7 @@ use super::{
 };
 use crate::units::{BoundaryEdge, UnitKey, Units};
 
-/// Window-operation work since the manager was created (spec 9.2; phase 5 exit: no full rebuild
-/// on paging).
+/// Window-operation work since the manager was created. Paging never performs a full rebuild.
 ///
 /// `replacements` counts every whole-window reduction: `Head`/`Tail`/`Around` results and SD2
 /// fallbacks. Paging and eviction add to their own counters only, and `events_reduced` grows by

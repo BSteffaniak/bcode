@@ -1,4 +1,4 @@
-//! Transcript selection entry points (spec C34–C36, W7, BMUX 13).
+//! Transcript selection entry points (C34–C36, W7, BMUX 13).
 //!
 //! The frame registers selectable text from the retained layouts it paints: one selection
 //! scope over the viewport, one child scope per visible unit with selectable text, and one

@@ -1,5 +1,5 @@
-//! Viewport: a controlled BMUX virtual list projected from navigation (spec section 3.4,
-//! rules VP1–VP7).
+//! Viewport: a controlled BMUX virtual list projected from navigation (rules
+//! VP1–VP7).
 //!
 //! The viewport stores no navigation policy. Before every layout it writes the BMUX position
 //! derived from `NavState` and never reads the list's position back (VP5). List input only
@@ -438,7 +438,7 @@ impl TranscriptViewport {
             .map_or_else(EdgeRows::default, ResolvedPosition::edge_rows)
     }
 
-    /// Run `read` with the read-only view the navigation reducer consults (spec 4.2).
+    /// Run `read` with the read-only view the navigation reducer consults.
     pub fn with_nav_view<R>(
         &self,
         context: NavViewContext<'_>,

@@ -1,4 +1,4 @@
-//! Navigation controller: the single position authority (spec sections 3.5 and 4, rules
+//! Navigation controller: the single position authority (rules
 //! N1–N12, P1–P4, T1–T27).
 //!
 //! [`NavState`] is the only stored navigation state. Every change goes through [`reduce`]; rows
@@ -180,7 +180,7 @@ pub enum ReadingPosition {
     },
 }
 
-/// Navigation intent (spec section 4.2). Every input source produces intents (N2).
+/// Navigation intent. Every input source produces intents (N2).
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavIntent {
     /// Explicit attach to the latest bottom.
@@ -274,7 +274,7 @@ pub enum Region {
     LatestBar,
 }
 
-/// Input to [`reduce`] (spec section 4.2).
+/// Input to [`reduce`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavInput {
     /// A navigation intent.
@@ -512,7 +512,7 @@ impl Default for MotionConfig {
     }
 }
 
-/// The single navigation authority (spec section 4.3, N1).
+/// The single navigation authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavState {
     /// Position mode.
@@ -582,7 +582,7 @@ impl NavState {
     }
 }
 
-/// Read-only view of layout and window state the reducer consults (spec section 4.2).
+/// Read-only view of layout and window state the reducer consults.
 ///
 /// Unit order, heights and offsets come from the measured index, which every resident unit has
 /// an exact height in before the update that made it resident returns (L9, W3).
@@ -668,7 +668,7 @@ impl std::fmt::Debug for NavView<'_> {
     }
 }
 
-/// Reduce one navigation input (spec section 4.4).
+/// Reduce one navigation input.
 ///
 /// This is the only function that changes [`NavState`] (N2). The view must already reflect
 /// every content change the input reports (N11): window, units and measured index are updated
@@ -680,7 +680,7 @@ impl std::fmt::Debug for NavView<'_> {
 /// clock. Grace and motion frames are timers the reducer schedules through [`NavEffect`]s.
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "spec section 4.2 fixes the signature: an input is handed over to the reducer"
+    reason = "the reducer takes ownership of each input by contract"
 )]
 pub fn reduce(state: &mut NavState, input: NavInput, view: &NavView<'_>) -> Vec<NavEffect> {
     reducer::reduce(state, &input, view)

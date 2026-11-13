@@ -1,4 +1,4 @@
-//! Bounded history loading for engine [`HostRequest`]s (spec sections 3.2 and 5, rules W5,
+//! Bounded history loading for engine [`HostRequest`]s (rules W5,
 //! W6, W8, W10, W11 and W12).
 //!
 //! The engine issues [`HostRequest`]s as data. A host executes each one with [`load_history`]

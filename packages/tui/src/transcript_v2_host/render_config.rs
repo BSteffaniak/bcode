@@ -1,4 +1,4 @@
-//! Render and structure inputs of the V2 engine from the live application (spec sections 3.4,
+//! Render and structure inputs of the V2 engine from the live application (rules
 //! L2, L3, L8, U5, X3, X4, D9).
 //!
 //! [`TranscriptV2Host::sync_render_inputs`] runs at the end of every update, outside drawing.

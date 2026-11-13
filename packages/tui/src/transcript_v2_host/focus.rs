@@ -1,4 +1,4 @@
-//! Key resolution for the V2 transcript (spec section 6, FO2–FO6, FO10).
+//! Key resolution for the V2 transcript.
 //!
 //! Keys resolve through the shared host keymap: the chat scope binds transcript focus entry
 //! (`tui.transcript.focusUnits`, `alt+u`) and the transcript scroll keys (Page Up/Down,

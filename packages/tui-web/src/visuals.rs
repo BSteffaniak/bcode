@@ -1,4 +1,4 @@
-//! Plugin visuals of the browser transcript (spec L8, D9, E1–E3, E10), outside drawing.
+//! Plugin visuals of the browser transcript (L8, D9, E1–E3, E10), outside drawing.
 //!
 //! The browser mirrors the native visual sync: every resident plugin-owned item (a request
 //! draft, an invocation presentation, an artifact result or a contribution) is projected to its

@@ -1,4 +1,4 @@
-//! Transcript input and keyboard focus for the V2 engine (spec sections 3.5, 4.2 and 6).
+//! Transcript input and keyboard focus for the V2 engine.
 //!
 //! * `alt+u` enters transcript unit focus on the initial target (FO2, C33) and leaves it again
 //!   (FO3); Escape leaves it too, and any key or paste the `transcript_focus` scope does not

@@ -1,4 +1,4 @@
-//! Transcript tooling entry points (spec section 6, FO6; C39; D10): bulk disclosure (expand,
+//! Transcript tooling entry points: bulk disclosure (expand,
 //! collapse, reset, detail cycling of every unit), the structure inspector, per-tool defaults,
 //! inline shell expansion and the inline interaction reservation.
 //!

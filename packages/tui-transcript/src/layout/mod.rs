@@ -1,4 +1,4 @@
-//! Identity-keyed item layout (spec section 3.3, rules L1–L9).
+//! Identity-keyed item layout.
 //!
 //! * [`context`]: explicit render inputs ([`ItemRenderContext`], [`PaintInputs`]) and the
 //!   layout fingerprint (L2, L3).

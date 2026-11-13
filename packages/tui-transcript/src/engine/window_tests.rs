@@ -1,4 +1,4 @@
-//! Phase-5 engine tests for the resident window (spec section 5): prefetch in both directions
+//! Engine tests for the resident window: prefetch in both directions
 //! (W5, W6, W7a), eviction and the `Live → Detached` transition (W7, W9), aligned timeline
 //! windows (W8, BUG-B1, BUG-B2, BUG-B5), direct `Head`/`Tail` windows and fast return to live
 //! (W10, X11, BUG-B3), continuous reading across pages (X12, BUG-A*) and the whole-session

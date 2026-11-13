@@ -1,6 +1,6 @@
 //! Headless scenario driver for the V2 transcript engine façade (`bcode_tui_transcript`).
 //!
-//! The phase 2–3 driver, kept for engine-level checks that isolate the engine from the host:
+//! A driver for engine-level checks that isolate the engine from the host:
 //! it drives the engine façade without the root model. The application path (root model,
 //! V2 host, keymap and root presenter) is [`super::v2::V2Driver`].
 //! History requests the engine issues become pending scenario requests; inputs reach the

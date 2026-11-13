@@ -1,10 +1,10 @@
-//! Resident window and paging scenarios (TUI V2 phase 5): prefetch, eviction and the resident
+//! Resident window and paging scenarios: prefetch, eviction and the resident
 //! ceiling, aligned timeline windows, direct head and tail windows, return to live, deep history
 //! paging in both directions and the optional scrollbar.
 //!
 //! The scenarios cover W1–W13 (with W7a), X6, X11, X12, BUG-B3 through `End` in transcript focus
-//! and BUG-B5. Paging work is checked through the driver's [`WindowWork`] counters (phase 5 exit:
-//! paging performs no full rebuild) and the resident event count (W7a ceiling). Those are engine
+//! and BUG-B5. Paging work is checked through the driver's [`WindowWork`] counters (paging performs
+//! no full rebuild) and the resident event count (W7a ceiling). Those are engine
 //! facts a frame cannot show, so the counter checks need a driver that reports them.
 //!
 //! Page latency is scripted in wheel ticks: a pending request is answered once it has waited
@@ -179,7 +179,7 @@ impl Latency {
 
 /// Fail unless paging since `before` replaced the window `windows` times and otherwise applied
 /// every page incrementally: no SD2 fallback, and no event reduced more than once per page
-/// result (no full rebuild, phase 5 exit).
+/// result (no full rebuild).
 #[track_caller]
 fn check_incremental<D: TranscriptScenarioDriver>(
     scenario: &Scenario<D>,
@@ -440,7 +440,7 @@ pub fn x12_wheel_down_from_session_start_returns_live<D: TranscriptScenarioDrive
     live_item_is_shown(&mut scenario, "after paging to the tail");
 }
 
-/// Phase 5 exit, W7, W7a: paging up and back down through the long session with Page Up/Down,
+/// W7, W7a: paging up and back down through the long session with Page Up/Down,
 /// every request answered before the next frame (several results per frame), keeps the resident
 /// window under the ceiling after every result and performs no full rebuild: no window
 /// replacement after attach, no fallback, and no event reduced more than once per result.
@@ -541,7 +541,7 @@ fn tool_session() -> ScenarioSession {
     session
 }
 
-/// Phase 5 exit over tool-heavy content (tool calls, resolved interactions, results): after a
+/// Paging over tool-heavy content (tool calls, resolved interactions, results): after a
 /// direct `Head` window and a jump back to the tail, paging up through the region the head
 /// window held stays incremental. The earlier window leaves no tool or interaction state that
 /// would make those pages shared keyed state (no SD2 fallback, no full rebuild).

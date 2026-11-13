@@ -1,4 +1,4 @@
-//! Data into the V2 engine and history requests out of it (spec sections 3.0, 3.2 and 5).
+//! Data into the V2 engine and history requests out of it.
 //!
 //! Owned by the host-effects work: live and durable session events, attach (`Window(Tail)`,
 //! W10), page and window results (W3), executing [`HostRequest`]s as host effects, and the

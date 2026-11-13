@@ -1,6 +1,6 @@
 //! Kept-behavior navigation scenarios, generic over the engine driver.
 //!
-//! These scenarios pin the kept navigation behavior (spec section 10, rows
+//! These scenarios pin the kept navigation behavior (rows
 //! C1–C17, C22–C33, and the focus model's Home/End rules FO4/FO5). Each one asserts what the
 //! specification requires, observed through committed frames: marker rows, content shift, the
 //! latest bar, following state, motion and focus. Names start with the requirement they cover;

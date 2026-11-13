@@ -1,4 +1,4 @@
-//! Engine glue for keyboard focus (spec section 6) and the latest-content bar (F6, C18–C21).
+//! Engine glue for keyboard focus and the latest-content bar (F6, C18–C21).
 //!
 //! Focus traversal and the latest-bar decision are pure functions in [`crate::focus`] and
 //! [`crate::latest_bar`]; this module applies them to engine state at the end of every update

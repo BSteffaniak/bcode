@@ -1,4 +1,4 @@
-//! Transcript host wiring (TUI V2 specification sections 3.0, 7 and 12).
+//! Transcript host wiring.
 //!
 //! The root runtime model routes transcript ingest, transcript input and transcript painting
 //! to [`TranscriptV2Host`], which owns the `bcode_tui_transcript` engine plus the host state it
@@ -18,8 +18,7 @@
 //! * [`render_config`]: theme, motion, Markdown, diff, structure (policy layers, plugin facts,
 //!   declared targets) and accepted plugin visuals from the live application.
 //! * [`focus`]: key resolution (focus entry, `transcript_focus` keys, scroll keys).
-//! * [`input`]: transcript keys, wheel and mouse input and the composer/transcript focus model
-//!   (spec section 6).
+//! * [`input`]: transcript keys, wheel and mouse input and the composer/transcript focus model.
 //! * [`inspector`]: the structure inspector and transcript tooling (bulk disclosure, detail
 //!   cycling, make-default, inline shell expansion; FO6, C39).
 //! * [`interactions`]: inline interaction placement inside the transcript (C37, D10).
@@ -30,17 +29,17 @@
 //! * [`markdown`]: Markdown contribution focus and activation (links, session links,
 //!   footnotes, fragments, `<details>`, the Mermaid source view).
 //! * [`visuals`]: Markdown images and Mermaid diagrams rendered by the host-side workers and
-//!   accepted into the render configuration (phase 6, L8, D2).
+//!   accepted into the render configuration.
 //! * [`paint`]: viewport geometry, frame preparation, painting, commit, the latest bar and the
-//!   optional scrollbar (phase 5, X6).
+//!   optional scrollbar.
 
-// Skeleton accessors and outcomes that the follow-up phase 4 work wires into the host; the
+// Skeleton accessors and outcomes not yet wired into the host; the
 // expectation fails once every item is used, so it is removed together with the last stub.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "phase 4 skeleton: focus, latest-bar and input outcomes are wired next"
+        reason = "skeleton: focus, latest-bar and input outcomes are not wired yet"
     )
 )]
 
@@ -218,7 +217,7 @@ impl TranscriptV2Host {
         self.last_frame.as_ref()
     }
 
-    /// Item layout work since the previous call, then reset (spec 9.2, scenario observation).
+    /// Item layout work since the previous call, then reset (scenario observation).
     #[cfg(test)]
     pub const fn take_layout_work(&mut self) -> bcode_tui_transcript::layout::LayoutWorkCounters {
         self.engine.take_layout_work()

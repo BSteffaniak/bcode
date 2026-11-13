@@ -1,4 +1,4 @@
-//! Submission acceptance (spec section 4.4, T2 and T27).
+//! Submission acceptance.
 //!
 //! The host reports a semantically accepted submission once its user message is durable. In a
 //! live window the accepted unit is revealed at the viewport top (T2); in a detached window the

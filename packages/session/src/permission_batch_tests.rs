@@ -102,7 +102,7 @@ async fn permission_batch_crash_child() {
     })
     .await
     .unwrap();
-    // Phase 3 is after canonical commit but before response/waiter publication.
+    // This crash point is after the canonical commit but before response/waiter publication.
     std::process::exit(94);
 }
 

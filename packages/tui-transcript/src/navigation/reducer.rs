@@ -1,4 +1,4 @@
-//! The navigation reducer: transitions T1–T27 (spec section 4.4).
+//! The navigation reducer: transitions T1–T27.
 //!
 //! Inputs are reduced against a [`NavView`] that already reflects every content change (N11),
 //! so positions are re-derived from keys and the current measured index on every input and no

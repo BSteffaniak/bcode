@@ -1,4 +1,4 @@
-//! Plugin visual scenarios (TUI V2 phase 7 parity, E1, E3, C36).
+//! Plugin visual scenarios (E1, E3, C36).
 //!
 //! The scenarios load the bundled filesystem plugin through the production static plugin host
 //! ([`TranscriptScenarioDriver::load_bundled_plugins`]) and record a file read whose result is

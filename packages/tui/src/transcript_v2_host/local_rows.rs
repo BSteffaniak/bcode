@@ -1,4 +1,4 @@
-//! Process-local transcript rows of the host shell (spec section 3.3, LR1–LR7).
+//! Process-local transcript rows of the host shell.
 //!
 //! The host shell owns two kinds of presentation that are not canonical session history:
 //! pending submissions (`PendingSubmissions`: staged, sending and queued messages the session

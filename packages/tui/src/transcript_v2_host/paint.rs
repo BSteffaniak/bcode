@@ -1,4 +1,4 @@
-//! Transcript frames for the V2 engine (spec sections 3.6 and 9, rules F1–F7).
+//! Transcript frames for the V2 engine.
 //!
 //! The chat-screen chrome (header, status, composer) keeps the host frame layout; the V2
 //! transcript owns the whole transcript region, including the latest-bar row (F6). Each frame
@@ -164,7 +164,7 @@ impl TranscriptV2Host {
         self.regions
     }
 
-    /// Prepare the frame for `region` (terminal coordinates) at `clock` (spec 9.1 step 2): the
+    /// Prepare the frame for `region` (terminal coordinates) at `clock`: the
     /// engine builds one snapshot from its derived caches (F1), and the host records the
     /// regions pointer input resolves against and the next glow deadline. Painting
     /// ([`Self::paint`]) then reads only this snapshot (F3). A frame prepared but never

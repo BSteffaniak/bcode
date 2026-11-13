@@ -1,4 +1,4 @@
-//! List units derived from the transcript document (spec section 3.3, rules U1–U5).
+//! List units derived from the transcript document.
 //!
 //! A *unit* is one virtual-list item: a transcript item, a group header, a hidden-items marker
 //! or a resident-window boundary row. Unit order equals document order (U1).

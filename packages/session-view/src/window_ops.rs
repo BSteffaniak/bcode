@@ -1,4 +1,4 @@
-//! Incremental resident-window operations (TUI V2 spec section 3.1, rules SD1–SD7).
+//! Incremental resident-window operations.
 //!
 //! A renderer that keeps a bounded *resident window* of canonical history changes it with the
 //! operations here instead of rebuilding the whole projection:

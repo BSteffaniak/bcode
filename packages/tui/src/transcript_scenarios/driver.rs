@@ -321,13 +321,13 @@ pub trait TranscriptScenarioDriver: Sized {
     }
 
     /// Item layout work performed since the previous call (updates and frames alike), then
-    /// reset; `None` when the engine does not count it (spec 9.2, D4).
+    /// reset; `None` when the engine does not count it.
     fn layout_work(&mut self) -> Option<LayoutWork> {
         None
     }
 
-    /// Resident-window operation work since the engine started (spec 9.2; phase 5: paging
-    /// performs no full rebuild); `None` when the engine does not count it.
+    /// Resident-window operation work since the engine started (paging performs no full
+    /// rebuild); `None` when the engine does not count it.
     fn window_work(&self) -> Option<WindowWork> {
         None
     }
@@ -337,7 +337,7 @@ pub trait TranscriptScenarioDriver: Sized {
         None
     }
 
-    /// Damage the last presented frame was drawn with (spec section 8 item 15b), after
+    /// Damage the last presented frame was drawn with, after
     /// promotion (the first frame and resets are full); `None` when the engine does not report
     /// it.
     fn last_damage(&self) -> Option<DamageObservation> {
@@ -474,7 +474,7 @@ pub enum ScenarioScrollbar {
     Gutter,
 }
 
-/// Resident-window operation work an engine performed (phase 5 exit: no full rebuild on paging).
+/// Resident-window operation work an engine performed (paging performs no full rebuild).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WindowWork {
     /// Whole-window replacements (attach, jumps, `Head`/`Tail`/`Around` windows).
@@ -492,7 +492,7 @@ pub struct WindowWork {
     pub events_reduced: u64,
 }
 
-/// Item layout work an engine performed (spec 9.2 `LayoutWorkCounters`, D4).
+/// Item layout work an engine performed (the engine's `LayoutWorkCounters`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LayoutWork {
     /// Markdown source parses.
@@ -529,7 +529,7 @@ pub struct RepaintObservation {
     pub changed_cells: usize,
 }
 
-/// Damage of one presented frame (spec section 8 items 11 and 15b), in terminal cells.
+/// Damage of one presented frame, in terminal cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DamageObservation {
     /// Nothing was presented.

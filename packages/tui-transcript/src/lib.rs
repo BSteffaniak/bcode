@@ -5,7 +5,7 @@
 // or synchronized globals.
 #![forbid(unsafe_code)]
 
-//! Terminal transcript engine ("TUI V2").
+//! Terminal transcript engine.
 //!
 //! This crate owns everything between the semantic `SessionView` transcript document and the
 //! painted transcript region: the resident history window, units and item layout, the viewport,

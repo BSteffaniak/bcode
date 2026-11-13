@@ -1,4 +1,4 @@
-//! Process-local rows (spec section 3.3, rules LR1–LR7).
+//! Process-local rows.
 //!
 //! The host shell owns presentation that is not canonical session history: submissions it
 //! staged and has not seen accepted ("You · sending", "queued") and process-local notices

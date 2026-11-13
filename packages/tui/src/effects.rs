@@ -1169,7 +1169,7 @@ pub enum TuiEffect {
     },
     /// Discover the models advertised for the attached managed instance.
     LoadManagedModels,
-    /// Execute one V2 transcript engine history request (TUI V2 W5, W10, W11).
+    /// Execute one V2 transcript engine history request (W5, W10, W11).
     LoadTranscriptV2History {
         /// The request, its session and the resident tail it was issued against.
         load: super::transcript_v2_host::effects::HistoryLoad,
@@ -1226,7 +1226,7 @@ impl DaemonObservation {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
-    /// A V2 transcript engine history request completed (TUI V2 W3, W5, W10, W11).
+    /// A V2 transcript engine history request completed (W3, W5, W10, W11).
     TranscriptV2HistoryLoaded {
         /// The executed request.
         load: super::transcript_v2_host::effects::HistoryLoad,

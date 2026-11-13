@@ -1,4 +1,4 @@
-//! Transcript selection (spec C34–C36, W7, BMUX 13).
+//! Transcript selection (C34–C36, W7, BMUX 13).
 //!
 //! A transcript selection is a BMUX [`LogicalSelection`] over [`SelectionKey`]s: one key per
 //! source-backed selectable part of a unit ([`crate::layout::geometry::SelectableText`]), an

@@ -1,4 +1,4 @@
-//! Structure inspector and transcript tooling for the V2 engine (spec section 6, FO6).
+//! Structure inspector and transcript tooling for the V2 engine.
 //!
 //! The inspector explains how the focused disclosure target resolved: facts, every resolved
 //! property with the rule and layer that set it, visibility-floor adjustments, the manual

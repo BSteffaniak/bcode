@@ -70,7 +70,7 @@ impl ItemLayout {
     }
 }
 
-/// Layout work observed since the counters were last taken (spec section 9.2, D4).
+/// Layout work observed since the counters were last taken.
 ///
 /// Scroll-only frames keep every counter at zero; a prepend counts only the new units.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

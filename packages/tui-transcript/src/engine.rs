@@ -1,6 +1,6 @@
-//! Engine façade the host calls (spec sections 3.0 and 9.1).
+//! Engine façade the host calls.
 //!
-//! The engine owns one `SessionView` per attached session (spec section 3.1), the resident
+//! The engine owns one `SessionView` per attached session, the resident
 //! window manager, units, the viewport projection, the navigation state and keyboard focus. It
 //! performs no I/O and reads no clock: every input carries its time, page and window requests
 //! leave as [`HostRequest`]s for the host to execute, and navigation timers are kept as
@@ -292,15 +292,15 @@ impl TranscriptEngine {
         &self.layouts
     }
 
-    /// Layout work since the last call, then reset (spec 9.2, D4).
+    /// Layout work since the last call, then reset.
     #[cfg(any(test, feature = "testing"))]
     pub const fn take_layout_work(&mut self) -> crate::layout::LayoutWorkCounters {
         self.layouts.take_counters()
     }
 
     /// Window-operation work since the engine was created: whole-window replacements, SD2
-    /// fallbacks, prepends, appends, evictions and reduced events (phase 5: paging performs no
-    /// full rebuild).
+    /// fallbacks, prepends, appends, evictions and reduced events. Paging never performs a full
+    /// rebuild.
     #[must_use]
     pub const fn window_work(&self) -> crate::window::WindowWork {
         self.window.work()
@@ -807,7 +807,7 @@ impl TranscriptEngine {
 
     // ---- frames ---------------------------------------------------------------------------
 
-    /// Prepare one frame at `clock` (spec 9.1 step 2). Writes only the derived list position
+    /// Prepare one frame at `clock`. Writes only the derived list position
     /// (VP5); navigation, window and units are unchanged (CK1).
     pub fn prepare_frame(&mut self, clock: FrameClock) -> FrameSnapshot {
         let position = self.presented(clock.now);
@@ -852,7 +852,7 @@ impl TranscriptEngine {
         snapshot
     }
 
-    /// Paint a prepared frame into `cx` at the transcript region's origin (spec 9.1 step 3).
+    /// Paint a prepared frame into `cx` at the transcript region's origin.
     /// Only visible, correctly positioned units are built and painted (VP3).
     ///
     /// The list is laid out with the snapshot's clock as the BMUX presentation clock (BMUX 8),
@@ -929,8 +929,8 @@ impl TranscriptEngine {
     /// host's next step ([`Self::activate_markdown`]). Other producer activations are returned
     /// for the host to handle and change nothing here.
     ///
-    /// Phase 6 routes pointer gestures through BMUX click activation (BMUX 14); this entry point
-    /// is the activation that routing ends in.
+    /// Pointer gestures are routed through BMUX click activation; this entry point is the
+    /// activation that routing ends in.
     pub fn click(
         &mut self,
         snapshot: &FrameSnapshot,

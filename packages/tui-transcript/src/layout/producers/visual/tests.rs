@@ -170,7 +170,7 @@ fn collapsed_visual_sections_count_rows_and_toggle() {
     assert_eq!(rendered.hit(&target).map(|rect| rect.y), Some(1));
 }
 
-// ---- full plugin visual presentation (E3, C36, phase 7) -----------------------------------
+// ---- full plugin visual presentation ------------------------------------------------------
 
 use crate::layout::SourcePosition;
 use crate::layout::geometry::SelectableRunKind;

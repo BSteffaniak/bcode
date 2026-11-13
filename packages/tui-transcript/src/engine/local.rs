@@ -1,4 +1,4 @@
-//! Process-local rows (spec section 3.3, LR1–LR7): pending submissions and notices the host
+//! Process-local rows: pending submissions and notices the host
 //! owns, reduced through the same update path as content changes.
 
 use web_time::Instant;

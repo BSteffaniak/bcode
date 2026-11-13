@@ -1,4 +1,4 @@
-//! Canonical artifact image admission as an accepted plugin visual (spec L8, E10).
+//! Canonical artifact image admission as an accepted plugin visual (L8, E10).
 //!
 //! A decoded artifact image becomes the item's accepted visual: [`IMAGE_ROWS`] reserved rows
 //! with one image placement over them, painted from the retained rows that show it. Decoding

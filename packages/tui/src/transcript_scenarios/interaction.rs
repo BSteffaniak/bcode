@@ -1091,7 +1091,7 @@ fn layout_work<D: TranscriptScenarioDriver>(scenario: &mut Scenario<D>) -> Layou
         .unwrap_or_else(|| scenario.fail("driver: needs per-frame layout work counters"))
 }
 
-/// D4 (spec 9.2): steady scrolling over resident content does no parse, highlight,
+/// D4: steady scrolling over resident content does no parse, highlight,
 /// projection, build or measurement work, in updates or frames.
 pub fn d4_scrolling_does_no_layout_work<D: TranscriptScenarioDriver>() {
     let mut scenario = attach_all::<D>(ScenarioSession::with_turns(20, 2), WIDTH, HEIGHT);
@@ -1113,7 +1113,7 @@ pub fn d4_scrolling_does_no_layout_work<D: TranscriptScenarioDriver>() {
     }
 }
 
-/// D4 (spec 9.2): incorporating an older page measures only the page's new units, and the
+/// D4: incorporating an older page measures only the page's new units, and the
 /// frames around it do no work.
 pub fn d4_prepend_measures_only_new_units<D: TranscriptScenarioDriver>() {
     let session = ScenarioSession::with_turns(60, 2);

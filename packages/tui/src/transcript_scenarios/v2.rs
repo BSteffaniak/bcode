@@ -1,4 +1,4 @@
-//! Scenario driver for the V2 transcript engine in the application (TUI V2 phase 4).
+//! Scenario driver for the transcript engine in the application.
 //!
 //! Drives the real [`BcodeRuntimeModel`] through `Program::update` (terminal input, session stream
 //! messages, effect completions, timers) and presents through the production root presenter,

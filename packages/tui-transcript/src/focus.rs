@@ -1,4 +1,4 @@
-//! Composer/transcript keyboard focus (spec section 6, rules FO1–FO10).
+//! Composer/transcript keyboard focus.
 //!
 //! Focus targets are the focus targets of each unit's retained layout (FO7, B12), walked in
 //! document order and, inside a unit, in layout order. Traversal is a pure function of units and

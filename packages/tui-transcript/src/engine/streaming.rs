@@ -1,4 +1,4 @@
-//! Paced live text (spec 9.2 "Smooth streaming", D13, EN4).
+//! Paced live text.
 //!
 //! Pacing lives in the engine's own `SessionView`: accepted live text is exposed as progressive
 //! visible prefixes under the renderer-neutral [`StreamingPresentationPolicy`]. The engine only

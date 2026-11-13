@@ -1,5 +1,4 @@
-//! The browser host of the V2 transcript engine (TUI V2 specification section 3.0, browser
-//! host section).
+//! The browser host of the V2 transcript engine.
 //!
 //! The engine runs in the browser exactly as it runs natively. This module owns what the
 //! engine deliberately does not: the feed it is fed from, the frames it painted and the

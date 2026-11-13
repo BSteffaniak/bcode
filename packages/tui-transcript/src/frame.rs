@@ -1,4 +1,4 @@
-//! Frame composition (spec sections 3.6 and 9, rules F1–F7).
+//! Frame composition.
 //!
 //! Identifiers, the per-frame clock and the frame snapshot. The clock is the BMUX presentation
 //! clock (BMUX 8): one instant sampled per presentation and handed to every layout and paint
@@ -69,7 +69,7 @@ pub struct FrameSnapshot {
     pub following: bool,
     /// Whether a scroll motion is running.
     pub motion_running: bool,
-    /// Latest-bar decision (phase 4; never visible before then).
+    /// Latest-bar decision.
     pub latest_bar: crate::latest_bar::LatestBarState,
     /// Presented scrollbar track in viewport cells, if any (VP4, X6).
     pub scrollbar_track: Option<bmux_tui::geometry::Rect>,
