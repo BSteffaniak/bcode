@@ -1,6 +1,6 @@
 # Colors of Claude Code's dark and light terminal themes, measured from its fullscreen renderer
 # with scripts/appearance-reference (see docs/appearance-reference.md). Pair with the
-# `claude-code` profile for its structure. Values marked "unverified" have not appeared in a
+# `claude-code-layout` profile for its structure. Values marked "unverified" have not appeared in a
 # reference capture yet.
 display_name   = "Claude Code"
 extends        = ["seeded-base"]
@@ -9,6 +9,7 @@ schema_version = 2
 
 [palette]
 accent     = "#b1b9f9"
+assistant_marker = "#ffffff"
 background = "terminal"
 blue       = "#b1b9f9"
 brand      = "#d77757"
@@ -52,8 +53,13 @@ fg = "$accent"
 fg = "$accent"
 
 [styles."surface.raised"]
-bg = "$user_bg"
-fg = "$user_text"
+fg = "$text"
+
+[styles."composer.border"]
+fg = "$rule"
+
+[styles."composer.surface"]
+fg = "$text"
 
 [styles."surface.overlay"]
 fg = "$text"
@@ -90,7 +96,7 @@ bg = "$user_bg"
 fg = "$user_text"
 
 [styles."transcript.assistant.label"]
-fg = "$text"
+fg = "$assistant_marker"
 
 [styles."transcript.reasoning.label"]
 fg = "$muted"
@@ -311,6 +317,7 @@ bg = "#5c0102"                                # unverified
 
 [variants.light.palette]
 accent     = "#5769f7"
+assistant_marker = "#000000"
 background = "terminal"
 blue       = "#5769f7"
 brand      = "#d77757"

@@ -264,6 +264,10 @@ pub struct SurfaceTheme {
     pub control_focused: bmux_tui::style::Style,
     /// Optional full-frame modal scrim.
     pub scrim: Option<bmux_tui::style::Style>,
+    /// The composer's border (`composer.border`); `None` uses the focused accent.
+    pub composer_border: Option<bmux_tui::style::Style>,
+    /// The composer's fill (`composer.surface`); `None` uses the raised surface.
+    pub composer_surface: Option<bmux_tui::style::Style>,
 }
 
 /// Fully resolved target theme derived from app state and configuration.
@@ -667,6 +671,8 @@ pub(crate) fn resolved_definition_theme(
         overlay: component_theme.surfaces.overlay,
         control_focused: shared.control_focused,
         scrim: component_theme.surfaces.scrim,
+        composer_border: style("composer.border"),
+        composer_surface: style("composer.surface"),
     };
     let selection = component_theme.selected;
     let info = component_theme.info;
@@ -860,6 +866,9 @@ const fn transcript_recipe(
                 }
                 ContainerBorder::All => {
                     bcode_tui_components::transcript::TranscriptContainerBorder::All
+                }
+                ContainerBorder::Rules => {
+                    bcode_tui_components::transcript::TranscriptContainerBorder::Rules
                 }
             },
             padding_x: recipe.padding_x,

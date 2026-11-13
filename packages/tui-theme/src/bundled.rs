@@ -137,6 +137,10 @@ pub const BUNDLED_THEMES: &[(&str, &str)] = &[
         "brutalist",
         include_str!("../themes/profiles/brutalist.toml"),
     ),
+    (
+        "claude-code-layout",
+        include_str!("../themes/profiles/claude-code-layout.toml"),
+    ),
     ("compact", include_str!("../themes/profiles/compact.toml")),
     (
         "editorial",

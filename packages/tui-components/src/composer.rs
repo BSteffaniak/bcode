@@ -30,6 +30,8 @@ pub enum ComposerFrame {
     Framed(BorderSet),
     /// A single leading bar drawn with this set's vertical glyph; untitled.
     LeftBar(BorderSet),
+    /// Horizontal rules above and below drawn with this set's horizontal glyph; untitled.
+    Rules(BorderSet),
     /// No painted border; untitled.
     None,
 }
@@ -45,7 +47,12 @@ pub struct ComposerPanel<'a> {
     surface: Surface<'a>,
     style: ComposerStyle,
     titled: bool,
+    prompt: Option<Line>,
 }
+
+/// Columns between the composer's left edge and its editor in every frame; a prompt glyph is
+/// drawn there.
+pub const COMPOSER_LEADING_CELLS: u16 = 2;
 
 /// Compose the message editor inside Bcode's bordered shell.
 #[must_use]
@@ -57,6 +64,7 @@ pub fn composer_panel<'a>(style: ComposerStyle, child: impl Component + 'a) -> C
             .content_style(style.surface),
         style,
         titled: false,
+        prompt: None,
     }
     .frame(ComposerFrame::default())
 }
@@ -78,6 +86,13 @@ impl ComposerPanel<'_> {
                 true,
                 false,
             ),
+            ComposerFrame::Rules(set) => (
+                Border::new(set, self.style.border)
+                    .sides(BorderSides::new(true, false, true, false)),
+                Insets::new(0, 2, 0, 2),
+                true,
+                false,
+            ),
             // The border keeps its layout insets but is not painted.
             ComposerFrame::None => (
                 Border::new(BorderSet::SINGLE, self.style.border),
@@ -92,6 +107,21 @@ impl ComposerPanel<'_> {
             .paint_border(paint)
             .padding(padding);
         self.titled = titled;
+        self
+    }
+
+    /// Hide the `Message` title that full frames draw.
+    #[must_use]
+    pub const fn untitled(mut self) -> Self {
+        self.titled = false;
+        self
+    }
+
+    /// Draw `prompt` before the editor's first row, in the leading cells every frame keeps.
+    /// A prompt wider than [`COMPOSER_LEADING_CELLS`] is not drawn.
+    #[must_use]
+    pub fn prompt(mut self, prompt: Line) -> Self {
+        self.prompt = Some(prompt);
         self
     }
 
@@ -114,6 +144,12 @@ impl Component for ComposerPanel<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.surface.paint(layout, cx);
+        if let Some(prompt) = &self.prompt
+            && prompt.width() <= usize::from(COMPOSER_LEADING_CELLS)
+            && layout.size.height > 2
+        {
+            cx.write_line(LocalRect::new(0, 1, COMPOSER_LEADING_CELLS, 1), prompt);
+        }
         if !self.titled {
             return;
         }
@@ -247,6 +283,7 @@ mod tests {
             ComposerFrame::Framed(BorderSet::SINGLE),
             ComposerFrame::Framed(BorderSet::ROUNDED),
             ComposerFrame::LeftBar(BorderSet::SINGLE),
+            ComposerFrame::Rules(BorderSet::SINGLE),
             ComposerFrame::None,
         ];
         for width in [0, 1, 3, 4, 5, 20] {
@@ -301,5 +338,47 @@ mod tests {
                 "width {width}: {rows:?}"
             );
         }
+    }
+
+    #[test]
+    fn rules_composer_frame_paints_full_width_rules_only() {
+        let rows = painted(ComposerFrame::Rules(BorderSet::SINGLE), 12, 3);
+        assert_eq!(rows[0], "─".repeat(12));
+        assert_eq!(rows[1], " ".repeat(12));
+        assert_eq!(rows[2], "─".repeat(12));
+    }
+
+    fn prompted(prompt: &str, width: u16) -> Vec<String> {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::geometry::Rect;
+        let panel = composer_panel(
+            ComposerStyle {
+                border: Style::new(),
+                surface: Style::new(),
+            },
+            TextBlock::new("hi"),
+        )
+        .frame(ComposerFrame::Rules(BorderSet::SINGLE))
+        .prompt(Line::raw(prompt));
+        let layout = panel.layout(
+            Constraints::tight(Size::new(width, 3)),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+        panel.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        (0..3)
+            .map(|y| buffer.row_symbols(y).expect("row"))
+            .collect()
+    }
+
+    #[test]
+    fn prompt_occupies_the_leading_cells_of_the_first_editor_row() {
+        assert!(prompted("❯ ", 12)[1].starts_with("❯ hi"));
+        // A wide prompt is dropped instead of overlapping the editor.
+        assert!(prompted(">>> ", 12)[1].starts_with("  hi"));
+        // CJK and emoji measure two cells each: one fits, two do not.
+        assert!(prompted("中", 12)[1].starts_with("中hi"));
+        assert!(prompted("🦀🦀", 12)[1].starts_with("  hi"));
     }
 }

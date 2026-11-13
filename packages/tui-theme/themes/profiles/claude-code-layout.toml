@@ -1,0 +1,52 @@
+# Profiles set chrome, structure, and containers only, so they combine with any palette.
+# Claude Code's fullscreen layout, measured with scripts/appearance-reference; pair with the
+# `claude-code` palette (see docs/appearance-reference.md).
+description    = "Claude Code's layout: no header, rules around a prompt, a footer status line."
+display_name   = "Claude Code (profile)"
+id             = "claude-code-layout"
+kind           = "profile"
+schema_version = 2
+
+[chrome.tui]
+borders       = { panel = "single", dialog = "single", tool = "none", composer = "rules" }
+composer      = { prompt = "❯ ", title = "hidden", placeholder = "", controls = "hidden" }
+density       = "cozy"
+header        = "hidden"
+icons         = "unicode"
+motion        = "subtle"
+separators    = { status = "plain" }
+session_start = "hidden"
+markers       = { user = "❯", assistant = "⏺" }
+speaker       = "marker"
+status        = { placement = "below_composer", indent = 2 }
+surfaces      = "flat"
+
+# User messages fill their rows edge to edge; no border or padding.
+[containers."transcript.user"]
+border = "none"
+layout = "panel"
+width  = "full"
+
+[containers."transcript.assistant"]
+layout = "plain"
+
+[containers."tool.requested"]
+layout = "plain"
+
+[containers."tool.running"]
+layout = "plain"
+
+[containers."tool.waiting"]
+layout = "plain"
+
+[containers."tool.succeeded"]
+layout = "plain"
+
+[containers."tool.failed"]
+layout = "plain"
+
+[containers."tool.cancelled"]
+layout = "plain"
+
+[containers."tool.timed_out"]
+layout = "plain"

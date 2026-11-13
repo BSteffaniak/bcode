@@ -5,6 +5,8 @@ use std::cell::{Cell, RefCell};
 
 #[cfg(test)]
 mod chrome_effects_tests;
+#[cfg(test)]
+mod screen_chrome_tests;
 
 thread_local! {
     static CHROME_THEME: Cell<Option<super::theme::PresentedTheme>> = const { Cell::new(None) };
@@ -170,9 +172,33 @@ pub struct TuiTheme {
     pub error: Style,
     /// The theme's `borders.composer` chrome, which the composer panel frames itself with.
     pub composer_border: Option<bcode_tui_theme::chrome::BorderStyle>,
+    /// The theme's composer chrome: prompt, title, placeholder, and controls.
+    pub composer: bcode_tui_theme::chrome::ComposerChrome,
+    /// The theme's header row visibility.
+    pub header: bcode_tui_theme::chrome::Visibility,
+    /// The theme's status line placement.
+    pub status: bcode_tui_theme::chrome::StatusChrome,
+    /// The composer's border style.
+    pub composer_frame: Style,
+    /// The composer's fill.
+    pub composer_surface: Style,
 }
 
 impl TuiTheme {
+    /// Fill the composer's border and surface from the theme's `composer.*` roles, falling
+    /// back to the focused accent and the raised surface.
+    const fn with_composer_roles(mut self, surfaces: super::theme::SurfaceTheme) -> Self {
+        self.composer_frame = match surfaces.composer_border {
+            Some(style) => style,
+            None => self.focused,
+        };
+        self.composer_surface = match surfaces.composer_surface {
+            Some(style) => style,
+            None => self.raised,
+        };
+        self
+    }
+
     pub const fn modal_theme(self) -> bmux_tui_components::modal_frame::ModalTheme {
         let theme = bmux_tui_components::modal_frame::ModalTheme::new(
             self.overlay,
@@ -211,7 +237,13 @@ impl TuiTheme {
             warning: theme.warning,
             error: theme.error,
             composer_border: theme.unit_chrome.composer_border,
+            composer: theme.unit_chrome.composer,
+            header: theme.unit_chrome.header,
+            status: theme.unit_chrome.status,
+            composer_frame: Style::new(),
+            composer_surface: Style::new(),
         }
+        .with_composer_roles(theme.surfaces)
     }
 
     #[cfg(test)]
@@ -242,7 +274,13 @@ impl TuiTheme {
             warning: theme.warning,
             error: theme.error,
             composer_border: theme.presented(theme.accent).unit_chrome.composer_border,
+            composer: theme.presented(theme.accent).unit_chrome.composer,
+            header: theme.presented(theme.accent).unit_chrome.header,
+            status: theme.presented(theme.accent).unit_chrome.status,
+            composer_frame: Style::new(),
+            composer_surface: Style::new(),
         }
+        .with_composer_roles(theme.surfaces)
     }
 
     #[cfg(test)]
@@ -272,7 +310,13 @@ impl TuiTheme {
             warning: theme.warning,
             error: theme.error,
             composer_border: theme.unit_chrome.composer_border,
+            composer: theme.unit_chrome.composer,
+            header: theme.unit_chrome.header,
+            status: theme.unit_chrome.status,
+            composer_frame: Style::new(),
+            composer_surface: Style::new(),
         }
+        .with_composer_roles(theme.surfaces)
     }
 }
 
@@ -313,14 +357,48 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
     if area.is_empty() {
         return area;
     }
+    transcript_area_for_body(app, screen_rows(app, area).body)
+}
+
+/// The full-width rows of one frame: header, transcript body, status line, and composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenRows {
+    header: Rect,
+    body: Rect,
+    status: Rect,
+    composer: Rect,
+}
+
+/// Stack the header (when the theme shows it) at the top and the composer with the status
+/// line at the bottom, the status line above or below the composer as the theme places it.
+/// The body takes the rows in between.
+fn screen_rows(app: &BmuxApp, area: Rect) -> ScreenRows {
+    let chrome = TuiTheme::for_app(app);
+    let header_height = u16::from(chrome.header.is_shown()).min(area.height);
+    let header = Rect::new(area.x, area.y, area.width, header_height);
+    let top = header.bottom();
     let composer_height = composer_height(app, area);
-    let composer_y = area.bottom().saturating_sub(composer_height);
-    let status_height = queue_status_height(app, area.width)
-        .min(composer_y.saturating_sub(area.y.saturating_add(1)));
-    let body_height =
-        composer_y.saturating_sub(area.y.saturating_add(1).saturating_add(status_height));
-    let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
-    transcript_area_for_body(app, body)
+    let status_height = queue_status_height(app, area.width).min(
+        area.bottom()
+            .saturating_sub(composer_height)
+            .saturating_sub(top),
+    );
+    let bottom_height = composer_height.saturating_add(status_height);
+    let bottom_y = area.bottom().saturating_sub(bottom_height).max(top);
+    let (status_y, composer_y) = match chrome.status.placement {
+        bcode_tui_theme::chrome::StatusPlacement::AboveComposer => {
+            (bottom_y, bottom_y.saturating_add(status_height))
+        }
+        bcode_tui_theme::chrome::StatusPlacement::BelowComposer => {
+            (bottom_y.saturating_add(composer_height), bottom_y)
+        }
+    };
+    ScreenRows {
+        header,
+        body: Rect::new(area.x, top, area.width, bottom_y.saturating_sub(top)),
+        status: Rect::new(area.x, status_y, area.width, status_height),
+        composer: Rect::new(area.x, composer_y, area.width, composer_height),
+    }
 }
 
 /// Prepare derived frame layout before rendering.
@@ -549,15 +627,12 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         return None;
     }
 
-    let header = Rect::new(area.x, area.y, area.width, 1);
-    let composer_height = composer_height(app, area);
-    let composer = composer_area(area, composer_height);
-    let status_height = queue_status_height(app, area.width)
-        .min(composer.y.saturating_sub(area.y.saturating_add(1)));
-    let body_height = composer
-        .y
-        .saturating_sub(area.y.saturating_add(1).saturating_add(status_height));
-    let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
+    let ScreenRows {
+        header,
+        body,
+        status,
+        composer,
+    } = screen_rows(app, area);
     let panel_height = if app.child_panel_open() {
         let presentation = app.monitor_presentation();
         u16::try_from(
@@ -577,12 +652,6 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         body.y.saturating_add(panel_height),
         body.width,
         body.height.saturating_sub(panel_height),
-    );
-    let status = Rect::new(
-        area.x,
-        composer.y.saturating_sub(status_height),
-        area.width,
-        status_height,
     );
     Some(FrameLayout {
         area,
@@ -727,7 +796,10 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
     let content_width = area.width.saturating_sub(4).max(1);
     let rows = app.composer_state().rows_with_trailing_exclusion(
         content_width,
-        super::composer_submit::trailing_exclusion(area.size()),
+        super::composer_submit::trailing_exclusion(
+            area.size(),
+            TuiTheme::for_app(app).composer.controls,
+        ),
         MAX_COMPOSER_ROWS,
     );
     let content_rows = rows.clamp(1, MAX_COMPOSER_ROWS);
@@ -735,15 +807,6 @@ fn composer_height(app: &BmuxApp, area: Rect) -> u16 {
         .saturating_add(2)
         .min(area.height.saturating_sub(2).max(3))
         .min(area.height)
-}
-
-const fn composer_area(area: Rect, composer_height: u16) -> Rect {
-    Rect::new(
-        area.x,
-        area.bottom().saturating_sub(composer_height),
-        area.width,
-        composer_height,
-    )
 }
 
 fn composer_content_area(area: Rect, theme: TuiTheme) -> Rect {
@@ -864,6 +927,13 @@ fn render_status(
         );
         return;
     }
+    let indent = u16::from(theme.status.indent).min(area.width);
+    let area = Rect::new(
+        area.x.saturating_add(indent),
+        area.y,
+        area.width.saturating_sub(indent),
+        area.height,
+    );
     let spans = statusline_spans(app, usize::from(area.width), theme, position);
     frame.write_line(LocalRect::terminal(area), &Line::from_spans(spans));
 }
@@ -1145,9 +1215,14 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
     }
     let state = RefCell::new(app.composer_state().clone());
     let policy = composer_policy();
-    let placeholder = app.managed_label().map_or_else(
-        || super::composer_submit::DEFAULT_PLACEHOLDER.to_owned(),
-        |label| format!("Ask {label}…"),
+    let placeholder = theme.composer.placeholder.map_or_else(
+        || {
+            app.managed_label().map_or_else(
+                || super::composer_submit::DEFAULT_PLACEHOLDER.to_owned(),
+                |label| format!("Ask {label}…"),
+            )
+        },
+        |placeholder| placeholder.as_str().to_owned(),
     );
     let panel = super::composer_submit::panel(
         &state,
@@ -1173,7 +1248,8 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
     *app.composer_state_mut() = state.into_inner();
     let inner = composer_content_area(area, theme);
     app.set_composer_content_area(inner);
-    let exclusion = super::composer_submit::trailing_exclusion(area.size());
+    let exclusion =
+        super::composer_submit::trailing_exclusion(area.size(), theme.composer.controls);
     for region in [
         Rect::new(
             inner.x,

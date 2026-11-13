@@ -4,7 +4,7 @@
 
 Bundled themes and profiles rendered through the TUI's sample transcript (the appearance picker preview), laid out by the transcript engine's unit producers, into a headless 80×112 BMUX buffer (trailing blank rows trimmed). Renders are plain text, so they show structure, chrome glyphs and disclosure; the swatch tables show color.
 
-Selection: every selectable bundled theme alone (dark variant), plus every bundled profile over the default theme and `bcode`. Identical renders are printed once and list every combination that produces them. This page shows 15 distinct renders of 86 combinations (at most 64).
+Selection: every selectable bundled theme alone (dark variant), plus every bundled profile over the default theme and `bcode`. Identical renders are printed once and list every combination that produces them. This page shows 16 distinct renders of 89 combinations (at most 64).
 
 Swatches name terminal-controlled colors (`default` and the 16 ANSI colors) instead of guessing their values; `—` means the role is unset. *Selection* is the selection background, or its foreground when it has none. Nerd Font icons need a Nerd Font to display, and viewers that measure them differently from the terminal show the rows they appear in misaligned.
 
@@ -12,7 +12,7 @@ Swatches name terminal-controlled colors (`default` and the 16 ANSI colors) inst
 
 ### 1. terminal-native
 
-Also rendered identically by: `amber`, `aurora`, `ayu`, `ayu-mirage`, `blueprint`, `catppuccin-frappe`, `catppuccin-latte`, `catppuccin-macchiato`, `catppuccin-mocha`, `dracula`, `dusk`, `ember`, `everforest`, `flexoki`, `github`, `github-dimmed`, `glacier`, `gruvbox`, `gruvbox-material`, `kanagawa`, `kanagawa-dragon`, `melange`, `modus`, `monochrome`, `monokai-classic`, `moss`, `neon-noir`, `night-owl`, `nightfox`, `one`, `oxocarbon`, `paper`, `phosphor`, `poimandres`, `rose-pine`, `rose-pine-moon`, `solarized`, `tokyonight`, `tokyonight-moon`, `tokyonight-storm`, `vesper`, `zenburn`.
+Also rendered identically by: `amber`, `aurora`, `ayu`, `ayu-mirage`, `blueprint`, `catppuccin-frappe`, `catppuccin-latte`, `catppuccin-macchiato`, `catppuccin-mocha`, `claude-code`, `dracula`, `dusk`, `ember`, `everforest`, `flexoki`, `github`, `github-dimmed`, `glacier`, `gruvbox`, `gruvbox-material`, `kanagawa`, `kanagawa-dragon`, `melange`, `modus`, `monochrome`, `monokai-classic`, `moss`, `neon-noir`, `night-owl`, `nightfox`, `one`, `oxocarbon`, `paper`, `phosphor`, `poimandres`, `rose-pine`, `rose-pine-moon`, `solarized`, `tokyonight`, `tokyonight-moon`, `tokyonight-storm`, `vesper`, `zenburn`.
 
 ```text
 You
@@ -873,7 +873,86 @@ Also rendered identically by: `bcode + accessible`.
 │   awaiting decision
 ```
 
-### 13. terminal-native + compact
+### 13. terminal-native + claude-code-layout
+
+Also rendered identically by: `bcode + claude-code-layout`.
+
+```text
+❯ Where is the picker drawn?
+
+▾ Tool result · glob · finished · duration 9ms
+  ▾ pattern
+    src/**/picker*.rs
+  ▾ output
+    src/picker.rs
+    src/picker_render.rs
+
+⏺ In src/picker_render.rs.
+
+❯ Why does the picker lose its selection after a resize?
+
+▾ Tool result · read · finished · duration 42ms
+  ▾ path
+    src/picker.rs
+  ▾ output
+      let row = 1
+      let row = 2
+      let row = 3
+      let row = 4
+      let row = 5
+      let row = 6
+      let row = 7
+      let row = 8
+      let row = 9
+      let row = 10
+      let row = 11
+      let row = 12
+      let row = 13
+      let row = 14
+
+▾ Tool result · read · finished · duration 27ms
+  ▾ path
+    src/render.rs
+  ▾ output
+      let offset = 1
+      let offset = 2
+      let offset = 3
+
+▾ Tool result · grep · finished · duration 18ms
+  ▾ pattern
+    list_offset
+  ▾ output
+    src/picker.rs:88
+    src/render.rs:412
+    src/mouse.rs:57
+
+⏺ The offset is recomputed before layout, so hit rows lag one frame. I’ll move
+  it after measurement.
+
+▾ Tool result · bash · failed · duration 2s
+  ▾ command
+    cargo check
+  ▾ output
+    error[E0599]: no method named `offset` found
+      --> src/picker.rs:91:18
+    error: could not compile
+  tool failed
+
+▾ Tool · bash · running                                                        ⠋
+  ▾ command
+    cargo test picker
+
+▾ Permission required · edit · awaiting decision                               ⠋
+  ▾ new
+    list_offset()
+  old
+    offset()
+  path
+    src/picker.rs
+  awaiting decision
+```
+
+### 14. terminal-native + compact
 
 Also rendered identically by: `bcode + compact`.
 
@@ -910,7 +989,7 @@ Bcode
   awaiting decision
 ```
 
-### 14. terminal-native + focus
+### 15. terminal-native + focus
 
 Also rendered identically by: `bcode + focus`.
 
@@ -965,7 +1044,7 @@ Bcode
 │   awaiting decision
 ```
 
-### 15. terminal-native + timeline
+### 16. terminal-native + timeline
 
 Also rendered identically by: `bcode + timeline`.
 
@@ -1024,6 +1103,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `catppuccin-latte` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
 | `catppuccin-macchiato` | `#24273a` | `#cad3f5` | `#8289a5` | `#c6a0f6` | `#494d64` | `#2b2e42` | `#50486d` | `#8aadf4` | `#a6da95` | `#eed49f` | `#ed8796` |
 | `catppuccin-mocha` | `#1e1e2e` | `#cdd6f4` | `#81869f` | `#cba6f7` | `#44465a` | `#252636` | `#4c4364` | `#89b4fa` | `#a6e3a1` | `#f9e2af` | `#f38ba8` |
+| `claude-code` | — | *default* | `#999999` | `#b1b9f9` | `#888888` | — | — | `#b1b9f9` | `#4eba65` | `#ffc107` | `#ff6b80` |
 | `crt` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
 | `dracula` | `#282a36` | `#f8f8f2` | `#9e9fa2` | `#bd93f9` | `#565861` | `#31333e` | `#51486b` | `#bd93f9` | `#50fa7b` | `#f1fa8c` | `#ff5555` |
 | `dusk` | `#1c1726` | `#e8def5` | `#8f879b` | `#f2a7c3` | `#484254` | `#241f2f` | `#553e51` | `#9bb4f5` | `#a8d8a0` | `#f5d58a` | `#f28b9a` |
@@ -1089,6 +1169,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `catppuccin-latte` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
 | `catppuccin-macchiato` | `#24273a` | `#cad3f5` | `#8289a5` | `#c6a0f6` | `#494d64` | `#2b2e42` | `#50486d` | `#8aadf4` | `#a6da95` | `#eed49f` | `#ed8796` |
 | `catppuccin-mocha` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
+| `claude-code` | — | *default* | `#666666` | `#5769f7` | `#8a8a8a` | — | — | `#5769f7` | `#2c7a39` | `#966c1e` | `#ab2b3f` |
 | `crt` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
 | `dracula` | `#fffbeb` | `#1f1f1f` | `#706e69` | `#644ac9` | `#c1beb2` | `#f2efdf` | `#cbc7e6` | `#644ac9` | `#14710a` | `#846e15` | `#cb3a2a` |
 | `dusk` | `#1c1726` | `#e8def5` | `#8f879b` | `#f2a7c3` | `#484254` | `#241f2f` | `#553e51` | `#9bb4f5` | `#a8d8a0` | `#f5d58a` | `#f28b9a` |

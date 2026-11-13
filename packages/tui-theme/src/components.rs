@@ -130,14 +130,16 @@ pub fn component_styles(theme: Option<&ResolvedThemeDefinition>, accent: Color) 
     }
 }
 
-/// BMUX glyph set for a theme border style; `None` for no border or a leading-bar-only style
-/// that has no panel glyph set.
+/// BMUX glyph set for a theme border style.
+///
+/// `None` for no border or a leading-bar-only style that has no panel glyph set. `rules` uses
+/// single-line glyphs; surfaces that support it draw only the top and bottom sides.
 #[must_use]
 pub const fn border_set(style: BorderStyle) -> Option<BorderSet> {
     match style {
         BorderStyle::None | BorderStyle::Left => None,
         BorderStyle::Ascii => Some(BorderSet::ASCII),
-        BorderStyle::Single => Some(BorderSet::SINGLE),
+        BorderStyle::Single | BorderStyle::Rules => Some(BorderSet::SINGLE),
         BorderStyle::Rounded => Some(BorderSet::ROUNDED),
         BorderStyle::Thick => Some(BorderSet::THICK),
         BorderStyle::Double => Some(BorderSet::DOUBLE),

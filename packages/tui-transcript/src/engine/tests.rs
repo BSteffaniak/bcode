@@ -962,3 +962,35 @@ fn l1_toggling_one_details_block_remeasures_only_its_unit() {
     assert_eq!(work.measurements, 1, "only the owning unit: {work:?}");
     assert_eq!(work.markdown_parses, 1, "{work:?}");
 }
+
+#[test]
+fn a_hidden_session_start_marker_paints_its_row_blank() {
+    // Two turns, all resident: the older boundary is exhausted (the session start).
+    let events = session(2);
+    let resident = events.len();
+    let mut harness = Harness::attach_with(
+        TranscriptEngine::with_producer(
+            ViewportGeometry::new(WIDTH, HEIGHT),
+            MotionConfig::INSTANT,
+            Box::new(crate::layout::producers::testing::PlainTextProducer),
+        ),
+        events,
+        resident,
+    );
+    let shown = harness.present();
+    let marker = row_of(&shown, "start of session").expect("marker painted by default");
+
+    let mut config = harness.engine.render_config().clone();
+    let mut theme = (*config.theme).clone();
+    theme.chrome.session_start = bcode_tui_theme::chrome::Visibility::Hidden;
+    config.theme = std::sync::Arc::new(theme);
+    let at = harness.at();
+    let _ = harness.engine.set_render_config(config, at);
+    let hidden = harness.present();
+    assert_eq!(hidden[marker].trim(), "", "{hidden:?}");
+    for (row, (before, after)) in shown.iter().zip(&hidden).enumerate() {
+        if row != marker {
+            assert_eq!(before, after, "the marker keeps its row; row {row} moved");
+        }
+    }
+}

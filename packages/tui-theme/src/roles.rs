@@ -192,6 +192,18 @@ pub const ROLES: &[RoleSpec] = &[
         Some(DerivedStyle::bg("mix($text, $background, 0.05)")),
     ),
     role(
+        "composer.border",
+        RoleCategory::Base,
+        "the composer's border; unset uses the focused accent",
+        None,
+    ),
+    role(
+        "composer.surface",
+        RoleCategory::Base,
+        "the composer's fill; unset uses surface.raised",
+        None,
+    ),
+    role(
         "surface.overlay",
         RoleCategory::Base,
         "opaque modal and dialog panels",

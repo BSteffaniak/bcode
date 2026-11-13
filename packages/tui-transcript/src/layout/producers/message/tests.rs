@@ -237,19 +237,80 @@ fn x4_speaker_variants_share_one_layout_definition() {
     }
 }
 
+fn markers(user: &str, assistant: &str) -> RenderConfig {
+    config_with(|theme| {
+        theme.chrome.speaker = SpeakerStyle::Marker;
+        theme.chrome.markers.user = bcode_tui_theme::chrome::ChromeText::new(user);
+        theme.chrome.markers.assistant = bcode_tui_theme::chrome::ChromeText::new(assistant);
+    })
+}
+
+#[test]
+fn marker_speaker_replaces_the_heading_and_hangs_the_body_beside_the_marker() {
+    let config = markers("❯", "⏺");
+    let rendered = render_with(&user("hello world"), 40, &config, &default_structure());
+    assert_eq!(trimmed(&rendered.rows), vec!["❯ hello world", ""]);
+    // The marker is the disclosure target; the body source row starts beside it.
+    assert_eq!(rendered.geometry.hit_regions[0].rect.x, 0);
+    assert_eq!(rendered.geometry.hit_regions[0].rect.width, 2);
+    assert_eq!(
+        rendered.geometry.source_map.source_for_row(0),
+        Some((SourcePosition::MarkdownByte(0), 0))
+    );
+    // Wrapped rows hang under the text, not under the marker.
+    let wrapped = render_with(
+        &assistant("one two three", false),
+        9,
+        &config,
+        &default_structure(),
+    );
+    assert_eq!(
+        trimmed(&wrapped.rows)[..2],
+        ["⏺ one two".to_owned(), "  three".to_owned()]
+    );
+    // A two-cell glyph widens the marker column by its measured width.
+    let wide = render_with(&user("hi"), 20, &markers("中", "⏺"), &default_structure());
+    assert_eq!(trimmed(&wide.rows)[0], "中 hi");
+    for rendered in [&rendered, &wrapped, &wide] {
+        assert_geometry_inside(rendered);
+    }
+}
+
+#[test]
+fn marker_speaker_degrades_to_the_heading_when_narrow_or_not_expanded() {
+    let config = markers("❯", "⏺");
+    assert_eq!(
+        SpeakerLayout::resolve(SpeakerStyle::Marker, true, 2 + MIN_MARKER_BODY_CELLS - 1, 2),
+        SpeakerLayout::PREFIX
+    );
+    let narrow = render_with(&user("hi"), 4, &config, &default_structure());
+    assert_eq!(trimmed(&narrow.rows)[0], "You");
+    let collapsed = render_with(
+        &user("hello"),
+        40,
+        &config,
+        &with_presentation(|presentation| presentation.disclosure = Disclosure::Collapsed),
+    );
+    assert!(
+        trimmed(&collapsed.rows)[0].contains("You"),
+        "{:?}",
+        collapsed.rows
+    );
+}
+
 #[test]
 fn b4_speaker_chrome_degrades_explicitly_at_narrow_widths() {
     let item = user("hi");
     assert_eq!(
-        SpeakerLayout::resolve(SpeakerStyle::Gutter, true, MIN_GUTTER_WIDTH - 1),
+        SpeakerLayout::resolve(SpeakerStyle::Gutter, true, MIN_GUTTER_WIDTH - 1, 0),
         SpeakerLayout::PREFIX
     );
     assert_eq!(
-        SpeakerLayout::resolve(SpeakerStyle::Bar, true, 3),
+        SpeakerLayout::resolve(SpeakerStyle::Bar, true, 3, 0),
         SpeakerLayout::PREFIX
     );
     assert_eq!(
-        SpeakerLayout::resolve(SpeakerStyle::Gutter, false, 80),
+        SpeakerLayout::resolve(SpeakerStyle::Gutter, false, 80, 0),
         SpeakerLayout::PREFIX,
         "only user and assistant messages carry a speaker"
     );
@@ -285,6 +346,7 @@ fn b8_matrix_zero_tiny_widths_wide_graphemes_and_styled_spans_stay_contained() {
         SpeakerStyle::Badge,
         SpeakerStyle::Bar,
         SpeakerStyle::Gutter,
+        SpeakerStyle::Marker,
     ] {
         let config = speaker(style);
         for source in sources {

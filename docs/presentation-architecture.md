@@ -144,10 +144,31 @@ focus     = { effect = "gradient", colors = ["$accent", "$violet"] }
 icons     = "nerd"          # none | unicode | nerd
 density   = "comfortable"   # compact | cozy | comfortable
 separators = { status = "powerline" }   # plain | bar | slant | powerline
-speaker   = "gutter"        # prefix | badge | bar | gutter
+speaker   = "gutter"        # prefix | badge | bar | gutter | marker
+markers   = { user = "›", assistant = "•" }   # glyphs of the marker treatment
 surfaces  = "layered"       # flat | layered
 motion    = "subtle"        # none | subtle | full
+header    = "shown"         # shown | hidden: the header row at the top of the screen
+session_start = "shown"     # shown | hidden: the marker at the start of a session
+status    = { placement = "above_composer", indent = 0 }   # above_composer | below_composer; indent 0..=8
+composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls = "shown" }
 ```
+
+* Border styles also include `rules`: full-width horizontal rules above and below with no sides
+  (the composer, tool containers).
+* Chrome text (`prompt`, `placeholder`) is one line of at most 48 bytes without control
+  characters. The prompt is drawn in the two leading cells every composer frame keeps before the
+  editor; a prompt measuring wider is not drawn, so it never changes the editor's geometry.
+* A hidden header gives its row to the transcript. A hidden session-start marker keeps its row
+  and paints it blank, so transcript geometry never depends on boundary state.
+* `speaker = "marker"` drops the heading row of expanded user and assistant messages: the
+  speaker's marker glyph (styled by its label role) precedes the first body row, and the body
+  hangs beside it. The marker column is the glyph's measured width plus one cell; narrower than
+  four body cells, and for collapsed or summarized messages, the heading row returns.
+* A container recipe with `layout = "panel"`, `border = "none"`, and `width = "full"` fills its
+  rows edge to edge with its role's background.
+* The `composer.border` and `composer.surface` roles style the composer; unset, the composer
+  uses the focused accent and `surface.raised`.
 
 * Icon sets always carry a Unicode or ASCII fallback. Widths are measured by BMUX; Nerd Font glyphs
   are treated as potentially ambiguous width and tested accordingly.

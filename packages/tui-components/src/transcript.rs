@@ -37,6 +37,8 @@ pub enum TranscriptContainerBorder {
     Left,
     /// Single-line border on all sides.
     All,
+    /// Horizontal rules above and below.
+    Rules,
 }
 
 /// Bounded Bcode transcript container recipe.
@@ -86,6 +88,7 @@ impl TranscriptContainerStyle {
             TranscriptContainerBorder::None => return Some(frame),
             TranscriptContainerBorder::Left => BorderSides::LEFT,
             TranscriptContainerBorder::All => BorderSides::ALL,
+            TranscriptContainerBorder::Rules => BorderSides::new(true, false, true, false),
         };
         Some(frame.border(Border::new(self.border_set, self.style).sides(sides)))
     }

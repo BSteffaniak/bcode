@@ -346,7 +346,7 @@ pub const fn border_set(style: BorderStyle) -> Option<BorderSet> {
     match style {
         BorderStyle::None => None,
         BorderStyle::Ascii => Some(BorderSet::ASCII),
-        BorderStyle::Single | BorderStyle::Left => Some(BorderSet::SINGLE),
+        BorderStyle::Single | BorderStyle::Left | BorderStyle::Rules => Some(BorderSet::SINGLE),
         BorderStyle::Rounded => Some(BorderSet::ROUNDED),
         BorderStyle::Thick => Some(BorderSet::THICK),
         BorderStyle::Double => Some(BorderSet::DOUBLE),
@@ -407,6 +407,7 @@ pub fn container_style(
                     ContainerBorder::None => TranscriptContainerBorder::None,
                     ContainerBorder::Left => TranscriptContainerBorder::Left,
                     ContainerBorder::All => TranscriptContainerBorder::All,
+                    ContainerBorder::Rules => TranscriptContainerBorder::Rules,
                 },
                 padding_x: recipe.padding_x,
                 padding_y: recipe.padding_y,
@@ -562,6 +563,7 @@ pub const fn frame_insets(style: &TranscriptContainerStyle) -> LogicalInsets {
         TranscriptContainerBorder::None => (0, 0, 0, 0),
         TranscriptContainerBorder::Left => (0, 0, 0, 1),
         TranscriptContainerBorder::All => (1, 1, 1, 1),
+        TranscriptContainerBorder::Rules => (1, 0, 1, 0),
     };
     let px = style.recipe.padding_x as u64;
     let py = style.recipe.padding_y as u64;
@@ -593,6 +595,10 @@ pub fn framed(
         TranscriptContainerBorder::All => {
             Some(Border::new(style.border_set, style.style).sides(BorderSides::ALL))
         }
+        TranscriptContainerBorder::Rules => Some(
+            Border::new(style.border_set, style.style)
+                .sides(BorderSides::new(true, false, true, false)),
+        ),
     };
     let padding = LogicalInsets::new(
         u64::from(style.recipe.padding_y),

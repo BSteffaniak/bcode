@@ -943,6 +943,11 @@ pub fn tool_container(
             style.recipe.width = TranscriptContainerWidth::Full;
             style.recipe.border = TranscriptContainerBorder::All;
         }
+        Some(BorderStyle::Rules) => {
+            style.recipe.layout = TranscriptContainerLayout::Panel;
+            style.recipe.width = TranscriptContainerWidth::Full;
+            style.recipe.border = TranscriptContainerBorder::Rules;
+        }
     }
     style
 }

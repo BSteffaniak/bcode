@@ -4,7 +4,9 @@ use bcode_presentation_policy::models::{
     FactMatcher, LayerSource, OneOrMany, PresentationRule, PropertyPatch, RuleLayer, Spacing,
     UnitKind,
 };
-use bcode_tui_theme::chrome::{BorderStyle, Density, IconSet, SpeakerStyle};
+use bcode_tui_theme::chrome::{
+    BorderStyle, ComposerChrome, Density, IconSet, SpeakerStyle, StatusChrome, Visibility,
+};
 use bcode_tui_theme::definition::{
     ContainerBorder, ContainerLayout, ContainerRecipe, ContainerWidth, ResolvedThemeDefinition,
 };
@@ -15,9 +17,10 @@ pub use bcode_tui_theme::components::{
     border_set, component_chrome, dialog_chrome, focus_gradient,
 };
 
-/// Terminal chrome consumed by transcript units and the composer: icons,
-/// disclosure markers, density, the tool and composer border styles, and the
-/// speaker treatment of messages.
+/// Terminal chrome consumed by transcript units and the screen.
+///
+/// Icons, disclosure markers, density, the tool and composer border styles, the speaker
+/// treatment of messages, and the header, status line, and composer chrome.
 ///
 /// The default reproduces the transcript of a theme without `[chrome.tui]`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -32,6 +35,12 @@ pub struct UnitChrome {
     pub composer_border: Option<BorderStyle>,
     /// Speaker treatment of user and assistant message headers.
     pub speaker: SpeakerStyle,
+    /// The header row at the top of the screen.
+    pub header: Visibility,
+    /// Status line placement and indentation.
+    pub status: StatusChrome,
+    /// Composer prompt, title, placeholder, and controls.
+    pub composer: ComposerChrome,
 }
 
 /// Header icon candidates for one tool category, most specific first.
@@ -70,6 +79,9 @@ impl UnitChrome {
             tool_border: theme.chrome.borders.tool,
             composer_border: theme.chrome.borders.composer,
             speaker: theme.chrome.speaker,
+            header: theme.chrome.header,
+            status: theme.chrome.status,
+            composer: theme.chrome.composer,
         })
     }
 
@@ -125,7 +137,8 @@ impl UnitChrome {
     /// * `none`: no container;
     /// * `left`: a leading bar, keeping the recipe's padding;
     /// * framed styles: a full-width panel with a border on all sides, whose
-    ///   glyphs come from [`Self::tool_border_set`].
+    ///   glyphs come from [`Self::tool_border_set`];
+    /// * `rules`: a full-width panel between horizontal rules.
     #[must_use]
     pub const fn tool_container(self, recipe: ContainerRecipe) -> ContainerRecipe {
         match self.tool_border {
@@ -150,6 +163,12 @@ impl UnitChrome {
                 layout: ContainerLayout::Panel,
                 width: ContainerWidth::Full,
                 border: ContainerBorder::All,
+                ..recipe
+            },
+            Some(BorderStyle::Rules) => ContainerRecipe {
+                layout: ContainerLayout::Panel,
+                width: ContainerWidth::Full,
+                border: ContainerBorder::Rules,
                 ..recipe
             },
         }

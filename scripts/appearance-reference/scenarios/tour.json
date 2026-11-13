@@ -133,7 +133,7 @@
   "steps": [
    {
     "expect": [
-     "Ask Bcode"
+     "ready"
     ],
     "settle": 2,
     "snapshot": "start",

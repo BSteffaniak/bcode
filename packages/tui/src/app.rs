@@ -2286,10 +2286,12 @@ impl BmuxApp {
             area.width.saturating_add(4),
             area.height.saturating_add(2),
         );
-        self.composer_state_mut().set_trailing_exclusion(
-            super::composer_submit::trailing_exclusion(panel_size),
-            &composer_policy(),
+        let exclusion = super::composer_submit::trailing_exclusion(
+            panel_size,
+            super::render::TuiTheme::for_app(self).composer.controls,
         );
+        self.composer_state_mut()
+            .set_trailing_exclusion(exclusion, &composer_policy());
         self.composer_input
             .set_content_area(area, &composer_policy());
     }

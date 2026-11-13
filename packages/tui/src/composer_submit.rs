@@ -219,9 +219,16 @@ fn controls(submit: &ComposerSubmit, styles: ButtonStyles) -> impl Component + '
         )
 }
 
-/// Right-edge reservation derived from the same controls used for paint and hits.
+/// Right-edge reservation derived from the same controls used for paint and hits; none when the
+/// theme hides the controls.
 #[must_use]
-pub fn trailing_exclusion(size: bmux_tui::geometry::Size) -> u16 {
+pub fn trailing_exclusion(
+    size: bmux_tui::geometry::Size,
+    controls_visibility: bcode_tui_theme::chrome::Visibility,
+) -> u16 {
+    if !controls_visibility.is_shown() {
+        return 0;
+    }
     let submit = ComposerSubmit::default();
     let width = controls(&submit, ButtonStyles::default())
         .layout(Constraints::new(0, u64::MAX, 0, None), &mut LayoutCx::new())
@@ -273,7 +280,7 @@ pub fn panel<'a>(
         disabled: theme.muted,
     };
     let buttons = controls(submit, styles);
-    let exclusion = trailing_exclusion(size);
+    let exclusion = trailing_exclusion(size, theme.composer.controls);
     let overlay = Align::new(buttons)
         .horizontal(bmux_tui::composition::HorizontalAlignment::End)
         .vertical(bmux_tui::composition::VerticalAlignment::End);
@@ -283,10 +290,10 @@ pub fn panel<'a>(
         .style(theme.text)
         .selection_style(theme.selection)
         .focused(focused);
-    bcode_tui_components::composer::composer_panel(
+    let mut panel = bcode_tui_components::composer::composer_panel(
         bcode_tui_components::composer::ComposerStyle {
-            border: theme.focused,
-            surface: theme.raised,
+            border: theme.composer_frame,
+            surface: theme.composer_surface,
         },
         Stack::new()
             .child(editor)
@@ -295,7 +302,16 @@ pub fn panel<'a>(
                 exclusion > 0,
             )),
     )
-    .frame(composer_frame(theme.composer_border))
+    .frame(composer_frame(theme.composer_border));
+    if !theme.composer.title.is_shown() {
+        panel = panel.untitled();
+    }
+    if let Some(prompt) = theme.composer.prompt {
+        panel = panel.prompt(bmux_tui::prelude::Line::from_spans(vec![
+            bmux_tui::prelude::Span::styled(prompt.as_str().to_owned(), theme.text),
+        ]));
+    }
+    panel
 }
 
 /// Composer shell for the theme's `borders.composer` chrome.
@@ -303,6 +319,7 @@ pub fn panel<'a>(
 /// * unset: the single-line frame;
 /// * `none`: no painted border;
 /// * `left`: a leading bar;
+/// * `rules`: horizontal rules above and below;
 /// * framed styles: a frame with that style's glyphs.
 ///
 /// Every frame keeps the editor geometry, so the composer height and the
@@ -315,6 +332,7 @@ const fn composer_frame(
     match style {
         Some(BorderStyle::None) => ComposerFrame::None,
         Some(BorderStyle::Left) => ComposerFrame::LeftBar(bmux_tui::chrome::BorderSet::SINGLE),
+        Some(BorderStyle::Rules) => ComposerFrame::Rules(bmux_tui::chrome::BorderSet::SINGLE),
         Some(style) => match super::theme::chrome::border_set(style) {
             Some(set) => ComposerFrame::Framed(set),
             None => ComposerFrame::None,
@@ -402,6 +420,7 @@ pub fn paint_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_tui_theme::chrome::Visibility;
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Point;
@@ -608,7 +627,11 @@ mod tests {
         assert_eq!(more.x, send.x + send.width);
         assert_eq!(send.width, 5);
         assert_eq!(more.width, 3);
-        assert_eq!(u64::from(trailing_exclusion(size)), send.width + more.width);
+        assert_eq!(
+            u64::from(trailing_exclusion(size, Visibility::Shown)),
+            send.width + more.width
+        );
+        assert_eq!(trailing_exclusion(size, Visibility::Hidden), 0);
         assert_eq!(send.x + send.width + more.width, editor.x + editor.width);
     }
 
@@ -657,7 +680,7 @@ mod tests {
             assert_eq!(
                 state.borrow().rows_with_trailing_exclusion(
                     u16::try_from(editor.width).unwrap(),
-                    trailing_exclusion(size),
+                    trailing_exclusion(size, Visibility::Shown),
                     8,
                 ),
                 expected_rows
@@ -827,6 +850,7 @@ mod tests {
                 BorderStyle::Rounded,
                 BorderStyle::Thick,
                 BorderStyle::Double,
+                BorderStyle::Rules,
             ] {
                 let (rows, editor) = paint_with_border(Some(style), width);
                 assert_eq!(editor, default_editor, "{style:?} at {width}");
@@ -845,6 +869,10 @@ mod tests {
                     BorderStyle::Thick => assert_eq!(first, Some('┏'), "{rows:?}"),
                     BorderStyle::Double => assert_eq!(first, Some('╔'), "{rows:?}"),
                     BorderStyle::Ascii => assert_eq!(first, Some('+'), "{rows:?}"),
+                    BorderStyle::Rules => {
+                        assert!(rows[0].chars().all(|cell| cell == '─'), "{rows:?}");
+                        assert!(!rows[1].contains('│'), "{rows:?}");
+                    }
                 }
             }
         }

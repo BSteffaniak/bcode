@@ -10,7 +10,10 @@ use bmux_tui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::chrome::{RawChrome, TuiBorders, TuiChrome};
+use crate::chrome::{
+    ComposerChrome, MAX_STATUS_INDENT, MessageMarkers, RawChrome, StatusChrome, TuiBorders,
+    TuiChrome,
+};
 use crate::contrast::ContrastAdjustment;
 use crate::expr::{self, ColorContext, Evaluated};
 
@@ -615,6 +618,8 @@ pub enum ContainerBorder {
     Left,
     /// Single-line border on all sides.
     All,
+    /// Horizontal rules above and below.
+    Rules,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1027,6 +1032,31 @@ fn resolve_chrome(
         speaker: raw.speaker.unwrap_or_default(),
         surfaces: raw.surfaces.unwrap_or_default(),
         motion: raw.motion.unwrap_or_default(),
+        header: raw.header.unwrap_or_default(),
+        session_start: raw.session_start.unwrap_or_default(),
+        status: raw
+            .status
+            .as_ref()
+            .map_or_else(StatusChrome::default, |status| StatusChrome {
+                placement: status.placement.unwrap_or_default(),
+                indent: status.indent.unwrap_or(0).min(MAX_STATUS_INDENT),
+            }),
+        composer: raw
+            .composer
+            .as_ref()
+            .map_or_else(ComposerChrome::default, |composer| ComposerChrome {
+                prompt: composer.prompt,
+                title: composer.title.unwrap_or_default(),
+                placeholder: composer.placeholder,
+                controls: composer.controls.unwrap_or_default(),
+            }),
+        markers: raw
+            .markers
+            .as_ref()
+            .map_or_else(MessageMarkers::default, |markers| MessageMarkers {
+                user: markers.user,
+                assistant: markers.assistant,
+            }),
     })
 }
 

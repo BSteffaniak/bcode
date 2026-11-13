@@ -91,6 +91,14 @@ pub const MIN_BAR_BODY_CELLS: u64 = 4;
 /// Indent of message bodies under their heading.
 pub const BODY_INDENT: u64 = 2;
 
+/// Narrowest body width beside a speaker marker; narrower messages use the `prefix` treatment.
+pub const MIN_MARKER_BODY_CELLS: u64 = 4;
+
+/// Marker glyphs when the theme sets none.
+pub const DEFAULT_USER_MARKER: &str = "›";
+/// See [`DEFAULT_USER_MARKER`].
+pub const DEFAULT_ASSISTANT_MARKER: &str = "•";
+
 /// Spacing the host default presentation resolves to; it keeps each kind's natural trailing
 /// rows (metadata notes have none).
 const DEFAULT_SPACING: Spacing = Spacing {
@@ -123,13 +131,20 @@ impl SpeakerLayout {
     }
 
     /// Treatment of a message at content `width`. Only speaker messages (user and assistant)
-    /// carry one; others use `prefix`.
+    /// carry one; others use `prefix`. `marker_cells` is the measured marker column (glyph
+    /// and gap) of the `marker` treatment.
     ///
     /// Degradation is explicit: `bar` needs the bar, its gap and [`MIN_BAR_BODY_CELLS`];
-    /// `gutter` needs [`MIN_GUTTER_WIDTH`]; otherwise the message uses `prefix`. `badge`
-    /// reserves no columns (it falls back per heading when the badge does not fit).
+    /// `gutter` needs [`MIN_GUTTER_WIDTH`]; `marker` needs its column and
+    /// [`MIN_MARKER_BODY_CELLS`]; otherwise the message uses `prefix`. `badge` reserves no
+    /// columns (it falls back per heading when the badge does not fit).
     #[must_use]
-    pub const fn resolve(style: SpeakerStyle, speaker: bool, width: u64) -> Self {
+    pub const fn resolve(
+        style: SpeakerStyle,
+        speaker: bool,
+        width: u64,
+        marker_cells: u64,
+    ) -> Self {
         if !speaker {
             return Self::PREFIX;
         }
@@ -155,6 +170,16 @@ impl SpeakerLayout {
                     Self {
                         style: SpeakerStyle::Gutter,
                         prefix: GUTTER_LABEL_CELLS,
+                    }
+                } else {
+                    Self::PREFIX
+                }
+            }
+            SpeakerStyle::Marker => {
+                if marker_cells > 0 && width >= marker_cells + MIN_MARKER_BODY_CELLS {
+                    Self {
+                        style: SpeakerStyle::Marker,
+                        prefix: marker_cells,
                     }
                 } else {
                     Self::PREFIX
@@ -207,6 +232,7 @@ impl MessageLayout {
         frame: Option<TranscriptContainerStyle>,
         speaker_style: SpeakerStyle,
         speaker: bool,
+        marker_cells: u64,
     ) -> Self {
         let (indent, after_indent) =
             reserve(width, u64::from(indent)).map_or((0, width), |rest| (u64::from(indent), rest));
@@ -217,10 +243,16 @@ impl MessageLayout {
                     .map(|rest| (Some(style), rest))
             })
             .unwrap_or((None, after_indent));
-        let speaker = SpeakerLayout::resolve(speaker_style, speaker, content_width);
+        let speaker = SpeakerLayout::resolve(speaker_style, speaker, content_width, marker_cells);
         let column_width = content_width - speaker.prefix;
-        let (body_indent, body_width) = reserve(column_width, BODY_INDENT)
-            .map_or((0, column_width), |rest| (BODY_INDENT, rest));
+        // A marker already sets the body off; it hangs beside the marker unindented.
+        let wanted_indent = if speaker.style == SpeakerStyle::Marker {
+            0
+        } else {
+            BODY_INDENT
+        };
+        let (body_indent, body_width) = reserve(column_width, wanted_indent)
+            .map_or((0, column_width), |rest| (wanted_indent, rest));
         Self {
             width,
             indent,
@@ -924,6 +956,32 @@ fn heading(inputs: &ColumnInputs<'_, '_>, cx: &ItemRenderContext<'_>) -> Heading
             ),
         ),
         SpeakerStyle::Gutter => Heading::Gutter(heading_block(plain(), TextWrap::None, target)),
+        SpeakerStyle::Marker => Heading::Gutter(heading_block(
+            vec![Span::styled(
+                marker_glyph(message, &cx.theme.chrome.markers).to_owned(),
+                message.title_style,
+            )],
+            TextWrap::None,
+            target,
+        )),
+    }
+}
+
+/// The `marker` treatment's glyph for a speaker message.
+fn marker_glyph<'a>(
+    message: &Message<'_>,
+    markers: &'a bcode_tui_theme::chrome::MessageMarkers,
+) -> &'a str {
+    if message.container == Some("transcript.user") {
+        markers
+            .user
+            .as_ref()
+            .map_or(DEFAULT_USER_MARKER, |marker| marker.as_str())
+    } else {
+        markers
+            .assistant
+            .as_ref()
+            .map_or(DEFAULT_ASSISTANT_MARKER, |marker| marker.as_str())
     }
 }
 
@@ -1011,14 +1069,27 @@ fn produce_message(
     } else {
         container(message, &presentation, cx.theme)
     };
+    // The marker treatment replaces the heading row of expanded messages only: a collapsed or
+    // summarized message keeps its heading row as the disclosure target.
+    let speaker_style = match cx.theme.chrome.speaker {
+        SpeakerStyle::Marker if disclosure != Disclosure::Expanded => SpeakerStyle::Prefix,
+        style => style,
+    };
+    let marker_cells = u64::try_from(display_width(marker_glyph(
+        message,
+        &cx.theme.chrome.markers,
+    )))
+    .unwrap_or(u64::MAX)
+    .saturating_add(1);
     let layout = MessageLayout::resolve(
         cx.width,
         presentation
             .indent
             .min(bcode_presentation_policy::models::MAX_INDENT),
         frame,
-        cx.theme.chrome.speaker,
+        speaker_style,
         message.speaker && !message.meta && !hidden,
+        marker_cells,
     );
     let (column, work) = if hidden {
         (

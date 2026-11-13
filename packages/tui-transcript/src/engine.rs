@@ -474,7 +474,8 @@ impl TranscriptEngine {
                 self.window.summary(),
                 &self.layouts,
                 self.activity,
-            );
+            )
+            .session_start(self.render.theme.chrome.session_start);
             let component = self.list_component(&source);
             let layout = component.layout(
                 Constraints::tight(self.list_size(self.geometry.height)),
@@ -869,7 +870,8 @@ impl TranscriptEngine {
             self.window.summary(),
             &self.layouts,
             self.activity,
-        );
+        )
+        .session_start(self.render.theme.chrome.session_start);
         let component = self.list_component(&source);
         let size = self.list_size(snapshot.geometry.height);
         let layout = component.layout(
