@@ -817,8 +817,10 @@ them in when the same target opens again; saving the review moves them.
   `F` file comment, `C` review comment, `i` edit, `D` delete, `R` resolve/reopen, `K` kind, `!`
   severity, `o` open session, `)`/`(` next/previous thread.
 * **AI questions** (`agent.rs`). Submitting records a pending exchange at once; the next poll
-  saves it, creates a session titled `Review: <path>` in the repository, sends a bounded prompt
-  (anchor, ranges, up to 80 anchored diff lines, the question, the review service operations),
+  saves it, creates a session titled after the file (and, asked from a thread, its author) in
+  the repository, sends a bounded prompt (anchor, ranges, up to 80 anchored diff lines, the
+  thread it was asked from with its comments and diff hunk, the other threads including pull
+  request threads, the review tools to call, the question),
   links the session (`thread.link_session`), saves the exchange as linked, and returns
   `PluginTuiAction::OpenSession`. The cursor and list position are kept in memory and restored
   by `session_navigation_finished`. Linked sessions are observed with
@@ -2258,7 +2260,8 @@ linked session live, from the session's `SessionViewSnapshot` stream (13.3) inst
   with the next message after the review reopens. AI cards' new sessions are bound the same way.
 * **Review tools** (`plugins/code-review-plugin/src/tools.rs` over
   `bcode_code_review::assistant`). `code_review.list_reviews`, `summary`, `list_files`,
-  `file_diff`, `file_content`, `list_threads`, `pull_request` (the GitHub CLI through
+  `file_diff`, `file_content`, `list_threads` and `get_thread` (local threads, and pull request
+  threads from the snapshot the app saves in the store), `pull_request` (the GitHub CLI through
   `bcode_forge`, giving checks state) and `navigate` are read-only; `add_comment`, `reply`,
   `resolve_thread`, `mark_viewed` and `suggest_change` are mutating; `publish` is mutating with
   its own permission category. Preparation takes the session id and working directory from the
@@ -3586,8 +3589,8 @@ Behavioral coverage is in `packages/code-review-ui/src/tests/` (`parity.rs` for 
 | --- | --- |
 | INV-AI-01 | Done: `a`, or Ask Bcode on a thread. |
 | INV-AI-02 | Done: `shift+a` menu with the five commands (digits are count prefixes in V2). |
-| INV-AI-03 | Done: first questions create and link a session; later questions on the anchor are follow-ups in it. |
-| INV-AI-04 | Done: bounded prompt with review, repository, sources, file, ranges, up to 80 lines, up to 12 other threads, the question, and the service operations. Line kinds are the diff markers; nearby hunk context and the draft being edited are reachable through `review.context.get` and `review.thread.get`, which the prompt names. |
+| INV-AI-03 | Done: first questions create and link a session; later questions on the anchor are follow-ups in it. Sessions are titled after the file (or the review) and, asked from a thread, its author. |
+| INV-AI-04 | Done: bounded prompt with review, repository, sources, file, ranges, up to 80 lines, the thread asked from (comments, state, where it was written, its diff hunk), up to 12 other threads (local and pull request), the question, and the review tools to call. Line kinds are the diff markers; nearby hunk context and threads in full are reachable through `code_review.file_diff` and `code_review.get_thread`, which the prompt names (plugin service operations are not tools a session can call). |
 | INV-AI-05 | Done: persisted exchanges; a failed save is not retried into a second session. |
 | INV-AI-06 | Done since phase 11: the card follows the session live with reasoning, tool lines and their output, the streaming answer, tokens and cost, and inline permission prompts (13.5); the full session is still one key away (`o`). |
 | INV-AI-07 | Done: the session's public follow stream through `BcodeClient` (13.3, 13.5). |

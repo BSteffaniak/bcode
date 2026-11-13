@@ -107,7 +107,33 @@ that exits.
 Asking Bcode (a new question, a follow-up, or an AI command) never leaves the review. The cursor
 moves to the question's card below its anchor, and the card follows the linked session live. It
 is framed like a comment thread, with a Viewed checkbox (`v`), and it folds with `z` or its
-chevron (see [`review-thread-cards.md`](review-thread-cards.md)):
+chevron (see [`review-thread-cards.md`](review-thread-cards.md)).
+
+What a question sends:
+
+* The review, its repository and sources, the anchor (file and line ranges, or *the whole
+  review*), up to 80 of its diff lines, and the other threads on the same file (or on the
+  review): the review's own and its pull requests', each with author, pull request, outdated and
+  resolved state, and thread id; at most 12, the rest counted.
+* Asked from a thread (**Ask Bcode** on it, `a` on it, an AI command or a follow-up with the
+  cursor on it), the thread itself: where it comes from (a local draft thread or a pull request's
+  thread on its forge), resolved and outdated state, its id for `code_review.get_thread`, where
+  it was written (path, original lines, commit) and where the review shows it now and why, the
+  diff hunk it was written on (kept even when outdated; its last 40 lines), and its comments in
+  order with their authors, including replies held for the next review. Comments keep the first
+  and as many of the latest as fit (2 KiB each, 8 KiB in all, at most 12), and say how many were
+  left out.
+* The review tools the session can call to read more (`code_review.list_threads`,
+  `code_review.get_thread`, `code_review.file_diff`, ...), then the question. Every part has its
+  own bound and the whole prompt at most 24 KiB; the question is never cut to make room for
+  context (cuts are marked).
+
+A question's new session is titled after its file (for a pull request thread, the file it was
+written on) and, asked from a thread, its first comment's author (`Review: src/retry.rs ·
+kevin`); a question about the whole review is titled after the review. A later question on the
+same anchor is a follow-up in that session and carries the thread again.
+
+The card:
 
 * The title shows a spinner while the turn runs, the status (`asking…`, `working…`,
   `needs you`, `stopping…`, `answered`, `stopped`, `failed`), the session's tokens and estimated
@@ -176,19 +202,31 @@ with the revisions it shows; any other session passes `review` with a saved revi
 | `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed. |
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
 | `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). |
-| `code_review.list_threads` | read | Threads (location, kind, severity, resolved, comments) and pending suggestions. |
+| `code_review.list_threads` | read | The review's local threads (location, kind, severity, resolved, comments), pending suggestions, and a page of its pull requests' threads (`origin = "pull_request"`: pull request, authors, the first and latest comments, resolved, outdated, where each was written and where the review shows it). `include_resolved`, `path`, `offset`, `limit` (50, at most 100); the page has `total`, `next_offset`, and how many resolved threads it left out. |
+| `code_review.get_thread` | read | One thread in full by `thread_id`: a local thread, or a pull request thread with every comment in order, links, and the diff hunk it was written on. |
 | `code_review.pull_request` | read, web | The pull request behind the review (by its pull request sources, else its branch): title, state, branches, review decision, CI checks, via the GitHub CLI with the user's credentials. |
 | `code_review.navigate` | read | Moves the reviewer's view to a file or line. |
 | `code_review.add_comment` | write | Drafts a comment on lines (`path`, `line`, `end_line`, `side`), a file, or the review, with an optional kind and severity. |
-| `code_review.reply` | write | Replies in a thread. |
-| `code_review.resolve_thread` | write | Resolves or reopens a thread. |
+| `code_review.reply` | write | Replies in one of the review's local threads. |
+| `code_review.resolve_thread` | write | Resolves or reopens one of the review's local threads. |
 | `code_review.mark_viewed` | write | Marks files viewed or not viewed at their current content. |
 | `code_review.suggest_change` | write | A suggested comment the reviewer accepts or rejects, optionally replacing the lines (a `suggestion` block). |
 | `code_review.publish` | publish | Previews, or with `submit` publishes, the comments with a built-in publisher (`local_markdown`, `markdown_file`, `json_file`). `output_path` is a path relative to the session's working directory that stays inside it; without it the file goes to `.bcode/reviews/` in the repository. |
 
-Reads are bounded (2,000 files, 2,000 diff or content lines per call, 200 threads, 4 KiB per
-comment, 128 KiB of output) and say when they were cut. Writes and publishing return what they
-did. Publishing to a forge such as GitHub stays in the app (`P`), which reaches publisher plugins.
+Reads are bounded (2,000 files, 2,000 diff or content lines per call, 200 local threads, 4 KiB
+per comment; pull request threads 100 per page, 1 KiB per listed comment and 8 KiB per comment
+of one thread; 128 KiB of output) and say when they were cut. Writes and publishing return what
+they did. Publishing to a forge such as GitHub stays in the app (`P`), which reaches publisher
+plugins.
+
+Pull request threads come from the review store, not the forge: whenever the review app places
+its pull requests' threads and they changed, it saves them for the review's scope (bounded:
+1,000 threads, 100 comments per thread keeping the first and the latest, 16 KiB per comment).
+So `list_threads` and `get_thread` stay read-only and work offline, show what the reviewer sees
+(as of `read_at_ms`), and say so when the app has not read them yet. Their thread ids are
+`<owner>/<name>#<number>:<forge id>`. `reply` and `resolve_thread` change local threads only:
+on a pull request thread they still ask first, then fail with an error that says to reply or
+resolve it in the review app or on the forge (or draft a comment with `add_comment`).
 
 #### Tool permissions
 
@@ -285,7 +323,9 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   the layer. Each has **Reply**, **Resolve**/**Reopen**, **Open ↗** and **Ask Bcode** as far as
   allowed; resolved ones fold. **Reply** sends at once and offers **Add to review**, which holds
   the reply as a draft under the thread until the next review of that pull request is submitted
-  (the default is configurable).
+  (the default is configurable). **Ask Bcode** sends the whole thread with the question (see
+  [AI cards](#ai-cards)), outdated ones included, and the review tools read the same threads
+  (see [Review tools](#review-tools)).
 * **The rail** marks each layer approved (✓) or changes requested (✕), with its open threads
   and a dot when something is new.
 * **The threads panel** lists pull request threads too, and filters them: *on the pull request*,

@@ -43,7 +43,9 @@ the review provider-neutral: GitHub is one implementation of an interface any fo
   * **Threads:** extends today's `ExternalReviewThread`. Each carries a raw anchor:
     * the path and side;
     * the line range, both on the commit it was written against and its original lines;
-    * the diff context around it;
+    * the diff context around it (`diff_hunk`: the hunk the first comment was written on,
+      ending at its line; GitHub keeps it for outdated threads; providers bound it, GitHub to
+      its last 40 lines and 4 KiB);
     * that commit's id.
   * **Conversation comments:** top-level comments on the pull request.
   * **Checks:** an overall state, plus each check's name, state and URL.
@@ -62,6 +64,13 @@ the review provider-neutral: GitHub is one implementation of an interface any fo
   a button to open that version's comparison. Providers stop doing anchor mapping (today the
   GitHub importer receives the review's files to map against). Every forge then gets the same
   mapping quality.
+
+* **Agents read the threads the reviewer sees.** Whenever the review places its threads and
+  they changed, it saves them, placed, to the review store for the review's scope (bounded;
+  `review.conversation.save`, `review.conversation.get`). The review tools
+  (`code_review.list_threads`, `code_review.get_thread`) read that snapshot, so agents never
+  reach the forge to read threads, and a question asked from a thread carries the thread itself.
+  See [`code-review-app.md`](code-review-app.md#review-tools).
 
 ## The provider interface
 
