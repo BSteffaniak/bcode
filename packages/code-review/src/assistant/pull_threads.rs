@@ -93,24 +93,24 @@ pub struct PullThreadView {
     pub outdated: bool,
     /// Everyone who commented, in order of first comment.
     pub authors: Vec<String>,
-    /// Comments in order (a listing shows the first and the latest).
-    pub comments: Vec<CommentView>,
-    /// Comments left out of `comments`.
+    /// Comments left out of `comments` (the oldest replies).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub comments_omitted: usize,
-    /// The diff the first comment was written on, ending at its line (full thread reads only).
+    /// The diff the first comment was written on, ending at its line (full thread reads only;
+    /// its end is kept when long, see [`super::fit::MAX_HUNK_BYTES`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_hunk: Option<String>,
     /// Web page (full thread reads only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Comments in order (a listing shows the first and the latest; a full read every one that
+    /// fits, the first and the latest).
+    pub comments: Vec<CommentView>,
 }
 
 /// A page of the review's pull request threads.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PullThreadsView {
-    /// Threads of this page.
-    pub threads: Vec<PullThreadView>,
     /// Threads matching the filters, on every page.
     pub total: usize,
     /// Index of this page's first thread.
@@ -130,10 +130,12 @@ pub struct PullThreadsView {
     /// Why there are none, when the review app has not read them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Threads of this page (shortened to fit the output; `next_offset` continues it).
+    pub threads: Vec<PullThreadView>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_zero(value: &usize) -> bool {
+pub(super) const fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
@@ -294,7 +296,11 @@ fn view(record: &PullThreadRecord, full: bool) -> PullThreadView {
         authors,
         comments,
         comments_omitted,
-        diff_hunk: anchor.diff_hunk.clone().filter(|_| full),
+        diff_hunk: anchor
+            .diff_hunk
+            .as_deref()
+            .filter(|_| full)
+            .map(|hunk| super::fit::hunk_tail(hunk, super::fit::MAX_HUNK_BYTES)),
         url: thread
             .comments
             .first()

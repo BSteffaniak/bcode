@@ -699,6 +699,123 @@ fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
     assert_eq!(full["url"], "https://github.com/o/r/pull/7#discussion_r0");
 }
 
+impl Harness {
+    /// Keep `snapshot` as the review app would for the review bound with `workspace`.
+    fn save_snapshot(
+        &self,
+        workspace: &ReviewWorkspace,
+        snapshot: bcode_code_review_models::ReviewConversationSnapshot,
+    ) {
+        let (target, scope) = bcode_code_review::scope::annotation_scope(workspace);
+        self.store()
+            .save_conversation(bcode_code_review_models::SaveReviewConversationRequest {
+                repo_path: self.fixture.root().to_path_buf(),
+                target,
+                scope: Some(scope),
+                snapshot,
+            })
+            .expect("save");
+    }
+}
+
+#[test]
+fn a_large_listing_is_shortened_to_whole_pages_that_continue() {
+    let mut harness = Harness::new();
+    let workspace = harness.bind(SESSION);
+    let mut snapshot = pull_snapshot(5);
+    let template = snapshot.threads[0].clone();
+    snapshot.threads = (0..90)
+        .map(|index| {
+            let mut record = template.clone();
+            record.thread.id = format!("PRRT_{index}");
+            record.id = bcode_code_review_models::pull_thread_ref("o/r", 7, &record.thread.id);
+            for comment in &mut record.thread.comments {
+                comment.body = format!("{index} {}", "\"quoted\" ".repeat(200));
+            }
+            record
+        })
+        .collect();
+    harness.save_snapshot(&workspace, snapshot);
+
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let output = harness.ok(
+            "code_review.list_threads",
+            &json!({"limit": 100, "offset": offset}),
+            SESSION,
+        );
+        assert!(
+            output.len() <= bcode_code_review::assistant::MAX_THREADS_OUTPUT_BYTES,
+            "{}",
+            output.len()
+        );
+        let listed: Value = serde_json::from_str(&output).expect("whole JSON");
+        let page = &listed["pull_request_threads"];
+        assert_eq!(page["total"], 90);
+        assert_eq!(page["read_at_ms"], 42);
+        let threads = page["threads"].as_array().expect("threads");
+        assert!(!threads.is_empty(), "every page shows a thread");
+        seen.extend(
+            threads
+                .iter()
+                .filter_map(|thread| thread["thread_id"].as_str().map(str::to_owned)),
+        );
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = usize::try_from(next).expect("offset"),
+            None => break,
+        }
+    }
+    assert!(offset > 0, "the listing was shortened to pages");
+    let expected: Vec<String> = (0..90).map(|index| format!("o/r#7:PRRT_{index}")).collect();
+    assert_eq!(seen, expected, "every thread once, in order");
+}
+
+#[test]
+fn a_long_thread_keeps_its_hunk_and_its_first_and_latest_comments() {
+    let mut harness = Harness::new();
+    let workspace = harness.bind(SESSION);
+    let mut snapshot = pull_snapshot(20);
+    let record = &mut snapshot.threads[0];
+    for (index, comment) in record.thread.comments.iter_mut().enumerate() {
+        comment.body = format!("comment {index} {}", "y".repeat(8 * 1024));
+    }
+    let hunk: Vec<String> = (0..2_000).map(|line| format!("+line {line}")).collect();
+    record.thread.anchor.diff_hunk = Some(hunk.join("\n"));
+    harness.save_snapshot(&workspace, snapshot);
+
+    let output = harness.ok(
+        "code_review.get_thread",
+        &json!({"thread_id": "o/r#7:PRRT_1"}),
+        SESSION,
+    );
+    assert!(
+        output.len() <= bcode_code_review::assistant::MAX_THREADS_OUTPUT_BYTES,
+        "{}",
+        output.len()
+    );
+    let full: Value = serde_json::from_str(&output).expect("whole JSON");
+    let hunk = full["diff_hunk"].as_str().expect("the hunk is kept");
+    assert!(
+        hunk.starts_with(bcode_code_review::assistant::fit::HUNK_CUT),
+        "{hunk:.80}"
+    );
+    assert!(hunk.ends_with("+line 1999"), "the commented end is kept");
+    let comments = full["comments"].as_array().expect("comments");
+    let first = comments
+        .first()
+        .and_then(|comment| comment["body"].as_str());
+    let latest = comments.last().and_then(|comment| comment["body"].as_str());
+    assert!(first.is_some_and(|body| body.starts_with("comment 0 ")));
+    assert!(latest.is_some_and(|body| body.starts_with("comment 20 ")));
+    let omitted = full["comments_omitted"].as_u64().expect("omitted counted");
+    assert_eq!(
+        usize::try_from(omitted).expect("count") + comments.len(),
+        21,
+        "{omitted} left out"
+    );
+}
+
 #[test]
 fn pull_request_threads_are_not_replied_to_or_resolved_by_the_tools() {
     let mut harness = Harness::new();

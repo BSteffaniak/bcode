@@ -8,14 +8,17 @@
 //! review app uses, so the app shows every change as if the reviewer had made it.
 //!
 //! Every read is bounded: file lists, diff lines, content lines, and thread bodies have limits,
-//! and the result says when it was cut.
+//! thread listings and full threads fit [`MAX_THREADS_OUTPUT_BYTES`] (see [`fit`]), and the
+//! result says when it was cut.
 //!
 //! Threads are the review's own (local drafts) and its pull requests' threads on their forge,
 //! read from the snapshot the review app keeps of them (see [`pull_threads`]); the operations
 //! that change threads change local ones only.
 
+pub mod fit;
 pub mod pull_threads;
 
+pub use fit::MAX_THREADS_OUTPUT_BYTES;
 pub use pull_threads::{PullThreadQuery, PullThreadView, PullThreadsView, ThreadOrigin};
 
 use crate::data::DataError;
@@ -315,8 +318,11 @@ pub struct ThreadView {
     pub severity: ReviewThreadSeverity,
     /// Whether it is resolved.
     pub resolved: bool,
-    /// Comment bodies, oldest first.
+    /// Comment bodies, oldest first (the first and the latest when some are left out).
     pub comments: Vec<String>,
+    /// Comments left out of `comments` (the oldest replies) to fit the output.
+    #[serde(default, skip_serializing_if = "pull_threads::is_zero")]
+    pub comments_omitted: usize,
 }
 
 /// A pending suggestion of a review.
@@ -337,8 +343,12 @@ pub struct ThreadsView {
     pub threads: Vec<ThreadView>,
     /// Pending suggestions.
     pub suggestions: Vec<SuggestionView>,
-    /// Threads left out (resolved ones when not asked for, and those past the limit).
+    /// Threads left out (resolved ones when not asked for, and those past the limit or the
+    /// output's size).
     pub omitted: usize,
+    /// Pending suggestions left out (past the output's size).
+    #[serde(default, skip_serializing_if = "pull_threads::is_zero")]
+    pub suggestions_omitted: usize,
     /// The pull requests' threads on their forge.
     #[serde(default)]
     pub pull_request_threads: PullThreadsView,
@@ -957,6 +967,7 @@ impl<'a> ReviewTools<'a> {
                     .iter()
                     .map(|comment| bounded(&comment.body, MAX_BODY_BYTES))
                     .collect(),
+                comments_omitted: 0,
             });
         }
         let (target, scope) = review.scope();
@@ -981,12 +992,15 @@ impl<'a> ReviewTools<'a> {
         if snapshot.is_none() && has_pull_requests(review) {
             pull_request_threads.note = Some(pull_threads::UNREAD_NOTE.to_owned());
         }
-        Ok(ThreadsView {
+        let mut view = ThreadsView {
             threads,
             suggestions,
             omitted,
+            suggestions_omitted: 0,
             pull_request_threads,
-        })
+        };
+        fit::listing(&mut view, MAX_THREADS_OUTPUT_BYTES);
+        Ok(view)
     }
 
     /// One thread of `review` in full: a local thread (by its id), or a pull request thread
@@ -1007,7 +1021,10 @@ impl<'a> ReviewTools<'a> {
                 .conversation(review)?
                 .ok_or_else(|| AssistantError::NotFound(pull_threads::UNREAD_NOTE.to_owned()))?;
             return pull_threads::find(&snapshot, thread_id)
-                .map(|view| ThreadDetail::PullRequest(Box::new(view)))
+                .map(|mut view| {
+                    fit::pull_thread(&mut view, MAX_THREADS_OUTPUT_BYTES);
+                    ThreadDetail::PullRequest(Box::new(view))
+                })
                 .ok_or_else(|| {
                     AssistantError::NotFound(format!(
                         "no pull request thread {thread_id} in this review (code_review.list_threads lists them)"
@@ -1025,7 +1042,7 @@ impl<'a> ReviewTools<'a> {
                 "no thread {thread_id} in this review (code_review.list_threads lists them)"
             ))
         })?;
-        Ok(ThreadDetail::Local(ThreadView {
+        let mut view = ThreadView {
             thread_id: thread_id.to_owned(),
             origin: ThreadOrigin::Local,
             location: location_label(&first.anchor),
@@ -1038,7 +1055,10 @@ impl<'a> ReviewTools<'a> {
                 .iter()
                 .map(|comment| bounded(&comment.body, pull_threads::MAX_THREAD_BODY_BYTES))
                 .collect(),
-        }))
+            comments_omitted: 0,
+        };
+        fit::local_thread(&mut view, MAX_THREADS_OUTPUT_BYTES);
+        Ok(ThreadDetail::Local(view))
     }
 
     /// The review's pull request threads as the review app last read them.

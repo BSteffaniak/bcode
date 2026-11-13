@@ -202,8 +202,8 @@ with the revisions it shows; any other session passes `review` with a saved revi
 | `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed. |
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
 | `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). |
-| `code_review.list_threads` | read | The review's local threads (location, kind, severity, resolved, comments), pending suggestions, and a page of its pull requests' threads (`origin = "pull_request"`: pull request, authors, the first and latest comments, resolved, outdated, where each was written and where the review shows it). `include_resolved`, `path`, `offset`, `limit` (50, at most 100); the page has `total`, `next_offset`, and how many resolved threads it left out. |
-| `code_review.get_thread` | read | One thread in full by `thread_id`: a local thread, or a pull request thread with every comment in order, links, and the diff hunk it was written on. |
+| `code_review.list_threads` | read | The review's local threads (location, kind, severity, resolved, comments), pending suggestions, and a page of its pull requests' threads (`origin = "pull_request"`: pull request, authors, the first and latest comments, resolved, outdated, where each was written and where the review shows it). `include_resolved`, `path` (the file a thread was written on or is shown on, matched whole), `offset`, `limit` (50, at most 100); the page has `total`, `next_offset`, and how many resolved threads it left out. |
+| `code_review.get_thread` | read | One thread in full by `thread_id`: a local thread, or a pull request thread with its comments in order, links, and the diff hunk it was written on. |
 | `code_review.pull_request` | read, web | The pull request behind the review (by its pull request sources, else its branch): title, state, branches, review decision, CI checks, via the GitHub CLI with the user's credentials. |
 | `code_review.navigate` | read | Moves the reviewer's view to a file or line. |
 | `code_review.add_comment` | write | Drafts a comment on lines (`path`, `line`, `end_line`, `side`), a file, or the review, with an optional kind and severity. |
@@ -215,7 +215,12 @@ with the revisions it shows; any other session passes `review` with a saved revi
 
 Reads are bounded (2,000 files, 2,000 diff or content lines per call, 200 local threads, 4 KiB
 per comment; pull request threads 100 per page, 1 KiB per listed comment and 8 KiB per comment
-of one thread; 128 KiB of output) and say when they were cut. Writes and publishing return what
+of one thread, 16 KiB of a diff hunk keeping its end; 128 KiB of output) and say when they were
+cut. A thread listing, or one thread, fits 96 KiB of JSON so it is never cut midway: a listing
+shortens its page of pull request threads (down to one; `next_offset` continues it), then leaves
+out local threads and then pending suggestions from the end (`omitted`, `suggestions_omitted`);
+one thread leaves out its oldest replies (keeping the first comment and the latest ones,
+`comments_omitted`), then shortens its diff hunk and then its longest comments. Writes and publishing return what
 they did. Publishing to a forge such as GitHub stays in the app (`P`), which reaches publisher
 plugins.
 
