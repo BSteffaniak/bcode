@@ -4637,49 +4637,12 @@ fn apply_root_slash_command_outcome(
             retry_submission_id,
         } => {
             if let Some(identity) = retry_submission_id {
-                let Some(request) = chat.app.managed_composer.requests.get(&identity).cloned()
-                else {
-                    chat.app
-                        .set_status("No retained native request for that submission".into());
-                    return;
-                };
-                let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } =
-                    &request.kind
-                else {
-                    return;
-                };
-                let Ok(session_id) = submission.session_id.parse() else {
-                    return;
-                };
-                if chat.attached_session_id() != Some(session_id) {
-                    chat.app
-                        .set_status("Attach the original native session before retrying".into());
+                if !resend_retained_native(chat, &identity, settings.launch_working_directory()) {
+                    chat.app.set_status(
+                        "No retained native request for this session and submission".into(),
+                    );
                     return;
                 }
-                chat.start_effect(TuiEffect::SubmitMessage {
-                    request: Box::new(super::effects::SubmitMessageRequest {
-                        submission_id: bcode_session_models::SubmissionId(
-                            submission.submission_id.clone(),
-                        ),
-                        session_id: Some(session_id),
-                        message: submission.text.clone(),
-                        managed: Some(request.clone()),
-                        attempt_id: submission.attempt_id.clone(),
-                        managed_only: true,
-                        expected_native_turn_id: None,
-                        placement: bcode_ipc::PromptPlacement::FollowUp,
-                        launch_working_directory: settings.launch_working_directory().to_path_buf(),
-                        provider_plugin_id: None,
-                        model_id: None,
-                        agent_id: None,
-                        native_agent: None,
-                        reasoning_effort: None,
-                        reasoning_summary: None,
-                        reasoning_effort_generation: None,
-                        execution: bcode_session_models::TurnExecutionOptions::default(),
-                        event_sender: chat.event_sender.clone(),
-                    }),
-                });
                 chat.app
                     .set_status("Retrying exact retained native request; no new attempt".into());
             } else {
@@ -5138,6 +5101,7 @@ fn apply_managed_composer_receipt(
         .unwrap_or("The native agent")
         .to_owned();
     let retained = chat.app.managed_composer.requests.remove(&submission_id.0);
+    chat.app.forget_native_resends(&submission_id.0);
     let status = match &response.kind {
         ExternalHarnessResponseKind::Receipt(receipt) => {
             let exact = retained.as_ref().is_some_and(|request| matches!(&request.kind,
@@ -5210,10 +5174,59 @@ const fn submitted_text(request: &bcode_session_models::ExternalHarnessRequest) 
     }
 }
 
+/// Resend a retained native submission under its exact identities. The daemon fences every
+/// identity, so a resend delivers it once if it never arrived and otherwise returns what was
+/// recorded; it never produces a second native message. Returns whether one was resent.
+fn resend_retained_native(
+    chat: &mut ActiveChat,
+    identity: &str,
+    launch_working_directory: &std::path::Path,
+) -> bool {
+    let Some(request) = chat.app.managed_composer.requests.get(identity).cloned() else {
+        return false;
+    };
+    let bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. } = &request.kind
+    else {
+        return false;
+    };
+    let Ok(session_id) = submission.session_id.parse() else {
+        return false;
+    };
+    if chat.attached_session_id() != Some(session_id) {
+        return false;
+    }
+    chat.start_effect(TuiEffect::SubmitMessage {
+        request: Box::new(super::effects::SubmitMessageRequest {
+            submission_id: bcode_session_models::SubmissionId(submission.submission_id.clone()),
+            session_id: Some(session_id),
+            message: submission.text.clone(),
+            managed: Some(request.clone()),
+            attempt_id: submission.attempt_id.clone(),
+            managed_only: true,
+            expected_native_turn_id: None,
+            placement: bcode_ipc::PromptPlacement::FollowUp,
+            launch_working_directory: launch_working_directory.to_path_buf(),
+            provider_plugin_id: None,
+            model_id: None,
+            agent_id: None,
+            native_agent: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            reasoning_effort_generation: None,
+            execution: bcode_session_models::TurnExecutionOptions::default(),
+            event_sender: chat.event_sender.clone(),
+        }),
+    });
+    true
+}
+
+/// Automatic resends of one native submission whose delivery could not be confirmed.
+const MAX_NATIVE_RESENDS: u8 = 3;
+
 fn apply_submit_message_result(
     chat: &mut ActiveChat,
     submission_id: &bcode_session_models::SubmissionId,
-    _message: &str,
+    message: &str,
     result: Result<super::effects::SubmitMessageResult, ClientError>,
 ) {
     match result {
@@ -5279,10 +5292,32 @@ fn apply_submit_message_result(
                 .requests
                 .contains_key(&submission_id.0)
             {
-                // Whether it arrived shows in the native reply; input stays open meanwhile.
-                chat.app.set_status(
-                    "Delivery is unconfirmed; the reply will show whether it arrived".into(),
-                );
+                // Resending the exact attempt is safe (the daemon fences its identity), so a
+                // failed hand-off recovers by itself instead of waiting for the user.
+                let attempts = chat.app.note_native_resend(&submission_id.0);
+                let directory = chat
+                    .app
+                    .working_directory()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_default();
+                if attempts <= MAX_NATIVE_RESENDS
+                    && resend_retained_native(chat, &submission_id.0, &directory)
+                {
+                    chat.app.set_status(format!(
+                        "Sending again ({attempts}/{MAX_NATIVE_RESENDS}) after: {error}"
+                    ));
+                } else {
+                    chat.app.managed_composer.requests.remove(&submission_id.0);
+                    chat.app.forget_native_resends(&submission_id.0);
+                    chat.app.acknowledge_managed_composer(submission_id);
+                    if chat.app.composer().text().trim().is_empty() {
+                        chat.app.replace_composer_with(message);
+                    }
+                    chat.app.forget_native_agent_announcement();
+                    chat.app.set_status(format!(
+                        "Could not confirm delivery ({error}); the message is back in the composer"
+                    ));
+                }
                 return;
             }
             daemon_issue::report_client_issue(
@@ -7362,6 +7397,53 @@ mod scheduler_tests {
             "uncertainty never auto-resends"
         );
         assert_managed_capture_rejects_conflicts_and_overflow(&mut chat, &identity, &retained);
+        chat.event_task.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_native_hand_off_resends_the_exact_attempt_then_gives_the_text_back() {
+        use super::super::effects::SubmitMessageResult;
+        let mut chat = managed_test_chat();
+        chat.event_task = Some(tokio::spawn(std::future::pending()));
+        chat.app.replace_composer_with("native input");
+        chat.app.stage_submission();
+        let identity = chat.app.pending_submissions().last().unwrap().id().clone();
+        let request = managed_test_request(&chat, &identity.0);
+        let retained = request.managed.clone().unwrap();
+        let prepared = SubmitMessageResult {
+            session_id: chat.attached_session_id().unwrap(),
+            created_session: None,
+            submission: Ok(None),
+            receipt: None,
+            prepared_request: Some(Box::new(request)),
+            committed_agent_id: None,
+            committed_reasoning_effort_generation: None,
+            event_task: None,
+            event_stream_release: None,
+        };
+        apply_submit_message_result(&mut chat, &identity, "native input", Ok(prepared));
+        let _ = chat.pending_effects.drain_runtime();
+        let failure = || Err(ClientError::Protocol("connection reset".into()));
+
+        for attempt in 1..=MAX_NATIVE_RESENDS {
+            apply_submit_message_result(&mut chat, &identity, "native input", failure());
+            let (resent, _) = chat.pending_effects.drain_runtime();
+            assert!(
+                matches!(
+                    resent.as_slice(),
+                    [(_, TuiEffect::SubmitMessage { request })]
+                        if request.managed.as_ref() == Some(&retained)
+                ),
+                "attempt {attempt} resends the exact retained request"
+            );
+            assert!(chat.app.status().contains("connection reset"));
+        }
+
+        apply_submit_message_result(&mut chat, &identity, "native input", failure());
+        assert_eq!(chat.pending_effects.queued_effect_count(), 0);
+        assert!(!chat.app.managed_composer.requests.contains_key(&identity.0));
+        assert_eq!(chat.app.composer().text(), "native input");
+        assert!(chat.app.status().contains("connection reset"));
         chat.event_task.take().unwrap().abort();
     }
 

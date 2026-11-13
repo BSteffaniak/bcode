@@ -560,7 +560,10 @@ impl ManagedSessionCommandHandle {
         // Never reconnect/replay an uncertain submission or transfer its grant to the event client.
         let mut channel = self.command_connection.lock().await;
         if channel.detached {
-            return Err(invalid());
+            return Err(ClientError::Protocol(
+                "the managed command channel closed when its session stream ended; reattach to send"
+                    .into(),
+            ));
         }
         if channel.connection.is_none() {
             channel.connection = Some(

@@ -50,6 +50,17 @@ def effect(root, label):
         raise ValueError()
 
 
+def without_agent_block(frame):
+    # Bcode may announce its agent at the start of a message; the fixture reads past it.
+    message = frame.get("message", {})
+    content = message.get("content")
+    if isinstance(content, str) and content.startswith("<bcode-agent name=\""):
+        end = content.find("</bcode-agent>")
+        if end >= 0:
+            message["content"] = content[end + len("</bcode-agent>"):].lstrip("\n")
+    return frame
+
+
 def mark(root, label):
     # Fixed-label timing only: no frames, credentials or account data.
     (root / (label + ".monotonic_ns")).write_text(str(time.monotonic_ns()), encoding="ascii")
@@ -247,7 +258,7 @@ def main():
     submission_uuid = None
     submission_uuid_seen = None
     for _ in range(32):
-        frame = receive(idle_seconds)
+        frame = without_agent_block(receive(idle_seconds))
         if frame.get("type") == "user" and scenario == "multi_turn":
             # Sequential foreground turns on one live process; each ends with its own
             # attributed result. Only the first turn confirms the native identity.

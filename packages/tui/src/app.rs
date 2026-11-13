@@ -327,6 +327,8 @@ pub struct BmuxApp {
     managed_queue: Vec<bcode_session_models::external_harness::QueuedNativeInput>,
     /// Bcode agent last announced to the native agent, with the native compaction count then.
     native_agent_announced: Option<(String, u64)>,
+    /// Automatic resends per native submission whose delivery could not be confirmed.
+    native_resends: std::collections::BTreeMap<String, u8>,
     input_history: InputHistory,
     /// Local presentation of an exact prepared recovery selection.
     pub queue_recovery: QueueRecoveryPresentation,
@@ -511,6 +513,7 @@ impl BmuxApp {
             managed_composer: ManagedComposerState::default(),
             managed_queue: Vec::new(),
             native_agent_announced: None,
+            native_resends: std::collections::BTreeMap::new(),
             input_history: InputHistory::from_entries(input_history),
             queue_recovery: QueueRecoveryPresentation::default(),
             notices: super::ephemeral_notices::EphemeralNotices::default(),
@@ -4102,6 +4105,21 @@ impl BmuxApp {
         let agent = current.0.clone();
         self.native_agent_announced = Some(current);
         Some(agent)
+    }
+
+    /// Count one more automatic resend of `submission_id`; returns the count.
+    pub fn note_native_resend(&mut self, submission_id: &str) -> u8 {
+        let attempts = self
+            .native_resends
+            .entry(submission_id.to_owned())
+            .or_default();
+        *attempts = attempts.saturating_add(1);
+        *attempts
+    }
+
+    /// Forget the automatic resends of a settled native submission.
+    pub fn forget_native_resends(&mut self, submission_id: &str) {
+        self.native_resends.remove(submission_id);
     }
 
     /// Announce the agent again with the next message, after a message was not delivered.
