@@ -28,8 +28,10 @@ pub enum ModelSelectionContract {
 impl ModelSelectionContract {
     pub(crate) fn for_version(version: &str) -> Self {
         // This native stream-json contract reports the resolved next-turn model in
-        // the correlated set_model success payload. It is not inference evidence.
-        if crate::is_tested_version(version) {
+        // the correlated set_model success payload. It is not inference evidence. Any
+        // well-formed release keeps that contract, so updating Claude Code does not break
+        // choosing a model by its advertised alias; unparseable output stays strict.
+        if crate::is_tested_version(version) || crate::parse_version(version.as_bytes()).is_ok() {
             Self::AdvertisedAliasResolution
         } else {
             Self::ExactIdentity
@@ -313,9 +315,13 @@ mod tests {
             ModelSelectionContract::for_version("unknown"),
             ModelSelectionContract::ExactIdentity
         );
-        // Untested drift keeps strict identity; only tested versions resolve aliases.
+        // Newer releases keep alias resolution; only unparseable output stays strict.
         assert_eq!(
             ModelSelectionContract::for_version("9.9.9 (Claude Code)"),
+            ModelSelectionContract::AdvertisedAliasResolution
+        );
+        assert_eq!(
+            ModelSelectionContract::for_version("wrapper 9.9.9"),
             ModelSelectionContract::ExactIdentity
         );
         for version in crate::TESTED_VERSIONS {

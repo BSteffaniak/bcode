@@ -782,9 +782,17 @@ impl ModelPickerApp {
                             plugin_id,
                             ..
                         } => {
+                            // Native tools name models by alias (`opus`); lead with the tool's
+                            // own display name (`Opus 5.5`) so versions are visible.
+                            let name = if model.display_name.trim().is_empty()
+                                || model.display_name == model.model_id
+                            {
+                                model.model_id.clone()
+                            } else {
+                                format!("{} ({})", model.display_name, model.model_id)
+                            };
                             row.model_id = format!(
-                                "{} · {}",
-                                row.model_id,
+                                "{name} · {}",
                                 bcode_session_view::external_projection::harness_display_label(
                                     plugin_id
                                 )
@@ -1856,5 +1864,45 @@ mod execution_connection_label_tests {
                 .any(|row| row.contains("Connect Codex") && row.contains("Select to connect"))
         );
         assert!(rows.iter().all(|row| !row.contains("binding")));
+    }
+}
+
+#[cfg(test)]
+mod harness_label_tests {
+    use super::*;
+    use bcode_model::execution::{
+        ExecutionBillingRoute, ExecutionModel, ExecutionModelProvenance, ExecutionModelReadiness,
+        ExecutionRoute,
+    };
+
+    #[test]
+    fn native_rows_show_the_tools_display_name_with_its_alias() {
+        let row = |id: &str, display: &str| {
+            let mut model = recommended_model(id).unwrap();
+            model.display_name = display.into();
+            ExecutionModel {
+                native_model_id: id.into(),
+                model,
+                route: ExecutionRoute::ManagedHarness {
+                    instance_id: "claude".into(),
+                    plugin_id: "bcode.claude-code".into(),
+                },
+                account_reference: Some("native".into()),
+                billing_route: ExecutionBillingRoute::Unknown,
+                confirmed_model_id: None,
+                provenance: ExecutionModelProvenance::HarnessDiscovery,
+                readiness: ExecutionModelReadiness::Unknown,
+            }
+        };
+        let app = ModelPickerApp::from_execution_models(
+            vec![row("opus", "Opus 5.5"), row("same", "same")],
+            "Select",
+        );
+        let rows = app.row_strings_for_test(160);
+        assert!(rows.iter().any(|row| row.contains("Opus 5.5 (opus)")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("same ·") && !row.contains("(same)"))
+        );
     }
 }

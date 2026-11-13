@@ -37,6 +37,29 @@ pub struct ManagedSessionClient {
     inner: BcodeClient,
 }
 
+/// What a failed native start means for the user, and what to do about it.
+const fn native_start_failure(failure: bcode_harness_models::HarnessFailure) -> &'static str {
+    use bcode_harness_models::HarnessFailure;
+    match failure {
+        HarnessFailure::Authentication => {
+            "The tool is not signed in. Sign in to it, then choose the model again."
+        }
+        HarnessFailure::Unsupported | HarnessFailure::InvalidRequest => {
+            "The tool did not accept that model. Choose another model, or update the tool."
+        }
+        HarnessFailure::Unavailable => {
+            "The tool could not be started. Check that it is installed and runs, then try again."
+        }
+        HarnessFailure::Policy => "The tool's settings do not allow that model.",
+        HarnessFailure::StaleGeneration | HarnessFailure::Conflict => {
+            "The conversation changed while starting the tool. Try again."
+        }
+        HarnessFailure::Uncertain => {
+            "The tool did not confirm the model change. Try again; nothing was sent."
+        }
+    }
+}
+
 impl ManagedSessionClient {
     /// Load the complete current configuration while deferring only model credential materialization.
     /// Configuration/context/profile/auth metadata failures remain connection-blocking errors.
@@ -254,6 +277,12 @@ impl ManagedSessionClient {
             .response
             .validate_for(&native)
             .map_err(|_| ClientError::Protocol("invalid selected start response".into()))?;
+        // A native start failure is not a changed selection; say what the tool reported.
+        if let bcode_harness_models::HarnessModelsResponseKind::Failure(failure) =
+            &response.response.kind
+        {
+            return Err(ClientError::Protocol(native_start_failure(*failure).into()));
+        }
         if response.selection.requested.model_id != request.selection.model_id
             || response.selection.requested.route != request.selection.route
             || response.selection.requested.account_reference != request.selection.account_reference

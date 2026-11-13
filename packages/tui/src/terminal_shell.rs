@@ -175,7 +175,22 @@ impl TerminalShell {
             session_id = match Box::pin(self.select_execution(&request)).await {
                 Ok(target) => target,
                 Err(error) => {
-                    self.show_error_without_retry(&format!("Could not select execution backend: {error}. No fallback was selected; returning to your conversation.")).await?;
+                    // Protocol messages are already written for the user; skip the wrapper text.
+                    let reason = match &error {
+                        crate::TuiError::Client(bcode_client::ClientError::Protocol(message)) => {
+                            message.clone()
+                        }
+                        other => other.to_string(),
+                    };
+                    let reason = if reason.ends_with('.') {
+                        reason
+                    } else {
+                        format!("{reason}.")
+                    };
+                    self.show_error_without_retry(&format!(
+                        "Could not switch: {reason} You are back in your conversation; nothing else changed."
+                    ))
+                    .await?;
                     request.session_id
                 }
             };
