@@ -46,6 +46,8 @@ pub struct UnitChrome {
     pub activity: ActivityChrome,
     /// Decision dialog placement and actions.
     pub dialogs: bcode_tui_theme::chrome::DialogChrome,
+    /// Completion menu frame, marker, tags, and rows.
+    pub menus: bcode_tui_theme::chrome::MenuChrome,
 }
 
 /// Header icon candidates for one tool category, most specific first.
@@ -89,6 +91,7 @@ impl UnitChrome {
             composer: theme.chrome.composer,
             activity: theme.chrome.activity,
             dialogs: theme.chrome.dialogs,
+            menus: theme.chrome.menus,
         })
     }
 

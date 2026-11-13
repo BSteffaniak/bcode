@@ -10,10 +10,7 @@ use bmux_tui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::chrome::{
-    ActivityChrome, ComposerChrome, DialogChrome, MAX_MARKER_GAP, MAX_STATUS_INDENT,
-    MarkdownChrome, MarkerGlyphs, RawChrome, StatusChrome, TuiBorders, TuiChrome,
-};
+use crate::chrome::{RawChrome, TuiBorders, TuiChrome};
 use crate::contrast::ContrastAdjustment;
 use crate::expr::{self, ColorContext, Evaluated};
 
@@ -1034,61 +1031,20 @@ fn resolve_chrome(
         motion: raw.motion.unwrap_or_default(),
         header: raw.header.unwrap_or_default(),
         session_start: raw.session_start.unwrap_or_default(),
-        status: raw
-            .status
-            .as_ref()
-            .map_or_else(StatusChrome::default, |status| StatusChrome {
-                placement: status.placement.unwrap_or_default(),
-                indent: status.indent.unwrap_or(0).min(MAX_STATUS_INDENT),
-                segments: status.segments.unwrap_or_default(),
-            }),
-        composer: raw
-            .composer
-            .as_ref()
-            .map_or_else(ComposerChrome::default, |composer| ComposerChrome {
-                prompt: composer.prompt,
-                title: composer.title.unwrap_or_default(),
-                placeholder: composer.placeholder,
-                controls: composer.controls.unwrap_or_default(),
-            }),
-        markers: raw
-            .markers
-            .as_ref()
-            .map_or_else(MarkerGlyphs::default, |markers| MarkerGlyphs {
-                user: markers.user,
-                assistant: markers.assistant,
-                bullet: markers.bullet,
-                connector: markers.connector,
-            }),
+        status: resolved(raw.status.as_ref()),
+        composer: resolved(raw.composer.as_ref()),
+        markers: resolved(raw.markers.as_ref()),
         follow: raw.follow.unwrap_or_default(),
-        activity: raw
-            .activity
-            .as_ref()
-            .map_or_else(ActivityChrome::default, |activity| ActivityChrome {
-                placement: activity.placement.unwrap_or_default(),
-                spinner: activity.spinner,
-                verbs: activity.verbs.unwrap_or_default(),
-                shimmer: activity.shimmer.unwrap_or(false),
-            }),
-        markdown: raw
-            .markdown
-            .as_ref()
-            .map_or_else(MarkdownChrome::default, |markdown| MarkdownChrome {
-                bullet: markdown.bullet,
-                marker_gap: markdown.marker_gap.map(|gap| gap.min(MAX_MARKER_GAP)),
-                code_blocks: markdown.code_blocks.unwrap_or_default(),
-                quote_bar: markdown.quote_bar,
-                table_headers: markdown.table_headers.unwrap_or_default(),
-                smart_punctuation: markdown.smart_punctuation.unwrap_or(true),
-            }),
-        dialogs: raw
-            .dialogs
-            .as_ref()
-            .map_or_else(DialogChrome::default, |dialogs| DialogChrome {
-                placement: dialogs.placement.unwrap_or_default(),
-                actions: dialogs.actions.unwrap_or_default(),
-            }),
+        activity: resolved(raw.activity.as_ref()),
+        markdown: resolved(raw.markdown.as_ref()),
+        dialogs: resolved(raw.dialogs.as_ref()),
+        menus: resolved(raw.menus.as_ref()),
     })
+}
+
+/// A nested chrome table resolved with defaults for its unset fields; absent, the defaults.
+fn resolved<R: crate::chrome::ResolveChrome>(raw: Option<&R>) -> R::Resolved {
+    raw.map_or_else(R::Resolved::default, R::resolve)
 }
 
 /// Resolves palette references and color expressions with cycle detection.

@@ -154,6 +154,7 @@ session_start = "shown"     # shown | hidden: the marker at the start of a sessi
 status    = { placement = "above_composer", indent = 0, segments = ["activity", "context", "usage", "children", "progress", "plugins", "message", "position", "hints"] }
 activity  = { placement = "status", spinner = "⠋⠙⠹", verbs = [], shimmer = false }
 dialogs   = { placement = "modal", actions = "buttons" }   # modal | docked; buttons | numbered
+menus     = { frame = "framed", marker = "›", tags = "shown", rows = 6 }   # framed | plain
 markdown  = { bullet = "•", marker_gap = 2, code_blocks = "framed", quote_bar = "│", table_headers = "column", smart_punctuation = true }
 composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls = "shown" }
 ```
@@ -188,6 +189,11 @@ composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls
   actions, and a hint row. `dialogs.actions = "numbered"` lists one action per row with a
   cursor, chosen with the arrow keys, Enter, a click, or the action's digit. One layout gives
   the painted rows, the hit regions, and the dock height.
+* `menus` draws completion menus such as the slash command menu: `frame = "plain"` lists rows
+  with no border, title, or fill, the selected row in the focused style and the others muted,
+  with commands padded to one column; `marker` is the selected-row glyph, `tags` shows or hides
+  item kind tags, and `rows` (1..=16) bounds the rows shown. Painting and mouse selection share
+  one menu area.
 * `follow = "reply"` holds a new submission's or reply's first row at the viewport top until it
   overflows; `latest` keeps the latest content at the bottom instead. Neither pulls a reader who
   scrolled away from the latest content; a submission returns to it under `latest`.

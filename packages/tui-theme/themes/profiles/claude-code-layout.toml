@@ -19,6 +19,7 @@ icons         = "unicode"
 motion        = "subtle"
 separators    = { status = "plain" }
 session_start = "hidden"
+menus         = { frame = "plain", marker = "❯", tags = "hidden", rows = 5 }
 markdown      = { bullet = "-", marker_gap = 1, code_blocks = "plain", quote_bar = "▎", table_headers = "center", smart_punctuation = false }
 markers       = { user = "❯", assistant = "⏺", bullet = "⏺", connector = "⎿" }
 speaker       = "marker"

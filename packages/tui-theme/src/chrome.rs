@@ -542,6 +542,33 @@ impl Default for MarkdownChrome {
 /// Widest Markdown list marker gap.
 pub const MAX_MARKER_GAP: u8 = 4;
 
+/// How completion menus (the slash command menu) are drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MenuFrame {
+    /// A titled, filled panel.
+    #[default]
+    Framed,
+    /// Rows only: no border, title, or fill; the selected row is highlighted by its text.
+    Plain,
+}
+
+/// Completion menu presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MenuChrome {
+    /// How the menu is drawn.
+    pub frame: MenuFrame,
+    /// Glyph before the selected row; `None` keeps the renderer's.
+    pub marker: Option<ChromeText>,
+    /// Item kind tags such as `[cmd]`.
+    pub tags: Visibility,
+    /// Most rows shown at once, 1..=[`MAX_MENU_ROWS`]; `None` keeps the renderer's.
+    pub rows: Option<u8>,
+}
+
+/// Most rows a completion menu may show at once.
+pub const MAX_MENU_ROWS: u8 = 16;
+
 /// Where decision dialogs (permission requests) appear.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -639,6 +666,8 @@ pub struct TuiChrome {
     pub markdown: MarkdownChrome,
     /// Decision dialogs.
     pub dialogs: DialogChrome,
+    /// Completion menus.
+    pub menus: MenuChrome,
 }
 
 /// Maximum focus gradient colors.
@@ -695,6 +724,19 @@ pub(crate) struct RawComposer {
     pub placeholder: Option<ChromeText>,
     #[serde(default)]
     pub controls: Option<Visibility>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawMenus {
+    #[serde(default)]
+    pub frame: Option<MenuFrame>,
+    #[serde(default)]
+    pub marker: Option<ChromeText>,
+    #[serde(default)]
+    pub tags: Option<Visibility>,
+    #[serde(default)]
+    pub rows: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -786,6 +828,108 @@ pub(crate) struct RawTuiChrome {
     pub markdown: Option<RawMarkdown>,
     #[serde(default)]
     pub dialogs: Option<RawDialogs>,
+    #[serde(default)]
+    pub menus: Option<RawMenus>,
+}
+
+/// A raw nested `[chrome.tui]` table that resolves to its chrome, with defaults for unset
+/// fields and values clamped to their bounds.
+pub(crate) trait ResolveChrome {
+    /// The resolved chrome.
+    type Resolved: Default;
+
+    /// Resolve the table.
+    fn resolve(&self) -> Self::Resolved;
+}
+
+impl ResolveChrome for RawStatus {
+    type Resolved = StatusChrome;
+
+    fn resolve(&self) -> StatusChrome {
+        StatusChrome {
+            placement: self.placement.unwrap_or_default(),
+            indent: self.indent.unwrap_or(0).min(MAX_STATUS_INDENT),
+            segments: self.segments.unwrap_or_default(),
+        }
+    }
+}
+
+impl ResolveChrome for RawComposer {
+    type Resolved = ComposerChrome;
+
+    fn resolve(&self) -> ComposerChrome {
+        ComposerChrome {
+            prompt: self.prompt,
+            title: self.title.unwrap_or_default(),
+            placeholder: self.placeholder,
+            controls: self.controls.unwrap_or_default(),
+        }
+    }
+}
+
+impl ResolveChrome for RawMarkers {
+    type Resolved = MarkerGlyphs;
+
+    fn resolve(&self) -> MarkerGlyphs {
+        MarkerGlyphs {
+            user: self.user,
+            assistant: self.assistant,
+            bullet: self.bullet,
+            connector: self.connector,
+        }
+    }
+}
+
+impl ResolveChrome for RawActivity {
+    type Resolved = ActivityChrome;
+
+    fn resolve(&self) -> ActivityChrome {
+        ActivityChrome {
+            placement: self.placement.unwrap_or_default(),
+            spinner: self.spinner,
+            verbs: self.verbs.unwrap_or_default(),
+            shimmer: self.shimmer.unwrap_or(false),
+        }
+    }
+}
+
+impl ResolveChrome for RawMarkdown {
+    type Resolved = MarkdownChrome;
+
+    fn resolve(&self) -> MarkdownChrome {
+        MarkdownChrome {
+            bullet: self.bullet,
+            marker_gap: self.marker_gap.map(|gap| gap.min(MAX_MARKER_GAP)),
+            code_blocks: self.code_blocks.unwrap_or_default(),
+            quote_bar: self.quote_bar,
+            table_headers: self.table_headers.unwrap_or_default(),
+            smart_punctuation: self.smart_punctuation.unwrap_or(true),
+        }
+    }
+}
+
+impl ResolveChrome for RawDialogs {
+    type Resolved = DialogChrome;
+
+    fn resolve(&self) -> DialogChrome {
+        DialogChrome {
+            placement: self.placement.unwrap_or_default(),
+            actions: self.actions.unwrap_or_default(),
+        }
+    }
+}
+
+impl ResolveChrome for RawMenus {
+    type Resolved = MenuChrome;
+
+    fn resolve(&self) -> MenuChrome {
+        MenuChrome {
+            frame: self.frame.unwrap_or_default(),
+            marker: self.marker,
+            tags: self.tags.unwrap_or_default(),
+            rows: self.rows.map(|rows| rows.clamp(1, MAX_MENU_ROWS)),
+        }
+    }
 }
 
 /// `[chrome]` table: the terminal section plus opaque sections for other renderers.
@@ -862,6 +1006,7 @@ impl RawTuiChrome {
         overlay!(composer, RawComposer: prompt, title, placeholder, controls);
         overlay!(status, RawStatus: placement, indent, segments);
         overlay!(dialogs, RawDialogs: placement, actions);
+        overlay!(menus, RawMenus: frame, marker, tags, rows);
         overlay!(
             markdown,
             RawMarkdown: bullet,

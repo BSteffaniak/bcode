@@ -83,7 +83,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 13 | Docked permission and question surfaces with numbered option lists | permission done: `dialogs`; question surface placement is configuration only (open); the awaiting permission unit duplicates a docked dialog (open) |
 | 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
 | 15 | Session banner | open |
-| 16 | Slash menu presentation | open |
+| 16 | Slash menu presentation | done: `menus` |
 | 17 | Permission records disappear once decided | done: `hidden_marker = false` |
 | 18 | Plugin-drawn tool bodies (file edit card, shell screen) follow header/section presentation | open |
 | 19 | Smart punctuation off (straight quotes) | done: `markdown.smart_punctuation` |

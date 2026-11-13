@@ -2876,6 +2876,7 @@ fn slash_palette_renders_above_composer() {
         Rect::new(2, 18, 76, 1),
         &mut bmux_tui::paint::PaintCx::new(&mut frame),
         render::TuiTheme::for_agent("build", None, true),
+        bcode_tui_theme::chrome::MenuChrome::default(),
     );
     let output = rendered_text(&buffer);
 
@@ -2896,6 +2897,7 @@ fn slash_palette_layout_is_bounded_at_tiny_sizes() {
                 bounds,
                 slash_palette_render::composer_panel_area(composer),
                 palette.item_count(),
+                bcode_tui_theme::chrome::MenuChrome::default(),
             );
             if let Some(area) = area {
                 assert!(area.right() <= bounds.right());
@@ -2909,6 +2911,7 @@ fn slash_palette_layout_is_bounded_at_tiny_sizes() {
                 composer,
                 &mut bmux_tui::paint::PaintCx::new(&mut frame),
                 render::TuiTheme::for_agent("build", None, true),
+                bcode_tui_theme::chrome::MenuChrome::default(),
             );
             if area.is_none() {
                 assert!(buffer.cells().iter().all(|cell| cell.symbol == " "));
@@ -2937,11 +2940,16 @@ fn slash_palette_mouse_agrees_with_painted_scrolled_rows() {
         bounds,
         slash_palette_render::composer_panel_area(composer),
         palette.item_count(),
+        bcode_tui_theme::chrome::MenuChrome::default(),
     )
     .unwrap();
-    let list =
-        slash_palette_render::slash_palette_list_area(bounds, composer, palette.item_count())
-            .unwrap();
+    let list = slash_palette_render::slash_palette_list_area(
+        bounds,
+        composer,
+        palette.item_count(),
+        bcode_tui_theme::chrome::MenuChrome::default(),
+    )
+    .unwrap();
     let mut buffer = Buffer::empty(bounds);
     let mut frame = Frame::new(&mut buffer);
     slash_palette_render::render_palette(
@@ -2949,6 +2957,7 @@ fn slash_palette_mouse_agrees_with_painted_scrolled_rows() {
         composer,
         &mut bmux_tui::paint::PaintCx::new(&mut frame),
         render::TuiTheme::for_agent("build", None, true),
+        bcode_tui_theme::chrome::MenuChrome::default(),
     );
     for y in area.y..area.bottom() {
         for x in area.x..area.right() {
@@ -2958,6 +2967,7 @@ fn slash_palette_mouse_agrees_with_painted_scrolled_rows() {
                 x,
                 y,
                 palette.item_count(),
+                bcode_tui_theme::chrome::MenuChrome::default(),
             );
             if y == area.y || y == area.bottom() - 1 || x < area.x + 2 || x >= area.right() - 2 {
                 assert_eq!(hit, None, "chrome/padding must not select at {x},{y}");
@@ -3011,11 +3021,13 @@ fn slash_palette_command_first_unicode_clipping_and_styles() {
             composer,
             &mut bmux_tui::paint::PaintCx::new(&mut frame),
             theme,
+            bcode_tui_theme::chrome::MenuChrome::default(),
         );
         let area = slash_palette_render::slash_palette_area(
             bounds,
             slash_palette_render::composer_panel_area(composer),
             palette.item_count(),
+            bcode_tui_theme::chrome::MenuChrome::default(),
         )
         .unwrap();
         for y in area.y..area.bottom() {
@@ -3062,6 +3074,7 @@ fn slash_palette_repaints_presented_focus_and_selection_styles() {
         bounds,
         slash_palette_render::composer_panel_area(composer),
         palette.item_count(),
+        bcode_tui_theme::chrome::MenuChrome::default(),
     )
     .unwrap();
     let mut buffer = Buffer::empty(bounds);
@@ -3075,6 +3088,7 @@ fn slash_palette_repaints_presented_focus_and_selection_styles() {
             composer,
             &mut bmux_tui::paint::PaintCx::new(&mut frame),
             theme,
+            bcode_tui_theme::chrome::MenuChrome::default(),
         );
         for point in [
             Point::new(area.x, area.y + 1),
@@ -3952,4 +3966,78 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
     dialog.cycle_focused();
     assert_eq!(dialog.summary(), None);
     assert_eq!(dialog.summary_values(), [] as [String; 0]);
+}
+
+#[test]
+fn plain_slash_menus_list_rows_without_chrome_and_mouse_agrees_with_paint() {
+    use bcode_tui_theme::chrome::{ChromeText, MenuChrome, MenuFrame, Visibility};
+    let menus = MenuChrome {
+        frame: MenuFrame::Plain,
+        marker: ChromeText::new("❯"),
+        tags: Visibility::Hidden,
+        rows: Some(3),
+    };
+    let mut palette = slash_palette::SlashPalette::from_items(vec![
+        ("/add-dir", "Add a directory"),
+        ("/branch", "Branch"),
+        ("/clear", "Clear"),
+        ("/diff", "Diff"),
+    ]);
+    palette.select_command("/branch");
+    let bounds = Rect::new(0, 0, 50, 12);
+    let composer = Rect::new(2, 10, 46, 1);
+    let area = slash_palette_render::slash_palette_area(
+        bounds,
+        slash_palette_render::composer_panel_area(composer),
+        palette.item_count(),
+        menus,
+    )
+    .expect("area");
+    assert_eq!(
+        area.height, 3,
+        "rows bound the menu and no frame rows are added"
+    );
+    let mut buffer = Buffer::empty(bounds);
+    let mut frame = Frame::new(&mut buffer);
+    slash_palette_render::render_palette(
+        &palette,
+        composer,
+        &mut bmux_tui::paint::PaintCx::new(&mut frame),
+        render::TuiTheme::for_agent("build", None, true),
+        menus,
+    );
+    let rows: Vec<String> = (area.y..area.bottom())
+        .map(|y| buffer.row_symbols(y).unwrap().trim_end().to_owned())
+        .collect();
+    assert!(
+        rows.iter().any(|row| row.ends_with("❯ /branch   Branch")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| !row.contains("[cmd]") && !row.contains('│')),
+        "{rows:?}"
+    );
+    for y in area.y..area.bottom() {
+        let hit = slash_palette_render::slash_palette_row_from_mouse(
+            bounds,
+            composer,
+            area.x,
+            y,
+            palette.item_count(),
+            menus,
+        );
+        let row = usize::from(y - area.y);
+        assert_eq!(hit, Some(row));
+        let item = palette
+            .visible_items(usize::from(area.height))
+            .nth(row)
+            .unwrap();
+        assert!(
+            buffer
+                .row_symbols(y)
+                .unwrap()
+                .contains(item.item.command())
+        );
+    }
 }

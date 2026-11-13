@@ -1340,6 +1340,7 @@ impl ChatLoopState {
             mouse.position.x,
             mouse.position.y,
             palette.item_count(),
+            chat.app.presented_theme().unit_chrome.menus,
         ) else {
             self.slash_completion.dismiss(chat.app.composer().text());
             self.slash_palette = None;
@@ -1349,6 +1350,7 @@ impl ChatLoopState {
             frame_area,
             chat.app.composer_content_area(),
             palette.item_count(),
+            chat.app.presented_theme().unit_chrome.menus,
         ) else {
             return false;
         };
@@ -6481,6 +6483,7 @@ fn paint_foreground(
             chat.app.composer_content_area(),
             frame,
             theme,
+            chat.app.presented_theme().unit_chrome.menus,
         );
     }
     if let Some(palette) = &mut loop_state.palette
