@@ -87,4 +87,4 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 17 | Permission records disappear once decided | done: `hidden_marker = false` |
 | 18 | Plugin-drawn tool bodies (file edit card, shell screen) follow header/section presentation | open |
 | 19 | Smart punctuation off (straight quotes) | open |
-| 20 | Status line: "rows below latest" shown while following content shorter than the viewport | open (bug) |
+| 20 | Status line: "rows below latest" shown while following content shorter than the viewport | fixed |

@@ -102,7 +102,12 @@ pub fn evaluate(inputs: &LatestBarInputs<'_>, activity: LatestActivity) -> Lates
     let visible = inputs.region_height >= MIN_REGION_HEIGHT && newer_content_below(inputs);
     LatestBarState {
         visible,
-        rows_below_latest: inputs.frame.map_or(0, ViewportFrame::blank_rows_below),
+        // Blank rows count as tail space only once the content top has scrolled above the
+        // viewport: content that fits leaves blank rows below without anything being "below".
+        rows_below_latest: inputs
+            .frame
+            .filter(|frame| frame.resolved.top_offset > 0)
+            .map_or(0, ViewportFrame::blank_rows_below),
         activity_at: activity.at.filter(|_| visible),
         burst: if visible { activity.burst } else { 0 },
     }

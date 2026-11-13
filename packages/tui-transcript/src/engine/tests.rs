@@ -994,3 +994,24 @@ fn a_hidden_session_start_marker_paints_its_row_blank() {
         }
     }
 }
+
+#[test]
+fn c2_content_that_fits_reports_no_rows_below_latest() {
+    let events = session(1);
+    let resident = events.len();
+    let mut harness = Harness::attach_with(
+        TranscriptEngine::with_producer(
+            ViewportGeometry::new(WIDTH, HEIGHT),
+            MotionConfig::INSTANT,
+            Box::new(crate::layout::producers::testing::PlainTextProducer),
+        ),
+        events,
+        resident,
+    );
+    let (rows, snapshot) = harness.present_snapshot();
+    assert!(
+        rows.iter().any(|row| row.trim().is_empty()),
+        "the content leaves blank rows: {rows:?}"
+    );
+    assert_eq!(snapshot.latest_bar.rows_below_latest, 0);
+}
