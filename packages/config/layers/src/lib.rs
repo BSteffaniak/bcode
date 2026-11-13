@@ -8,7 +8,8 @@
 //! `BCODE_CONFIG`/`BCODE_CONFIG_TOML`/CLI overlays stack on top of them, and how
 //! the `[composition]` section selects profiles and layer order. It produces
 //! untyped TOML; typed validation and product-specific transforms stay with the
-//! caller (for example `bcode_config`).
+//! caller (for example `bcode_config`). [`user_state`] locates the interactive user state that
+//! layers over configuration for presentation choices.
 //!
 //! Lightweight tools load configuration with the same semantics as Bcode itself:
 //!
@@ -31,6 +32,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+pub mod user_state;
 
 /// Default Bcode config file name.
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "bcode.toml";

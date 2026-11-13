@@ -7,6 +7,7 @@
 //! This crate owns the versioned theme file format and semantic role resolution so that
 //! standalone terminal tools can share bcode themes without depending on the full TUI.
 
+pub mod appearance;
 pub mod bundled;
 pub mod check;
 pub mod chrome;

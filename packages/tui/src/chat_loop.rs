@@ -4529,27 +4529,20 @@ pub fn apply_saved_appearance(
     theme_selection: Result<Option<String>, String>,
     profile_selection: Result<Option<String>, String>,
 ) {
-    match theme_selection {
-        Ok(Some(theme_id)) if !chat.app.apply_theme(&theme_id) => {
-            let configured = chat.app.tui_config().theme.name.clone();
-            chat.app.set_status(format!(
-                "saved theme {theme_id} is unavailable; using configured default {configured}"
-            ));
-        }
-        Ok(_) => {}
-        Err(error) => chat
-            .app
-            .set_status(format!("TUI state unavailable: {error}")),
+    let saved = bcode_tui_theme::appearance::SavedAppearance {
+        theme: theme_selection.as_ref().ok().cloned().flatten(),
+        profile: profile_selection.as_ref().ok().cloned().flatten(),
+    };
+    for notice in chat.app.apply_saved_appearance(&saved) {
+        chat.app.set_status(notice.to_string());
     }
-    match profile_selection {
-        Ok(Some(profile)) if !chat.app.apply_profile(Some(&profile)) => {
-            chat.app
-                .set_status(format!("saved profile {profile} is unavailable"));
-        }
-        Ok(_) => {}
-        Err(error) => chat
-            .app
-            .set_status(format!("TUI profile state unavailable: {error}")),
+    if let Err(error) = theme_selection {
+        chat.app
+            .set_status(format!("TUI state unavailable: {error}"));
+    }
+    if let Err(error) = profile_selection {
+        chat.app
+            .set_status(format!("TUI profile state unavailable: {error}"));
     }
 }
 

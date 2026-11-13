@@ -1839,6 +1839,35 @@ impl BmuxApp {
         true
     }
 
+    /// Apply the palette and profile saved in user state over the configured ones, with the
+    /// precedence every Bcode program shares
+    /// ([`bcode_tui_theme::appearance::apply_saved_appearance`]). Returns the saved choices
+    /// that could not apply.
+    pub fn apply_saved_appearance(
+        &mut self,
+        saved: &bcode_tui_theme::appearance::SavedAppearance,
+    ) -> Vec<bcode_tui_theme::appearance::AppearanceNotice> {
+        let configured = super::theme::theme_preferences(&self.tui_config.theme);
+        let variant = super::theme::resolve_variant_for_config(self.tui_config.theme.variant);
+        let Some((effective, notices)) = self.theme_catalog().map(|discovered| {
+            bcode_tui_theme::appearance::apply_saved_appearance(
+                &configured,
+                saved,
+                &discovered.catalog,
+                variant,
+            )
+        }) else {
+            return Vec::new();
+        };
+        if effective != configured {
+            self.tui_config.theme.name = effective.name;
+            self.tui_config.theme.profile = effective.profile;
+            self.theme_preview_id = None;
+            self.sync_theme_target(Instant::now());
+        }
+        notices
+    }
+
     /// Request the terminal color query once, only when the theme variant
     /// follows the terminal (`auto`); returns true when it should be written.
     pub fn take_terminal_color_query(&mut self) -> bool {

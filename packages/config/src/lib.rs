@@ -22,6 +22,7 @@ pub use bcode_config_layers::{
     ConfigEnvironment, ConfigLoadOverrides, DEFAULT_CONFIG_FILE_NAME, ProcessConfigEnvironment,
     default_config_paths, default_config_paths_from, default_config_paths_from_with_environment,
     default_config_paths_with_environment, merge_config_values, model_profile_override_toml,
+    user_state::SavedTuiAppearance,
 };
 pub mod shell_presentation;
 pub use shell_presentation::{
@@ -6258,22 +6259,9 @@ pub fn default_session_store_dir_with_environment(environment: &impl ConfigEnvir
 /// [`resolve_state_location_set`].
 #[must_use]
 pub fn default_state_dir_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
-    if let Some(root) = process_state_location_root() {
-        return root;
-    }
-    if let Some(path) = environment.var(BCODE_STATE_DIR_ENV) {
-        return PathBuf::from(path);
-    }
-    if let Some(state_home) = environment.var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home).join("bcode");
-    }
-    if let Some(home) = environment.var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode");
-    }
-    env::temp_dir().join("bcode")
+    process_state_location_root().unwrap_or_else(|| {
+        bcode_config_layers::user_state::default_state_dir_with_environment(environment)
+    })
 }
 
 #[cfg(test)]
@@ -6369,7 +6357,7 @@ pub fn push_process_state_location(location: &StateLocation) -> StateLocationGua
 }
 
 /// Environment variable selecting the primary durable state root.
-pub const BCODE_STATE_DIR_ENV: &str = "BCODE_STATE_DIR";
+pub const BCODE_STATE_DIR_ENV: &str = bcode_config_layers::user_state::BCODE_STATE_DIR_ENV;
 /// Environment variable selecting the canonical session store root.
 pub const BCODE_SESSION_STORE_DIR_ENV: &str = "BCODE_SESSION_STORE_DIR";
 
@@ -6918,10 +6906,10 @@ pub fn default_tui_state_path() -> PathBuf {
 /// Return the default runtime TUI state file path for an explicit environment.
 #[must_use]
 pub fn default_tui_state_path_with_environment(environment: &impl ConfigEnvironment) -> PathBuf {
-    if let Some(path) = environment.var("BCODE_TUI_STATE") {
-        return PathBuf::from(path);
-    }
-    default_state_dir_with_environment(environment).join("tui.toml")
+    bcode_config_layers::user_state::tui_state_path_in(
+        environment,
+        &default_state_dir_with_environment(environment),
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -7020,7 +7008,25 @@ pub fn load_tui_theme_selection() -> Result<Option<String>, ConfigError> {
 ///
 /// Returns an error when the state file exists but cannot be read or parsed.
 pub fn load_tui_theme_selection_from(path: &Path) -> Result<Option<String>, ConfigError> {
-    Ok(load_tui_state_from(path)?.theme.name)
+    Ok(load_saved_tui_appearance_from(path)?.theme)
+}
+
+/// Load the theme and profile the appearance picker saved in user state.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_saved_tui_appearance() -> Result<SavedTuiAppearance, ConfigError> {
+    load_saved_tui_appearance_from(&default_tui_state_path())
+}
+
+/// Load the saved theme and profile from a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_saved_tui_appearance_from(path: &Path) -> Result<SavedTuiAppearance, ConfigError> {
+    SavedTuiAppearance::load(path).map_err(ConfigError::from)
 }
 
 /// Persist the globally selected interactive TUI theme to user state.
@@ -7054,7 +7060,7 @@ pub fn load_tui_profile_selection() -> Result<Option<String>, ConfigError> {
 ///
 /// Returns an error when the state file exists but cannot be read or parsed.
 pub fn load_tui_profile_selection_from(path: &Path) -> Result<Option<String>, ConfigError> {
-    Ok(load_tui_state_from(path)?.theme.profile)
+    Ok(load_saved_tui_appearance_from(path)?.profile)
 }
 
 /// Persist (or clear, with `None`) the interactive TUI profile in user state.

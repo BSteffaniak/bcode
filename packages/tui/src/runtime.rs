@@ -1934,11 +1934,18 @@ mod saved_appearance_tests {
     }
 
     fn start(appearance: SavedAppearance) -> session_flow::ActiveChat {
+        start_with(bcode_config::BcodeConfig::default(), appearance)
+    }
+
+    fn start_with(
+        config: bcode_config::BcodeConfig,
+        appearance: SavedAppearance,
+    ) -> session_flow::ActiveChat {
         let mut chat = chat();
         let cwd = std::path::PathBuf::from(".");
         let mut settings = chat_loop::TuiRuntimeSettings::bootstrap(cwd.clone(), &[]);
         let _ = apply_initial_config(
-            Ok(bcode_config::BcodeConfig::default()),
+            Ok(config),
             Ok(None),
             appearance,
             None,
@@ -1981,5 +1988,55 @@ mod saved_appearance_tests {
             chat.app.tui_config().theme.name,
             configured.app.tui_config().theme.name
         );
+    }
+
+    #[tokio::test]
+    async fn saved_appearance_precedence_is_the_shared_resolution() {
+        use bcode_tui_theme::appearance::{self, ThemePreferences, VariantPreference};
+
+        assert_eq!(
+            super::super::theme::theme_preferences(&bcode_config::TuiThemeConfig::default()),
+            ThemePreferences::default(),
+            "bcode's configured defaults are the shared defaults"
+        );
+        let mut config = bcode_config::BcodeConfig::default();
+        config.tui.theme.name = "nord".to_owned();
+        config.tui.theme.profile = Some("bare".to_owned());
+        config.tui.theme.variant = bcode_config::TuiThemeVariant::Dark;
+        for (theme, profile) in [
+            (Some("catppuccin-mocha"), Some("structured")),
+            (Some("no-such-theme"), Some("structured")),
+            (Some("catppuccin-mocha"), Some("nord")),
+            (None, None),
+        ] {
+            let chat = start_with(
+                config.clone(),
+                SavedAppearance {
+                    theme: Ok(theme.map(str::to_owned)),
+                    profile: Ok(profile.map(str::to_owned)),
+                },
+            );
+            let configured = ThemePreferences {
+                name: "nord".to_owned(),
+                profile: Some("bare".to_owned()),
+                variant: VariantPreference::Dark,
+                ..ThemePreferences::default()
+            };
+            let (shared, _) = appearance::apply_saved_appearance(
+                &configured,
+                &appearance::SavedAppearance {
+                    theme: theme.map(str::to_owned),
+                    profile: profile.map(str::to_owned),
+                },
+                &bcode_tui_theme::definition::ThemeCatalog::bundled().expect("bundled"),
+                bcode_tui_theme::definition::ResolvedThemeVariant::Dark,
+            );
+            assert_eq!(chat.app.tui_config().theme.name, shared.name, "{theme:?}");
+            assert_eq!(
+                chat.app.tui_config().theme.profile,
+                shared.profile,
+                "{profile:?}"
+            );
+        }
     }
 }

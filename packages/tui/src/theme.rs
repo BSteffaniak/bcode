@@ -478,13 +478,7 @@ pub fn resolve_configured_theme_with_definition(
     config: &bcode_config::TuiConfig,
     project_root: &std::path::Path,
 ) -> (PresentedTheme, Option<definition::ResolvedThemeDefinition>) {
-    let resolved = resolve_definition(
-        &config.theme.name,
-        &config.theme.effective_overlays(),
-        config.theme.variant,
-        project_root,
-        &config.theme.paths,
-    );
+    let resolved = resolve_definition(&theme_preferences(&config.theme), project_root);
     let accent = resolved_accent(resolved.as_ref());
     let presented = resolved_definition_theme(resolved.as_ref(), accent).presented(accent);
     (presented, resolved)
@@ -509,13 +503,7 @@ pub fn resolve_theme_with_structure(
         .map(std::path::Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let resolved = resolve_definition(
-        &app.tui_config().theme.name,
-        &app.tui_config().theme.effective_overlays(),
-        app.tui_config().theme.variant,
-        &project_root,
-        &app.tui_config().theme.paths,
-    );
+    let resolved = resolve_definition(&theme_preferences(&app.tui_config().theme), &project_root);
     let configured_theme_accent = resolved_accent(resolved.as_ref());
     let accent = resolve_app_accent(app, configured_theme_accent);
     let layers = structure_layers_for(resolved.as_ref());
@@ -553,24 +541,19 @@ pub(crate) fn resolve_app_accent(app: &BmuxApp, configured_theme_accent: Color) 
 }
 
 fn resolve_definition(
-    theme_name: &str,
-    overlays: &[String],
-    variant: TuiThemeVariant,
+    preferences: &bcode_tui_theme::appearance::ThemePreferences,
     project_root: &std::path::Path,
-    explicit_paths: &[std::path::PathBuf],
 ) -> Option<definition::ResolvedThemeDefinition> {
     let roots = discovery::default_theme_roots(
         &bcode_config::default_config_dir(),
         project_root,
-        explicit_paths,
+        &preferences.paths,
     );
-    let variant = resolve_variant(variant, terminal_capabilities());
-    let resolution = bcode_tui_theme::selection::resolve_discovered(
-        &roots,
-        &definition::ThemeSelection::new(theme_name)
-            .overlays(overlays.to_vec())
-            .variant(variant),
-    );
+    let variant = preferences
+        .variant
+        .resolve(terminal_capabilities().background);
+    let resolution =
+        bcode_tui_theme::selection::resolve_discovered(&roots, &preferences.selection(variant));
     for diagnostic in &resolution.diagnostics {
         tracing::warn!(
             path = %diagnostic.path.display(),
@@ -583,6 +566,31 @@ fn resolve_definition(
         "theme catalog discovered"
     );
     resolution.resolved.ok()
+}
+
+/// The shared theme selection for configured `[tui.theme]` settings.
+#[must_use]
+pub fn theme_preferences(
+    theme: &bcode_config::TuiThemeConfig,
+) -> bcode_tui_theme::appearance::ThemePreferences {
+    bcode_tui_theme::appearance::ThemePreferences {
+        name: theme.name.clone(),
+        profile: theme.profile.clone(),
+        overlays: theme.overlays.clone(),
+        variant: variant_preference(theme.variant),
+        paths: theme.paths.clone(),
+    }
+}
+
+const fn variant_preference(
+    variant: TuiThemeVariant,
+) -> bcode_tui_theme::appearance::VariantPreference {
+    use bcode_tui_theme::appearance::VariantPreference;
+    match variant {
+        TuiThemeVariant::Auto => VariantPreference::Auto,
+        TuiThemeVariant::Dark => VariantPreference::Dark,
+        TuiThemeVariant::Light => VariantPreference::Light,
+    }
 }
 
 /// Process-wide terminal color replies; a Bcode process drives one terminal.
@@ -620,7 +628,7 @@ pub fn terminal_color_depth(
 /// Resolve a configured light/dark variant, detecting the terminal for `auto`.
 #[must_use]
 pub fn resolve_variant_for_config(variant: TuiThemeVariant) -> definition::ResolvedThemeVariant {
-    resolve_variant(variant, terminal_capabilities())
+    variant_preference(variant).resolve(terminal_capabilities().background)
 }
 
 /// Environment capabilities, with the background replaced by the terminal's
@@ -632,25 +640,6 @@ fn terminal_capabilities() -> bmux_tui::capabilities::TerminalCapabilities {
         capabilities.background = reported;
     }
     capabilities
-}
-
-const fn resolve_variant(
-    variant: TuiThemeVariant,
-    capabilities: bmux_tui::capabilities::TerminalCapabilities,
-) -> definition::ResolvedThemeVariant {
-    match variant {
-        TuiThemeVariant::Dark => definition::ResolvedThemeVariant::Dark,
-        TuiThemeVariant::Light => definition::ResolvedThemeVariant::Light,
-        TuiThemeVariant::Auto => match capabilities.background {
-            bmux_tui::capabilities::TerminalBackground::Light => {
-                definition::ResolvedThemeVariant::Light
-            }
-            bmux_tui::capabilities::TerminalBackground::Dark
-            | bmux_tui::capabilities::TerminalBackground::Unknown => {
-                definition::ResolvedThemeVariant::Dark
-            }
-        },
-    }
 }
 
 pub(crate) fn resolved_accent(theme: Option<&definition::ResolvedThemeDefinition>) -> Color {
@@ -882,6 +871,13 @@ const fn transcript_recipe(
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+
+    fn resolve_variant(
+        variant: TuiThemeVariant,
+        capabilities: bmux_tui::capabilities::TerminalCapabilities,
+    ) -> definition::ResolvedThemeVariant {
+        variant_preference(variant).resolve(capabilities.background)
+    }
 
     #[test]
     fn presented_theme_has_one_canonical_component_conversion() {
