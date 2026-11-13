@@ -2,8 +2,9 @@
 //! processes so a review opens from disk and is confirmed afterwards.
 //!
 //! It is separate from the review store and disposable: never needed for correctness, bounded by
-//! age (each kind's entries are dropped [`CacheKind::kept_for`] after they were written), rebuilt
-//! from scratch when it is unreadable, and safe to delete at any time. Every failure is a miss
+//! age (each kind's entries are dropped [`CacheKind::kept_for`] after they were written) and by
+//! size (past [`CacheKind::max_entries`], the oldest are dropped), rebuilt from scratch when it is
+//! unreadable, and safe to delete at any time. Every failure is a miss
 //! (reads) or a skipped write; none reaches a caller.
 //!
 //! Entries are text under a kind and a key:
@@ -24,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use switchy::database::query::{FilterableQuery as _, where_eq, where_gte, where_in, where_lt};
+use switchy::database::query::{
+    FilterableQuery as _, SortDirection, count_all, select, where_eq, where_gte, where_in, where_lt,
+};
 use switchy::database::schema::{Column, DataType, create_table};
 use switchy::database::{Database, DatabaseError, DatabaseValue, Row};
 use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
@@ -65,6 +68,17 @@ impl CacheKind {
             Self::Index => "index",
             Self::Pull => "pull",
             Self::Stack => "stack",
+        }
+    }
+
+    /// Most entries kept; past it, the oldest are dropped down to nine tenths of it.
+    #[must_use]
+    pub const fn max_entries(self) -> usize {
+        match self {
+            Self::MergeBase => 200_000,
+            Self::Index => 4_000,
+            Self::Pull => 20_000,
+            Self::Stack => 1_000,
         }
     }
 
@@ -351,9 +365,11 @@ fn id(kind: CacheKind, key: &str) -> String {
 /// Writes held until a quiet moment, oldest first.
 type Held = std::collections::VecDeque<(CacheKind, String, String)>;
 
-/// Answer `incoming` until every sender is gone, then write what is held.
+/// Answer `incoming` until every sender is gone, then write what is held. Once every held write
+/// is written, the kinds written to are trimmed to their size.
 async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
     let mut held = Held::new();
+    let mut grown = std::collections::BTreeSet::new();
     loop {
         let request = if held.is_empty() {
             incoming
@@ -364,6 +380,7 @@ async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
         };
         match request {
             Ok(Request::Put { kind, entries }) => {
+                grown.insert(kind);
                 held.extend(entries.into_iter().map(|(key, value)| (kind, key, value)));
             }
             Ok(read) => answer(database, read, &held).await,
@@ -371,9 +388,17 @@ async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let chunk: Vec<_> = held.drain(..held.len().min(WRITE_CHUNK)).collect();
                 let _ = put(database, chunk).await;
+                if held.is_empty() {
+                    for kind in std::mem::take(&mut grown) {
+                        let _ = trim(database, kind, kind.max_entries()).await;
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = put(database, held.into_iter().collect()).await;
+                for kind in grown {
+                    let _ = trim(database, kind, kind.max_entries()).await;
+                }
                 return;
             }
         }
@@ -468,6 +493,35 @@ async fn put(
     transaction.commit().await
 }
 
+/// Drop the oldest entries of `kind` (by when they were written, then by key) down to nine
+/// tenths of `max` when it holds more than `max`.
+async fn trim(database: &dyn Database, kind: CacheKind, max: usize) -> Result<(), DatabaseError> {
+    let count = database
+        .select(TABLE)
+        .project_as(count_all(), "entries")
+        .filter(Box::new(where_eq("kind", kind.as_str())))
+        .execute_first(database)
+        .await?
+        .and_then(|row| row.get("entries")?.as_i64())
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    if count <= max {
+        return Ok(());
+    }
+    let oldest = select(TABLE)
+        .columns(&["id"])
+        .filter(Box::new(where_eq("kind", kind.as_str())))
+        .sort("written_ms", SortDirection::Asc)
+        .sort("key", SortDirection::Asc)
+        .limit(count - max + max / 10);
+    database
+        .delete(TABLE)
+        .filter(Box::new(where_in("id", oldest)))
+        .execute(database)
+        .await?;
+    Ok(())
+}
+
 fn entry_of(row: &Row) -> Option<(String, CacheEntry)> {
     let text = |column: &str| {
         row.get(column)
@@ -560,6 +614,32 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn past_its_size_a_kind_drops_its_oldest_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.db");
+        let max = CacheKind::Stack.max_entries();
+        let entries: Vec<(String, String)> = (0..=max + 50)
+            .map(|index| (format!("{index:06}"), "s".to_owned()))
+            .collect();
+        {
+            let cache = ReviewCache::open(&path);
+            // The first 100 are written first, so they are the oldest.
+            cache.put_many(CacheKind::Stack, &entries[..100]);
+            std::thread::sleep(WRITE_DELAY * 3);
+            cache.put_many(CacheKind::Stack, &entries[100..]);
+            // Another kind is not trimmed by this one's size.
+            cache.put_many(CacheKind::Pull, &[("p".into(), "p".into())]);
+        }
+        // Closing writes what is held and trims what grew.
+        let cache = ReviewCache::open(&path);
+        let kept = cache.get_prefixed(CacheKind::Stack, "");
+        assert_eq!(kept.len(), max * 9 / 10);
+        assert!(!kept.contains_key("000000") && !kept.contains_key("000099"));
+        assert!(kept.contains_key(&format!("{:06}", max + 50)));
+        assert_eq!(cache.get_prefixed(CacheKind::Pull, "").len(), 1);
     }
 
     #[test]

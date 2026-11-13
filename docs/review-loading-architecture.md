@@ -198,7 +198,9 @@ a comment belongs to) uses confirmed layers only.
 | stack snapshot of a review | review source | revalidated on open | review store (with the workspace) |
 
 The on-disk cache database is separate from the review store: disposable, bounded by age (merge
-bases kept 90 days, listings and pull requests 30, stacks 7, pruned when it opens), never needed
+bases kept 90 days, listings and pull requests 30, stacks 7, pruned when it opens) and by size
+(200,000 merge bases, 4,000 listings, 20,000 pull requests, 1,000 stacks; past a cap, the oldest
+go, trimmed once held writes are written), never needed
 for correctness, safe to delete. It goes through Switchy (Turso), like the review store, with one
 worker thread owning the connection; writes do not wait. It is `review-cache.db` in Bcode's state directory
 (`code-review/`), or the file `BCODE_CODE_REVIEW_CACHE` names (`off` disables it); an unreadable
