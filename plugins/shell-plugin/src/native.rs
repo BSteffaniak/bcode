@@ -1242,9 +1242,6 @@ fn direnv_file_for(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-#[cfg(any(windows, test))]
-#[path = "native/conpty_bootstrap.rs"]
-mod conpty_bootstrap;
 #[path = "native/direnv_probe.rs"]
 mod direnv_probe;
 #[path = "native/terminal_process.rs"]
@@ -4657,7 +4654,6 @@ mod tests {
             });
     }
 
-    #[cfg(unix)]
     struct TestResizeInputState {
         next: std::sync::atomic::AtomicUsize,
     }
@@ -4987,7 +4983,6 @@ mod tests {
         assert!(response.output.contains("\"exit_code\":1"));
     }
 
-    #[cfg(unix)]
     extern "C" fn test_typed_input_bridge(
         request_ptr: *const u8,
         request_len: usize,
@@ -5031,7 +5026,6 @@ mod tests {
         bcode_plugin_sdk::SERVICE_BRIDGE_STATUS_OK
     }
 
-    #[cfg(unix)]
     #[test]
     fn typed_input_reaches_the_running_command() {
         let environment = isolated_config_environment("typed-input");
@@ -5050,7 +5044,12 @@ mod tests {
             bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-typed-input",
             &ShellRunArguments {
-                command: "read line; echo \"got <$line>\"".to_owned(),
+                command: if cfg!(windows) {
+                    "powershell -NoLogo -NoProfile -Command $line = Read-Host; Write-Output got:$line"
+                        .to_owned()
+                } else {
+                    "read line; echo \"got:$line\"".to_owned()
+                },
                 cwd: None,
                 timeout_ms: Some(10_000),
                 columns: Some(80),
@@ -5070,7 +5069,7 @@ mod tests {
         let output: serde_json::Value =
             serde_json::from_str(&response.output).expect("terminal response JSON");
         assert!(
-            output["output"].as_str().unwrap().contains("got <hello>"),
+            output["output"].as_str().unwrap().contains("got:hello"),
             "{output}"
         );
     }

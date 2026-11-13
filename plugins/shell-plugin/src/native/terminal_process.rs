@@ -1,9 +1,8 @@
 //! The process a terminal-mode command runs as, behind one interface on every platform.
 //!
-//! [`spawn`] starts it on a pseudo-terminal and returns a [`TerminalChild`], which the
-//! invocation thread uses to wait for, resize and stop it, and the reader its terminal output
-//! is captured from on a thread of its own. Unix runs it through `bmux_pty`; Windows through
-//! `portable-pty`'s `ConPTY`.
+//! [`spawn`] starts it on a pseudo-terminal (a Windows pseudo-console) through `bmux_pty` and
+//! returns a [`TerminalChild`], which the invocation thread uses to wait for, resize, stop and
+//! type into it, and the reader its terminal output is captured from on a thread of its own.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -166,6 +165,12 @@ pub fn signal_name(signal: i32) -> String {
     }
 }
 
+/// How a signal is named where processes do not end by signal.
+#[cfg(not(unix))]
+pub fn signal_name(signal: i32) -> String {
+    format!("Signal {signal}")
+}
+
 /// Start `spec` on a new pseudo-terminal. Its output reader stops with an error when `budget`
 /// runs out (or is cancelled) before all output arrived, even while descendants keep the
 /// terminal open.
@@ -176,7 +181,6 @@ pub fn spawn(spec: &TerminalSpawn<'_>, budget: ShellExecutionBudget) -> Result<S
     platform::spawn(spec, budget)
 }
 
-#[cfg(unix)]
 mod platform {
     use std::io::{self, Read};
     use std::time::{Duration, Instant};
@@ -265,10 +269,13 @@ mod platform {
         spec: &TerminalSpawn<'_>,
         budget: ShellExecutionBudget,
     ) -> Result<super::Spawned, String> {
-        let cwd = super::working_directory(spec.cwd)?;
-        let mut command = PtyCommand::new(spec.program)
-            .args(spec.args)
-            .current_dir(cwd)
+        let mut command = PtyCommand::new(spec.program).args(spec.args);
+        // Without a directory, Unix commands run in the home directory and Windows ones in
+        // this process's own.
+        if cfg!(unix) || spec.cwd.is_some() {
+            command = command.current_dir(super::working_directory(spec.cwd)?);
+        }
+        let mut command = command
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             // Output from descendants keeping the terminal open is awaited until the budget
@@ -279,6 +286,7 @@ mod platform {
                     .saturating_duration_since(Instant::now())
                     .saturating_add(Duration::from_secs(1)),
             );
+        #[cfg(unix)]
         if std::env::var_os("SHELL").is_none()
             && let Some(entry) = super::login_entry()
         {
@@ -300,108 +308,5 @@ mod platform {
             offset: 0,
         };
         Ok((Box::new(child), Box::new(output)))
-    }
-}
-
-#[cfg(windows)]
-mod platform {
-    use std::io::{self, Read};
-
-    use super::{ShellExecutionBudget, TerminalChild, TerminalExit, TerminalSpawn};
-
-    struct ConptyChild {
-        child: Box<dyn portable_pty::Child + Send + Sync>,
-        master: Box<dyn portable_pty::MasterPty + Send>,
-    }
-
-    impl TerminalChild for ConptyChild {
-        fn try_wait(&mut self) -> io::Result<Option<TerminalExit>> {
-            Ok(self.child.try_wait()?.map(|status| TerminalExit {
-                code: status.exit_code(),
-                signal: status.signal().map(ToOwned::to_owned),
-            }))
-        }
-
-        fn terminate(&mut self) -> io::Result<()> {
-            self.child.kill()
-        }
-
-        fn size(&self) -> io::Result<(u16, u16)> {
-            let size = self
-                .master
-                .get_size()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            Ok((size.cols, size.rows))
-        }
-
-        fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
-            self.master
-                .resize(portable_pty::PtySize {
-                    rows,
-                    cols: columns,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|error| io::Error::other(error.to_string()))
-        }
-
-        // ConPTY's input is held by its opening cursor-query reply.
-        fn write_input(&self, _bytes: &[u8]) -> io::Result<()> {
-            Err(io::Error::from(io::ErrorKind::Unsupported))
-        }
-    }
-
-    pub fn spawn(
-        spec: &TerminalSpawn<'_>,
-        _budget: ShellExecutionBudget,
-    ) -> Result<super::Spawned, String> {
-        // Without a directory, ConPTY runs in this process's own.
-        let cwd = spec
-            .cwd
-            .map(|cwd| super::working_directory(Some(cwd)))
-            .transpose()?;
-        let pair = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize {
-                rows: spec.rows,
-                cols: spec.columns,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| error.to_string())?;
-        let mut command = portable_pty::CommandBuilder::new(spec.program);
-        for arg in spec.args {
-            command.arg(arg);
-        }
-        if let Some(cwd) = cwd {
-            command.cwd(cwd);
-        }
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        for name in &spec.remove_env {
-            command.env_remove(name);
-        }
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| error.to_string())?;
-        drop(pair.slave);
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| error.to_string())?;
-        // ConPTY waits for an answer to its opening cursor query before starting the program.
-        let reader = super::super::conpty_bootstrap::CursorQueryResponder::new(
-            reader,
-            pair.master
-                .take_writer()
-                .map_err(|error| error.to_string())?,
-        );
-        Ok((
-            Box::new(ConptyChild {
-                child,
-                master: pair.master,
-            }),
-            Box::new(reader),
-        ))
     }
 }

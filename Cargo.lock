@@ -588,7 +588,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -599,7 +599,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3664,7 +3664,6 @@ dependencies = [
  "dunce",
  "hex",
  "libc",
- "portable-pty",
  "ruff_formatter",
  "ruff_python_formatter",
  "serde",
@@ -4464,7 +4463,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -4474,7 +4473,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "lz4_flex 0.14.0",
  "serde",
@@ -4484,7 +4483,7 @@ dependencies = [
 [[package]]
 name = "bmux_color"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "serde",
 ]
@@ -4492,7 +4491,7 @@ dependencies = [
 [[package]]
 name = "bmux_config_composition"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "libc",
  "serde",
@@ -4502,7 +4501,7 @@ dependencies = [
 [[package]]
 name = "bmux_fonts"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -4511,7 +4510,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -4526,7 +4525,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -4541,7 +4540,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "crossterm",
  "serde",
@@ -4550,7 +4549,7 @@ dependencies = [
 [[package]]
 name = "bmux_markdown"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
@@ -4568,7 +4567,7 @@ dependencies = [
 [[package]]
 name = "bmux_mermaid_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_fonts",
  "cranelift-codegen",
@@ -4580,7 +4579,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "serde",
  "serde_json",
@@ -4589,7 +4588,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4617,7 +4616,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "serde",
  "serde_json",
@@ -4629,7 +4628,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "serde",
  "sha2 0.11.1",
@@ -4639,7 +4638,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4658,15 +4657,16 @@ dependencies = [
 [[package]]
 name = "bmux_pty"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "bmux_syntax_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_tui",
  "syntect",
@@ -4676,7 +4676,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_terminal_protocol",
  "serde",
@@ -4688,7 +4688,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "serde",
 ]
@@ -4696,7 +4696,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_keyboard",
  "serde",
@@ -4709,7 +4709,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_color",
  "bmux_keyboard",
@@ -4730,7 +4730,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_color",
  "bmux_keyboard",
@@ -4747,7 +4747,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_image",
  "bmux_keyboard",
@@ -4761,7 +4761,7 @@ dependencies = [
 [[package]]
 name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#4e4b17cd4f9405986268de0eb336e97319932a66"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#5b8528206ab8dd65fbff208fe9441eab8c233530"
 dependencies = [
  "bmux_codec",
  "bmux_keyboard",
@@ -5304,12 +5304,6 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cfg_aliases"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
-
-[[package]]
-name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
@@ -5539,7 +5533,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6134,7 +6128,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
 dependencies = [
  "dispatch2",
- "nix 0.31.3",
+ "nix",
  "windows-sys 0.61.2",
 ]
 
@@ -6458,7 +6452,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6752,7 +6746,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6881,17 +6875,6 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
-
-[[package]]
-name = "filedescriptor"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
-dependencies = [
- "libc",
- "thiserror 1.0.69",
- "winapi",
-]
 
 [[package]]
 name = "filetime"
@@ -10284,25 +10267,13 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nix"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
-dependencies = [
- "bitflags 2.13.2",
- "cfg-if",
- "cfg_aliases 0.1.1",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
- "cfg_aliases 0.2.2",
+ "cfg_aliases",
  "libc",
 ]
 
@@ -10388,7 +10359,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10999,7 +10970,7 @@ checksum = "9cf20a545b305cf1da722b236b5155c9bb35f1d5ceb28c048bd96ca842f41b5b"
 dependencies = [
  "android_system_properties",
  "log 0.4.34",
- "nix 0.31.3",
+ "nix",
  "objc2",
  "objc2-foundation",
  "objc2-ui-kit",
@@ -11518,27 +11489,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "portable-pty"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e"
-dependencies = [
- "anyhow",
- "bitflags 1.3.2",
- "downcast-rs 1.2.1",
- "filedescriptor",
- "lazy_static",
- "libc",
- "log 0.4.34",
- "nix 0.28.0",
- "serial2",
- "shared_library",
- "shell-words",
- "winapi",
- "winreg",
-]
-
-[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11852,13 +11802,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
 dependencies = [
  "bytes 1.12.1",
- "cfg_aliases 0.2.2",
+ "cfg_aliases",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.45",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -11893,12 +11843,12 @@ version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
- "cfg_aliases 0.2.2",
+ "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12936,7 +12886,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12949,7 +12899,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13370,17 +13320,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serial2"
-version = "0.2.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b16809bc35793b19ce4e0c53924bc0dce3937f15487997cfdaed936004180730"
-dependencies = [
- "cfg-if",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13459,16 +13398,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "shared_library"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11"
-dependencies = [
- "lazy_static",
- "libc",
 ]
 
 [[package]]
@@ -13741,7 +13670,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -13880,7 +13809,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -15281,7 +15210,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -16029,7 +15958,7 @@ dependencies = [
  "branches",
  "bumpalo",
  "bytemuck",
- "cfg_aliases 0.2.2",
+ "cfg_aliases",
  "cfg_block",
  "chrono",
  "crc32c",
@@ -17090,7 +17019,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -17399,15 +17328,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "winreg"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
-dependencies = [
- "winapi",
 ]
 
 [[package]]
