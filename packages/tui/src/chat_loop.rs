@@ -438,6 +438,14 @@ pub struct ChatLoopState {
     viewport_input_connection:
         std::sync::Arc<tokio::sync::Mutex<Option<bcode_client::ClientConnection>>>,
     viewport_input_retry_at: Instant,
+    /// Input typed into running invocations, sent in order on a connection of its own.
+    typed_input: Option<
+        tokio::sync::mpsc::UnboundedSender<(
+            bcode_session_models::SessionId,
+            bcode_tool::ToolInvocationInput,
+        )>,
+    >,
+    typed_input_task: Option<tokio::task::JoinHandle<()>>,
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
     thinking_dialog: Option<super::thinking_dialog::ThinkingDialogState>,
@@ -483,6 +491,9 @@ pub struct ChatLoopState {
 impl Drop for ChatLoopState {
     fn drop(&mut self) {
         if let Some(task) = self.viewport_input_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.typed_input_task.take() {
             task.abort();
         }
     }
@@ -539,6 +550,8 @@ impl ChatLoopState {
             viewport_input_task: None,
             viewport_input_connection: std::sync::Arc::default(),
             viewport_input_retry_at: Instant::now(),
+            typed_input: None,
+            typed_input_task: None,
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             thinking_dialog: None,
@@ -2234,9 +2247,59 @@ impl ChatLoopState {
         }
         self.viewport_input_connection = std::sync::Arc::default();
         self.viewport_input_retry_at = Instant::now();
+        self.typed_input = None;
+        if let Some(task) = self.typed_input_task.take() {
+            task.abort();
+        }
         self.request_draft_handoff.clear();
         if let Some(stream) = &mut self.artifact_stream {
             stream.retain_session(session_id);
+        }
+    }
+
+    /// Send input typed into a running invocation of `session_id`. Inputs go out in the order
+    /// they were typed, on one connection.
+    pub(super) fn send_typed_input(
+        &mut self,
+        session_id: bcode_session_models::SessionId,
+        input: bcode_tool::ToolInvocationInput,
+    ) {
+        if self
+            .typed_input
+            .as_ref()
+            .is_none_or(tokio::sync::mpsc::UnboundedSender::is_closed)
+        {
+            let Some(client) = self.foreground_client.clone() else {
+                return;
+            };
+            let (sender, mut queued) = tokio::sync::mpsc::unbounded_channel::<(
+                bcode_session_models::SessionId,
+                bcode_tool::ToolInvocationInput,
+            )>();
+            self.typed_input_task = Some(tokio::spawn(async move {
+                let mut connection = None;
+                while let Some((session_id, input)) = queued.recv().await {
+                    if connection.is_none() {
+                        match client.connect("bcode-typed-input").await {
+                            Ok(connected) => connection = Some(connected),
+                            Err(error) => {
+                                tracing::debug!(%error, "typed input dropped: no connection");
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(connected) = connection.as_mut()
+                        && let Err(error) = connected.send_invocation_input(session_id, input).await
+                    {
+                        tracing::debug!(%error, "typed input dropped");
+                        connection = None;
+                    }
+                }
+            }));
+            self.typed_input = Some(sender);
+        }
+        if let Some(sender) = &self.typed_input {
+            let _ = sender.send((session_id, input));
         }
     }
 

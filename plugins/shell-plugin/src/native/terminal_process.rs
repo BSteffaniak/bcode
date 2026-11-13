@@ -51,6 +51,13 @@ pub trait TerminalChild: Send {
     /// # Errors
     /// * [`io::Error`] when the terminal rejects the size.
     fn resize(&self, columns: u16, rows: u16) -> io::Result<()>;
+
+    /// Write `bytes` to the terminal, as typing would.
+    ///
+    /// # Errors
+    /// * [`io::ErrorKind::Unsupported`] where typing into a running command is not supported.
+    /// * [`io::Error`] when the terminal can no longer be written.
+    fn write_input(&self, bytes: &[u8]) -> io::Result<()>;
 }
 
 /// A started process: its control, and the reader its terminal output arrives on.
@@ -202,6 +209,10 @@ mod platform {
         fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
             self.control.resize(PtySize::new(columns, rows))
         }
+
+        fn write_input(&self, bytes: &[u8]) -> io::Result<()> {
+            self.control.writer()?.write(bytes)
+        }
     }
 
     fn exit(status: PtyExit) -> TerminalExit {
@@ -332,6 +343,11 @@ mod platform {
                     pixel_height: 0,
                 })
                 .map_err(|error| io::Error::other(error.to_string()))
+        }
+
+        // ConPTY's input is held by its opening cursor-query reply.
+        fn write_input(&self, _bytes: &[u8]) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
         }
     }
 

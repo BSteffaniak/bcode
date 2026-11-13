@@ -17,6 +17,8 @@ pub(super) fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiReg
         ("left", "left"),
         ("right", "right"),
         ("home", "home"),
+        ("input", "i"),
+        ("input-exit", "ctrl+]"),
     ] {
         registry.register_keymap_action(bcode_plugin_sdk::tui::keymap::KeymapAction {
             id: format!("shell.terminal.{action}"),
@@ -49,6 +51,9 @@ use std::sync::Mutex;
 
 thread_local! {
     static ACTIVE_KEY_HINTS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+
+    /// Keys that stop typing into a command, as currently bound.
+    static ACTIVE_INPUT_EXIT_KEYS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 
     static ACTIVE_THEME: std::cell::Cell<Option<bcode_plugin_sdk::tui::PluginTuiTheme>> = const {
         std::cell::Cell::new(None)
@@ -106,6 +111,11 @@ impl LiveTerminalReplay {
         self.view = ShellTerminalView::default();
     }
 
+    /// Whether the command still runs.
+    const fn running(&self) -> bool {
+        self.exit_code.is_none() && self.signal.is_none() && !self.timed_out && !self.cancelled
+    }
+
     /// Whether a full-screen program owns the terminal.
     fn alternate(&self) -> bool {
         self.terminal
@@ -131,6 +141,10 @@ pub struct ShellRunTuiVisualAdapter {
     live_replays: Mutex<BTreeMap<String, LiveTerminalReplay>>,
     artifact_replays: Mutex<BTreeMap<String, LiveArtifactReplay>>,
     diagnostics: Mutex<ShellTuiDiagnostics>,
+    /// Running commands being typed into, by invocation.
+    typing: Mutex<std::collections::BTreeSet<String>>,
+    /// Typed inputs sent so far, for unique input ids.
+    typed: std::sync::atomic::AtomicU64,
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter {
@@ -493,6 +507,19 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         let Some(replay) = replays.get_mut(key) else {
             return false;
         };
+        if let bmux_tui::event::Event::Key(stroke) = event {
+            match host.keymap_action("shell.terminal", *stroke).as_deref() {
+                Some("shell.terminal.input") if replay.running() => {
+                    drop(replays);
+                    return self.set_typing(key, true);
+                }
+                Some("shell.terminal.input-exit") => {
+                    drop(replays);
+                    return self.set_typing(key, false);
+                }
+                _ => {}
+            }
+        }
         if !replay.alternate() {
             return false;
         }
@@ -540,9 +567,69 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         true
     }
 
+    fn content_invocation_input(
+        &self,
+        identity: &str,
+        event: &bmux_tui::event::Event,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        let (key, _, _) = shell_content_identity(identity)?;
+        if !self.typing.lock().ok()?.contains(key) {
+            return None;
+        }
+        let replays = self.live_replays.lock().ok()?;
+        let replay = replays.get(key)?;
+        if !replay.running() {
+            drop(replays);
+            self.set_typing(key, false);
+            return None;
+        }
+        let protocol = replay
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.grid().protocol_state())
+            .unwrap_or_default();
+        drop(replays);
+        let text = match event {
+            bmux_tui::event::Event::Key(stroke) => {
+                // Leaving input mode is for the presentation, not the command.
+                if host.keymap_action("shell.terminal", *stroke).as_deref()
+                    == Some("shell.terminal.input-exit")
+                {
+                    return None;
+                }
+                let bytes = bmux_keyboard::encode::encode_key_with_modes(
+                    stroke,
+                    false,
+                    bmux_keyboard::encode::KeyEncodingModes {
+                        application_cursor: protocol.application_cursor,
+                        application_keypad: protocol.application_keypad,
+                    },
+                )?;
+                String::from_utf8(bytes).ok()?
+            }
+            bmux_tui::event::Event::Paste(text) if protocol.bracketed_paste => {
+                format!("\x1b[200~{text}\x1b[201~")
+            }
+            bmux_tui::event::Event::Paste(text) => text.clone(),
+            _ => return None,
+        };
+        let sequence = self
+            .typed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(bcode_tool::ToolInvocationInput {
+            invocation_id: key.to_owned(),
+            input_id: format!("{key}-typed-{sequence}"),
+            producer_id: "bcode.shell".to_owned(),
+            schema: crate::contracts::SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
+            schema_version: crate::contracts::SHELL_SCHEMA_VERSION,
+            payload: serde_json::json!({"type": "input", "text": text}),
+        })
+    }
+
     fn anchors(
         &self,
-        _kind: &str,
+        kind: &str,
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
         rows: &[Line],
@@ -586,7 +673,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                     || replay.signal.is_some()
                     || replay.exit_code.is_some(),
             );
-            let body_start = row + status;
+            // Live command rows show whether keys go to the command.
+            let typing = if kind == "bcode.tool.request.shell.run" {
+                self.typing_rows(key).len()
+            } else {
+                0
+            };
+            let body_start = row + status + typing;
             return replay
                 .view
                 .sources
@@ -638,6 +731,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             ("page-up", "page up"),
             ("page-down", "page down"),
             ("home", "reset columns"),
+            ("input", "type into the command"),
         ]
         .into_iter()
         .filter_map(|(action, label)| {
@@ -648,9 +742,14 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         })
         .collect::<Vec<_>>()
         .join(" · ");
+        let exit = host
+            .keymap_keys("shell.terminal", "shell.terminal.input-exit")
+            .join("/");
         let prior = ACTIVE_KEY_HINTS.with(|hints| hints.replace(hint));
+        let prior_exit = ACTIVE_INPUT_EXIT_KEYS.with(|keys| keys.replace(exit));
         let projection = self.projection(kind, payload, context);
         ACTIVE_KEY_HINTS.with(|hints| hints.replace(prior));
+        ACTIVE_INPUT_EXIT_KEYS.with(|keys| keys.replace(prior_exit));
         projection
     }
 
@@ -802,6 +901,34 @@ impl ShellRunTuiVisualAdapter {
 }
 
 impl ShellRunTuiVisualAdapter {
+    /// Start or stop typing into the command of invocation `key`; whether that changed.
+    fn set_typing(&self, key: &str, typing: bool) -> bool {
+        self.typing.lock().is_ok_and(|mut keys| {
+            if typing {
+                keys.insert(key.to_owned())
+            } else {
+                keys.remove(key)
+            }
+        })
+    }
+
+    /// A row saying keys go to the command of invocation `key`, while they do.
+    fn typing_rows(&self, key: &str) -> Vec<Line> {
+        if !self.typing.lock().is_ok_and(|keys| keys.contains(key)) {
+            return Vec::new();
+        }
+        let exit = ACTIVE_INPUT_EXIT_KEYS.with(|keys| keys.borrow().clone());
+        let text = if exit.is_empty() {
+            "typing into the command".to_owned()
+        } else {
+            format!("typing into the command · {exit}: stop")
+        };
+        vec![Line::from_spans(vec![
+            Span::styled("  ", muted_style()),
+            Span::styled(text, muted_style()),
+        ])]
+    }
+
     fn live_grid_rows(
         &self,
         key: &str,
@@ -1044,6 +1171,7 @@ impl ShellRunTuiVisualAdapter {
         }
         let mut lines = prompt.to_vec();
         lines.extend(self.live_replay_status_rows(key, runtime));
+        lines.extend(self.typing_rows(key));
         let retained_rows = self.live_grid_rows(key, input, width, lines.len(), projection);
         let used_retained_grid = retained_rows.is_some();
         let terminal_rows = retained_rows.unwrap_or_else(|| terminal_viewer_rows(input, width));
@@ -3297,6 +3425,89 @@ mod tests {
             registry.register(action.clone()).unwrap();
         }
         registry
+    }
+
+    #[test]
+    fn keys_go_to_a_running_command_only_while_typing_into_it() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "typing";
+        adapter.update_live_replay(key, b"name? ", None, 40, 5);
+        let identity = format!("terminal:{}:{}:1:0", key.len(), key);
+        let host = ShellKeymapHost(shell_test_keymap());
+        let key_event =
+            |key| bmux_tui::event::Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+        let typed = |event: &bmux_tui::event::Event| {
+            adapter
+                .content_invocation_input(&identity, event, &host)
+                .map(|input| {
+                    assert_eq!(input.invocation_id, key);
+                    assert_eq!(
+                        input.schema,
+                        crate::contracts::SHELL_INVOCATION_INPUT_SCHEMA
+                    );
+                    assert_eq!(input.payload["type"], "input");
+                    input.payload["text"].as_str().unwrap().to_owned()
+                })
+        };
+        // Not typing yet: keys are the transcript's.
+        assert_eq!(typed(&key_event("a")), None);
+        assert!(adapter.content_event_with_host(&identity, &key_event("i"), &host));
+        // Now every key is the command's, escape included.
+        assert_eq!(typed(&key_event("a")).as_deref(), Some("a"));
+        assert_eq!(typed(&key_event("enter")).as_deref(), Some("\r"));
+        assert_eq!(typed(&key_event("escape")).as_deref(), Some("\x1b"));
+        assert_eq!(typed(&key_event("up")).as_deref(), Some("\x1b[A"));
+        assert_eq!(
+            typed(&bmux_tui::event::Event::Paste("two words".into())).as_deref(),
+            Some("two words")
+        );
+        // Programs that ask for application cursor keys and bracketed paste get them.
+        adapter.update_live_replay(key, b"name? \x1b[?1h\x1b[?2004h", None, 40, 5);
+        assert_eq!(typed(&key_event("up")).as_deref(), Some("\x1bOA"));
+        assert_eq!(
+            typed(&bmux_tui::event::Event::Paste("x".into())).as_deref(),
+            Some("\x1b[200~x\x1b[201~")
+        );
+        // Each input is distinct.
+        let first = adapter
+            .content_invocation_input(&identity, &key_event("b"), &host)
+            .unwrap();
+        let second = adapter
+            .content_invocation_input(&identity, &key_event("b"), &host)
+            .unwrap();
+        assert_ne!(first.input_id, second.input_id);
+        // The stop key never reaches the command, and stops typing.
+        assert_eq!(typed(&key_event("ctrl+]")), None);
+        assert!(adapter.content_event_with_host(&identity, &key_event("ctrl+]"), &host));
+        assert_eq!(typed(&key_event("a")), None);
+    }
+
+    #[test]
+    fn a_finished_command_takes_no_typing() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let key = "finished-typing";
+        adapter.update_live_replay(key, b"done\r\n", None, 40, 5);
+        let identity = format!("terminal:{}:{}:1:0", key.len(), key);
+        let host = ShellKeymapHost(shell_test_keymap());
+        let key_event =
+            |key| bmux_tui::event::Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap());
+        assert!(adapter.content_event_with_host(&identity, &key_event("i"), &host));
+        adapter
+            .live_replays
+            .lock()
+            .unwrap()
+            .get_mut(key)
+            .unwrap()
+            .exit_code = Some(0);
+        // Typing ends with the command.
+        assert!(
+            adapter
+                .content_invocation_input(&identity, &key_event("a"), &host)
+                .is_none()
+        );
+        assert!(!adapter.content_event_with_host(&identity, &key_event("i"), &host));
     }
 
     #[test]

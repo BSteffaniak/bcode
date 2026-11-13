@@ -258,8 +258,18 @@ pub enum ShellRunResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShellInvocationAction {
-    Resize { columns: u16, rows: u16 },
+    Resize {
+        columns: u16,
+        rows: u16,
+    },
+    /// Text typed into the command's terminal, as a keyboard sends it.
+    Input {
+        text: String,
+    },
 }
+
+/// Most bytes of typed input one action carries.
+pub const MAX_SHELL_INPUT_BYTES: usize = 64 * 1024;
 
 /// Payload accompanying an incrementally committed shell recording artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

@@ -2068,6 +2068,18 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         false
     }
 
+    /// Turn an event for focused content into execution input for the invocation that content
+    /// shows, such as keys typed into a running command. `None` leaves the event to
+    /// [`Self::content_event_with_host`]. The host authorizes and dispatches the input, in order.
+    fn content_invocation_input(
+        &self,
+        _identity: &str,
+        _event: &Event,
+        _host: &dyn PluginTuiHost,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        None
+    }
+
     /// Handle presentation navigation with current effective host bindings.
     /// Existing adapters retain their original handler by default.
     fn content_event_with_host(
@@ -4117,6 +4129,19 @@ impl PluginTuiRegistry {
         self.visual_adapters
             .values()
             .any(|adapter| adapter.content_event_with_host(identity, event, host))
+    }
+
+    /// Execution input the owning visual adapter makes of an event for focused content.
+    #[must_use]
+    pub fn visual_content_invocation_input(
+        &self,
+        identity: &str,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        self.visual_adapters
+            .values()
+            .find_map(|adapter| adapter.content_invocation_input(identity, event, host))
     }
 
     /// Route local visual navigation without invoking tools or services.

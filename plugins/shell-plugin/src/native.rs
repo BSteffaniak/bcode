@@ -1550,6 +1550,14 @@ impl ShellInvocationActionReader {
                     applied.clear();
                     applied.push(ShellAppliedResize { columns, rows });
                 }
+                ShellInvocationAction::Input { text } => {
+                    if text.len() > crate::contracts::MAX_SHELL_INPUT_BYTES {
+                        return Err("typed shell input is too large".to_owned());
+                    }
+                    // A command that already ended, or a platform without typing support,
+                    // drops the input rather than failing the invocation.
+                    let _ = terminal.write_input(text.as_bytes());
+                }
             }
         }
         Ok(())
@@ -4980,6 +4988,94 @@ mod tests {
     }
 
     #[cfg(unix)]
+    extern "C" fn test_typed_input_bridge(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut c_void,
+    ) -> i32 {
+        // SAFETY: the test keeps this state alive through the terminal invocation.
+        let state = unsafe { &*user_data.cast::<TestResizeInputState>() };
+        // SAFETY: the SDK supplies this callback with a valid request buffer.
+        let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request: ServiceBridgeRequest =
+            serde_json::from_slice(request).expect("input bridge request");
+        let ServiceBridgeRequest::ReceiveInput { invocation_id, .. } = request else {
+            panic!("expected input request");
+        };
+        let index = state.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Typed once the command has had time to start reading.
+        let response = if index == 20 {
+            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Received {
+                input: bcode_tool::ToolInvocationInput {
+                    invocation_id,
+                    input_id: "typed-0".to_owned(),
+                    producer_id: "bcode.shell".to_string(),
+                    schema: SHELL_INVOCATION_INPUT_SCHEMA.to_owned(),
+                    schema_version: SHELL_SCHEMA_VERSION,
+                    payload: json!({"type": "input", "text": "hello\r"}),
+                },
+            })
+        } else {
+            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::TimedOut)
+        };
+        let encoded = serde_json::to_vec(&response).expect("input bridge response");
+        assert!(encoded.len() <= output_capacity);
+        // SAFETY: the SDK supplies a response buffer with `output_capacity` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
+        }
+        bcode_plugin_sdk::SERVICE_BRIDGE_STATUS_OK
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_input_reaches_the_running_command() {
+        let environment = isolated_config_environment("typed-input");
+        let artifact_dir = tempfile::tempdir().expect("artifact dir");
+        let input_state = TestResizeInputState {
+            next: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let bridge = ServiceBridge::new(
+            Some(test_typed_input_bridge),
+            std::ptr::from_ref(&input_state).cast_mut().cast(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "test-typed-input",
+            &ShellRunArguments {
+                command: "read line; echo \"got <$line>\"".to_owned(),
+                cwd: None,
+                timeout_ms: Some(10_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: Some(artifact_dir.path()),
+                input_bridge: Some(&bridge),
+                primary_presentation: None,
+            },
+            &environment,
+        );
+        assert!(!response.is_error, "{}", response.output);
+        let output: serde_json::Value =
+            serde_json::from_str(&response.output).expect("terminal response JSON");
+        assert!(
+            output["output"].as_str().unwrap().contains("got <hello>"),
+            "{output}"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn active_terminal_control_resize_reaches_pty_and_recording() {
         let environment = isolated_config_environment("active-resize-recording");
@@ -6060,6 +6156,10 @@ mod tests {
         }
 
         fn resize(&self, _columns: u16, _rows: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn write_input(&self, _bytes: &[u8]) -> std::io::Result<()> {
             Ok(())
         }
     }

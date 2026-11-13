@@ -651,6 +651,22 @@ impl PluginTuiPresentation {
         changed
     }
 
+    /// Execution input for the invocation a focused visual shows, made of `event`, such as keys
+    /// typed into a running command.
+    pub fn content_invocation_input(
+        &self,
+        identity: &str,
+        event: &bmux_tui::event::Event,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> Option<bcode_tool::ToolInvocationInput> {
+        let (plugin, identity) = identity.split_once(':')?;
+        let input = self
+            .registry(plugin)?
+            .visual_content_invocation_input(identity, event, host)?;
+        self.full_generation.fetch_add(1, Ordering::Relaxed);
+        Some(input)
+    }
+
     /// Route a focused visual through the current effective frontend keymap.
     pub fn content_event_with_host(
         &self,

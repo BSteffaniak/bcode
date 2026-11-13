@@ -776,6 +776,30 @@ impl BcodeRuntimeModel {
             .retain_task(task.abort_handle(), client);
     }
 
+    /// Send `event` to the invocation the focused visual shows when that visual takes typed
+    /// input (for example a running command being typed into); `None` when it does not.
+    fn type_into_focused_visual(
+        &mut self,
+        event: &Event,
+    ) -> Option<super::invalidation::UiInvalidation> {
+        let identity = self.focused_visual.clone()?;
+        let session_id = self.chat.attached_session_id()?;
+        let client = self.loop_state.foreground_client()?;
+        let host = super::plugin_surface_host::root_host(
+            bmux_tui_runtime::InvalidationSignal::new(),
+            client,
+            self.fresh_session_settings(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let input = self
+            .chat
+            .app
+            .plugin_presentation()?
+            .content_invocation_input(&identity, event, &host)?;
+        self.loop_state.send_typed_input(session_id, input);
+        Some(super::invalidation::UiInvalidation::Structural)
+    }
+
     fn fresh_session_settings(&self) -> super::plugin_surface_host::FreshSessionSettings {
         super::plugin_surface_host::FreshSessionSettings {
             keymap: self.settings.keymap().shared_registry(),
@@ -1722,6 +1746,9 @@ impl BcodeRuntimeModel {
                 if self.loop_state.modal_foreground() {
                     return super::invalidation::UiInvalidation::None;
                 }
+                if let Some(damage) = self.type_into_focused_visual(&Event::Paste(text.clone())) {
+                    return damage;
+                }
                 self.chat.app.reset_input_history_navigation();
                 self.chat.app.paste_composer_text(&text);
                 self.chat.app.wake_cursor();
@@ -1815,6 +1842,11 @@ impl BcodeRuntimeModel {
                         _ => return super::invalidation::UiInvalidation::None,
                     }
                     return super::invalidation::UiInvalidation::Structural;
+                }
+                if !self.loop_state.modal_foreground()
+                    && let Some(damage) = self.type_into_focused_visual(&Event::Key(stroke))
+                {
+                    return damage;
                 }
                 if !self.loop_state.modal_foreground()
                     && let Some(identity) = &self.focused_visual
