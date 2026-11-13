@@ -597,10 +597,17 @@ fn wake(target: WakeTarget, pending: Arc<AtomicBool>) -> Arc<dyn Fn() + Send + S
     })
 }
 
+/// Environment variable through which a session-resurrection host advertises itself.
+const RESURRECTION_HOST_ADVERTISEMENT: &str = "APPLICATION_RESURRECTION_HOST";
+
 /// Run `command` attached to the terminal.
 fn run_external(command: &ExternalCommand) -> Result<(), String> {
+    // A session-resurrection host admits only the command the shell started, and that
+    // command is this review. A launched child cannot claim it and would fail its
+    // handshake, so it runs without the host advertisement.
     let status = std::process::Command::new(&command.program)
         .args(&command.args)
+        .env_remove(RESURRECTION_HOST_ADVERTISEMENT)
         .status()
         .map_err(|error| format!("{}: {error}", command.program))?;
     if status.success() {

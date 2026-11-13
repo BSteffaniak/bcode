@@ -6,6 +6,16 @@
 use bcode_config::{SessionResurrectionConfig, SessionResurrectionMode};
 use bcode_session_models::SessionId;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+type Selected = tokio::sync::watch::Sender<Option<SessionId>>;
+
+/// The host binds a command invocation to the first process that claims it and releases
+/// the claim only at the next command boundary. Every chat screen in this process
+/// therefore shares one connection; a second handshake would be rejected as foreign.
+#[cfg(unix)]
+static RETAINED: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<Selected>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 #[cfg(unix)]
 mod wire;
@@ -44,12 +54,20 @@ fn endpoint(
 
 /// A bounded latest-selection mailbox; socket I/O runs outside the frame loop.
 pub struct Publisher {
-    sender: tokio::sync::watch::Sender<Option<SessionId>>,
+    sender: Arc<Selected>,
     last: Option<SessionId>,
     published: bool,
 }
 
 impl Publisher {
+    const fn new(sender: Arc<Selected>) -> Self {
+        Self {
+            sender,
+            last: None,
+            published: false,
+        }
+    }
+
     pub fn observe(&mut self, attachment: super::session_flow::ChatSessionAttachment) {
         use super::session_flow::ChatSessionAttachment;
         let selected = match attachment {
@@ -84,7 +102,8 @@ pub async fn connect(
     };
     #[cfg(unix)]
     {
-        connect_endpoint(
+        connect_retained(
+            &RETAINED,
             path,
             explicit_session,
             bcode_config::default_session_store_dir(),
@@ -100,6 +119,33 @@ pub async fn connect(
             "local resurrection transport is unavailable on this platform",
         ))
     }
+}
+
+/// Reuse this process's established host connection, or establish it once.
+/// A reused connection never offers restoration: that applies only to the launch.
+#[cfg(unix)]
+async fn connect_retained(
+    retained: &tokio::sync::Mutex<Option<Arc<Selected>>>,
+    path: PathBuf,
+    explicit_session: Option<SessionId>,
+    authority: PathBuf,
+    mode: SessionResurrectionMode,
+) -> std::io::Result<(Option<SessionId>, Option<Publisher>, Option<String>)> {
+    // Held across the handshake so concurrent screens cannot both claim the host.
+    let mut retained = retained.lock().await;
+    if let Some(sender) = retained.as_ref() {
+        return Ok((
+            explicit_session,
+            Some(Publisher::new(Arc::clone(sender))),
+            None,
+        ));
+    }
+    let connected = connect_endpoint(path, explicit_session, authority, mode).await?;
+    if let Some(publisher) = &connected.1 {
+        *retained = Some(Arc::clone(&publisher.sender));
+    }
+    drop(retained);
+    Ok(connected)
 }
 
 #[cfg(unix)]
@@ -241,11 +287,7 @@ fn start_publisher(
             }
         }
     });
-    Publisher {
-        sender,
-        last: None,
-        published: false,
-    }
+    Publisher::new(Arc::new(sender))
 }
 
 #[cfg(test)]
@@ -399,11 +441,7 @@ mod tests {
     async fn publication_tracks_selection_but_not_inflight_opens() {
         use crate::session_flow::ChatSessionAttachment;
         let (sender, mut receiver) = tokio::sync::watch::channel(None);
-        let mut publisher = Publisher {
-            sender,
-            last: None,
-            published: false,
-        };
+        let mut publisher = Publisher::new(Arc::new(sender));
         let first = SessionId::new();
         let second = SessionId::new();
         publisher.observe(ChatSessionAttachment::Attached { session_id: first });
@@ -563,6 +601,98 @@ mod tests {
             assert!(!authority.exists());
             host.join().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reentering_the_chat_reuses_the_claimed_connection() {
+        use crate::session_flow::ChatSessionAttachment;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("host.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let authority = dir.path().canonicalize().unwrap();
+        let restored = SessionId::new();
+        let reentered = SessionId::new();
+        let host_authority = authority.clone();
+        let (first_published, first_seen) = tokio::sync::oneshot::channel();
+        let mut first_published = Some(first_published);
+        // Like the real host, this one admits a single claim per command invocation.
+        let host = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = std::io::BufReader::new(stream);
+            let _: serde_json::Value = read_frame(&mut stream).unwrap();
+            let descriptor = Descriptor {
+                application: "bcode".into(),
+                version: 1,
+                session_store: host_authority,
+                session_id: restored,
+            };
+            write_frame(
+                stream.get_mut(),
+                &serde_json::json!({"protocol": PROTOCOL, "restore": descriptor}),
+            )
+            .unwrap();
+            let mut selections = Vec::new();
+            for revision in 1..=2 {
+                let selection: serde_json::Value = read_frame(&mut stream).unwrap();
+                assert_eq!(selection["revision"], revision);
+                selections.push(selection["descriptor"]["session_id"].clone());
+                write_frame(stream.get_mut(), &serde_json::json!({"revision": revision})).unwrap();
+                if let Some(signal) = first_published.take() {
+                    signal.send(()).unwrap();
+                }
+            }
+            listener.set_nonblocking(true).unwrap();
+            let reconnected = listener.accept().is_ok();
+            (selections, reconnected)
+        });
+        let retained = tokio::sync::Mutex::new(None);
+        let (first, publisher, _) = connect_retained(
+            &retained,
+            socket.clone(),
+            None,
+            authority.clone(),
+            SessionResurrectionMode::Enabled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, Some(restored));
+        let mut publisher = publisher.unwrap();
+        publisher.observe(ChatSessionAttachment::Attached {
+            session_id: restored,
+        });
+        first_seen.await.unwrap();
+        drop(publisher);
+
+        let (second, publisher, warning) = connect_retained(
+            &retained,
+            socket,
+            Some(reentered),
+            authority,
+            SessionResurrectionMode::Enabled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, Some(reentered));
+        assert!(warning.is_none());
+        publisher.unwrap().observe(ChatSessionAttachment::Attached {
+            session_id: reentered,
+        });
+
+        let (selections, reconnected) = tokio::task::spawn_blocking(move || host.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            selections,
+            [
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(reentered).unwrap()
+            ]
+        );
+        assert!(!reconnected);
     }
 
     #[cfg(unix)]
