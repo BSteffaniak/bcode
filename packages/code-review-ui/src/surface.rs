@@ -163,7 +163,7 @@ mod stack_files;
 mod threads;
 
 pub use annotate::COMPOSER_SCOPE;
-pub use conversation::{BarState, ConversationMessage};
+pub use conversation::{BarState, ConversationMessage, WatchCancel};
 pub use dock::{ASSISTANT_PANE_ID, ASSISTANT_SCOPE, DockResult};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;

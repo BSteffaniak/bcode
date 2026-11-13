@@ -924,34 +924,50 @@ pub async fn place(
         .unwrap_or_default()
 }
 
-/// Ask `provider`'s watch once.
+/// What a watch asks: its provider and repository, the pull requests, where it left off, and
+/// the provider's settings.
+#[derive(Debug, Clone)]
+pub struct WatchAsk {
+    /// Provider.
+    pub provider: String,
+    /// Repository.
+    pub repository: String,
+    /// Pull requests.
+    pub numbers: Vec<u64>,
+    /// Where the last answer left off.
+    pub cursor: Option<String>,
+    /// The provider's watch settings.
+    pub settings: serde_json::Value,
+}
+
+/// Ask `ask.provider`'s watch once. The watch waits up to [`WATCH_WAIT`] in a blocking task;
+/// `cancel` stops it early (the review is going away), so the program is not held open by it.
 ///
 /// # Errors
-/// The provider's failure.
+/// The provider's failure (`cancelled` once `cancel` is set).
 pub async fn watch(
     services: ReviewServices,
     repo: PathBuf,
-    provider: String,
-    repository: String,
-    numbers: Vec<u64>,
-    cursor: Option<String>,
-    settings: serde_json::Value,
+    ask: WatchAsk,
+    cancel: bcode_code_review::provider::Cancel,
 ) -> Result<ReviewSourcePullsWatchResponse, String> {
     let registry = services.providers();
     services
         .blocking(move || {
-            core::watch(
-                &registry,
-                &provider,
-                &ReviewSourcePullsWatchRequest {
-                    repo_path: repo,
-                    repository: Some(repository),
-                    numbers,
-                    cursor,
-                    wait_ms: u64::try_from(WATCH_WAIT.as_millis()).unwrap_or(u64::MAX),
-                    settings,
-                },
-            )
+            bcode_code_review::provider::with_cancel(&cancel, || {
+                core::watch(
+                    &registry,
+                    &ask.provider,
+                    &ReviewSourcePullsWatchRequest {
+                        repo_path: repo,
+                        repository: Some(ask.repository),
+                        numbers: ask.numbers,
+                        cursor: ask.cursor,
+                        wait_ms: u64::try_from(WATCH_WAIT.as_millis()).unwrap_or(u64::MAX),
+                        settings: ask.settings,
+                    },
+                )
+            })
         })
         .await
         .map_err(|error| error.message)

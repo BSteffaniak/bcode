@@ -124,6 +124,29 @@ pub struct ConversationUi {
     pub card_clicks: Vec<(String, CardAction)>,
     /// Saves of the pull request threads for the review tools.
     pub thread_saves: conv::ThreadSaves,
+    /// Stops the provider watches when the review goes away.
+    pub watch_cancel: WatchCancel,
+}
+
+/// Cancels a review's provider watches when dropped (the review closed, or the program quits).
+///
+/// A watch waits in a blocking task for up to two minutes; without this it would keep the
+/// program from exiting until it finished.
+#[derive(Debug, Default)]
+pub struct WatchCancel(bcode_code_review::provider::Cancel);
+
+impl WatchCancel {
+    /// The flag a watch runs under.
+    #[must_use]
+    pub fn handle(&self) -> bcode_code_review::provider::Cancel {
+        self.0.clone()
+    }
+}
+
+impl Drop for WatchCancel {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl ConversationUi {
@@ -412,20 +435,19 @@ impl ReviewSurface {
                 self.inbox.clone(),
                 self.repo_path.clone(),
             );
+            let cancel = self.talk.watch_cancel.handle();
             host.spawn(Box::pin(async move {
                 if failures > 0 {
                     tokio::time::sleep(conv::watch_backoff(failures)).await;
                 }
-                let result = conv::watch(
-                    services,
-                    repo,
-                    provider.clone(),
-                    repository.clone(),
+                let ask = conv::WatchAsk {
+                    provider: provider.clone(),
+                    repository: repository.clone(),
                     numbers,
                     cursor,
                     settings,
-                )
-                .await;
+                };
+                let result = conv::watch(services, repo, ask, cancel).await;
                 inbox.push(Message::Conversation(Box::new(
                     ConversationMessage::Watched {
                         provider,

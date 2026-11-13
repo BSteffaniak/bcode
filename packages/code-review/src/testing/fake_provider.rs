@@ -509,6 +509,80 @@ impl FakeProvider {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
+    /// A stack of the fake's pull requests, rooted at the base branch.
+    fn stack(&self, operation: &str, payload: &[u8]) -> Result<Vec<u8>, ProviderCallError> {
+        let encode = |value: serde_json::Value| Ok(serde_json::to_vec(&value).expect("encodes"));
+        let record = |call: String| self.calls.lock().expect("calls lock").push(call);
+        let request: ReviewSourceStackResolveRequest =
+            serde_json::from_slice(payload).expect("stack request");
+        // A walk the caller no longer wants stops, as GitHub's does between requests.
+        if crate::provider::cancelled() {
+            record(format!("{operation} cancelled"));
+            return Err(ProviderCallError {
+                code: bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED.to_owned(),
+                message: "cancelled".to_owned(),
+            });
+        }
+        record(format!("{operation} #{}", request.number));
+        if !FAKE_PULLS.contains(&request.number) {
+            return Err(ProviderCallError {
+                code: REVIEW_SOURCE_ERROR_PULL_NOT_FOUND.to_owned(),
+                message: format!("no pull request #{}", request.number),
+            });
+        }
+        let layers = self
+            .summaries()
+            .into_iter()
+            .enumerate()
+            .map(|(index, pull)| ReviewStackLayer {
+                pull,
+                parent: index.checked_sub(1).map(|below| FAKE_PULLS[below]),
+            })
+            .collect();
+        encode(
+            serde_json::to_value(ReviewSourceStackResolveResponse {
+                repository: FAKE_REPOSITORY.to_owned(),
+                stack: ReviewStack {
+                    trunk: BASE_BRANCH.to_owned(),
+                    rooted_at_default_branch: true,
+                    layers,
+                    requested: request.number,
+                    siblings: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            })
+            .expect("stack"),
+        )
+    }
+
+    /// A watch: waits as a forge's does, until something changes (nothing does here), the wait
+    /// runs out, or the caller cancels.
+    fn watch(&self, operation: &str, payload: &[u8]) -> Result<Vec<u8>, ProviderCallError> {
+        let request: bcode_code_review_models::ReviewSourcePullsWatchRequest =
+            serde_json::from_slice(payload).expect("watch request");
+        let record = |call: String| self.calls.lock().expect("calls lock").push(call);
+        record(operation.to_owned());
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(request.wait_ms);
+        while std::time::Instant::now() < deadline {
+            if crate::provider::cancelled() {
+                record(format!("{operation} cancelled"));
+                return Err(ProviderCallError {
+                    code: bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED.to_owned(),
+                    message: "cancelled".to_owned(),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(
+            serde_json::to_vec(&bcode_code_review_models::ReviewSourcePullsWatchResponse {
+                changed: Vec::new(),
+                cursor: request.cursor.unwrap_or_default(),
+            })
+            .expect("encodes"),
+        )
+    }
+
     /// Answer one provider operation.
     ///
     /// # Errors
@@ -546,50 +620,12 @@ impl FakeProvider {
                     .expect("manifest"),
                 )
             }
+            bcode_code_review_models::OP_REVIEW_SOURCE_PULLS_WATCH => {
+                self.watch(operation, payload)
+            }
             OP_REVIEW_SOURCE_PULLS_LIST => self.pulls(operation, payload),
             OP_REVIEW_SOURCE_PULLS_GET => Ok(self.get(operation, payload)),
-            OP_REVIEW_SOURCE_STACK_RESOLVE => {
-                let request: ReviewSourceStackResolveRequest =
-                    serde_json::from_slice(payload).expect("stack request");
-                // A walk the caller no longer wants stops, as GitHub's does between requests.
-                if crate::provider::cancelled() {
-                    record(format!("{operation} cancelled"));
-                    return Err(ProviderCallError {
-                        code: bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED.to_owned(),
-                        message: "cancelled".to_owned(),
-                    });
-                }
-                record(format!("{operation} #{}", request.number));
-                if !FAKE_PULLS.contains(&request.number) {
-                    return Err(ProviderCallError {
-                        code: REVIEW_SOURCE_ERROR_PULL_NOT_FOUND.to_owned(),
-                        message: format!("no pull request #{}", request.number),
-                    });
-                }
-                let layers = self
-                    .summaries()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, pull)| ReviewStackLayer {
-                        pull,
-                        parent: index.checked_sub(1).map(|below| FAKE_PULLS[below]),
-                    })
-                    .collect();
-                encode(
-                    serde_json::to_value(ReviewSourceStackResolveResponse {
-                        repository: FAKE_REPOSITORY.to_owned(),
-                        stack: ReviewStack {
-                            trunk: BASE_BRANCH.to_owned(),
-                            rooted_at_default_branch: true,
-                            layers,
-                            requested: request.number,
-                            siblings: Vec::new(),
-                            warnings: Vec::new(),
-                        },
-                    })
-                    .expect("stack"),
-                )
-            }
+            OP_REVIEW_SOURCE_STACK_RESOLVE => self.stack(operation, payload),
             OP_REVIEW_SOURCE_PULL_FETCH => {
                 let request: ReviewSourcePullFetchRequest =
                     serde_json::from_slice(payload).expect("fetch request");

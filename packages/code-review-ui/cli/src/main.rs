@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use bcode_code_review_ui::cli::ReviewCommand;
 use clap::Parser;
@@ -28,8 +29,29 @@ struct Args {
     command: Option<ReviewCommand>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// How long background work may run once the app has exited (a save finishing), before the
+/// process exits anyway. The terminal is restored before this.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("bcode-review: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(run());
+    // Blocking work still running (a provider call, a large diff) would otherwise hold the
+    // process open after the review closed; it gets a short grace period instead.
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    code
+}
+
+async fn run() -> ExitCode {
     let args = Args::parse();
     if let Some(path) = &args.path
         && let Err(error) = std::env::set_current_dir(path)

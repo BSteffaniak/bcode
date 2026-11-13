@@ -724,3 +724,51 @@ fn a_question_on_a_file_lists_its_pull_request_threads() {
         format!("Review: {}", GitFixture::stack_layer_path(2))
     );
 }
+
+#[test]
+fn a_review_going_away_stops_its_provider_watch_at_once() {
+    use crate::surface::WatchCancel;
+    let fixture = fixture();
+    let capabilities = ConversationCapabilities {
+        watch: Some(bcode_code_review_models::WatchMechanism::Conditional),
+        ..everything()
+    };
+    let backend = backend(&fixture, capabilities);
+    let watches = WatchCancel::default();
+    let cancel = watches.handle();
+    // The review goes away while its watch waits (it would wait two minutes).
+    let dropped = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(watches);
+    });
+    let started = std::time::Instant::now();
+    let result = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime")
+        .block_on(crate::conversation::watch(
+            backend.services(),
+            fixture.root().to_path_buf(),
+            crate::conversation::WatchAsk {
+                provider: crate::testing::fake_provider::FAKE_PROVIDER.to_owned(),
+                repository: FAKE_REPOSITORY.to_owned(),
+                numbers: vec![PULL],
+                cursor: None,
+                settings: serde_json::Value::Null,
+            },
+            cancel,
+        ));
+    dropped.join().expect("dropped");
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the watch held on for {:?}",
+        started.elapsed()
+    );
+    let calls = backend.provider().expect("provider").calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "review_source.pulls.watch cancelled"),
+        "{calls:?}"
+    );
+}
