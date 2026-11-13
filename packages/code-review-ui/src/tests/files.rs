@@ -1,5 +1,6 @@
-//! File separation: headers set apart from the chrome and the content, torn pages between
-//! files, the details row's buttons, collapsing, and the densities by size and configuration.
+//! File separation and folding: headers set apart from the chrome and the content, files as
+//! cards on a desk, the details row's buttons, folding (by hand and by the viewed mark), and
+//! the densities and separators by size, configuration, and theme.
 
 use super::{stable, surface};
 use crate::ReviewSurface;
@@ -25,6 +26,12 @@ fn open_with(
     (scenario, screen)
 }
 
+/// A row's text inside the review panel's borders, trimmed.
+fn inner(row: &str) -> String {
+    row.trim_matches(|cell: char| cell == '│' || cell == '█' || cell.is_whitespace())
+        .to_owned()
+}
+
 fn click(scenario: &mut Scenario<ReviewSurface>, needle: &str) -> Screen {
     let screen = scenario.frame();
     let at = screen
@@ -35,7 +42,7 @@ fn click(scenario: &mut Scenario<ReviewSurface>, needle: &str) -> Screen {
 }
 
 #[test]
-fn file_headers_stand_apart_and_pages_tear_between_files() {
+fn file_headers_stand_apart_and_files_are_cards_on_a_desk() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let (_, screen) = open_with(&fixture, ReviewViewConfig::default(), 80, 20);
     let header = screen.find(".gitmodules").expect("first file header");
@@ -51,15 +58,20 @@ fn file_headers_stand_apart_and_pages_tear_between_files() {
             .modifiers
             .contains(bmux_tui::style::Modifier::BOLD)
     );
-    // Compact: one torn row between the files, the page color over the desk.
+    // Compact: one row between the files, the page's straight bottom edge over the desk.
     let next = screen.find("added/new_000.rs").expect("second file header");
-    let tear = screen.row_text(next.y - 1);
-    assert!(tear.contains('▀'), "{}", screen.text());
-    let paper = screen
-        .find("▀")
-        .map(|at| screen.style_at(at.x, at.y))
-        .expect("tear");
+    let edge = inner(&screen.row_text(next.y - 1));
+    assert!(edge.chars().all(|cell| cell == '▀'), "{}", screen.text());
+    let paper = screen.style_at(header.x, next.y - 1);
     assert!(paper.bg.is_some() && paper.fg.is_some() && paper.fg != paper.bg);
+    // The page above the edge is the page's own color (the hunk row is on it).
+    let hunk = screen.find("@@").expect("hunk header");
+    assert_eq!(
+        paper.fg,
+        screen.style_at(hunk.x, hunk.y).bg,
+        "{paper:?} {:?}",
+        screen.style_at(hunk.x, hunk.y)
+    );
 }
 
 #[test]
@@ -80,7 +92,7 @@ fn comfortable_files_have_details_and_buttons_that_work() {
     ] {
         assert!(screen.contains(part), "{part:?}:\n{}", screen.text());
     }
-    // Two torn rows: this page's bottom and the next one's top.
+    // Two rows: this card's bottom edge and the next card's lip.
     let next = screen.find("added/new_000.rs").expect("second file");
     assert!(
         screen.row_text(next.y - 1).contains('▄'),
@@ -93,14 +105,17 @@ fn comfortable_files_have_details_and_buttons_that_work() {
         screen.text()
     );
 
-    // Collapse folds the file to its header; Expand brings its content back.
+    // Collapse folds the file to its header (no details either); its chevron opens it again.
     let screen = click(&mut scenario, "Collapse");
     assert!(!screen.contains("[submodule"), "{}", screen.text());
-    assert!(screen.contains("collapsed"));
     let file = FileKey::new("source-1".to_owned(), None, ".gitmodules".to_owned());
     assert!(scenario.surface().document().unwrap().is_collapsed(&file));
-    let screen = click(&mut scenario, "Expand");
+    let header = screen.find(".gitmodules").expect("header");
+    assert!(screen.row_text(header.y).contains('▸'), "{}", screen.text());
+    assert!(!screen.row_text(header.y + 1).contains("1 hunk"));
+    let screen = click(&mut scenario, "▸");
     assert!(screen.contains("[submodule"), "{}", screen.text());
+    assert!(screen.contains("Collapse"));
 
     // The viewed mark in the header is a button.
     let screen = scenario.frame();
@@ -151,8 +166,25 @@ fn the_separator_and_density_follow_configuration() {
     };
     let (_, screen) = open_with(&fixture, rule, 80, 20);
     let next = screen.find("added/new_000.rs").expect("second file");
+    // A rule naming the next file's position.
+    let rule_row = screen.row_text(next.y - 1);
     assert!(
-        screen.row_text(next.y - 1).contains('┄'),
+        rule_row.contains('─') && rule_row.contains(" 2 of 15 "),
+        "{}",
+        screen.text()
+    );
+    let unlabeled = ReviewViewConfig {
+        file_separator: FileSeparator::Rule,
+        file_separator_label: Some(false),
+        file_separator_rows: Some(3),
+        ..ReviewViewConfig::default()
+    };
+    let (_, screen) = open_with(&fixture, unlabeled, 80, 20);
+    let next = screen.find("added/new_000.rs").expect("second file");
+    assert_eq!(inner(&screen.row_text(next.y - 1)), "");
+    let rule_row = screen.row_text(next.y - 2);
+    assert!(
+        rule_row.contains('─') && !rule_row.contains(" of "),
         "{}",
         screen.text()
     );
@@ -199,4 +231,113 @@ fn an_edge_sets_the_pinned_headers_apart_from_the_content_under_them() {
     assert!(underlined(hunk), "{}", screen.text());
     assert!(!underlined(header.y));
     assert!(!underlined(hunk + 1));
+}
+
+#[test]
+fn viewed_files_fold_and_open_by_hand_like_on_the_forge() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let (mut scenario, _) = open_with(&fixture, ReviewViewConfig::default(), 80, 30);
+    let file = FileKey::new("source-1".to_owned(), None, ".gitmodules".to_owned());
+    let doc = |scenario: &Scenario<ReviewSurface>| scenario.surface().document().unwrap().clone();
+    let viewed = |scenario: &Scenario<ReviewSurface>| {
+        doc(scenario)
+            .viewed_state(&file)
+            .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed)
+    };
+    // Marking viewed folds it.
+    scenario.key("g");
+    scenario.key("v");
+    let screen = stable(&mut scenario);
+    assert!(viewed(&scenario));
+    assert!(doc(&scenario).is_collapsed(&file), "{}", screen.text());
+    assert!(!screen.contains("[submodule"), "{}", screen.text());
+    // Opened by hand, it stays viewed and open.
+    scenario.key("g");
+    stable(&mut scenario);
+    let screen = click(&mut scenario, "▸");
+    assert!(screen.contains("[submodule"), "{}", screen.text());
+    assert!(viewed(&scenario));
+    assert!(!doc(&scenario).is_collapsed(&file));
+    // Unmarked it stays open; marked again, it folds again.
+    scenario.key("g");
+    scenario.key("v");
+    stable(&mut scenario);
+    assert!(!viewed(&scenario) && !doc(&scenario).is_collapsed(&file));
+    scenario.key("g");
+    scenario.key("v");
+    stable(&mut scenario);
+    assert!(viewed(&scenario) && doc(&scenario).is_collapsed(&file));
+    // Folding by hand marks nothing.
+    let next = FileKey::new("source-1".to_owned(), None, "added/new_000.rs".to_owned());
+    let screen = scenario.frame();
+    let header = screen.find("added/new_000.rs").expect("second header");
+    let row = screen.row_text(header.y);
+    let chevron = row.chars().position(|cell| cell == '▾').expect("chevron");
+    scenario.click(u16::try_from(chevron).unwrap(), header.y);
+    stable(&mut scenario);
+    let doc_now = doc(&scenario);
+    assert!(doc_now.is_collapsed(&next));
+    assert!(
+        !doc_now
+            .viewed_state(&next)
+            .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed)
+    );
+}
+
+#[test]
+fn folded_files_read_as_a_list_and_motions_open_them() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let (mut scenario, _) = open_with(&fixture, ReviewViewConfig::default(), 80, 30);
+    // `shift+z` on a header folds every file: headers one desk row apart, no edges.
+    scenario.key("g");
+    scenario.key("shift+z");
+    let screen = stable(&mut scenario);
+    let first = screen.find(".gitmodules").expect("first");
+    let second = screen.find("added/new_000.rs").expect("second");
+    assert_eq!(second.y - first.y, 2, "{}", screen.text());
+    assert_eq!(
+        inner(&screen.row_text(first.y + 1)),
+        "",
+        "{}",
+        screen.text()
+    );
+    // A hunk motion goes into the first file, opening it.
+    let file = FileKey::new("source-1".to_owned(), None, ".gitmodules".to_owned());
+    scenario.key("}");
+    stable(&mut scenario);
+    assert!(!scenario.surface().document().unwrap().is_collapsed(&file));
+    assert!(
+        matches!(scenario.surface().cursor(), Some(ItemKey::HunkHeader { file: at, .. }) if at.path == ".gitmodules"),
+        "{:?}",
+        scenario.surface().cursor()
+    );
+    // And again: every file opens.
+    scenario.key("g");
+    scenario.key("shift+z");
+    scenario.key("shift+z");
+    let screen = stable(&mut scenario);
+    assert!(screen.contains("[submodule"), "{}", screen.text());
+}
+
+#[test]
+fn a_theme_sets_the_file_roles() {
+    use bmux_tui::style::{Color, Style};
+    let mut styles = super::chrome::host_theme(super::chrome::rgb(200, 120, 250));
+    let derived =
+        crate::theme::ReviewTheme::derive(Some(&styles), crate::theme::IconStyle::Unicode);
+    // Derived: a desk close to the page but told apart from it.
+    let page = derived.files.page_edge.fg;
+    assert!(derived.files.desk.bg.is_some() && derived.files.desk.bg != page);
+    styles.files.desk = Some(Style::new().bg(Color::Rgb(1, 2, 3)));
+    styles.files.header = Some(Style::new().bg(Color::Rgb(4, 5, 6)));
+    styles.files.label = Some(Style::new().fg(Color::Rgb(7, 8, 9)));
+    let theme = crate::theme::ReviewTheme::derive(Some(&styles), crate::theme::IconStyle::Unicode);
+    assert_eq!(theme.files.desk.bg, Some(Color::Rgb(1, 2, 3)));
+    assert_eq!(theme.files.header.bg, Some(Color::Rgb(4, 5, 6)));
+    assert_eq!(theme.files.label.fg, Some(Color::Rgb(7, 8, 9)));
+    // The lip is the header color over the desk.
+    assert_eq!(
+        (theme.files.lip.fg, theme.files.lip.bg),
+        (Some(Color::Rgb(4, 5, 6)), Some(Color::Rgb(1, 2, 3)))
+    );
 }

@@ -24,7 +24,7 @@ pub use load::{DEFAULT_THEME, HostTheme};
 pub use tiers::Tiers;
 
 use bcode_code_review_models::ReviewFileStatus;
-use bcode_tui_theme::components::ComponentStyles;
+use bcode_tui_theme::components::{ComponentStyles, FileChromeRoles};
 use bmux_color::Rgb;
 use bmux_tui::capabilities::TerminalColorDepth;
 use bmux_tui::chrome::BorderSet;
@@ -130,10 +130,10 @@ pub struct Icons {
     pub external: &'static str,
     /// Something new since last looked at.
     pub new: &'static str,
-    /// Cells a page's bottom edge is torn with (the page hangs into the row).
-    pub tear_bottom: [&'static str; 3],
-    /// Cells a page's top edge is torn with (the page rises into the row).
-    pub tear_top: [&'static str; 3],
+    /// The upper half of a cell: a card's bottom edge.
+    pub half_upper: &'static str,
+    /// The lower half of a cell: the lip of the next card.
+    pub half_lower: &'static str,
     /// A plain rule between files.
     pub file_rule: &'static str,
     /// Name of the BMUX spinner preset of busy items (`braille` or `ascii`).
@@ -177,9 +177,9 @@ impl Icons {
         checks: "●",
         external: "↗",
         new: "•",
-        tear_bottom: ["▀", "▔", " "],
-        tear_top: ["▄", "▁", " "],
-        file_rule: "┄",
+        half_upper: "▀",
+        half_lower: "▄",
+        file_rule: "─",
         spinner: "braille",
     };
 
@@ -219,8 +219,8 @@ impl Icons {
         checks: "*",
         external: "->",
         new: "*",
-        tear_bottom: ["~", "^", " "],
-        tear_top: ["~", "_", " "],
+        half_upper: "-",
+        half_lower: "-",
         file_rule: "-",
         spinner: "ascii",
     };
@@ -451,7 +451,9 @@ impl ReviewTheme {
         .filter(|color| *color != Color::Default)
         .collect();
         let tiers = Tiers::derive(&component, styles.control_focused.fg, &alternates);
-        Self::from_tiers(tiers, component, styles.diff, Icons::for_style(icons))
+        let mut theme = Self::from_tiers(tiers, component, styles.diff, Icons::for_style(icons));
+        theme.files = FileStyles::of(&tiers, styles.files);
+        theme
     }
 
     /// Theme from a component theme and diff styles, with tiers derived from the component
@@ -544,7 +546,7 @@ impl ReviewTheme {
             gutter,
             hunk: diff.hunk,
             hunk_fill: tiers.canvas.patch(diff.hunk),
-            files: FileStyles::of(&tiers),
+            files: FileStyles::of(&tiers, FileChromeRoles::default()),
             source_header: bold(tiers.accent),
             gap: tiers.dim,
             gap_action: bold(component.link),
@@ -599,6 +601,8 @@ impl ReviewTheme {
             self.pill_accent = self.pill_accent.add_modifier(Modifier::REVERSED);
             self.publish.button.normal =
                 self.publish.button.normal.add_modifier(Modifier::REVERSED);
+            // No colors, no desk: cards fall back to a rule.
+            self.files.desk = Style::new();
         }
         self
     }
@@ -637,7 +641,7 @@ impl ReviewTheme {
         Line::from_spans(vec![Span::styled(format!(" {status} "), self.muted)])
     }
 
-    /// Whether the theme has a desk color (torn pages need one).
+    /// Whether the theme has a desk color (cards need one).
     #[must_use]
     pub const fn has_desk(&self) -> bool {
         self.files.desk.bg.is_some()
@@ -804,34 +808,54 @@ fn modified_status(tiers: &Tiers, taken: [Style; 3]) -> Style {
 
 /// Share of the accent mixed into the canvas for file headers.
 const FILE_HEADER_TINT: f64 = 0.16;
-/// Share of black mixed into a canvas for the desk between files.
-const DESK_SHADE: f64 = 0.38;
-/// Share of black mixed into a light canvas for the desk.
-const DESK_SHADE_LIGHT: f64 = 0.10;
-/// Share of the text color mixed into a canvas too dark to shade.
-const DESK_LIFT: f64 = 0.07;
+/// Contrast of the desk against the page: enough to see the cards, little enough to stay calm.
+const DESK_CONTRAST: f64 = 1.18;
 
-/// Styles of files' chrome.
+/// Styles of files' chrome. A theme sets them with the `source.file.*` roles; the rest are
+/// derived from the tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileStyles {
     /// File header row fill (it stays pinned at the top): the accent mixed into the canvas, so
     /// it differs from the header and footer bars and from content.
     pub header: Style,
-    /// The desk between files: what shows where a page is torn off. No fill when the theme
-    /// has no RGB canvas to derive one from (see [`ReviewTheme::has_desk`]).
+    /// The desk between file cards. No fill when the theme has no RGB canvas to derive one from
+    /// (see [`ReviewTheme::has_desk`]).
     pub desk: Style,
-    /// A page's torn edge drawn over the desk: the canvas color as foreground.
-    pub tear: Style,
+    /// A card's bottom edge: the page color over the desk.
+    pub page_edge: Style,
+    /// The lip of a card's header (and a folded card's bottom): the header color over the desk.
+    pub lip: Style,
+    /// The rule between files.
+    pub rule: Style,
+    /// The label on the rule.
+    pub label: Style,
     /// The edge under the pinned headers.
     pub pinned_edge: Style,
 }
 
 impl FileStyles {
-    fn of(tiers: &Tiers) -> Self {
+    fn of(tiers: &Tiers, roles: FileChromeRoles) -> Self {
+        let header = roles
+            .header
+            .map_or_else(|| file_header_fill(tiers), |role| tiers.text.patch(role));
+        let desk = roles.desk.unwrap_or_else(|| desk_fill(tiers));
+        // An edge is drawn with half blocks: the color above (or below) as foreground, the
+        // desk as background.
+        let edge = |color: Option<Color>| match (color, desk.bg) {
+            (Some(color), Some(_)) => desk.fg(color),
+            _ => tiers.dim,
+        };
+        let page_edge = roles
+            .edge
+            .and_then(|role| role.fg)
+            .map_or_else(|| edge(tiers.canvas.bg), |fg| edge(Some(fg)));
         Self {
-            header: file_header_fill(tiers),
-            desk: desk_fill(tiers),
-            tear: tear_style(tiers),
+            header,
+            desk,
+            page_edge,
+            lip: edge(header.bg),
+            rule: roles.edge.unwrap_or(tiers.dim),
+            label: roles.label.unwrap_or(tiers.muted),
             pinned_edge: Style::new().add_modifier(Modifier::UNDERLINE),
         }
     }
@@ -843,30 +867,26 @@ fn file_header_fill(tiers: &Tiers) -> Style {
         .map_or(tiers.surface_alt, |bg| tiers.text.bg(bg))
 }
 
-/// The desk between files: the canvas shaded (or, when it is nearly black, lifted).
+/// The desk between files: the canvas stepped just far enough to tell apart
+/// ([`DESK_CONTRAST`]): darker, or lighter when the canvas is too dark to darken.
 fn desk_fill(tiers: &Tiers) -> Style {
     let Some(Color::Rgb(r, g, b)) = tiers.canvas.bg else {
         return Style::new();
     };
     let canvas = Rgb::new(r, g, b);
-    let black = Some(Color::Rgb(0, 0, 0));
-    let shade = if canvas.contrast_ratio(Rgb::BLACK) < 1.25 {
-        mixed(tiers.text.fg, tiers.canvas.bg, DESK_LIFT)
-    } else if canvas.contrast_ratio(Rgb::BLACK) > 10.0 {
-        mixed(black, tiers.canvas.bg, DESK_SHADE_LIGHT)
+    let toward = if canvas.contrast_ratio(Rgb::BLACK) < 1.6 {
+        tiers.text.fg.unwrap_or(Color::Rgb(255, 255, 255))
     } else {
-        mixed(black, tiers.canvas.bg, DESK_SHADE)
+        Color::Rgb(0, 0, 0)
     };
-    shade.map_or_else(Style::new, |bg| Style::new().bg(bg))
-}
-
-/// A torn edge: the page (canvas) color drawn over the desk.
-fn tear_style(tiers: &Tiers) -> Style {
-    let desk = desk_fill(tiers);
-    match (tiers.canvas.bg, desk.bg) {
-        (Some(page), Some(_)) => desk.fg(page),
-        _ => tiers.dim,
-    }
+    let Color::Rgb(tr, tg, tb) = toward else {
+        return Style::new();
+    };
+    let target = Rgb::new(tr, tg, tb);
+    (1..=60)
+        .map(|step| bmux_color::mix(target, canvas, f64::from(step) / 100.0))
+        .find(|desk| desk.contrast_ratio(canvas) >= DESK_CONTRAST)
+        .map_or_else(Style::new, |desk| Style::new().bg(Color::from(desk)))
 }
 
 /// A neutral pill: text on the overlay fill, which stands apart from the header and footer

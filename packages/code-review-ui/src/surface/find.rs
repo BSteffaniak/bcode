@@ -18,7 +18,7 @@ use crate::action::Action;
 use crate::context::UiContext;
 use crate::rows::{RowKey, SearchHighlights};
 use bcode_code_review::document::{
-    Direction, ItemKey, LayoutMode, NavKind, ReviewItem, SearchQuery, SearchResults,
+    Direction, FileFold, ItemKey, LayoutMode, NavKind, ReviewItem, SearchQuery, SearchResults,
 };
 use bcode_code_review_models::{
     DraftComment, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind, ReviewLayoutMode,
@@ -29,7 +29,7 @@ use bmux_tui_components::status_bar::StatusSeverity;
 use bmux_tui_components::text_input::{
     EdgePolicy, TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
-use bmux_tui_components::virtual_list::{AnchorPolicy, ListAnchor, ListPosition};
+use bmux_tui_components::virtual_list::{AnchorPolicy, Edge, ListAnchor, ListPosition};
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -309,10 +309,23 @@ impl ReviewSurface {
         let (Some(search), Some(review)) = (self.search.as_mut(), self.review.as_mut()) else {
             return;
         };
-        let target = review
-            .doc
-            .navigate_matches(&search.results, from, direction)
-            .or_else(|| review.doc.wrapped_match(&search.results, direction));
+        let find = |review: &super::Review, from: usize| {
+            review
+                .doc
+                .navigate_matches(&search.results, from, direction)
+                .or_else(|| review.doc.wrapped_match(&search.results, direction))
+        };
+        let mut target = find(review, from);
+        // A match in a folded file opens it; the step then lands on the match itself.
+        if let Some(file) = target.as_ref().and_then(|target| target.opens.clone()) {
+            let origin = review.doc.item(from).map(ReviewItem::key);
+            review.doc.set_collapsed(&file, false);
+            review.note_splices();
+            let from = origin
+                .and_then(|key| review.doc.index_of(&key))
+                .unwrap_or(from);
+            target = find(review, from);
+        }
         if let Some(target) = target {
             review.set_cursor(target.index, AnchorPolicy::Center);
         }
@@ -406,10 +419,24 @@ impl ReviewSurface {
                 &identity.with_patch(patch.as_deref()),
             );
         }
+        // Marking (or unmarking) hands the fold back to the mark: viewed folds, unviewed opens.
+        if let Some(review) = self.review.as_mut() {
+            review.doc.set_fold(&file, FileFold::Auto);
+        }
         self.apply_viewed();
         let Some(review) = self.review.as_mut() else {
             return;
         };
+        // A file folded under the cursor leaves it on the file's header.
+        let header = ItemKey::FileHeader(file.clone());
+        if review
+            .cursor
+            .as_ref()
+            .is_none_or(|cursor| review.doc.index_of(cursor).is_none())
+            && let Some(index) = review.doc.index_of(&header)
+        {
+            review.set_cursor(index, AnchorPolicy::EnsureVisibleFrom(Edge::Top));
+        }
         if viewed {
             self.set_status(
                 format!("{} marked unviewed", file.path),
@@ -569,12 +596,16 @@ impl ReviewSurface {
         state.all_stack_layers = self.stack_view == super::stack::StackView::AllLayers;
         state.conversation_seen.clone_from(&self.talk.seen);
         if let Some(review) = &self.review {
-            state.collapsed_files = review
-                .doc
-                .collapsed_files()
-                .iter()
-                .map(|file| format!("{}\u{1}{}", file.source_id, file.path))
-                .collect();
+            state.collapsed_files.clear();
+            state.opened_files.clear();
+            for (file, fold) in review.doc.file_folds() {
+                let key = format!("{}\u{1}{}", file.source_id, file.path);
+                match fold {
+                    FileFold::Folded => state.collapsed_files.insert(key),
+                    FileFold::Open => state.opened_files.insert(key),
+                    FileFold::Auto => false,
+                };
+            }
         }
         state.layout_mode = self.layout_override.map(|mode| match mode {
             LayoutMode::Unified => ReviewLayoutMode::Unified,
@@ -681,18 +712,23 @@ impl ReviewSurface {
             review.doc.set_layout(mode);
         }
         review.doc.restore_expansions(&state.expansions);
-        let collapsed: Vec<bcode_code_review::document::FileRef> = review
+        let folds: Vec<(bcode_code_review::document::FileRef, FileFold)> = review
             .doc
             .file_keys()
-            .filter(|file| {
-                state
-                    .collapsed_files
-                    .contains(&format!("{}\u{1}{}", file.source_id, file.path))
+            .filter_map(|file| {
+                let key = format!("{}\u{1}{}", file.source_id, file.path);
+                if state.collapsed_files.contains(&key) {
+                    Some((file.clone(), FileFold::Folded))
+                } else {
+                    state
+                        .opened_files
+                        .contains(&key)
+                        .then(|| (file.clone(), FileFold::Open))
+                }
             })
-            .cloned()
             .collect();
-        for file in collapsed {
-            review.doc.set_collapsed(&file, true);
+        for (file, fold) in folds {
+            review.doc.set_fold(&file, fold);
         }
         review.note_splices();
         let Some(anchor) = state.scroll_anchor else {

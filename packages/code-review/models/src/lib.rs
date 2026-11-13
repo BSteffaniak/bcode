@@ -426,9 +426,12 @@ pub struct ReviewPresentationState {
     /// it is new.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub conversation_seen: BTreeMap<String, u64>,
-    /// Files shown collapsed to their header, by `source id`, a `\u{1}`, and the path.
+    /// Files folded to their header by hand, by `source id`, a `\u{1}`, and the path.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub collapsed_files: BTreeSet<String>,
+    /// Viewed files opened by hand (they would fold by themselves), keyed as `collapsed_files`.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub opened_files: BTreeSet<String>,
     /// One-time notices the user dismissed (such as the over-the-layer-limit warning), by tag:
     /// they are not shown again unless configured to.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -456,6 +459,7 @@ impl Default for ReviewPresentationState {
             all_stack_layers: false,
             conversation_seen: BTreeMap::new(),
             collapsed_files: BTreeSet::new(),
+            opened_files: BTreeSet::new(),
             dismissed_notices: BTreeSet::new(),
         }
     }

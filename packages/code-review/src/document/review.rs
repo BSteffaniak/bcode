@@ -44,6 +44,8 @@ pub struct DocumentConfig {
     pub blob_chunk_lines: u32,
     /// What makes a viewed file stale.
     pub viewed_reset: ViewedReset,
+    /// Whether a viewed file folds by itself (see [`FileFold::Auto`]).
+    pub fold_viewed: bool,
 }
 
 impl Default for DocumentConfig {
@@ -57,6 +59,7 @@ impl Default for DocumentConfig {
             max_inflight_blobs: 16,
             blob_chunk_lines: REVIEW_BLOB_LINES_MAX_COUNT,
             viewed_reset: ViewedReset::Diff,
+            fold_viewed: false,
         }
     }
 }
@@ -304,8 +307,20 @@ pub(super) struct FileState {
     pub resident_bytes: usize,
     /// Patch unchanged since the last review pass.
     pub carried_over: bool,
-    /// Only the file's header shows.
-    pub collapsed: bool,
+    /// Whether only the file's header shows: by hand, or by its viewed mark.
+    pub fold: FileFold,
+}
+
+/// Whether a file shows only its header. Folding never changes the file's viewed mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileFold {
+    /// Follow the viewed mark: folded while viewed, when [`DocumentConfig::fold_viewed`].
+    #[default]
+    Auto,
+    /// Opened by hand.
+    Open,
+    /// Folded by hand.
+    Folded,
 }
 
 impl FileState {
@@ -690,7 +705,7 @@ impl ReviewDocument {
                 last_used: 0,
                 resident_bytes: 0,
                 carried_over: false,
-                collapsed: false,
+                fold: FileFold::Auto,
             });
             self.blocks.push(Block::new(BlockKind::File(index)));
             self.file_annotations.push(Vec::new());
@@ -861,13 +876,13 @@ impl ReviewDocument {
         true
     }
 
-    /// Files shown only as their header.
+    /// Files folded or opened by hand, with their fold.
     #[must_use]
-    pub fn collapsed_files(&self) -> Vec<FileRef> {
+    pub fn file_folds(&self) -> Vec<(FileRef, FileFold)> {
         self.files
             .iter()
-            .filter(|state| state.collapsed)
-            .map(|state| state.key.clone())
+            .filter(|state| state.fold != FileFold::Auto)
+            .map(|state| (state.key.clone(), state.fold))
             .collect()
     }
 
@@ -876,19 +891,74 @@ impl ReviewDocument {
     pub fn is_collapsed(&self, file: &FileKey) -> bool {
         self.file_index
             .get(file)
-            .is_some_and(|index| self.files[*index].collapsed)
+            .is_some_and(|index| self.folded(*index))
     }
 
-    /// Show only `file`'s header (or its content again). Returns whether it changed.
-    pub fn set_collapsed(&mut self, file: &FileKey, collapsed: bool) -> bool {
+    /// Whether the file at `file` shows only its header, its fold resolved against its viewed
+    /// mark.
+    pub(super) fn folded(&self, file: usize) -> bool {
+        let state = &self.files[file];
+        match state.fold {
+            FileFold::Open => false,
+            FileFold::Folded => true,
+            FileFold::Auto => self.config.fold_viewed && state.viewed.is_viewed(),
+        }
+    }
+
+    /// The fold of `file`, before resolving [`FileFold::Auto`].
+    #[must_use]
+    pub fn file_fold(&self, file: &FileKey) -> Option<FileFold> {
+        self.file_index
+            .get(file)
+            .map(|index| self.files[*index].fold)
+    }
+
+    /// Set `file`'s fold. Returns whether whether it shows folded changed.
+    pub fn set_fold(&mut self, file: &FileKey, fold: FileFold) -> bool {
         let Some(&index) = self.file_index.get(file) else {
             return false;
         };
-        if self.files[index].collapsed == collapsed {
+        let was = self.folded(index);
+        self.files[index].fold = fold;
+        self.refold(index, was)
+    }
+
+    /// Fold or open `file` by hand. Returns whether it changed.
+    pub fn set_collapsed(&mut self, file: &FileKey, collapsed: bool) -> bool {
+        let fold = if collapsed {
+            FileFold::Folded
+        } else {
+            FileFold::Open
+        };
+        self.set_fold(file, fold)
+    }
+
+    /// Whether viewed files fold by themselves ([`DocumentConfig::fold_viewed`]).
+    pub fn set_fold_viewed(&mut self, fold_viewed: bool) {
+        if self.config.fold_viewed == fold_viewed {
+            return;
+        }
+        self.config.fold_viewed = fold_viewed;
+        // Only files following a viewed mark change: they were folded when the setting was on.
+        for file in 0..self.files.len() {
+            let state = &self.files[file];
+            if state.fold == FileFold::Auto && state.viewed.is_viewed() {
+                self.refold(file, !fold_viewed);
+            }
+        }
+    }
+
+    /// Rebuild the file at `file` when whether it shows folded is no longer `was`, and the
+    /// file before it in its group, whose break depends on it. Returns whether it changed.
+    pub(super) fn refold(&mut self, file: usize, was: bool) -> bool {
+        if self.folded(file) == was {
             return false;
         }
-        self.files[index].collapsed = collapsed;
-        self.rebuild_file(index);
+        self.rebuild_file(file);
+        let group = &self.groups[self.files[file].group];
+        if file > group.files.start {
+            self.rebuild_file(file - 1);
+        }
         true
     }
 
@@ -1848,6 +1918,7 @@ impl ReviewDocument {
     /// Recompute a file's viewed state, rebuilding its block when it changed. The caller
     /// rebuilds the group's source header when this returns `true`.
     pub(super) fn refresh_viewed(&mut self, file: usize) -> bool {
+        let was_folded = self.folded(file);
         let state = &self.files[file];
         let identity = Self::identity(state);
         let viewed_identity = identity.with_patch(state.patch_id.as_deref());
@@ -1873,7 +1944,9 @@ impl ReviewDocument {
             _ => {}
         }
         state.viewed = viewed;
-        self.rebuild_file(file);
+        if !self.refold(file, was_folded) {
+            self.rebuild_file(file);
+        }
         true
     }
 

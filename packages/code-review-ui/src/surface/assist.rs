@@ -27,6 +27,7 @@ use crate::palette::{Overlay, OverlayEntry, OverlayKind};
 use bcode_code_review::document::{ItemKey, NavKind, ReviewItem};
 use bcode_code_review_models::{ReviewSuggestion, ReviewSuggestionStatus};
 use bmux_tui_components::status_bar::StatusSeverity;
+use bmux_tui_components::virtual_list::{AnchorPolicy, Edge};
 use std::fmt::Write as _;
 
 /// Files listed by name in the report's unviewed section.
@@ -175,6 +176,22 @@ impl ReviewSurface {
 
     /// Collapse every thread, or expand them all when every one is collapsed.
     pub(super) fn fold_all(&mut self) {
+        // On a file's header: every file.
+        if self.review.as_ref().is_some_and(|review| {
+            matches!(
+                review.cursor,
+                Some(bcode_code_review::document::ItemKey::FileHeader(_))
+            )
+        }) {
+            let any_open = self.review.as_ref().is_some_and(|review| {
+                review
+                    .doc
+                    .file_keys()
+                    .any(|file| !review.doc.is_collapsed(file))
+            });
+            self.fold_files(any_open);
+            return;
+        }
         let threads: std::collections::BTreeSet<String> = self
             .notes
             .drafts()
@@ -197,6 +214,35 @@ impl ReviewSurface {
             self.set_status("collapsed every thread", StatusSeverity::Info);
         }
         self.folds_changed();
+    }
+
+    /// Fold every file to its header (`fold`), or open every file, by hand. The cursor stays on
+    /// its file.
+    pub(super) fn fold_files(&mut self, fold: bool) {
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let file = review.cursor_file();
+        let files: Vec<_> = review.doc.file_keys().cloned().collect();
+        for key in &files {
+            review.doc.set_collapsed(key, fold);
+        }
+        review.note_splices();
+        if let Some(index) = file
+            .map(bcode_code_review::document::ItemKey::FileHeader)
+            .and_then(|key| review.doc.index_of(&key))
+        {
+            review.set_cursor(index, AnchorPolicy::EnsureVisibleFrom(Edge::Top));
+        }
+        self.persist_presentation(true);
+        self.set_status(
+            if fold {
+                "folded every file"
+            } else {
+                "opened every file"
+            },
+            StatusSeverity::Info,
+        );
     }
 
     /// Show or hide resolved threads in the document.
@@ -480,6 +526,14 @@ impl ReviewSurface {
             .filter_map(|file| review.doc.viewed_identity(file))
             .collect();
         let count = identities.len();
+        let files: Vec<_> = review.doc.file_keys().cloned().collect();
+        if let Some(review) = self.review.as_mut() {
+            for file in &files {
+                review
+                    .doc
+                    .set_fold(file, bcode_code_review::document::FileFold::Auto);
+            }
+        }
         let workspace = self.workspace_mut();
         if viewed {
             let files: Vec<_> = identities

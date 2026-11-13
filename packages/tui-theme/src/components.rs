@@ -32,12 +32,27 @@ pub struct ComponentStyles {
     pub source: SourceViewerStyle,
     /// Diff presentation.
     pub diff: DiffViewerStyle,
+    /// The review's file chrome, where the theme sets it (`source.file.*`).
+    pub files: FileChromeRoles,
     /// Markdown presentation.
     pub markdown: MarkdownTheme,
     /// Syntax colors for code.
     pub syntax: SyntaxPalette,
     /// Border glyphs and focus effects for dialogs and modals.
     pub dialog_chrome: ComponentChrome,
+}
+
+/// The `source.file.*` roles a theme sets; the review derives the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileChromeRoles {
+    /// `source.file.header`: a file's header row.
+    pub header: Option<Style>,
+    /// `source.file.desk`: the space between files.
+    pub desk: Option<Style>,
+    /// `source.file.edge`: a file's card edge and the rule between files.
+    pub edge: Option<Style>,
+    /// `source.file.label`: the label on the rule between files.
+    pub label: Option<Style>,
 }
 
 /// Derive component styles from `theme`, or terminal defaults when there is none.
@@ -124,6 +139,12 @@ pub fn component_styles(theme: Option<&ResolvedThemeDefinition>, accent: Color) 
         control_focused: style("control.focused").unwrap_or(focused),
         source,
         diff,
+        files: FileChromeRoles {
+            header: style("source.file.header"),
+            desk: style("source.file.desk"),
+            edge: style("source.file.edge"),
+            label: style("source.file.label"),
+        },
         markdown: markdown_theme(theme, text, muted),
         syntax: syntax_palette(theme, text, muted, info, success, warning),
         dialog_chrome: theme.map_or(ComponentChrome::DEFAULT, dialog_chrome),

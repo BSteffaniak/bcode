@@ -1001,10 +1001,25 @@ fn a_review_with_path_only_viewed_marks_opens_with_its_viewed_files_and_drafts()
         repo_path: fixture.root().to_path_buf(),
         workspace: serde_json::from_value(legacy).expect("stored workspace decodes"),
     });
-    let (scenario, screen) = open(&fixture, &backend, resume(), 140, 40);
+    let (mut scenario, screen) = open(&fixture, &backend, resume(), 140, 40);
     assert_eq!(scenario.surface().route_name(), RouteName::Review);
     let doc = scenario.surface().review().unwrap().document().unwrap();
     assert_eq!(doc.viewed_progress().viewed, 1, "{}", screen.text());
+    // The viewed file is folded; opened, its draft is on its line.
+    let file = doc
+        .file_keys()
+        .find(|file| file.path == anchor.file_path)
+        .cloned()
+        .expect("the viewed file");
+    assert!(doc.is_collapsed(&file));
+    // Its chevron opens it.
+    let at = scenario
+        .frame()
+        .find("▸")
+        .expect("the folded file's chevron");
+    scenario.click(at.x, at.y);
+    let screen = settled(&mut scenario);
+    let doc = scenario.surface().review().unwrap().document().unwrap();
     let placements: Vec<AnchorPlacement> = (0..doc.len())
         .filter_map(|index| match doc.item(index) {
             Some(ReviewItem::Thread(thread)) => Some(thread.placement),

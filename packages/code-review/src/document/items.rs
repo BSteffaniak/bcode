@@ -165,6 +165,22 @@ pub struct FileHeaderItem {
     pub collapsed: bool,
 }
 
+/// The end of a file: the break before the next one (see [`super::FileChrome::ends`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEndItem {
+    /// File.
+    pub file: FileRef,
+    /// Position (1-based) of the next file of the same group, when there is one.
+    pub next_position: Option<u32>,
+    /// Files in the group.
+    pub count: u32,
+    /// This file is folded: its card ends at its header.
+    pub folded: bool,
+    /// This file and the next are both folded: a run of folded headers reads as a list, so the
+    /// break between them is a light one.
+    pub tight: bool,
+}
+
 /// The facts and actions under a file's header (see [`super::FileChrome::details`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDetailsItem {
@@ -446,7 +462,7 @@ pub enum ReviewItem {
     /// Facts and actions under a file header.
     FileDetails(FileDetailsItem),
     /// The end of a file: the break before the next one.
-    FileEnd(FileRef),
+    FileEnd(FileEndItem),
     /// Placeholder for non-resident content.
     Placeholder(PlaceholderItem),
     /// File notice.
@@ -481,7 +497,7 @@ impl ReviewItem {
             },
             Self::FileHeader(item) => ItemKey::FileHeader(item.file.clone()),
             Self::FileDetails(item) => ItemKey::FileDetails(item.file.clone()),
-            Self::FileEnd(file) => ItemKey::FileEnd(file.clone()),
+            Self::FileEnd(end) => ItemKey::FileEnd(end.file.clone()),
             Self::Placeholder(item) => ItemKey::Placeholder(item.file.clone()),
             Self::FileNotice(item) => ItemKey::FileNotice {
                 file: item.file.clone(),
@@ -525,7 +541,7 @@ impl ReviewItem {
         match self {
             Self::FileHeader(FileHeaderItem { file, .. })
             | Self::FileDetails(FileDetailsItem { file, .. })
-            | Self::FileEnd(file)
+            | Self::FileEnd(FileEndItem { file, .. })
             | Self::Placeholder(PlaceholderItem { file, .. })
             | Self::FileNotice(FileNoticeItem { file, .. })
             | Self::HunkHeader(HunkHeaderItem { file, .. })

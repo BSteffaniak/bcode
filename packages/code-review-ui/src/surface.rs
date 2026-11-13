@@ -787,6 +787,7 @@ impl ReviewSurface {
             config,
             document_config: DocumentConfig {
                 viewed_reset: config.viewed_reset,
+                fold_viewed: config.fold_viewed(),
                 ..DocumentConfig::default()
             },
             inbox: Inbox::default(),
@@ -1203,20 +1204,23 @@ impl ReviewSurface {
     }
 
     /// How files are separated, from the configuration and the theme.
-    const fn separation(&self) -> super::rows::file::Separation {
+    fn separation(&self) -> super::rows::file::Separation {
         use super::config::view::{FilePage, FileSeparator};
-        use super::rows::file::Separation;
-        match self.config.file_separator {
-            FileSeparator::Torn => match self.config.file_page {
-                FilePage::Off => Separation::Torn { desk: false },
-                FilePage::Auto | FilePage::On if self.theme.has_desk() => {
-                    Separation::Torn { desk: true }
-                }
-                // A theme without a desk color cannot tear a page over it.
-                FilePage::Auto | FilePage::On => Separation::Rule,
-            },
-            FileSeparator::Rule | FileSeparator::None => Separation::Rule,
-            FileSeparator::Space => Separation::Space,
+        use super::rows::file::{Separation, SeparatorStyle};
+        let desk = self.config.file_page != FilePage::Off && self.theme.has_desk();
+        let style = match self.config.file_separator {
+            // Cards need a desk to sit on and half blocks to draw their edges.
+            FileSeparator::Card if desk && self.theme.icons.half_upper == "▀" => {
+                SeparatorStyle::Card
+            }
+            FileSeparator::Card | FileSeparator::Rule | FileSeparator::None => SeparatorStyle::Rule,
+            FileSeparator::Gap => SeparatorStyle::Gap { desk },
+        };
+        Separation {
+            style,
+            rows: self.config.file_separator_rows,
+            label: self.config.file_separator_label.unwrap_or(true),
+            inset: self.config.file_separator_inset,
         }
     }
 
@@ -2545,6 +2549,10 @@ impl ReviewSurface {
                 self.toggle_file_collapsed();
                 Action::Redraw
             }
+            "fold_files" | "open_files" => {
+                self.fold_files(action == "fold_files");
+                Action::Redraw
+            }
             "copy_path" => {
                 self.copy_file_path();
                 Action::Redraw
@@ -3078,6 +3086,14 @@ impl ReviewSurface {
         let Some(target) = review.doc.navigate(from, kind, direction) else {
             return false;
         };
+        // A target inside a folded file opens it; the motion then runs again over its content.
+        if let Some(file) = &target.opens
+            && repeats < MAX_MOTION_REPEATS
+        {
+            review.doc.set_collapsed(file, false);
+            review.note_splices();
+            return Self::run_motion(review, origin, kind, direction, repeats + 1);
+        }
         let policy = match kind {
             NavKind::Change | NavKind::Thread | NavKind::OpenThread | NavKind::AiAnswer => {
                 AnchorPolicy::Center

@@ -1123,6 +1123,11 @@ impl ReviewSurface {
 /// Move the cursor to an annotation; one in a file whose content is not resident moves to the
 /// file's header and finishes once the file loads.
 pub(super) fn jump_to_annotation(review: &mut Review, key: &ItemKey) {
+    // An annotation in a folded file opens it.
+    if let Some(file) = review.doc.jump_to(key).and_then(|target| target.opens) {
+        review.doc.set_collapsed(&file, false);
+        review.note_splices();
+    }
     match review.doc.jump_to(key) {
         Some(target) => {
             review.set_cursor(target.index, AnchorPolicy::Center);

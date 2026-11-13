@@ -303,8 +303,7 @@ fn the_review_follows_what_the_sessions_review_tools_change() {
         tool("write-1", "code_review.add_comment", "{}"),
         tool("view-1", "code_review.mark_viewed", "{}"),
     ];
-    let screen = send(&mut setup, &session, snapshot(items.clone()));
-    assert!(screen.contains("TOOL_DRAFTED_COMMENT"), "{}", screen.text());
+    send(&mut setup, &session, snapshot(items.clone()));
     let viewed = {
         let doc = setup.scenario.surface().document().expect("document");
         let file = doc
@@ -316,6 +315,31 @@ fn the_review_follows_what_the_sessions_review_tools_change() {
             .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed)
     };
     assert!(viewed, "the file shows as viewed");
+    // Viewed, it folds; the draft shows again once the file is opened.
+    let file = {
+        let doc = setup.scenario.surface().document().expect("document");
+        doc.file_keys()
+            .find(|file| file.path == path)
+            .cloned()
+            .expect("file")
+    };
+    assert!(
+        setup
+            .scenario
+            .surface()
+            .document()
+            .expect("document")
+            .is_collapsed(&file)
+    );
+    // Its chevron opens it.
+    let at = setup
+        .scenario
+        .frame()
+        .find("▸")
+        .expect("the folded file's chevron");
+    setup.scenario.click(at.x, at.y);
+    let screen = stable(&mut setup.scenario);
+    assert!(screen.contains("TOOL_DRAFTED_COMMENT"), "{}", screen.text());
 
     // A new navigation moves the cursor to the line.
     setup.scenario.key("g");

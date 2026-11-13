@@ -841,6 +841,30 @@ pub const ROLES: &[RoleSpec] = &[
         Some(DerivedStyle::fg(WARNING)),
     ),
     role(
+        "source.file.header",
+        RoleCategory::Source,
+        "a review file's header row; unset mixes the accent into the canvas",
+        None,
+    ),
+    role(
+        "source.file.desk",
+        RoleCategory::Source,
+        "the space between a review's files; unset steps the canvas by contrast",
+        None,
+    ),
+    role(
+        "source.file.edge",
+        RoleCategory::Source,
+        "a review file's card edge and rule (foreground); unset is the page over the desk",
+        None,
+    ),
+    role(
+        "source.file.label",
+        RoleCategory::Source,
+        "the label on the rule between a review's files; unset uses text.muted",
+        None,
+    ),
+    role(
         "diff.text",
         RoleCategory::Source,
         "diff text",

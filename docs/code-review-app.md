@@ -270,7 +270,7 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   buttons for what the provider and your permissions allow: **Approve**, **Request changes**,
   **Comment**, **Open ↗**, and **↻** to read it again. Clicking the summary (or `ctrl+o`) goes to
   the pull request's card.
-* **The card** comes before the pull request's files, as the top of its page, torn off from the
+* **The card** comes before the pull request's files, as the top of its page, set apart from the
   first file like files are from each other, so a stack reads as one page per pull request. It
   holds the title, the status line with the same buttons and a ▾/▸ toggle (`z` on the card also
   folds it), the description, each reviewer's latest verdict (and whether it was given on an
@@ -457,7 +457,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `shift+m` | Mark the review pass complete |
 | `enter` | Actions of the thread or AI answer (reveals a gap) |
 | `z` | Collapse or expand the thread (whole or preview AI answer) |
-| `shift+z` | Collapse every thread (expand all when all are collapsed) |
+| `shift+z` | Collapse every thread (expand all when all are collapsed); on a file's header, fold every file (open all when all are folded) |
 | `shift+h` | Show / hide resolved threads |
 | `h` | Show / hide viewed files in the file panel |
 | palette only | Next open thread |
@@ -484,7 +484,9 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | palette only | Copy a Markdown review report |
 | palette only | Edit the review's sources… |
 | palette only | Ask Bcode about this file |
-| palette only | Collapse this file to its header (or expand it); `z` on a file's header |
+| palette only | Fold this file to its header (or open it); `z` on a file's header, or its ▾/▸ chevron |
+| palette only | Fold every file to its header |
+| palette only | Open every file, viewed ones too |
 | palette only | Copy this file's path |
 | `ctrl+o` | Pull request: open or close its overview (reviews, checks, conversation) |
 | palette only | Pull request: approve… |
@@ -571,13 +573,18 @@ bcode's own (`--print-config-paths` lists them in order):
   that review, saved or not) or `"every_open"`. Invalid values are reported and the defaults are
   used.
 * `[plugins.config."bcode.code_review".review_v2]` `file_header` (`auto`, the default, by the
-  review pane's size; `compact`, `comfortable` or `spacious`), `file_separator` (`torn`, the
-  default; `rule`, `space` or `none`) and `file_page` (`auto`, `on` or `off`: whether torn files
-  read as pages over a desk color). See [`review-file-separation.md`](review-file-separation.md).
+  review pane's size; `compact`, `comfortable` or `spacious`); `file_separator` (`card`, the
+  default: files as cards on a desk color; `rule`, labeled with the next file's position; `gap`;
+  or `none`), with `file_separator_rows` (1 to 3; unset follows the density),
+  `file_separator_label` (default true) and `file_separator_inset` (default false);
+  `file_page` (`auto`, `on` or `off`: whether a desk color is used; without one cards become a
+  rule); and `fold_viewed_files` (default true: a viewed file folds to its header). Themes can
+  set the `source.file.header`, `source.file.desk`, `source.file.edge` and `source.file.label`
+  roles. See [`review-separators-and-folding.md`](review-separators-and-folding.md).
 * `[plugins.config."bcode.code_review".conversation]`: pull request conversations.
   `enabled` (default true); `replies` (`"send_now"`, the default, or `"with_review"`: where a
-  reply to a pull request thread goes, the other way being a button); `overview` (`"auto"`, the
-  default: one line unless something is new, `"collapsed"` or `"expanded"`); `notify` (which new
+  reply to a pull request thread goes, the other way being a button); `overview` (`"expanded"`,
+  the default, `"auto"`: folded unless something is new, or `"collapsed"`); `notify` (which new
   activity makes a toast: `"reviews_and_replies"`, the default, `"all"`, `"reviews"` or
   `"none"`); `fold_resolved` (default true); `outdated_on_file` (default true: threads whose code
   could not be followed show on their file). Its `signals` table: `provider` (default true: use

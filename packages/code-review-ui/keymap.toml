@@ -192,7 +192,7 @@ keymap_actions = [
     { id = "bcode.code_review.fold", scope = "code-review", description = "Collapse or expand the thread, AI answer, or file (on its header)", defaults = [
         "z",
     ] },
-    { id = "bcode.code_review.fold_all", scope = "code-review", description = "Collapse every thread (expand all when all are collapsed)", defaults = [
+    { id = "bcode.code_review.fold_all", scope = "code-review", description = "Collapse every thread (expand all when all are collapsed); on a file's header, fold every file (open all when all are folded)", defaults = [
         "shift+z",
     ] },
     { id = "bcode.code_review.resolved_toggle", scope = "code-review", description = "Show / hide resolved threads", defaults = [
@@ -252,7 +252,11 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.ask_file", scope = "code-review", description = "Ask Bcode about this file", defaults = [
     ] },
-    { id = "bcode.code_review.collapse_file", scope = "code-review", description = "Collapse this file to its header (or expand it)", defaults = [
+    { id = "bcode.code_review.collapse_file", scope = "code-review", description = "Fold this file to its header (or open it); viewed files fold by themselves", defaults = [
+    ] },
+    { id = "bcode.code_review.fold_files", scope = "code-review", description = "Fold every file to its header", defaults = [
+    ] },
+    { id = "bcode.code_review.open_files", scope = "code-review", description = "Open every file, viewed ones too", defaults = [
     ] },
     { id = "bcode.code_review.copy_path", scope = "code-review", description = "Copy this file's path", defaults = [
     ] },

@@ -36,17 +36,17 @@ pub use anchors::{AnchorLines, AnchorTarget, Annotations, DocAnchor, target_of};
 pub use build::estimate_rows;
 pub use interval::IntervalSet;
 pub use items::{
-    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileHeaderItem, FileLoad,
-    FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayerNumber, LayoutMode, LineContent,
-    LineItem, LineKind, LinePairItem, OutdatedReason, PairSide, PlaceholderItem, ReviewItem,
-    SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem,
+    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileEndItem, FileHeaderItem,
+    FileLoad, FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayerNumber, LayoutMode,
+    LineContent, LineItem, LineKind, LinePairItem, OutdatedReason, PairSide, PlaceholderItem,
+    ReviewItem, SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem,
 };
 pub use keys::{FileKey, FileNoticeKind, FileRef, ItemKey};
 pub use navigation::{
     Direction, NavKind, NavTarget, SearchError, SearchMatch, SearchQuery, SearchResults,
 };
 pub use review::{
-    DEFAULT_RESIDENCY_BUDGET_BYTES, DocumentConfig, DocumentNeed, FileChrome, GroupInfo,
+    DEFAULT_RESIDENCY_BUDGET_BYTES, DocumentConfig, DocumentNeed, FileChrome, FileFold, GroupInfo,
     REVIEW_LEVEL_PATH, ReviewDocument, Sections, SourceInput, SourceStack, Splice, Ticket,
     ViewedProgress,
 };

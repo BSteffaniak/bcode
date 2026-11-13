@@ -206,6 +206,10 @@ The density thresholds are constants, not settings, unless use shows they need t
 
 ## Status
 
+The torn edges are replaced by cards, a labeled rule and gaps, and files fold by their viewed
+mark: see [`review-separators-and-folding.md`](review-separators-and-folding.md). What follows is
+the status of this plan as it was implemented first.
+
 Implemented, not committed.
 
 * **Phases 1–3:**

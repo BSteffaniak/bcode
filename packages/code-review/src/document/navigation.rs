@@ -3,7 +3,9 @@
 //! Targets are computed over the whole review. A target inside a file whose content is not
 //! resident is reported at that file's header with `needs_load`, at the position of its
 //! placeholder in the motion's order, so the client can load the file and repeat the motion
-//! from where it started; nothing is skipped because it was not loaded yet.
+//! from where it started; nothing is skipped because it was not loaded yet. A target inside a
+//! folded file is reported at its header with `opens`, so the client opens the file and
+//! repeats the motion.
 
 use super::items::ReviewItem;
 use super::keys::{FileKey, FileRef, ItemKey};
@@ -49,6 +51,9 @@ pub struct NavTarget {
     /// are its header (to scroll to meanwhile); load the file and repeat the motion from the
     /// original position (resolved again by its key, since loading changes indices).
     pub needs_load: Option<FileRef>,
+    /// The real target lies inside this folded file: `index` and `key` are its header. Open the
+    /// file and repeat the motion from the original position.
+    pub opens: Option<FileRef>,
 }
 
 /// A search over loaded content.
@@ -132,6 +137,11 @@ impl ReviewDocument {
                     Direction::Forward => index > from,
                     Direction::Backward => index < from,
                 };
+                if local == 0
+                    && let Some(target) = self.folded_target(block, from, kind, direction)
+                {
+                    return Some(target);
+                }
                 if !beyond {
                     continue;
                 }
@@ -145,6 +155,7 @@ impl ReviewDocument {
                         index: start,
                         key: items[0].key(),
                         needs_load: Some(self.files[file].key.clone()),
+                        opens: None,
                     });
                 }
                 if self.is_target(block, local, kind) {
@@ -152,6 +163,7 @@ impl ReviewDocument {
                         index,
                         key: items[local].key(),
                         needs_load: None,
+                        opens: None,
                     });
                 }
             }
@@ -189,7 +201,42 @@ impl ReviewDocument {
         }
     }
 
-    /// Whether a non-resident file can contain a target of `kind`.
+    /// The header of the folded file of `block` when its hidden content holds a target of
+    /// `kind` that lies beyond item `from` in `direction`. The content would sit before the
+    /// file's end (after its header and details).
+    fn folded_target(
+        &self,
+        block: usize,
+        from: usize,
+        kind: NavKind,
+        direction: Direction,
+    ) -> Option<NavTarget> {
+        let BlockKind::File(file) = self.blocks[block].kind else {
+            return None;
+        };
+        if matches!(kind, NavKind::File | NavKind::UnviewedFile) || !self.folded(file) {
+            return None;
+        }
+        let start = self.block_start(block);
+        let items = &self.blocks[block].items;
+        let content_at = start
+            + items
+                .iter()
+                .take_while(|item| !matches!(item, ReviewItem::FileEnd(_)))
+                .count();
+        let beyond = match direction {
+            Direction::Forward => content_at > from,
+            Direction::Backward => content_at <= from,
+        };
+        (beyond && self.may_contain(file, kind)).then(|| NavTarget {
+            index: start,
+            key: items[0].key(),
+            needs_load: None,
+            opens: Some(self.files[file].key.clone()),
+        })
+    }
+
+    /// Whether a non-resident (or folded) file can contain a target of `kind`.
     fn may_contain(&self, file: usize, kind: NavKind) -> bool {
         let state = &self.files[file];
         let changed = state.entry.additions + state.entry.deletions > 0;
@@ -216,6 +263,7 @@ impl ReviewDocument {
                 index,
                 key: self.item(index)?.key(),
                 needs_load: None,
+                opens: None,
             });
         }
         // Keys inside a file (including threads anchored in it) fall back to its header.
@@ -227,10 +275,12 @@ impl ReviewDocument {
         }
         let state = &self.files[file];
         let index = self.block_start(state.block);
+        let folded = self.folded(file);
         Some(NavTarget {
             index,
             key: ItemKey::FileHeader(state.key.clone()),
-            needs_load: state.loaded().is_none().then(|| state.key.clone()),
+            needs_load: (!folded && state.loaded().is_none()).then(|| state.key.clone()),
+            opens: folded.then(|| state.key.clone()),
         })
     }
 
@@ -404,13 +454,14 @@ impl ReviewDocument {
     ) -> Option<NavTarget> {
         let indices = self.match_indices(results);
         let found = match direction {
-            Direction::Forward => indices.into_iter().find(|(index, _)| *index > from),
-            Direction::Backward => indices.into_iter().rev().find(|(index, _)| *index < from),
+            Direction::Forward => indices.into_iter().find(|(index, ..)| *index > from),
+            Direction::Backward => indices.into_iter().rev().find(|(index, ..)| *index < from),
         }?;
         Some(NavTarget {
             index: found.0,
             key: found.1,
             needs_load: None,
+            opens: found.2,
         })
     }
 
@@ -431,21 +482,30 @@ impl ReviewDocument {
             index: found.0,
             key: found.1,
             needs_load: None,
+            opens: found.2,
         })
     }
 
-    /// The items holding a match in the current layout, in order, one per item.
-    fn match_indices(&self, results: &SearchResults) -> Vec<(usize, ItemKey)> {
-        let mut indices: Vec<(usize, ItemKey)> = results
+    /// The items holding a match in the current layout, in order, one per item. Matches in a
+    /// folded file are at its header, with the file to open.
+    fn match_indices(&self, results: &SearchResults) -> Vec<(usize, ItemKey, Option<FileRef>)> {
+        let mut indices: Vec<(usize, ItemKey, Option<FileRef>)> = results
             .matches
             .iter()
             .filter_map(|found| {
-                let index = self.index_of(&found.key())?;
-                Some((index, self.item(index)?.key()))
+                if let Some(index) = self.index_of(&found.key()) {
+                    return Some((index, self.item(index)?.key(), None));
+                }
+                let file = *self.file_index.get(&found.file)?;
+                if !self.folded(file) || self.file_hidden(file) {
+                    return None;
+                }
+                let index = self.block_start(self.files[file].block);
+                Some((index, self.item(index)?.key(), Some(found.file.clone())))
             })
             .collect();
-        indices.sort_by_key(|(index, _)| *index);
-        indices.dedup_by_key(|(index, _)| *index);
+        indices.sort_by_key(|(index, ..)| *index);
+        indices.dedup_by_key(|(index, ..)| *index);
         indices
     }
 }

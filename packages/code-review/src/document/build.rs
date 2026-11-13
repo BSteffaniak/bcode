@@ -7,7 +7,7 @@
 use super::anchors::{AnchorLines, AnchorTarget, AnnotationBody};
 use super::gaps::{self, Region};
 use super::items::{
-    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileHeaderItem,
+    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileEndItem, FileHeaderItem,
     FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayoutMode, LineContent, LineItem, LineKind,
     LinePairItem, OutdatedReason, PairSide, PlaceholderItem, ReviewItem, SourceHeaderItem,
     SourceIntroItem, StackLayerLabel, ThreadItem,
@@ -19,10 +19,6 @@ use super::review::{
 };
 use bcode_code_review_models::{ReviewIndexFlag, ReviewLineKind, ReviewLineSide};
 
-/// The file key of `state`.
-fn key_of(state: &super::review::FileState) -> FileRef {
-    state.key.clone()
-}
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -260,8 +256,8 @@ impl ReviewDocument {
         let key = state.key.clone();
         let mut items = self.file_head(file);
         let mut parents = vec![None; items.len()];
-        if state.collapsed {
-            self.end_file(&key, &mut items, &mut parents);
+        if self.folded(file) {
+            self.end_file(file, &mut items, &mut parents);
             return Built {
                 items,
                 hunk_parent: parents,
@@ -308,14 +304,14 @@ impl ReviewDocument {
                 };
                 builder.content(&regions);
                 let (mut items, mut parents) = (builder.items, builder.parents);
-                self.end_file(&key_of(state), &mut items, &mut parents);
+                self.end_file(file, &mut items, &mut parents);
                 return Built {
                     items,
                     hunk_parent: parents,
                 };
             }
         }
-        self.end_file(&key_of(state), &mut items, &mut parents);
+        self.end_file(file, &mut items, &mut parents);
         Built {
             items,
             hunk_parent: parents,
@@ -348,9 +344,9 @@ impl ReviewDocument {
             carried_over: state.carried_over,
             position: u32::try_from(file - group.files.start + 1).unwrap_or(u32::MAX),
             count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),
-            collapsed: state.collapsed,
+            collapsed: self.folded(file),
         })];
-        if self.chrome.details {
+        if self.chrome.details && !self.folded(file) {
             items.push(ReviewItem::FileDetails(FileDetailsItem {
                 file: key,
                 status: state.entry.status,
@@ -363,7 +359,7 @@ impl ReviewDocument {
                     .loaded()
                     .map(|loaded| u32::try_from(loaded.hunks.len()).unwrap_or(u32::MAX)),
                 viewed: state.viewed.is_viewed(),
-                collapsed: state.collapsed,
+                collapsed: self.folded(file),
                 in_stack: group.stack.is_some(),
             }));
         }
@@ -371,16 +367,23 @@ impl ReviewDocument {
     }
 
     /// The break after `file`'s content, when the document has them.
-    fn end_file(
-        &self,
-        file: &FileRef,
-        items: &mut Vec<ReviewItem>,
-        parents: &mut Vec<Option<u32>>,
-    ) {
-        if self.chrome.ends {
-            items.push(ReviewItem::FileEnd(file.clone()));
-            parents.push(None);
+    fn end_file(&self, file: usize, items: &mut Vec<ReviewItem>, parents: &mut Vec<Option<u32>>) {
+        if !self.chrome.ends {
+            return;
         }
+        let state = &self.files[file];
+        let group = &self.groups[state.group];
+        let next = file + 1;
+        let has_next = next < group.files.end;
+        items.push(ReviewItem::FileEnd(FileEndItem {
+            file: state.key.clone(),
+            next_position: has_next
+                .then(|| u32::try_from(next - group.files.start + 1).unwrap_or(u32::MAX)),
+            count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),
+            folded: self.folded(file),
+            tight: has_next && self.folded(file) && self.folded(next),
+        }));
+        parents.push(None);
     }
 
     /// Resolve every annotation of `file` (and the composer) to a slot.

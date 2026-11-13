@@ -55,9 +55,22 @@ pub struct ReviewViewConfig {
     /// or `spacious`.
     #[serde(default)]
     pub file_header: FileHeaderDensity,
-    /// What separates files: `torn` pages, a `rule`, `space`, or `none`.
+    /// What separates files: `card` (the default), `rule`, `gap`, or `none`.
     #[serde(default)]
     pub file_separator: FileSeparator,
+    /// Rows of the break between files (1 to 3); unset follows the header density.
+    #[serde(default)]
+    pub file_separator_rows: Option<u8>,
+    /// Whether a `rule` names the next file's position (default true).
+    #[serde(default)]
+    pub file_separator_label: Option<bool>,
+    /// Whether cards keep a column of desk at each side of their edges.
+    #[serde(default)]
+    pub file_separator_inset: bool,
+    /// Whether a viewed file folds to its header by itself (default true). A file folded or
+    /// opened by hand stays so until it is marked viewed or unviewed again.
+    #[serde(default)]
+    pub fold_viewed_files: Option<bool>,
     /// Whether files read as pages on a desk: `auto` (when the theme gives a desk color), `on`,
     /// or `off`.
     #[serde(default)]
@@ -90,13 +103,15 @@ pub enum FileHeaderDensity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileSeparator {
-    /// The previous page torn off, the next one's edge torn.
+    /// Files as cards on a desk (`torn`, from before, reads as this).
     #[default]
-    Torn,
-    /// A plain rule.
+    #[serde(alias = "torn")]
+    Card,
+    /// A rule, labeled with the next file's position.
     Rule,
-    /// Blank rows.
-    Space,
+    /// Blank rows (`space` reads as this).
+    #[serde(alias = "space")]
+    Gap,
     /// Nothing.
     None,
 }
@@ -110,7 +125,7 @@ pub enum FilePage {
     Auto,
     /// Always (a theme without a desk color falls back to a rule).
     On,
-    /// Never: tears are drawn as lines.
+    /// Never: cards are drawn as rules.
     Off,
 }
 
@@ -162,6 +177,12 @@ impl ReviewViewConfig {
             self.color_depth
                 .unwrap_or(bmux_tui::capabilities::TerminalColorDepth::TrueColor),
         )
+    }
+
+    /// Whether viewed files fold by themselves.
+    #[must_use]
+    pub fn fold_viewed(self) -> bool {
+        self.fold_viewed_files.unwrap_or(true)
     }
 
     /// Tab stop interval of diff text: the configured width clamped to `1..=16`, else

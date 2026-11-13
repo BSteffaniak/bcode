@@ -166,7 +166,7 @@ rail then answers "what's approved, what's blocked, where's the discussion" with
 anything.
 
 **Layer overview.** Each pull request's card comes before its files, like the top of a pull
-request's page, and is set apart from them by the same torn edge that separates files. In a
+request's page, and is set apart from them by the same edge that separates files. In a
 stack, the cards are what break the document into pull requests. The card holds:
 * title, author, state and base;
 * reviewers, each with their verdict, and *on an older version* when the layer changed in content
@@ -297,7 +297,7 @@ Implemented end to end (not yet committed).
 * **The app:**
   * The pull request bar: one line (summary and buttons) whose summary goes to the card.
   * Pull request cards in the document (`SourceIntro` items), before each pull request's files
-    and torn off from them. A whole-stack review's card has one status line per layer.
+    and set apart from them. A whole-stack review's card has one status line per layer.
   * Remote threads with their buttons, and replies sent now or held (configurable).
   * Rail marks, and the threads panel's *on the pull request* and *waiting on you* filters.
   * Provider-backed publishing with a verdict.
@@ -327,7 +327,7 @@ Implemented end to end (not yet committed).
 * Leaving a pull request (moving to another layer) or collapsing its overview marks it seen.
 * The overview is not a panel under the bar but a card in the document, before the files, so it
   scrolls with the review and separates pull requests in a whole-stack view. The bar stays one
-  line. Its summary goes to the card. The cursor skips a file's details and torn edge.
+  line. Its summary goes to the card. The cursor skips a file's details and the break after it.
 
 **Verification:**
 
@@ -339,7 +339,7 @@ Implemented end to end (not yet committed).
   * review marks on the timeline;
   * the GitHub parsers and mappings.
 * Screen tests (`tests/conversation.rs`) against the fake provider:
-  * the bar, and the card before the files with its torn edge, folding and reopening;
+  * the bar, and the card before the files with its edge, folding and reopening;
   * resolving a thread on the provider;
   * a reply sent now;
   * a held reply submitted with an approval started from the bar;

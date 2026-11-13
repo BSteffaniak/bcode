@@ -8,13 +8,14 @@
 //! * **Details**: the file's facts (rename, language, lines, hunks, flags, layers, threads) and
 //!   its buttons (Comment, Ask, Whole file, Collapse, Through the stack, Copy path; previous and
 //!   next file when spacious).
-//! * **End**: the break before the next file. Torn: the page's bottom edge torn over the desk,
-//!   and (comfortable and spacious) the next page's top edge, both from a hash of the path so
-//!   they never change while scrolling. Or a rule, blank rows, or nothing.
+//! * **End**: the break before the next file (see `docs/review-separators-and-folding.md`).
+//!   Cards: the page's straight bottom edge over the desk and, with room, a lip raising the
+//!   next header. Or a rule labeled with the next file's position, or blank rows. Between two
+//!   folded files the break is one light row, so folded headers read as a list.
 
 use super::{ActionCells, ItemAction, ItemRows, change_bar, count_spans, header_line};
 use crate::theme::{ReviewTheme, status_letter};
-use bcode_code_review::document::{FileDetailsItem, FileHeaderItem};
+use bcode_code_review::document::{FileDetailsItem, FileEndItem, FileHeaderItem};
 use bcode_code_review_models::ReviewIndexFlag;
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
@@ -72,17 +73,43 @@ impl Density {
 
 /// How files are separated, as drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Separation {
-    /// Torn pages; `desk` when the theme gives a desk color to tear them over.
-    Torn {
-        /// The page edge is drawn in the canvas color over the desk.
-        desk: bool,
-    },
-    /// A plain rule.
+pub struct Separation {
+    /// The kind of break.
+    pub style: SeparatorStyle,
+    /// Rows of a break; `None` follows the density.
+    pub rows: Option<u8>,
+    /// A rule names the next file's position.
+    pub label: bool,
+    /// A card's edges keep a column of desk at each side.
+    pub inset: bool,
+}
+
+/// The kind of break between files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SeparatorStyle {
+    /// Files as cards on the desk: straight edges, needs a desk color.
+    Card,
+    /// A rule.
     #[default]
     Rule,
-    /// Blank rows.
-    Space,
+    /// Blank rows, on the desk when `desk`.
+    Gap {
+        /// The rows are desk colored.
+        desk: bool,
+    },
+}
+
+impl Separation {
+    /// Rows of a break at `density`; a tight one (between folded files) is one row.
+    #[must_use]
+    pub fn height(self, density: Density, tight: bool) -> u64 {
+        if tight {
+            1
+        } else {
+            self.rows
+                .map_or_else(|| density.end_rows(), |rows| u64::from(rows.clamp(1, 3)))
+        }
+    }
 }
 
 /// An action of a file's chrome.
@@ -163,10 +190,6 @@ fn header_facts(item: &FileHeaderItem, theme: &ReviewTheme, counts: bool) -> Vec
         ));
         trailing.push(Span::raw(" "));
     }
-    if item.collapsed {
-        trailing.push(Span::styled("collapsed", theme.badge_outdated));
-        trailing.push(Span::raw(" "));
-    }
     for (flag, label, style) in [
         (ReviewIndexFlag::Binary, "binary", theme.status_binary),
         (ReviewIndexFlag::ModeChanged, "mode", theme.muted),
@@ -204,15 +227,38 @@ fn header_facts(item: &FileHeaderItem, theme: &ReviewTheme, counts: bool) -> Vec
     trailing
 }
 
-/// The lead of a header row: the accent bar in the status color, then `rest`.
-fn lead(item: &FileHeaderItem, theme: &ReviewTheme, rest: Vec<Span>) -> Vec<Span> {
+/// The lead of a header row: the accent bar in the status color, the fold chevron (on the
+/// first row; blank on others), then `rest`.
+fn lead(item: &FileHeaderItem, theme: &ReviewTheme, chevron: bool, rest: Vec<Span>) -> Vec<Span> {
     let bar = theme
         .status(item.status)
         .fg
         .map_or(theme.accent, |fg| Style::new().fg(fg));
-    let mut spans = vec![Span::styled(theme.icons.accent_bar, bar), Span::raw(" ")];
+    let fold = if !chevron {
+        " ".repeat(display_width(theme.icons.menu))
+    } else if item.collapsed {
+        theme.icons.collapsed.to_owned()
+    } else {
+        theme.icons.menu.to_owned()
+    };
+    let mut spans = vec![
+        Span::styled(theme.icons.accent_bar, bar),
+        Span::raw(" "),
+        Span::styled(fold, theme.muted),
+        Span::raw(" "),
+    ];
     spans.extend(rest);
     spans
+}
+
+/// The fold chevron's cells on a header's first row.
+fn chevron_action(theme: &ReviewTheme) -> ActionCells<ItemAction> {
+    let start = display_width(theme.icons.accent_bar) + 1;
+    ActionCells {
+        row: 0,
+        cells: cells(start)..cells(start + display_width(theme.icons.menu)),
+        action: ItemAction::File(FileAction::Collapse),
+    }
 }
 
 /// The status pill, ` M `.
@@ -259,7 +305,7 @@ pub fn header_rows(
             trailing.push(viewed_span(item.viewed, false, theme));
             trailing.push(Span::raw(" "));
             let line = header_line(
-                &Line::from_spans(lead(item, theme, content)),
+                &Line::from_spans(lead(item, theme, true, content)),
                 &Line::from_spans(trailing),
                 width,
                 fill,
@@ -267,11 +313,14 @@ pub fn header_rows(
             let mark = width.saturating_sub(2);
             ItemRows::lines(
                 vec![line],
-                vec![ActionCells {
-                    row: 0,
-                    cells: cells(mark)..cells(mark + 1),
-                    action: ItemAction::File(FileAction::Viewed),
-                }],
+                vec![
+                    chevron_action(theme),
+                    ActionCells {
+                        row: 0,
+                        cells: cells(mark)..cells(mark + 1),
+                        action: ItemAction::File(FileAction::Viewed),
+                    },
+                ],
             )
         }
         Density::Spacious => {
@@ -282,7 +331,7 @@ pub fn header_rows(
             let position = format!("   {} of {} files ", item.position, item.count);
             let trailing = vec![viewed, Span::styled(position.clone(), theme.muted)];
             let top = header_line(
-                &Line::from_spans(lead(item, theme, first)),
+                &Line::from_spans(lead(item, theme, true, first)),
                 &Line::from_spans(trailing),
                 width,
                 fill,
@@ -301,18 +350,21 @@ pub fn header_rows(
                 ));
             }
             let bottom = header_line(
-                &Line::from_spans(lead(item, theme, second)),
+                &Line::from_spans(lead(item, theme, false, second)),
                 &Line::from_spans(header_facts(item, theme, true)),
                 width,
                 fill,
             );
             ItemRows::lines(
                 vec![top, bottom],
-                vec![ActionCells {
-                    row: 0,
-                    cells: cells(start)..cells(start + viewed_width),
-                    action: ItemAction::File(FileAction::Viewed),
-                }],
+                vec![
+                    chevron_action(theme),
+                    ActionCells {
+                        row: 0,
+                        cells: cells(start)..cells(start + viewed_width),
+                        action: ItemAction::File(FileAction::Viewed),
+                    },
+                ],
             )
         }
     }
@@ -503,87 +555,108 @@ pub fn details_rows(
     ItemRows::lines(vec![Line::from_spans(spans_all).truncate(width)], actions)
 }
 
-/// A stable pseudo-random value of `path`, `salt`, and `x`.
-fn noise(path: &str, salt: u64, x: usize) -> u64 {
-    // FNV-1a over the path, then a mix with the column: the same file always tears the same.
-    let mut hash: u64 = 0xcbf2_ce48_4222_2325 ^ salt;
-    for byte in path.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    let mut value = hash ^ (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    value ^= value >> 33;
-    value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    value ^= value >> 33;
-    value
+/// What a break separates: the file it ends (`None` for a source's introduction).
+#[derive(Debug, Clone, Copy)]
+pub struct Break<'a> {
+    /// The file ending, with the next file's position.
+    pub end: Option<&'a FileEndItem>,
 }
 
-/// One torn edge of `width` cells from `glyphs` (full, thin, gone): runs of a few cells each,
-/// mostly full, so it reads as a ragged edge rather than noise.
-fn tear_row(glyphs: [&'static str; 3], seed: &str, salt: u64, width: usize) -> String {
-    let mut row = String::with_capacity(width * 3);
-    let mut x = 0;
-    let mut run = 0;
-    while x < width {
-        let value = noise(seed, salt, run);
-        let level = match value % 10 {
-            0..=5 => 0,
-            6..=8 => 1,
-            _ => 2,
-        };
-        let length = 1 + usize::try_from((value >> 8) % 4).unwrap_or(0);
-        for _ in 0..length.min(width - x) {
-            row.push_str(glyphs[level]);
-        }
-        x += length;
-        run += 1;
+/// One row of `glyph` across `width`, with a cell of `margin` at each side when `inset`.
+fn edge_row(glyph: &str, style: Style, margin: Style, inset: bool, width: usize) -> Line {
+    if !inset || width < 3 {
+        return Line::from_spans(vec![Span::styled(glyph.repeat(width), style)]);
     }
-    row
+    Line::from_spans(vec![
+        Span::styled(" ", margin),
+        Span::styled(glyph.repeat(width - 2), style),
+        Span::styled(" ", margin),
+    ])
 }
 
-/// Rows of a break: torn (by `seed`, so each tears its own way), a rule, or blank, at
-/// `density`.
+/// A rule across `width`, ending in ` N of M ` when `label` names one.
+fn rule_row(label: Option<String>, theme: &ReviewTheme, width: usize) -> Line {
+    let glyph = theme.icons.file_rule;
+    let Some(label) = label.filter(|label| display_width(label) + 6 <= width) else {
+        return Line::from_spans(vec![Span::styled(glyph.repeat(width), theme.files.rule)]);
+    };
+    let tail = 2;
+    let lead = width - display_width(&label) - tail;
+    Line::from_spans(vec![
+        Span::styled(glyph.repeat(lead), theme.files.rule),
+        Span::styled(label, theme.files.label),
+        Span::styled(glyph.repeat(tail), theme.files.rule),
+    ])
+}
+
+/// Rows of a break at `density`: a card's edges, a rule, or blank rows.
 #[must_use]
 pub fn end_rows(
-    seed: &str,
+    at: Break,
     separation: Separation,
     density: Density,
     theme: &ReviewTheme,
     width: usize,
 ) -> ItemRows {
-    let rows = density.end_rows();
+    let tight = at.end.is_some_and(|end| end.tight);
+    let rows = usize::try_from(separation.height(density, tight)).unwrap_or(1);
+    let desk = theme.files.desk;
     let blank = |style: Style| Line::from_spans(vec![Span::styled(" ".repeat(width), style)]);
-    let lines: Vec<Line> = match separation {
-        Separation::Space => (0..rows).map(|_| blank(Style::new())).collect(),
-        Separation::Rule => (0..rows)
-            .map(|row| {
-                if row == rows / 2 {
-                    Line::from_spans(vec![Span::styled(
-                        theme.icons.file_rule.repeat(width),
-                        theme.gap,
-                    )])
-                } else {
-                    blank(Style::new())
-                }
-            })
-            .collect(),
-        Separation::Torn { desk } => {
-            let style = if desk { theme.files.tear } else { theme.gap };
-            let gap = if desk { theme.files.desk } else { Style::new() };
-            let bottom = Line::from_spans(vec![Span::styled(
-                tear_row(theme.icons.tear_bottom, seed, 1, width),
-                style,
-            )]);
-            // The next page's top edge tears differently from this page's bottom.
-            let top = Line::from_spans(vec![Span::styled(
-                tear_row(theme.icons.tear_top, seed, 2, width),
-                style,
-            )]);
-            match density {
-                Density::Compact => vec![bottom],
-                Density::Comfortable => vec![bottom, top],
-                Density::Spacious => vec![bottom, blank(gap), top],
+    let label = at
+        .end
+        .filter(|_| separation.label && !tight)
+        .and_then(|end| {
+            end.next_position
+                .map(|next| format!(" {next} of {} ", end.count))
+        });
+    let lines: Vec<Line> = match separation.style {
+        SeparatorStyle::Gap { desk: on_desk } => {
+            let style = if on_desk { desk } else { Style::new() };
+            (0..rows).map(|_| blank(style)).collect()
+        }
+        SeparatorStyle::Rule => {
+            let mut label = label;
+            (0..rows)
+                .map(|row| {
+                    if row == rows / 2 {
+                        rule_row(label.take(), theme, width)
+                    } else {
+                        blank(Style::new())
+                    }
+                })
+                .collect()
+        }
+        // Between folded files: a sliver of desk, so the headers read as a list of cards.
+        SeparatorStyle::Card if tight => vec![blank(desk)],
+        SeparatorStyle::Card => {
+            // A folded file's card ends at its header; an open one's at its page.
+            let bottom = if at.end.is_some_and(|end| end.folded) {
+                theme.files.lip
+            } else {
+                theme.files.page_edge
+            };
+            let mut lines = vec![edge_row(
+                theme.icons.half_upper,
+                bottom,
+                desk,
+                separation.inset,
+                width,
+            )];
+            // The next card's lip, under a file with one after it (not before a source).
+            let lip = at.end.is_some_and(|end| end.next_position.is_some()) && rows > 1;
+            for _ in 1..rows - usize::from(lip) {
+                lines.push(blank(desk));
             }
+            if lip {
+                lines.push(edge_row(
+                    theme.icons.half_lower,
+                    theme.files.lip,
+                    desk,
+                    separation.inset,
+                    width,
+                ));
+            }
+            lines
         }
     };
     ItemRows::lines(lines, Vec::new())
@@ -624,18 +697,6 @@ mod tests {
             Density::for_size(89, 30, Density::Compact),
             Density::Compact
         );
-    }
-
-    #[test]
-    fn a_tear_is_the_same_for_a_file_and_differs_between_files() {
-        let glyphs = ["▀", "▔", " "];
-        let one = tear_row(glyphs, "a.rs", 1, 60);
-        assert_eq!(one, tear_row(glyphs, "a.rs", 1, 60));
-        assert_ne!(one, tear_row(glyphs, "b.rs", 1, 60));
-        assert_eq!(one.chars().count(), 60);
-        // Mostly paper, with ragged bits.
-        let full = one.chars().filter(|c| *c == '▀').count();
-        assert!(full > 20 && full < 60, "{one}");
     }
 
     #[test]

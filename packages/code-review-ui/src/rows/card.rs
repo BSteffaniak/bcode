@@ -366,7 +366,13 @@ pub fn card_rows(
         [link] => single(&mut rows, link, item.under_header, cx, theme),
         layers => stack(&mut rows, layers, cx, theme),
     }
-    let mut end = super::file::end_rows(&item.source_id, separation, density, theme, width);
+    let mut end = super::file::end_rows(
+        super::file::Break { end: None },
+        separation,
+        density,
+        theme,
+        width,
+    );
     let mut built = rows.lines;
     let actions = Rows::actions(rows.regions);
     built.append(&mut end.lines);

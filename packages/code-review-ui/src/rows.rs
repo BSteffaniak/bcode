@@ -467,6 +467,15 @@ enum ContentStamp {
         /// Layers that change the file.
         layers: usize,
     },
+    /// A file's break: whether the file (and the next) is folded, and the next file's place.
+    End {
+        /// The file is folded.
+        folded: bool,
+        /// The file and the next are folded.
+        tight: bool,
+        /// The next file's position and the group's file count.
+        next: (Option<u32>, u32),
+    },
 }
 
 impl ContentStamp {
@@ -497,6 +506,11 @@ impl ContentStamp {
                 threads: details.thread_count,
                 counts: (details.line_count, details.hunks),
                 layers: details.layers.len(),
+            },
+            ReviewItem::FileEnd(end) => Self::End {
+                folded: end.folded,
+                tight: end.tight,
+                next: (end.next_position, end.count),
             },
             _ => Self::Fixed,
         }
@@ -675,7 +689,10 @@ impl RowContext<'_> {
                 LAYER_BANNER_ROWS
             }
             ReviewItem::FileHeader(_) => self.params.density.header_rows(),
-            ReviewItem::FileEnd(_) => self.params.density.end_rows(),
+            ReviewItem::FileEnd(end) => self
+                .params
+                .separation
+                .height(self.params.density, end.tight),
             _ => 1,
         };
         Some(height)
@@ -701,7 +718,7 @@ impl RowContext<'_> {
             ReviewItem::SourceIntro(item) => self.cards.as_ref().map_or_else(
                 || {
                     file::end_rows(
-                        &item.source_id,
+                        file::Break { end: None },
                         self.params.separation,
                         self.params.density,
                         styles,
@@ -725,8 +742,8 @@ impl RowContext<'_> {
             ReviewItem::FileDetails(item) => {
                 file::details_rows(item, self.params.density, styles, cells)
             }
-            ReviewItem::FileEnd(file) => file::end_rows(
-                &file.path,
+            ReviewItem::FileEnd(end) => file::end_rows(
+                file::Break { end: Some(end) },
                 self.params.separation,
                 self.params.density,
                 styles,

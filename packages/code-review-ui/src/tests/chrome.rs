@@ -44,6 +44,7 @@ pub(super) fn host_theme(accent: Rgb) -> ComponentStyles {
     let accent_color = Color::Rgb(accent.r, accent.g, accent.b);
     ComponentStyles {
         component,
+        files: bcode_tui_theme::components::FileChromeRoles::default(),
         diff: DiffViewerStyle {
             text: component.text,
             muted: style(110, 110, 120),
