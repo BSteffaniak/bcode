@@ -592,9 +592,12 @@ impl ReviewTheme {
         Line::from_spans(vec![Span::styled(format!(" {title} "), style)])
     }
 
-    /// A pane's right title, ` status `, in muted text.
+    /// A pane's right title, ` status `, in muted text; nothing when the status is empty.
     #[must_use]
     pub fn pane_status(&self, status: &str) -> Line {
+        if status.is_empty() {
+            return Line::default();
+        }
         Line::from_spans(vec![Span::styled(format!(" {status} "), self.muted)])
     }
 

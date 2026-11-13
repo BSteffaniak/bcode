@@ -105,6 +105,7 @@ mod tests {
             FILES_SCOPE,
             THREADS_SCOPE,
             ASSISTANT_SCOPE,
+            FEED_SCOPE,
             WIZARD_SCOPE,
         ] {
             assert!(

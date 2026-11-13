@@ -1311,6 +1311,8 @@ fn palette_and_help_come_from_the_keymap_and_run_actions() {
     assert!(help.contains(&"Save the comment"));
     assert!(screen.contains("Keys"), "{}", screen.text());
     assert!(help.contains(&"File panel") && help.contains(&"Threads panel"));
+    assert!(help.contains(&"AI card") && help.contains(&"Stop the AI card's running turn"));
+    assert!(help.contains(&"Review assistant") && help.contains(&"Start a new conversation"));
     assert!(help.contains(&"Next threads filter"));
     setup.scenario.key("end");
     let scrolled = setup.scenario.render();

@@ -3394,6 +3394,11 @@ impl ReviewSurface {
                 Some("AI card"),
             ));
             entries.extend(super::palette::entries(
+                &crate::keymap::actions_for(ASSISTANT_SCOPE),
+                keys(ASSISTANT_SCOPE),
+                Some("Review assistant"),
+            ));
+            entries.extend(super::palette::entries(
                 &crate::keymap::actions_for(FILES_SCOPE),
                 keys(FILES_SCOPE),
                 Some("File panel"),

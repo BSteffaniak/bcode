@@ -211,6 +211,9 @@ fn the_dock_sits_under_the_review_when_the_body_is_narrow() {
     let title = screen.find("Assistant").expect("dock title");
     let review = screen.find("Review").expect("review title");
     assert!(title.y > review.y + 5, "{title:?} under {review:?}");
+    // With no conversation yet there is no status, so the border runs to the corner.
+    let title_row = screen.row_text(title.y);
+    assert!(title_row.trim_end().ends_with("─╮"), "{title_row:?}");
     // Too short for a bottom panel: no dock, and focus stays usable in the review.
     setup.scenario.resize(100, 16);
     let screen = stable(&mut setup.scenario);
