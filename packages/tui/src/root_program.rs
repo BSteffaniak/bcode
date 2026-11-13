@@ -5735,12 +5735,9 @@ mod tests {
     /// engine, its rows are published as visual targets from the presented frame, a
     /// right-button press focuses the visual, the focused visual's keys (`shell.terminal.*`)
     /// reach the adapter, which scrolls its screen, and Escape releases it.
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn v2_shell_alternate_screen_takes_pointer_focus_and_terminal_keys() {
-        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-        use bmux_tui::geometry::{Point, Rect};
-        use bmux_tui_runtime::{Presenter, Program, RuntimeEvent, TimerId};
+    /// A root model showing one running `shell.run` request whose terminal has shown `output`,
+    /// through the bundled shell plugin.
+    fn shell_terminal_model(output: &str) -> super::BcodeRuntimeModel {
         let session_id = bcode_session_models::SessionId::new();
         let mut model = root_test_model_with_history(session_id, &[]);
         let bundled = [bcode_plugin::StaticBundledPlugin::new(
@@ -5761,7 +5758,7 @@ mod tests {
             .set_effective_keymap(model.settings.keymap().shared_registry());
         let payload = serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
             "live_state_key":"shell-navigation-v2", "columns":80, "rows":24, "streaming":true,
-            "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}});
+            "output": output}});
         let registry = model
             .chat
             .app
@@ -5818,6 +5815,97 @@ mod tests {
             std::time::Instant::now(),
         );
         model.transcript_host = Box::new(host);
+        model
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn v2_running_shell_command_takes_focus_and_typed_keys() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::{Presenter, Program, RuntimeEvent, TimerId};
+        // An ordinary command waiting at a prompt: no full-screen program.
+        let mut model = shell_terminal_model("name? ");
+        let mut daemon = super::super::chat_loop::typed_input_tests::typed_input_daemon(2);
+        model.loop_state = Box::new(super::super::chat_loop::ChatLoopState::new(
+            &daemon.client,
+            &daemon.client,
+            false,
+        ));
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 60, 40));
+        let mut present = |model: &mut super::BcodeRuntimeModel| {
+            model.presentation_damage = bmux_tui::damage::Damage::Full;
+            let report = super::bcode_runtime_presenter(&mut terminal)
+                .present(model)
+                .unwrap();
+            let _ = model.presentation_committed(report);
+            let buffer = terminal.retained_buffer().expect("retained buffer");
+            (0..buffer.area().height)
+                .map(|row| buffer.row_symbols(row).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let update = |model: &mut super::BcodeRuntimeModel, event| {
+            Program::update(model, event).expect("update");
+        };
+        let key = |model: &mut super::BcodeRuntimeModel, key: &str| {
+            Program::update(
+                model,
+                RuntimeEvent::Terminal(Event::Key(bmux_keyboard::parse_key_stroke(key).unwrap())),
+            )
+            .expect("update");
+        };
+        for _ in 0..2 {
+            update(
+                &mut model,
+                RuntimeEvent::Timer(TimerId::new("bcode.transcript_v2")),
+            );
+            let _ = present(&mut model);
+        }
+        let (target, identity) = model
+            .committed_visual_targets
+            .iter()
+            .find(|(_, identity)| identity.contains(":terminal:"))
+            .cloned()
+            .expect("visible shell terminal target");
+        update(
+            &mut model,
+            RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Right),
+                Point::new(target.x, target.y),
+            ))),
+        );
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        key(&mut model, "i");
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        assert!(present(&mut model).contains("typing into the command"));
+        // Typed keys go to the command, which keeps the focus.
+        key(&mut model, "a");
+        key(&mut model, "enter");
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut daemon.received)
+                .await
+                .expect("typed input arrives")
+                .expect("daemon task");
+        assert_eq!(received, ["a", "\r"]);
+        key(&mut model, "ctrl+]");
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        assert!(!present(&mut model).contains("typing into the command"));
+        key(&mut model, "escape");
+        assert_eq!(model.focused_visual, None, "Escape releases the command");
+        drop(model);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn v2_shell_alternate_screen_takes_pointer_focus_and_terminal_keys() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::{Presenter, Program, RuntimeEvent, TimerId};
+        let mut model = shell_terminal_model("\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789");
         let mut bytes = Vec::new();
         let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 24, 40));
         let mut present = |model: &mut super::BcodeRuntimeModel| {

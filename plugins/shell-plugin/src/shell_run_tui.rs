@@ -520,6 +520,18 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
                 _ => {}
             }
         }
+        // Right-clicking focuses a running command, so it can be typed into; panning and the
+        // other screen keys are for full-screen programs.
+        if replay.running()
+            && matches!(
+                event,
+                bmux_tui::event::Event::Mouse(mouse)
+                    if mouse.kind
+                        == bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Right)
+            )
+        {
+            return true;
+        }
         if !replay.alternate() {
             return false;
         }
@@ -3462,6 +3474,12 @@ mod tests {
                     input.payload["text"].as_str().unwrap().to_owned()
                 })
         };
+        let right_click = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Right),
+            bmux_tui::geometry::Point::new(0, 0),
+        ));
+        // A running command takes focus, though no full-screen program runs.
+        assert!(adapter.content_event_with_host(&identity, &right_click, &host));
         // Not typing yet: keys are the transcript's.
         assert_eq!(typed(&key_event("a")), None);
         assert!(adapter.content_event_with_host(&identity, &key_event("i"), &host));
@@ -3520,6 +3538,12 @@ mod tests {
                 .is_none()
         );
         assert!(!adapter.content_event_with_host(&identity, &key_event("i"), &host));
+        // Nor does its finished output take focus: there is nothing to type into or pan.
+        let right_click = bmux_tui::event::Event::Mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Right),
+            bmux_tui::geometry::Point::new(0, 0),
+        ));
+        assert!(!adapter.content_event_with_host(&identity, &right_click, &host));
     }
 
     #[test]

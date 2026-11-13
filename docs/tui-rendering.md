@@ -358,8 +358,8 @@ eight columns per wheel tick or Left/Right key, clamped to the widest shown line
 Up/Down and PageUp/PageDown navigate source screen rows. This is an inline expansion, not a
 separate full-screen modal. Normal transcript scrolling exposes the expanded rows.
 
-A focused running shell command can also be typed into: `i` (`shell.terminal.input`) starts
-typing, after which every key, Escape included, and every paste become invocation input for that
+A running shell command can also be typed into, whether or not a full-screen program runs in it:
+right-click its output to focus it, then `i` (`shell.terminal.input`) starts typing, after which every key, Escape included, and every paste become invocation input for that
 command, encoded as a terminal keyboard sends them (with the program's cursor-key mode, and
 bracketed pastes when the program asks for them). `ctrl+]` (`shell.terminal.input-exit`) stops
 typing, and typing ends with the command. A row under the command says when keys go to it. The
