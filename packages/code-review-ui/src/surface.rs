@@ -2479,6 +2479,14 @@ impl ReviewSurface {
                 );
             }
             "edit_sources" => return Some(self.edit_sources(host)),
+            "appearance" => {
+                if !host.request_appearance_picker() {
+                    self.set_status(
+                        "the theme is set by the program hosting the review",
+                        StatusSeverity::Info,
+                    );
+                }
+            }
             _ => return None,
         }
         Some(Action::Redraw)

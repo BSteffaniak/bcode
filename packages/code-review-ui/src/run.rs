@@ -10,9 +10,11 @@
 //! * After each presented frame the app is polled again, so data needed by the new viewport is
 //!   requested at once; while the app keeps reporting changes (animations, spinners) frames
 //!   continue at the runtime cadence, and the loop goes idle when nothing changes.
-//! * With the standalone host the theme follows bcode's: an appearance watcher re-resolves it
-//!   when configuration, the saved appearance or theme files change, or when the terminal
-//!   reports its background, and the host restyles the app.
+//! * With the standalone host the app owns its theme: the review's own saved appearance, else
+//!   bcode's. An appearance watcher re-resolves it when configuration, the saved appearance or
+//!   theme files change, or when the terminal reports its background, and offers it to the
+//!   app's [`AppearanceControl`], which restyles the host unless the appearance picker is
+//!   previewing.
 //! * Opening a session in Bcode ends the runtime, runs the host's open command with the terminal
 //!   handed over, and resumes the app where it was.
 
@@ -38,6 +40,7 @@ use bmux_tui_runtime::{Program, RuntimeEvent, RuntimeHandle, Update};
 
 use crate::action::Action;
 use crate::app::ReviewApp;
+use crate::appearance::AppearanceControl;
 use crate::config::LoadedConfig;
 use crate::context::UiContext;
 use crate::entry::Entry;
@@ -222,12 +225,14 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .map_err(|error| RunError::Keymap(format!("invalid review keybindings: {error}")))?;
     let mut diagnostics = loaded.diagnostics.clone();
     let mut appearance = None;
+    let mut control_for_ui = None;
     let host = if let Some(host) = options.host {
         host
     } else {
         let sources = crate::config::appearance_sources(&loaded, &repo);
         let background = TerminalCapabilities::detect().background;
-        let (theme, theme_diagnostics) = HostTheme::load(&sources, background);
+        let resolution = sources.resolve(background);
+        let (theme, theme_diagnostics) = HostTheme::from_resolution(&resolution);
         diagnostics.extend(theme_diagnostics);
         let access = options
             .bcode_program
@@ -239,12 +244,26 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
                 program,
             });
         let standalone = Arc::new(StandaloneHost::new(access, theme));
+        let control = Arc::new(AppearanceControl::new(
+            resolution,
+            {
+                let host = Arc::clone(&standalone);
+                Box::new(move |resolution| {
+                    let (theme, _) = HostTheme::from_resolution(resolution);
+                    if host.theme() != theme {
+                        host.set_theme(theme);
+                    }
+                })
+            },
+            loaded.state_file.clone(),
+        ));
         appearance = Some(watch_appearance(
             sources,
             background,
             repo.clone(),
-            Arc::clone(&standalone),
+            Arc::clone(&control),
         ));
+        control_for_ui = Some(control);
         standalone as Arc<dyn ReviewHost>
     };
     let query_terminal_colors =
@@ -258,7 +277,10 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .with_source(Arc::new(bcode_code_review_github::GitHubReviewSource))
         .with_contributor(Arc::new(bcode_code_review::discovery::git::GitDiscovery))
         .with_contributor(Arc::new(bcode_code_review_graphite::GraphiteDiscovery));
-    let ui = UiContext::new(host, Arc::new(keymap), loaded.diff_layout);
+    let mut ui = UiContext::new(host, Arc::new(keymap), loaded.diff_layout);
+    if let Some(control) = control_for_ui {
+        ui = ui.with_appearance(control);
+    }
     let mut review = ReviewApp::new(services, repo, loaded.view, options.entry);
     review.prepare_keymap(&ui);
     Ok(App {
@@ -275,24 +297,20 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     })
 }
 
-/// Restyle `host` whenever bcode's theme selection for `repo` changes.
+/// Offer `control` every new appearance of `repo`: the review's own choice or bcode's, as
+/// configuration, user state and theme files change.
 fn watch_appearance(
     sources: bcode_tui_theme::appearance::AppearanceSources,
     background: bmux_tui::capabilities::TerminalBackground,
     repo: PathBuf,
-    host: Arc<StandaloneHost>,
+    control: Arc<AppearanceControl>,
 ) -> AppearanceWatcher {
     AppearanceWatcher::spawn(
         sources,
         background,
         APPEARANCE_INTERVAL,
         move || crate::config::appearance_sources(&crate::config::load(&repo), &repo),
-        move |resolution| {
-            let (theme, _) = HostTheme::from_resolution(&resolution);
-            if host.theme() != theme {
-                host.set_theme(theme);
-            }
-        },
+        move |resolution| control.offer(resolution),
     )
 }
 

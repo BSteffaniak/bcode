@@ -29,7 +29,9 @@
 //!   icon sets.
 //! * [`notes`] keeps drafts, threads, AI exchanges, and suggestions with optimistic, serialized
 //!   persistence; [`composer`] is the inline comment editor; [`agent`] asks Bcode about anchors
-//!   and observes linked sessions; [`palette`] is the command palette and the keymap help.
+//!   and observes linked sessions; [`palette`] is the command palette and the keymap help;
+//!   [`appearance`] is the review's appearance picker, which previews palettes and profiles
+//!   on the whole app and saves the review's own choice.
 //! * [`host`] is the boundary to whatever hosts the UI (theme, Bcode sessions, plugin services,
 //!   clipboard, tasks, redraws); [`context`] pairs it with the keymap for the screens, and
 //!   [`action`] is what screens ask of the run loop.
@@ -37,6 +39,7 @@
 pub mod action;
 pub mod agent;
 pub mod app;
+pub mod appearance;
 pub mod chrome;
 pub mod cli;
 pub mod composer;

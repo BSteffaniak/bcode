@@ -523,20 +523,55 @@ bcode's own (`--print-config-paths` lists them in order):
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.
   `none` or `unbind` removes a default.
-* `[tui.theme]`: the theme, selected exactly as bcode's chat interface selects it:
-  `name` (the palette or theme, such as `catppuccin-mocha`, `nord` or `bcode-dark`; default
+* `[tui.theme]`: the theme, selected as bcode's chat interface selects it: `name` (the
+  palette or theme, such as `catppuccin-mocha`, `nord` or `bcode-dark`; default
   `terminal-native`), `profile` (applied over the palette before other overlays), `overlays`,
-  `variant` (`auto`, `dark` or `light`) and extra theme files or directories in `paths`. The
-  palette and profile saved by bcode's appearance picker (`[theme]` in bcode's user state,
-  `$BCODE_TUI_STATE` or `tui.toml` in the state directory: `$BCODE_STATE_DIR`,
-  `$XDG_STATE_HOME/bcode` or `~/.local/state/bcode`) replace the configured ones when they
-  resolve; one that does not is reported and the configured one is kept. With `variant = "auto"`
-  the app asks the terminal for its colors and presents the light variant on a light background
-  (else `COLORFGBG`, else dark). Both resolve through `bcode_tui_theme::appearance`, the code
-  bcode and `bcode-git` use. The theme follows changes while the app runs: configuration files,
-  the user state file and theme files are checked every 750 ms, so choosing a palette in bcode's
-  appearance picker restyles an open review. The visual system above derives every color the
-  app uses from the chosen theme.
+  `variant` (`auto`, `dark` or `light`) and extra theme files or directories in `paths`. With
+  `variant = "auto"` the app asks the terminal for its colors and presents the light variant on
+  a light background (else `COLORFGBG`, else dark). Everything resolves through
+  `bcode_tui_theme::appearance`, the code bcode and `bcode-git` use, and the visual system above
+  derives every color the app uses from the chosen theme.
+* `[plugins.config."bcode.code_review".theme]`: `name`, `profile`, `overlays` and `paths` for
+  the review only; each set field replaces the `[tui.theme]` one.
+
+#### Appearance: the review's own, or bcode's
+
+The review can present its own palette and profile, apart from bcode's, or follow bcode's. The
+appearance picker opens with `ctrl+t` (on home and in a review), from the command palette
+("Appearance: the review's palette and profile…") and from home's keyboard help. It lists a
+**Follow Bcode** row (with bcode's current palette and profile), the palettes and the profiles;
+its first line says which mode is active. The cursor previews the row it is on on the whole
+app at once, without saving anything; `f` jumps to Follow Bcode. `enter` applies: a palette or
+profile row saves the review's own choice, the Follow Bcode row removes it so the review
+follows bcode's again. `esc` restores what was presented. The appearance watcher keeps
+running meanwhile, but its results wait until the picker closes, and results read from the
+state before an apply are dropped, so the applied appearance never flickers back.
+
+Choices are saved in bcode's user state file (`$BCODE_TUI_STATE`, else `tui.toml` in the
+state directory: `$BCODE_STATE_DIR`, `$XDG_STATE_HOME/bcode` or `~/.local/state/bcode`).
+bcode's own appearance picker writes `[theme]`; the review's picker writes only
+`[apps.review.theme]` (`name`, `profile`), so neither changes the other. Older state files
+without an `[apps]` table read as following bcode.
+
+Precedence for the review, highest first:
+
+1. A palette named by `[plugins.config."bcode.code_review".theme] name`. It is chosen for the
+   review specifically in configuration, so it wins over every saved palette; the picker then
+   shows the palette as pinned by that key instead of listing palettes, and only the profile
+   applies.
+2. The review's own saved choice (`[apps.review.theme]`).
+3. bcode's saved choice (`[theme]`), as bcode's chat interface presents it.
+4. The configured selection: `[plugins.config."bcode.code_review".theme]` fields over
+   `[tui.theme]`, and its defaults.
+
+Saved choices over the shared `[tui.theme]` configuration mirror bcode's chat interface, where
+the picker's saved palette replaces the configured one. A saved palette or profile that does
+not resolve is reported and the configured one is kept. The theme follows changes while the app
+runs: configuration files, the user state file and theme files are checked every 750 ms, so
+choosing a palette in bcode's appearance picker restyles an open review that follows bcode,
+and leaves one with its own choice alone. When a host supplies the theme itself, the picker is
+unavailable and the app says so.
+
 * `[tui] color_depth`: `auto` (the default: no colors under `NO_COLOR` or a dumb terminal, else
   full color), `truecolor`, `ansi256`, `ansi16`, or `none`, as in bcode.
 * `[tui.diff_viewer]`: bcode's diff layout preference, followed unless the review's own table

@@ -127,6 +127,8 @@ pub struct LoadedConfig {
     /// Files whose change may change the theme: configuration candidates, present or not, and
     /// the user state file.
     pub appearance_files: Vec<PathBuf>,
+    /// The user state file, where the review's appearance picker saves its choice.
+    pub state_file: PathBuf,
     /// Terminal color depth from `[tui] color_depth`.
     pub color_depth: ColorDepthChoice,
     /// Whether `[plugins] disabled` lists the code review plugin.
@@ -180,7 +182,8 @@ pub fn load_in(start: &Path, environment: &impl ConfigEnvironment) -> LoadedConf
     }
     let mut files = candidates;
     files.extend(loaded.files.iter().cloned());
-    files.push(state);
+    files.push(state.clone());
+    loaded.state_file = state;
     files.sort();
     files.dedup();
     loaded.appearance_files = files;

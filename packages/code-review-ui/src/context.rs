@@ -11,6 +11,7 @@ use bcode_session_models::{ProjectionWindowRequest, SessionId};
 use bcode_session_view_models::ReasoningPresentationPolicy;
 use bmux_keyboard::KeyStroke;
 
+use crate::appearance::AppearanceControl;
 use crate::config::DiffLayout;
 use crate::host::{BlockingTask, HostError, HostTask, ReviewHost, SessionFollow};
 
@@ -20,6 +21,7 @@ pub struct UiContext {
     host: Arc<dyn ReviewHost>,
     keymap: Arc<KeymapRegistry>,
     diff_layout: Option<DiffLayout>,
+    appearance: Option<Arc<AppearanceControl>>,
 }
 
 impl std::fmt::Debug for UiContext {
@@ -44,7 +46,30 @@ impl UiContext {
             host,
             keymap,
             diff_layout,
+            appearance: None,
         }
+    }
+
+    /// Let the review choose its appearance through `control` (the app owns its theme).
+    #[must_use]
+    pub fn with_appearance(mut self, control: Arc<AppearanceControl>) -> Self {
+        self.appearance = Some(control);
+        self
+    }
+
+    /// The appearance the app presents, when the app owns its theme (not when the host does).
+    #[must_use]
+    pub fn appearance(&self) -> Option<&AppearanceControl> {
+        self.appearance.as_deref()
+    }
+
+    /// Ask the app to open its appearance picker. Returns `false` when the host owns the
+    /// theme, so there is nothing to choose here.
+    #[must_use]
+    pub fn request_appearance_picker(&self) -> bool {
+        self.appearance()
+            .inspect(|control| control.request_open())
+            .is_some()
     }
 
     /// The host.

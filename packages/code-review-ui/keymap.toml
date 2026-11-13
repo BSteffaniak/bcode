@@ -162,6 +162,9 @@ keymap_actions = [
     { id = "bcode.code_review.help", scope = "code-review", description = "Keyboard help", defaults = [
         "?",
     ] },
+    { id = "bcode.code_review.appearance", scope = "code-review", description = "Appearance: the review's palette and profile…", defaults = [
+        "ctrl+t",
+    ] },
     { id = "bcode.code_review.save_review", scope = "code-review", description = "Save this review to the reviews home", defaults = [
         "ctrl+s",
     ] },
@@ -345,6 +348,9 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.home_help", scope = "code-review-home", description = "Keyboard help", defaults = [
         "?",
+    ] },
+    { id = "bcode.code_review.home_appearance", scope = "code-review-home", description = "Appearance: the review's palette and profile…", defaults = [
+        "ctrl+t",
     ] },
     { id = "bcode.code_review.home_exit", scope = "code-review-home", description = "Quit", defaults = [
         "q",

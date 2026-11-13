@@ -1029,6 +1029,14 @@ impl Home {
                 );
                 self.overlay = Some(Overlay::new(OverlayKind::Help, entries, theme));
             }
+            "home_appearance" => {
+                if !host.request_appearance_picker() {
+                    self.set_status(
+                        "the theme is set by the program hosting the review",
+                        StatusSeverity::Info,
+                    );
+                }
+            }
             "home_exit" => return HomeOutcome::Exit,
             _ => return HomeOutcome::Ignored,
         }

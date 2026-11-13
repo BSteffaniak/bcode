@@ -738,6 +738,11 @@ impl<S: View> Scenario<S> {
         self.theme = theme.copied();
     }
 
+    /// Let the screen choose its appearance through `control`, as the standalone app does.
+    pub fn set_appearance(&mut self, control: Arc<crate::appearance::AppearanceControl>) {
+        self.ui = self.ui.clone().with_appearance(control);
+    }
+
     /// Non-`None` actions returned by the screen so far, oldest first.
     #[must_use]
     pub fn actions(&self) -> &[Action] {

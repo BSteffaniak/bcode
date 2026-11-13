@@ -13,6 +13,7 @@
 //! * **Theme.** Home, the wizard, and the opening route derive the same [`ReviewTheme`] from the
 //!   host theme as the review does.
 
+use super::appearance::{AppearanceOutcome, AppearanceOverlay};
 use super::config::ReviewViewConfig;
 use super::entry::{self, Entry};
 use super::home::{Home, HomeOutcome};
@@ -106,6 +107,8 @@ pub struct ReviewApp {
     /// The reviews a comparison was opened from (the stack history), most recent last: closing
     /// a review returns to the one before it instead of home.
     return_to: Vec<ReviewWorkspace>,
+    /// The appearance picker, over every route while open.
+    appearance: Option<AppearanceOverlay>,
 }
 
 impl std::fmt::Debug for ReviewApp {
@@ -145,6 +148,7 @@ impl ReviewApp {
             keymap_stale: true,
             editing: None,
             return_to: Vec::new(),
+            appearance: None,
         };
         match entry {
             Entry::Home => app.show_home(false),
@@ -236,6 +240,48 @@ impl ReviewApp {
     #[must_use]
     pub const fn opened_reviews(&self) -> usize {
         self.opened_reviews
+    }
+
+    /// The appearance picker, while open.
+    #[must_use]
+    pub const fn appearance_picker(&self) -> Option<&AppearanceOverlay> {
+        self.appearance.as_ref()
+    }
+
+    /// Open the appearance picker when a route asked for it.
+    fn open_requested_appearance(&mut self, host: &UiContext) -> bool {
+        let Some(control) = host.appearance() else {
+            return false;
+        };
+        if !control.take_open_request() || self.appearance.is_some() {
+            return false;
+        }
+        self.appearance = Some(AppearanceOverlay::open(control, &self.theme));
+        true
+    }
+
+    /// Route `event` to the open appearance picker, which captures all input.
+    fn appearance_event(&mut self, event: &Event, host: &UiContext) -> Option<EventResult> {
+        let overlay = self.appearance.as_mut()?;
+        let Some(control) = host.appearance() else {
+            self.appearance = None;
+            return Some(EventResult::from_action(Action::Redraw));
+        };
+        let outcome = match event {
+            Event::Key(stroke) => overlay.key(*stroke, control, &self.theme),
+            Event::Mouse(_) => overlay.mouse(event, control, &self.theme),
+            Event::Resize(_) => AppearanceOutcome::Redraw,
+            _ => AppearanceOutcome::Ignored,
+        };
+        let action = match outcome {
+            AppearanceOutcome::Close => {
+                self.appearance = None;
+                Action::Redraw
+            }
+            AppearanceOutcome::Redraw => Action::Redraw,
+            AppearanceOutcome::Ignored => Action::None,
+        };
+        Some(EventResult::from_action(action))
     }
 
     // ----------------------------------------------------------------------------------------
@@ -679,20 +725,32 @@ impl View for ReviewApp {
         frame.with_style(self.theme.canvas, |frame| {
             if let Route::Review(review) = &mut self.route {
                 review.render(area, frame, styles, host);
-                return;
+            } else {
+                self.render_route(area, frame);
             }
-            self.render_route(area, frame);
+            if let Some(overlay) = self.appearance.as_mut() {
+                overlay.paint(&self.theme, area, frame);
+            }
         });
     }
 
     fn handle_event(&mut self, event: &Event, host: &UiContext) -> EventResult {
-        let result = self.route_event(event, host);
+        if let Some(result) = self.appearance_event(event, host) {
+            return result;
+        }
+        let mut result = self.route_event(event, host);
+        if self.open_requested_appearance(host) && result.action == Action::None {
+            result = EventResult::from_action(Action::Redraw);
+        }
         self.refresh_keymap(host);
         result
     }
 
     fn poll(&mut self, host: &UiContext) -> Action {
-        let action = self.poll_route(host);
+        let mut action = self.poll_route(host);
+        if self.open_requested_appearance(host) && action == Action::None {
+            action = Action::Redraw;
+        }
         self.refresh_keymap(host);
         action
     }
