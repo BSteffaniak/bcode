@@ -555,14 +555,15 @@ without an `[apps]` table read as following bcode.
 
 Precedence for the review, highest first:
 
-1. A palette named by `[plugins.config."bcode.code_review".theme] name`. It is chosen for the
-   review specifically in configuration, so it wins over every saved palette; the picker then
-   shows the palette as pinned by that key instead of listing palettes, and only the profile
-   applies.
+1. A palette named by `[plugins.config."bcode.code_review".theme] name`, and a profile named
+   by `profile` in the same table. Each is chosen for the review specifically in
+   configuration, so it wins over every saved palette or profile on its axis; the picker then
+   shows that axis as pinned by its key instead of listing its rows, and says that only the
+   other axis applies (or, with both pinned, that choices in the picker do not apply).
 2. The review's own saved choice (`[apps.review.theme]`).
 3. bcode's saved choice (`[theme]`), as bcode's chat interface presents it.
-4. The configured selection: `[plugins.config."bcode.code_review".theme]` fields over
-   `[tui.theme]`, and its defaults.
+4. The configured selection: `[plugins.config."bcode.code_review".theme]` `overlays` and
+   `paths` over `[tui.theme]`, and its defaults.
 
 Saved choices over the shared `[tui.theme]` configuration mirror bcode's chat interface, where
 the picker's saved palette replaces the configured one. A saved palette or profile that does

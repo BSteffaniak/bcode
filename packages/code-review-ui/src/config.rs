@@ -124,6 +124,9 @@ pub struct LoadedConfig {
     /// Where the review's own `theme.name` is set, when it is: that palette wins over every
     /// saved palette.
     pub theme_pinned_by: Option<String>,
+    /// Where the review's own `theme.profile` is set, when it is: that profile wins over every
+    /// saved profile.
+    pub profile_pinned_by: Option<String>,
     /// Files whose change may change the theme: configuration candidates, present or not, and
     /// the user state file.
     pub appearance_files: Vec<PathBuf>,
@@ -209,6 +212,7 @@ pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> Appeara
         user_config_dir: loaded.config_dir.clone(),
         project_root: project_root.to_path_buf(),
         theme_pinned_by: loaded.theme_pinned_by.clone(),
+        profile_pinned_by: loaded.profile_pinned_by.clone(),
     }
 }
 
@@ -318,7 +322,8 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
 }
 
 /// The review's own theme settings (`[plugins.config."bcode.code_review".theme]`); each set
-/// field replaces the `[tui.theme]` one for the review only.
+/// field replaces the `[tui.theme]` one for the review only. A `name` or `profile` set here is
+/// chosen for the review specifically, so it also wins over every saved palette or profile.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ReviewThemeSettings {
@@ -336,6 +341,8 @@ impl ReviewThemeSettings {
         }
         if let Some(profile) = self.profile {
             loaded.theme.profile = Some(profile);
+            loaded.profile_pinned_by =
+                Some(format!("plugins.config.\"{PLUGIN_ID}\".theme.profile"));
         }
         if let Some(overlays) = self.overlays {
             loaded.theme.overlays = overlays;
@@ -681,6 +688,62 @@ mod tests {
             resolution.preferences.profile.as_deref(),
             Some("structured")
         );
+    }
+
+    #[test]
+    fn a_profile_in_the_review_config_wins_over_every_saved_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(
+            state.join("tui.toml"),
+            "[theme]\nname = \"catppuccin-mocha\"\nprofile = \"structured\"\n",
+        )
+        .expect("user state");
+        let environment = TestEnvironment(BTreeMap::from([
+            ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+            (
+                "BCODE_STATE_DIR".to_owned(),
+                state.to_string_lossy().into_owned(),
+            ),
+        ]));
+
+        // A profile named in the review's own configuration wins over bcode's saved profile and
+        // the review's own; the saved palette still applies.
+        std::fs::write(
+            repo.join("bcode.toml"),
+            "[plugins.config.\"bcode.code_review\".theme]\nprofile = \"bare\"\n",
+        )
+        .expect("review config");
+        let loaded = load_in(&repo, &environment);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.theme_pinned_by, None);
+        assert_eq!(
+            loaded.profile_pinned_by.as_deref(),
+            Some("plugins.config.\"bcode.code_review\".theme.profile")
+        );
+        let resolution = appearance_sources(&loaded, &repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Unknown);
+        assert_eq!(resolution.preferences.name, "catppuccin-mocha");
+        assert_eq!(resolution.preferences.profile.as_deref(), Some("bare"));
+        bcode_config_layers::user_state::save_app_tui_appearance(
+            &state.join("tui.toml"),
+            APPEARANCE_APP,
+            Some(&SavedTuiAppearance {
+                theme: Some("dracula".to_owned()),
+                profile: Some("structured".to_owned()),
+            }),
+        )
+        .expect("app choice");
+        let loaded = load_in(&repo, &environment);
+        let resolution = appearance_sources(&loaded, &repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Unknown);
+        assert_eq!(resolution.preferences.name, "dracula");
+        assert_eq!(resolution.preferences.profile.as_deref(), Some("bare"));
     }
 
     struct TestEnvironment(BTreeMap<String, String>);

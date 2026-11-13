@@ -3,8 +3,8 @@
 //! The list starts with a "Follow Bcode" row, then the palettes and the profiles under their
 //! headings. The cursor previews the row it is on: the follow row previews Bcode's choice, a
 //! palette or profile row previews that value as the app's own choice. Each axis marks its
-//! chosen row. A palette pinned by the app's configuration is shown as a note instead of
-//! palette rows, since choosing one could not take effect.
+//! chosen row. A palette or profile pinned by the app's configuration is shown as a note
+//! instead of that axis's rows, since choosing one could not take effect.
 //!
 //! The model is UI-agnostic: an app renders [`AppPicker::rows`] with its own list component and
 //! styles, and presents each resolution the picker returns.
@@ -21,8 +21,8 @@ pub enum AppPickerRowKind {
     Follow,
     /// The heading of an axis.
     Heading(AppearanceAxis),
-    /// The app's configuration pins the palette; not selectable.
-    Pinned,
+    /// The app's configuration pins this axis; not selectable.
+    Pinned(AppearanceAxis),
     /// A palette row (index on the palette axis).
     Palette(usize),
     /// A profile row (index on the profile axis).
@@ -58,6 +58,8 @@ pub struct AppPicker {
     selection: AppearanceSelection,
     pinned_by: Option<String>,
     pinned_palette: String,
+    profile_pinned_by: Option<String>,
+    pinned_profile: String,
     bcode_summary: String,
     cursor: usize,
 }
@@ -79,6 +81,8 @@ impl AppPicker {
             app: app.into(),
             pinned_by: opened.theme_pinned_by.clone(),
             pinned_palette: display_name(&opened, &opened.preferences.name),
+            profile_pinned_by: opened.profile_pinned_by.clone(),
+            pinned_profile: profile_name(&opened),
             bcode_summary: summary(&bcode),
             selection,
             cursor: 0,
@@ -115,10 +119,34 @@ impl AppPicker {
         }
     }
 
-    /// What pins the palette, when the app's configuration does.
+    /// What pins `axis`, when the app's configuration does.
     #[must_use]
-    pub fn pinned_by(&self) -> Option<&str> {
-        self.pinned_by.as_deref()
+    pub fn pinned_by(&self, axis: AppearanceAxis) -> Option<&str> {
+        match axis {
+            AppearanceAxis::Palette => self.pinned_by.as_deref(),
+            AppearanceAxis::Profile => self.profile_pinned_by.as_deref(),
+        }
+    }
+
+    /// One sentence saying which axes the app's configuration pins and what still applies, or
+    /// `None` when nothing is pinned.
+    #[must_use]
+    pub fn pinned_note(&self) -> Option<String> {
+        match (&self.pinned_by, &self.profile_pinned_by) {
+            (None, None) => None,
+            (Some(palette), None) => Some(format!(
+                "Palette pinned by {palette}; only the profile applies."
+            )),
+            (None, Some(profile)) => Some(format!(
+                "Profile pinned by {profile}; only the palette applies."
+            )),
+            (Some(palette), Some(profile)) if palette == profile => Some(format!(
+                "Palette and profile pinned by {palette}; choices here do not apply."
+            )),
+            (Some(palette), Some(profile)) => Some(format!(
+                "Palette pinned by {palette} and profile by {profile}; choices here do not apply."
+            )),
+        }
     }
 
     /// The rows, top to bottom.
@@ -133,12 +161,11 @@ impl AppPicker {
         }];
         rows.push(heading(AppearanceAxis::Palette));
         if let Some(pinned_by) = &self.pinned_by {
-            rows.push(AppPickerRow {
-                kind: AppPickerRowKind::Pinned,
-                label: self.pinned_palette.clone(),
-                detail: Some(format!("pinned by {pinned_by}")),
-                chosen: true,
-            });
+            rows.push(pinned(
+                AppearanceAxis::Palette,
+                &self.pinned_palette,
+                pinned_by,
+            ));
         } else {
             let selected = self.selection.palettes().selected_index();
             rows.extend(self.selection.palettes().entries().iter().enumerate().map(
@@ -151,6 +178,14 @@ impl AppPicker {
             ));
         }
         rows.push(heading(AppearanceAxis::Profile));
+        if let Some(pinned_by) = &self.profile_pinned_by {
+            rows.push(pinned(
+                AppearanceAxis::Profile,
+                &self.pinned_profile,
+                pinned_by,
+            ));
+            return rows;
+        }
         let selected = self.selection.profiles().selected_index();
         rows.extend(
             self.selection
@@ -175,7 +210,8 @@ impl AppPicker {
     }
 
     /// The row of the presented choice: the follow row when following, else the chosen
-    /// palette row (the chosen profile row when the palette is pinned).
+    /// palette row (the chosen profile row when the palette is pinned; the follow row when
+    /// both are).
     fn chosen_row(&self) -> usize {
         if self.following_bcode() {
             return 0;
@@ -211,7 +247,7 @@ impl AppPicker {
                 let _ = self.selection.select_row(AppearanceAxis::Profile, index);
                 live.preview(&self.selection)
             }
-            AppPickerRowKind::Heading(_) | AppPickerRowKind::Pinned => return None,
+            AppPickerRowKind::Heading(_) | AppPickerRowKind::Pinned(_) => return None,
         };
         self.cursor = row;
         Some(preview)
@@ -277,6 +313,15 @@ fn heading(axis: AppearanceAxis) -> AppPickerRow {
     }
 }
 
+fn pinned(axis: AppearanceAxis, label: &str, pinned_by: &str) -> AppPickerRow {
+    AppPickerRow {
+        kind: AppPickerRowKind::Pinned(axis),
+        label: label.to_owned(),
+        detail: Some(format!("pinned by {pinned_by}")),
+        chosen: true,
+    }
+}
+
 fn display_name(resolution: &AppearanceResolution, id: &str) -> String {
     resolution.catalog.definition(id).map_or_else(
         || id.to_owned(),
@@ -284,18 +329,22 @@ fn display_name(resolution: &AppearanceResolution, id: &str) -> String {
     )
 }
 
-/// "Palette · Profile" of `resolution`.
-fn summary(resolution: &AppearanceResolution) -> String {
-    let palette = display_name(resolution, &resolution.preferences.name);
-    let profile = resolution.preferences.profile.as_deref().map_or_else(
+/// The profile `resolution` presents, as the user knows it.
+fn profile_name(resolution: &AppearanceResolution) -> String {
+    resolution.preferences.profile.as_deref().map_or_else(
         || "theme default".to_owned(),
         |profile| {
             display_name(resolution, profile)
                 .trim_end_matches(" (profile)")
                 .to_owned()
         },
-    );
-    format!("{palette} · {profile}")
+    )
+}
+
+/// "Palette · Profile" of `resolution`.
+fn summary(resolution: &AppearanceResolution) -> String {
+    let palette = display_name(resolution, &resolution.preferences.name);
+    format!("{palette} · {}", profile_name(resolution))
 }
 
 #[cfg(test)]
@@ -445,13 +494,74 @@ mod tests {
                 .iter()
                 .any(|row| matches!(row.kind, AppPickerRowKind::Palette(_)))
         );
-        let pinned = &rows[row_of(&picker, AppPickerRowKind::Pinned)];
+        let pinned = &rows[row_of(&picker, AppPickerRowKind::Pinned(AppearanceAxis::Palette))];
         assert_eq!(pinned.label, "Nord");
         assert_eq!(pinned.detail.as_deref(), Some("pinned by review config"));
-        assert_eq!(picker.pinned_by(), Some("review config"));
+        assert_eq!(
+            picker.pinned_by(AppearanceAxis::Palette),
+            Some("review config")
+        );
+        assert_eq!(
+            picker.pinned_note().as_deref(),
+            Some("Palette pinned by review config; only the profile applies.")
+        );
         assert!(matches!(
             rows[picker.cursor()].kind,
             AppPickerRowKind::Profile(_)
         ));
+    }
+
+    #[test]
+    fn a_pinned_profile_is_a_note_and_palette_rows_preview_under_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = LiveAppearance::new(
+            AppearanceSources {
+                configured: ThemePreferences {
+                    name: "nord".to_owned(),
+                    profile: Some("bare".to_owned()),
+                    ..ThemePreferences::default()
+                },
+                saved: SavedAppearance {
+                    theme: Some("catppuccin-mocha".to_owned()),
+                    profile: Some("structured".to_owned()),
+                },
+                user_config_dir: dir.path().to_path_buf(),
+                project_root: dir.path().to_path_buf(),
+                profile_pinned_by: Some("review config".to_owned()),
+                ..AppearanceSources::default()
+            }
+            .resolve(TerminalBackground::Unknown),
+        );
+        let mut picker = AppPicker::open("review", &live, |path| path.display().to_string());
+        let rows = picker.rows();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.kind, AppPickerRowKind::Profile(_)))
+        );
+        let pinned = &rows[row_of(&picker, AppPickerRowKind::Pinned(AppearanceAxis::Profile))];
+        assert_eq!(pinned.label, "Bare");
+        assert_eq!(pinned.detail.as_deref(), Some("pinned by review config"));
+        assert_eq!(
+            picker.pinned_note().as_deref(),
+            Some("Profile pinned by review config; only the palette applies.")
+        );
+        // Bcode's profile does not show through the follow row either.
+        assert_eq!(rows[0].detail.as_deref(), Some("Catppuccin Mocha · Bare"));
+
+        let row = palette_row(&picker, "dracula");
+        let previewed = picker.select(row, &live).expect("selectable");
+        assert_eq!(id(&previewed), "dracula");
+        assert_eq!(previewed.preferences.profile.as_deref(), Some("bare"));
+        // The last selectable row is the last palette: the pinned note is skipped.
+        while picker.step(1, &live).is_some() {}
+        assert!(matches!(
+            picker.rows()[picker.cursor()].kind,
+            AppPickerRowKind::Palette(_)
+        ));
+        let applied = picker
+            .apply(&live, |_| Ok::<(), ()>(()), |_| {})
+            .expect("saved");
+        assert_eq!(applied.preferences.profile.as_deref(), Some("bare"));
     }
 }

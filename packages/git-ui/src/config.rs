@@ -1052,6 +1052,8 @@ pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> Appeara
         user_config_dir: loaded.config_dir.clone(),
         project_root: project_root.to_path_buf(),
         theme_pinned_by: loaded.theme_pinned_by.clone(),
+        // The git UI schema has no profile setting.
+        profile_pinned_by: None,
     }
 }
 

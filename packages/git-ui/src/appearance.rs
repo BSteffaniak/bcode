@@ -65,10 +65,8 @@ fn fill(menu: &mut Menu, picker: AppPicker, error: Option<String>) {
     state.set_selected(Some(menu.selected));
     menu.list.set(state);
     let mut notes = vec![Line::from(picker.mode_label())];
-    if let Some(pinned_by) = picker.pinned_by() {
-        notes.push(Line::from(format!(
-            "The palette is pinned by {pinned_by}; only the profile applies."
-        )));
+    if let Some(note) = picker.pinned_note() {
+        notes.push(Line::from(note));
     }
     if let Some(error) = error {
         notes.push(Line::from(error));

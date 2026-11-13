@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use bcode_config_layers::user_state::SavedAppAppearance;
-use bcode_tui_theme::appearance::{AppearanceResolution, AppearanceSources, SavedAppearance};
+use bcode_tui_theme::appearance::{
+    AppearanceResolution, AppearanceSources, SavedAppearance, ThemePreferences,
+};
 use bmux_tui::capabilities::TerminalBackground;
 
 use super::app::{fixture, open};
@@ -25,18 +27,30 @@ struct Appearance {
     state: PathBuf,
     presented: Arc<Mutex<Vec<HostTheme>>>,
     control: Arc<AppearanceControl>,
+    configured: ThemePreferences,
+    profile_pinned_by: Option<String>,
 }
 
 impl Appearance {
     /// Bcode's saved palette is nord; the review has no choice of its own.
     fn new() -> Self {
+        Self::configured(ThemePreferences::default(), None)
+    }
+
+    /// As [`Self::new`], with the review's configured selection `configured`, whose profile
+    /// `profile_pinned_by` pins when set.
+    fn configured(configured: ThemePreferences, profile_pinned_by: Option<String>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let state = root.join("tui.toml");
-        std::fs::write(&state, "[theme]\nname = \"nord\"\n").expect("state");
+        std::fs::write(
+            &state,
+            "[theme]\nname = \"nord\"\nprofile = \"structured\"\n",
+        )
+        .expect("state");
         let presented = Arc::new(Mutex::new(Vec::new()));
         let control = Arc::new(AppearanceControl::new(
-            resolve(&root, &state),
+            resolve(&root, &state, &configured, profile_pinned_by.clone()),
             {
                 let presented = Arc::clone(&presented);
                 Box::new(move |resolution: &AppearanceResolution| {
@@ -52,6 +66,8 @@ impl Appearance {
             state,
             presented,
             control,
+            configured,
+            profile_pinned_by,
         }
     }
 
@@ -74,11 +90,21 @@ impl Appearance {
 
     /// What the appearance watcher resolves from the state file now.
     fn watched(&self) -> AppearanceResolution {
-        resolve(&self.root, &self.state)
+        resolve(
+            &self.root,
+            &self.state,
+            &self.configured,
+            self.profile_pinned_by.clone(),
+        )
     }
 }
 
-fn resolve(root: &Path, state: &Path) -> AppearanceResolution {
+fn resolve(
+    root: &Path,
+    state: &Path,
+    configured: &ThemePreferences,
+    profile_pinned_by: Option<String>,
+) -> AppearanceResolution {
     let saved = SavedAppAppearance::load(state, APPEARANCE_APP).expect("state");
     let convert = |saved: &bcode_config_layers::user_state::SavedTuiAppearance| SavedAppearance {
         theme: saved.theme.clone(),
@@ -87,8 +113,10 @@ fn resolve(root: &Path, state: &Path) -> AppearanceResolution {
     AppearanceSources {
         saved: convert(&saved.bcode),
         app_saved: saved.app.as_ref().map(convert),
+        configured: configured.clone(),
         user_config_dir: root.to_path_buf(),
         project_root: root.to_path_buf(),
+        profile_pinned_by,
         ..AppearanceSources::default()
     }
     .resolve(TerminalBackground::Unknown)
@@ -297,4 +325,47 @@ fn tiny_terminals_keep_the_picker_inside_the_screen() {
     assert!(screen.contains("Review appearance"), "{}", screen.text());
     scenario.key("esc");
     assert_eq!(appearance.presented().as_deref(), Some("nord"));
+}
+
+#[test]
+fn a_profile_pinned_by_the_review_config_is_stated_and_wins_over_bcodes() {
+    let pin = "plugins.config.\"bcode.code_review\".theme.profile";
+    let appearance = Appearance::configured(
+        ThemePreferences {
+            profile: Some("bare".to_owned()),
+            ..ThemePreferences::default()
+        },
+        Some(pin.to_owned()),
+    );
+    // Bcode saved "structured"; the review's own profile setting wins.
+    let current = appearance.control.current();
+    assert_eq!(current.preferences.name, "nord");
+    assert_eq!(current.preferences.profile.as_deref(), Some("bare"));
+
+    let mut scenario = home(&appearance);
+    scenario.resize(60, 30);
+    scenario.key("ctrl+t");
+    let screen = render(&mut scenario, &appearance);
+    // The note wraps inside the picker instead of being cut off.
+    for part in [
+        "Profile pinned by",
+        &format!("{pin};"),
+        "only the palette applies.",
+    ] {
+        assert!(screen.contains(part), "{part}:\n{}", screen.text());
+    }
+
+    preview(&mut scenario, &appearance, "dracula");
+    assert_eq!(
+        appearance.control.current().preferences.profile.as_deref(),
+        Some("bare")
+    );
+    scenario.key("enter");
+    let applied = appearance.control.current();
+    assert_eq!(applied.preferences.name, "dracula");
+    assert_eq!(applied.preferences.profile.as_deref(), Some("bare"));
+    assert_eq!(
+        appearance.watched().preferences.profile.as_deref(),
+        Some("bare")
+    );
 }

@@ -261,11 +261,8 @@ impl AppearanceOverlay {
             self.picker.mode_label(),
             theme.muted,
         )])];
-        if let Some(pinned_by) = self.picker.pinned_by() {
-            lines.push(Line::from_spans(vec![Span::styled(
-                format!("The palette is pinned by {pinned_by}; only the profile applies."),
-                theme.muted,
-            )]));
+        if let Some(note) = self.picker.pinned_note() {
+            lines.push(Line::from_spans(vec![Span::styled(note, theme.muted)]));
         }
         if let Some(error) = &self.error {
             lines.push(Line::from_spans(vec![Span::styled(
@@ -324,7 +321,7 @@ fn item(index: usize, row: &AppPickerRow, theme: &ReviewTheme) -> MenuItem {
             item.section = true;
             item
         }
-        AppPickerRowKind::Pinned => {
+        AppPickerRowKind::Pinned(_) => {
             let mut item = MenuItem::rich(id, row_line(row, theme));
             item.section = true;
             item
