@@ -1204,3 +1204,33 @@ fn output_path_override_is_used() {
 
     assert_eq!(path, PathBuf::from("custom/review.json"));
 }
+
+/// Opening a fresh state database from many callers at once (the app and the daemon's plugin,
+/// or several requests of one process) migrates it once; no caller fails on a schema change
+/// another caller already applied.
+#[test]
+fn concurrent_first_opens_of_a_fresh_database_all_succeed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = initialized_test_repository(temp.path());
+    let repo_root = resolve_repo_root(&repo).expect("repo root");
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let (repo_root, config, barrier) = (repo_root.clone(), config.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                with_database(&repo_root, &config, |database| {
+                    Box::pin(async move { Ok(database.table_exists("draft_threads").await?) })
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let opened = handle.join().expect("caller thread");
+        assert!(opened.expect("fresh database opens"), "schema is migrated");
+    }
+}

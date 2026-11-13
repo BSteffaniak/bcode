@@ -65,6 +65,8 @@ const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_REPO_STATE_ROOT: &str = ".bcode/code-review";
 const DEFAULT_STATE_SUBDIR: &str = "code-review";
 const DATABASE_FILE_NAME: &str = "code-review.db";
+/// Lock file that serializes schema migrations of the state database.
+const MIGRATION_LOCK_FILE_NAME: &str = "code-review.db.migrate.lock";
 const MIGRATIONS_TABLE: &str = "__bcode_code_review_migrations";
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);

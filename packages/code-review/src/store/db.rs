@@ -1078,12 +1078,38 @@ where
             .expect("current-thread Tokio runtime should build");
         runtime.block_on(async {
             let database = open_database(&paths.database_path).await?;
-            run_migrations(database.as_ref()).await?;
+            {
+                // Callers in other processes (the app and the daemon's plugin) and other
+                // threads of this one share the database; migrating it concurrently would apply
+                // the same schema change twice.
+                let _migrating = lock_migrations(&paths.state_root)?;
+                run_migrations(database.as_ref()).await?;
+            }
             operation(database.as_ref()).await
         })
     })
     .join()
     .map_err(|_| StoreError::InvalidRequest("database worker panicked".to_string()))?
+}
+
+/// Hold the state directory's migration lock until the returned file is dropped.
+///
+/// The lock is an exclusive advisory lock on a file beside the database. It excludes every
+/// other holder, whether in another process or another thread of this one, because each
+/// caller opens its own handle.
+///
+/// # Errors
+///
+/// * The lock file cannot be opened or created.
+/// * Locking it fails.
+pub fn lock_migrations(state_root: &Path) -> Result<std::fs::File, StoreError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_root.join(MIGRATION_LOCK_FILE_NAME))?;
+    file.lock()?;
+    Ok(file)
 }
 
 pub async fn open_database(path: &Path) -> Result<Box<dyn Database>, StoreError> {
