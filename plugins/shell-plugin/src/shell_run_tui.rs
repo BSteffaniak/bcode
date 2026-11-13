@@ -84,6 +84,8 @@ struct LiveTerminalReplay {
     terminal: Option<TerminalState>,
     view: ShellTerminalView,
     last_frame_sequence: u64,
+    /// The recording header's dimensions were applied; later chunks repeat them.
+    dimensions_applied: bool,
     initial_columns: u16,
     initial_rows: u16,
     columns: u16,
@@ -347,9 +349,11 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         // Rendering a request is not terminal initialization. The recording header owns
         // execution dimensions; a request can be painted before even its header arrives.
         if let Some((columns, rows)) = dimensions
+            && !replay.dimensions_applied
             && replay.frames.is_empty()
             && replay.output.is_empty()
         {
+            replay.dimensions_applied = true;
             replay.initial_columns = columns;
             replay.initial_rows = rows;
             replay.columns = columns;
@@ -377,18 +381,14 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         .unwrap_or(u64::MAX);
         for frame in frames {
             match frame {
+                // The terminal is all a recording leaves: its bytes are not kept.
                 crate::recording::ShellRecordingFrame::ReplayOutput { bytes, .. } => {
-                    replay.output.extend_from_slice(&bytes);
-                    let frame = TerminalReplayFrame::Output(bytes);
-                    replay.apply_frame(&frame);
-                    replay.frames.push(frame);
+                    replay.apply_frame(&TerminalReplayFrame::Output(bytes));
                 }
                 crate::recording::ShellRecordingFrame::Resize { columns, rows, .. } => {
                     replay.columns = columns;
                     replay.rows = rows;
-                    let frame = TerminalReplayFrame::Resize { columns, rows };
-                    replay.apply_frame(&frame);
-                    replay.frames.push(frame);
+                    replay.apply_frame(&TerminalReplayFrame::Resize { columns, rows });
                 }
                 crate::recording::ShellRecordingFrame::Finish {
                     exit_code,
@@ -2363,7 +2363,8 @@ mod tests {
         assert!(values.get("decode_frames").is_some_and(|value| *value > 0));
         assert!(values.get("emulate_bytes").is_some_and(|value| *value > 0));
         assert!(values.get("emulate_frames").is_some_and(|value| *value > 0));
-        assert!(values.get("retained_bytes").is_some_and(|value| *value > 0));
+        // A recording's bytes are not kept once emulated.
+        assert!(!values.contains_key("retained_bytes"));
         assert!(values.get("emitted_rows").is_some_and(|value| *value > 0));
         assert_eq!(
             bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter),
@@ -2628,7 +2629,10 @@ mod tests {
         assert!(!rendered.contains("exit code 7"), "{rendered}");
         let replays = adapter.live_replays.lock().expect("live replays");
         let replay = replays.get("call").expect("replacement replay");
-        assert_eq!(replay.output, b"new artifact\r\n");
+        assert_eq!(
+            replay.terminal.as_ref().expect("terminal").text(),
+            "new artifact"
+        );
         assert_eq!((replay.initial_columns, replay.initial_rows), (9, 3));
         drop(replays);
         let values = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::drain_diagnostics(&adapter)
@@ -2892,8 +2896,9 @@ mod tests {
                 drop(replays);
                 values
             };
-            assert_eq!(retained_output_bytes, total_bytes);
-            assert_eq!(retained_frames, frame_count);
+            // Only the terminal remains, however long the recording.
+            assert_eq!((retained_output_bytes, retained_frames), (0, 0));
+            let _ = (total_bytes, frame_count);
         }
     }
 
@@ -3107,18 +3112,25 @@ mod tests {
         }
         let replays = adapter.live_replays.lock().expect("live replays");
         let replay = replays.get("call").expect("artifact replay");
-        assert_eq!(replay.output, b"first\r\n\xffsecond");
-        assert_eq!(
-            replay.frames,
-            vec![
+        // Each frame was emulated once, in order: the same terminal as the frames give.
+        let expected = shell_terminal_state(
+            12,
+            3,
+            &[
                 TerminalReplayFrame::Output(b"first\r\n".to_vec()),
                 TerminalReplayFrame::Resize {
                     columns: 9,
                     rows: 4,
                 },
                 TerminalReplayFrame::Output(b"\xffsecond".to_vec()),
-            ]
+            ],
         );
+        let terminal = replay.terminal.as_ref().expect("terminal");
+        assert_eq!(
+            terminal.grid().snapshot(0, 8),
+            expected.grid().snapshot(0, 8)
+        );
+        assert_eq!(terminal.text(), expected.text());
         assert_eq!((replay.initial_columns, replay.initial_rows), (12, 3));
         assert_eq!((replay.columns, replay.rows), (9, 4));
         assert_eq!(replay.exit_code, Some(0));
