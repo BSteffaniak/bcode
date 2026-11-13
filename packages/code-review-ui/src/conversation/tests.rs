@@ -244,3 +244,100 @@ fn watches_start_once_per_repository_and_not_while_unfocused() {
     assert_eq!(talk.watches_to_start(true)[0].failures, 1);
     assert!(watch_backoff(1) > watch_backoff(0));
 }
+
+fn snapshot(threads: &[&str], read_at_ms: u64) -> ThreadsSnapshot {
+    let template = bcode_code_review_models::PullThreadRecord {
+        id: String::new(),
+        provider: "forge".to_owned(),
+        provider_label: "Forge".to_owned(),
+        repository: "octo/repo".to_owned(),
+        number: 1,
+        location: "the review".to_owned(),
+        placement: bcode_code_review_models::ThreadPlacement::Exact,
+        thread: RemoteThread {
+            id: "t".to_owned(),
+            anchor: bcode_code_review_models::RemoteAnchor::default(),
+            resolved: false,
+            outdated: false,
+            can_reply: false,
+            can_resolve: false,
+            comments: Vec::new(),
+        },
+    };
+    ThreadsSnapshot {
+        scope: crate::notes::NoteScope {
+            repo_path: PathBuf::from("/repo"),
+            target: bcode_code_review_models::ReviewTarget::LastCommit,
+            scope: None,
+        },
+        threads: threads
+            .iter()
+            .map(|id| {
+                let mut record = template.clone();
+                (*id).clone_into(&mut record.id);
+                record
+            })
+            .collect(),
+        read_at_ms,
+    }
+}
+
+#[test]
+fn thread_saves_run_one_at_a_time_and_the_newest_waits() {
+    let mut saves = ThreadSaves::default();
+    let cached = snapshot(&["a"], 1_000);
+    assert_eq!(saves.offer(cached.clone()), Some(cached));
+    // Read from the forge while the cached one is being saved: it waits, and only the newest
+    // waits.
+    assert_eq!(saves.offer(snapshot(&["a", "b"], 2_000)), None);
+    let newest = snapshot(&["a", "b", "c"], 3_000);
+    assert_eq!(saves.offer(newest.clone()), None);
+    assert_eq!(saves.finished(true), Some(newest.clone()), "saved after");
+    assert!(saves.is_saving());
+    assert_eq!(saves.finished(true), None);
+    assert!(!saves.is_saving());
+    // The same threads again are not saved again.
+    assert_eq!(saves.offer(newest), None);
+}
+
+#[test]
+fn a_failed_thread_save_is_tried_again_on_the_next_offer() {
+    let mut saves = ThreadSaves::default();
+    let threads = snapshot(&["a"], 1_000);
+    assert!(saves.offer(threads.clone()).is_some());
+    assert_eq!(saves.finished(false), None);
+    assert_eq!(saves.offer(threads.clone()), Some(threads));
+}
+
+#[test]
+fn unchanged_threads_are_saved_again_once_their_read_time_is_stale() {
+    let mut saves = ThreadSaves::default();
+    assert!(saves.offer(snapshot(&["a"], 1_000)).is_some());
+    saves.finished(true);
+    assert_eq!(
+        saves.offer(snapshot(&["a"], 1_000 + SNAPSHOT_REFRESH_MS - 1)),
+        None
+    );
+    let read_again = snapshot(&["a"], 1_000 + SNAPSHOT_REFRESH_MS);
+    assert_eq!(saves.offer(read_again.clone()), Some(read_again));
+}
+
+#[test]
+fn conversations_are_as_fresh_as_their_oldest_read_and_the_cache_keeps_its_time() {
+    let mut conversations = Conversations::default();
+    assert_eq!(conversations.read_at_ms(), None);
+    let then = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+    conversations.read_cached(vec![
+        (key(1), activity(1), then),
+        (key(2), activity(2), then),
+    ]);
+    assert_eq!(conversations.read_at_ms(), Some(1_000_000));
+    // Read from the provider: newer, but the snapshot is as old as its oldest pull request.
+    conversations.read(&[key(1)], Ok(vec![activity(1)]), false);
+    assert_eq!(conversations.read_at_ms(), Some(1_000_000));
+    conversations.read(&[key(2)], Ok(vec![activity(2)]), false);
+    assert!(conversations.read_at_ms() > Some(1_000_000));
+    // The cache answering late does not make a read conversation older.
+    conversations.read_cached(vec![(key(1), activity(1), then)]);
+    assert!(conversations.read_at_ms() > Some(1_000_000));
+}

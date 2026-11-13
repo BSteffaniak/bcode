@@ -225,8 +225,12 @@ they did. Publishing to a forge such as GitHub stays in the app (`P`), which rea
 plugins.
 
 Pull request threads come from the review store, not the forge: whenever the review app places
-its pull requests' threads and they changed, it saves them for the review's scope (bounded:
-1,000 threads, 100 comments per thread keeping the first and the latest, 16 KiB per comment).
+its pull requests' threads and they changed, or it read them again a minute or more after the
+saved read, it saves them for the review's scope (bounded: 1,000 threads, 100 comments per thread
+keeping the first and the latest, 16 KiB per comment). Saves run one at a time in order, so an
+older placement never replaces a newer one, and a failed save is tried again on the next
+placement. `read_at_ms` is when the app read them: the oldest read of the review's pull requests,
+from the forge or, before that, from its cache.
 So `list_threads` and `get_thread` stay read-only and work offline, show what the reviewer sees
 (as of `read_at_ms`), and say so when the app has not read them yet. A review without pull
 request sources (one whose pull request was removed, say) shows none, whatever was saved for it. Their thread ids are

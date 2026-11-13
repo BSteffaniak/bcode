@@ -66,7 +66,8 @@ the review provider-neutral: GitHub is one implementation of an interface any fo
   mapping quality.
 
 * **Agents read the threads the reviewer sees.** Whenever the review places its threads and
-  they changed, it saves them, placed, to the review store for the review's scope (bounded;
+  they changed (or were read again well after the saved read), it saves them, placed, one save
+  at a time, to the review store for the review's scope (bounded;
   `review.conversation.save`, `review.conversation.get`). The review tools
   (`code_review.list_threads`, `code_review.get_thread`) read that snapshot, so agents never
   reach the forge to read threads, and a question asked from a thread carries the thread itself.

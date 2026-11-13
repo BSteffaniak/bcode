@@ -40,7 +40,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum ConversationMessage {
     /// What the cache held.
-    Cached(Vec<(PullKey, PullActivity)>),
+    Cached(Vec<conv::CachedActivity>),
     /// A read finished.
     Read {
         /// What was read.
@@ -70,6 +70,11 @@ pub enum ConversationMessage {
     WatchAgain,
     /// A change finished.
     Changed(Box<ChangeDone>),
+    /// A save of the pull request threads for the review tools finished.
+    ThreadsSaved {
+        /// The store kept them.
+        saved: bool,
+    },
 }
 
 /// A finished change.
@@ -117,11 +122,8 @@ pub struct ConversationUi {
     pub view_revision: u64,
     /// Card parts clicked, to run once the host is at hand: source id and action.
     pub card_clicks: Vec<(String, CardAction)>,
-    /// The pull request threads last saved for the review tools, and where.
-    pub saved_threads: Option<(
-        crate::notes::NoteScope,
-        Vec<bcode_code_review_models::PullThreadRecord>,
-    )>,
+    /// Saves of the pull request threads for the review tools.
+    pub thread_saves: conv::ThreadSaves,
 }
 
 impl ConversationUi {
@@ -254,9 +256,7 @@ impl ReviewSurface {
         let gap = Duration::from_millis(self.services.conversation_config().signals.min_gap_ms);
         match message {
             ConversationMessage::Cached(found) => {
-                let keys: Vec<PullKey> = found.iter().map(|(key, _)| key.clone()).collect();
-                let activities = found.into_iter().map(|(_, activity)| activity).collect();
-                self.talk.data.read(&keys, Ok(activities), true);
+                self.talk.data.read_cached(found);
                 self.note_baselines();
                 self.place_conversations(host);
             }
@@ -318,11 +318,17 @@ impl ReviewSurface {
                 } = *done;
                 self.apply_change(key, thread.as_deref(), &change, result, host);
             }
+            ConversationMessage::ThreadsSaved { saved } => {
+                if let Some(next) = self.talk.thread_saves.finished(saved) {
+                    self.send_pull_threads(next, host);
+                }
+            }
         }
     }
 
     /// Keep the placed pull request threads in the review store, where the review tools read
-    /// them, when they changed since they were last kept.
+    /// them, when they (or where they are kept) changed, or they were read again well after the
+    /// kept read; saves run one at a time, in order.
     fn save_pull_threads(&mut self, placed: &[(PullKey, PlacedThread)], host: &UiContext) {
         let threads: Vec<bcode_code_review_models::PullThreadRecord> = placed
             .iter()
@@ -345,17 +351,30 @@ impl ReviewSurface {
                 thread: placed.thread.clone(),
             })
             .collect();
-        let scope = self.note_scope();
-        let saved = (scope.clone(), threads);
-        if self.talk.saved_threads.as_ref() == Some(&saved) {
-            return;
+        let snapshot = conv::ThreadsSnapshot {
+            scope: self.note_scope(),
+            threads,
+            read_at_ms: self
+                .talk
+                .data
+                .read_at_ms()
+                .unwrap_or_else(crate::history::now_ms),
+        };
+        if let Some(snapshot) = self.talk.thread_saves.offer(snapshot) {
+            self.send_pull_threads(snapshot, host);
         }
-        let threads = saved.1.clone();
-        self.talk.saved_threads = Some(saved);
-        let services = self.services.clone();
+    }
+
+    /// Save `snapshot` for the review tools, and say when the save finished.
+    fn send_pull_threads(&self, snapshot: conv::ThreadsSnapshot, host: &UiContext) {
+        let (services, inbox) = (self.services.clone(), self.inbox.clone());
         host.spawn(Box::pin(async move {
-            // The tools say when they have nothing; a failed save only leaves them older.
-            let _ = services
+            let conv::ThreadsSnapshot {
+                scope,
+                threads,
+                read_at_ms,
+            } = snapshot;
+            let saved = services
                 .call(bcode_code_review_models::SaveReviewConversationRequest {
                     repo_path: scope.repo_path,
                     target: scope.target,
@@ -363,10 +382,14 @@ impl ReviewSurface {
                     snapshot: bcode_code_review_models::ReviewConversationSnapshot {
                         threads,
                         omitted: 0,
-                        read_at_ms: crate::history::now_ms(),
+                        read_at_ms,
                     },
                 })
-                .await;
+                .await
+                .is_ok();
+            inbox.push(Message::Conversation(Box::new(
+                ConversationMessage::ThreadsSaved { saved },
+            )));
         }));
     }
 

@@ -204,6 +204,89 @@ pub struct Conversations {
     pub opened: BTreeMap<PullKey, bool>,
 }
 
+/// A pull request's conversation as the cache held it, and when it was read.
+pub type CachedActivity = (PullKey, PullActivity, std::time::SystemTime);
+
+/// How stale a saved snapshot's read time may get before an unchanged snapshot is saved again
+/// (to say it was read again).
+pub const SNAPSHOT_REFRESH_MS: u64 = 60_000;
+
+/// The pull request threads saved for the review tools: where, the threads, and when the app
+/// read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadsSnapshot {
+    /// The review's scope.
+    pub scope: crate::notes::NoteScope,
+    /// The placed threads.
+    pub threads: Vec<bcode_code_review_models::PullThreadRecord>,
+    /// When the app read them (its oldest read of the pull requests), in milliseconds since the
+    /// Unix epoch.
+    pub read_at_ms: u64,
+}
+
+impl ThreadsSnapshot {
+    /// Whether this snapshot says more than `kept`: other threads or scope, or a read time at
+    /// least [`SNAPSHOT_REFRESH_MS`] newer.
+    #[must_use]
+    pub fn news_over(&self, kept: &Self) -> bool {
+        self.scope != kept.scope
+            || self.threads != kept.threads
+            || self.read_at_ms >= kept.read_at_ms.saturating_add(SNAPSHOT_REFRESH_MS)
+    }
+}
+
+/// Saves of the pull request threads, one at a time and in order.
+///
+/// A snapshot offered while one is being saved waits (replacing any older one waiting), and a
+/// failed save leaves the last stored snapshot as the one to beat, so the next offer saves again.
+#[derive(Debug, Default)]
+pub struct ThreadSaves {
+    /// The last snapshot the store confirmed.
+    stored: Option<ThreadsSnapshot>,
+    /// The snapshot being saved.
+    saving: Option<ThreadsSnapshot>,
+    /// The newest snapshot waiting for the save in flight.
+    waiting: Option<ThreadsSnapshot>,
+}
+
+impl ThreadSaves {
+    /// Offer `snapshot`; the snapshot to save now, if any.
+    pub fn offer(&mut self, snapshot: ThreadsSnapshot) -> Option<ThreadsSnapshot> {
+        let latest = self
+            .waiting
+            .as_ref()
+            .or(self.saving.as_ref())
+            .or(self.stored.as_ref());
+        if latest.is_some_and(|latest| !snapshot.news_over(latest)) {
+            return None;
+        }
+        if self.saving.is_some() {
+            self.waiting = Some(snapshot);
+            return None;
+        }
+        self.saving = Some(snapshot.clone());
+        Some(snapshot)
+    }
+
+    /// The save in flight finished (`saved` when the store kept it); the snapshot to save next,
+    /// if one waits.
+    pub fn finished(&mut self, saved: bool) -> Option<ThreadsSnapshot> {
+        let done = self.saving.take();
+        if saved {
+            self.stored = done;
+        }
+        let next = self.waiting.take()?;
+        self.saving = Some(next.clone());
+        Some(next)
+    }
+
+    /// Whether a save is in flight.
+    #[must_use]
+    pub const fn is_saving(&self) -> bool {
+        self.saving.is_some()
+    }
+}
+
 /// A provider watch to ask.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchStart {
@@ -231,6 +314,41 @@ pub enum Next {
 }
 
 impl Conversations {
+    /// Conversations the cache held: shown for pull requests not read yet, as read when the
+    /// cache read them.
+    pub fn read_cached(&mut self, found: Vec<CachedActivity>) {
+        let first: Vec<(PullKey, std::time::SystemTime)> = found
+            .iter()
+            .filter(|(key, _, _)| {
+                self.pulls
+                    .get(key)
+                    .is_none_or(|entry| entry.activity.is_none())
+            })
+            .map(|(key, _, read_at)| (key.clone(), *read_at))
+            .collect();
+        let keys: Vec<PullKey> = found.iter().map(|(key, _, _)| key.clone()).collect();
+        let activities = found.into_iter().map(|(_, activity, _)| activity).collect();
+        self.read(&keys, Ok(activities), true);
+        for (key, read_at) in first {
+            if let Some(entry) = self.pulls.get_mut(&key) {
+                entry.read_at = Some(read_at);
+            }
+        }
+    }
+
+    /// When the pull requests with a conversation were read, as of the oldest of them, in
+    /// milliseconds since the Unix epoch.
+    #[must_use]
+    pub fn read_at_ms(&self) -> Option<u64> {
+        self.pulls
+            .values()
+            .filter(|entry| entry.activity.is_some())
+            .filter_map(|entry| entry.read_at)
+            .min()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| u64::try_from(since.as_millis()).ok())
+    }
+
     /// The pull requests whose providers report conversations.
     #[must_use]
     pub fn readable(&self) -> Vec<PullKey> {
@@ -705,7 +823,7 @@ pub fn remote_notes(
 }
 
 /// The pull requests' conversations the cache holds.
-pub async fn cached(services: ReviewServices, keys: Vec<PullKey>) -> Vec<(PullKey, PullActivity)> {
+pub async fn cached(services: ReviewServices, keys: Vec<PullKey>) -> Vec<CachedActivity> {
     let registry = services.providers();
     services
         .blocking(move || {
@@ -718,7 +836,7 @@ pub async fn cached(services: ReviewServices, keys: Vec<PullKey>) -> Vec<(PullKe
                     .push(key.number);
             }
             for ((provider, repository), numbers) in groups {
-                for (number, (activity, _)) in
+                for (number, (activity, read_at)) in
                     core::cached_activity(&registry, &provider, &repository, &numbers)
                 {
                     found.push((
@@ -728,6 +846,7 @@ pub async fn cached(services: ReviewServices, keys: Vec<PullKey>) -> Vec<(PullKe
                             number,
                         },
                         activity,
+                        read_at,
                     ));
                 }
             }
