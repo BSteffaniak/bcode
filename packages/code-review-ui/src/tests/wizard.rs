@@ -438,6 +438,7 @@ fn stacks_over_the_limit_warn_and_the_warnings_can_be_dismissed() {
             .with_stack_limit(ReviewStackLimit {
                 max_layers: 2,
                 over_limit: StackOverLimit::Warn,
+                ..ReviewStackLimit::default()
             }),
     );
     let mut scenario = wizard(&fixture, &backend);

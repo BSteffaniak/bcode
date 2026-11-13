@@ -562,8 +562,10 @@ bcode's own (`--print-config-paths` lists them in order):
   `"warn"` (the default) loads every layer and shows a warning that can be dismissed: a row of
   the new-review wizard's stack step (`enter` dismisses it) and, when the review opens, a toast
   that stays until its `×` is clicked or the "Dismiss notifications" command runs. `"stop"` asks
-  the provider to cut the stack at the limit, with a warning in the stack step. Invalid values
-  are reported and the defaults are used.
+  the provider to cut the stack at the limit, with a warning in the stack step. `remind` says
+  how often the review's toast comes back: `"once"` (the default: closing it keeps it closed for
+  that review, saved or not) or `"every_open"`. Invalid values are reported and the defaults are
+  used.
 * `[plugins.config."bcode.code_review".review_v2]` `file_header` (`auto`, the default, by the
   review pane's size; `compact`, `comfortable` or `spacious`), `file_separator` (`torn`, the
   default; `rule`, `space` or `none`) and `file_page` (`auto`, `on` or `off`: whether torn files

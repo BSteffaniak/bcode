@@ -59,8 +59,19 @@ pub enum StackOverLimit {
     Stop,
 }
 
+/// How often a review warns that its stack is over the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackLimitReminder {
+    /// Until the warning is dismissed once; the review remembers it.
+    #[default]
+    Once,
+    /// Every time the review opens.
+    EveryOpen,
+}
+
 /// How many layers a resolved stack may have, and what happens beyond that
-/// (`[plugins.config."bcode.code_review".stack]`: `max_layers`, `over_limit`).
+/// (`[plugins.config."bcode.code_review".stack]`: `max_layers`, `over_limit`, `remind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewStackLimit {
@@ -68,6 +79,8 @@ pub struct ReviewStackLimit {
     pub max_layers: usize,
     /// Warn or stop beyond [`Self::max_layers`].
     pub over_limit: StackOverLimit,
+    /// How often the review repeats the warning.
+    pub remind: StackLimitReminder,
 }
 
 impl Default for ReviewStackLimit {
@@ -75,6 +88,7 @@ impl Default for ReviewStackLimit {
         Self {
             max_layers: DEFAULT_REVIEW_STACK_MAX_LAYERS,
             over_limit: StackOverLimit::default(),
+            remind: StackLimitReminder::default(),
         }
     }
 }

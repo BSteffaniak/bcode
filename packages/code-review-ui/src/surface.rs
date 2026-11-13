@@ -1230,13 +1230,22 @@ impl ReviewSurface {
 
     /// Warn, in a toast that stays until dismissed, when a stack of the review has more layers
     /// than the configured limit and the limit only warns. Every layer is in the review; the
-    /// warning says so and how to change the limit.
+    /// warning says so and how to change the limit. Once dismissed, the review remembers it and
+    /// does not warn again, unless the limit is configured to remind on every open.
     fn warn_about_stack_size(&mut self, deepest: Option<usize>) {
         let limit = self.services.stack_limit();
         let Some(layers) = deepest.filter(|layers| limit.warns_for(*layers)) else {
             return;
         };
-        self.toasts.push_sticky(
+        let dismissed = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.presentation.as_ref())
+            .is_some_and(|state| state.dismissed_notices.contains(STACK_WARNING_TAG));
+        if dismissed && limit.remind == bcode_code_review_models::StackLimitReminder::Once {
+            return;
+        }
+        self.toasts.push_sticky_tagged(
             ToastSeverity::Warning,
             format!("Stack of {layers} layers"),
             Some(format!(
@@ -1245,7 +1254,32 @@ impl ReviewSurface {
                  \"stop\" to cut stacks there.",
                 limit.max_layers
             )),
+            STACK_WARNING_TAG,
         );
+    }
+
+    /// Remember notices the user dismissed (the stack warning): they stay dismissed for this
+    /// review (an unsaved one keeps them with its target's viewed state).
+    fn note_dismissed_toasts(&mut self) {
+        let dismissed = self.toasts.take_dismissed();
+        if dismissed.is_empty() {
+            return;
+        }
+        let workspace = self.workspace_mut();
+        workspace
+            .presentation
+            .get_or_insert_with(Default::default)
+            .dismissed_notices
+            .extend(dismissed.into_iter().map(str::to_owned));
+        let transient = workspace.id == TRANSIENT_WORKSPACE_ID;
+        if transient {
+            self.save = match self.save {
+                SaveState::Idle | SaveState::Pending => SaveState::Pending,
+                SaveState::Running | SaveState::RunningThenPending => SaveState::RunningThenPending,
+            };
+        } else {
+            self.request_save();
+        }
     }
 
     fn set_status(&mut self, text: impl Into<String>, severity: StatusSeverity) {
@@ -1956,6 +1990,32 @@ impl ReviewSurface {
         review.note_splices();
     }
 
+    /// An unsaved review's state stored for its target: viewed files and marks, and dismissed
+    /// notices.
+    fn adopt_transient_record(&mut self, stored: Option<ReviewWorkspace>) {
+        let workspace = self.workspace_mut();
+        if let Some(stored) = stored {
+            if let Some(stored) = &stored.presentation
+                && !stored.dismissed_notices.is_empty()
+            {
+                workspace
+                    .presentation
+                    .get_or_insert_with(Default::default)
+                    .dismissed_notices
+                    .extend(stored.dismissed_notices.iter().cloned());
+            }
+            workspace.viewed_files.extend(stored.viewed_files);
+            workspace.viewed_marks.extend(stored.viewed_marks);
+            workspace.viewed_marks.sort();
+            workspace.viewed_marks.dedup();
+        }
+        let viewed = (
+            workspace.viewed_files.clone(),
+            workspace.viewed_marks.clone(),
+        );
+        self.transient_viewed = Some(viewed);
+    }
+
     fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
         let was_filling = std::mem::replace(&mut self.filling, !opened.complete);
@@ -1963,21 +2023,10 @@ impl ReviewSurface {
         self.refreshing = false;
         self.generation += 1;
         let fingerprints = std::mem::take(&mut opened.fingerprints);
-        // An unsaved review picks up the viewed state stored for its target when it first opens.
+        // An unsaved review picks up the state stored for its target when it first opens.
         let stored = opened.stored_viewed.take();
         if self.review.is_none() && self.is_transient() {
-            let workspace = self.workspace_mut();
-            if let Some(stored) = stored {
-                workspace.viewed_files.extend(stored.viewed_files);
-                workspace.viewed_marks.extend(stored.viewed_marks);
-                workspace.viewed_marks.sort();
-                workspace.viewed_marks.dedup();
-            }
-            let viewed = (
-                workspace.viewed_files.clone(),
-                workspace.viewed_marks.clone(),
-            );
-            self.transient_viewed = Some(viewed);
+            self.adopt_transient_record(stored);
         }
         let mut review = Review::new(
             self.repo_path.clone(),
@@ -2569,6 +2618,7 @@ impl ReviewSurface {
                 if !self.toasts.dismiss_all() {
                     self.set_status("No notifications", StatusSeverity::Info);
                 }
+                self.note_dismissed_toasts();
             }
             "ai_menu" => self.open_ai_menu(host),
             "activate" => return Some(self.activate(host)),
@@ -4891,9 +4941,13 @@ impl View for ReviewSurface {
                 }
                 Action::Redraw
             }
-            Event::Mouse(_) => self
-                .toast_mouse(event)
-                .unwrap_or_else(|| self.handle_mouse(event, host)),
+            Event::Mouse(_) => {
+                let action = self
+                    .toast_mouse(event)
+                    .unwrap_or_else(|| self.handle_mouse(event, host));
+                self.note_dismissed_toasts();
+                action
+            }
             Event::Resize(_) => {
                 // A resize cancels a drag and the hover (their rows moved).
                 if let Some(review) = self.review.as_mut() {
@@ -5012,3 +5066,6 @@ const fn filter_policy() -> TextInputPolicy {
     policy.edge = EdgePolicy::disabled();
     policy
 }
+
+/// Tag of the over-the-layer-limit warning, whose dismissal the review remembers.
+const STACK_WARNING_TAG: &str = "stack_limit";

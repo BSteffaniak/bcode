@@ -458,6 +458,7 @@ mod tests {
                 ReviewStackLimit {
                     max_layers: 100,
                     over_limit: StackOverLimit::Stop,
+                    ..ReviewStackLimit::default()
                 },
                 Vec::new()
             )

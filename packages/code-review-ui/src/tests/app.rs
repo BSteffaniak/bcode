@@ -1063,3 +1063,51 @@ fn looking_at_a_review_keeps_its_updated_time_and_commenting_moves_it() {
     settled(&mut scenario);
     assert!(updated(&backend) > created, "commented");
 }
+
+#[test]
+fn a_dismissed_stack_warning_stays_dismissed_unless_configured_to_remind() {
+    use bcode_code_review_models::{ReviewStackLimit, StackLimitReminder, StackOverLimit};
+    let fixture = fixture();
+    let backend = |remind| {
+        Arc::new(
+            TestBackend::default()
+                .with_provider(FakeProvider::new(fixture.root()))
+                .with_stack_limit(ReviewStackLimit {
+                    max_layers: 2,
+                    over_limit: StackOverLimit::Warn,
+                    remind,
+                }),
+        )
+    };
+    let toast = "Stack of 4 layers";
+    let shows = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .expect("review")
+            .toasts()
+            .contains(&toast)
+    };
+    // An unsaved stack review: warned once, then closed with the toast's ×.
+    let once = backend(StackLimitReminder::Once);
+    let stack = || Entry::Stack { reference: None };
+    let (mut scenario, screen) = open(&fixture, &once, stack(), 140, 40);
+    assert!(shows(&scenario), "{}", screen.text());
+    let close = screen.find("×").expect("toast close button");
+    scenario.click(close.x, close.y);
+    settled(&mut scenario);
+    assert!(!shows(&scenario));
+    // Opening it again does not warn again.
+    let (scenario, _) = open(&fixture, &once, stack(), 140, 40);
+    assert!(!shows(&scenario));
+
+    // Configured to remind: every open warns, dismissed or not.
+    let every = backend(StackLimitReminder::EveryOpen);
+    let (mut scenario, screen) = open(&fixture, &every, stack(), 140, 40);
+    assert!(shows(&scenario));
+    let close = screen.find("×").expect("toast close button");
+    scenario.click(close.x, close.y);
+    settled(&mut scenario);
+    let (scenario, _) = open(&fixture, &every, stack(), 140, 40);
+    assert!(shows(&scenario));
+}

@@ -741,7 +741,15 @@ pub fn transient_viewed_record(
         archived_at_ms: None,
         viewed_marks: transient.viewed_marks.clone(),
         reviewed_revisions: std::collections::BTreeMap::new(),
-        presentation: None,
+        // Only what an unsaved review remembers besides its viewed files: dismissed notices.
+        presentation: transient
+            .presentation
+            .as_ref()
+            .filter(|state| !state.dismissed_notices.is_empty())
+            .map(|state| bcode_code_review_models::ReviewPresentationState {
+                dismissed_notices: state.dismissed_notices.clone(),
+                ..Default::default()
+            }),
         stack_snapshots: Vec::new(),
     }
 }

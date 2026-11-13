@@ -429,6 +429,10 @@ pub struct ReviewPresentationState {
     /// Files shown collapsed to their header, by `source id`, a `\u{1}`, and the path.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub collapsed_files: BTreeSet<String>,
+    /// One-time notices the user dismissed (such as the over-the-layer-limit warning), by tag:
+    /// they are not shown again unless configured to.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub dismissed_notices: BTreeSet<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -452,6 +456,7 @@ impl Default for ReviewPresentationState {
             all_stack_layers: false,
             conversation_seen: BTreeMap::new(),
             collapsed_files: BTreeSet::new(),
+            dismissed_notices: BTreeSet::new(),
         }
     }
 }

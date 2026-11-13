@@ -523,6 +523,8 @@ struct Toast {
     /// When the toast goes away by itself; `None` for a sticky toast, which stays until
     /// dismissed.
     expires: Option<Instant>,
+    /// What the toast is, for a notice whose dismissal the caller remembers.
+    tag: Option<&'static str>,
 }
 
 /// Toast notifications. Every toast has a close button; sticky ones stay until it is clicked or
@@ -530,6 +532,8 @@ struct Toast {
 #[derive(Debug, Default)]
 pub struct Toasts {
     shown: Vec<Toast>,
+    /// Tags of tagged toasts the user dismissed, not taken yet.
+    dismissed: Vec<&'static str>,
     next: u64,
     state: Cell<ToastStackState>,
     /// Where the stack was last painted and the policy it was painted with, so clicks on its
@@ -550,7 +554,13 @@ impl Toasts {
         } else {
             TOAST_TTL
         };
-        self.insert(severity, title.into(), body, Some(Instant::now() + ttl));
+        self.insert(
+            severity,
+            title.into(),
+            body,
+            Some(Instant::now() + ttl),
+            None,
+        );
     }
 
     /// Show a toast that stays until it is dismissed.
@@ -560,7 +570,24 @@ impl Toasts {
         title: impl Into<String>,
         body: Option<String>,
     ) {
-        self.insert(severity, title.into(), body, None);
+        self.insert(severity, title.into(), body, None, None);
+    }
+
+    /// Show a sticky toast tagged `tag`; when the user dismisses it, [`Self::take_dismissed`]
+    /// says so.
+    pub fn push_sticky_tagged(
+        &mut self,
+        severity: ToastSeverity,
+        title: impl Into<String>,
+        body: Option<String>,
+        tag: &'static str,
+    ) {
+        self.insert(severity, title.into(), body, None, Some(tag));
+    }
+
+    /// Tags of tagged toasts dismissed since the last call.
+    pub fn take_dismissed(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.dismissed)
     }
 
     fn insert(
@@ -569,6 +596,7 @@ impl Toasts {
         title: String,
         body: Option<String>,
         expires: Option<Instant>,
+        tag: Option<&'static str>,
     ) {
         self.next += 1;
         self.shown.push(Toast {
@@ -577,6 +605,7 @@ impl Toasts {
             body,
             severity,
             expires,
+            tag,
         });
         if self.shown.len() > MAX_TOASTS {
             // Make room by dropping the oldest toast that would go away anyway; sticky toasts
@@ -601,6 +630,8 @@ impl Toasts {
     /// Drop every toast, sticky ones included. Returns whether any was shown.
     pub fn dismiss_all(&mut self) -> bool {
         let any = !self.shown.is_empty();
+        self.dismissed
+            .extend(self.shown.iter().filter_map(|toast| toast.tag));
         self.shown.clear();
         any
     }
@@ -636,6 +667,12 @@ impl Toasts {
         };
         self.state.set(state);
         if let Some(id) = closed {
+            self.dismissed.extend(
+                self.shown
+                    .iter()
+                    .filter(|toast| toast.id == id)
+                    .filter_map(|toast| toast.tag),
+            );
             self.shown.retain(|toast| toast.id != id);
         }
         true
