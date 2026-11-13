@@ -166,6 +166,11 @@ pub struct StartupRecommendationResponse {
 pub struct StartupModelChoicesResponse {
     /// Offline catalog choices, with the recommended choice first when available.
     pub choices: Vec<StartupRecommendation>,
+    /// Setting keys, including aliases, that decide where requests go or how they
+    /// authenticate. A request using a choice must match it on these keys; other settings are
+    /// free. Empty means every setting must match the choice exactly.
+    #[serde(default)]
+    pub routing_settings: Vec<String>,
 }
 
 /// Operation for validating provider configuration.

@@ -97,6 +97,9 @@ impl RustPlugin for SyntheticProvider {
                         model_id: "synthetic-model".into(),
                         settings: BTreeMap::from([("transport".into(), "synthetic".into())]),
                     }],
+                    routing_settings: ["transport", "base_url", "endpoint", "api_key"]
+                        .map(Into::into)
+                        .to_vec(),
                 })
                 .unwrap()
             }
@@ -259,6 +262,16 @@ async fn injected_credentials_overrides_and_custom_destinations_never_fall_back(
             .insert(key.into(), "https://untrusted.invalid".into());
         assert!(fixture.dispatch(&request).await.is_err());
     }
+    // A setting the provider does not declare as routing is free to differ.
+    let mut request = fixture.request.clone();
+    request
+        .provider_context
+        .settings
+        .insert("reasoning_summary".into(), "detailed".into());
+    assert_eq!(
+        fixture.dispatch(&request).await.unwrap().provider_turn_id,
+        "synthetic-first"
+    );
     let mut request = fixture.request.clone();
     request
         .provider_context

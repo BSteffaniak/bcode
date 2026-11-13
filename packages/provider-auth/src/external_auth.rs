@@ -312,9 +312,31 @@ pub struct DispatchResolution<'a> {
     /// Current authenticated enabled-plugin declarations.
     pub enabled: EnabledDeclarations<'a>,
     /// Fresh offline destinations the provider recommends for the approved method. The
-    /// request's settings must match one exactly, so configuration cannot redirect an
+    /// request must match one on its routing settings, so configuration cannot redirect an
     /// external credential to another endpoint.
     pub provider_choices: &'a [bcode_model::StartupRecommendation],
+    /// Setting keys the provider declares as deciding routing; empty requires an exact match.
+    pub routing_settings: &'a [String],
+}
+
+/// Whether request `settings` use the destination a provider `choice` recommends.
+///
+/// Every declared routing key, and every key the choice sets, must have the same value (absent
+/// counts as a value). Other settings are free. Without a declaration the settings must match the
+/// choice exactly.
+#[must_use]
+pub fn destination_matches(
+    choice: &BTreeMap<String, String>,
+    settings: &BTreeMap<String, String>,
+    routing_settings: &[String],
+) -> bool {
+    if routing_settings.is_empty() {
+        return choice == settings;
+    }
+    routing_settings
+        .iter()
+        .chain(choice.keys())
+        .all(|key| choice.get(key) == settings.get(key))
 }
 
 /// Durable non-secret approvals, guarded by an OS file lock with atomic publication.
@@ -506,7 +528,7 @@ impl ExternalAuthStore {
         if !request.provider_choices.iter().any(|choice| {
             choice.provider_plugin_id == request.provider_plugin_id
                 && choice.model_id == request.model_id
-                && choice.settings == recipe.settings
+                && destination_matches(&choice.settings, &recipe.settings, request.routing_settings)
         }) {
             return Err(ExternalAuthError::DestinationRejected);
         }

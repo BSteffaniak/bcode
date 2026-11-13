@@ -41,8 +41,11 @@ with explicit consent. Nothing is imported into sshenv, copied, refreshed, or re
 * **Dispatch.** The daemon (or a direct CLI probe) calls
   `ExternalAuthStore::resolve_dispatch`, which rejects recipes that also carry a profile, pool,
   request overrides, environment values, or materialized credentials; requires the request's
-  model and settings to exactly match a destination the provider recommends for the approved
-  method, so configuration cannot redirect the credential; then reads the document under a shared
+  model to be one the provider recommends for the approved method, with matching routing settings:
+  every key the provider declares in `routing_settings` (including aliases such as
+  `openai.base_url`) and every key the recommendation sets must have the same value, so
+  configuration cannot redirect the credential, while unrelated settings are free (a provider that
+  declares none requires an exact match); then reads the document under a shared
   lock (revocation takes it exclusively), rejects an account change with `AccountChanged`, and
   delivers the values for that request only. Requests carrying a binding get no credential custody
   bridge, so providers cannot write credentials back. There is never a fallback to another account
@@ -66,9 +69,11 @@ with explicit consent. Nothing is imported into sshenv, copied, refreshed, or re
   access token's `exp` as its expiry; once it passes, the request fails before reaching the
   provider, asking the user to open Codex to renew the sign-in. Codex installs that
   keep credentials in the OS keyring instead of `auth.json` are not discovered.
-* **Unsupported operations.** `bcode model capabilities`, `auth usage`, and image-upload
-  verification route through generic daemon plugin calls, not dispatch, and reject external
-  connections explicitly.
+* **Usage.** `bcode auth connections --usage` shows each ready connection's usage windows, such as
+  ChatGPT limits for a Codex sign-in, by resolving the connection in place exactly as dispatch does.
+* **Unsupported operations.** `bcode model capabilities` and image-upload verification route
+  through generic daemon plugin calls, not dispatch, and reject external connections explicitly.
+  `bcode auth usage` reports auth pools and is unaffected by an external default selection.
 
 The first-run Setup picker groups options by agent: for Codex, "Run Codex" (the native harness,
 using Codex's own sign-in and settings) sits next to "Use Codex credentials in Bcode" (Bcode's agent

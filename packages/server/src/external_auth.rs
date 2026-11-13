@@ -222,6 +222,7 @@ pub async fn context_for_dispatch(
                 roots,
                 enabled,
                 provider_choices: &choices.choices,
+                routing_settings: &choices.routing_settings,
             })
         },
     )

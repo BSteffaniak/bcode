@@ -359,7 +359,9 @@ pub enum ExternalAuthError {
     #[error("external connection state is damaged or from an unsupported version")]
     UnsupportedState,
     /// No matching explicit approval exists.
-    #[error("this external connection has not been approved; run `bcode auth connect`")]
+    #[error(
+        "this external connection is not approved; connect it from /model or with `bcode auth connect`"
+    )]
     NotApproved,
     /// Source is absent or its contents do not match the declared format.
     #[error(
@@ -373,7 +375,7 @@ pub enum ExternalAuthError {
     Expired,
     /// The source now belongs to a different account than the one approved.
     #[error(
-        "the external credential document now belongs to a different account; approve it again with `bcode auth connect`"
+        "the external credentials now belong to a different account; approve them again from /model or with `bcode auth connect`"
     )]
     AccountChanged,
     /// Enabled plugin declaration is absent or changed.
@@ -382,7 +384,9 @@ pub enum ExternalAuthError {
     )]
     DeclarationChanged,
     /// The selected model or endpoint is not a destination the provider recommends for it.
-    #[error("the selected model or endpoint is not approved for this external connection")]
+    #[error(
+        "this model or endpoint is not one the provider recommends for this external connection; choose a model listed for the connection in /model"
+    )]
     DestinationRejected,
     /// Consent state could not be safely persisted or read.
     #[error("external connection state is unavailable")]

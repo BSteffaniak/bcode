@@ -12,6 +12,19 @@ use bcode_plugin_sdk::{ServiceRequest, ServiceResponse};
 
 use super::{DEFAULT_BASE_URL, DEFAULT_XAI_BASE_URL, PROVIDER_ID, invalid_request, json_response};
 
+/// Every setting key, including namespaced aliases, this provider reads to choose a destination,
+/// dialect, or credential source. Namespaced aliases take precedence over plain keys.
+pub const ROUTING_SETTINGS: [&str; 8] = [
+    "base_url",
+    "openai.base_url",
+    "dialect",
+    "openai.dialect",
+    "api_key_env",
+    "openai.api_key_env",
+    "auth_mode",
+    "catalog_provider_id",
+];
+
 struct Routing {
     base_url: &'static str,
     dialect: &'static str,
@@ -102,7 +115,13 @@ pub fn choices_response(request: &ServiceRequest) -> ServiceResponse {
             Some(choices)
         })
         .unwrap_or_default();
-    json_response(&bcode_model::StartupModelChoicesResponse { choices })
+    json_response(&bcode_model::StartupModelChoicesResponse {
+        choices,
+        routing_settings: ROUTING_SETTINGS
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect(),
+    })
 }
 
 pub fn offline_catalog() -> Option<ModelCatalog> {

@@ -146,6 +146,7 @@ impl Fixture {
             roots: &self.roots(),
             enabled: &[(PLUGIN, &self.provider)],
             provider_choices: &[choice],
+            routing_settings: &[],
         })
     }
 
@@ -291,6 +292,7 @@ fn source_identity_changes_and_root_overrides_are_distinct_bindings() {
             roots: &roots,
             enabled: &[(PLUGIN, &fixture.provider)],
             provider_choices: &[choice],
+            routing_settings: &[],
         }),
         Err(ExternalAuthError::DeclarationChanged)
     );
@@ -414,4 +416,42 @@ fn status_reports_each_connection_without_failing_the_list() {
             .status,
         ExternalConnectionStatus::DeclarationChanged
     );
+}
+
+#[test]
+fn routing_settings_decide_the_destination_and_other_settings_are_free() {
+    let choice = BTreeMap::from([("base_url".to_owned(), "https://api".to_owned())]);
+    let routing = ["base_url".to_owned(), "openai.base_url".to_owned()];
+    let with = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    };
+    assert!(destination_matches(
+        &choice,
+        &with(&[("base_url", "https://api")]),
+        &routing
+    ));
+    assert!(destination_matches(
+        &choice,
+        &with(&[("base_url", "https://api"), ("reasoning", "high")]),
+        &routing
+    ));
+    // A namespaced alias that would override the plain key is rejected.
+    assert!(!destination_matches(
+        &choice,
+        &with(&[
+            ("base_url", "https://api"),
+            ("openai.base_url", "https://evil")
+        ]),
+        &routing
+    ));
+    assert!(!destination_matches(&choice, &with(&[]), &routing));
+    // Without a declaration, only an exact match is accepted.
+    assert!(!destination_matches(
+        &choice,
+        &with(&[("base_url", "https://api"), ("reasoning", "high")]),
+        &[]
+    ));
 }

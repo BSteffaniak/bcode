@@ -7827,7 +7827,11 @@ enum AuthCommand {
     /// Use credentials another coding agent keeps on this computer, in place and with consent.
     Connect,
     /// List approved external connections without exposing credentials.
-    Connections,
+    Connections {
+        /// Also show each ready connection's usage windows, such as subscription limits.
+        #[arg(long)]
+        usage: bool,
+    },
     /// Remove an external connection approval without signing out its source application.
     Disconnect,
     /// Discover provider-declared external API keys without displaying their values.
@@ -10768,7 +10772,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     };
     match command {
         AuthCommand::Connect => Box::pin(external_connections::connect_command()).await,
-        AuthCommand::Connections => external_connections::list_command().await,
+        AuthCommand::Connections { usage } => external_connections::list_command(usage).await,
         AuthCommand::Disconnect => external_connections::disconnect_command().await,
         AuthCommand::Discover | AuthCommand::Import { .. } => {
             credential_setup::handle_command(command)
@@ -11536,8 +11540,6 @@ fn auth_usage_status(
     refresh: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let context = configured_provider_context(&bcode_config::load_config()?);
-    external_execution::reject_unsupported(&context, "auth usage").map_err(CliError::PluginCli)?;
     let plan = auth_prime_plan(pool, profile, include_primary)?;
     let refresh_debug = if refresh {
         refresh_prime_usage_windows(&plan)?

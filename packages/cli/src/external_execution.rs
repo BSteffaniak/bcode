@@ -29,6 +29,57 @@ impl ExecutionLocation {
     }
 }
 
+/// Usage windows for one approved connection, acquired in place exactly as dispatch does.
+///
+/// # Errors
+/// Fails when the connection is not usable, the provider recommends no model for it, or the
+/// provider rejects the usage request.
+pub fn usage(
+    host: &bcode_plugin::PluginHost,
+    connection: &bcode_provider_auth_models::external::ExternalAuthConnection,
+    location: &ExecutionLocation,
+) -> Result<bcode_model::AuthUsageResponse, String> {
+    let target = &connection.grant.target;
+    let choices: bcode_model::StartupModelChoicesResponse = host
+        .invoke_service_json(
+            &target.plugin_id,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::OP_STARTUP_MODEL_CHOICES,
+            &bcode_model::StartupRecommendationRequest {
+                auth_provider_id: target.provider_id.clone(),
+                method_id: target.method_id.clone(),
+            },
+        )
+        .map_err(|_| "the provider offers no model for this connection".to_owned())?;
+    let choice = choices
+        .choices
+        .first()
+        .ok_or("the provider offers no model for this connection")?;
+    let recipe = ProviderRequestContext {
+        settings: choice.settings.clone(),
+        external_auth_binding: Some(connection.grant.binding_id.clone()),
+        ..Default::default()
+    };
+    let context = resolve(
+        host,
+        Some(&target.plugin_id),
+        &recipe,
+        &choice.model_id,
+        location,
+    )?
+    .ok_or("external connection unavailable")?;
+    host.invoke_service_json(
+        &target.plugin_id,
+        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+        bcode_model::OP_AUTH_USAGE,
+        &bcode_model::AuthUsageRequest {
+            provider_context: context,
+            meter_ids: Vec::new(),
+        },
+    )
+    .map_err(|error| format!("usage unavailable: {error}"))
+}
+
 /// Acquire an approved connection for a direct CLI probe, exactly as daemon dispatch does.
 /// Returns `None` when the context does not select an external connection.
 pub fn resolve(
@@ -82,6 +133,7 @@ pub fn resolve(
             roots: &SourceRoots::from_process(home, &enabled),
             enabled: &enabled,
             provider_choices: &choices.choices,
+            routing_settings: &choices.routing_settings,
         })
         .map(Some)
         .map_err(|error| error.to_string())
@@ -186,6 +238,7 @@ mod tests {
                             model_id: "synthetic-model".into(),
                             settings: settings(),
                         }],
+                        routing_settings: Vec::new(),
                     })
                     .unwrap()
                 }
@@ -327,7 +380,7 @@ library = "unused.dylib"
             invoker
                 .start_turn(Some("fixture.cli"), &changed)
                 .unwrap_err()
-                .contains("not approved for this external connection")
+                .contains("not one the provider recommends")
         );
         changed = request.clone();
         changed.model_id = "unapproved-model".into();
@@ -335,7 +388,7 @@ library = "unused.dylib"
             invoker
                 .start_turn(Some("fixture.cli"), &changed)
                 .unwrap_err()
-                .contains("not approved for this external connection")
+                .contains("not one the provider recommends")
         );
         for pool in [false, true] {
             changed = request.clone();

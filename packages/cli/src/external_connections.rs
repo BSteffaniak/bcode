@@ -8,7 +8,7 @@ use bcode_provider_auth_models::external::{
     ExternalAuthApplication as _, ExternalAuthCandidate, ExternalAuthConnection, ExternalAuthGrant,
     ExternalConnectionStatus,
 };
-use std::io::{BufRead as _, IsTerminal as _, Read as _};
+use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
 
 /// Discover, review and approve a connection through the daemon, then offer model selection.
 pub async fn connect_command() -> Result<(), CliError> {
@@ -46,13 +46,64 @@ pub async fn connect_command() -> Result<(), CliError> {
     Ok(())
 }
 
-/// List approvals with their current local status.
-pub async fn list_command() -> Result<(), CliError> {
+/// List approvals with their current local status, optionally with usage windows.
+pub async fn list_command(usage: bool) -> Result<(), CliError> {
     let connections = bcode_client::BcodeClient::default_endpoint()
         .external_auth_status()
         .await
         .map_err(external_error)?;
-    status_with_io(&connections, &mut std::io::stdout().lock())
+    status_with_io(&connections, &mut std::io::stdout().lock())?;
+    if !usage {
+        return Ok(());
+    }
+    let mut host = super::load_cli_plugin_host()?;
+    let location = super::external_execution::ExecutionLocation::current();
+    let mut output = std::io::stdout().lock();
+    for connection in connections
+        .iter()
+        .filter(|connection| matches!(connection.status, ExternalConnectionStatus::Ready { .. }))
+    {
+        writeln!(output, "\n{} usage:", connection.grant.application)?;
+        match super::external_execution::usage(&host, connection, &location) {
+            Ok(report) => usage_with_io(&report, &mut output)?,
+            Err(error) => writeln!(output, "  unavailable: {error}")?,
+        }
+    }
+    host.deactivate_all()?;
+    Ok(())
+}
+
+fn usage_with_io(
+    report: &bcode_model::AuthUsageResponse,
+    output: &mut impl std::io::Write,
+) -> Result<(), CliError> {
+    if !report.supported || report.meters.is_empty() {
+        writeln!(
+            output,
+            "  not reported{}",
+            report
+                .degraded_reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        )?;
+        return Ok(());
+    }
+    for meter in &report.meters {
+        let name = meter.meter_name.as_deref().unwrap_or(&meter.meter_id);
+        for window in &meter.windows {
+            let used = window.used_percent.map_or_else(
+                || "usage unknown".to_owned(),
+                |percent| format!("{percent}% used"),
+            );
+            let resets = window
+                .resets_at_unix
+                .map(|reset| format!(", resets at Unix {reset}"))
+                .unwrap_or_default();
+            writeln!(output, "  {name} {}: {used}{resets}", window.window_id)?;
+        }
+    }
+    Ok(())
 }
 
 /// What a status means for the user, with the one action that fixes it.
@@ -350,6 +401,44 @@ mod tests {
         assert_eq!(
             disconnect_with_io(&grants, &mut &b"1\ndisconnect\n"[..], &mut Vec::new()).unwrap(),
             Some(grant)
+        );
+    }
+
+    #[test]
+    fn usage_lists_each_window_and_explains_missing_reports() {
+        let report = bcode_model::AuthUsageResponse {
+            supported: true,
+            meters: vec![bcode_model::AuthUsageMeterSnapshot {
+                meter_id: "codex".into(),
+                meter_name: Some("Codex".into()),
+                windows: vec![bcode_model::AuthUsageWindowSnapshot {
+                    window_id: "5h".into(),
+                    used_percent: Some(42),
+                    resets_at_unix: Some(100),
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        usage_with_io(&report, &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "  Codex 5h: 42% used, resets at Unix 100\n"
+        );
+        let mut output = Vec::new();
+        usage_with_io(
+            &bcode_model::AuthUsageResponse {
+                degraded_reason: Some("not a subscription".into()),
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("not reported (not a subscription)")
         );
     }
 

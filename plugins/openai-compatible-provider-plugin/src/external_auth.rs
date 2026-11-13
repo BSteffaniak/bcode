@@ -187,6 +187,7 @@ mod tests {
             roots,
             enabled: &enabled,
             provider_choices: &[choice],
+            routing_settings: &[],
         })?;
         Ok(context
             .auth
