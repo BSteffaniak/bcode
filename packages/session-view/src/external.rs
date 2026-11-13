@@ -273,6 +273,7 @@ pub fn external_interaction(
             .map(|choice| ExternalChoiceView {
                 id: choice.choice_id.clone(),
                 label: choice.label.clone(),
+                description: choice.description.clone(),
             })
             .collect(),
         tool_name: interaction.tool_name.clone(),

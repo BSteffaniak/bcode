@@ -179,6 +179,10 @@ pub fn format_question_outcome_output(outcome: &QuestionToolOutcome) -> String {
 /// Returns a diagnostic for unsupported fields, controls, modes, or invalid limits.
 pub fn parse_question_request(value: Value) -> Result<NormalizedQuestionRequest, String> {
     let value = normalize_value_keys(value);
+    let submit_on_choice = value
+        .get("submit_on_choice")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let question_values = match value {
         Value::Object(mut object) if object.contains_key("questions") => {
             match object.remove("questions").unwrap_or(Value::Null) {
@@ -213,7 +217,10 @@ pub fn parse_question_request(value: Value) -> Result<NormalizedQuestionRequest,
         .enumerate()
         .map(|(index, value)| parse_question(index, value))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(NormalizedQuestionRequest { questions })
+    Ok(NormalizedQuestionRequest {
+        questions,
+        submit_on_choice,
+    })
 }
 
 fn parse_question(index: usize, value: Value) -> Result<Question, String> {

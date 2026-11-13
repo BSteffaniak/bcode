@@ -804,6 +804,9 @@ fn interaction_anatomy(
 ) -> ToolAnatomy {
     let (status, text) = interaction_state(interaction.state);
     let status = facts.and_then(|facts| facts.status).unwrap_or(status);
+    if let Some(anatomy) = prose_interaction_anatomy(interaction, facts, status, text) {
+        return anatomy;
+    }
     let snapshot = match &interaction.snapshot {
         Some(serde_json::Value::Object(fields)) => format!("snapshot {} fields", fields.len()),
         Some(serde_json::Value::Array(values)) => format!("snapshot {} values", values.len()),
@@ -868,6 +871,57 @@ fn interaction_anatomy(
         summary: None,
         sections,
     }
+}
+
+/// Anatomy of an interaction whose title is prose (several lines, such as a question with its
+/// options): every line is a wrapped paragraph of the body, and the status detail (an answer,
+/// say) stays in the header where a collapsed unit still shows it.
+fn prose_interaction_anatomy(
+    interaction: &InteractionViewSummary,
+    facts: Option<&UnitFacts>,
+    status: UnitStatus,
+    state_text: &str,
+) -> Option<ToolAnatomy> {
+    let prose = interaction
+        .title
+        .as_deref()
+        .filter(|title| title.contains('\n'))?;
+    let sections = prose
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            Section::unlabelled(
+                &format!("prose.{index}"),
+                SectionBody::Line {
+                    text: line.trim_end().to_owned(),
+                    role: BodyRole::Output,
+                },
+            )
+        })
+        .collect();
+    let status_text = interaction
+        .status_detail
+        .as_deref()
+        .filter(|detail| !detail.trim().is_empty())
+        .unwrap_or(state_text);
+    Some(ToolAnatomy {
+        header: HeaderData {
+            label: interaction
+                .kind
+                .contains("question")
+                .then(|| "Question".to_owned()),
+            tool: None,
+            target: facts.and_then(|facts| facts.target.clone()),
+            status_text: Some(status_text.to_owned()),
+            status: Some(status),
+            is_error: matches!(status, UnitStatus::Failed),
+            title: None,
+            ..HeaderData::default()
+        },
+        summary: None,
+        sections,
+    })
 }
 
 /// Anatomy of a tool-like item (invocations, requests, drafts, contributions, permissions,

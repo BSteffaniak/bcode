@@ -1653,6 +1653,7 @@ mod tests {
         let renderer = QuestionTerminalRenderer::default();
         let mut snapshot = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Pick", &[("A", None)], false, false)],
+            submit_on_choice: false,
         })
         .snapshot();
         snapshot.closed = true;
@@ -1681,6 +1682,7 @@ mod tests {
         let renderer = QuestionTerminalRenderer::default();
         let mut snapshot = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Pick", &[("A", None)], false, false)],
+            submit_on_choice: false,
         })
         .snapshot();
         snapshot.closed = true;
@@ -1715,6 +1717,7 @@ mod tests {
         let host = RemappedHost(registry);
         let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Pick", &[("A", None), ("B", None)], false, false)],
+            submit_on_choice: false,
         });
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
@@ -1749,6 +1752,7 @@ mod tests {
     fn preparing_unchanged_bindings_retains_question_measurement() {
         let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Pick", &[("An option label", None)], false, false)],
+            submit_on_choice: false,
         });
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
@@ -1791,6 +1795,7 @@ mod tests {
                 false,
                 false,
             )],
+            submit_on_choice: false,
         });
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
@@ -1959,6 +1964,7 @@ mod tests {
                 true,
                 true,
             )],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         assert!(matches!(
@@ -2012,6 +2018,7 @@ mod tests {
         use bmux_tui::event::EventOutcome;
         let request = NormalizedQuestionRequest {
             questions: vec![question("Answer", &[], true, true)],
+            submit_on_choice: false,
         };
         let factory = TypedTerminalInteractionSurfaceFactory::<
             QuestionInteractionController,
@@ -2060,15 +2067,13 @@ mod tests {
             QuestionInteractionController,
             QuestionTerminalRenderer,
         >::new();
+        let request = NormalizedQuestionRequest::new(vec![question("Answer", &[], true, true)]);
         let mut opening = factory.open(PluginTuiSurfaceOpenRequest {
             instance_id: "transformed-question".into(),
             repo_path: None,
             session_id: None,
             target: None,
-            options: serde_json::to_value(NormalizedQuestionRequest {
-                questions: vec![question("Answer", &[], true, true)],
-            })
-            .unwrap(),
+            options: serde_json::to_value(request).unwrap(),
         });
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let std::task::Poll::Ready(result) = opening.as_mut().poll(&mut context) else {
@@ -2161,6 +2166,7 @@ mod tests {
     fn completion_field_lifetimes_distinguish_retained_question_surfaces() {
         let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Answer", &[], true, false)],
+            submit_on_choice: false,
         });
         let snapshot = controller.snapshot();
         let mut first = QuestionTerminalRenderer::default();
@@ -2187,6 +2193,7 @@ mod tests {
     fn custom_completion_preserves_live_history_and_submits_inserted_answer() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Answer", &[], true, true)],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         apply_event(&mut renderer, &mut controller, &Event::Paste("@sr".into()));
@@ -2263,6 +2270,7 @@ mod tests {
                 question("First", &[], true, false),
                 question("Second", &[], true, false),
             ],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         apply_event(&mut renderer, &mut controller, &Event::Paste("@é".into()));
@@ -2350,6 +2358,7 @@ mod tests {
         let host = RemappedHost(registry);
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Answer", &[], true, false)],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         apply_event(&mut renderer, &mut controller, &Event::Paste("text".into()));
@@ -2390,6 +2399,7 @@ mod tests {
                 false,
                 true,
             )],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         assert_eq!(
@@ -2408,6 +2418,7 @@ mod tests {
         checkbox_question.selection_mode = QuestionSelectionMode::Multiple;
         let mut checkbox = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![checkbox_question],
+            submit_on_choice: false,
         });
         assert_eq!(
             apply_event(&mut renderer, &mut checkbox, &key(KeyCode::Space)),
@@ -2431,6 +2442,7 @@ mod tests {
     fn composer_grade_custom_input_supports_cursor_delete_unicode_multiline_and_paste() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Explain", &[], true, true)],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
 
@@ -2457,6 +2469,7 @@ mod tests {
     fn custom_input_accepts_shift_modified_capital_letters() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Explain", &[], true, true)],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
 
@@ -2474,6 +2487,7 @@ mod tests {
     fn custom_input_reserves_left_right_home_end_and_delete_for_host_behavior() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Explain", &[], true, true)],
+            submit_on_choice: false,
         });
         controller.handle_input(InteractionInput::Change {
             control_id: custom_control_id(0),
@@ -2512,6 +2526,7 @@ mod tests {
     fn renderer_uses_host_theme_for_options_actions_and_hints() {
         let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Choose", &[("Yes", None)], false, true)],
+            submit_on_choice: false,
         });
         controller.handle_input(InteractionInput::Activate {
             control_id: option_control_id(0, 0),
@@ -2595,6 +2610,7 @@ mod tests {
                 false,
                 true,
             )],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         controller.handle_input(InteractionInput::Activate {
@@ -2624,6 +2640,7 @@ mod tests {
 
         let mut required = QuestionInteractionController::new(NormalizedQuestionRequest {
             questions: vec![question("Required", &[("Answer", None)], false, true)],
+            submit_on_choice: false,
         });
         let initial_height =
             QuestionTerminalRenderer::default().preferred_height(&required.snapshot(), 32);
@@ -2652,6 +2669,7 @@ mod tests {
                 true,
                 false,
             )],
+            submit_on_choice: false,
         });
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
@@ -2679,6 +2697,7 @@ mod tests {
                 true,
                 true,
             )],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         let initial = controller.snapshot();
@@ -2740,6 +2759,7 @@ mod tests {
                 true,
                 true,
             )],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         let initial = controller.snapshot();
@@ -2798,8 +2818,10 @@ mod tests {
                 required: true,
             })
             .collect();
-        let controller =
-            QuestionInteractionController::new(NormalizedQuestionRequest { questions });
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions,
+            submit_on_choice: false,
+        });
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
         let logical_height = renderer.preferred_height(&snapshot, 80);
@@ -2836,6 +2858,7 @@ mod tests {
                 custom_mode: QuestionCustomMode::Additional,
                 required: false,
             }],
+            submit_on_choice: false,
         });
         let mut renderer = QuestionTerminalRenderer::default();
         let _buffer = render_snapshot(
@@ -2860,8 +2883,10 @@ mod tests {
                 )
             })
             .collect();
-        let controller =
-            QuestionInteractionController::new(NormalizedQuestionRequest { questions });
+        let controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions,
+            submit_on_choice: false,
+        });
         let snapshot = controller.snapshot();
         let mut renderer = QuestionTerminalRenderer::default();
         let width = 40;
@@ -2898,6 +2923,7 @@ mod tests {
                     true,
                 ),
             ],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         let mut renderer = QuestionTerminalRenderer::default();
@@ -2930,6 +2956,7 @@ mod tests {
     fn custom_multiline_arrows_edit_interior_rows_and_leave_at_edges() {
         let request = NormalizedQuestionRequest {
             questions: vec![question("Explain", &[], true, true)],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         controller.handle_input(InteractionInput::Change {
@@ -2979,6 +3006,7 @@ mod tests {
                 true,
                 true,
             )],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         let expected = [
@@ -3016,6 +3044,7 @@ mod tests {
                 question("First", &[("One", None)], false, false),
                 question("Second", &[], true, true),
             ],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         controller.handle_input(InteractionInput::Change {
@@ -3065,6 +3094,7 @@ mod tests {
                 question("First", &[("One", None)], false, false),
                 question("Second", &[], true, true),
             ],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         controller.handle_input(InteractionInput::Change {
@@ -3120,6 +3150,7 @@ mod tests {
                 false,
                 false,
             )],
+            submit_on_choice: false,
         };
         let mut controller = QuestionInteractionController::new(request);
         let mut renderer = QuestionTerminalRenderer::default();

@@ -1776,6 +1776,10 @@ impl CodexSession {
                                 option["label"].as_str().map(|label| HarnessChoice {
                                     choice_id: format!("option-{index}"),
                                     label: label.to_owned(),
+                                    description: option["description"]
+                                        .as_str()
+                                        .filter(|text| !text.trim().is_empty())
+                                        .map(ToOwned::to_owned),
                                 })
                             })
                             .collect()

@@ -358,6 +358,9 @@ impl QuestionInteractionController {
                         self.toggle_option(question_index, option_index);
                         self.invalid_question_index = None;
                         self.validation_error = None;
+                        if self.submits_on_choice() {
+                            return self.submit();
+                        }
                     }
                     QuestionFocusTarget::Custom { .. }
                     | QuestionFocusTarget::Submit
@@ -366,6 +369,16 @@ impl QuestionInteractionController {
                 InteractionOutput::Redraw
             }
         }
+    }
+
+    /// Whether choosing an option answers the request at once: requested, and the request is
+    /// one single-choice question.
+    fn submits_on_choice(&self) -> bool {
+        self.request.submit_on_choice
+            && matches!(
+                self.request.questions.as_slice(),
+                [question] if question.selection_mode == QuestionSelectionMode::Single
+            )
     }
 
     fn change_control(
@@ -797,6 +810,7 @@ mod tests {
     fn request(question: Question) -> NormalizedQuestionRequest {
         NormalizedQuestionRequest {
             questions: vec![question],
+            submit_on_choice: false,
         }
     }
 
@@ -859,6 +873,7 @@ mod tests {
                     false,
                 ),
             ],
+            submit_on_choice: false,
         };
         let count = focus_target_count(&request);
         assert_eq!(count, 6);
@@ -913,6 +928,48 @@ mod tests {
             panic!("expected submitted output");
         };
         assert_eq!(payload["questions"][0]["selected"], json!(["Use Postgres"]));
+    }
+
+    #[test]
+    fn choosing_submits_only_when_requested_for_one_single_choice_question() {
+        let mut eager = request(question_with_labels(
+            &["Use SQLite", "Use Postgres"],
+            QuestionSelectionMode::Single,
+        ));
+        eager.submit_on_choice = true;
+        let mut controller = QuestionInteractionController::new(eager);
+        let InteractionOutput::Submitted { payload } =
+            controller.handle_input(InteractionInput::Activate {
+                control_id: option_control_id(0, 1),
+            })
+        else {
+            panic!("choosing an option submits it");
+        };
+        assert_eq!(payload["questions"][0]["selected"], json!(["Use Postgres"]));
+
+        let mut ordinary = QuestionInteractionController::new(request(question_with_labels(
+            &["Use SQLite", "Use Postgres"],
+            QuestionSelectionMode::Single,
+        )));
+        assert_eq!(
+            ordinary.handle_input(InteractionInput::Activate {
+                control_id: option_control_id(0, 1),
+            }),
+            InteractionOutput::Redraw
+        );
+
+        let mut multiple = request(question_with_labels(
+            &["Tests", "Docs"],
+            QuestionSelectionMode::Multiple,
+        ));
+        multiple.submit_on_choice = true;
+        let mut multiple = QuestionInteractionController::new(multiple);
+        assert_eq!(
+            multiple.handle_input(InteractionInput::Activate {
+                control_id: option_control_id(0, 0),
+            }),
+            InteractionOutput::Redraw
+        );
     }
 
     #[test]

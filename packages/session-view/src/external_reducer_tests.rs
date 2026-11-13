@@ -268,6 +268,7 @@ impl Fixture {
             choices: vec![HarnessChoice {
                 choice_id: "allow".into(),
                 label: "Allow".into(),
+                description: None,
             }],
             tool_name: Some("Bash".into()),
             input_preview: Some("{\"command\":\"cargo test\"}".into()),
@@ -870,22 +871,25 @@ fn agent_announcements_are_labelled_not_shown_and_compaction_is_counted() {
 }
 
 #[test]
-fn a_question_is_one_card_that_shows_the_answer() {
+fn a_question_is_one_card_that_hosts_its_controls_then_shows_the_answer() {
     let mut fixture = Fixture::new();
     let mut pair = Pair::new();
     pair.durable(&fixture.configured());
+    let long = format!("What should I plan? {}", "Plan mode is on. ".repeat(20));
     let mut question = fixture.interaction(GENERATION, "question-1");
     question.kind = HarnessInteractionKind::Question;
-    question.prompt = "What should I plan?".into();
+    question.prompt.clone_from(&long);
     question.tool_name = None;
     question.choices = vec![
         HarnessChoice {
             choice_id: "0".into(),
             label: "Just testing".into(),
+            description: Some("Confirm the connection works".into()),
         },
         HarnessChoice {
             choice_id: "1".into(),
             label: "Review work".into(),
+            description: None,
         },
     ];
     let page = fixture.page(vec![(
@@ -895,21 +899,35 @@ fn a_question_is_one_card_that_shows_the_answer() {
         },
     )]);
     pair.durable(&page);
+    let asked = format!(
+        "Claude Code asks: {}\n  1. Just testing — Confirm the connection works\n  2. Review work",
+        long.trim()
+    );
+    // While open, the card is the interaction the question controls are placed in.
     let card = |pair: &Pair| {
-        pair.ordinary
+        let cards = pair
+            .ordinary
             .snapshot()
             .transcript
             .items
             .iter()
-            .filter_map(system_text)
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>()
+            .filter_map(|item| match &item.kind {
+                TranscriptViewItemKind::Interaction { interaction } => Some(interaction.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1, "one card per question");
+        cards[0].clone()
     };
+    let open = card(&pair);
     assert_eq!(
-        card(&pair),
-        [
-            "Claude Code asks: What should I plan?\n  1. Just testing\n  2. Review work\nPick an option, or type your own answer and send it."
-        ]
+        open.interaction_id,
+        crate::external_projection::native_interaction_surface_id(GENERATION, "question-1")
+    );
+    assert!(!open.resolved);
+    assert_eq!(
+        open.title.as_deref(),
+        Some(format!("{asked}\nPick an option, or type your own answer and send it.").as_str())
     );
     let mut answer = fixture.respond_request("question-1");
     if let ExternalHarnessRequestKind::Respond { response, .. } = &mut answer.kind {
@@ -923,11 +941,54 @@ fn a_question_is_one_card_that_shows_the_answer() {
         ExternalHarnessOperationRecord::DeliveryClaimed { request: answer },
     );
     pair.durable(&claimed);
+    let answered = card(&pair);
+    assert!(answered.resolved);
+    assert_eq!(answered.interaction_id, open.interaction_id);
+    assert_eq!(answered.title.as_deref(), Some(asked.as_str()));
     assert_eq!(
-        card(&pair),
-        [
-            "Claude Code asks: What should I plan?\n  1. Just testing\n  2. Review work\nYou answered: what model are you?"
-        ]
+        answered.status_detail.as_deref(),
+        Some("You answered: what model are you?")
+    );
+}
+
+#[test]
+fn a_withdrawn_question_card_stops_waiting() {
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    let mut question = fixture.interaction(GENERATION, "question-1");
+    question.kind = HarnessInteractionKind::Question;
+    question.prompt = "Which?".into();
+    question.tool_name = None;
+    question.choices = Vec::new();
+    pair.durable(&fixture.page(vec![(
+        "question",
+        HarnessObservationKind::Interaction {
+            interaction: question,
+        },
+    )]));
+    pair.durable(&fixture.page(vec![(
+        "withdrawn",
+        HarnessObservationKind::InteractionWithdrawn {
+            request_id: "question-1".into(),
+        },
+    )]));
+    let snapshot = pair.ordinary.snapshot();
+    assert_eq!(snapshot.pending_external_interactions.len(), 0);
+    let closed = snapshot
+        .transcript
+        .items
+        .iter()
+        .find_map(|item| match &item.kind {
+            TranscriptViewItemKind::Interaction { interaction } => Some(interaction),
+            _ => None,
+        })
+        .unwrap();
+    assert!(closed.resolved);
+    assert_eq!(closed.title.as_deref(), Some("Claude Code asks: Which?"));
+    assert_eq!(
+        closed.status_detail.as_deref(),
+        Some("No longer waiting for an answer")
     );
 }
 

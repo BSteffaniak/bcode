@@ -459,6 +459,9 @@ pub enum HarnessInteractionKind {
 pub struct HarnessChoice {
     pub choice_id: String,
     pub label: String,
+    /// What choosing it means, when the native agent explains its options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 /// A native request observed under the canonical generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,6 +508,9 @@ impl HarnessInteraction {
         for choice in &self.choices {
             id(&choice.choice_id)?;
             text(&choice.label)?;
+            if let Some(description) = &choice.description {
+                text(description)?;
+            }
             if !seen.insert(&choice.choice_id) {
                 return Err(HarnessContractError::InvalidShape);
             }

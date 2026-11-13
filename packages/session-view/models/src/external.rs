@@ -143,6 +143,9 @@ pub struct ExternalChoiceView {
     pub id: String,
     /// Secret-safe label.
     pub label: String,
+    /// What choosing it means, when the native agent explains its options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Non-secret launch provenance retained for offline history.

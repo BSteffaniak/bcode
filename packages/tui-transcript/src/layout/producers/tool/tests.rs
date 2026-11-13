@@ -629,6 +629,42 @@ fn interactions_summarize_state_and_snapshot() {
 }
 
 #[test]
+fn prose_interactions_show_every_line_wrapped_and_their_outcome_in_the_header() {
+    let question = format!(
+        "Claude Code asks: {}",
+        "Which database should I use? ".repeat(4)
+    );
+    let interaction = InteractionViewSummary {
+        interaction_id: "i".to_owned(),
+        producer_id: None,
+        exchange_schema: None,
+        exchange_schema_version: None,
+        kind: "native_question".to_owned(),
+        tool_call_id: None,
+        title: Some(format!("{question}\n  1. SQLite — embedded\n  2. Postgres")),
+        required: false,
+        snapshot: None,
+        state: InteractionViewState::Resolved,
+        status_detail: Some("You answered: SQLite".to_owned()),
+        resolved: true,
+        resolution: None,
+    };
+    let fixture = single(
+        StructureConfig::default(),
+        item("t", TranscriptViewItemKind::Interaction { interaction }),
+    );
+    let rendered = fixture.render_item("t", 40);
+    let text = rendered.text();
+    assert!(text.contains("Question"), "{text}");
+    assert!(text.contains("You answered: SQLite"), "{text}");
+    assert!(text.contains("SQLite — embedded"), "{text}");
+    assert!(text.contains("Postgres"), "{text}");
+    // The long question wraps rather than being clipped at the width.
+    let words = text.matches("database").count();
+    assert_eq!(words, 4, "{text}");
+}
+
+#[test]
 fn argument_fields_are_bounded() {
     let long = "x".repeat(500);
     let arguments = json!({

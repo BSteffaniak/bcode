@@ -446,30 +446,7 @@ impl Normalizer {
             CallbackRequest::CanUseTool {
                 tool_name, input, ..
             } if tool_name == "AskUserQuestion" => {
-                // One native question per response. Multi-question forms are not silently flattened.
-                let questions = input.get("questions")?.as_array()?;
-                if questions.len() != 1 {
-                    return None;
-                }
-                let question = &questions[0];
-                if question.get("multiSelect").and_then(Value::as_bool) == Some(true) {
-                    return None;
-                }
-                let prompt = bounded_text(question.get("question"))?;
-                let options = question.get("options")?.as_array()?;
-                if options.len() > MAX_HARNESS_ITEMS {
-                    return None;
-                }
-                let choices = options
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        Some(HarnessChoice {
-                            choice_id: index.to_string(),
-                            label: bounded_text(value.get("label"))?,
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?;
+                let (prompt, choices) = question_form(input)?;
                 (
                     HarnessInteractionKind::Question,
                     prompt,
@@ -575,9 +552,9 @@ impl Normalizer {
                 CallbackRequest::CanUseTool { input, .. },
             ) => {
                 let mut updated_input = input.clone();
-                let question = input
-                    .pointer("/questions/0/question")
-                    .and_then(Value::as_str)
+                let questions = input
+                    .get("questions")
+                    .and_then(Value::as_array)
                     .ok_or(HarnessContractError::InvalidShape)?;
                 let answer = choice_id
                     .as_ref()
@@ -588,7 +565,16 @@ impl Normalizer {
                             .find(|choice| &choice.choice_id == id)
                     })
                     .map_or(text.as_str(), |choice| choice.label.as_str());
-                updated_input["answers"] = json!({(question): answer});
+                // One reply answers every question asked; with several, it covers them all.
+                let answers = questions
+                    .iter()
+                    .filter_map(|question| question.get("question")?.as_str())
+                    .map(|question| (question.to_owned(), Value::from(answer)))
+                    .collect::<serde_json::Map<_, _>>();
+                if answers.is_empty() {
+                    return Err(HarnessContractError::InvalidShape);
+                }
+                updated_input["answers"] = Value::Object(answers);
                 Ok(CallbackResponse::Allow { updated_input })
             }
             (HarnessResponseValue::Cancel, CallbackRequest::McpMessage { message, .. }) => {
@@ -653,6 +639,67 @@ impl Normalizer {
         );
         observations
     }
+}
+/// The prompt and choices of a native `AskUserQuestion` form. One question offers its options
+/// (with what each means); several questions, or several selections, are answered in one reply,
+/// so every form the native agent can ask is answerable.
+fn question_form(input: &Value) -> Option<(String, Vec<HarnessChoice>)> {
+    use std::fmt::Write as _;
+    let questions = input.get("questions")?.as_array()?;
+    if questions.is_empty() || questions.len() > MAX_HARNESS_ITEMS {
+        return None;
+    }
+    let options = |question: &Value| -> Option<Vec<Value>> {
+        let options = question
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        (options.len() <= MAX_HARNESS_ITEMS).then_some(options)
+    };
+    let several =
+        |question: &Value| question.get("multiSelect").and_then(Value::as_bool) == Some(true);
+    if let [question] = questions.as_slice() {
+        let mut prompt = bounded_text(question.get("question"))?;
+        if several(question) {
+            prompt.push_str("\n(Choose one, or type several separated by commas.)");
+        }
+        let choices = options(question)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                Some(HarnessChoice {
+                    choice_id: index.to_string(),
+                    label: bounded_text(value.get("label"))?,
+                    description: bounded_text(value.get("description"))
+                        .filter(|text| !text.trim().is_empty()),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return (prompt.len() <= MAX_HARNESS_TEXT_BYTES).then_some((prompt, choices));
+    }
+    let mut prompt = String::new();
+    for (index, question) in questions.iter().enumerate() {
+        let text = bounded_text(question.get("question"))?;
+        if index > 0 {
+            prompt.push('\n');
+        }
+        let _ = write!(prompt, "{}. {text}", index + 1);
+        let labels = options(question)?
+            .iter()
+            .filter_map(|option| option.get("label")?.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        if !labels.is_empty() {
+            let _ = write!(
+                prompt,
+                " ({}{})",
+                if several(question) { "any of: " } else { "" },
+                labels.join(" / ")
+            );
+        }
+    }
+    prompt.push_str("\nAnswer each question in one reply.");
+    (prompt.len() <= MAX_HARNESS_TEXT_BYTES).then_some((prompt, Vec::new()))
 }
 fn bounded_text(value: Option<&Value>) -> Option<String> {
     let value = value?.as_str()?;

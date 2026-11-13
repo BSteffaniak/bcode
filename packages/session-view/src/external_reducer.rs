@@ -4,6 +4,7 @@
 //! bounded reducer can charge exactly the touched owners after applying, and restore the previous
 //! state and ledger atomically when the retention budget rejects the event.
 
+use bcode_session_view_models::InteractionViewState;
 use std::collections::BTreeMap;
 
 use bcode_harness_models::HarnessCapabilities;
@@ -617,6 +618,17 @@ impl SessionView {
                 self.snapshot.native_context_compactions =
                     self.snapshot.native_context_compactions.saturating_add(1);
             }
+            ExternalEffect::QuestionAsked {
+                id,
+                interaction_id,
+                text,
+            } => self.upsert_external_item(
+                journal,
+                event,
+                TranscriptViewItemId::new(id),
+                question_card(interaction_id, text, InteractionViewState::Pending, None),
+                remaining,
+            ),
             ExternalEffect::QuestionAnswered { id, answer } => {
                 self.answer_question_card(journal, event, id, &answer, remaining);
             }
@@ -626,7 +638,10 @@ impl SessionView {
             ExternalEffect::InteractionResolved {
                 generation,
                 request_id,
-            } => self.resolve_external_interaction(journal, generation, &request_id),
+            } => {
+                self.resolve_external_interaction(journal, generation, &request_id);
+                self.close_question_card(journal, event, generation, &request_id, remaining);
+            }
         }
     }
 
@@ -786,25 +801,70 @@ impl SessionView {
         remaining: usize,
     ) {
         let id = TranscriptViewItemId::new(id);
-        let answered = self.snapshot.transcript.items.iter().find_map(|item| {
-            match (&item.kind, item.id == id) {
-                (TranscriptViewItemKind::SystemMessage { message }, true) => Some(
-                    crate::external_projection::answered_question_text(&message.text, answer),
-                ),
+        let Some((interaction_id, text)) = self.open_question_card(&id) else {
+            return;
+        };
+        let question = crate::external_projection::question_without_hint(&text).to_owned();
+        self.upsert_external_item(
+            journal,
+            event,
+            id,
+            question_card(
+                interaction_id,
+                question,
+                InteractionViewState::Resolved,
+                Some(crate::external_projection::answered_question_status(answer)),
+            ),
+            remaining,
+        );
+    }
+
+    /// The surface identity and text of question card `id` while it is still open.
+    fn open_question_card(&self, id: &TranscriptViewItemId) -> Option<(String, String)> {
+        self.snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| &item.id == id)
+            .and_then(|item| match &item.kind {
+                TranscriptViewItemKind::Interaction { interaction } if !interaction.resolved => {
+                    Some((
+                        interaction.interaction_id.clone(),
+                        interaction.title.clone()?,
+                    ))
+                }
                 _ => None,
-            }
-        });
-        if let Some(text) = answered {
-            self.upsert_external_item(
-                journal,
-                event,
-                id,
-                TranscriptViewItemKind::SystemMessage {
-                    message: ChatMessageView::plain(text),
-                },
-                remaining,
-            );
-        }
+            })
+    }
+
+    /// Close a question card that is still open once its request ends unanswered.
+    fn close_question_card(
+        &mut self,
+        journal: &mut ExternalJournal,
+        event: &SessionEvent,
+        generation: u64,
+        request_id: &str,
+        remaining: usize,
+    ) {
+        let id = TranscriptViewItemId::new(crate::external_projection::question_card_id(
+            generation, request_id,
+        ));
+        let Some((interaction_id, text)) = self.open_question_card(&id) else {
+            return;
+        };
+        let question = crate::external_projection::question_without_hint(&text).to_owned();
+        self.upsert_external_item(
+            journal,
+            event,
+            id,
+            question_card(
+                interaction_id,
+                question,
+                InteractionViewState::Cancelled,
+                Some("No longer waiting for an answer".to_owned()),
+            ),
+            remaining,
+        );
     }
 
     fn upsert_external_item(
@@ -1023,3 +1083,31 @@ impl SessionView {
 #[cfg(test)]
 #[path = "external_reducer_tests.rs"]
 mod tests;
+
+/// A native question's card: open (hosting the question controls) while `state` is pending,
+/// then the question with its outcome.
+fn question_card(
+    interaction_id: String,
+    text: String,
+    state: InteractionViewState,
+    status_detail: Option<String>,
+) -> TranscriptViewItemKind {
+    let resolved = state != InteractionViewState::Pending;
+    TranscriptViewItemKind::Interaction {
+        interaction: bcode_session_view_models::InteractionViewSummary {
+            interaction_id,
+            producer_id: None,
+            exchange_schema: None,
+            exchange_schema_version: None,
+            kind: crate::external_projection::NATIVE_QUESTION_KIND.to_owned(),
+            tool_call_id: None,
+            title: Some(text),
+            required: !resolved,
+            snapshot: None,
+            state,
+            status_detail,
+            resolved,
+            resolution: None,
+        },
+    }
+}

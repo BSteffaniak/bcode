@@ -149,6 +149,16 @@ pub enum ExternalEffect {
         /// Friendly literal text.
         text: String,
     },
+    /// A native question awaits an answer: its card hosts the question controls in the
+    /// transcript until it is answered.
+    QuestionAsked {
+        /// Transcript identity of the question card.
+        id: String,
+        /// Identity of the interaction surface the card hosts.
+        interaction_id: String,
+        /// The question and its options.
+        text: String,
+    },
     /// A native question was answered; its card shows the answer in place of the prompt to
     /// answer.
     QuestionAnswered {
@@ -458,10 +468,17 @@ fn project_observation(
             let text = interaction_notice(builder.label(), interaction);
             if interaction.kind == HarnessInteractionKind::Question {
                 // One card per question, updated in place once it is answered.
-                builder.projection.effects.push(ExternalEffect::Notice {
-                    id: question_card_id(generation, &interaction.request_id),
-                    text,
-                });
+                builder
+                    .projection
+                    .effects
+                    .push(ExternalEffect::QuestionAsked {
+                        id: question_card_id(generation, &interaction.request_id),
+                        interaction_id: native_interaction_surface_id(
+                            generation,
+                            &interaction.request_id,
+                        ),
+                        text,
+                    });
             } else {
                 builder.notice(text);
             }
@@ -662,20 +679,36 @@ pub fn split_agent_block(text: &str) -> (Option<&str>, &str) {
 /// Response identities of native approvals the conversation's agent policy answered.
 pub const AGENT_POLICY_RESPONSE_PREFIX: &str = "agent-policy-";
 
+/// Identity of the interaction surface that answers native request `request_id`.
+#[must_use]
+pub fn native_interaction_surface_id(generation: u64, request_id: &str) -> String {
+    format!("{NATIVE_INTERACTION_PREFIX}:{generation}:{request_id}")
+}
+
+/// Interaction kind of a native question's card.
+pub const NATIVE_QUESTION_KIND: &str = "native_question";
+
+/// Prefix of [`native_interaction_surface_id`] identities.
+pub const NATIVE_INTERACTION_PREFIX: &str = "native-harness";
+
 /// Transcript identity of a native question's card.
-fn question_card_id(generation: u64, request_id: &str) -> String {
+#[must_use]
+pub fn question_card_id(generation: u64, request_id: &str) -> String {
     format!("external-question:{generation}:{request_id}")
 }
 
-/// The answered form of a question card: the question and its options, then the answer in
-/// place of the prompt to answer.
+/// A question card's question and options, without its prompt to answer.
 #[must_use]
-pub fn answered_question_text(card: &str, answer: &str) -> String {
-    let question = card
-        .rsplit_once('\n')
+pub fn question_without_hint(card: &str) -> &str {
+    card.rsplit_once('\n')
         .filter(|(_, last)| last.contains("answer"))
-        .map_or(card, |(rest, _)| rest);
-    format!("{question}\nYou answered: {}", excerpt(answer))
+        .map_or(card, |(rest, _)| rest)
+}
+
+/// How a question card reports its answer.
+#[must_use]
+pub fn answered_question_status(answer: &str) -> String {
+    format!("You answered: {}", excerpt(answer))
 }
 
 fn interaction_notice(label: &str, interaction: &HarnessInteraction) -> String {
@@ -692,9 +725,13 @@ fn interaction_notice(label: &str, interaction: &HarnessInteraction) -> String {
             |tool| format!("{label} is asking for approval to run {tool}"),
         ),
         HarnessInteractionKind::Question => {
-            let mut notice = format!("{label} asks: {prompt}");
-            for (index, choice) in interaction.choices.iter().take(9).enumerate() {
+            // The whole question: it is what the user answers.
+            let mut notice = format!("{label} asks: {}", interaction.prompt.trim());
+            for (index, choice) in interaction.choices.iter().enumerate() {
                 let _ = write!(notice, "\n  {}. {}", index + 1, excerpt(&choice.label));
+                if let Some(description) = &choice.description {
+                    let _ = write!(notice, " — {}", description.trim());
+                }
             }
             notice.push_str(if interaction.choices.is_empty() {
                 "\nType your answer and send it."

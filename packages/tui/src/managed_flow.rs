@@ -303,7 +303,11 @@ pub fn apply_queue_result(
             .managed_queue()
             .iter()
             .find(|input| input.submission_id == submission_id)
-            .map(|input| input.text.clone());
+            .map(|input| {
+                bcode_session_view::external_projection::split_agent_block(&input.text)
+                    .1
+                    .to_owned()
+            });
         let status = match (queue.withdrawn, edit, text) {
             (true, true, Some(text)) => {
                 let draft = chat.app.composer().text().to_owned();
@@ -577,6 +581,7 @@ mod tests {
             choices: vec![ExternalChoiceView {
                 id: "yes".into(),
                 label: "Yes".into(),
+                description: None,
             }],
             tool_name: Some("Bash".into()),
             input_preview: Some(r#"{"command":"ls"}"#.into()),

@@ -211,6 +211,7 @@ fn question_approval_and_assistance_require_current_application_admission() {
             choices: vec![HarnessChoice {
                 choice_id: "choice".into(),
                 label: "Choice".into(),
+                description: None,
             }],
         };
         for availability in [

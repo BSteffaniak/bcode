@@ -1,6 +1,7 @@
 //! Native-parity normalization: segment identities, reasoning, tool input/output, usage,
 //! approval previews, live sidecar and mid-session configuration surfaces.
 use super::*;
+use bcode_claude_code::CallbackResponse;
 use bcode_harness_models::{
     HarnessLiveStream, MAX_HARNESS_PREVIEW_BYTES, MAX_HARNESS_TEXT_BYTES,
     MAX_HARNESS_TOOL_INPUT_BYTES,
@@ -269,18 +270,57 @@ fn approvals_carry_tool_name_and_bounded_pretty_preview_without_dispatch() {
 }
 
 #[test]
-fn multi_select_questions_stay_fail_closed() {
+fn every_question_form_is_answerable() {
     let mut normalizer = normalizer();
+    // A multi-select question offers its options; several may be typed in one answer.
     let observations = normalizer.event(callback(
         "AskUserQuestion",
         json!({"questions":[{"question":"Which?","multiSelect":true,
-            "options":[{"label":"One"},{"label":"Two"}]}]}),
+            "options":[{"label":"One","description":"The first"},{"label":"Two"}]}]}),
     ));
-    assert!(normalizer.pending.is_empty());
-    assert!(matches!(
-        observations[0].kind,
-        HarnessObservationKind::Diagnostic { .. }
-    ));
+    let HarnessObservationKind::Interaction { interaction } = &observations[0].kind else {
+        panic!("expected a question");
+    };
+    assert_eq!(interaction.kind, HarnessInteractionKind::Question);
+    assert!(interaction.prompt.starts_with("Which?"));
+    assert_eq!(interaction.choices.len(), 2);
+    assert_eq!(
+        interaction.choices[0].description.as_deref(),
+        Some("The first")
+    );
+    interaction.validate().unwrap();
+    normalizer.complete_callback("callback");
+
+    // Several questions are answered in one reply that covers every question.
+    let input = json!({"questions":[
+        {"question":"Scope?","options":[{"label":"Small"},{"label":"Large"}]},
+        {"question":"Deadline?","options":[]}]});
+    let observations = normalizer.event(callback("AskUserQuestion", input));
+    let HarnessObservationKind::Interaction { interaction } = &observations[0].kind else {
+        panic!("expected a question");
+    };
+    assert_eq!(
+        interaction.prompt,
+        "1. Scope? (Small / Large)\n2. Deadline?\nAnswer each question in one reply."
+    );
+    assert_eq!(interaction.choices.len(), 0);
+    let response = HarnessResponse {
+        response_id: "answer".into(),
+        request_id: interaction.request_id.clone(),
+        session_id: interaction.session_id.clone(),
+        generation: interaction.generation,
+        value: HarnessResponseValue::Answer {
+            choice_id: None,
+            text: "Small, by Friday".into(),
+        },
+    };
+    let CallbackResponse::Allow { updated_input } = normalizer.response(&response).unwrap() else {
+        panic!("expected the answer to allow the question");
+    };
+    assert_eq!(
+        updated_input["answers"],
+        json!({"Scope?": "Small, by Friday", "Deadline?": "Small, by Friday"})
+    );
 }
 
 #[test]

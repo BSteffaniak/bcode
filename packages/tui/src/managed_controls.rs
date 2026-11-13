@@ -31,7 +31,8 @@ pub const MANAGED_NATIVE_PASSTHROUGH_COMMANDS: &[&str] = &["compact"];
 pub const QUESTION_INLINE_SURFACE: &str = "bcode.question.inline";
 
 /// Interaction-id prefix reserved for managed native interactions presented on a surface.
-const MANAGED_SURFACE_PREFIX: &str = "native-harness";
+const MANAGED_SURFACE_PREFIX: &str =
+    bcode_session_view::external_projection::NATIVE_INTERACTION_PREFIX;
 
 const MAX_QUESTION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_OPTION_TEXT_BYTES: usize = 4 * 1024;
@@ -236,7 +237,7 @@ pub fn interaction_key(view: &ExternalInteractionView) -> ManagedInteractionKey 
 /// Surface interaction id for a managed interaction presented on the question surface.
 #[must_use]
 pub fn surface_interaction_id(key: &ManagedInteractionKey) -> String {
-    format!("{MANAGED_SURFACE_PREFIX}:{}:{}", key.0, key.1)
+    bcode_session_view::external_projection::native_interaction_surface_id(key.0, &key.1)
 }
 
 /// Inverse of [`surface_interaction_id`]; `None` for ordinary interaction ids.
@@ -325,7 +326,10 @@ pub fn question_surface_request(
                         MAX_OPTION_TEXT_BYTES,
                     ),
                     "value": truncate_utf8(&choice.id, MAX_OPTION_TEXT_BYTES),
-                    "description": null,
+                    "description": choice
+                        .description
+                        .as_deref()
+                        .map(|text| truncate_utf8(text, MAX_OPTION_TEXT_BYTES)),
                 })
             })
             .collect::<Vec<_>>(),
@@ -344,7 +348,9 @@ pub fn question_surface_request(
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .map(|name| truncate_utf8(name, MAX_OPTION_TEXT_BYTES));
+    // As in the native agent's own prompt: choosing an option answers it.
     let request = serde_json::json!({
+        "submit_on_choice": true,
         "questions": [{
             "header": header,
             "question": truncate_utf8(prompt, MAX_QUESTION_TEXT_BYTES),
@@ -636,10 +642,12 @@ mod tests {
                 ExternalChoiceView {
                     id: "a".into(),
                     label: "src/a.rs".into(),
+                    description: None,
                 },
                 ExternalChoiceView {
                     id: "b".into(),
                     label: "src/b.rs".into(),
+                    description: None,
                 },
             ],
             tool_name: Some("Edit".into()),

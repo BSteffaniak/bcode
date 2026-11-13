@@ -11,6 +11,21 @@ pub const QUESTION_INLINE_SURFACE: &str = "bcode.question.inline";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedQuestionRequest {
     pub(crate) questions: Vec<Question>,
+    /// Choosing an option of the only, single-choice question submits it at once.
+    #[serde(default)]
+    pub(crate) submit_on_choice: bool,
+}
+
+#[cfg(test)]
+impl NormalizedQuestionRequest {
+    /// A request for `questions`, answered with an explicit submit.
+    #[must_use]
+    pub(crate) const fn new(questions: Vec<Question>) -> Self {
+        Self {
+            questions,
+            submit_on_choice: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

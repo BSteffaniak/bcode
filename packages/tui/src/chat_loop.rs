@@ -5151,10 +5151,12 @@ fn apply_managed_composer_receipt(
         // Definitely not delivered: give the text back so it can be sent again.
         ExternalHarnessResponseKind::Failure(failure) => {
             chat.app.forget_native_agent_announcement();
+            // Only what the user wrote comes back; the agent announcement is re-added on send.
             if let Some(text) = retained.as_ref().and_then(submitted_text)
                 && chat.app.composer().text().is_empty()
             {
-                chat.app.replace_composer_with(text);
+                let (_, message) = bcode_session_view::external_projection::split_agent_block(text);
+                chat.app.replace_composer_with(message);
             }
             format!("{label} did not take that message ({failure:?}); it is back in the composer")
         }

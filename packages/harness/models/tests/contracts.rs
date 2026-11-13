@@ -212,6 +212,7 @@ fn interaction_kind_choice_and_generation_are_checked() {
         choices: vec![HarnessChoice {
             choice_id: "yes".into(),
             label: "Yes".into(),
+            description: None,
         }],
     };
     let mut response = HarnessResponse {

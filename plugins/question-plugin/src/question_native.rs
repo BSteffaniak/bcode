@@ -346,6 +346,7 @@ mod tests {
                 custom_mode: QuestionCustomMode::Additional,
                 required: false,
             }],
+            submit_on_choice: false,
         }
     }
 

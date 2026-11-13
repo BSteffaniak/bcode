@@ -4084,7 +4084,9 @@ impl BmuxApp {
                 }
                 (
                     bcode_session_models::SubmissionId(id.to_owned()),
-                    input.text.clone(),
+                    bcode_session_view::external_projection::split_agent_block(&input.text)
+                        .1
+                        .to_owned(),
                 )
             })
             .collect();
