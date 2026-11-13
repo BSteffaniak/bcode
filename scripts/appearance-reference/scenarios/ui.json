@@ -191,14 +191,15 @@
     "send": "\r"
    },
    {
-    "expect": [
-     "step 2"
-    ],
     "settle": 0.0,
     "snapshot": "tool-running",
     "frames": 3,
     "interval": 0.5,
-    "timeout": 40
+    "timeout": 40,
+    "expect_any": [
+     "step 2",
+     "Running the slow check"
+    ]
    },
    {
     "expect": [

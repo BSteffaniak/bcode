@@ -53,6 +53,10 @@ set   = { display_name = "Bash" }
 match = { kind = "tool", tool = ["filesystem.grep", "filesystem.find", "filesystem.list"] }
 set   = { display_name = "Search" }
 
+[[presentation.rules]]
+match = { kind = "tool", tool = "question" }
+set   = { display_name = "Question", header = { template = "{bullet} {tool}" } }
+
 # Successful reads and shell commands fold into one summary row per run.
 [[presentation.rules]]
 match = { kind = "tool", tool = ["filesystem.read", "shell.run"], status = "succeeded" }

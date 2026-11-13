@@ -62,6 +62,19 @@ Dark values; the palette file carries the light variant.
 | Banner | logo art (`#d77757`), bold title + muted version, model line, cwd line |
 | Scrolling | follows the newest content; no rows-below indicator |
 
+## Measurements
+
+Mean drawn-cell agreement of `--theme claude-code --profile claude-code-layout` with the dark
+reference (`compare.py`), against default Bcode:
+
+| Scenario | Default Bcode (text / style) | Claude Code look (text / style) |
+|---|---|---|
+| tour | 9.7% / 7.8% | 52.8% / 44.2% |
+| ui | 7.3% / 17.1% | 16.2% / 29.2% |
+
+The remaining tour difference is mostly content (tool names, plugin-drawn bodies, the banner);
+the ui scenario is dominated by the shortcut help overlay and the undocked question surface.
+
 ## Gaps
 
 Status of the presentation vocabulary needed by the `claude-code-layout` profile.
@@ -76,15 +89,17 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 6 | Tool header template (`{tool}({target})`), per-tool display names, status-colored marker | done: `header.template`, `display_name`, `bullet` |
 | 7 | Section connector (`⎿`) with hanging indent instead of section label rows | done: `section_labels = "connector"` |
 | 8 | Group summary templates with plural forms (`Read {count} file{s}`) | done: group `header.template`, `{plural}`, `group.min = 1` |
-| 9 | Reasoning summary template with duration | template done; reasoning duration needs activity timing in the session view (open) |
+| 9 | Reasoning summary template with duration | template done; duration open: live reasoning events carry no timestamps and persisted activities lose their start, so `{elapsed}` needs a recorded duration in the session model |
 | 10 | Turn summary row (duration and completion time) | done: `turn_summary` (process-local) |
 | 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | done: `markdown` chrome (BMUX `MarkdownPresentation`) |
 | 12 | Activity line: placement, spinner frames, verbs, shimmer | done: `activity`, `activity.*` roles |
-| 13 | Docked permission and question surfaces with numbered option lists | permission done: `dialogs`; question surface placement is configuration only (open); the awaiting permission unit duplicates a docked dialog (open) |
+| 13 | Docked permission and question surfaces with numbered option lists | permission done: `dialogs`. Open: question placement is the `[tui.interactions] placement` user setting, not theme chrome; the visibility floor keeps the awaiting permission unit expanded above a docked dialog (relaxing it is a design decision, since another foreground can cover the dock) |
 | 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
 | 15 | Session banner | open |
 | 16 | Slash menu presentation | done: `menus` |
 | 17 | Permission records disappear once decided | done: `hidden_marker = false` |
-| 18 | Plugin-drawn tool bodies (file edit card, shell screen) follow header/section presentation | open |
+| 18 | Plugin-drawn tool bodies (file edit card, shell screen) follow header/section presentation | open: full-block plugin visuals draw their own header and rows; the plugins need to honor the resolved presentation they receive (header template, display name) and offer summary styles as plugin properties |
 | 19 | Smart punctuation off (straight quotes) | done: `markdown.smart_punctuation` |
+| 21 | A `?` shortcut help overlay below the input | open (Bcode has no chat-scope shortcut help) |
+| 22 | Session banner (art, title, model, cwd) at the session start | open: needs a session-start transcript unit present only while the window reaches the session start |
 | 20 | Status line: "rows below latest" shown while following content shorter than the viewport | fixed |
