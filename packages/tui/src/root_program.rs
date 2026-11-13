@@ -1323,6 +1323,14 @@ impl BcodeRuntimeModel {
                     super::chat_loop::start_cancel_turn(&mut self.chat, &mut self.loop_state);
                     return super::invalidation::UiInvalidation::Structural;
                 }
+                if let Some(edit @ ("tui.queue.edit" | "tui.queue.cancel")) = action
+                    && super::managed_flow::withdraw_newest_queued(
+                        &mut self.chat,
+                        edit == "tui.queue.edit",
+                    )
+                {
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if action == Some("tui.agent.cycle") {
                     // The agent cycle selects Bcode agents, which the native agent follows.
                     super::managed_flow::cycle_native_agent(&mut self.chat, &mut self.loop_state);
@@ -3993,6 +4001,11 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 }
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::SessionStream(update)) => {
+                // Held native input leaves the queue as the native agent takes it.
+                if !self.chat.app.managed_queue().is_empty() {
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::LoadManagedQueue);
+                }
                 let refresh_permissions = matches!(
                     update.as_ref(),
                     super::history_flow::SessionStreamUpdate::Event(event)

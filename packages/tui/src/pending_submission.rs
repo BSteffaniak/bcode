@@ -21,6 +21,18 @@ impl PendingSubmission {
         }
     }
 
+    /// A submission held by the daemon under `id`, as reported after a restart.
+    #[must_use]
+    pub const fn queued(id: bcode_session_models::SubmissionId, text: String) -> Self {
+        Self {
+            id,
+            text,
+            state: PendingSubmissionState::Queued {
+                queue_position: None,
+            },
+        }
+    }
+
     /// Stable submission identity.
     #[must_use]
     pub const fn id(&self) -> &bcode_session_models::SubmissionId {

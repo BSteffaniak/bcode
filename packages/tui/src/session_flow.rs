@@ -256,6 +256,14 @@ impl AgentCatalog {
         app.apply_runtime_selection(selection, accent);
     }
 
+    /// Display name of an agent, falling back to its id.
+    #[must_use]
+    pub fn name_of<'a>(&'a self, agent_id: &'a str) -> &'a str {
+        self.by_id
+            .get(agent_id)
+            .map_or(agent_id, |agent| agent.name.as_str())
+    }
+
     /// Return true when the catalog has no agent profiles.
     #[must_use]
     pub const fn is_empty(&self) -> bool {

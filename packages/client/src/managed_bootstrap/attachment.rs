@@ -328,6 +328,31 @@ impl ManagedSessionCommandHandle {
         select_terminal_auth_interface(&binding.instance.plugin_id, &services)
     }
 
+    /// Native input held for this session until its native agent can take it.
+    /// # Errors
+    /// Returns authorization, storage or transport failures.
+    pub async fn queued_input(
+        &self,
+    ) -> Result<bcode_ipc::harness::ManagedQueuedInput, ClientError> {
+        self.client
+            .inner
+            .managed_queued_input(self.session_id)
+            .await
+    }
+
+    /// Withdraw one held input before it is sent.
+    /// # Errors
+    /// Returns authorization, storage or transport failures.
+    pub async fn withdraw_queued_input(
+        &self,
+        submission_id: String,
+    ) -> Result<bcode_ipc::harness::ManagedQueuedInput, ClientError> {
+        self.client
+            .inner
+            .withdraw_managed_queued_input(self.session_id, submission_id)
+            .await
+    }
+
     /// Read this session's composer draft, without submitting input.
     /// # Errors
     /// Returns ordinary draft authorization or transport failures.

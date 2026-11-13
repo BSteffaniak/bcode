@@ -153,7 +153,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 65 adds importing a named source file with an origin.
 /// Version 66 adds explicit external credential connection operations.
 /// Version 67 adds application turn context blocks and contributed agent profiles.
-/// Version 68 marks read-only agent profiles.
+/// Version 68 marks read-only agent profiles and counts native context compactions in session
+/// views.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 68;
 
 /// Durable session-storage writer epoch expected by this IPC build.

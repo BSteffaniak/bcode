@@ -1095,6 +1095,7 @@ pub fn inspect_snapshot(
         runtime: _,
         interactions: _,
         pending_external_interactions: _,
+        native_context_compactions: _,
         session_summary: _,
     } = value;
     let mut walker = Walker::new(limits, 8)?;

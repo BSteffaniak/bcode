@@ -545,10 +545,17 @@ impl SessionView {
         remaining: usize,
     ) {
         match effect {
-            ExternalEffect::User { id, text, steering } => {
+            ExternalEffect::User {
+                id,
+                text,
+                steering,
+                agent,
+            } => {
                 let mut message = ChatMessageView::markdown(text);
                 if steering {
                     message.display_label = Some("Steering".to_owned());
+                } else if let Some(agent) = agent {
+                    message.display_label = Some(format!("Agent: {agent}"));
                 }
                 self.upsert_external_item(
                     journal,
@@ -606,6 +613,13 @@ impl SessionView {
                 },
                 remaining,
             ),
+            ExternalEffect::ContextCompacted => {
+                self.snapshot.native_context_compactions =
+                    self.snapshot.native_context_compactions.saturating_add(1);
+            }
+            ExternalEffect::QuestionAnswered { id, answer } => {
+                self.answer_question_card(journal, event, id, &answer, remaining);
+            }
             ExternalEffect::InteractionRequested(view) => {
                 self.request_external_interaction(journal, *view);
             }
@@ -760,6 +774,37 @@ impl SessionView {
             TranscriptViewItemKind::AssistantMessage { message },
             remaining,
         );
+    }
+
+    /// Show `answer` on the question card `id` in place of the prompt to answer.
+    fn answer_question_card(
+        &mut self,
+        journal: &mut ExternalJournal,
+        event: &SessionEvent,
+        id: String,
+        answer: &str,
+        remaining: usize,
+    ) {
+        let id = TranscriptViewItemId::new(id);
+        let answered = self.snapshot.transcript.items.iter().find_map(|item| {
+            match (&item.kind, item.id == id) {
+                (TranscriptViewItemKind::SystemMessage { message }, true) => Some(
+                    crate::external_projection::answered_question_text(&message.text, answer),
+                ),
+                _ => None,
+            }
+        });
+        if let Some(text) = answered {
+            self.upsert_external_item(
+                journal,
+                event,
+                id,
+                TranscriptViewItemKind::SystemMessage {
+                    message: ChatMessageView::plain(text),
+                },
+                remaining,
+            );
+        }
     }
 
     fn upsert_external_item(

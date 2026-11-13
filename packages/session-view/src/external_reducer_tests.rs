@@ -834,6 +834,104 @@ fn durable_reasoning_supersedes_live_reasoning_and_respects_visibility() {
 }
 
 #[test]
+fn agent_announcements_are_labelled_not_shown_and_compaction_is_counted() {
+    use crate::external_projection::{split_agent_block, with_agent_block};
+    let announced = with_agent_block("Plan", Some("Plan before changing files."), "what next?");
+    assert_eq!(split_agent_block(&announced), (Some("Plan"), "what next?"));
+    assert_eq!(split_agent_block("plain"), (None, "plain"));
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    let claimed = fixture.operation(
+        GENERATION,
+        ExternalHarnessOperationRecord::DeliveryClaimed {
+            request: fixture.submit_request(&announced),
+        },
+    );
+    pair.durable(&claimed);
+    {
+        let snapshot = pair.ordinary.snapshot();
+        let TranscriptViewItemKind::UserMessage { message } = &snapshot.transcript.items[0].kind
+        else {
+            panic!("user message");
+        };
+        assert_eq!(message.text, "what next?");
+        assert_eq!(message.display_label.as_deref(), Some("Agent: Plan"));
+    }
+    let page = fixture.page(vec![(
+        "compacted",
+        HarnessObservationKind::Vendor {
+            namespace: bcode_harness_models::NATIVE_CONTEXT_NAMESPACE.into(),
+            detail: serde_json::json!({"code": "compacted"}),
+        },
+    )]);
+    pair.durable(&page);
+    assert_eq!(pair.ordinary.snapshot().native_context_compactions, 1);
+}
+
+#[test]
+fn a_question_is_one_card_that_shows_the_answer() {
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    let mut question = fixture.interaction(GENERATION, "question-1");
+    question.kind = HarnessInteractionKind::Question;
+    question.prompt = "What should I plan?".into();
+    question.tool_name = None;
+    question.choices = vec![
+        HarnessChoice {
+            choice_id: "0".into(),
+            label: "Just testing".into(),
+        },
+        HarnessChoice {
+            choice_id: "1".into(),
+            label: "Review work".into(),
+        },
+    ];
+    let page = fixture.page(vec![(
+        "question",
+        HarnessObservationKind::Interaction {
+            interaction: question,
+        },
+    )]);
+    pair.durable(&page);
+    let card = |pair: &Pair| {
+        pair.ordinary
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter_map(system_text)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        card(&pair),
+        [
+            "Claude Code asks: What should I plan?\n  1. Just testing\n  2. Review work\nPick an option, or type your own answer and send it."
+        ]
+    );
+    let mut answer = fixture.respond_request("question-1");
+    if let ExternalHarnessRequestKind::Respond { response, .. } = &mut answer.kind {
+        response.value = HarnessResponseValue::Answer {
+            choice_id: None,
+            text: "what model are you?".into(),
+        };
+    }
+    let claimed = fixture.operation(
+        GENERATION,
+        ExternalHarnessOperationRecord::DeliveryClaimed { request: answer },
+    );
+    pair.durable(&claimed);
+    assert_eq!(
+        card(&pair),
+        [
+            "Claude Code asks: What should I plan?\n  1. Just testing\n  2. Review work\nYou answered: what model are you?"
+        ]
+    );
+}
+
+#[test]
 fn pending_interactions_follow_requests_responses_and_generations() {
     let mut fixture = Fixture::new();
     let mut pair = Pair::new();

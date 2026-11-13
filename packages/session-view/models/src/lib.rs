@@ -353,6 +353,9 @@ pub struct SessionViewSnapshot {
     /// Derived presentation only; responding remains subject to managed-session admission.
     #[serde(default)]
     pub pending_external_interactions: Vec<external::ExternalInteractionView>,
+    /// Times the native agent summarized earlier turns, dropping context the host added there.
+    #[serde(default)]
+    pub native_context_compactions: u64,
     /// Session summary metadata, when supplied by the daemon/catalog.
     pub session_summary: Option<SessionSummary>,
 }
@@ -390,6 +393,7 @@ impl SessionViewSnapshot {
             runtime: SessionRuntimeViewState::default(),
             interactions: Vec::new(),
             pending_external_interactions: Vec::new(),
+            native_context_compactions: 0,
             session_summary: None,
         }
     }

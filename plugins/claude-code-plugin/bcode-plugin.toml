@@ -119,6 +119,92 @@ tool_name     = "SlashCommand"
 target_fields = ["query"]
 tool_name     = "ToolSearch"
 
+# How native tools map onto Bcode's tool policy, so the conversation's agent decides them.
+[[native_tools]]
+fields    = ["command"]
+operation = "command"
+tool_name = "Bash"
+
+[[native_tools]]
+fields    = ["file_path"]
+operation = "read"
+tool_name = "Read"
+
+[[native_tools]]
+fields    = ["path"]
+operation = "read"
+tool_name = "Grep"
+
+[[native_tools]]
+fields    = ["path"]
+operation = "read"
+tool_name = "Glob"
+
+[[native_tools]]
+fields    = ["path"]
+operation = "read"
+tool_name = "LS"
+
+[[native_tools]]
+fields    = ["file_path"]
+operation = "write"
+tool_name = "Write"
+
+[[native_tools]]
+fields    = ["file_path"]
+operation = "write"
+tool_name = "Edit"
+
+[[native_tools]]
+fields    = ["file_path"]
+operation = "write"
+tool_name = "MultiEdit"
+
+[[native_tools]]
+fields    = ["notebook_path"]
+operation = "write"
+tool_name = "NotebookEdit"
+
+[[native_tools]]
+fields    = ["url"]
+operation = "web"
+tool_name = "WebFetch"
+
+[[native_tools]]
+fields    = []
+operation = "read_only"
+tool_name = "WebSearch"
+
+[[native_tools]]
+fields    = []
+operation = "read_only"
+tool_name = "TodoWrite"
+
+[[native_tools]]
+fields    = []
+operation = "read_only"
+tool_name = "ToolSearch"
+
+[[native_tools]]
+fields    = []
+operation = "read_only"
+tool_name = "ExitPlanMode"
+
+[[native_tools]]
+fields    = []
+operation = "read_only"
+tool_name = "BashOutput"
+
+# The question card in the transcript replaces the native question tool's own row.
+[[presentation.rules]]
+match = { kind = "tool", tool = "AskUserQuestion" }
+set   = { disclosure = "hidden" }
+
+# Native tool lookups are plumbing: show the row, not its output.
+[[presentation.rules]]
+match = { kind = "tool", tool = "ToolSearch" }
+set   = { disclosure = "collapsed" }
+
 [concurrency]
 # Operations still serialize on retained plugin state; only a waiting observe
 # releases that lock while it waits for native output.

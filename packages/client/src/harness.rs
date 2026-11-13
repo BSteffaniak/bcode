@@ -326,6 +326,56 @@ impl BcodeClient {
         decode_target_snapshot(&json, session_id)
     }
 
+    /// Native input held for a session until its native agent can take it, oldest first.
+    /// # Errors
+    /// Returns authorization, storage or transport failures.
+    pub async fn managed_queued_input(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_ipc::harness::ManagedQueuedInput, ClientError> {
+        self.queued_input_request(ManagedSessionOperation::QueuedInput, session_id, None)
+            .await
+    }
+
+    /// Withdraw one held input before it is sent. The response says whether it was withdrawn;
+    /// it is not when it was already being sent.
+    /// # Errors
+    /// Returns authorization, storage or transport failures.
+    pub async fn withdraw_managed_queued_input(
+        &self,
+        session_id: SessionId,
+        submission_id: String,
+    ) -> Result<bcode_ipc::harness::ManagedQueuedInput, ClientError> {
+        self.queued_input_request(
+            ManagedSessionOperation::WithdrawQueuedInput,
+            session_id,
+            Some(submission_id),
+        )
+        .await
+    }
+
+    async fn queued_input_request(
+        &self,
+        operation: ManagedSessionOperation,
+        session_id: SessionId,
+        withdraw: Option<String>,
+    ) -> Result<bcode_ipc::harness::ManagedQueuedInput, ClientError> {
+        let request = bcode_ipc::harness::ManagedQueuedInputRequest {
+            session_id,
+            withdraw,
+        };
+        let json = self
+            .managed_session_request(ManagedSessionRequest {
+                schema_version: MANAGED_SESSION_VERSION,
+                operation,
+                request_json: serde_json::to_string(&request)
+                    .map_err(|_| ClientError::Protocol("invalid queued input request".into()))?,
+            })
+            .await?;
+        serde_json::from_str(&json)
+            .map_err(|_| ClientError::Protocol("invalid queued input response".into()))
+    }
+
     /// Read one bounded canonical observation page independently of native resume availability.
     /// # Errors
     /// Returns canonical-history/transport/compatibility failures without repair or replay.

@@ -3350,6 +3350,8 @@ dependencies = [
  "bcode_session_view",
  "bcode_session_view_models",
  "bcode_settings",
+ "bcode_shell_command_analysis",
+ "bcode_shell_command_analysis_models",
  "bcode_shell_plugin",
  "bcode_skill",
  "bcode_skill_models",

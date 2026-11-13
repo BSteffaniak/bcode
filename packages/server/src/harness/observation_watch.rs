@@ -204,6 +204,14 @@ async fn drive(
                 let waited =
                     wait > 0 && started.elapsed() >= Duration::from_millis(u64::from(wait / 2));
                 delay = next_delay(progress, waited, delay);
+                // The agent's policy answers the native approvals it decides.
+                if backend
+                    .apply_agent_policy(&caller, query.session_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    delay = Duration::ZERO;
+                }
                 // Input queued while the native agent was busy goes out once it is idle.
                 if backend
                     .release_queued_input(&caller, query.session_id)

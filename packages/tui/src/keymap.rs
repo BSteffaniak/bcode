@@ -687,6 +687,18 @@ fn register_monitor_actions(
     for (scope, id, description, defaults) in [
         ("chat", "tui.session.search", "Session Search Open", vec![]),
         (
+            "chat",
+            "tui.queue.edit",
+            "Take back the newest queued message to edit it",
+            vec!["alt+up"],
+        ),
+        (
+            "chat",
+            "tui.queue.cancel",
+            "Withdraw the newest queued message",
+            vec!["alt+x"],
+        ),
+        (
             "auth_pool_picker",
             "tui.auth.clear",
             "Follow configuration",

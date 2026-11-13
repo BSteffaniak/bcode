@@ -279,6 +279,66 @@ pub fn answer_open_question(
     true
 }
 
+/// Show the daemon's held input and the outcome of a withdrawal.
+pub fn apply_queue_result(
+    chat: &mut ActiveChat,
+    withdrawal: Option<(String, bool)>,
+    result: Result<bcode_ipc::harness::ManagedQueuedInput, bcode_client::ClientError>,
+) {
+    let label = chat
+        .app
+        .managed_label()
+        .unwrap_or("The native agent")
+        .to_owned();
+    let Ok(queue) = result else {
+        if withdrawal.is_some() {
+            chat.app
+                .set_status("Could not withdraw that message; it stays queued".into());
+        }
+        return;
+    };
+    if let Some((submission_id, edit)) = withdrawal {
+        let text = chat
+            .app
+            .managed_queue()
+            .iter()
+            .find(|input| input.submission_id == submission_id)
+            .map(|input| input.text.clone());
+        let status = match (queue.withdrawn, edit, text) {
+            (true, true, Some(text)) => {
+                let draft = chat.app.composer().text().to_owned();
+                let combined = if draft.trim().is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{draft}")
+                };
+                chat.app.replace_composer_with(&combined);
+                "Withdrawn from the queue; edit it and send again".to_owned()
+            }
+            (true, _, _) => "Withdrawn from the queue; it will not be sent".to_owned(),
+            (false, _, _) => format!("Already sent to {label}; it can no longer be withdrawn"),
+        };
+        chat.app.set_status(status);
+    }
+    chat.app.sync_managed_queue(&queue.queued);
+}
+
+/// Withdraw the newest queued message, returning its text to the composer when `edit`.
+pub fn withdraw_newest_queued(chat: &mut ActiveChat, edit: bool) -> bool {
+    if chat.app.managed_execution_session().is_none() {
+        return false;
+    }
+    let Some(newest) = chat.app.managed_queue().last() else {
+        return false;
+    };
+    let submission_id = newest.submission_id.clone();
+    chat.start_effect(TuiEffect::WithdrawManagedQueued {
+        submission_id,
+        edit,
+    });
+    true
+}
+
 /// Apply one managed response outcome without retrying it.
 pub fn apply_response_result(
     chat: &mut ActiveChat,
@@ -369,6 +429,13 @@ pub fn cycle_native_agent(chat: &mut ActiveChat, loop_state: &mut ChatLoopState)
     };
     chat.agents
         .apply_agent_to_app(&mut chat.app, agent.id.clone());
+    if let Some(session_id) = chat.attached_session_id() {
+        // The daemon decides the native agent's permission requests with this agent.
+        chat.start_effect(TuiEffect::SetSessionAgent {
+            session_id,
+            agent_id: agent.id.clone(),
+        });
+    }
     let label = chat
         .app
         .managed_label()
@@ -521,6 +588,14 @@ mod tests {
         }
     }
 
+    fn with_agents(chat: &mut ActiveChat) {
+        chat.agents = crate::session_flow::AgentCatalog::from_agents(vec![
+            agent("build", false),
+            agent("plan", true),
+        ]);
+        chat.agents.apply_agent_to_app(&mut chat.app, "build");
+    }
+
     fn agent(id: &str, read_only: bool) -> bcode_agent_profile::AgentInfo {
         bcode_agent_profile::AgentInfo {
             id: id.into(),
@@ -623,6 +698,103 @@ mod tests {
             panic!("expected managed response");
         };
         assert_eq!(reused, response_id);
+        drop(chat);
+    }
+
+    #[test]
+    fn the_native_agent_hears_of_each_agent_change_once() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut chat = chat(owner);
+        chat.agents = crate::session_flow::AgentCatalog::from_agents(vec![
+            agent("build", false),
+            agent("plan", true),
+        ]);
+        chat.agents.apply_agent_to_app(&mut chat.app, "build");
+        assert_eq!(
+            chat.app.take_native_agent_announcement().as_deref(),
+            Some("build")
+        );
+        assert_eq!(chat.app.take_native_agent_announcement(), None);
+        chat.agents.apply_agent_to_app(&mut chat.app, "plan");
+        assert_eq!(
+            chat.app.take_native_agent_announcement().as_deref(),
+            Some("plan")
+        );
+        assert_eq!(chat.app.take_native_agent_announcement(), None);
+        // A message that was not delivered announces the agent again next time.
+        chat.app.forget_native_agent_announcement();
+        assert_eq!(
+            chat.app.take_native_agent_announcement().as_deref(),
+            Some("plan")
+        );
+        assert_eq!(chat.agents.name_of("plan"), "plan");
+        drop(chat);
+    }
+
+    #[test]
+    fn queued_rows_follow_the_daemon_and_withdrawing_returns_text_to_edit() {
+        let owner = bcode_session_models::SessionId::new();
+        let mut chat = chat(owner);
+        let held =
+            |id: &str, text: &str| bcode_session_models::external_harness::QueuedNativeInput {
+                submission_id: id.into(),
+                attempt_id: "attempt".into(),
+                text: text.into(),
+                queued_at_ms: 1,
+            };
+        // After a restart, held input reappears as queued rows; a re-queued identity keeps its row.
+        apply_queue_result(
+            &mut chat,
+            None,
+            Ok(bcode_ipc::harness::ManagedQueuedInput {
+                queued: vec![held("first.retry", "first"), held("second", "second")],
+                withdrawn: false,
+            }),
+        );
+        let rows: Vec<_> = chat
+            .app
+            .pending_submissions()
+            .iter()
+            .map(|row| (row.id().0.clone(), row.text().to_owned()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("first".to_owned(), "first".to_owned()),
+                ("second".to_owned(), "second".to_owned())
+            ]
+        );
+        assert!(withdraw_newest_queued(&mut chat, true));
+        assert!(matches!(
+            &drained(&mut chat)[..],
+            [TuiEffect::WithdrawManagedQueued { submission_id, edit: true }] if submission_id == "second"
+        ));
+        chat.app.replace_composer_with("draft");
+        apply_queue_result(
+            &mut chat,
+            Some(("second".into(), true)),
+            Ok(bcode_ipc::harness::ManagedQueuedInput {
+                queued: vec![held("first.retry", "first")],
+                withdrawn: true,
+            }),
+        );
+        assert_eq!(chat.app.composer().text(), "second\n\ndraft");
+        assert_eq!(chat.app.pending_submissions().len(), 1);
+        // Too late: it was already being sent, so nothing returns to the composer.
+        apply_queue_result(
+            &mut chat,
+            Some(("first.retry".into(), false)),
+            Ok(bcode_ipc::harness::ManagedQueuedInput {
+                queued: Vec::new(),
+                withdrawn: false,
+            }),
+        );
+        assert!(
+            chat.app.status().contains("Already sent"),
+            "{}",
+            chat.app.status()
+        );
+        assert_eq!(chat.app.pending_submissions().len(), 0);
         drop(chat);
     }
 
@@ -731,14 +903,16 @@ mod tests {
         assert!(loop_state.execution_picker.is_none());
         loop_state.model_switcher = None;
         // Tab cycles Bcode's own agents; the read-only one runs as the native plan mode.
-        chat.agents = crate::session_flow::AgentCatalog::from_agents(vec![
-            agent("build", false),
-            agent("plan", true),
-        ]);
-        chat.agents.apply_agent_to_app(&mut chat.app, "build");
+        with_agents(&mut chat);
         cycle_native_agent(&mut chat, &mut loop_state);
         assert_eq!(chat.app.current_agent_id(), "plan");
-        let effects = drained(&mut chat);
+        let mut effects = drained(&mut chat);
+        // The agent is saved with the session, so the daemon decides native approvals with it.
+        let saved = effects
+            .iter()
+            .position(|effect| matches!(effect, TuiEffect::SetSessionAgent { agent_id, .. } if agent_id == "plan"))
+            .expect("agent saved");
+        effects.remove(saved);
         let [
             TuiEffect::ConfigureManagedSession {
                 generation: 7,
@@ -785,7 +959,10 @@ mod tests {
         cycle_native_agent(&mut chat, &mut loop_state);
         assert_eq!(chat.app.current_agent_id(), "build");
         assert!(matches!(
-            &drained(&mut chat)[..],
+            &drained(&mut chat)
+                .into_iter()
+                .filter(|effect| !matches!(effect, TuiEffect::SetSessionAgent { .. }))
+                .collect::<Vec<_>>()[..],
             [TuiEffect::ConfigureManagedSession {
                 setting: HarnessSessionSetting::PermissionMode {
                     mode: bcode_harness_models::HarnessPermissionMode::Default

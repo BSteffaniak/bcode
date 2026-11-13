@@ -149,6 +149,16 @@ pub fn stage_session_message(
         }
         None => placement,
     };
+    // A native agent learns the conversation's Bcode agent with the next message after it
+    // changes, and again after it summarized away the earlier announcement.
+    let native_agent = if chat.app.managed_execution_session().is_some() {
+        chat.app.take_native_agent_announcement().map(|agent| {
+            let name = chat.agents.name_of(&agent).to_owned();
+            (agent, name)
+        })
+    } else {
+        None
+    };
     chat.start_effect(TuiEffect::SubmitMessage {
         request: Box::new(SubmitMessageRequest {
             managed: None,
@@ -170,6 +180,7 @@ pub fn stage_session_message(
             provider_plugin_id: draft_provider_plugin_id,
             model_id: draft_model_id,
             agent_id,
+            native_agent,
             reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
             reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
             reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),

@@ -230,6 +230,10 @@ pub enum ManagedSessionOperation {
     /// Mid-session native setting change (model or permission mode). Carries a
     /// `HarnessRequestKind::Configure` call; the response is `Acknowledged` or `Failure`.
     Configure,
+    /// List input held for the session until its native agent can take it.
+    QueuedInput,
+    /// Withdraw one held input before it is sent.
+    WithdrawQueuedInput,
 }
 impl ManagedSessionOperation {
     /// Stable interface operation.
@@ -252,6 +256,8 @@ impl ManagedSessionOperation {
             Self::Interrupt => "interrupt",
             Self::Observe => "observe",
             Self::Watch => "watch",
+            Self::QueuedInput => "queued_input",
+            Self::WithdrawQueuedInput => "withdraw_queued_input",
             Self::Configure => "configure",
             Self::Close => "close",
             Self::Reconcile => "reconcile",
@@ -281,6 +287,28 @@ impl ManagedSessionOperation {
                 | Self::AuthAcknowledge
         )
     }
+}
+
+/// Read held native input for a session, or withdraw one held input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedQueuedInputRequest {
+    /// Session whose held input is read.
+    pub session_id: bcode_session_models::SessionId,
+    /// Held input to withdraw; `None` only lists.
+    #[serde(default)]
+    pub withdraw: Option<String>,
+}
+
+/// Held native input, oldest first, and whether a requested withdrawal took effect.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedQueuedInput {
+    /// Input still held after the request.
+    pub queued: Vec<bcode_session_models::external_harness::QueuedNativeInput>,
+    /// The requested input was withdrawn. False when it was already being sent or was gone.
+    #[serde(default)]
+    pub withdrawn: bool,
 }
 
 /// Bounded installation discovery across enabled manifest-declared harness plugins.

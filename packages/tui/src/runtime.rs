@@ -999,6 +999,8 @@ async fn run_managed_chat_bound<W: Write + Send>(
         ));
         session_flow::complete_switch_session(&mut chat, session_id, Ok((attached, task)));
         chat.app.set_managed_execution(session_id);
+        // Input held for this conversation (also across restarts) shows as queued rows.
+        chat.start_effect(TuiEffect::LoadManagedQueue);
         match commands.auth_flow().await {
         Ok(mut auth) => match auth.readiness().await {
             Ok(status) if matches!(status.readiness, bcode_provider_auth_models::managed::AuthReadiness::Ready | bcode_provider_auth_models::managed::AuthReadiness::Verified) => {

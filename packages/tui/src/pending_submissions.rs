@@ -34,6 +34,31 @@ impl PendingSubmissions {
         }
     }
 
+    /// Show native input held by the daemon, oldest first. Queued rows the daemon no longer
+    /// holds were sent or withdrawn and leave; held input missing a row (after a restart) gets
+    /// one. `held` pairs each row identity with its text.
+    pub fn sync_held(&mut self, held: &[(bcode_session_models::SubmissionId, String)]) {
+        self.items.retain(|item| {
+            !matches!(
+                item.state(),
+                super::pending_submission::PendingSubmissionState::Queued { .. }
+            ) || held.iter().any(|(id, _)| id == item.id())
+        });
+        for (id, text) in held {
+            if !self.items.iter().any(|item| item.id() == id) {
+                self.items
+                    .push(PendingSubmission::queued(id.clone(), text.clone()));
+            }
+        }
+    }
+
+    /// Mark the pending submission with this identity as queued.
+    pub fn mark_queued_id(&mut self, id: &bcode_session_models::SubmissionId) {
+        if let Some(pending) = self.items.iter_mut().find(|item| item.id() == id) {
+            pending.mark_queued(None);
+        }
+    }
+
     /// Mark the oldest pending submission as queued.
     pub fn mark_first_queued(&mut self, queue_position: Option<u32>) {
         if let Some(pending) = self.items.first_mut() {

@@ -110,6 +110,43 @@ a plugin or losing a native executable must not erase canonical evidence or prev
 unrelated sessions from opening. Resuming native work requires current ownership,
 compatible exact native identity and supported reconciliation semantics.
 
+## Input while the native agent is busy
+
+Next-turn input that arrives while a native foreground turn is running, or while earlier input
+still waits, is held with the session (`native_input_queue` in the session database) instead
+of being refused. A held input claims nothing: its later delivery claims exactly its submission
+and attempt identities, so it becomes canonical history only when it is actually sent. The
+client receives an `accepted` receipt and shows the input as queued.
+
+The daemon sends the oldest held input once committed evidence shows the native turn ended,
+after any committed page from the attachment watch or an explicit observe, so input queued
+without an attached client is not stranded. A refusal as busy re-queues it under fresh
+identities a bounded number of times; an uncertain outcome is never re-sent. A client may list
+held input and withdraw one before it is sent; withdrawal and release are serialized, so an
+input is either withdrawn or sent, never both. A definite refusal never blocks later input.
+
+## Agents in native conversations
+
+A native conversation uses the same Bcode agents as any conversation:
+
+* A read-only agent runs as the native agent's plan permission mode; any other agent runs in its
+  default mode.
+* Harness plugins declare how their native tools map onto Bcode's tool policy
+  (`[[native_tools]]`: a shell command, reads or writes of paths, a web fetch). For each
+  committed native approval the daemon evaluates that operation under the conversation's
+  agent. An allow or deny is answered on the user's behalf, recorded with an
+  `agent-policy-` response identity and noted in the transcript; anything else, and any tool
+  or input the declarations do not cover, is left for the user.
+* The agent's instructions reach the native agent in a marked block at the start of the next
+  message after the agent changes, and again after the native agent reports (through a
+  `bcode.harness.context` vendor observation) that it summarized earlier turns. The block
+  is part of the canonical submission; presentation shows only the message, labelled with the
+  agent.
+
+A native question is presented as one transcript card listing its options, updated in place
+with the answer once the answer's delivery is claimed. Typing while an option is focused
+writes a custom answer, and a message sent while a question is open answers it.
+
 ## Interactions and cancellation
 
 Questions, approvals and requests for assistance have different authority semantics.

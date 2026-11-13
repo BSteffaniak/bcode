@@ -86,7 +86,11 @@ pub enum ExternalEffect {
         text: String,
         /// Whether the input steers an in-flight native turn.
         steering: bool,
+        /// Bcode agent announced to the native agent with this input, if any.
+        agent: Option<String>,
     },
+    /// The native agent summarized earlier turns; context the host added there is gone.
+    ContextCompacted,
     /// Untrusted native assistant text rendered as markdown.
     Assistant {
         /// Stable transcript item identity (shared with the live stream when segmented).
@@ -144,6 +148,14 @@ pub enum ExternalEffect {
         id: String,
         /// Friendly literal text.
         text: String,
+    },
+    /// A native question was answered; its card shows the answer in place of the prompt to
+    /// answer.
+    QuestionAnswered {
+        /// Transcript identity of the question card.
+        id: String,
+        /// The answer as sent.
+        answer: String,
     },
     /// A native interaction now awaits a response.
     InteractionRequested(Box<ExternalInteractionView>),
@@ -227,13 +239,15 @@ impl Builder<'_> {
         if submission.text.trim().is_empty() {
             return;
         }
+        let (agent, text) = split_agent_block(&submission.text);
         self.projection.effects.push(ExternalEffect::User {
             id: format!(
                 "external-submission:{}:{}",
                 submission.generation, submission.submission_id
             ),
-            text: submission.text.clone(),
+            text: text.to_owned(),
             steering: matches!(submission.placement, HarnessPlacement::Steer { .. }),
+            agent: agent.map(ToOwned::to_owned),
         });
     }
 
@@ -309,8 +323,38 @@ fn project_operation(
         Record::TransportReleased { .. } | Record::RecoveryPrepared { .. } => {}
         Record::DeliveryClaimed { request } => {
             builder.observe_instance(&request.instance);
-            if let ExternalHarnessRequestKind::Submit { submission, .. } = &request.kind {
-                builder.submission(submission);
+            match &request.kind {
+                ExternalHarnessRequestKind::Submit { submission, .. } => {
+                    builder.submission(submission);
+                }
+                ExternalHarnessRequestKind::Respond { response, .. } => match &response.value {
+                    bcode_harness_models::HarnessResponseValue::Answer { text, .. } => {
+                        builder
+                            .projection
+                            .effects
+                            .push(ExternalEffect::QuestionAnswered {
+                                id: question_card_id(response.generation, &response.request_id),
+                                answer: text.clone(),
+                            });
+                    }
+                    // Answered by the conversation's agent policy rather than the user.
+                    bcode_harness_models::HarnessResponseValue::Approval { approved }
+                        if response
+                            .response_id
+                            .starts_with(AGENT_POLICY_RESPONSE_PREFIX) =>
+                    {
+                        builder.notice(
+                            if *approved {
+                                "Allowed by the agent's permission rules"
+                            } else {
+                                "Denied by the agent's permission rules"
+                            }
+                            .to_owned(),
+                        );
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         }
         Record::DeliveryCompleted { request, response } => {
@@ -412,7 +456,15 @@ fn project_observation(
         }
         HarnessObservationKind::Interaction { interaction } => {
             let text = interaction_notice(builder.label(), interaction);
-            builder.notice(text);
+            if interaction.kind == HarnessInteractionKind::Question {
+                // One card per question, updated in place once it is answered.
+                builder.projection.effects.push(ExternalEffect::Notice {
+                    id: question_card_id(generation, &interaction.request_id),
+                    text,
+                });
+            } else {
+                builder.notice(text);
+            }
             ExternalEffect::InteractionRequested(Box::new(pending_interaction(
                 builder,
                 interaction,
@@ -453,7 +505,22 @@ fn project_observation(
         | HarnessObservationKind::Status { .. }
         | HarnessObservationKind::Settlement { .. }
         | HarnessObservationKind::NativeTurnTerminal { .. }
-        | HarnessObservationKind::Vendor { .. } => return Ok(()),
+        | HarnessObservationKind::Vendor { .. } => {
+            if let HarnessObservationKind::Vendor { namespace, detail } = &observation.kind
+                && namespace == bcode_harness_models::NATIVE_CONTEXT_NAMESPACE
+                && detail.get("code").and_then(serde_json::Value::as_str) == Some("compacted")
+            {
+                builder.notice(format!(
+                    "{} summarized earlier turns to free up context",
+                    builder.label()
+                ));
+                builder
+                    .projection
+                    .effects
+                    .push(ExternalEffect::ContextCompacted);
+            }
+            return Ok(());
+        }
     };
     builder.projection.effects.push(effect);
     Ok(())
@@ -551,6 +618,64 @@ fn excerpt(text: &str) -> String {
         excerpt.push('…');
     }
     excerpt
+}
+
+/// Opening of the block announcing the conversation's Bcode agent to a native agent at the
+/// start of a message: `<bcode-agent name="NAME">` … `</bcode-agent>`, then the message.
+pub const AGENT_BLOCK_OPEN: &str = "<bcode-agent name=\"";
+/// Closing of the agent block.
+pub const AGENT_BLOCK_CLOSE: &str = "</bcode-agent>";
+
+/// A message announcing `agent` and its `instructions` before `text`.
+#[must_use]
+pub fn with_agent_block(agent: &str, instructions: Option<&str>, text: &str) -> String {
+    let name: String = agent
+        .chars()
+        .filter(|character| *character != '"')
+        .collect();
+    let mut block = format!(
+        "{AGENT_BLOCK_OPEN}{name}\">\nThe Bcode agent for this conversation is now {name}. \
+These instructions replace any earlier Bcode agent instructions."
+    );
+    if let Some(instructions) = instructions.filter(|value| !value.trim().is_empty()) {
+        block.push_str("\n\n");
+        block.push_str(instructions.trim());
+    }
+    format!("{block}\n{AGENT_BLOCK_CLOSE}\n\n{text}")
+}
+
+/// The announced agent name and the message itself, for display.
+#[must_use]
+pub fn split_agent_block(text: &str) -> (Option<&str>, &str) {
+    let Some(rest) = text.strip_prefix(AGENT_BLOCK_OPEN) else {
+        return (None, text);
+    };
+    let Some((name, _)) = rest.split_once("\">") else {
+        return (None, text);
+    };
+    let Some((_, message)) = rest.split_once(AGENT_BLOCK_CLOSE) else {
+        return (None, text);
+    };
+    (Some(name), message.trim_start_matches('\n'))
+}
+
+/// Response identities of native approvals the conversation's agent policy answered.
+pub const AGENT_POLICY_RESPONSE_PREFIX: &str = "agent-policy-";
+
+/// Transcript identity of a native question's card.
+fn question_card_id(generation: u64, request_id: &str) -> String {
+    format!("external-question:{generation}:{request_id}")
+}
+
+/// The answered form of a question card: the question and its options, then the answer in
+/// place of the prompt to answer.
+#[must_use]
+pub fn answered_question_text(card: &str, answer: &str) -> String {
+    let question = card
+        .rsplit_once('\n')
+        .filter(|(_, last)| last.contains("answer"))
+        .map_or(card, |(rest, _)| rest);
+    format!("{question}\nYou answered: {}", excerpt(answer))
 }
 
 fn interaction_notice(label: &str, interaction: &HarnessInteraction) -> String {

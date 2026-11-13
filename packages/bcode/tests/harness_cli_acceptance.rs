@@ -261,6 +261,13 @@ impl Cli {
         if scenario == "terminal_auth" {
             settings = settings.replace("2.1.308 (Claude Code)", "2.1.308");
         }
+        if scenario == "approval" {
+            // The conversation's agents decide native approvals.
+            settings = settings.replace(
+                r#"enabled = ["bcode.claude-code"]"#,
+                r#"enabled = ["bcode.claude-code", "bcode.default-agents"]"#,
+            );
+        }
         if scenario == "multi_turn" {
             // Matches the configuration native setup generates by default.
             settings = settings.replace(
@@ -948,6 +955,81 @@ fn managed_start_respond_stale_cancel_and_offline_bounded_history() {
         "offline history must retain the committed prefix"
     );
     assert!(history.value["completeness"].is_string());
+}
+
+#[cfg(feature = "static-bundled-default-agents-plugin")]
+#[test]
+fn the_conversations_agent_decides_native_approvals_without_asking() {
+    let cli = Cli::new("approval");
+    let binding = cli.open(SESSION, None);
+    // The read-only Plan agent must refuse a native write on the user's behalf.
+    let agent = cli.run(&cli.config, &["session", "set-agent", SESSION, "plan"]);
+    assert!(agent.ok, "{} {}", agent.value, agent.output);
+    let first = cli.send(&binding, "fixture-only");
+    assert_eq!(first.value["kind"]["kind"], "receipt", "{}", first.value);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut target = binding;
+    let mut after = None;
+    while !cli.native.join("approval-deny.effect").exists() {
+        assert!(
+            !cli.native.join("approval-allow.effect").exists(),
+            "Plan must not allow a native write"
+        );
+        assert!(Instant::now() < deadline, "the agent policy never answered");
+        let page = cli.observe(&target, after.as_deref());
+        for item in page["observations"].as_array().unwrap() {
+            if item["kind"]["kind"] == "binding_confirmed" {
+                target = json!({"state":"confirmed","session":item["kind"]["binding"]});
+            }
+        }
+        after = page["next_after"].as_str().map(str::to_owned).or(after);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!cli.native.join("approval-allow.effect").exists());
+}
+
+#[test]
+fn input_sent_mid_turn_is_queued_then_delivered_once_after_the_turn() {
+    let cli = Cli::new("question");
+    std::fs::remove_file(cli.native.join("hold-after-answer")).unwrap();
+    std::fs::write(cli.native.join("finish-after-answer-seconds"), "4").unwrap();
+    let binding = cli.open(SESSION, None);
+    let first = cli.send(&binding, "fixture-only");
+    assert_eq!(first.value["kind"]["kind"], "receipt", "{}", first.value);
+    let (binding, question, after) = cli.confirmed_question(&binding);
+    let generation = binding["session"]["generation"].as_u64().unwrap();
+    let answer = cli.answer(&binding, &question, generation);
+    assert_eq!(
+        answer.value["kind"]["kind"], "acknowledged",
+        "{}",
+        answer.value
+    );
+
+    // The answered turn is still running: the follow-up is held, not refused as a conflict.
+    let follow_up = cli.send_turn(
+        &binding,
+        "queued-follow-up",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+    );
+    assert!(follow_up.ok, "{} {}", follow_up.value, follow_up.output);
+    assert_eq!(
+        follow_up.value["kind"]["kind"], "receipt",
+        "{}",
+        follow_up.value
+    );
+    assert_eq!(
+        follow_up.value["kind"]["response"]["state"], "accepted",
+        "mid-turn input must be queued; value={}",
+        follow_up.value
+    );
+    assert!(!cli.native.join("queued-follow-up.effect").exists());
+
+    // Observing lets it go out once the turn ends, with no attached interactive client.
+    let _ = cli.await_terminal(&binding, after, "22222222-2222-4222-8222-222222222222");
+    assert!(cli.native.join("queued-follow-up.effect").exists());
+    assert!(!cli.native.join("queued-follow-up.duplicate").exists());
+    assert!(!cli.native.join("follow-up-during-turn.rejected").exists());
 }
 
 #[test]

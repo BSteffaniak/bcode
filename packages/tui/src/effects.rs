@@ -371,6 +371,41 @@ async fn invoke_plugin_command(
     }
 }
 
+/// The agent's instructions for a native agent, from the agent's own provider. Missing
+/// instructions announce the agent by name only.
+async fn native_agent_instructions(
+    commands: &bcode_client::ManagedSessionCommandHandle,
+    session_id: SessionId,
+    agent_id: String,
+) -> Option<String> {
+    let request = bcode_agent_profile::AgentContextRequest {
+        session_id,
+        agent_id,
+        available_tools: Vec::new(),
+        effective_config_toml: bcode_config::load_config()
+            .ok()
+            .and_then(|config| bcode_config::encode_effective_config(&config).ok())
+            .map(Box::new),
+        claimed_tools: Vec::new(),
+        claimed_mutating_tools: Vec::new(),
+    };
+    let response = commands
+        .host_client()
+        .call_plugin_service(
+            bcode_agent_profile::AGENT_PROFILE_INTERFACE_ID.to_owned(),
+            bcode_agent_profile::OP_AGENT_CONTEXT.to_owned(),
+            serde_json::to_vec(&request).ok()?,
+        )
+        .await
+        .ok()?;
+    if response.error.is_some() {
+        return None;
+    }
+    serde_json::from_slice::<bcode_agent_profile::AgentContextResponse>(&response.payload)
+        .ok()?
+        .system_prompt_suffix
+}
+
 async fn managed_submit_message(
     commands: &bcode_client::ManagedSessionCommandHandle,
     request: SubmitMessageRequest,
@@ -397,9 +432,20 @@ async fn managed_submit_message(
             }
             result.receipt = Some(ComposerReceipt::Managed(Box::new(commands.submit_managed_composer_request(retained).await?)));
         } else {
+            let text = match request.native_agent.take() {
+                Some((agent_id, name)) => {
+                    let instructions = native_agent_instructions(commands, session_id, agent_id).await;
+                    bcode_session_view::external_projection::with_agent_block(
+                        &name,
+                        instructions.as_deref(),
+                        &request.message,
+                    )
+                }
+                None => request.message.clone(),
+            };
             let retained = commands.prepare_managed_composer_submission(
                 (request.submission_id.0.clone(), request.attempt_id.clone()),
-                request.message.clone(), request.placement == PromptPlacement::Steering,
+                text, request.placement == PromptPlacement::Steering,
                 request.expected_native_turn_id.clone(),
             ).await?;
             if Some(retained.target().1) != generation {
@@ -650,6 +696,9 @@ pub struct SubmitMessageRequest {
     pub model_id: Option<String>,
     /// Agent to apply before sending, if any.
     pub agent_id: Option<String>,
+    /// Bcode agent (id and name) to announce to a native agent with this message, when it
+    /// changed or the native agent dropped the earlier announcement.
+    pub native_agent: Option<(String, String)>,
     /// Reasoning effort to apply before sending.
     pub reasoning_effort: Option<String>,
     /// Reasoning summary to apply before sending.
@@ -1044,6 +1093,15 @@ pub enum TuiEffect {
         /// Typed response value.
         value: bcode_harness_models::HarnessResponseValue,
     },
+    /// Save the conversation's agent, which also decides a native agent's permission requests.
+    SetSessionAgent {
+        session_id: SessionId,
+        agent_id: String,
+    },
+    /// Read input the daemon holds for this native session until it can be sent.
+    LoadManagedQueue,
+    /// Withdraw one held input before it is sent; `edit` returns its text to the composer.
+    WithdrawManagedQueued { submission_id: String, edit: bool },
     /// Change one managed native session setting using a retained mutation identity.
     ConfigureManagedSession {
         /// Ownership generation the mutation must target.
@@ -1500,6 +1558,15 @@ pub enum TuiEffectResult {
         /// Managed application response.
         result: Result<bcode_harness_models::HarnessServiceResponse, ClientError>,
     },
+    /// The conversation's agent was saved, or could not be.
+    SessionAgentSet { result: Result<(), ClientError> },
+    /// Held native input, after a read or a withdrawal.
+    ManagedQueueLoaded {
+        /// Withdrawal this answers, with whether its text returns to the composer.
+        withdrawal: Option<(String, bool)>,
+        /// Held input and whether the withdrawal took effect.
+        result: Result<bcode_ipc::harness::ManagedQueuedInput, ClientError>,
+    },
     /// Result for one managed native setting change.
     ManagedSessionConfigured {
         /// Retained mutation identity.
@@ -1620,6 +1687,10 @@ impl TuiEffectResult {
             | Self::ManagedSessionConfigured { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
+            Self::ManagedQueueLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::SessionAgentSet { result } => DaemonObservation::from_client_result(result),
             Self::ManagedSessionDetected { .. } => DaemonObservation::Success,
         }
     }
@@ -1760,6 +1831,8 @@ enum EffectKey {
     ResolvePermission(String),
     ManagedRespond(u64, String),
     ManagedConfigure,
+    ManagedQueue,
+    SessionAgent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2082,6 +2155,20 @@ impl TuiEffect {
                 response_id,
                 result: Err(client_error),
             },
+            Self::LoadManagedQueue => TuiEffectResult::ManagedQueueLoaded {
+                withdrawal: None,
+                result: Err(client_error),
+            },
+            Self::SetSessionAgent { .. } => TuiEffectResult::SessionAgentSet {
+                result: Err(client_error),
+            },
+            Self::WithdrawManagedQueued {
+                submission_id,
+                edit,
+            } => TuiEffectResult::ManagedQueueLoaded {
+                withdrawal: Some((submission_id, edit)),
+                result: Err(client_error),
+            },
             Self::ConfigureManagedSession {
                 mutation_id,
                 setting,
@@ -2119,6 +2206,9 @@ impl TuiEffect {
             | Self::OpenXray { .. }
             | Self::InvokePluginCommand { .. }
             | Self::RespondManagedInteraction { .. }
+            | Self::LoadManagedQueue
+            | Self::WithdrawManagedQueued { .. }
+            | Self::SetSessionAgent { .. }
             | Self::ConfigureManagedSession { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
@@ -2476,6 +2566,8 @@ impl TuiEffect {
                 request_id,
                 ..
             } => EffectKey::ManagedRespond(*generation, request_id.clone()),
+            Self::LoadManagedQueue | Self::WithdrawManagedQueued { .. } => EffectKey::ManagedQueue,
+            Self::SetSessionAgent { .. } => EffectKey::SessionAgent,
             Self::ConfigureManagedSession { .. } => EffectKey::ManagedConfigure,
         }
     }
@@ -2511,6 +2603,7 @@ impl TuiEffect {
                 | Self::LoadMilestones { .. }
                 | Self::OpenXray { .. }
                 | Self::LoadAgentCatalog
+                | Self::SetSessionAgent { .. }
         )
     }
 
@@ -2658,6 +2751,17 @@ impl TuiEffect {
                 ))
                 .await
             }
+            Self::LoadManagedQueue => TuiEffectResult::ManagedQueueLoaded {
+                withdrawal: None,
+                result: commands.queued_input().await,
+            },
+            Self::WithdrawManagedQueued {
+                submission_id,
+                edit,
+            } => TuiEffectResult::ManagedQueueLoaded {
+                result: commands.withdraw_queued_input(submission_id.clone()).await,
+                withdrawal: Some((submission_id, edit)),
+            },
             Self::RespondManagedInteraction {
                 generation: target,
                 request_id,
@@ -2883,6 +2987,8 @@ impl TuiEffect {
                 })
             }
             managed @ (Self::RespondManagedInteraction { .. }
+            | Self::LoadManagedQueue
+            | Self::WithdrawManagedQueued { .. }
             | Self::ConfigureManagedSession { .. }) => managed.application_access_failed(
                 ClientError::Protocol("Native controls require a managed conversation".into()),
             ),
@@ -2906,6 +3012,12 @@ impl TuiEffect {
                     error,
                 }
             }
+            Self::SetSessionAgent {
+                session_id,
+                agent_id,
+            } => TuiEffectResult::SessionAgentSet {
+                result: client.set_session_agent(session_id, agent_id).await,
+            },
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
                 agents: AgentCatalog::load(&client)
                     .await

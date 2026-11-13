@@ -323,6 +323,10 @@ pub struct BmuxApp {
     composer_input: TextInputState,
     pub(crate) composer_submit: super::composer_submit::ComposerSubmit,
     pub(crate) managed_composer: ManagedComposerState,
+    /// Native input the daemon holds for this conversation, oldest first.
+    managed_queue: Vec<bcode_session_models::external_harness::QueuedNativeInput>,
+    /// Bcode agent last announced to the native agent, with the native compaction count then.
+    native_agent_announced: Option<(String, u64)>,
     input_history: InputHistory,
     /// Local presentation of an exact prepared recovery selection.
     pub queue_recovery: QueueRecoveryPresentation,
@@ -505,6 +509,8 @@ impl BmuxApp {
             composer_input: TextInputState::new(TextEditBuffer::new()),
             composer_submit: super::composer_submit::ComposerSubmit::default(),
             managed_composer: ManagedComposerState::default(),
+            managed_queue: Vec::new(),
+            native_agent_announced: None,
             input_history: InputHistory::from_entries(input_history),
             queue_recovery: QueueRecoveryPresentation::default(),
             notices: super::ephemeral_notices::EphemeralNotices::default(),
@@ -4054,6 +4060,59 @@ impl BmuxApp {
 
     pub fn acknowledge_managed_composer(&mut self, id: &bcode_session_models::SubmissionId) {
         self.pending_submissions.remove_id(id);
+    }
+
+    /// Show a native submission as held by the daemon until the native turn ends.
+    pub fn mark_managed_queued(&mut self, id: &bcode_session_models::SubmissionId) {
+        self.pending_submissions.mark_queued_id(id);
+    }
+
+    /// Reflect the daemon's held native input. Re-queued input keeps its original row.
+    pub fn sync_managed_queue(
+        &mut self,
+        held: &[bcode_session_models::external_harness::QueuedNativeInput],
+    ) {
+        let rows: Vec<_> = held
+            .iter()
+            .map(|input| {
+                let mut id = input.submission_id.as_str();
+                while let Some(original) = id.strip_suffix(".retry") {
+                    id = original;
+                }
+                (
+                    bcode_session_models::SubmissionId(id.to_owned()),
+                    input.text.clone(),
+                )
+            })
+            .collect();
+        self.pending_submissions.sync_held(&rows);
+        self.managed_queue.clone_from(&held.to_vec());
+    }
+
+    /// The current agent, when the native agent has not been told about it yet (or dropped
+    /// the announcement when it summarized earlier turns). Records it as announced.
+    pub fn take_native_agent_announcement(&mut self) -> Option<String> {
+        let current = (
+            self.current_agent_id().to_owned(),
+            self.session_view.snapshot().native_context_compactions,
+        );
+        if self.native_agent_announced.as_ref() == Some(&current) {
+            return None;
+        }
+        let agent = current.0.clone();
+        self.native_agent_announced = Some(current);
+        Some(agent)
+    }
+
+    /// Announce the agent again with the next message, after a message was not delivered.
+    pub fn forget_native_agent_announcement(&mut self) {
+        self.native_agent_announced = None;
+    }
+
+    /// Native input the daemon holds for this conversation, oldest first.
+    #[must_use]
+    pub fn managed_queue(&self) -> &[bcode_session_models::external_harness::QueuedNativeInput] {
+        &self.managed_queue
     }
 
     pub fn apply_submission_records(&mut self, records: &[bcode_session_models::SubmissionRecord]) {

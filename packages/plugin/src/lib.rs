@@ -772,6 +772,10 @@ pub struct PluginManifest {
     pub keymap_actions: Vec<bcode_plugin_models::keymap::KeymapAction>,
     #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
+    /// How a native harness's own tools map onto Bcode's tool policy, so the conversation's
+    /// agent can decide the native agent's permission requests.
+    #[serde(default)]
+    pub native_tools: Vec<NativeToolPolicyDeclaration>,
     #[serde(default)]
     pub workflow_templates: Vec<WorkflowTemplateContribution>,
     #[serde(default)]
@@ -785,6 +789,35 @@ pub struct PluginManifest {
 
 fn default_tool_service_interface_id() -> String {
     bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned()
+}
+
+/// One native tool of a harness plugin, described for Bcode's tool policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeToolPolicyDeclaration {
+    /// The native tool's exact name.
+    pub tool_name: String,
+    /// What the tool does, for policy.
+    pub operation: NativeToolOperation,
+    /// Top-level input fields holding the command, paths or URL, in order.
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+/// What a native tool does, for Bcode's tool policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolOperation {
+    /// Runs the shell command in its first field.
+    Command,
+    /// Reads the paths in its fields.
+    Read,
+    /// Writes or edits the paths in its fields.
+    Write,
+    /// Fetches the URL in its first field.
+    Web,
+    /// Reads nothing outside the conversation and changes nothing.
+    ReadOnly,
 }
 
 /// Visual adapter capability declared by a plugin manifest.
@@ -6984,6 +7017,25 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn claude_code_manifest_presents_native_tools_without_diagnostics() {
+        let manifest: PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/claude-code-plugin/bcode-plugin.toml"
+        ))
+        .expect("claude code manifest parses");
+        let declaration = manifest.presentation_declaration();
+        assert!(
+            declaration.diagnostics.is_empty(),
+            "{:?}",
+            declaration.diagnostics
+        );
+        assert_eq!(
+            declaration.target_fields("Write"),
+            Some(&["file_path".to_owned()][..])
+        );
+        assert_eq!(declaration.rules.len(), 2);
+    }
+
+    #[test]
     fn shell_manifest_declares_valid_workflow_block_contract() {
         let manifest: PluginManifest = toml::from_str(include_str!(
             "../../../plugins/shell-plugin/bcode-plugin.toml"
@@ -7819,6 +7871,7 @@ library = "libauth_test.dylib"
             presentation: PluginPresentationDeclaration::default(),
             keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
+            native_tools: Vec::new(),
             workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -7870,6 +7923,7 @@ library = "libauth_test.dylib"
             presentation: PluginPresentationDeclaration::default(),
             keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
+            native_tools: Vec::new(),
             workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -12497,6 +12551,7 @@ library = "libexample_plugin.dylib"
                 presentation: PluginPresentationDeclaration::default(),
                 keymap_actions: Vec::new(),
                 command_contributions: Vec::new(),
+                native_tools: Vec::new(),
                 workflow_templates: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
@@ -13530,6 +13585,7 @@ library = "libexample_plugin.dylib"
             presentation: PluginPresentationDeclaration::default(),
             keymap_actions: Vec::new(),
             command_contributions: Vec::new(),
+            native_tools: Vec::new(),
             workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,

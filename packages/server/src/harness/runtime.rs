@@ -40,6 +40,7 @@ pub struct ManagedHarnessRuntime<S, T = HarnessPluginTransport> {
     store: S,
     transport: T,
     activity: super::activity::NativeActivity,
+    approvals: super::native_policy::NativeApprovals,
 }
 
 impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S, T> {
@@ -50,6 +51,7 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             store,
             transport,
             activity: super::activity::NativeActivity::new(),
+            approvals: super::native_policy::NativeApprovals::new(),
         }
     }
 
@@ -58,6 +60,14 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
     #[must_use]
     pub fn busy_native_sessions(&self) -> usize {
         self.activity.busy_sessions()
+    }
+
+    /// Native approvals committed for `session` and not yet put to its agent's policy.
+    pub fn take_native_approvals(
+        &self,
+        session: SessionId,
+    ) -> Vec<bcode_harness_models::HarnessInteraction> {
+        self.approvals.take(session)
     }
 
     /// Whether a native foreground turn is running for `session`.
@@ -481,6 +491,8 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         page.live = live;
         self.activity
             .observed(owner.session_id, &session.capabilities, &page.observations);
+        self.approvals
+            .observed(owner.session_id, &page.observations);
         if !page.live.is_empty() {
             self.store.publish_live(owner, &page).await;
         }

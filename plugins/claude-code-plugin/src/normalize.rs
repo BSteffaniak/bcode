@@ -228,6 +228,13 @@ impl Normalizer {
                 {
                     self.model = Some(model);
                 }
+                // Earlier turns were summarized: context Bcode added in them is gone.
+                if value.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+                    kinds.push(HarnessObservationKind::Vendor {
+                        namespace: bcode_harness_models::NATIVE_CONTEXT_NAMESPACE.into(),
+                        detail: serde_json::json!({"code": "compacted"}),
+                    });
+                }
                 if let Some("task_started" | "task_notification") =
                     value.get("subtype").and_then(Value::as_str)
                     && let Some(id) = bounded_id(value.get("task_id"))

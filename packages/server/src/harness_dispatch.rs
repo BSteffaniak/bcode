@@ -148,6 +148,27 @@ pub trait ManagedSessionBackend: Send + Sync {
         Box::pin(async { Ok(false) })
     }
 
+    /// Answer native approvals the conversation's agent policy decides; others stay with the
+    /// user. Returns whether any was answered.
+    fn apply_agent_policy<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+    ) -> Task<'a, bool> {
+        let _ = (caller, session_id);
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Withdraw one held input unless it is already being sent; returns whether it was.
+    fn withdraw_queued_input<'a>(
+        &'a self,
+        session_id: SessionId,
+        submission_id: &'a str,
+    ) -> Task<'a, bool> {
+        let _ = (session_id, submission_id);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+
     /// Retain an explicitly recovered current owner for normal shutdown cleanup.
     /// Implementations without canonical runtime ownership must reject this operation.
     fn retain_recovery_owner(&self, owner: HarnessOwner) -> Task<'_, ()> {
@@ -451,6 +472,8 @@ struct CanonicalBackend<S, A> {
     /// Sessions whose stored queue was last seen empty; any hold clears the mark. Absent
     /// sessions (including every session after a restart) are read from storage.
     empty_queues: std::sync::Mutex<std::collections::BTreeSet<SessionId>>,
+    /// Orders the choice between releasing and withdrawing one held input.
+    queue_decisions: tokio::sync::Mutex<()>,
 }
 impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
     for CanonicalBackend<S, A>
@@ -461,6 +484,57 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
         session_id: SessionId,
     ) -> Task<'a, bool> {
         Box::pin(self.release_queued(caller, session_id))
+    }
+
+    fn apply_agent_policy<'a>(
+        &'a self,
+        caller: &'a ManagedCaller,
+        session_id: SessionId,
+    ) -> Task<'a, bool> {
+        Box::pin(self.answer_by_policy(caller, session_id))
+    }
+
+    fn withdraw_queued_input<'a>(
+        &'a self,
+        session_id: SessionId,
+        submission_id: &'a str,
+    ) -> Task<'a, bool> {
+        Box::pin(async move {
+            // Serialized with release: an input is either withdrawn or sent, never both.
+            let _decision = self.queue_decisions.lock().await;
+            if self
+                .releasing
+                .lock()
+                .map_or(true, |releasing| releasing.contains(submission_id))
+            {
+                return Ok(false);
+            }
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            let held = state
+                .sessions
+                .native_input_queue(session_id, bcode_session::NativeInputQueueChange::List)
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?;
+            if !held
+                .iter()
+                .any(|input| input.submission_id == submission_id)
+            {
+                return Ok(false);
+            }
+            state
+                .sessions
+                .native_input_queue(
+                    session_id,
+                    bcode_session::NativeInputQueueChange::Remove(submission_id.to_owned()),
+                )
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?;
+            drop(state);
+            Ok(true)
+        })
     }
 
     fn execute_selected<'a>(
@@ -987,6 +1061,10 @@ fn log_admitted_failure(
                     revoke_submit_scope, "managed admitted operation failed");
 }
 
+/// Response identities of answers the agent's policy gave, so the transcript can say so.
+const AGENT_POLICY_RESPONSE_PREFIX: &str =
+    bcode_session_view::external_projection::AGENT_POLICY_RESPONSE_PREFIX;
+
 /// Times one queued input may be refused as busy before it is given up.
 const MAX_QUEUED_INPUT_ATTEMPTS: usize = 3;
 
@@ -1141,6 +1219,72 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
         Ok(call)
     }
 
+    /// Put committed native approvals to the conversation's agent policy, answering those it
+    /// allows or denies through the ordinary respond admission. A failed answer leaves the
+    /// approval with the user, who can still answer it.
+    async fn answer_by_policy(
+        &self,
+        caller: &ManagedCaller,
+        session_id: SessionId,
+    ) -> Result<bool, ManagedHarnessError> {
+        let approvals = self.runtime.take_native_approvals(session_id);
+        if approvals.is_empty() {
+            return Ok(false);
+        }
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ManagedHarnessError::Unavailable)?;
+        let canonical = state
+            .sessions
+            .session_external_harness_state(session_id)
+            .await
+            .map_err(|_| ManagedHarnessError::Storage)?
+            .ok_or(ManagedHarnessError::StaleOwner)?;
+        let Some(target) = canonical.target else {
+            return Ok(false);
+        };
+        let mut answered = false;
+        for approval in approvals {
+            let Some(approved) = crate::harness::native_policy::decide(
+                &state,
+                session_id,
+                &canonical.instance.plugin_id,
+                &approval,
+            )
+            .await
+            else {
+                continue;
+            };
+            let response_id = format!("{AGENT_POLICY_RESPONSE_PREFIX}{}", uuid::Uuid::new_v4());
+            let call = ManagedSessionCall {
+                session_id: Some(session_id),
+                parent_session_id: None,
+                assistance_destination_session_id: None,
+                harness: bcode_harness_models::HarnessRequest {
+                    schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
+                    request_id: response_id.clone(),
+                    instance: canonical.instance.clone(),
+                    kind: HarnessRequestKind::Respond {
+                        target: target.clone(),
+                        response: bcode_harness_models::HarnessResponse {
+                            response_id,
+                            request_id: approval.request_id.clone(),
+                            session_id: session_id.to_string(),
+                            generation: approval.generation,
+                            value: bcode_harness_models::HarnessResponseValue::Approval {
+                                approved,
+                            },
+                        },
+                    },
+                },
+            };
+            answered |= self.execute(caller, call).await.is_ok();
+        }
+        drop(state);
+        Ok(answered)
+    }
+
     /// Send the oldest queued input once the native agent is idle, through the same admission
     /// and canonical claim as any submit. A refusal as busy re-queues it under fresh
     /// identities (the refused ones are already recorded); an uncertain outcome is never
@@ -1174,10 +1318,24 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> CanonicalBackend<S, A> 
             return Ok(false);
         };
         let call = Self::queued_submit_call(&state, session_id, &next).await?;
-        drop(state);
-        if let Ok(mut releasing) = self.releasing.lock() {
-            releasing.insert(next.submission_id.clone());
+        {
+            // Claim it for sending only if it was not withdrawn meanwhile.
+            let _decision = self.queue_decisions.lock().await;
+            let still_held = state
+                .sessions
+                .native_input_queue(session_id, bcode_session::NativeInputQueueChange::List)
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?
+                .iter()
+                .any(|input| input.submission_id == next.submission_id);
+            if !still_held {
+                return Ok(true);
+            }
+            if let Ok(mut releasing) = self.releasing.lock() {
+                releasing.insert(next.submission_id.clone());
+            }
         }
+        drop(state);
         let outcome = self.execute(caller, call).await;
         if let Ok(mut releasing) = self.releasing.lock() {
             releasing.remove(&next.submission_id);
@@ -1502,6 +1660,7 @@ impl crate::ServerState {
             watches: crate::harness::ObservationWatches::default(),
             releasing: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             empty_queues: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            queue_decisions: tokio::sync::Mutex::new(()),
         };
         self.managed_sessions
             .set(Arc::new(backend))
@@ -1521,6 +1680,74 @@ fn failure(error: ManagedHarnessError) -> ErrorResponse {
         ManagedHarnessError::Unsupported => "managed_session_unsupported",
     };
     ErrorResponse::new(code, error.to_string())
+}
+
+/// The session an explicit observe reads.
+fn observed_session(call: &ManagedSessionCall) -> Option<SessionId> {
+    match &call.harness.kind {
+        HarnessRequestKind::Observe(value) => value.target.session_id().parse().ok(),
+        _ => None,
+    }
+}
+
+/// After an explicit observe, the agent's policy answers the approvals it decides and queued
+/// input goes out once the native agent is idle, so neither waits for an attached client.
+async fn after_observe(
+    backend: &dyn ManagedSessionBackend,
+    caller: &ManagedCaller,
+    session_id: Option<SessionId>,
+) {
+    if let Some(session_id) = session_id {
+        let _ = backend.apply_agent_policy(caller, session_id).await;
+        let _ = backend.release_queued_input(caller, session_id).await;
+    }
+}
+
+/// Read or withdraw input held for an interactive client's own session.
+async fn dispatch_queued_input(
+    state: &Arc<crate::ServerState>,
+    caller: ManagedCaller,
+    request: &ManagedSessionRequest,
+) -> Result<ManagedSessionResponse, ErrorResponse> {
+    let query: bcode_ipc::harness::ManagedQueuedInputRequest =
+        serde_json::from_str(&request.request_json)
+            .map_err(|_| failure(ManagedHarnessError::Invalid))?;
+    let ManagedCaller::Client(client) = caller else {
+        return Err(failure(ManagedHarnessError::Unsupported));
+    };
+    crate::session_operations::require_selected_location(state, query.session_id)
+        .await
+        .map_err(|_| failure(ManagedHarnessError::StaleOwner))?;
+    if state
+        .active_session_namespace_mismatch(query.session_id, client)
+        .await
+        .is_some()
+    {
+        return Err(failure(ManagedHarnessError::StaleOwner));
+    }
+    let withdrawn = match (&query.withdraw, request.operation) {
+        (Some(submission_id), ManagedSessionOperation::WithdrawQueuedInput) => {
+            let backend = state
+                .managed_sessions
+                .get()
+                .ok_or_else(|| failure(ManagedHarnessError::Unavailable))?;
+            backend
+                .withdraw_queued_input(query.session_id, submission_id)
+                .await
+                .map_err(failure)?
+        }
+        (None, ManagedSessionOperation::QueuedInput) => false,
+        _ => return Err(failure(ManagedHarnessError::Invalid)),
+    };
+    let queued = state
+        .sessions
+        .native_input_queue(
+            query.session_id,
+            bcode_session::NativeInputQueueChange::List,
+        )
+        .await
+        .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    auth_response(&bcode_ipc::harness::ManagedQueuedInput { queued, withdrawn })
 }
 
 async fn dispatch_binding(
@@ -2251,8 +2478,12 @@ async fn dispatch_request(
         .map_err(|_| failure(ManagedHarnessError::Invalid))?;
         return dispatch_attachment_watch(state, &caller, &query).await;
     }
-    if request.operation == ManagedSessionOperation::Binding {
-        return dispatch_binding(state, caller, &request).await;
+    match request.operation {
+        ManagedSessionOperation::Binding => return dispatch_binding(state, caller, &request).await,
+        ManagedSessionOperation::QueuedInput | ManagedSessionOperation::WithdrawQueuedInput => {
+            return dispatch_queued_input(state, caller, &request).await;
+        }
+        _ => {}
     }
     let json = if request.operation == ManagedSessionOperation::History {
         let query = request
@@ -2297,7 +2528,9 @@ async fn dispatch_request(
                 "canonical managed-session admission/store bridge is not installed",
             )
         })?;
+        let observed_session = observed_session(&call);
         let response = backend.execute(&caller, call).await.map_err(failure)?;
+        after_observe(backend.as_ref(), &caller, observed_session).await;
         serde_json::to_string(&response)
     }
     .map_err(|_| failure(ManagedHarnessError::Invalid))?;

@@ -209,7 +209,7 @@ def main():
         return
     root = Path(os.environ["CLAUDE_CONFIG_DIR"])
     scenario = (root / "scenario").read_text(encoding="utf-8").strip()
-    if scenario not in {"question", "lost_ack", "lost_before_confirmation", "sensitive_error", "cancel", "terminal_auth", "multi_turn"}:
+    if scenario not in {"question", "approval", "lost_ack", "lost_before_confirmation", "sensitive_error", "cancel", "terminal_auth", "multi_turn"}:
         raise ValueError()
     # Count only actual stream processes; version/auth inspection is not creation.
     for sequence in range(32):
@@ -281,6 +281,25 @@ def main():
             emit(result)
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"idle"})
+        elif (frame.get("type") == "user" and submission_uuid is not None
+              and frame.get("message", {}).get("content") == "queued-follow-up"):
+            # The follow-up a client sent while the answered turn was still running. The host
+            # must hold it and deliver it exactly once, only after that turn ended.
+            if not (root / "first-turn-finished").exists():
+                (root / "follow-up-during-turn.rejected").touch()
+                raise ValueError()
+            follow_up = str(uuid.UUID(frame["uuid"]))
+            effect(root, "queued-follow-up")
+            emit({"type":"system", "subtype":"session_state_changed",
+                  "session_id":session, "state":"running"})
+            emit({"type":"assistant", "session_id":session, "uuid":str(uuid.uuid4()),
+                  "user_message_uuid":follow_up,
+                  "message":{"role":"assistant","content":[{"type":"text","text":"follow-up reply"}]}})
+            emit({"type":"result", "subtype":"success", "session_id":session,
+                  "is_error":False, "result":"follow-up reply", "uuid":str(uuid.uuid4()),
+                  "user_message_uuid":follow_up, "queued_turn_count":0})
+            emit({"type":"system", "subtype":"session_state_changed",
+                  "session_id":session, "state":"idle"})
         elif frame.get("type") == "user":
             # Only the actual admitted first user input may trigger native init.
             if frame.get("message", {}).get("content") != "fixture-only":
@@ -309,12 +328,30 @@ def main():
                       "user_message_uuid":submission_uuid, "queued_turn_count":0,
                       "errors":["fixture-secret-DO-NOT-PERSIST"]})
                 raise SystemExit(82)
+            if scenario == "approval":
+                # A native write the host's agent policy must decide without asking the user.
+                emit({"type":"control_request", "request_id":"native-approval-1",
+                      "request":{"subtype":"can_use_tool", "tool_name":"Write",
+                      "input":{"file_path":"fixture.txt", "content":"fixture"},
+                      "tool_use_id":"fixture-tool-2"}})
             if scenario == "question":
                 emit({"type":"control_request", "request_id":"native-question-1",
                       "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion",
                       "input":{"questions":[{"question":"Choose fixture mode",
                       "multiSelect":False,"options":[{"label":"safe"},{"label":"inspect"}]}]},
                       "tool_use_id":"fixture-tool-1"}})
+        elif (frame.get("type") == "control_response"
+              and frame.get("response", {}).get("request_id") == "native-approval-1"):
+            behavior = frame["response"].get("response", {}).get("behavior")
+            if behavior not in {"allow", "deny"}:
+                raise ValueError()
+            effect(root, "approval-" + behavior)
+            emit({"type":"result", "subtype":"success", "session_id":session,
+                  "is_error":False, "result":"approval " + behavior,
+                  "uuid":str(uuid.uuid4()),
+                  "user_message_uuid":submission_uuid, "queued_turn_count":0})
+            emit({"type":"system", "subtype":"session_state_changed",
+                  "session_id":session, "state":"idle"})
         elif frame.get("type") == "control_response":
             response = frame.get("response", {})
             if response.get("request_id") != "native-question-1":
@@ -329,6 +366,13 @@ def main():
                 emit({"type":"system", "subtype":"session_state_changed",
                       "session_id":session, "state":"running"})
                 continue
+            finish_after = root / "finish-after-answer-seconds"
+            if finish_after.exists():
+                # Keep the answered turn running long enough for a client to send more input.
+                emit({"type":"system", "subtype":"session_state_changed",
+                      "session_id":session, "state":"running"})
+                time.sleep(int(finish_after.read_text(encoding="ascii")))
+                (root / "first-turn-finished").touch()
             emit({"type":"result", "subtype":"success", "session_id":session,
                   "is_error":False, "result":"fixture complete",
                   "uuid":"88888888-8888-4888-8888-888888888888",

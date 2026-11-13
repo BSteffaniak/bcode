@@ -14,6 +14,7 @@ pub(crate) mod configuration_views;
 pub(crate) mod execution_catalog;
 mod history;
 mod live;
+pub(crate) mod native_policy;
 mod observation_watch;
 
 /// Explicit graceful-restart recovery is published. It still requires canonical recovery

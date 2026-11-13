@@ -45,6 +45,12 @@ pub const HARNESS_INTERFACE_ID: &str = "bcode.harness/v3";
 pub const TERMINAL_AUTH_INTERFACE_ID: &str = "bcode.harness.terminal-auth/v1";
 
 /// Current envelope schema; other versions are rejected, not coerced.
+/// Vendor observation namespace for generic native context events.
+///
+/// Detail `{"code": "compacted"}` reports that the native agent summarized earlier turns,
+/// dropping context the host added to them.
+pub const NATIVE_CONTEXT_NAMESPACE: &str = "bcode.harness.context";
+
 pub const HARNESS_SCHEMA_VERSION: u16 = 1;
 /// Maximum encoded request or response, checked before decoding.
 pub const MAX_HARNESS_WIRE_BYTES: usize = 1024 * 1024;

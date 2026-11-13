@@ -4197,6 +4197,14 @@ pub fn apply_effect_result(
             &setting,
             &result,
         ),
+        TuiEffectResult::SessionAgentSet { result } => {
+            if let Err(error) = result {
+                report_nonfatal_client_error(chat, "Saving the agent failed", &error);
+            }
+        }
+        TuiEffectResult::ManagedQueueLoaded { withdrawal, result } => {
+            super::managed_flow::apply_queue_result(chat, withdrawal, result);
+        }
         TuiEffectResult::ManagedSessionDetected {
             session_id,
             binding,
@@ -4664,6 +4672,7 @@ fn apply_root_slash_command_outcome(
                         provider_plugin_id: None,
                         model_id: None,
                         agent_id: None,
+                        native_agent: None,
                         reasoning_effort: None,
                         reasoning_summary: None,
                         reasoning_effort_generation: None,
@@ -5135,19 +5144,26 @@ fn apply_managed_composer_receipt(
                 bcode_session_models::ExternalHarnessRequestKind::Submit { submission, .. }
                 if submission.submission_id == receipt.submission_id && submission.attempt_id == receipt.attempt_id
                     && submission.generation == receipt.generation && submission.session_id == receipt.session_id));
-            if receipt.state != bcode_harness_models::HarnessDeliveryState::Uncertain {
-                chat.app.acknowledge_managed_composer(submission_id);
+            match receipt.state {
+                bcode_harness_models::HarnessDeliveryState::Uncertain => {}
+                bcode_harness_models::HarnessDeliveryState::Accepted => {
+                    chat.app.mark_managed_queued(submission_id);
+                    chat.replace_effect(TuiEffect::LoadManagedQueue);
+                }
+                _ => chat.app.acknowledge_managed_composer(submission_id),
             }
             if exact {
                 match receipt.state {
                     // Held by the daemon with this session: it goes out when the turn ends.
                     bcode_harness_models::HarnessDeliveryState::Accepted => {
-                        if let Some(text) = retained.as_ref().and_then(submitted_text) {
-                            chat.app.push_ephemeral_system_plain(format!(
-                                "Queued: {text}\nIt will be sent when {label} finishes its current turn."
-                            ));
-                        }
-                        format!("Queued; {label} gets it when its current turn ends")
+                        let keys = super::keymap::BmuxKeyMap::from_registry(
+                            chat.app.shared_effective_keymap(),
+                        );
+                        format!(
+                            "Queued; {label} gets it when its current turn ends · {} edit · {} withdraw",
+                            keys.hint("chat", "tui.queue.edit"),
+                            keys.hint("chat", "tui.queue.cancel"),
+                        )
                     }
                     // The native record of what arrived settles this. The exact attempt is
                     // kept for an explicit retry, but nothing else waits on it.
@@ -5170,6 +5186,7 @@ fn apply_managed_composer_receipt(
         }
         // Definitely not delivered: give the text back so it can be sent again.
         ExternalHarnessResponseKind::Failure(failure) => {
+            chat.app.forget_native_agent_announcement();
             if let Some(text) = retained.as_ref().and_then(submitted_text)
                 && chat.app.composer().text().is_empty()
             {
@@ -7187,6 +7204,7 @@ mod scheduler_tests {
             provider_plugin_id: None,
             model_id: None,
             agent_id: None,
+            native_agent: None,
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_effort_generation: None,
