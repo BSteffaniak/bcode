@@ -573,6 +573,9 @@ pub struct ReviewDocument {
     pub(super) rows: Fenwick,
     pub(super) annotations: Vec<Annotation>,
     pub(super) review_annotations: Vec<usize>,
+    /// Annotations on a source as a whole (a review-level anchor naming its source), by group:
+    /// shown with that source, after its header and introduction.
+    pub(super) source_annotations: BTreeMap<usize, Vec<usize>>,
     pub(super) file_annotations: Vec<Vec<usize>>,
     /// Block each thread and agent-thread key is placed in.
     pub(super) annotation_blocks: BTreeMap<ItemKey, usize>,
@@ -635,6 +638,7 @@ impl ReviewDocument {
             rows: Fenwick::default(),
             annotations: Vec::new(),
             review_annotations: Vec::new(),
+            source_annotations: BTreeMap::new(),
             file_annotations: Vec::new(),
             annotation_blocks: BTreeMap::new(),
             composer: None,
@@ -1691,6 +1695,9 @@ impl ReviewDocument {
             .map(|(file, _)| file)
             .collect();
         self.review_annotations.clear();
+        let mut groups: BTreeSet<usize> = std::mem::take(&mut self.source_annotations)
+            .into_keys()
+            .collect();
         for list in &mut self.file_annotations {
             list.clear();
         }
@@ -1700,13 +1707,30 @@ impl ReviewDocument {
                     self.file_annotations[file].push(index);
                     affected.insert(file);
                 }
-                _ => self.review_annotations.push(index),
+                _ => match self.source_group(&annotation.anchor) {
+                    Some(group) if annotation.target == AnchorTarget::Review => {
+                        self.source_annotations
+                            .entry(group)
+                            .or_default()
+                            .push(index);
+                        groups.insert(group);
+                    }
+                    _ => self.review_annotations.push(index),
+                },
             }
         }
         self.annotation_blocks.clear();
         for &index in &self.review_annotations {
             self.annotation_blocks
                 .insert(collected[index].key.clone(), 0);
+        }
+        for (group, list) in &self.source_annotations {
+            for &index in list {
+                self.annotation_blocks.insert(
+                    collected[index].key.clone(),
+                    self.groups[*group].header_block,
+                );
+            }
         }
         for (file, list) in self.file_annotations.iter().enumerate() {
             for &index in list {
@@ -1716,9 +1740,26 @@ impl ReviewDocument {
         }
         self.annotations = collected;
         self.rebuild_block(0);
+        for group in groups {
+            self.rebuild_block(self.groups[group].header_block);
+        }
         for file in affected {
             self.rebuild_file(file);
         }
+    }
+
+    /// The group a review-level anchor naming a source belongs to: that source's (first part's)
+    /// group.
+    fn source_group(&self, anchor: &bcode_code_review_models::DraftAnchor) -> Option<usize> {
+        let source = anchor.source_id.as_deref()?;
+        self.groups.iter().position(|group| {
+            group.source.source_id == source
+                && group
+                    .source
+                    .part
+                    .as_ref()
+                    .is_none_or(|part| part.index == 0)
+        })
     }
 
     /// The file a persisted anchor refers to: same source and path, else the first file with

@@ -400,3 +400,79 @@ fn a_loading_group_fills_in_place_and_the_others_keep_their_state_and_loads() {
         .collect();
     assert_eq!(order, ["zero", "one", "two", "three"]);
 }
+
+#[test]
+fn a_thread_on_a_source_as_a_whole_shows_with_that_source_only() {
+    use bcode_code_review_models::{
+        DraftAnchor, DraftComment, ReviewAnchorKind, ReviewLineKind, ReviewThreadKind,
+        ReviewThreadSeverity,
+    };
+    let fake = one_file();
+    let mut doc = ReviewDocument::new(
+        PathBuf::from("/repo"),
+        vec![fake.input("one"), fake.input("two"), fake.input("three")],
+        DocumentConfig::default(),
+    );
+    let draft = |thread: &str, source: Option<&str>| DraftComment {
+        comment_id: format!("{thread}-1"),
+        thread_id: thread.to_owned(),
+        anchor: DraftAnchor {
+            kind: ReviewAnchorKind::Review,
+            file_path: super::super::REVIEW_LEVEL_PATH.to_owned(),
+            diff_row: 0,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            old_line: None,
+            new_line: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: source.map(str::to_owned),
+            head_oid: None,
+            blob_oid: None,
+            reply_to: None,
+        },
+        body: "body".into(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        session_id: None,
+        resolved_at_ms: None,
+        thread_kind: ReviewThreadKind::Note,
+        severity: ReviewThreadSeverity::Info,
+    };
+    doc.set_annotations(&super::super::Annotations {
+        drafts: vec![draft("on-two", Some("two")), draft("on-review", None)],
+        ..super::super::Annotations::default()
+    });
+    let _ = doc.take_splices();
+    doc.assert_consistent("annotated");
+    let thread = |id: &str| ItemKey::Thread {
+        thread_id: id.to_owned(),
+    };
+    let header = |source: &str| ItemKey::SourceHeader {
+        source_id: source.to_owned(),
+        part: None,
+    };
+    // The source's thread follows its header, before its file; the review's stays on top.
+    let on_two = doc.index_of(&thread("on-two")).expect("shown");
+    assert_eq!(doc.index_of(&header("two")), Some(on_two - 1));
+    assert!(matches!(
+        doc.item(on_two + 1),
+        Some(ReviewItem::FileHeader(file)) if file.file.source_id == "two"
+    ));
+    assert!(
+        doc.index_of(&thread("on-review")).expect("shown")
+            < doc.index_of(&header("one")).expect("one")
+    );
+    // Another source in focus: the thread is not shown; its own source in focus: it is.
+    doc.set_focus(Some("one"));
+    doc.assert_consistent("one focused");
+    assert_eq!(doc.index_of(&thread("on-two")), None);
+    assert!(doc.index_of(&thread("on-review")).is_some());
+    doc.set_focus(Some("two"));
+    assert!(doc.index_of(&thread("on-two")).is_some());
+}

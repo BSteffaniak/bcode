@@ -130,8 +130,8 @@ impl ReviewDocument {
         Built { items, hunk_parent }
     }
 
-    fn build_source_header(&self, group: usize) -> Built {
-        let group = &self.groups[group];
+    fn build_source_header(&self, index: usize) -> Built {
+        let group = &self.groups[index];
         // A source's introduction follows its header, once (on its first part).
         let intro = (self.intros.contains(&group.source.source_id)
             && group
@@ -145,8 +145,16 @@ impl ReviewDocument {
                 under_header: group.show_header,
             })
         });
+        // Annotations on the source as a whole follow the introduction.
+        let notes: Vec<ReviewItem> = self
+            .source_annotations
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .map(|annotation| self.annotation_item(*annotation, AnchorPlacement::Review))
+            .collect();
         if !group.show_header {
-            let items: Vec<ReviewItem> = intro.into_iter().collect();
+            let items: Vec<ReviewItem> = intro.into_iter().chain(notes).collect();
             return Built {
                 hunk_parent: vec![None; items.len()],
                 items,
@@ -189,7 +197,7 @@ impl ReviewDocument {
             viewed_count: group.viewed,
             loading: group.loading,
         });
-        let items: Vec<ReviewItem> = std::iter::once(item).chain(intro).collect();
+        let items: Vec<ReviewItem> = std::iter::once(item).chain(intro).chain(notes).collect();
         Built {
             hunk_parent: vec![None; items.len()],
             items,
