@@ -27,6 +27,7 @@ mod items;
 mod keys;
 mod navigation;
 mod review;
+mod upsert;
 
 #[cfg(test)]
 pub(crate) mod tests;

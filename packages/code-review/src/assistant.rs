@@ -147,6 +147,7 @@ impl OpenReview {
             viewed_marks: self.workspace.viewed_marks.clone(),
             reviewed_revisions: BTreeMap::new(),
             presentation: None,
+            stack_snapshots: Vec::new(),
         }
     }
 }

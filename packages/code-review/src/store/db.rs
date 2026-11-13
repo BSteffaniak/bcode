@@ -31,6 +31,7 @@ impl<'a> CodeReviewDb<'a> {
                 "viewed_marks_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
+                "stack_snapshots_json",
             ])
             .filter(Box::new(where_eq(
                 "repo_root",
@@ -75,6 +76,7 @@ impl<'a> CodeReviewDb<'a> {
                 "viewed_marks_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
+                "stack_snapshots_json",
             ])
             .filter(Box::new(where_eq("workspace_id", workspace_id)))
             .execute_first(self.db)
@@ -95,6 +97,9 @@ impl<'a> CodeReviewDb<'a> {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let stack_snapshots_json = (!workspace.stack_snapshots.is_empty())
+            .then(|| serde_json::to_string(&workspace.stack_snapshots))
+            .transpose()?;
         if self.get_workspace(&workspace.id).await?.is_some() {
             self.db
                 .update("review_workspaces")
@@ -105,6 +110,7 @@ impl<'a> CodeReviewDb<'a> {
                 .value("viewed_marks_json", viewed_marks_json.clone())
                 .value("reviewed_revisions_json", reviewed_revisions_json.clone())
                 .value("presentation_v2_json", presentation_json.clone())
+                .value("stack_snapshots_json", stack_snapshots_json.clone())
                 .value(
                     "updated_at_ms",
                     u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
@@ -125,6 +131,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("viewed_marks_json", viewed_marks_json)
             .value("reviewed_revisions_json", reviewed_revisions_json)
             .value("presentation_v2_json", presentation_json)
+            .value("stack_snapshots_json", stack_snapshots_json)
             .value(
                 "created_at_ms",
                 u64_to_i64(workspace.created_at_ms.unwrap_or_else(now_ms)),
@@ -1443,7 +1450,22 @@ pub fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(thread_head_oid_column_migration());
     source.add_migration(thread_blob_oid_column_migration());
     source.add_migration(review_assistant_sessions_table_migration());
+    source.add_migration(workspace_stack_snapshots_column_migration());
     source
+}
+
+/// The stacks a review last opened with (see `ReviewWorkspace::stack_snapshots`).
+pub fn workspace_stack_snapshots_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "022_workspace_stack_snapshots_column".to_string(),
+        Box::new(alter_table("review_workspaces").add_column(
+            "stack_snapshots_json".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
 }
 
 /// Sessions bound to the review they assist, with the binding as recorded.
@@ -1801,6 +1823,10 @@ pub fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, StoreError> {
             .filter(|state| {
                 state.schema_version <= bcode_code_review_models::REVIEW_PRESENTATION_SCHEMA_VERSION
             }),
+        // Disposable too: an unreadable value is dropped.
+        stack_snapshots: optional_text(row, "stack_snapshots_json")
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
     })
 }
 

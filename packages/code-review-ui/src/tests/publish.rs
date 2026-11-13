@@ -170,7 +170,7 @@ fn stack_rail_steps_between_layers_keeping_each_layers_position() {
 
 #[test]
 fn opening_shows_the_first_layer_before_the_rest_with_the_others_loading() {
-    use crate::loader::{Inbox, Message, ViewedInputs, open};
+    use crate::loader::{Inbox, Message, OpenOptions, open};
     use bcode_code_review_models::ReviewSource;
     let fixture = fixture();
     let backend = TestBackend::default().with_provider(FakeProvider::new(fixture.root()));
@@ -188,18 +188,23 @@ fn opening_shows_the_first_layer_before_the_rest_with_the_others_loading() {
         .enable_all()
         .build()
         .expect("runtime");
-    let complete = runtime
+    let streamed = runtime
         .block_on(open(
             backend.services(),
             fixture.root().to_path_buf(),
             sources,
             inbox.clone(),
-            ViewedInputs::default(),
-            Some("layer-102".into()),
+            OpenOptions {
+                first: Some("layer-102".into()),
+                stream: true,
+                ..OpenOptions::default()
+            },
         ))
         .expect("open");
-    // First an incomplete review: #102 listed, every other layer a loading group, in order.
+    // Streamed: the review comes through the inbox, not as the answer.
+    assert!(streamed.is_none());
     let messages = inbox.drain();
+    // First an incomplete review: #102 listed, every other layer a loading group, in order.
     let partial = messages
         .iter()
         .find_map(|message| match message {
@@ -227,16 +232,63 @@ fn opening_shows_the_first_layer_before_the_rest_with_the_others_loading() {
     for (index, (_, loading, entries)) in states.iter().enumerate() {
         assert!(index == 2 || (*loading && *entries == 0), "{states:?}");
     }
+    // Then every other layer as it is listed, with what is still loading, and the end.
+    let mut arrived: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Arrived(arrived) if !arrived.input.loading => {
+                assert_ne!(arrived.input.entries.len(), 0);
+                Some(arrived.input.source.source_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    arrived.sort_unstable();
+    assert_eq!(arrived, ["layer-100", "layer-101", "layer-103"]);
     assert!(
-        messages
-            .iter()
-            .any(|message| matches!(message, Message::Stage(stage) if stage.contains("of 3"))),
+        messages.iter().any(
+            |message| matches!(message, Message::Filling(Some(stage)) if stage.contains("of 3"))
+        ),
         "{messages:?}"
     );
-    // Then the whole review.
-    assert!(complete.complete);
     assert!(
-        complete
+        matches!(messages.last(), Some(Message::Filled { .. })),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_refresh_answers_the_whole_review_at_once() {
+    use crate::loader::{Inbox, OpenOptions, open};
+    use bcode_code_review_models::ReviewSource;
+    let fixture = fixture();
+    let backend = TestBackend::default().with_provider(FakeProvider::new(fixture.root()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    // Without streaming, nothing is pushed: the whole review is the answer.
+    let refreshed = runtime
+        .block_on(open(
+            backend.services(),
+            fixture.root().to_path_buf(),
+            [100, 101, 102, 103]
+                .into_iter()
+                .map(|number| ReviewSource {
+                    id: format!("layer-{number}"),
+                    kind: layer(number),
+                    label: format!("#{number}"),
+                    included: true,
+                })
+                .collect(),
+            Inbox::default(),
+            OpenOptions::default(),
+        ))
+        .expect("open")
+        .expect("the whole review");
+    assert!(refreshed.complete);
+    assert!(
+        refreshed
             .inputs
             .iter()
             .all(|input| !input.loading && !input.entries.is_empty())
@@ -300,6 +352,20 @@ fn step_through_reviews_show_one_pull_request_at_a_time_or_every_one() {
         screen.text()
     );
     assert!(screen.row_text(2).contains("#102"), "{}", screen.text());
+    // The strip says how current the stack is, and the review keeps the stack it opened with.
+    assert!(
+        screen.row_text(2).contains("stack confirmed just now"),
+        "{}",
+        screen.text()
+    );
+    let snapshots = &scenario
+        .surface()
+        .review()
+        .and_then(|review| review.workspace())
+        .expect("workspace")
+        .stack_snapshots;
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert_eq!(snapshots[0].stack.layers.len(), 4);
     // The file panel groups files by pull request, only the current one open.
     assert!(screen.contains("▸ #101 Layer 101"), "{}", screen.text());
     assert!(screen.contains("▾ #102 Layer 102"), "{}", screen.text());

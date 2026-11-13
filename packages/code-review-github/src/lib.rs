@@ -59,6 +59,9 @@ pub enum ReviewSourceError {
     /// GitHub could not be reached or answered with an error.
     #[error("{0}")]
     Failed(String),
+    /// The caller stopped wanting the answer.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl ReviewSourceError {
@@ -72,6 +75,7 @@ impl ReviewSourceError {
             Self::PullNotFound(..) => REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
             Self::Fetch(_) => REVIEW_SOURCE_ERROR_FETCH_FAILED,
             Self::Failed(_) => REVIEW_SOURCE_ERROR_FAILED,
+            Self::Cancelled => bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED,
         }
     }
 }
@@ -141,10 +145,29 @@ impl ReviewSourceProvider for GitHubReviewSource {
     ) -> ProviderResult<ReviewSourcePullsGetResponse> {
         let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
         let github = repository.github(&request.repo_path);
-        let found = github
-            .pull_requests_by_number(&repository.0, &request.numbers)
-            .map_err(ReviewSourceError::from)?;
-        Ok(pulls_get_response(&repository, &request.numbers, &found))
+        // The pull requests and the branches' children are asked for at once.
+        let (found, children) = std::thread::scope(|scope| {
+            let children = (!request.children_of.is_empty()).then(|| {
+                scope.spawn(|| github.branches_pull_requests(&repository.0, &request.children_of))
+            });
+            let found = github.pull_requests_by_number(&repository.0, &request.numbers);
+            let children = children.map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(ForgeError::Failed("a GitHub request panicked".to_owned()))
+                })
+            });
+            (found, children.transpose())
+        });
+        let found = found.map_err(ReviewSourceError::from)?;
+        let children = children
+            .map_err(ReviewSourceError::from)?
+            .unwrap_or_default();
+        let mut response = pulls_get_response(&repository, &request.numbers, &found);
+        response.children = children
+            .into_iter()
+            .map(|(branch, pulls)| (branch, stack_candidates(&repository, &pulls.with_base)))
+            .collect();
+        Ok(response)
     }
 
     fn resolve_stack(
@@ -446,6 +469,7 @@ fn pulls_get_response(
         repository: repository.display(),
         pulls: Vec::new(),
         not_open: Vec::new(),
+        children: BTreeMap::new(),
     };
     for number in numbers {
         match found.get(number).and_then(Option::as_ref) {
@@ -638,6 +662,10 @@ struct ForgeBranches<'a> {
 impl ForgeBranches<'_> {
     /// Look `branch` up with the next pending hints, and keep every answer.
     fn look_up(&mut self, branch: &str) -> Result<(), ReviewSourceError> {
+        // A walk is several round trips; one the caller no longer wants stops here.
+        if bcode_code_review_provider::cancelled() {
+            return Err(ReviewSourceError::Cancelled);
+        }
         let mut batch = vec![branch.to_owned()];
         while batch.len() < LOOKUP_BATCH {
             let Some(next) = self.pending.pop_front() else {

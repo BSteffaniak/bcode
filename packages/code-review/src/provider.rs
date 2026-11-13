@@ -14,8 +14,8 @@
 //! `provider_required` diagnostic; every other source keeps working.
 
 pub use bcode_code_review_provider::{
-    DiscoveryContributor, JsonCall, JsonDiscovery, JsonReviewSource, ProviderCallError,
-    ProviderResult, ReviewSourceProvider,
+    Cancel, DiscoveryContributor, JsonCall, JsonDiscovery, JsonReviewSource, ProviderCallError,
+    ProviderResult, ReviewSourceProvider, cancelled, with_cancel,
 };
 
 use bcode_code_review_models::{
@@ -98,7 +98,7 @@ impl std::fmt::Debug for ContributorRoute {
 mod known;
 
 use known::{KnownPulls, KnownStacks};
-pub use known::{STACK_FRESH, STACK_KEPT, STACK_RECONFIRM};
+pub use known::{STACK_FRESH, STACK_KEPT};
 
 /// How far a caller trusts a remembered stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub enum Freshness {
     /// to be confirmed after.
     Remembered,
     /// A remembered stack as it is now: used as it is within the registry's freshness window,
-    /// confirmed with its provider within [`STACK_RECONFIRM`], resolved again past it.
+    /// confirmed with its provider past it.
     Confirmed,
 }
 
@@ -119,6 +119,8 @@ pub struct ProviderRegistry {
     contributors: Vec<ContributorRoute>,
     known_stacks: Arc<KnownStacks>,
     known_pulls: Arc<KnownPulls>,
+    /// The on-disk cache (disabled unless [`Self::with_cache`]), for discovery answers.
+    disk: Arc<crate::cache::ReviewCache>,
     stack_fresh: std::time::Duration,
 }
 
@@ -129,6 +131,7 @@ impl Default for ProviderRegistry {
             contributors: Vec::new(),
             known_stacks: Arc::default(),
             known_pulls: Arc::default(),
+            disk: Arc::default(),
             stack_fresh: STACK_FRESH,
         }
     }
@@ -145,8 +148,14 @@ impl ProviderRegistry {
     #[must_use]
     pub fn with_cache(mut self, disk: Arc<crate::cache::ReviewCache>) -> Self {
         self.known_stacks = Arc::new(KnownStacks::with_disk(Arc::clone(&disk)));
-        self.known_pulls = Arc::new(KnownPulls::with_disk(disk));
+        self.known_pulls = Arc::new(KnownPulls::with_disk(Arc::clone(&disk)));
+        self.disk = disk;
         self
+    }
+
+    /// The on-disk cache this registry keeps what it learns in.
+    pub(crate) fn disk(&self) -> &crate::cache::ReviewCache {
+        &self.disk
     }
 
     /// Use remembered stacks as they are for `fresh` (instead of [`STACK_FRESH`]); older ones
@@ -229,6 +238,20 @@ impl ProviderRegistry {
         );
     }
 
+    /// Remember `stack` as provider `provider` confirmed it in `repository` at `confirmed_at` (a
+    /// review's saved snapshot), unless a stack sharing a layer with it was confirmed since. Like
+    /// any remembered stack, it is shown at once and confirmed when it is not fresh.
+    pub fn seed_stack(
+        &self,
+        provider: &str,
+        repository: &str,
+        stack: &ReviewStack,
+        confirmed_at: std::time::SystemTime,
+    ) {
+        self.known_stacks
+            .seed(provider, repository, stack, confirmed_at);
+    }
+
     /// Note pull requests provider `provider` reported in `repository` (see [`Self::known_pull`]).
     pub fn note_pulls<'a>(
         &self,
@@ -264,14 +287,28 @@ impl ProviderRegistry {
             .containing(provider, repository, number)
             .map(|(stack, _)| stack)
     }
+
+    /// How long ago the remembered stack that has pull request `number` as a layer was resolved
+    /// or confirmed.
+    #[must_use]
+    pub fn known_stack_age(
+        &self,
+        provider: &str,
+        repository: &str,
+        number: u64,
+    ) -> Option<std::time::Duration> {
+        self.known_stacks
+            .containing(provider, repository, number)
+            .map(|(_, age)| age)
+    }
 }
 
 /// The remembered stack of `route`'s provider in `repository` with pull request `number` as a
 /// layer, trusted as `freshness` says.
 ///
 /// [`Freshness::Confirmed`] confirms one older than the registry's freshness window with
-/// [`confirm_stack`] (and remembers the answer). `None` when no stack is remembered, it is too old
-/// to confirm, or confirming it showed the stack changed shape: the caller resolves it.
+/// [`confirm_stack`] (and remembers the answer). `None` when no stack is remembered or confirming
+/// it showed the stack changed shape: the caller resolves it.
 #[must_use]
 pub fn remembered_stack(
     registry: &ProviderRegistry,
@@ -287,20 +324,19 @@ pub fn remembered_stack(
     if freshness == Freshness::Remembered || age < registry.stack_fresh {
         return Some(stack);
     }
-    if age >= STACK_RECONFIRM {
-        return None;
-    }
     let confirmed = confirm_stack(route, repo_path, repository, &stack)?;
     registry.remember_stack(&route.manifest.id, repository, &confirmed);
     Some(confirmed)
 }
 
-/// `stack` as its pull requests are now, from one `review_source.pulls.get` for every layer.
+/// `stack` as its pull requests are now, from one `review_source.pulls.get` for every layer and
+/// the pull requests targeting the top layer's branch.
 ///
-/// Titles and commits are refreshed. `None` when a layer is no longer open or its branches
-/// changed (the stack changed shape and must be resolved again), when the provider cannot get
-/// pull requests by number, or when it fails. Pull requests opened on top of the stack since it
-/// was resolved are not seen; resolving finds them.
+/// Titles and commits are refreshed. `None` when the stack changed shape and must be resolved
+/// again: a layer is no longer open or its branches changed, or the pull requests on top of it are
+/// not the ones it had (a layer was opened on top). Also `None` when the provider cannot get pull
+/// requests by number, or fails. A stack cut at a layer limit has pull requests above its top, so
+/// it is resolved again each time it is confirmed.
 #[must_use]
 pub fn confirm_stack(
     route: &ProviderRoute,
@@ -317,9 +353,33 @@ pub fn confirm_stack(
             repo_path: repo_path.to_path_buf(),
             repository: Some(repository.to_owned()),
             numbers: stack.layers.iter().map(|layer| layer.pull.number).collect(),
+            children_of: stack
+                .layers
+                .last()
+                .map(|top| top.pull.head_branch.clone())
+                .into_iter()
+                .collect(),
         })
         .ok()?;
     if !response.not_open.is_empty() {
+        return None;
+    }
+    // What is on top must be what was on top: nothing, or the same siblings.
+    let top = stack.layers.last()?;
+    let on_top: BTreeSet<u64> = response
+        .children
+        .get(&top.pull.head_branch)
+        .into_iter()
+        .flatten()
+        .map(|pull| pull.number)
+        .collect();
+    let had: BTreeSet<u64> = stack
+        .siblings
+        .iter()
+        .filter(|sibling| sibling.parent == top.pull.number)
+        .map(|sibling| sibling.pull.number)
+        .collect();
+    if on_top != had {
         return None;
     }
     let mut confirmed = stack.clone();
@@ -334,6 +394,58 @@ pub fn confirm_stack(
         layer.pull = now.clone();
     }
     Some(confirmed)
+}
+
+/// What a cold open needs to show stack layer `number` before its stack is known.
+///
+/// The pull request alone (one `review_source.pulls.get`), fetched against its own base branch.
+/// Resolved without a stack, the layer is the pull request's diff, which for a layer stacked on
+/// the one below is the same change. `None` when the provider cannot get pull requests by number
+/// or fetch in batches, or fails: the caller resolves the stack instead.
+#[must_use]
+pub fn quick_layer(
+    registry: &ProviderRegistry,
+    route: &ProviderRoute,
+    repo_path: &Path,
+    repository: &str,
+    number: u64,
+) -> Option<ReviewSourceProviderOutcome> {
+    let capabilities = &route.manifest.capabilities.batched;
+    if !capabilities.pulls_get || !capabilities.pulls_fetch {
+        return None;
+    }
+    let response = route
+        .provider
+        .get_pulls(&ReviewSourcePullsGetRequest {
+            repo_path: repo_path.to_path_buf(),
+            repository: Some(repository.to_owned()),
+            numbers: vec![number],
+            children_of: Vec::new(),
+        })
+        .ok()?;
+    let pull = response
+        .pulls
+        .into_iter()
+        .find(|pull| pull.number == number)?;
+    registry.note_pulls(&route.manifest.id, repository, [&pull]);
+    let fetched = route
+        .provider
+        .fetch_pulls(&ReviewSourcePullsFetchRequest {
+            repo_path: repo_path.to_path_buf(),
+            repository: Some(repository.to_owned()),
+            pulls: vec![ReviewPullFetchTarget {
+                number,
+                base_branch: pull.base_branch,
+                head_oid: Some(pull.head_oid).filter(|oid| !oid.is_empty()),
+                base_oid: pull.base_oid,
+            }],
+        })
+        .ok()?
+        .fetched;
+    (fetched.len() == 1).then_some(ReviewSourceProviderOutcome::Resolved {
+        stack: None,
+        fetched,
+    })
 }
 
 /// The providers and contributors a running Bcode's plugins offer, by plugin id.

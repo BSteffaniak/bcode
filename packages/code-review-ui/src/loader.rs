@@ -29,6 +29,21 @@ pub enum Message {
     Opened(Box<Opened>),
     /// The review could not be opened.
     OpenFailed(String),
+    /// A source arrived after the first frame: listed, or pending (see [`Arrived`]).
+    Arrived(Box<Arrived>),
+    /// A source failed after the first frame.
+    SourceFailed(ReviewSourceDiagnostic),
+    /// The review's stack, as its provider resolved or confirmed it (or as remembered).
+    StackConfirmed(Box<session::StackNews>),
+    /// What is still loading after the first frame (`None`: nothing).
+    Filling(Option<String>),
+    /// Every source arrived: the change token taken after them.
+    Filled {
+        /// Change token, when it could be taken.
+        token: Option<String>,
+        /// Whether a source reads the working tree.
+        working_tree: bool,
+    },
     /// Result of one document need.
     Need {
         /// Document generation the need was issued for.
@@ -180,14 +195,45 @@ pub struct ViewedInputs {
 /// Fingerprints loaded while opening a review at most; files beyond get theirs with their hunks.
 const MAX_OPEN_FINGERPRINTS: usize = 2_000;
 
+/// A source that arrived after the first frame.
+#[derive(Debug)]
+pub struct Arrived {
+    /// Its document group (loading while it is only pending).
+    pub input: SourceInput,
+    /// Its index among the review's included sources (workspace order).
+    pub position: usize,
+    /// Fingerprints of its files with viewed marks.
+    pub fingerprints: Option<(String, ReviewPatchIdsResponse)>,
+}
+
+/// How [`open`] runs.
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    /// What the first frame's viewed state needs.
+    pub viewed: ViewedInputs,
+    /// The source to make ready first.
+    pub first: Option<String>,
+    /// Push the review through the inbox as it arrives (see [`open`]).
+    pub stream: bool,
+    /// Set when the review no longer wants the open.
+    pub cancel: bcode_code_review::provider::Cancel,
+}
+
 /// Open a review progressively ([`bcode_code_review::session::open`]).
 ///
-/// The session runs on a blocking thread and reports through a channel: stages become
-/// [`Message::Stage`]; when the first source is ready while others still load, an incomplete
-/// [`Opened`] (the others as loading groups) is pushed at once, so the screen draws without
-/// waiting. The returned [`Opened`] has every source. Each [`Opened`] also carries what its first
-/// frame's viewed state needs: an unsaved review's stored viewed state and the fingerprints of
-/// files with viewed marks (bounded; failures leave them to their hunks).
+/// The session runs on a blocking thread and reports through a channel. Before the first frame,
+/// stages become [`Message::Stage`]. With [`OpenOptions::stream`], the first frame is pushed as an
+/// incomplete [`Message::Opened`] as soon as the first source is listed (with the others known so
+/// far as loading groups); every later source as [`Message::Arrived`] or
+/// [`Message::SourceFailed`]; what is still loading as [`Message::Filling`]; stacks as
+/// [`Message::StackConfirmed`]; and the end as [`Message::Filled`]. The answer is then `None`.
+/// Without it (a refresh, which keeps showing the old review until the new one is whole) nothing
+/// is pushed and the answer is the whole review; so it is too when no source could be listed.
+///
+/// Each [`Opened`] carries what its first frame's viewed state needs: an unsaved review's stored
+/// viewed state and the fingerprints of files with viewed marks (bounded; failures leave them to
+/// their hunks). [`OpenOptions::cancel`] stops the open (and providers that check it) when the
+/// review no longer wants it.
 ///
 /// # Errors
 ///
@@ -197,11 +243,11 @@ pub async fn open(
     repo_path: PathBuf,
     sources: Vec<ReviewSource>,
     inbox: Inbox,
-    viewed: ViewedInputs,
-    first: Option<String>,
-) -> Result<Opened, String> {
+    options: OpenOptions,
+) -> Result<Option<Opened>, String> {
     let labels: Vec<(String, String, bool)> = sources
         .iter()
+        .filter(|source| source.included)
         .map(|source| {
             (
                 source.id.clone(),
@@ -213,8 +259,9 @@ pub async fn open(
     let request = session::OpenRequest {
         repo_path: repo_path.clone(),
         sources,
-        first,
+        first: options.first,
         max_layers: services.stack_limit().resolve_limit(),
+        cancel: options.cancel,
     };
     let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (data, registry) = (services.data(), services.providers());
@@ -230,25 +277,214 @@ pub async fn open(
         .map_err(|error| ProviderCallError::new(error.code(), error.to_string()))
     });
     let consume = async {
-        let mut last = None;
+        let (stored_viewed, marked) = viewed_state(&services, &repo_path, &options.viewed).await;
+        let mut streamer = Streamer {
+            services: &services,
+            repo_path: &repo_path,
+            labels: &labels,
+            inbox: &inbox,
+            stream: options.stream,
+            stored_viewed,
+            marked,
+            known: Known::default(),
+            stacks: Vec::new(),
+            shown: false,
+        };
         while let Some(event) = events.recv().await {
-            match event {
-                session::OpenEvent::Stage(stage) => inbox.push(Message::Stage(stage_text(&stage))),
-                session::OpenEvent::Ready(opened) if !opened.pending.is_empty() => {
-                    let partial = finish(&services, &repo_path, &labels, opened, &viewed).await;
-                    inbox.push(Message::Opened(Box::new(partial)));
-                }
-                session::OpenEvent::Ready(opened) | session::OpenEvent::Rest(opened) => {
-                    last = Some(opened);
+            streamer.handle(event).await;
+        }
+        streamer
+    };
+    let (result, streamer) = tokio::join!(work, consume);
+    result.map_err(|error| error.message)?;
+    streamer.finish().await
+}
+
+/// What [`open`] made of the session's events so far, and where it pushes them.
+struct Streamer<'a> {
+    services: &'a ReviewServices,
+    repo_path: &'a std::path::Path,
+    labels: &'a [(String, String, bool)],
+    inbox: &'a Inbox,
+    stream: bool,
+    stored_viewed: Option<ReviewWorkspace>,
+    marked: BTreeSet<String>,
+    known: Known,
+    /// Stacks reported before the first frame, pushed with it.
+    stacks: Vec<session::StackNews>,
+    /// Whether the first frame was pushed.
+    shown: bool,
+}
+
+impl Streamer<'_> {
+    async fn handle(&mut self, event: session::OpenEvent) {
+        let live = self.shown && self.stream;
+        match event {
+            session::OpenEvent::Stage(stage) => {
+                if !self.shown {
+                    self.inbox.push(Message::Stage(stage_text(&stage)));
+                } else if self.stream {
+                    self.inbox.push(Message::Filling(Some(stage_text(&stage))));
                 }
             }
+            session::OpenEvent::Stack(news) => {
+                if live {
+                    self.inbox.push(Message::StackConfirmed(Box::new(news)));
+                } else {
+                    self.stacks.push(news);
+                }
+            }
+            session::OpenEvent::Pending(opened) => {
+                if self.known.listed(&opened.source.source_id) {
+                    return;
+                }
+                self.known.put(opened.clone(), true);
+                if live {
+                    self.arrived(opened, true).await;
+                }
+            }
+            session::OpenEvent::Ready(opened) => {
+                self.known.put(opened.clone(), false);
+                if live {
+                    self.arrived(opened, false).await;
+                } else if self.stream {
+                    self.first_frame().await;
+                }
+            }
+            session::OpenEvent::Failed(diagnostic) => {
+                self.known.forget(&diagnostic.source_id);
+                if live {
+                    self.inbox.push(Message::SourceFailed(diagnostic.clone()));
+                }
+                self.known.diagnostics.push(diagnostic);
+            }
+            session::OpenEvent::Done => {}
         }
-        last
-    };
-    let (result, last) = tokio::join!(work, consume);
-    result.map_err(|error| error.message)?;
-    let opened = last.ok_or_else(|| "the review opened no sources".to_owned())?;
-    Ok(finish(&services, &repo_path, &labels, opened, &viewed).await)
+    }
+
+    /// Push the first frame: what is listed, and what is known to be loading.
+    async fn first_frame(&mut self) {
+        let opened = opened_from(
+            self.services,
+            self.repo_path,
+            self.known.inputs(self.labels),
+            self.known.diagnostics.clone(),
+            &self.marked,
+            self.stored_viewed.clone(),
+            false,
+        )
+        .await;
+        self.inbox.push(Message::Opened(Box::new(opened)));
+        for news in std::mem::take(&mut self.stacks) {
+            self.inbox.push(Message::StackConfirmed(Box::new(news)));
+        }
+        self.shown = true;
+    }
+
+    /// Push a source that arrived after the first frame.
+    async fn arrived(&self, opened: session::OpenedSource, pending: bool) {
+        let input = document_input(self.labels, opened, pending);
+        let fingerprints = if pending {
+            None
+        } else {
+            fingerprints(
+                self.services,
+                self.repo_path,
+                std::slice::from_ref(&input),
+                &self.marked,
+            )
+            .await
+            .pop()
+        };
+        self.inbox.push(Message::Arrived(Box::new(Arrived {
+            position: position(self.labels, &input.source.source_id),
+            input,
+            fingerprints,
+        })));
+    }
+
+    /// End the open: when streamed, push the change token and answer `None`; else answer the
+    /// whole review.
+    async fn finish(self) -> Result<Option<Opened>, String> {
+        if self.shown {
+            let working_tree = self
+                .known
+                .sources
+                .iter()
+                .any(|(opened, _)| reads_working_tree(&opened.source));
+            let token = token(self.services, self.repo_path, working_tree)
+                .await
+                .ok();
+            self.inbox.push(Message::Filling(None));
+            self.inbox.push(Message::Filled {
+                token,
+                working_tree,
+            });
+            return Ok(None);
+        }
+        if self.known.sources.is_empty() && self.known.diagnostics.is_empty() {
+            return Err("the review opened no sources".to_owned());
+        }
+        let inputs = self.known.inputs(self.labels);
+        let complete = !inputs.iter().any(|input| input.loading);
+        Ok(Some(
+            opened_from(
+                self.services,
+                self.repo_path,
+                inputs,
+                self.known.diagnostics,
+                &self.marked,
+                self.stored_viewed,
+                complete,
+            )
+            .await,
+        ))
+    }
+}
+
+/// What an open reported so far: each source with whether it is only pending, and failures.
+#[derive(Debug, Default)]
+struct Known {
+    sources: Vec<(session::OpenedSource, bool)>,
+    diagnostics: Vec<ReviewSourceDiagnostic>,
+}
+
+impl Known {
+    /// Whether source `id` was listed (a pending placeholder never replaces it).
+    fn listed(&self, id: &str) -> bool {
+        self.sources
+            .iter()
+            .any(|(source, pending)| source.source.source_id == id && !pending)
+    }
+
+    fn put(&mut self, source: session::OpenedSource, pending: bool) {
+        self.forget(&source.source.source_id);
+        self.sources.push((source, pending));
+    }
+
+    fn forget(&mut self, id: &str) {
+        self.sources
+            .retain(|(source, _)| source.source.source_id != id);
+    }
+
+    /// The sources as document groups, in workspace order.
+    fn inputs(&self, labels: &[(String, String, bool)]) -> Vec<SourceInput> {
+        let mut inputs: Vec<SourceInput> = self
+            .sources
+            .iter()
+            .map(|(source, pending)| document_input(labels, source.clone(), *pending))
+            .collect();
+        inputs.sort_by_key(|input| position(labels, &input.source.source_id));
+        inputs
+    }
+}
+
+/// Index of source `id` among the review's included sources.
+fn position(labels: &[(String, String, bool)], id: &str) -> usize {
+    labels
+        .iter()
+        .position(|(label, _, _)| label == id)
+        .unwrap_or(usize::MAX)
 }
 
 /// What the loading screen says for `stage`.
@@ -256,54 +492,41 @@ fn stage_text(stage: &session::OpenStage) -> String {
     match stage {
         session::OpenStage::AskingProviders => "finding pull requests and stacks".to_owned(),
         session::OpenStage::OpeningFirst => "listing files".to_owned(),
+        session::OpenStage::Confirming => "checking the stack with its provider".to_owned(),
         session::OpenStage::Listing { done, total } => {
             format!("listing files of every layer: {done} of {total}")
         }
     }
 }
 
-/// Turn opened sources into document inputs (pending ones as loading groups) with the change
-/// token and the viewed state the first frame needs.
-async fn finish(
+/// `source` as a document group.
+fn document_input(
+    labels: &[(String, String, bool)],
+    source: session::OpenedSource,
+    loading: bool,
+) -> SourceInput {
+    let (label, whole) = labels
+        .iter()
+        .find(|(id, _, _)| *id == source.source.source_id)
+        .map_or_else(
+            || (source.source.source_id.clone(), false),
+            |(_, label, whole)| (label.clone(), *whole),
+        );
+    SourceInput {
+        stack: source.stack.map(|stack| SourceStack { stack, whole }),
+        source: source.source,
+        label,
+        entries: source.entries,
+        loading,
+    }
+}
+
+/// An unsaved review's stored viewed state, and every path a viewed mark names.
+async fn viewed_state(
     services: &ReviewServices,
     repo_path: &std::path::Path,
-    labels: &[(String, String, bool)],
-    opened: session::OpenedSources,
     viewed: &ViewedInputs,
-) -> Opened {
-    let complete = opened.pending.is_empty();
-    let input = |source: session::OpenedSource, loading: bool| {
-        let (label, whole) = labels
-            .iter()
-            .find(|(id, _, _)| *id == source.source.source_id)
-            .map_or_else(
-                || (source.source.source_id.clone(), false),
-                |(_, label, whole)| (label.clone(), *whole),
-            );
-        SourceInput {
-            stack: source.stack.map(|stack| SourceStack { stack, whole }),
-            source: source.source,
-            label,
-            entries: source.entries,
-            loading,
-        }
-    };
-    // Ready and pending sources in workspace order.
-    let order: Vec<&str> = labels.iter().map(|(id, _, _)| id.as_str()).collect();
-    let mut inputs: Vec<SourceInput> = opened
-        .ready
-        .into_iter()
-        .map(|source| input(source, false))
-        .chain(opened.pending.into_iter().map(|source| input(source, true)))
-        .collect();
-    inputs.sort_by_key(|input| {
-        order
-            .iter()
-            .position(|id| *id == input.source.source_id)
-            .unwrap_or(usize::MAX)
-    });
-    let working_tree = inputs.iter().any(|input| reads_working_tree(&input.source));
-    let token = token(services, repo_path, working_tree).await.ok();
+) -> (Option<ReviewWorkspace>, BTreeSet<String>) {
     let stored_viewed = match viewed.transient_scope.clone() {
         Some(workspace_id) => services
             .call(GetReviewWorkspaceRequest {
@@ -323,10 +546,25 @@ async fn finish(
                 .map(|mark| mark.path),
         );
     }
-    let fingerprints = fingerprints(services, repo_path, &inputs, &marked).await;
+    (stored_viewed, marked)
+}
+
+/// An [`Opened`] of `inputs`, with the change token and the fingerprints of marked files.
+async fn opened_from(
+    services: &ReviewServices,
+    repo_path: &std::path::Path,
+    inputs: Vec<SourceInput>,
+    diagnostics: Vec<ReviewSourceDiagnostic>,
+    marked: &BTreeSet<String>,
+    stored_viewed: Option<ReviewWorkspace>,
+    complete: bool,
+) -> Opened {
+    let working_tree = inputs.iter().any(|input| reads_working_tree(&input.source));
+    let token = token(services, repo_path, working_tree).await.ok();
+    let fingerprints = fingerprints(services, repo_path, &inputs, marked).await;
     Opened {
         inputs,
-        diagnostics: opened.diagnostics,
+        diagnostics,
         token,
         working_tree,
         fingerprints,
@@ -462,6 +700,7 @@ pub fn transient_viewed_record(
         viewed_marks: transient.viewed_marks.clone(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         presentation: None,
+        stack_snapshots: Vec::new(),
     }
 }
 

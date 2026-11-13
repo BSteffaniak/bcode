@@ -101,7 +101,11 @@ pub fn discover(
     }
     let tracked = connected(&metadata, &request.branches);
     let tips = branch_tips(root)?;
-    let mut response = ReviewDiscoveryResponse::default();
+    // Graphite's metadata and the branch tips decide the answer.
+    let mut response = ReviewDiscoveryResponse {
+        read: vec![METADATA_NAMESPACE.to_owned(), "refs/heads/".to_owned()],
+        ..ReviewDiscoveryResponse::default()
+    };
     for (branch, meta) in metadata
         .iter()
         .filter(|(branch, _)| tracked.contains(*branch))

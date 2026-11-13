@@ -748,6 +748,44 @@ fn index_pages_concatenate_to_the_full_listing_and_reject_stale_cursors() {
 // Hunks -----------------------------------------------------------------------------------------
 
 #[test]
+fn hunks_of_two_commits_are_computed_once_and_kept_for_later_runs() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let disk = std::sync::Arc::new(crate::cache::ReviewCache::open(
+        &dir.path().join("cache.db"),
+    ));
+    let service = ReviewData::with_cache(std::sync::Arc::clone(&disk));
+    let source = resolve_one(&service, repo, branch_compare());
+    let entries = full_index(&service, repo, &source);
+    let path = GitFixture::modified_path(0);
+    let file = entry(&entries, &path).clone();
+    let diffs = || {
+        super::git::spawned(repo)
+            .iter()
+            .filter(|command| command.as_str() == "diff")
+            .count()
+    };
+    let first = hunks(&service, &hunks_request(repo, &source, &file.path));
+    let after_first = diffs();
+    // Another source with the same commits: no git, and the answer names it.
+    let other = ResolvedSource {
+        source_id: "other".into(),
+        ..source.clone()
+    };
+    let again = hunks(&service, &hunks_request(repo, &other, &file.path));
+    assert_eq!(diffs(), after_first);
+    assert_eq!(again.source_id, "other");
+    assert_eq!(again.hunks, first.hunks);
+    // A later run reads them from disk.
+    drop(service);
+    let later = ReviewData::with_cache(disk);
+    let reread = hunks(&later, &hunks_request(repo, &source, &file.path));
+    assert_eq!(reread, first);
+    assert_eq!(diffs(), after_first);
+}
+
+#[test]
 fn modified_file_hunks_match_both_blob_sides() {
     let fixture = GitFixture::generate(FixtureSpec::small());
     let repo = fixture.root();

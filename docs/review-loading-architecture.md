@@ -220,43 +220,54 @@ On a synthetic 100-layer stack with local commits and a fake provider with reali
 
 ## Status
 
-Every phase below is built; where it differs from the plan, it says so.
+Everything above is built; where it differs from the plan, it says so.
 
-0. **Providers as libraries.** Traits in `packages/code-review/provider`; GitHub and Graphite
-   in `code-review-github` and `code-review-graphite`, wrapped by the plugins; git discovery
-   in-process; the registry merges built-in and plugin-backed providers.
-1. **Git engine.** No global data lock (a lock per cache, a bounded git process pool);
-   content-addressed index and merge-base caches; `review.index.get_many`. Merge bases of a
-   stack come from one `git rev-list --parents --boundary` walk (a layer on the layer below it,
-   a layer's fork point from the trunk), falling back to `git merge-base` per pair only for what
-   the walk cannot settle; commits the walk names need no separate existence check. Every
-   commit-to-commit listing a request needs is read with one `git diff-tree --stdin`. The
-   repository root is found without git in the usual layout.
-2. **Session.** `session::open` in `packages/code-review`: the first source first (with the rest
-   of its stack as pending placeholders), then the rest, as events; `ControlFlow::Break` from the
-   event callback cancels it between stages and listing batches. The planned priority scheduler
-   (interactive, near, background classes) is not built: there are two phases, first source and
-   rest, which is what the first frame needs.
-3. **Forge facts.** `review_source.pulls.get` (GitHub: aliased GraphQL, 50 per request,
-   requests in parallel); remembered stacks are confirmed with it, and a confirmation that shows
-   a layer closed or rebased onto another branch resolves the stack again. Pull requests every
-   provider answer reports are kept (in memory and on disk), so discovery starts from a known
-   head branch without a lookup. Forge requests run concurrently; a stack walk looks up every
-   hinted branch at once, alongside the pull request itself.
-4. **Cold open.** Discovery's chain is shown in the wizard and on home as unconfirmed while the
-   provider resolves the stack. Provider progress events are not built: with every hint looked
-   up at once, a cold walk is one or two round trips, and the unconfirmed chain already fills the
-   screen before it.
-5. **Persistence and budgets.** The cache database above backs index listings, merge bases,
-   pull requests, and stacks. The budgets are checked by
-   `session::budgets` (a synthetic 100-layer stack, a provider with a 250 ms round trip), which
-   asserts exactly what each path asks the provider and, run alone in release, the timings:
-   `cargo test --release -p bcode_code_review budgets -- --ignored --nocapture`.
+* **Providers are libraries** (`packages/code-review/provider`): GitHub and Graphite in
+  `code-review-github` and `code-review-graphite`, wrapped by the plugins; git discovery
+  in-process; the registry merges built-in and plugin-backed providers.
+* **Git engine:** no global data lock (a lock per cache, a bounded git process pool). Merge bases
+  of a stack come from one `git rev-list --parents --boundary` walk, with `git merge-base` only
+  for pairs it cannot settle; commits the walk names need no separate check. Every
+  commit-to-commit listing an open needs is read with one `git diff-tree --stdin`. The repository
+  root is found without git in the usual layout. Overlapping requests for one listing or merge
+  base share one computation (`data::flight`).
+* **Session** (`session::open`): per-source events (`Pending`, `Ready`, `Failed`), `Stack` when a
+  stack becomes known or is confirmed, stages, and `Done`. The first source first, with the rest
+  of its stack as placeholders before it is listed; then the stacks are confirmed (or resolved)
+  and the rest listed, nearest to the first source first. A cold stack layer is shown after one
+  `pulls.get` as its pull request (`provider::quick_layer`); the stack walk runs after the first
+  frame. The planned priority scheduler is not built: listing every other layer is one git
+  process, so there is nothing left to reorder when the reviewer moves.
+* **Cancellation:** the surface hands each open a `Cancel` and cancels it when it starts another
+  or goes away. The session stops at its next step, and a provider that checks
+  (`provider::cancelled`, made current with `with_cancel`) stops between its requests: GitHub's
+  stack walk does. Plugin-backed providers run their calls in their plugin, so cancelling them
+  (and reporting their progress) needs the host to forward both; that is not built.
+* **Forge facts:** `review_source.pulls.get` (GitHub: aliased GraphQL, 50 per request, requests
+  in parallel), also reporting the pull requests on given branches (`children_of`). Confirming a
+  remembered stack asks for every layer and for what targets the top layer's branch: a layer
+  closed, rebased onto another branch, or opened on top makes it resolve again. Every
+  remembered stack is confirmed this way, however old (within `STACK_KEPT`). Pull requests
+  providers report are kept, so discovery starts from a known head branch without a lookup.
+* **Document:** `ReviewDocument::upsert_group` adds or replaces one group, carrying every other
+  file's state (loaded hunks, revealed lines, viewed state, loads in flight) and reporting one
+  splice. The surface fills each layer in as it arrives; a refresh still answers the whole review
+  at once.
+* **Screen:** the layer strip says whether the layer is loading or failed, how many layers are
+  still loading, and whether the stack is being checked or when it was last confirmed; a failed
+  layer's tab shows `!`. Discovery's unconfirmed chain is shown in the wizard and on home.
+* **Persistence:** the cache database (`review-cache.db`; Switchy over Turso, one worker thread,
+  reads before writes) keeps merge bases, listings, hunks, pull requests, stacks, and discovery
+  answers (kept while the references they read are unchanged), each kind bounded by age and size.
+  A review also keeps the stacks it last opened with (`ReviewWorkspace::stack_snapshots`), so it
+  opens at once even when the cache is gone; the stack is confirmed after the first frame.
+* **Budgets:** `session::budgets` asserts in every test run how many provider round trips and git
+  processes each path needs before its first frame and in all (from the wizard: none and two;
+  a saved review: none and one; cold: one and three), and, run alone in release, the timings:
+  `cargo test --release -p bcode_code_review budgets -- --ignored --nocapture`.
 
 Measured with that test in release on a heavily loaded machine (where starting a git process
-costs 20–40 ms): first frame from the wizard ~105 ms, of a saved review ~52 ms, cold ~350 ms
-(one round trip plus the first frame); every layer listed in 0.36–0.83 s. The first frames miss
-their 50 ms budget there by the two git processes they need (the history walk and one diff); on
-an idle machine they fit. On the real 87-layer stack: confirming it takes one request
-(0.5–0.9 s); resolving it cold 2.5–3.5 s, nearly all of it GitHub answering the batched branch
-queries.
+costs 20–40 ms): first frame from the wizard ~105 ms, of a saved review ~50 ms, cold ~400 ms (one
+round trip of 250 ms, then the layer); every layer listed in 0.27–0.37 s (cold, after a three
+round-trip walk, 1.26 s). On an idle machine the first frames fit their 50 ms budget; here they
+miss it by the cost of the git processes they need.

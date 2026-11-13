@@ -11,6 +11,7 @@
 //! cache of immutable (commit-to-commit) file indexes, and resolved repository roots.
 
 mod blob;
+mod flight;
 pub(crate) mod git;
 mod hunks;
 mod index;
@@ -99,6 +100,7 @@ pub struct ReviewData {
     roots: Mutex<BTreeMap<PathBuf, PathBuf>>,
     blobs: Mutex<BlobService>,
     indexes: Mutex<index::IndexCache>,
+    hunks: Mutex<hunks::HunkCache>,
     merge_bases: resolve::MergeBases,
 }
 
@@ -109,6 +111,7 @@ impl ReviewData {
     pub fn with_cache(disk: Arc<crate::cache::ReviewCache>) -> Self {
         Self {
             indexes: Mutex::new(index::IndexCache::with_disk(Arc::clone(&disk))),
+            hunks: Mutex::new(hunks::HunkCache::with_disk(Arc::clone(&disk))),
             merge_bases: resolve::MergeBases::with_disk(disk),
             ..Self::default()
         }
@@ -232,6 +235,24 @@ impl ReviewData {
         index::index_page(&self.indexes, &root, request)
     }
 
+    /// Make the file listings of `sources` ready to page without git: read what the disk cache
+    /// holds, then list every remaining commit-to-commit diff with one `git diff-tree --stdin`.
+    /// Anything it cannot cover is listed when it is asked for.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::InvalidRequest`] when the repository path is invalid.
+    pub fn prepare_listings(
+        &self,
+        repo_path: &Path,
+        sources: &[bcode_code_review_models::ResolvedSource],
+    ) -> Result<(), DataError> {
+        let root = self.repo_root(repo_path)?;
+        index::prefetch(&self.indexes, &root, sources);
+        index::list_together(&self.indexes, &root, sources);
+        Ok(())
+    }
+
     /// Return the first page of many resolved sources' file indexes, listed in parallel (git
     /// processes stay within the machine-wide bound). A source that fails reports its error in
     /// its outcome; the others are unaffected.
@@ -303,7 +324,7 @@ impl ReviewData {
         request: &ReviewFileHunksRequest,
     ) -> Result<ReviewFileHunksResponse, DataError> {
         let root = self.repo_root(&request.repo_path)?;
-        hunks::file_hunks(&root, request)
+        hunks::cached_file_hunks(&self.hunks, &root, request)
     }
 
     /// Return a line range of one blob.

@@ -65,6 +65,58 @@ impl std::error::Error for ProviderCallError {}
 /// Result of a provider or contributor call.
 pub type ProviderResult<T> = Result<T, ProviderCallError>;
 
+/// A flag the caller of a provider sets when it no longer wants the answer.
+///
+/// Providers are called synchronously; the caller makes its flag current for the call with
+/// [`with_cancel`], and a provider that makes several requests checks [`cancelled`] between them
+/// and stops with [`REVIEW_SOURCE_ERROR_CANCELLED`](bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED).
+/// The trait methods keep their signatures, so plugin-backed providers (whose calls run in their
+/// plugin) are not reached: their hosts would have to forward cancellation.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Cancel {
+    /// Stop wanting the answer.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] was called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+thread_local! {
+    static CURRENT: std::cell::RefCell<Option<Cancel>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `call` with `cancel` as the current thread's cancellation (see [`cancelled`]); the one
+/// current before is restored after.
+pub fn with_cancel<T>(cancel: &Cancel, call: impl FnOnce() -> T) -> T {
+    let previous = CURRENT.with(|current| current.replace(Some(cancel.clone())));
+    // Restored even when `call` panics.
+    let _restore = Restore(previous);
+    call()
+}
+
+/// Makes the cancellation it holds current again when dropped (see [`with_cancel`]).
+struct Restore(Option<Cancel>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CURRENT.with(|current| *current.borrow_mut() = previous);
+    }
+}
+
+/// Whether the current thread's caller stopped wanting the answer (see [`with_cancel`]).
+#[must_use]
+pub fn cancelled() -> bool {
+    CURRENT.with(|current| current.borrow().as_ref().is_some_and(Cancel::is_cancelled))
+}
+
 /// A forge's answers about pull requests (`bcode.review_source/v1`). Every method blocks.
 pub trait ReviewSourceProvider: Send + Sync {
     /// The provider's id, label, and capabilities.
@@ -319,6 +371,25 @@ mod tests {
                 ..ReviewDiscoveryResponse::default()
             })
         }
+    }
+
+    #[test]
+    fn a_cancellation_is_current_only_within_its_call() {
+        let cancel = Cancel::default();
+        assert!(!cancelled());
+        with_cancel(&cancel, || {
+            assert!(!cancelled());
+            cancel.cancel();
+            assert!(cancelled());
+            // A nested call with its own flag sees that one, and the outer one comes back.
+            with_cancel(&Cancel::default(), || assert!(!cancelled()));
+            assert!(cancelled());
+        });
+        assert!(!cancelled());
+        // Other threads do not see it.
+        with_cancel(&cancel, || {
+            assert!(!std::thread::spawn(cancelled).join().expect("thread"));
+        });
     }
 
     #[test]

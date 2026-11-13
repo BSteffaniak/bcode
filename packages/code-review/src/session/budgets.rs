@@ -2,9 +2,13 @@
 //! budgets" in `docs/review-loading-architecture.md`).
 //!
 //! A synthetic repository holds the stack's commits locally; a provider answers about it with a
-//! fixed delay per round trip, as a forge would, and fetches locally (as GitHub's provider does
-//! when the commits are already there). What each path may ask the provider is asserted exactly;
-//! how long it takes is asserted against the budgets.
+//! fixed delay per round trip (three for a stack walk), as a forge would, and fetches locally (as
+//! GitHub's provider does when the commits are already there).
+//!
+//! What makes a path fast does not depend on the machine: how many provider round trips and git
+//! processes it needs before its first frame and in all. Those are asserted in every test run.
+//! How long it takes does depend on the machine (starting a git process costs from 2 ms to 40 ms),
+//! so the timings are asserted by an ignored test, run alone in release.
 
 use super::*;
 use crate::cache::ReviewCache;
@@ -201,6 +205,12 @@ impl ReviewSourceProvider for ChainProvider {
                 .map(|number| self.pull(*number))
                 .collect(),
             not_open: Vec::new(),
+            // Nothing is stacked on the top layer.
+            children: request
+                .children_of
+                .iter()
+                .map(|branch| (branch.clone(), Vec::new()))
+                .collect(),
         })
     }
 
@@ -209,7 +219,8 @@ impl ReviewSourceProvider for ChainProvider {
         request: &ReviewSourceStackResolveRequest,
     ) -> ProviderResult<ReviewSourceStackResolveResponse> {
         self.resolves.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(ROUND_TRIP);
+        // A stack walk takes several round trips.
+        std::thread::sleep(ROUND_TRIP * 3);
         Ok(ReviewSourceStackResolveResponse {
             repository: REPOSITORY.to_owned(),
             stack: ReviewStack {
@@ -270,39 +281,135 @@ fn step_through(root: &Path, first: u64) -> OpenRequest {
             .collect(),
         first: Some(format!("layer-{first}")),
         max_layers: None,
+        cancel: crate::provider::Cancel::default(),
     }
 }
 
-/// How long until the first frame and until every layer is listed.
-struct Timing {
+/// One open of a path: when its first frame and every layer were ready, and what it asked of git
+/// and the provider before its first frame and in all.
+struct Measured {
     first_frame: Duration,
     every_layer: Duration,
+    git_first: Vec<String>,
+    git_all: Vec<String>,
+    /// Stack resolutions and `pulls.get` requests.
+    calls_first: (usize, usize),
+    calls_all: (usize, usize),
 }
 
-fn timed_open(data: &ReviewData, registry: &ProviderRegistry, request: &OpenRequest) -> Timing {
+fn measure(
+    data: &ReviewData,
+    registry: &ProviderRegistry,
+    request: &OpenRequest,
+    provider: &ChainProvider,
+) -> Measured {
+    let calls = || {
+        (
+            provider.resolves.load(Ordering::SeqCst),
+            provider.gets.load(Ordering::SeqCst),
+        )
+    };
+    let since = |before: (usize, usize)| {
+        let now = calls();
+        (now.0 - before.0, now.1 - before.1)
+    };
+    let git_before = crate::data::git::spawned(&request.repo_path).len();
+    let git_since = || crate::data::git::spawned(&request.repo_path)[git_before..].to_vec();
+    let calls_before = calls();
     let start = Instant::now();
-    let mut first_frame = None;
-    let mut every_layer = None;
+    let mut first = None;
+    let mut ready = std::collections::BTreeSet::new();
     open(data, registry, request, |event| {
         match event {
-            OpenEvent::Ready(ready) => {
-                assert_eq!(ready.ready.len(), 1);
-                assert_eq!(ready.pending.len(), 99, "the rest of the stack, pending");
-                first_frame = Some(start.elapsed());
+            OpenEvent::Ready(opened) => {
+                if first.is_none() {
+                    first = Some((start.elapsed(), git_since(), since(calls_before)));
+                }
+                ready.insert(opened.source.source_id);
             }
-            OpenEvent::Rest(rest) => {
-                assert_eq!(rest.ready.len(), 100, "{:?}", rest.diagnostics);
-                every_layer = Some(start.elapsed());
-            }
-            OpenEvent::Stage(_) => {}
+            OpenEvent::Failed(diagnostic) => panic!("{diagnostic:?}"),
+            _ => {}
         }
         ControlFlow::Continue(())
     })
     .expect("open");
-    Timing {
-        first_frame: first_frame.expect("first frame"),
-        every_layer: every_layer.expect("every layer"),
+    assert_eq!(ready.len(), 100, "every layer listed");
+    let (first_frame, git_first, calls_first) = first.expect("first frame");
+    Measured {
+        first_frame,
+        every_layer: start.elapsed(),
+        git_first,
+        git_all: git_since(),
+        calls_first,
+        calls_all: since(calls_before),
     }
+}
+
+/// Open the chain three ways: from the wizard (the stack just resolved), as a saved review in a
+/// later run (the stack and listings on disk), and cold (nothing remembered).
+fn open_three_ways() -> [Measured; 3] {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).expect("repo dir");
+    let oids = chain_repository(&root);
+    let provider = Arc::new(ChainProvider {
+        oids,
+        resolves: AtomicUsize::new(0),
+        gets: AtomicUsize::new(0),
+    });
+    let cache = Arc::new(ReviewCache::open(&dir.path().join("cache.db")));
+    let run = |cache: &Arc<ReviewCache>| {
+        (
+            ReviewData::with_cache(Arc::clone(cache)),
+            ProviderRegistry::new()
+                .with_cache(Arc::clone(cache))
+                .with_source(Arc::clone(&provider) as Arc<dyn ReviewSourceProvider>),
+        )
+    };
+
+    let (data, registry) = run(&cache);
+    let route = registry.sources()[0].clone();
+    resolve_through(&route, &root, Some(REPOSITORY.into()), 50, None, Vec::new())
+        .map(|response| registry.remember_stack(PROVIDER, REPOSITORY, &response.stack))
+        .expect("stack");
+    let wizard = measure(&data, &registry, &step_through(&root, 50), &provider);
+
+    let (data, registry) = run(&cache);
+    let registry = registry.with_stack_freshness(Duration::ZERO);
+    let saved = measure(&data, &registry, &step_through(&root, 73), &provider);
+
+    let (data, registry) = run(&Arc::new(ReviewCache::disabled()));
+    let cold = measure(&data, &registry, &step_through(&root, 20), &provider);
+    [wizard, saved, cold]
+}
+
+fn count(git: &[String], command: &str) -> usize {
+    git.iter().filter(|run| run.as_str() == command).count()
+}
+
+#[test]
+fn a_hundred_layer_step_through_review_asks_little_before_its_first_frame() {
+    let [wizard, saved, cold] = open_three_ways();
+    // From the wizard: nothing from the provider; one history walk and one diff for the layer;
+    // then one diff-tree for every other layer.
+    assert_eq!((wizard.calls_first, wizard.calls_all), ((0, 0), (0, 0)));
+    assert_eq!(wizard.git_first, ["rev-list", "diff"]);
+    assert_eq!(count(&wizard.git_all, "diff-tree"), 1);
+    assert_eq!(count(&wizard.git_all, "merge-base"), 0);
+    assert!(wizard.git_all.len() <= 5);
+    // A saved review: the stack, merge bases, and listings come from disk; only the commits are
+    // checked before the first frame, and the stack is confirmed with one request after it.
+    assert_eq!((saved.calls_first, saved.calls_all), ((0, 0), (0, 1)));
+    assert_eq!(saved.git_first, ["cat-file"]);
+    assert!(saved.git_all.len() <= 3);
+    assert_eq!(
+        count(&saved.git_all, "diff") + count(&saved.git_all, "diff-tree"),
+        0
+    );
+    // Cold: one quick request for the layer, the stack walk only after its first frame.
+    assert_eq!((cold.calls_first, cold.calls_all), ((0, 1), (1, 1)));
+    assert!(cold.git_first.len() <= 3);
+    assert_eq!(count(&cold.git_all, "diff-tree"), 1);
 }
 
 fn within(what: &str, took: Duration, budget: Duration) {
@@ -318,69 +425,16 @@ fn within(what: &str, took: Duration, budget: Duration) {
 #[test]
 #[ignore = "timing budget; run alone in release"]
 fn a_hundred_layer_step_through_review_opens_within_its_budgets() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().join("repo");
-    std::fs::create_dir(&root).expect("repo dir");
-    let oids = chain_repository(&root);
-    let cache = Arc::new(ReviewCache::open(&dir.path().join("cache.db")));
-    let provider = Arc::new(ChainProvider {
-        oids,
-        resolves: AtomicUsize::new(0),
-        gets: AtomicUsize::new(0),
-    });
-    let calls = || {
-        (
-            provider.resolves.load(Ordering::SeqCst),
-            provider.gets.load(Ordering::SeqCst),
-        )
-    };
-    let process = || {
-        (
-            ReviewData::with_cache(Arc::clone(&cache)),
-            ProviderRegistry::new()
-                .with_cache(Arc::clone(&cache))
-                .with_source(Arc::clone(&provider) as Arc<dyn ReviewSourceProvider>),
-        )
-    };
-
-    // From the wizard: the stack was just resolved (one round trip), so opening asks nothing
-    // before its first frame.
-    let (data, registry) = process();
-    let route = registry.sources()[0].clone();
-    resolve_through(&route, &root, Some(REPOSITORY.into()), 50, None, Vec::new())
-        .map(|response| registry.remember_stack(PROVIDER, REPOSITORY, &response.stack))
-        .expect("stack");
-    assert_eq!(calls(), (1, 0));
-    let wizard = timed_open(&data, &registry, &step_through(&root, 50));
-    assert_eq!(
-        calls(),
-        (1, 0),
-        "a fresh stack is neither resolved nor confirmed"
-    );
+    let [wizard, saved, cold] = open_three_ways();
     within("wizard: first frame", wizard.first_frame, FIRST_FRAME);
     within("wizard: every layer", wizard.every_layer, EVERY_LAYER);
-
-    // A saved review reopened by a later run: the stack and every listing come from disk; the
-    // stack is confirmed with one round trip, after the first frame.
-    let (data, registry) = process();
-    let registry = registry.with_stack_freshness(Duration::ZERO);
-    let saved = timed_open(&data, &registry, &step_through(&root, 73));
-    assert_eq!(calls(), (1, 1), "one confirmation, no resolution");
     within("saved: first frame", saved.first_frame, FIRST_FRAME);
     within(
         "saved: every layer",
         saved.every_layer,
         ROUND_TRIP + EVERY_LAYER / 4,
     );
-
-    // Cold, nothing remembered: the requested layer after one round trip.
-    let cold_cache = Arc::new(ReviewCache::disabled());
-    let data = ReviewData::with_cache(Arc::clone(&cold_cache));
-    let registry = ProviderRegistry::new()
-        .with_cache(cold_cache)
-        .with_source(Arc::clone(&provider) as Arc<dyn ReviewSourceProvider>);
-    let cold = timed_open(&data, &registry, &step_through(&root, 20));
-    assert_eq!(calls(), (2, 1), "one resolution for the whole stack");
+    // One round trip for the layer; the walk (three) only afterwards.
     within(
         "cold: first frame",
         cold.first_frame,
@@ -389,6 +443,6 @@ fn a_hundred_layer_step_through_review_opens_within_its_budgets() {
     within(
         "cold: every layer",
         cold.every_layer,
-        ROUND_TRIP + EVERY_LAYER,
+        ROUND_TRIP * 4 + EVERY_LAYER,
     );
 }

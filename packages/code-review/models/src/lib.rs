@@ -161,6 +161,24 @@ pub struct ReviewWorkspace {
         skip_serializing_if = "Option::is_none"
     )]
     pub presentation: Option<ReviewPresentationState>,
+    /// The stacks the review's stack sources last opened with, so reopening shows them at once
+    /// and confirms them afterwards. Disposable like presentation state: never what a source
+    /// pins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack_snapshots: Vec<ReviewStackSnapshot>,
+}
+
+/// A stack as its provider last resolved or confirmed it, saved with a review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewStackSnapshot {
+    /// Provider id.
+    pub provider: String,
+    /// Provider repository.
+    pub repository: String,
+    /// The stack.
+    pub stack: ReviewStack,
+    /// When its provider resolved or confirmed it, in milliseconds since the Unix epoch.
+    pub confirmed_at_ms: u64,
 }
 
 /// A file marked viewed at a specific identity.
@@ -447,6 +465,7 @@ impl ReviewWorkspace {
             viewed_marks: Vec::new(),
             reviewed_revisions: BTreeMap::new(),
             presentation: None,
+            stack_snapshots: Vec::new(),
         }
     }
 }

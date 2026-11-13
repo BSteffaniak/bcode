@@ -80,6 +80,7 @@ fn test_workspace(repo: &Path, sources: Vec<ReviewSource>) -> ReviewWorkspace {
         viewed_marks: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         presentation: None,
+        stack_snapshots: Vec::new(),
     }
 }
 
@@ -272,6 +273,7 @@ fn publish_record_thread_membership_round_trips() {
         viewed_marks: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         presentation: None,
+        stack_snapshots: Vec::new(),
     };
     let anchor = DraftAnchor {
         kind: ReviewAnchorKind::Review,
@@ -548,12 +550,65 @@ fn workspace_rows_with_only_the_original_columns_list_open_and_save() {
         &config,
     )
     .expect("update");
-    let reopened = get(repo);
+    let reopened = get(repo.clone());
     assert_eq!(reopened.title, "Renamed later");
     assert_eq!(
         reopened.viewed_files,
         BTreeSet::from(["src/lib.rs".to_owned()])
     );
+
+    stack_snapshots_round_trip(&repo, &repo_root, &config, reopened, get);
+}
+
+/// The stack a review last opened with is kept with it; an unreadable one is dropped.
+fn stack_snapshots_round_trip(
+    repo: &Path,
+    repo_root: &Path,
+    config: &CodeReviewConfig,
+    reopened: ReviewWorkspace,
+    get: impl Fn(PathBuf) -> ReviewWorkspace,
+) {
+    let repo = repo.to_path_buf();
+    let config = config.clone();
+    let repo_root = repo_root.to_path_buf();
+    assert_eq!(reopened.stack_snapshots, Vec::new());
+    let snapshot = bcode_code_review_models::ReviewStackSnapshot {
+        provider: "github".into(),
+        repository: "o/r".into(),
+        stack: bcode_code_review_models::ReviewStack {
+            trunk: "main".into(),
+            rooted_at_default_branch: true,
+            layers: Vec::new(),
+            requested: 7,
+            siblings: Vec::new(),
+            warnings: Vec::new(),
+        },
+        confirmed_at_ms: 1_700_000_000_000,
+    };
+    let mut with_stack = reopened;
+    with_stack.stack_snapshots = vec![snapshot.clone()];
+    update_review_workspace_for_request(
+        UpdateReviewWorkspaceRequest {
+            repo_path: repo.clone(),
+            workspace: with_stack,
+        },
+        &config,
+    )
+    .expect("update");
+    assert_eq!(get(repo.clone()).stack_snapshots, [snapshot]);
+    // An unreadable snapshot is dropped, not an error.
+    with_database(&repo_root, &config, move |database| {
+        Box::pin(async move {
+            database
+                .update("review_workspaces")
+                .value("stack_snapshots_json", "{not json")
+                .execute(database)
+                .await?;
+            Ok(())
+        })
+    })
+    .expect("corrupt snapshot");
+    assert_eq!(get(repo).stack_snapshots, Vec::new());
 }
 
 #[test]

@@ -511,6 +511,7 @@ fn discovery_hints_go_to_the_provider_and_its_warnings_onto_the_stack() {
             code: "needs_restack".into(),
             message: "needs a restack".into(),
         }],
+        read: Vec::new(),
     });
     let registry = registry(&provider);
     let response = crate::discovery::resolve_stack_with_discovery(

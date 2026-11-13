@@ -68,8 +68,36 @@ impl Drop for Slot {
     }
 }
 
+/// Git processes started per repository (canonical path) and their subcommands, in tests: what
+/// budgets assert, because how many processes a path starts does not depend on the machine.
+#[cfg(test)]
+static SPAWNED: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, Vec<String>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The subcommands of the git processes started for `repo_root` so far, in order.
+#[cfg(test)]
+pub fn spawned(repo_root: &Path) -> Vec<String> {
+    let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    SPAWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&root)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Build a git command for `repo_root` with the service's global options.
 pub fn command(repo_root: &Path, args: &[&str]) -> Command {
+    #[cfg(test)]
+    {
+        let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        SPAWNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root)
+            .or_default()
+            .push(args.first().copied().unwrap_or_default().to_owned());
+    }
     let mut command = Command::new("git");
     command
         .args(GLOBAL_ARGS)

@@ -85,6 +85,8 @@ pub fn discover(request: &ReviewDiscoveryRequest) -> Result<ReviewDiscoveryRespo
             .into_iter()
             .take(REVIEW_DISCOVERY_MAX_ITEMS)
             .collect(),
+        // Branch tips decide the answer (the history behind them never changes).
+        read: vec!["refs/heads/".to_owned(), "refs/remotes/".to_owned()],
         ..ReviewDiscoveryResponse::default()
     })
 }

@@ -57,10 +57,21 @@ pub enum CacheKind {
     Pull,
     /// A stack as a provider resolved or confirmed it.
     Stack,
+    /// The hunks of one file between two commits.
+    Hunks,
+    /// A discovery contributor's answer, with the refs it read.
+    Discovery,
 }
 
 impl CacheKind {
-    const ALL: [Self; 4] = [Self::MergeBase, Self::Index, Self::Pull, Self::Stack];
+    const ALL: [Self; 6] = [
+        Self::MergeBase,
+        Self::Index,
+        Self::Pull,
+        Self::Stack,
+        Self::Hunks,
+        Self::Discovery,
+    ];
 
     const fn as_str(self) -> &'static str {
         match self {
@@ -68,6 +79,8 @@ impl CacheKind {
             Self::Index => "index",
             Self::Pull => "pull",
             Self::Stack => "stack",
+            Self::Hunks => "hunks",
+            Self::Discovery => "discovery",
         }
     }
 
@@ -77,8 +90,9 @@ impl CacheKind {
         match self {
             Self::MergeBase => 200_000,
             Self::Index => 4_000,
-            Self::Pull => 20_000,
+            Self::Pull | Self::Hunks => 20_000,
             Self::Stack => 1_000,
+            Self::Discovery => 2_000,
         }
     }
 
@@ -87,7 +101,9 @@ impl CacheKind {
     pub const fn kept_for(self) -> Duration {
         match self {
             Self::MergeBase => Duration::from_hours(90 * 24),
-            Self::Index | Self::Pull => Duration::from_hours(30 * 24),
+            Self::Index | Self::Pull | Self::Hunks | Self::Discovery => {
+                Duration::from_hours(30 * 24)
+            }
             Self::Stack => crate::provider::STACK_KEPT,
         }
     }

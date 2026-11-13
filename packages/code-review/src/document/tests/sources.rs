@@ -331,3 +331,72 @@ fn focusing_a_source_hides_the_others_until_unfocused() {
     assert_eq!(items(&doc).len(), all);
     assert!(doc.index_of(&header("one")).is_some());
 }
+
+#[test]
+fn a_loading_group_fills_in_place_and_the_others_keep_their_state_and_loads() {
+    use super::support::Shadow;
+    let fake = one_file();
+    let mut loading = fake.input("two");
+    loading.entries.clear();
+    loading.loading = true;
+    let mut doc = ReviewDocument::new(
+        PathBuf::from("/repo"),
+        vec![fake.input("one"), loading, fake.input("three")],
+        DocumentConfig::default(),
+    );
+    // Group one's file is loaded; group three's load is still in flight.
+    doc.set_viewport(0, doc.len().saturating_sub(1));
+    let needs = doc.take_needs();
+    let source_of = |need: &DocumentNeed| match need {
+        DocumentNeed::Hunks { file, .. } => file.source_id.clone(),
+        other => panic!("unexpected need {other:?}"),
+    };
+    let (one, three): (Vec<_>, Vec<_>) = needs.iter().partition(|need| source_of(need) == "one");
+    assert_eq!((one.len(), three.len()), (1, 1));
+    assert!(fake.answer(&mut doc, one[0]));
+    let _ = doc.take_splices();
+    let mut shadow = Shadow::new(&doc);
+    // The items after source `source`'s header, up to the next source's.
+    let shown_for = |doc: &ReviewDocument, source: &str| -> Vec<ReviewItem> {
+        let mut current = String::new();
+        items(doc)
+            .into_iter()
+            .filter(|item| {
+                if let ReviewItem::SourceHeader(header) = item {
+                    current.clone_from(&header.source_id);
+                }
+                current == source
+            })
+            .collect()
+    };
+    let one_before = shown_for(&doc, "one");
+
+    // Group two is listed: it fills in with one splice; group one keeps its loaded lines.
+    assert!(doc.upsert_group(fake.input("two"), 1));
+    let splices = doc.take_splices();
+    assert_eq!(splices.len(), 1, "{splices:?}");
+    let mut replay = doc.clone();
+    replay.splices = splices;
+    shadow.apply_and_check(&mut replay, "filled");
+    assert_eq!(shown_for(&doc, "one"), one_before);
+    // The same input again changes nothing.
+    assert!(!doc.upsert_group(fake.input("two"), 1));
+    // Group three's load, asked for before the change, still lands on its file.
+    assert!(fake.answer(&mut doc, three[0]));
+    fake.settle(&mut doc);
+    doc.assert_consistent("three loaded");
+    assert!(
+        !shown_for(&doc, "three")
+            .iter()
+            .any(|item| matches!(item, ReviewItem::Placeholder(_)))
+    );
+
+    // A new group goes where it is asked to; groups keep workspace order.
+    assert!(doc.upsert_group(fake.input("zero"), 0));
+    doc.assert_consistent("inserted");
+    let order: Vec<String> = doc
+        .groups()
+        .map(|group| group.source.source_id.clone())
+        .collect();
+    assert_eq!(order, ["zero", "one", "two", "three"]);
+}

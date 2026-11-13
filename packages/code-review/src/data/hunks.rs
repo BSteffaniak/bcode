@@ -12,6 +12,116 @@ use sha2::{Digest as _, Sha256};
 use std::path::Path;
 
 /// Load and parse the diff of one file.
+/// Hunk answers kept in memory; past it, the least recently used go.
+const MAX_CACHED_HUNKS: usize = 512;
+
+/// Largest answer kept on disk (as JSON), so one huge file cannot crowd out the rest.
+const MAX_STORED_HUNKS_BYTES: usize = 512 * 1024;
+
+/// Hunks of files whose sides are both commits: they never change, so they are kept in memory
+/// (bounded) and in the on-disk cache, by everything that shapes them.
+#[derive(Debug, Default)]
+pub struct HunkCache {
+    entries: std::collections::VecDeque<(String, std::sync::Arc<ReviewFileHunksResponse>)>,
+    disk: std::sync::Arc<crate::cache::ReviewCache>,
+}
+
+impl HunkCache {
+    /// An empty cache backed by `disk`.
+    pub const fn with_disk(disk: std::sync::Arc<crate::cache::ReviewCache>) -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            disk,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<std::sync::Arc<ReviewFileHunksResponse>> {
+        let position = self.entries.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.entries.remove(position)?;
+        let answer = std::sync::Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(answer)
+    }
+
+    fn insert(&mut self, key: String, answer: std::sync::Arc<ReviewFileHunksResponse>) {
+        self.entries.retain(|(cached, _)| *cached != key);
+        if self.entries.len() >= MAX_CACHED_HUNKS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, answer));
+    }
+}
+
+/// [`file_hunks`], answered from `cache` (memory, then disk) when both sides are commits.
+///
+/// # Errors
+///
+/// As [`file_hunks`].
+pub fn cached_file_hunks(
+    cache: &std::sync::Mutex<HunkCache>,
+    root: &Path,
+    request: &ReviewFileHunksRequest,
+) -> Result<ReviewFileHunksResponse, DataError> {
+    let lock = || {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let immutable = !request.source.base.is_live() && !request.source.head.is_live();
+    if !immutable {
+        return file_hunks(root, request);
+    }
+    let key = serde_json::to_string(&(
+        root,
+        &request.source.base,
+        &request.source.head,
+        &request.source.mode,
+        &request.path,
+        &request.old_path,
+        request.context_lines,
+        request.ignore_whitespace,
+        request.max_lines,
+    ))
+    .map_err(|error| DataError::InvalidRequest(error.to_string()))?;
+    // Answers are shared by every source with these revisions; each names the asking one.
+    let stamped = |answer: &ReviewFileHunksResponse| {
+        let mut answer = answer.clone();
+        answer.source_id.clone_from(&request.source.source_id);
+        answer
+    };
+    let kept = lock().get(&key);
+    if let Some(answer) = kept {
+        return Ok(stamped(&answer));
+    }
+    let disk = std::sync::Arc::clone(&lock().disk);
+    let stored = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(key.as_bytes()))
+    };
+    if let Some(entry) = disk
+        .get_many(
+            crate::cache::CacheKind::Hunks,
+            std::slice::from_ref(&stored),
+        )
+        .into_values()
+        .next()
+        && let Ok(answer) = serde_json::from_str::<ReviewFileHunksResponse>(&entry.value)
+    {
+        let answer = std::sync::Arc::new(answer);
+        lock().insert(key, std::sync::Arc::clone(&answer));
+        return Ok(stamped(&answer));
+    }
+    let answer = std::sync::Arc::new(file_hunks(root, request)?);
+    if disk.enabled()
+        && let Ok(text) = serde_json::to_string(answer.as_ref())
+        && text.len() <= MAX_STORED_HUNKS_BYTES
+    {
+        disk.put_many(crate::cache::CacheKind::Hunks, &[(stored, text)]);
+    }
+    lock().insert(key, std::sync::Arc::clone(&answer));
+    Ok(stamped(&answer))
+}
+
 pub fn file_hunks(
     root: &Path,
     request: &ReviewFileHunksRequest,

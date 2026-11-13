@@ -39,6 +39,8 @@ pub const REVIEW_SOURCE_ERROR_PULL_NOT_FOUND: &str = "pull_not_found";
 pub const REVIEW_SOURCE_ERROR_FETCH_FAILED: &str = "fetch_failed";
 /// Error code: the provider could not be reached or answered with an error.
 pub const REVIEW_SOURCE_ERROR_FAILED: &str = "provider_failed";
+/// Error code: the caller stopped wanting the answer (the review was closed) before it was done.
+pub const REVIEW_SOURCE_ERROR_CANCELLED: &str = "cancelled";
 /// Diagnostic code: the provider failed while the client gathered a source's resolution.
 pub const REVIEW_DIAGNOSTIC_PROVIDER_FAILED: &str = "provider_failed";
 
@@ -193,6 +195,10 @@ pub struct ReviewSourcePullsGetRequest {
     pub repository: Option<String>,
     /// The pull requests to return.
     pub numbers: Vec<u64>,
+    /// Branches whose open pull requests (those with the branch as their base) to report too: a
+    /// stack's top branch, to see layers opened on top of it.
+    #[serde(default)]
+    pub children_of: Vec<String>,
 }
 
 /// Response payload for `review_source.pulls.get`: every requested number is in exactly one of
@@ -206,6 +212,10 @@ pub struct ReviewSourcePullsGetResponse {
     /// The requested numbers that are not open pull requests (closed, merged, or unknown).
     #[serde(default)]
     pub not_open: Vec<u64>,
+    /// For each branch of `children_of`, its open pull requests whose head branch is in the
+    /// repository itself (a fork's cannot be a stack layer).
+    #[serde(default)]
+    pub children: std::collections::BTreeMap<String, Vec<PullRequestSummary>>,
 }
 
 /// Response payload for `review_source.pulls.list`.

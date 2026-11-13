@@ -55,6 +55,11 @@ pub struct ReviewDiscoveryResponse {
     /// Notes about branches.
     #[serde(default)]
     pub annotations: Vec<BranchAnnotation>,
+    /// Reference namespaces the answer was read from (`refs/heads/`, say): while every
+    /// reference under them points where it did, the same request gets the same answer, so the
+    /// client may keep it. Empty: not to be kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
 }
 
 /// `branch` is stacked on `parent`.

@@ -13,12 +13,6 @@ use std::time::{Duration, SystemTime};
 /// confirmed with its provider first.
 pub const STACK_FRESH: Duration = Duration::from_secs(30);
 
-/// How old a remembered stack may be and still be confirmed rather than resolved again.
-///
-/// Confirming is one batched request but does not see pull requests opened on top of a stack
-/// since, so past this, resolving is worth its cost.
-pub const STACK_RECONFIRM: Duration = Duration::from_hours(1);
-
 /// How long a stack is remembered at all: shown at once when a review opens, then confirmed.
 pub const STACK_KEPT: Duration = Duration::from_hours(7 * 24);
 
@@ -91,6 +85,40 @@ impl KnownStacks {
                 &[(format!("{}{}", prefix(&scope), bottom.pull.number), bytes)],
             );
         }
+    }
+
+    /// Remember `stack`, confirmed at `confirmed` (a review's saved snapshot), unless a stack
+    /// sharing a layer with it was confirmed since. Not written to disk: the review keeps it.
+    pub(super) fn seed(
+        &self,
+        provider: &str,
+        repository: &str,
+        stack: &ReviewStack,
+        confirmed: SystemTime,
+    ) {
+        let scope = scope(provider, repository);
+        self.load(&scope);
+        let mut memory = lock(&self.memory);
+        let stacks = memory.entry(scope).or_default();
+        let newer = stacks.iter().any(|known| {
+            known.confirmed >= confirmed
+                && known.stack.layers.iter().any(|layer| {
+                    stack
+                        .layers
+                        .iter()
+                        .any(|seeded| seeded.pull.number == layer.pull.number)
+                })
+        });
+        if !newer && age(confirmed) < STACK_KEPT {
+            insert(
+                stacks,
+                KnownStack {
+                    confirmed,
+                    stack: stack.clone(),
+                },
+            );
+        }
+        drop(memory);
     }
 
     /// The remembered stack with `number` as a layer, and how long ago it was confirmed.
@@ -304,6 +332,32 @@ mod tests {
             Some("b7".to_owned())
         );
         assert_eq!(pulls.get("gh", "o/r", 8), None);
+    }
+
+    #[test]
+    fn a_saved_snapshot_is_remembered_unless_something_newer_is() {
+        let stacks = KnownStacks::default();
+        let hour_ago = SystemTime::now() - Duration::from_secs(3_600);
+        stacks.seed("gh", "o/r", &stack(&[1, 2]), hour_ago);
+        let (seeded, age) = stacks.containing("gh", "o/r", 2).expect("seeded");
+        assert_eq!(seeded, stack(&[1, 2]));
+        // Its age is the snapshot's, so it is confirmed rather than trusted.
+        assert!(age >= Duration::from_secs(3_599));
+        // A newer resolution wins over an older snapshot, whichever came first.
+        stacks.remember("gh", "o/r", &stack(&[1, 2, 3]));
+        stacks.seed("gh", "o/r", &stack(&[1, 2]), hour_ago);
+        assert_eq!(
+            stacks.containing("gh", "o/r", 1).map(|(stack, _)| stack),
+            Some(stack(&[1, 2, 3]))
+        );
+        // Too old to keep: ignored.
+        stacks.seed(
+            "gh",
+            "x/y",
+            &stack(&[9]),
+            SystemTime::now() - STACK_KEPT - Duration::from_secs(1),
+        );
+        assert!(stacks.containing("gh", "x/y", 9).is_none());
     }
 
     #[test]

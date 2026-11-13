@@ -1309,6 +1309,7 @@ fn create_review_workspace_for_request(
         viewed_marks: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         presentation: None,
+        stack_snapshots: Vec::new(),
     };
     let saved = workspace.clone();
     with_database(&repo_root, config, move |database| {

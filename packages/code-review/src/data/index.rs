@@ -282,28 +282,59 @@ fn totals(entries: &[ReviewIndexEntry]) -> (u64, u64) {
     })
 }
 
+/// Listings being computed, so overlapping requests for one share its git process.
+static LISTINGS: std::sync::LazyLock<super::flight::SingleFlight<String, Arc<IndexListing>>> =
+    std::sync::LazyLock::new(super::flight::SingleFlight::default);
+
 fn listing(
     cache: &Mutex<IndexCache>,
     root: &Path,
     source: &ResolvedSource,
 ) -> Result<Arc<IndexListing>, DataError> {
     let (key, immutable) = listing_key(root, source)?;
+    if !immutable {
+        // A live side (the index or working tree) is listed every time.
+        return compute_listing(root, source, &key);
+    }
     // The cache lock is held only to look up and to store, never while git or the disk runs.
-    if immutable && let Some(listing) = lock(cache).get(&key) {
+    let kept = lock(cache).get(&key);
+    if let Some(listing) = kept {
         return Ok(listing);
     }
-    let disk = Arc::clone(&lock(cache).disk);
-    if immutable
-        && let Some(entry) = disk
+    LISTINGS.run(&key, || {
+        // Another flight may have landed between the lookup and this one.
+        let kept = lock(cache).get(&key);
+        if let Some(listing) = kept {
+            return Ok(listing);
+        }
+        let disk = Arc::clone(&lock(cache).disk);
+        if let Some(entry) = disk
             .get_many(CacheKind::Index, &[disk_key(&key)])
             .into_values()
             .next()
-        && let Ok(listing) = serde_json::from_str::<IndexListing>(&entry.value)
-    {
-        let listing = Arc::new(listing);
-        lock(cache).insert(key, Arc::clone(&listing));
-        return Ok(listing);
-    }
+            && let Ok(listing) = serde_json::from_str::<IndexListing>(&entry.value)
+        {
+            let listing = Arc::new(listing);
+            lock(cache).insert(key.clone(), Arc::clone(&listing));
+            return Ok(listing);
+        }
+        let listing = compute_listing(root, source, &key)?;
+        if disk.enabled()
+            && let Ok(text) = serde_json::to_string(listing.as_ref())
+        {
+            disk.put_many(CacheKind::Index, &[(disk_key(&key), text)]);
+        }
+        lock(cache).insert(key.clone(), Arc::clone(&listing));
+        Ok(listing)
+    })
+}
+
+/// List `source` with git.
+fn compute_listing(
+    root: &Path,
+    source: &ResolvedSource,
+    key: &str,
+) -> Result<Arc<IndexListing>, DataError> {
     let (output, entries) = match source.mode {
         ResolvedSourceMode::Diff => {
             let args = diff_args(root, source)?;
@@ -321,21 +352,12 @@ fn listing(
         }
     };
     let (additions, deletions) = totals(&entries);
-    let listing = Arc::new(IndexListing {
+    Ok(Arc::new(IndexListing {
         fingerprint: fingerprint(&[key.as_bytes(), &output]),
         entries,
         additions,
         deletions,
-    });
-    if immutable {
-        if disk.enabled()
-            && let Ok(text) = serde_json::to_string(listing.as_ref())
-        {
-            disk.put_many(CacheKind::Index, &[(disk_key(&key), text)]);
-        }
-        lock(cache).insert(key, Arc::clone(&listing));
-    }
-    Ok(listing)
+    }))
 }
 
 /// Resolve one side to a tree-ish argument (`None` for the index or working tree).

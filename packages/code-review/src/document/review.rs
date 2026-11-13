@@ -461,7 +461,7 @@ impl BlockLookup {
         }
     }
 
-    fn build(items: &[ReviewItem]) -> Self {
+    pub(super) fn build(items: &[ReviewItem]) -> Self {
         let mut lookup = Self::empty();
         for (local, item) in items.iter().enumerate() {
             let local = u32::try_from(local).unwrap_or(u32::MAX);
@@ -548,6 +548,9 @@ pub struct ReviewDocument {
     /// Block each thread and agent-thread key is placed in.
     pub(super) annotation_blocks: BTreeMap<ItemKey, usize>,
     pub(super) composer: Option<DocAnchor>,
+    /// The annotations last given to [`Self::set_annotations`], to place again after a group
+    /// changes (see [`Self::upsert_group`]).
+    pub(super) annotations_input: Option<Annotations>,
     pub(super) marks: BTreeMap<String, Vec<ViewedMark>>,
     pub(super) pending: BTreeMap<Ticket, Pending>,
     pub(super) next_ticket: Ticket,
@@ -575,6 +578,17 @@ impl ReviewDocument {
     /// content is loaded until requested through [`Self::take_needs`].
     #[must_use]
     pub fn new(repo_path: PathBuf, sources: Vec<SourceInput>, config: DocumentConfig) -> Self {
+        let mut doc = Self::structure(repo_path, sources, config);
+        doc.build_all();
+        doc
+    }
+
+    /// The groups, files, and blocks of `sources`, with no items built yet.
+    pub(super) fn structure(
+        repo_path: PathBuf,
+        sources: Vec<SourceInput>,
+        config: DocumentConfig,
+    ) -> Self {
         let show_headers = sources.len() > 1 || sources.iter().any(|input| input.stack.is_some());
         let mut doc = Self {
             repo_path,
@@ -593,6 +607,7 @@ impl ReviewDocument {
             file_annotations: Vec::new(),
             annotation_blocks: BTreeMap::new(),
             composer: None,
+            annotations_input: None,
             marks: BTreeMap::new(),
             pending: BTreeMap::new(),
             next_ticket: 1,
@@ -607,16 +622,6 @@ impl ReviewDocument {
         for input in sources {
             doc.add_source(input, show_headers);
         }
-        for block in 0..doc.blocks.len() {
-            let built = doc.build_block(block);
-            doc.blocks[block].lookup = BlockLookup::build(&built.items);
-            doc.blocks[block].items = built.items;
-            doc.blocks[block].hunk_parent = built.hunk_parent;
-        }
-        let lengths: Vec<u64> = doc.blocks.iter().map(|b| b.items.len() as u64).collect();
-        let rows: Vec<u64> = doc.blocks.iter().map(super::build::block_rows).collect();
-        doc.lengths = Fenwick::from_values(&lengths);
-        doc.rows = Fenwick::from_values(&rows);
         doc
     }
 
@@ -1518,6 +1523,7 @@ impl ReviewDocument {
 
     /// Replace the persisted annotations shown in the document.
     pub fn set_annotations(&mut self, annotations: &Annotations) {
+        self.annotations_input = Some(annotations.clone());
         let collected = anchors::collect(annotations);
         let mut affected: std::collections::BTreeSet<usize> = self
             .file_annotations
@@ -1753,7 +1759,7 @@ impl ReviewDocument {
 
     /// Recompute a file's viewed state, rebuilding its block when it changed. The caller
     /// rebuilds the group's source header when this returns `true`.
-    fn refresh_viewed(&mut self, file: usize) -> bool {
+    pub(super) fn refresh_viewed(&mut self, file: usize) -> bool {
         let state = &self.files[file];
         let identity = Self::identity(state);
         let viewed_identity = identity.with_patch(state.patch_id.as_deref());
@@ -1938,6 +1944,17 @@ impl ReviewDocument {
             .map_or(&[][..], |group| &self.files[group.files.clone()])
             .iter()
             .map(|file| &file.key)
+    }
+
+    /// Lines added and removed across every file.
+    #[must_use]
+    pub fn totals(&self) -> (u64, u64) {
+        self.files.iter().fold((0, 0), |(add, del), file| {
+            (
+                add + u64::from(file.entry.additions),
+                del + u64::from(file.entry.deletions),
+            )
+        })
     }
 
     /// Viewed progress across the whole review (`O(1)`).

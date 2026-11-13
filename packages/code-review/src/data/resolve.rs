@@ -235,7 +235,8 @@ fn resolve_source(
 ///
 /// * `PullRequest`: merge base of the base branch and the head → head (the pull request's diff).
 /// * `StackLayer`: merge base of the layer below's head (the trunk for the bottom layer) and the
-///   layer's head → the layer's head; exactly the layer's own changes.
+///   layer's head → the layer's head; exactly the layer's own changes. Without a stack, as a
+///   `PullRequest`.
 /// * `Stack`: merge base of the trunk and the top layer → the top layer's head.
 fn provider_source(
     root: &Path,
@@ -246,6 +247,10 @@ fn provider_source(
 ) -> Result<Resolution, DataError> {
     match &source.kind {
         ReviewSourceKind::PullRequest { number, .. } => {
+            pull_request_source(root, source, *number, fetched, memo)
+        }
+        // Before its stack is known (a cold open's first frame), a layer is its pull request.
+        ReviewSourceKind::StackLayer { number, .. } if stack.is_none() => {
             pull_request_source(root, source, *number, fetched, memo)
         }
         ReviewSourceKind::StackLayer { number, .. } => {
@@ -478,6 +483,11 @@ fn disk_key((left, right): &(String, String)) -> String {
     format!("{left}\0{right}")
 }
 
+/// Merge bases being computed (see [`super::flight`]).
+static MERGE_BASES: std::sync::LazyLock<
+    super::flight::SingleFlight<(String, String), Option<String>>,
+> = std::sync::LazyLock::new(super::flight::SingleFlight::default);
+
 /// Git answers one resolve request reuses: commits checked once per request, merge bases from
 /// the shared [`MergeBases`]. The sources of one stack (one per layer when stepping through it)
 /// all walk the same layers, so without this a stack of `n` layers cost about `n²` git
@@ -635,9 +645,15 @@ impl<'a> GitMemo<'a> {
         if let Some(known) = self.merge_bases.get(&key) {
             return Ok(known.into_option());
         }
-        let found = git::merge_base(root, left, right)?;
-        self.merge_bases.insert_all([(key, found.clone())]);
-        Ok(found)
+        // Overlapping requests for one pair share its git process.
+        MERGE_BASES.run(&key, || {
+            if let Some(known) = self.merge_bases.get(&key) {
+                return Ok(known.into_option());
+            }
+            let found = git::merge_base(root, left, right)?;
+            self.merge_bases.insert_all([(key.clone(), found.clone())]);
+            Ok(found)
+        })
     }
 }
 

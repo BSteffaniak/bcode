@@ -64,6 +64,7 @@ impl ReviewSurface {
             viewed_marks: Vec::new(),
             reviewed_revisions: std::collections::BTreeMap::new(),
             presentation: None,
+            stack_snapshots: Vec::new(),
         })
     }
 

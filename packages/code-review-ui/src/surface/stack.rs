@@ -237,8 +237,9 @@ impl ReviewSurface {
                     .last()
                     .map_or_else(String::new, |layer| format!("#{}", layer.number))
             };
+            let failed = self.failed_sources.contains(&source_id);
             let (viewed, viewed_style, cells) =
-                tab_progress(group.loading, group.viewed, group.file_count, theme);
+                tab_progress(failed, group.loading, group.viewed, group.file_count, theme);
             let mut full = vec![
                 Span::styled(name, theme.text),
                 Span::raw(" "),
@@ -424,12 +425,41 @@ impl ReviewSurface {
                 theme.muted,
             ));
         }
-        let complete = group.file_count > 0 && group.viewed == group.file_count;
         spans.push(Span::styled(separator, theme.muted));
-        spans.push(Span::styled(
-            format!("{}/{} viewed", group.viewed, group.file_count),
-            if complete { theme.viewed } else { theme.muted },
-        ));
+        if self.failed_sources.contains(&group.source.source_id) {
+            spans.push(Span::styled("could not be opened", theme.error));
+        } else if group.loading {
+            spans.push(Span::styled(
+                format!("{} loading files", theme.icons.ellipsis),
+                theme.notice,
+            ));
+        } else {
+            let complete = group.file_count > 0 && group.viewed == group.file_count;
+            spans.push(Span::styled(
+                format!("{}/{} viewed", group.viewed, group.file_count),
+                if complete { theme.viewed } else { theme.muted },
+            ));
+        }
+        // What the rest of the stack is doing, and how current the stack is.
+        let loading = review.doc.groups().filter(|group| group.loading).count();
+        if loading > 0 {
+            spans.push(Span::styled(separator, theme.muted));
+            spans.push(Span::styled(
+                format!(
+                    "{loading} more layer{} loading",
+                    if loading == 1 { "" } else { "s" }
+                ),
+                theme.notice,
+            ));
+        }
+        if let Some(status) = stack_status(
+            self.filling_note.as_deref(),
+            self.stack_confirmed_at,
+            std::time::SystemTime::now(),
+        ) {
+            spans.push(Span::styled(separator, theme.muted));
+            spans.push(Span::styled(status, theme.muted));
+        }
         let line = Line::from_spans(spans).truncate(usize::from(area.width));
         cx.paint_component(&TextBlock::new(Text::from_lines(vec![line])), area);
     }
@@ -512,14 +542,40 @@ const fn rail_policy() -> TabBarPolicy {
     TabBarPolicy::interactive().separator(" │ ")
 }
 
-/// A tab's viewed progress: its label (`viewed/files`, or an ellipsis while the layer's files are
-/// still loading), the label's style, and its progress cells.
+/// What the layer strip says about the stack: what the open is still doing while it checks the
+/// stack, else how long ago its provider confirmed it. `None` when neither is known.
+fn stack_status(
+    filling: Option<&str>,
+    confirmed_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    if let Some(note) = filling.filter(|note| note.starts_with("checking")) {
+        return Some(format!("{note}…"));
+    }
+    let age = now
+        .duration_since(confirmed_at?)
+        .unwrap_or_default()
+        .as_secs();
+    Some(match age {
+        0..60 => "stack confirmed just now".to_owned(),
+        60..3_600 => format!("stack confirmed {}m ago", age / 60),
+        3_600..86_400 => format!("stack confirmed {}h ago", age / 3_600),
+        _ => format!("stack confirmed {}d ago", age / 86_400),
+    })
+}
+
+/// A tab's viewed progress: its label (`viewed/files`, an ellipsis while the layer's files are
+/// still loading, `!` when it could not be opened), the label's style, and its progress cells.
 fn tab_progress(
+    failed: bool,
     loading: bool,
     viewed: usize,
     total: usize,
     theme: &super::ReviewTheme,
 ) -> (String, bmux_tui::style::Style, Vec<Span>) {
+    if failed {
+        return ("!".to_owned(), theme.error, progress_cells(0, 0, theme));
+    }
     let label = if loading {
         theme.icons.ellipsis.to_owned()
     } else {
@@ -545,4 +601,38 @@ fn progress_cells(viewed: usize, total: usize, theme: &super::ReviewTheme) -> Ve
             theme.bar_empty,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stack_status;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_strip_says_what_the_stack_is_doing_then_how_current_it_is() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ago = |secs: u64| Some(now - Duration::from_secs(secs));
+        // Checking wins over an older confirmation; other stages say nothing about the stack.
+        assert_eq!(
+            stack_status(Some("checking the stack with its provider"), ago(90), now).as_deref(),
+            Some("checking the stack with its provider…")
+        );
+        assert_eq!(
+            stack_status(Some("listing files of every layer: 3 of 9"), ago(90), now).as_deref(),
+            Some("stack confirmed 1m ago")
+        );
+        assert_eq!(
+            stack_status(None, ago(5), now).as_deref(),
+            Some("stack confirmed just now")
+        );
+        assert_eq!(
+            stack_status(None, ago(7_200), now).as_deref(),
+            Some("stack confirmed 2h ago")
+        );
+        assert_eq!(
+            stack_status(None, ago(3 * 86_400), now).as_deref(),
+            Some("stack confirmed 3d ago")
+        );
+        assert_eq!(stack_status(None, None, now), None);
+    }
 }

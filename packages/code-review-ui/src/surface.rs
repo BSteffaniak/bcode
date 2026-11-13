@@ -298,6 +298,30 @@ struct ThreadRows {
     keys: Vec<ItemKey>,
 }
 
+/// The open a surface is running: [`Self::start`] cancels the one before, and dropping the
+/// surface cancels the last, so a review that was closed or opened again stops loading.
+#[derive(Debug, Default)]
+struct OpenInFlight(Option<bcode_code_review::provider::Cancel>);
+
+impl OpenInFlight {
+    /// Cancel the open in flight and return the new one's token.
+    fn start(&mut self) -> bcode_code_review::provider::Cancel {
+        let cancel = bcode_code_review::provider::Cancel::default();
+        if let Some(previous) = self.0.replace(cancel.clone()) {
+            previous.cancel();
+        }
+        cancel
+    }
+}
+
+impl Drop for OpenInFlight {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel.cancel();
+        }
+    }
+}
+
 /// The open review.
 struct Review {
     doc: ReviewDocument,
@@ -651,8 +675,16 @@ pub struct ReviewSurface {
     hide_viewed_files: bool,
     /// How a step-through stack review is shown (persisted).
     stack_view: stack::StackView,
-    /// The review shown has sources still loading; a complete open follows.
+    /// The review shown has sources still loading; they arrive one by one.
     filling: bool,
+    /// What is still loading after the first frame (the open's stage), shown on the layer strip.
+    filling_note: Option<String>,
+    /// When the review's stack was last resolved or confirmed by its provider.
+    stack_confirmed_at: Option<std::time::SystemTime>,
+    /// Sources that failed after the first frame.
+    failed_sources: BTreeSet<String>,
+    /// The open running now: cancelled when another starts or the surface goes away.
+    opening: OpenInFlight,
     /// Text to copy once the host is at hand, and what it is.
     clipboard: Option<(String, &'static str)>,
     /// Exiting an unsaved review with annotations was asked once (the next exit leaves).
@@ -773,6 +805,10 @@ impl ReviewSurface {
             hide_viewed_files: false,
             stack_view: stack::StackView::default(),
             filling: false,
+            filling_note: None,
+            stack_confirmed_at: None,
+            failed_sources: BTreeSet::new(),
+            opening: OpenInFlight::default(),
             clipboard: None,
             exit_armed: false,
             edit_requested: false,
@@ -1139,6 +1175,19 @@ impl ReviewSurface {
     // ----------------------------------------------------------------------------------------
 
     fn start_open(&mut self, host: &UiContext) {
+        // The stacks the review last opened with are shown at once (and confirmed after).
+        if let Some(workspace) = &self.workspace {
+            let registry = self.services.providers();
+            for snapshot in &workspace.stack_snapshots {
+                registry.seed_stack(
+                    &snapshot.provider,
+                    &snapshot.repository,
+                    &snapshot.stack,
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_millis(snapshot.confirmed_at_ms),
+                );
+            }
+        }
         self.phase = Phase::Opening {
             stage: "opening".to_owned(),
         };
@@ -1156,12 +1205,21 @@ impl ReviewSurface {
             ..self.viewed_inputs()
         };
         let first = self.first_source();
+        let cancel = self.opening.start();
         host.spawn(Box::pin(async move {
-            let message =
-                match loader::open(services, repo, sources, inbox.clone(), viewed, first).await {
-                    Ok(opened) => Message::Opened(Box::new(opened)),
-                    Err(error) => Message::OpenFailed(error),
-                };
+            // Streamed: the first frame, then each source as it arrives.
+            let options = loader::OpenOptions {
+                viewed,
+                first,
+                stream: true,
+                cancel,
+            };
+            let message = match loader::open(services, repo, sources, inbox.clone(), options).await
+            {
+                Ok(Some(opened)) => Message::Opened(Box::new(opened)),
+                Ok(None) => return,
+                Err(error) => Message::OpenFailed(error),
+            };
             inbox.push(message);
         }));
     }
@@ -1691,6 +1749,21 @@ impl ReviewSurface {
                 }
             }
             Message::Opened(opened) => self.apply_opened(*opened),
+            Message::Arrived(arrived) => self.apply_arrived(*arrived),
+            Message::SourceFailed(diagnostic) => self.apply_source_failed(diagnostic),
+            Message::StackConfirmed(news) => self.apply_stack_news(*news),
+            Message::Filling(note) => self.filling_note = note,
+            Message::Filled {
+                token,
+                working_tree,
+            } => {
+                self.filling = false;
+                self.filling_note = None;
+                if let Some(review) = self.review.as_mut() {
+                    review.token = token;
+                    review.working_tree = working_tree;
+                }
+            }
             Message::OpenFailed(error) => {
                 self.switching = false;
                 if self.review.is_some() {
@@ -1893,6 +1966,128 @@ impl ReviewSurface {
         self.sync_notes();
     }
 
+    /// Fill in (or add) the group of a source that arrived after the first frame, in place: the
+    /// cursor, the scroll position, and every other group stay as they are.
+    fn apply_arrived(&mut self, arrived: loader::Arrived) {
+        let order: Vec<&str> = self
+            .sources
+            .iter()
+            .filter(|source| source.included)
+            .map(|source| source.id.as_str())
+            .collect();
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let id = arrived.input.source.source_id.clone();
+        self.failed_sources.remove(&id);
+        // Its place among the groups shown: after every group earlier in the workspace.
+        let at = review
+            .doc
+            .groups()
+            .filter(|group| {
+                order
+                    .iter()
+                    .position(|source| *source == group.source.source_id)
+                    .is_some_and(|index| index < arrived.position)
+            })
+            .count();
+        if !arrived.input.loading {
+            let revision = bcode_code_review_models::ReviewedRevision::from_resolved(
+                &arrived.input.source,
+                Some(annotate::now_ms()),
+            );
+            if revision.reviewed_head_oid.is_some() {
+                review.revisions.insert(id.clone(), revision);
+            }
+        }
+        if !review.doc.upsert_group(arrived.input, at) {
+            return;
+        }
+        if let Some((source, answer)) = &arrived.fingerprints {
+            review.doc.accept_fingerprints(source, answer);
+        }
+        review.doc.set_carried_over(&self.carried);
+        review.totals = review.doc.totals();
+        review.rebuild_files(&self.theme, self.hide_viewed_files);
+        review.note_splices();
+        self.apply_stack_view();
+    }
+
+    /// A stack the review follows was resolved or confirmed (or recalled): shown on the layer
+    /// strip, and saved with the review so it opens at once next time.
+    fn apply_stack_news(&mut self, news: bcode_code_review::session::StackNews) {
+        self.stack_confirmed_at = Some(news.confirmed_at);
+        let confirmed_at_ms = news
+            .confirmed_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_millis()).ok())
+            .unwrap_or(0);
+        let snapshot = bcode_code_review_models::ReviewStackSnapshot {
+            provider: news.provider,
+            repository: news.repository,
+            stack: news.stack,
+            confirmed_at_ms,
+        };
+        let Some(workspace) = self.workspace.as_mut() else {
+            return;
+        };
+        if workspace.stack_snapshots.contains(&snapshot) {
+            return;
+        }
+        // A snapshot replaces the ones it shares a layer with.
+        workspace.stack_snapshots.retain(|kept| {
+            kept.provider != snapshot.provider
+                || kept.repository != snapshot.repository
+                || !kept.stack.layers.iter().any(|layer| {
+                    snapshot
+                        .stack
+                        .layers
+                        .iter()
+                        .any(|new| new.pull.number == layer.pull.number)
+                })
+        });
+        workspace.stack_snapshots.push(snapshot);
+        self.request_save();
+    }
+
+    /// A source that failed after the first frame: its group stops loading and the layer strip
+    /// and rail say it failed.
+    fn apply_source_failed(&mut self, diagnostic: ReviewSourceDiagnostic) {
+        self.toasts.push(
+            ToastSeverity::Warning,
+            format!("{} could not be opened", diagnostic.source_id),
+            Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
+        );
+        self.failed_sources.insert(diagnostic.source_id.clone());
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let failed = review
+            .doc
+            .groups()
+            .find(|group| group.source.source_id == diagnostic.source_id && group.loading)
+            .map(|group| {
+                (
+                    bcode_code_review::document::SourceInput {
+                        source: group.source.clone(),
+                        label: group.label.to_owned(),
+                        entries: Vec::new(),
+                        stack: group.stack.cloned(),
+                        loading: false,
+                    },
+                    group.index,
+                )
+            });
+        review.diagnostics.push(diagnostic);
+        if let Some((input, at)) = failed
+            && review.doc.upsert_group(input, at)
+        {
+            review.rebuild_files(&self.theme, self.hide_viewed_files);
+            review.note_splices();
+        }
+    }
+
     fn apply_token(&mut self, host: &UiContext, result: Result<String, String>, manual: bool) {
         self.refreshing = false;
         let Some(review) = &mut self.review else {
@@ -1930,18 +2125,24 @@ impl ReviewSurface {
         let first = self.first_source();
         // A refresh keeps showing the review until every source is listed again: early,
         // incomplete answers go to a throwaway inbox.
+        let cancel = self.opening.start();
         host.spawn(Box::pin(async move {
             let message = match loader::open(
                 services,
                 repo,
                 sources,
                 Inbox::default(),
-                viewed,
-                first,
+                loader::OpenOptions {
+                    viewed,
+                    first,
+                    stream: false,
+                    cancel,
+                },
             )
             .await
             {
-                Ok(opened) => Message::Opened(Box::new(opened)),
+                Ok(Some(opened)) => Message::Opened(Box::new(opened)),
+                Ok(None) => return,
                 Err(error) => Message::OpenFailed(error),
             };
             inbox.push(message);

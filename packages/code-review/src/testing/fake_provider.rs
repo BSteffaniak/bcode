@@ -80,6 +80,18 @@ impl FakeProvider {
         self.closed.lock().expect("closed lock").push(number);
     }
 
+    /// Open pull request `number` again after [`Self::close`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn reopen(&self, number: u64) {
+        self.closed
+            .lock()
+            .expect("closed lock")
+            .retain(|closed| *closed != number);
+    }
+
     /// Answer `review_source.pulls.get`: the open pull requests among the requested numbers.
     fn get(&self, operation: &str, payload: &[u8]) -> Vec<u8> {
         self.calls
@@ -98,10 +110,23 @@ impl FakeProvider {
                     .ok_or(*number)
             })
             .partition(Result::is_ok);
+        let children = request
+            .children_of
+            .iter()
+            .map(|branch| {
+                let on: Vec<PullRequestSummary> = open
+                    .iter()
+                    .filter(|pull| pull.base_branch == *branch)
+                    .cloned()
+                    .collect();
+                (branch.clone(), on)
+            })
+            .collect();
         serde_json::to_vec(&ReviewSourcePullsGetResponse {
             repository: FAKE_REPOSITORY.to_owned(),
             pulls: pulls.into_iter().flatten().cloned().collect(),
             not_open: not_open.into_iter().filter_map(Result::err).collect(),
+            children,
         })
         .expect("encodes")
     }
@@ -222,6 +247,14 @@ impl FakeProvider {
             OP_REVIEW_SOURCE_STACK_RESOLVE => {
                 let request: ReviewSourceStackResolveRequest =
                     serde_json::from_slice(payload).expect("stack request");
+                // A walk the caller no longer wants stops, as GitHub's does between requests.
+                if crate::provider::cancelled() {
+                    record(format!("{operation} cancelled"));
+                    return Err(ProviderCallError {
+                        code: bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED.to_owned(),
+                        message: "cancelled".to_owned(),
+                    });
+                }
                 record(format!("{operation} #{}", request.number));
                 if !FAKE_PULLS.contains(&request.number) {
                     return Err(ProviderCallError {

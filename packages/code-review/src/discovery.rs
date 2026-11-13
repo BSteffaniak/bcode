@@ -225,7 +225,9 @@ pub fn discover(
                 workers.push(scope.spawn(move || {
                     (
                         route.manifest.label.clone(),
-                        route.contributor.discover(request),
+                        kept_answer(registry, &route.manifest.id, request, || {
+                            route.contributor.discover(request)
+                        }),
                     )
                 }));
             }
@@ -256,6 +258,66 @@ pub fn provisional_stack(
         return Vec::new();
     }
     discover(registry, repo_path, &[head.to_owned()], None).provisional_chain(head)
+}
+
+/// A contributor's answer as kept on disk, with the digest of the references it was read from.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptAnswer {
+    digest: String,
+    answer: ReviewDiscoveryResponse,
+}
+
+/// Contributor `contributor`'s answer to `request`: the one kept on disk while the references it
+/// was read from (see [`ReviewDiscoveryResponse::read`]) are unchanged, checked with one
+/// `git for-each-ref`; else `ask`'s, kept when it says what it read.
+fn kept_answer(
+    registry: &ProviderRegistry,
+    contributor: &str,
+    request: &ReviewDiscoveryRequest,
+    ask: impl FnOnce() -> Result<ReviewDiscoveryResponse, ProviderCallError>,
+) -> Result<ReviewDiscoveryResponse, ProviderCallError> {
+    let disk = registry.disk();
+    let Ok(request_key) = serde_json::to_string(request) else {
+        return ask();
+    };
+    if !disk.enabled() {
+        return ask();
+    }
+    let key = format!("{contributor}\u{1}{request_key}");
+    let kept = disk
+        .get_many(
+            crate::cache::CacheKind::Discovery,
+            std::slice::from_ref(&key),
+        )
+        .into_values()
+        .next()
+        .and_then(|entry| serde_json::from_str::<KeptAnswer>(&entry.value).ok());
+    if let Some(kept) = kept
+        && refs_digest(&request.repo_path, &kept.answer.read).as_deref() == Some(&kept.digest)
+    {
+        return Ok(kept.answer);
+    }
+    let answer = ask()?;
+    if !answer.read.is_empty()
+        && let Some(digest) = refs_digest(&request.repo_path, &answer.read)
+        && let Ok(value) = serde_json::to_string(&KeptAnswer {
+            digest,
+            answer: answer.clone(),
+        })
+    {
+        disk.put_many(crate::cache::CacheKind::Discovery, &[(key, value)]);
+    }
+    Ok(answer)
+}
+
+/// A digest of every reference under `namespaces` and what it points at; `None` when git
+/// cannot list them.
+fn refs_digest(repo_path: &Path, namespaces: &[String]) -> Option<String> {
+    use sha2::Digest as _;
+    let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)", "--"];
+    args.extend(namespaces.iter().map(String::as_str));
+    let listed = crate::data::git::output(repo_path, &args).ok()?;
+    Some(hex::encode(sha2::Sha256::digest(&listed)))
 }
 
 /// Resolve the stack containing pull request `number` through `route` with discovery.
@@ -400,6 +462,7 @@ mod tests {
                 ],
                 related: vec!["d".into(), "b".into()],
                 annotations: Vec::new(),
+                read: Vec::new(),
             },
         );
         let hints = discovery.hints("b");
@@ -435,6 +498,7 @@ mod tests {
                 ],
                 related: Vec::new(),
                 annotations: Vec::new(),
+                read: Vec::new(),
             },
         );
         let chain = |seed: &str| chain_of(&discovery, seed);
@@ -460,9 +524,77 @@ mod tests {
                 links: vec![link("b", "x")],
                 related: Vec::new(),
                 annotations: Vec::new(),
+                read: Vec::new(),
             },
         );
         assert_eq!(chain_of(&discovery, "c"), pairs(&[("c", "b")]));
+    }
+
+    #[test]
+    fn a_contributors_answer_is_kept_until_the_refs_it_read_move() {
+        use crate::provider::DiscoveryContributor;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(AtomicUsize);
+        impl DiscoveryContributor for Counting {
+            fn manifest(&self) -> bcode_code_review_models::ReviewDiscoveryManifest {
+                bcode_code_review_models::ReviewDiscoveryManifest {
+                    id: "counting".into(),
+                    label: "Counting".into(),
+                }
+            }
+            fn discover(
+                &self,
+                _: &ReviewDiscoveryRequest,
+            ) -> Result<ReviewDiscoveryResponse, ProviderCallError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ReviewDiscoveryResponse {
+                    related: vec!["x".into()],
+                    read: vec!["refs/heads/".into()],
+                    ..ReviewDiscoveryResponse::default()
+                })
+            }
+        }
+
+        let fixture = crate::testing::fixture::GitFixture::generate(
+            crate::testing::fixture::FixtureSpec::small(),
+        );
+        let root = fixture.root();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = Arc::new(crate::cache::ReviewCache::open(
+            &dir.path().join("cache.db"),
+        ));
+        let contributor = Arc::new(Counting(AtomicUsize::new(0)));
+        let registry = ProviderRegistry::new()
+            .with_cache(disk)
+            .with_contributor(Arc::clone(&contributor) as Arc<dyn DiscoveryContributor>);
+        let asked = || contributor.0.load(Ordering::SeqCst);
+        let seeds = ["main".to_owned()];
+        assert_eq!(
+            discover(&registry, root, &seeds, None).related,
+            BTreeSet::from(["x".into()])
+        );
+        assert_eq!(
+            discover(&registry, root, &seeds, None).related,
+            BTreeSet::from(["x".into()])
+        );
+        assert_eq!(asked(), 1, "kept while the branches stay put");
+        // A new branch moves what it read: asked again.
+        let status = std::process::Command::new("git")
+            .args(["branch", "fresh-branch"])
+            .current_dir(root)
+            .status()
+            .expect("git");
+        assert!(status.success());
+        let _ = discover(&registry, root, &seeds, None);
+        assert_eq!(asked(), 2);
+        // Without a disk cache, every request is asked.
+        let uncached = ProviderRegistry::new()
+            .with_contributor(Arc::clone(&contributor) as Arc<dyn DiscoveryContributor>);
+        let _ = discover(&uncached, root, &seeds, None);
+        let _ = discover(&uncached, root, &seeds, None);
+        assert_eq!(asked(), 4);
     }
 
     #[test]
@@ -493,6 +625,7 @@ mod tests {
                         message: "needs a restack".into(),
                     },
                 ],
+                read: Vec::new(),
             },
         );
         discovery
