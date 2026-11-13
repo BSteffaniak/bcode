@@ -1017,6 +1017,11 @@ impl<'a> ReviewTools<'a> {
         thread_id: &str,
     ) -> Result<ThreadDetail, AssistantError> {
         if bcode_code_review_models::is_pull_thread_ref(thread_id) {
+            if !has_pull_requests(review) {
+                return Err(AssistantError::NotFound(format!(
+                    "this review has no pull requests, so no pull request thread {thread_id}"
+                )));
+            }
             let snapshot = self
                 .conversation(review)?
                 .ok_or_else(|| AssistantError::NotFound(pull_threads::UNREAD_NOTE.to_owned()))?;
@@ -1061,11 +1066,15 @@ impl<'a> ReviewTools<'a> {
         Ok(ThreadDetail::Local(view))
     }
 
-    /// The review's pull request threads as the review app last read them.
+    /// The review's pull request threads as the review app last read them; none for a review
+    /// without pull requests (a snapshot kept while it had some is not its own any more).
     fn conversation(
         &self,
         review: &OpenReview,
     ) -> Result<Option<ReviewConversationSnapshot>, AssistantError> {
+        if !has_pull_requests(review) {
+            return Ok(None);
+        }
         let (target, scope) = review.scope();
         Ok(self
             .store

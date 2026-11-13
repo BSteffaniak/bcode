@@ -106,15 +106,29 @@ impl Harness {
 
     /// The transient last-commit review the app would show, bound to `session`.
     fn bind(&self, session: &str) -> ReviewWorkspace {
+        self.bind_sources(session, false)
+    }
+
+    /// The transient last-commit review, with the pull request `o/r#7` among its sources when
+    /// `pull_request` (only the last commit is resolved), bound to `session`.
+    fn bind_sources(&self, session: &str, pull_request: bool) -> ReviewWorkspace {
+        let mut kinds = vec![bcode_code_review_models::ReviewSourceKind::LastCommit];
+        if pull_request {
+            kinds.push(bcode_code_review_models::ReviewSourceKind::PullRequest {
+                provider: "github".to_owned(),
+                repository: "o/r".to_owned(),
+                number: 7,
+            });
+        }
         let workspace = bcode_code_review::scope::transient_workspace(
             self.fixture.root().to_path_buf(),
             None,
-            vec![bcode_code_review_models::ReviewSourceKind::LastCommit],
+            kinds,
         );
         let resolved = ReviewData::default()
             .resolve_sources(&ResolveReviewSourcesRequest {
                 repo_path: self.fixture.root().to_path_buf(),
-                sources: workspace.sources.clone(),
+                sources: workspace.sources[..1].to_vec(),
                 provider_resolutions: Vec::new(),
             })
             .expect("resolve");
@@ -572,12 +586,17 @@ fn pull_snapshot(replies: usize) -> bcode_code_review_models::ReviewConversation
 #[test]
 fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
     let mut harness = Harness::new();
-    let workspace = harness.bind(SESSION);
+    let workspace = harness.bind_sources(SESSION, true);
 
-    // Before the app read the pull request threads, there are none, and nothing says why for a
-    // review without pull requests.
+    // Before the app read the pull request threads, there are none, and the listing says why.
     let listed = harness.json("code_review.list_threads", &json!({}), SESSION);
     assert_eq!(listed["pull_request_threads"]["total"], 0, "{listed}");
+    assert!(
+        listed["pull_request_threads"]["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("has not read")),
+        "{listed}"
+    );
     let unread = harness.call(
         "code_review.get_thread",
         &json!({"thread_id": "o/r#7:PRRT_1"}),
@@ -589,16 +608,7 @@ fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
         unread.output
     );
 
-    let (target, scope) = bcode_code_review::scope::annotation_scope(&workspace);
-    harness
-        .store()
-        .save_conversation(bcode_code_review_models::SaveReviewConversationRequest {
-            repo_path: harness.fixture.root().to_path_buf(),
-            target,
-            scope: Some(scope),
-            snapshot: pull_snapshot(6),
-        })
-        .expect("save");
+    harness.save_snapshot(&workspace, pull_snapshot(6));
 
     let listed = harness.json("code_review.list_threads", &json!({}), SESSION);
     let page = &listed["pull_request_threads"];
@@ -663,25 +673,6 @@ fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
         SESSION,
     );
     assert_eq!(on_file["pull_request_threads"]["total"], 1, "{on_file}");
-    // The file is matched whole, by where it was written or where the review shows it.
-    for (path, total) in [
-        ("README", 0),
-        ("README.md.orig", 0),
-        ("src/retry", 0),
-        ("src/retry.rs", 1),
-        ("src/shown", 0),
-        ("src/shown.rs", 1),
-    ] {
-        let listed = harness.json(
-            "code_review.list_threads",
-            &json!({"include_resolved": true, "path": path}),
-            SESSION,
-        );
-        assert_eq!(
-            listed["pull_request_threads"]["total"], total,
-            "{path}: {listed}"
-        );
-    }
 
     let full = harness.json(
         "code_review.get_thread",
@@ -719,9 +710,35 @@ impl Harness {
 }
 
 #[test]
+fn listing_pull_request_threads_by_path_matches_the_whole_file() {
+    let mut harness = Harness::new();
+    let workspace = harness.bind_sources(SESSION, true);
+    harness.save_snapshot(&workspace, pull_snapshot(1));
+    // By where it was written or where the review shows it.
+    for (path, total) in [
+        ("README", 0),
+        ("README.md.orig", 0),
+        ("src/retry", 0),
+        ("src/retry.rs", 1),
+        ("src/shown", 0),
+        ("src/shown.rs", 1),
+    ] {
+        let listed = harness.json(
+            "code_review.list_threads",
+            &json!({"include_resolved": true, "path": path}),
+            SESSION,
+        );
+        assert_eq!(
+            listed["pull_request_threads"]["total"], total,
+            "{path}: {listed}"
+        );
+    }
+}
+
+#[test]
 fn a_large_listing_is_shortened_to_whole_pages_that_continue() {
     let mut harness = Harness::new();
-    let workspace = harness.bind(SESSION);
+    let workspace = harness.bind_sources(SESSION, true);
     let mut snapshot = pull_snapshot(5);
     let template = snapshot.threads[0].clone();
     snapshot.threads = (0..90)
@@ -774,7 +791,7 @@ fn a_large_listing_is_shortened_to_whole_pages_that_continue() {
 #[test]
 fn a_long_thread_keeps_its_hunk_and_its_first_and_latest_comments() {
     let mut harness = Harness::new();
-    let workspace = harness.bind(SESSION);
+    let workspace = harness.bind_sources(SESSION, true);
     let mut snapshot = pull_snapshot(20);
     let record = &mut snapshot.threads[0];
     for (index, comment) in record.thread.comments.iter_mut().enumerate() {
@@ -813,6 +830,35 @@ fn a_long_thread_keeps_its_hunk_and_its_first_and_latest_comments() {
         usize::try_from(omitted).expect("count") + comments.len(),
         21,
         "{omitted} left out"
+    );
+}
+
+#[test]
+fn a_review_without_pull_requests_shows_no_pull_request_threads() {
+    let mut harness = Harness::new();
+    let with_pull = harness.bind_sources(SESSION, true);
+    harness.save_snapshot(&with_pull, pull_snapshot(1));
+    let summary = harness.json("code_review.summary", &json!({}), SESSION);
+    assert_eq!(summary["pull_request_threads"], 3, "{summary}");
+
+    // A snapshot left for a review that no longer has pull request sources is not shown.
+    let without = harness.bind(SESSION);
+    harness.save_snapshot(&without, pull_snapshot(1));
+    let listed = harness.json("code_review.list_threads", &json!({}), SESSION);
+    let page = &listed["pull_request_threads"];
+    assert_eq!(page["total"], 0, "{listed}");
+    assert!(page.get("note").is_none(), "{listed}");
+    let summary = harness.json("code_review.summary", &json!({}), SESSION);
+    assert_eq!(summary["pull_request_threads"], 0, "{summary}");
+    let read = harness.call(
+        "code_review.get_thread",
+        &json!({"thread_id": "o/r#7:PRRT_1"}),
+        SESSION,
+    );
+    assert!(
+        read.is_error && read.output.contains("no pull requests"),
+        "{}",
+        read.output
     );
 }
 

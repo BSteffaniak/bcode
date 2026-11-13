@@ -228,7 +228,8 @@ Pull request threads come from the review store, not the forge: whenever the rev
 its pull requests' threads and they changed, it saves them for the review's scope (bounded:
 1,000 threads, 100 comments per thread keeping the first and the latest, 16 KiB per comment).
 So `list_threads` and `get_thread` stay read-only and work offline, show what the reviewer sees
-(as of `read_at_ms`), and say so when the app has not read them yet. Their thread ids are
+(as of `read_at_ms`), and say so when the app has not read them yet. A review without pull
+request sources (one whose pull request was removed, say) shows none, whatever was saved for it. Their thread ids are
 `<owner>/<name>#<number>:<forge id>`. `reply` and `resolve_thread` change local threads only:
 on a pull request thread they still ask first, then fail with an error that says to reply or
 resolve it in the review app or on the forge (or draft a comment with `add_comment`).
