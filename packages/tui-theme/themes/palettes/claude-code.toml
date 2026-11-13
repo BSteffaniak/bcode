@@ -1,0 +1,389 @@
+# Colors of Claude Code's dark and light terminal themes, measured from its fullscreen renderer
+# with scripts/appearance-reference (see docs/appearance-reference.md). Pair with the
+# `claude-code` profile for its structure. Values marked "unverified" have not appeared in a
+# reference capture yet.
+display_name   = "Claude Code"
+extends        = ["seeded-base"]
+id             = "claude-code"
+schema_version = 2
+
+[palette]
+accent     = "#b1b9f9"
+background = "terminal"
+blue       = "#b1b9f9"
+brand      = "#d77757"
+brand_glow = "#eb9f7f"
+cyan       = "#66d9ef"
+green      = "#4eba65"
+magenta    = "#ae81ff"
+muted      = "#999999"
+orange     = "#d77757"
+red        = "#ff6b80"
+rule       = "#888888"
+rule_faint = "#505050"
+text       = "terminal"
+user_bg    = "#373737"
+user_text  = "#ffffff"
+warning    = "#ffc107"                        # unverified
+yellow     = "#ffc107"                        # unverified
+
+[styles.canvas]
+fg = "$text"
+
+[styles."text.primary"]
+fg = "$text"
+
+[styles."text.muted"]
+fg = "$muted"
+
+[styles.title]
+modifiers = ["bold"]
+
+[styles.accent]
+fg = "$accent"
+
+[styles."border.default"]
+fg = "$rule"
+
+[styles."border.focused"]
+fg = "$accent"
+
+[styles."border.focused.panel"]
+fg = "$accent"
+
+[styles."surface.raised"]
+bg = "$user_bg"
+fg = "$user_text"
+
+[styles."surface.overlay"]
+fg = "$text"
+
+[styles."control.focused"]
+fg = "$accent"
+
+[styles."control.hover"]
+fg = "$accent"
+
+[styles."selection.active"]
+modifiers = ["reversed"]
+
+[styles."selection.inactive"]
+modifiers = ["reversed"]
+
+[styles."state.info"]
+fg = "$accent"
+
+[styles."state.success"]
+fg = "$green"
+
+[styles."state.warning"]
+fg = "$warning"
+
+[styles."state.error"]
+fg = "$red"
+
+[styles."transcript.user.label"]
+fg = "$muted"
+
+[styles."transcript.user.container"]
+bg = "$user_bg"
+fg = "$user_text"
+
+[styles."transcript.assistant.label"]
+fg = "$text"
+
+[styles."transcript.reasoning.label"]
+fg = "$muted"
+
+[styles."transcript.system.label"]
+fg = "$muted"
+
+[styles."transcript.meta"]
+fg = "$muted"
+
+[styles."transcript.pending.label"]
+fg = "$muted"
+
+[styles."transcript.stream_status.label"]
+fg = "$brand"
+
+[styles."transcript.detail.label"]
+fg = "$muted"
+
+[styles."transcript.detail.body"]
+fg = "$muted"
+
+[styles."tool.requested.title"]
+fg = "$muted"
+
+[styles."tool.running.title"]
+fg = "$muted"
+
+[styles."tool.waiting.title"]
+fg = "$muted"
+
+[styles."tool.succeeded.title"]
+fg = "$green"
+
+[styles."tool.failed.title"]
+fg = "$red"
+
+[styles."tool.cancelled.title"]
+fg = "$muted"
+
+[styles."tool.timed_out.title"]
+fg = "$red"
+
+[styles."tool.label"]
+modifiers = ["bold"]
+
+[styles."tool.argument"]
+fg = "$text"
+
+[styles."tool.metadata"]
+fg = "$muted"
+
+[styles."tool.output"]
+fg = "$text"
+
+[styles."tool.truncation"]
+fg = "$muted"
+
+[styles."markdown.text"]
+fg = "$text"
+
+[styles."markdown.heading"]
+modifiers = ["bold"]
+
+[styles."markdown.strong"]
+modifiers = ["bold"]
+
+[styles."markdown.emphasis"]
+modifiers = ["italic"]
+
+[styles."markdown.link"]
+fg        = "$accent"
+modifiers = ["underline"]
+
+[styles."markdown.inline_code"]
+fg = "$accent"
+
+[styles."markdown.code_block_text"]
+fg = "$text"
+
+[styles."markdown.code_block_border"]
+fg = "$muted"
+
+[styles."markdown.blockquote_bar"]
+modifiers = ["dim"]
+
+[styles."markdown.strikethrough"]
+modifiers = ["crossed_out"]
+
+[styles."markdown.alert_note"]
+fg = "$accent"
+
+[styles."markdown.alert_tip"]
+fg = "$green"
+
+[styles."markdown.alert_important"]
+fg = "$magenta"
+
+[styles."markdown.alert_warning"]
+fg = "$warning"
+
+[styles."markdown.alert_caution"]
+fg = "$red"
+
+[styles."markdown.task_checked"]
+fg = "$green"
+
+[styles."markdown.task_unchecked"]
+fg = "$muted"
+
+[styles."transcript.skill.label"]
+fg = "$muted"
+
+[styles."transcript.skill_error.label"]
+fg = "$red"
+
+[styles.link]
+fg        = "$accent"
+modifiers = ["underline"]
+
+[styles."markdown.list_marker"]
+fg = "$text"
+
+[styles."markdown.table_border"]
+fg = "$text"
+
+[styles."markdown.horizontal_rule"]
+fg = "$muted"
+
+[styles."syntax.text"]
+fg = "#f8f8f2"
+
+[styles."syntax.comment"]
+fg = "#75715e"
+
+[styles."syntax.keyword"]
+fg = "#66d9ef"
+
+[styles."syntax.function"]
+fg = "#a6e22e"
+
+[styles."syntax.variable"]
+fg = "#f8f8f2"
+
+[styles."syntax.string"]
+fg = "#e6db74"
+
+[styles."syntax.number"]
+fg = "#ae81ff"
+
+[styles."syntax.type"]
+fg = "#66d9ef"
+
+[styles."syntax.operator"]
+fg = "#f92672"
+
+[styles."syntax.punctuation"]
+fg = "#f8f8f2"
+
+[styles."syntax.heading"]
+fg        = "#f8f8f2"
+modifiers = ["bold"]
+
+[styles."syntax.link"]
+fg = "#66d9ef"
+
+[styles."syntax.raw"]
+fg = "#e6db74"
+
+[styles."source.text"]
+fg = "#f8f8f2"
+
+[styles."source.gutter"]
+fg        = "#f8f8f2"
+modifiers = ["dim"]
+
+[styles."source.border"]
+fg = "$rule_faint"
+
+[styles."source.truncated"]
+fg = "$muted"
+
+[styles."diff.text"]
+fg = "#f8f8f2"
+
+[styles."diff.muted"]
+fg        = "#f8f8f2"
+modifiers = ["dim"]
+
+[styles."diff.title"]
+modifiers = ["bold"]
+
+[styles."diff.label"]
+fg = "$muted"
+
+[styles."diff.added"]
+fg = "#50c850"
+
+[styles."diff.removed"]
+fg = "#dc5a5a"
+
+[styles."diff.hunk"]
+fg = "$muted"
+
+[styles."diff.added_row"]
+bg = "#022800"
+
+[styles."diff.removed_row"]
+bg = "#3d0100"
+
+[styles."diff.added_emphasis"]
+bg = "#044700"
+
+[styles."diff.removed_emphasis"]
+bg = "#5c0102"                                # unverified
+
+[variants.dark]
+
+[variants.light.palette]
+accent     = "#5769f7"
+background = "terminal"
+blue       = "#5769f7"
+brand      = "#d77757"
+brand_glow = "#f59575"
+green      = "#2c7a39"                        # unverified
+muted      = "#666666"
+red        = "#ab2b3f"
+rule       = "#8a8a8a"
+rule_faint = "#afafaf"
+text       = "terminal"
+user_bg    = "#f0f0f0"
+user_text  = "#000000"
+warning    = "#966c1e"                        # unverified
+yellow     = "#966c1e"                        # unverified
+
+[variants.light.styles."syntax.text"]
+fg = "#333333"
+
+[variants.light.styles."syntax.comment"]
+fg = "#969896"
+
+[variants.light.styles."syntax.keyword"]
+fg = "#a71d5d"
+
+[variants.light.styles."syntax.function"]
+fg = "#795da3"
+
+[variants.light.styles."syntax.variable"]
+fg = "#333333"
+
+[variants.light.styles."syntax.string"]
+fg = "#183691"
+
+[variants.light.styles."syntax.number"]
+fg = "#0086b3"
+
+[variants.light.styles."syntax.type"]
+fg = "#0086b3"
+
+[variants.light.styles."syntax.operator"]
+fg = "#a71d5d"
+
+[variants.light.styles."syntax.punctuation"]
+fg = "#333333"
+
+[variants.light.styles."source.text"]
+fg = "#333333"
+
+[variants.light.styles."source.gutter"]
+fg        = "#333333"
+modifiers = ["dim"]
+
+[variants.light.styles."diff.text"]
+fg = "#333333"
+
+[variants.light.styles."diff.muted"]
+fg        = "#333333"
+modifiers = ["dim"]
+
+[variants.light.styles."diff.added"]
+fg = "#248a3d"
+
+[variants.light.styles."diff.removed"]
+fg = "#cf222e"
+
+[variants.light.styles."diff.added_row"]
+bg = "#dcffdc"
+
+[variants.light.styles."diff.removed_row"]
+bg = "#ffdcdc"
+
+[variants.light.styles."diff.added_emphasis"]
+bg = "#b2ffb2"
+
+[variants.light.styles."diff.removed_emphasis"]
+bg = "#ffb2b2"                                # unverified

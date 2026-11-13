@@ -31,7 +31,7 @@ import fixture
 KEY = "sk-ant-api03-mockmockmockmockmockmockmockmock"
 
 
-def fixture(root, theme):
+def claude_home(root, theme):
     """A fresh home whose Claude Code config has every first-run notice already seen."""
     shutil.rmtree(root, ignore_errors=True)
     home = os.path.join(root, "home")
@@ -44,6 +44,7 @@ def fixture(root, theme):
                    "lastReleaseNotesSeen": "9.9.9", "lastClawdEntranceVersion": "9.9.9",
                    "opusProMigrationComplete": True, "sonnet1m45MigrationComplete": True,
                    "migrationVersion": 14, "officialMarketplaceAutoInstallAttempted": True,
+                   "lspRecommendationDisabled": True,
                    "customApiKeyResponses": {"approved": [KEY[-20:]], "rejected": []},
                    "projects": {project: {"hasTrustDialogAccepted": True, "allowedTools": [],
                                           "hasCompletedProjectOnboarding": True}}}, handle)
@@ -55,7 +56,7 @@ def fixture(root, theme):
 def capture(scenario_path, out, theme, size, probe):
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
-    home, project = fixture(os.path.join(os.path.dirname(out), ".fixture"), theme)
+    home, project = claude_home(os.path.join(os.path.dirname(out), ".fixture"), theme)
     scenario = fixture.load_scenario(scenario_path, project)
     mock_scenario = os.path.join(out, "mock-scenario.json")
     with open(mock_scenario, "w") as handle:

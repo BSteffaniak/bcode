@@ -32,6 +32,10 @@ pub const BUNDLED_THEMES: &[(&str, &str)] = &[
         include_str!("../themes/palettes/blueprint.toml"),
     ),
     (
+        "claude-code",
+        include_str!("../themes/palettes/claude-code.toml"),
+    ),
+    (
         "catppuccin-frappe",
         include_str!("../themes/palettes/catppuccin-frappe.toml"),
     ),
