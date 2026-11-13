@@ -701,7 +701,9 @@ pub enum ThreadPlacement {
     Exact,
     /// Carried from the commit it was written on to where that code is now.
     Moved,
-    /// Its code is gone (or could not be followed): on its file.
+    /// Its code was rewritten or removed since: on the lines that replaced it, or where it was.
+    Near,
+    /// Its code could not be followed: on its file.
     OnFile,
     /// The layer no longer changes its file: on the layer.
     OnLayer,

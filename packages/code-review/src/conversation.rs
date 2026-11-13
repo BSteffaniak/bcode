@@ -155,7 +155,10 @@ pub enum Placement {
     Exact,
     /// Carried from the commit it was written on to where that code is now.
     Moved,
-    /// Its code is gone (or could not be followed): on its file.
+    /// Its code was rewritten or removed since: carried to the lines that replaced it, or to
+    /// where it was.
+    Near,
+    /// Its code could not be followed (the commit it was written on is not here): on its file.
     OnFile,
     /// The layer no longer changes its file: on the layer.
     OnLayer,
@@ -166,6 +169,7 @@ impl From<Placement> for bcode_code_review_models::ThreadPlacement {
         match placement {
             Placement::Exact => Self::Exact,
             Placement::Moved => Self::Moved,
+            Placement::Near => Self::Near,
             Placement::OnFile => Self::OnFile,
             Placement::OnLayer => Self::OnLayer,
         }
@@ -279,14 +283,20 @@ fn carry_lines(root: &Path, target: &LayerTarget, carries: &[Carry], placed: &mu
         };
         for carry in carries {
             let hunks = changes.get(&carry.path).map_or(&[][..], Vec::as_slice);
-            let (Some(start), Some(end)) =
-                (carry_line(hunks, carry.start), carry_line(hunks, carry.end))
-            else {
-                continue;
-            };
+            // Exactly where its code is now; else, when that code was rewritten or removed,
+            // as near it as the changes allow (never dropped to the top of the file).
+            let (start, end, placement) =
+                match (carry_line(hunks, carry.start), carry_line(hunks, carry.end)) {
+                    (Some(start), Some(end)) => (start, end, Placement::Moved),
+                    _ => (
+                        carry_line_near(hunks, carry.start),
+                        carry_line_near(hunks, carry.end),
+                        Placement::Near,
+                    ),
+                };
             let thread = &mut placed[carry.thread];
             thread.anchor = line_anchor(&carry.path, target, DiffSide::New, start, end);
-            thread.placement = Placement::Moved;
+            thread.placement = placement;
         }
     }
 }
@@ -323,6 +333,36 @@ fn carry_line(hunks: &[LineHunk], line: u32) -> Option<u32> {
     u32::try_from(i64::from(line) + shift)
         .ok()
         .filter(|line| *line > 0)
+}
+
+/// `line` of the old version in the new one, or as near as it gets: a line a region rewrote goes
+/// to the matching line of what replaced it (its last, when fewer replaced it); a line a region
+/// removed goes to the line before where it was (the first line when it was at the top).
+fn carry_line_near(hunks: &[LineHunk], line: u32) -> u32 {
+    let mut shift: i64 = 0;
+    for hunk in hunks {
+        let first = if hunk.old_count == 0 {
+            hunk.old_start + 1
+        } else {
+            hunk.old_start
+        };
+        if line < first {
+            break;
+        }
+        if hunk.old_count > 0 && line < hunk.old_start + hunk.old_count {
+            if hunk.new_count == 0 {
+                // Removed: `new_start` is the line before the removal.
+                return hunk.new_start.max(1);
+            }
+            let offset = (line - hunk.old_start).min(hunk.new_count - 1);
+            return hunk.new_start + offset;
+        }
+        shift += i64::from(hunk.new_count) - i64::from(hunk.old_count);
+    }
+    u32::try_from(i64::from(line) + shift)
+        .ok()
+        .filter(|line| *line > 0)
+        .unwrap_or(1)
 }
 
 /// The changed regions of `paths` from `from` to `to`, per path (renames followed).

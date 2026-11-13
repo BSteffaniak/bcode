@@ -146,8 +146,8 @@ fn threads_follow_their_code_to_the_head_the_review_shows() {
                 thread("kept", at_line("a.rs", Some(5), 5, &written)),
                 // Outdated on the forge: only where it was written is known.
                 thread("outdated", at_line("a.rs", None, 15, &written)),
-                // Its line was rewritten.
-                thread("gone", at_line("a.rs", Some(10), 10, &written)),
+                // Its line was rewritten: on the line that replaced it.
+                thread("rewritten", at_line("a.rs", Some(10), 10, &written)),
                 thread("elsewhere", at_line("b.rs", Some(1), 1, &written)),
             ],
         ),
@@ -168,7 +168,7 @@ fn threads_follow_their_code_to_the_head_the_review_shows() {
         vec![
             ("kept", Placement::Moved, Some(8)),
             ("outdated", Placement::Moved, Some(18)),
-            ("gone", Placement::OnFile, None),
+            ("rewritten", Placement::Near, Some(13)),
             ("elsewhere", Placement::OnLayer, None),
         ]
     );
@@ -177,7 +177,7 @@ fn threads_follow_their_code_to_the_head_the_review_shows() {
             .iter()
             .all(|placed| placed.anchor.source_id.as_deref() == Some("s"))
     );
-    assert_eq!(placed[2].anchor.kind, ReviewAnchorKind::File);
+    assert_eq!(placed[2].anchor.kind, ReviewAnchorKind::Range);
     assert_eq!(placed[3].anchor.kind, ReviewAnchorKind::Review);
 }
 
@@ -275,4 +275,36 @@ fn a_thread_waits_on_the_viewer_when_someone_else_spoke_last() {
     assert!(!waiting_on_viewer(&pull, &stranger));
     pull.viewer.is_author = true;
     assert!(waiting_on_viewer(&pull, &stranger));
+}
+
+#[test]
+fn a_range_whose_code_was_partly_removed_stays_by_what_is_left_of_it() {
+    let repo = Repo::new();
+    let written = repo.commit("a.rs", &lines(1..=30));
+    // Three lines inserted at the top; lines 21 to 25 removed (the end of the commented range).
+    let mut text = String::from("new 1\nnew 2\nnew 3\n");
+    for line in (1..=30).filter(|line| !(21..=25).contains(line)) {
+        let _ = writeln!(text, "line {line}");
+    }
+    let head = repo.commit("a.rs", &text);
+    let target = LayerTarget {
+        source_id: "s".to_owned(),
+        head_oid: head,
+        paths: BTreeSet::from(["a.rs".to_owned()]),
+    };
+    // Outdated on the forge, written on lines 12 to 24.
+    let mut range = at_line("a.rs", None, 24, &written);
+    range.original_start_line = Some(12);
+    let placed = place_threads(
+        &repo.root,
+        &activity(&written, vec![thread("range", range)]),
+        &target,
+    );
+    assert_eq!(placed[0].placement, Placement::Near);
+    // From line 12 (now 15) to where the removed lines were: after line 20 (now 23).
+    assert_eq!(
+        (placed[0].anchor.new_start, placed[0].anchor.new_end),
+        (Some(15), Some(23))
+    );
+    assert_eq!(placed[0].anchor.kind, ReviewAnchorKind::Range);
 }

@@ -293,7 +293,11 @@ Implemented end to end (not yet committed).
   * Thread placement:
     * exact on the same head;
     * otherwise carried through one `git diff -U0` per pair of commits;
-    * otherwise on the file, or on the layer.
+    * when the lines it was on were rewritten or removed since, *near its code*: on the lines
+      that replaced them, or where the removed lines were (never dropped to the top of the
+      file);
+    * otherwise (the commit it was written on is not in the repository) on the file, or on the
+      layer.
   * Review currency from stack history, and *waiting on you*.
 * **GitHub (`bcode_code_review_github::conversation`, `bcode_forge`):**
   * Batched GraphQL activity reads.

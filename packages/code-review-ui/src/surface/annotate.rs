@@ -916,6 +916,9 @@ impl ReviewSurface {
                 match info.placement {
                     bcode_code_review::conversation::Placement::Exact => "where it was written",
                     bcode_code_review::conversation::Placement::Moved => "moved with its code",
+                    bcode_code_review::conversation::Placement::Near => {
+                        "near its code: the lines it was on changed since"
+                    }
                     bcode_code_review::conversation::Placement::OnFile => {
                         "on its file: its lines are gone from the code the review shows"
                     }

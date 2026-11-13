@@ -331,8 +331,9 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   layers**, and a whole-stack review gets one status line per layer. Cards start open; the
   `overview` setting can start them folded, or folded unless something is new.
 * **Threads** from the forge sit on their lines in the diff, placed on the code the review shows:
-  exactly, moved with their code when it moved, else on their file (*on an older version*) or on
-  the layer. Each has **Reply**, **Resolve**/**Reopen**, **Open ↗** and **Ask Bcode** as far as
+  exactly, moved with their code when it moved, *near their code* when the lines they were on
+  were rewritten or removed since (on what replaced them, or where they were), else on their file
+  (*on an older version*, when the commit they were written on is not here) or on the layer. Each has **Reply**, **Resolve**/**Reopen**, **Open ↗** and **Ask Bcode** as far as
   allowed; resolved ones fold. **Reply** sends at once and offers **Add to review**, which holds
   the reply as a draft under the thread until the next review of that pull request is submitted
   (the default is configurable). **Ask Bcode** sends the whole thread with the question (see

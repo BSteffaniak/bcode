@@ -2165,6 +2165,7 @@ fn remote_title(
     let placement = match remote.placement {
         Placement::Exact => None,
         Placement::Moved => Some("moved with its code"),
+        Placement::Near => Some("near its code, which changed since"),
         Placement::OnFile => Some("on an older version"),
         Placement::OnLayer => Some("on a file this layer no longer changes"),
     };
