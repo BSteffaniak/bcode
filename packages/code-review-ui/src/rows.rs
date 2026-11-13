@@ -136,6 +136,7 @@ use std::fmt::Write as _;
 mod agent;
 pub mod card;
 pub mod file;
+pub mod thread_card;
 
 pub use agent::{dock_key, dock_rows, exchange_turn, is_newest, item_id, open_key};
 
@@ -162,6 +163,8 @@ pub struct ViewParams {
     pub density: file::Density,
     /// How files are separated.
     pub separation: file::Separation,
+    /// How thread cards are laid out.
+    pub threads: thread_card::Params,
 }
 
 /// What a gap segment does when clicked.
@@ -198,6 +201,8 @@ pub enum ThreadAction {
     Reject,
     /// Open the thread's web page.
     Open,
+    /// Mark the thread viewed or unviewed.
+    Viewed,
 }
 
 /// An action on an AI answer item.
@@ -242,8 +247,13 @@ pub enum AgentAction {
 /// How threads and AI answers are folded (presentation only; persisted with the workspace).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Folds {
-    /// Threads shown as their header only.
+    /// Threads shown folded: by hand, or by themselves (viewed, resolved). Computed from the
+    /// rest (see `ReviewSurface::refresh_threads`).
     pub collapsed: std::collections::BTreeSet<String>,
+    /// Threads folded or opened by hand.
+    pub hand: std::collections::BTreeMap<String, bcode_code_review_models::ThreadFoldMark>,
+    /// Each thread's viewed state and the comments new since it was viewed.
+    pub threads: std::collections::BTreeMap<String, ThreadLook>,
     /// AI exchanges whose whole answer is shown.
     pub expanded: std::collections::BTreeSet<String>,
     /// Opened feed items of AI cards (reasoning text, all tool output), keyed by
@@ -251,6 +261,15 @@ pub struct Folds {
     pub feed_open: std::collections::BTreeSet<String>,
     /// Changes whenever the folds change.
     pub revision: u64,
+}
+
+/// How a thread shows, beyond its comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadLook {
+    /// Viewed, never, or with comments new since.
+    pub viewed: bcode_code_review::threads::ThreadViewed,
+    /// The comments new since it was viewed.
+    pub new: std::collections::BTreeSet<String>,
 }
 
 /// What a clickable item cell does.
@@ -761,6 +780,7 @@ impl RowContext<'_> {
                 thread,
                 self.notes,
                 self.folds,
+                self.params.threads,
                 styles,
                 cells,
                 self.gutter_indent(width),
@@ -1595,130 +1615,239 @@ const fn outdated_label(reason: bcode_code_review::document::OutdatedReason) -> 
     }
 }
 
-/// Header spans of a thread: fold marker, comment count, kind, severity, state, and badges.
-fn thread_header(
+/// Rows of a thread: a card (see [`thread_card`]) with its comments, suggestions and buttons;
+/// one row when folded.
+fn thread_rows(
     thread: &bcode_code_review::document::ThreadItem,
     notes: &super::notes::ReviewNotes,
-    comments: &[&bcode_code_review_models::DraftComment],
-    collapsed: bool,
+    folds: &Folds,
+    card: thread_card::Params,
     theme: &ReviewTheme,
+    width: usize,
     indent: usize,
-) -> Vec<Span> {
-    let icons = &theme.icons;
-    let saving = comments
-        .iter()
-        .any(|comment| super::notes::is_local(&comment.comment_id));
-    let mut header = vec![
-        Span::raw(" ".repeat(indent)),
+) -> ItemRows {
+    // A thread on the review or a layer as a whole starts at the left edge.
+    let indent = if thread.placement == bcode_code_review::document::AnchorPlacement::Review {
+        0
+    } else {
+        indent
+    };
+    let look = Look::of(thread, folds, theme);
+    let layout = card.layout(indent, width);
+    let inner = layout.inner();
+    if let Some(external) = notes.external(&thread.thread_id) {
+        return external_card(thread, external, notes, &look, theme, inner).rows(layout, theme);
+    }
+    if let Some(remote) = notes.remote(&thread.thread_id) {
+        return remote_card(thread, remote, notes, &look, theme, inner).rows(layout, theme);
+    }
+    local_card(thread, notes, &look, theme, inner).rows(layout, theme)
+}
+
+/// What a thread card shows besides its comments: folded, viewed, new.
+struct Look {
+    folded: bool,
+    viewed: bcode_code_review::threads::ThreadViewed,
+    new: std::collections::BTreeSet<String>,
+    checkbox: Span,
+}
+
+impl Look {
+    fn of(
+        thread: &bcode_code_review::document::ThreadItem,
+        folds: &Folds,
+        theme: &ReviewTheme,
+    ) -> Self {
+        let look = folds.threads.get(&thread.thread_id);
+        let viewed = look.map_or(bcode_code_review::threads::ThreadViewed::Unviewed, |look| {
+            look.viewed
+        });
+        let checkbox = if viewed.is_viewed() {
+            Span::styled(format!("{} Viewed", theme.icons.viewed), theme.viewed)
+        } else {
+            Span::styled(format!("{} Viewed", theme.icons.unviewed), theme.muted)
+        };
+        Self {
+            folded: folds.collapsed.contains(&thread.thread_id),
+            viewed,
+            new: look.map(|look| look.new.clone()).unwrap_or_default(),
+            checkbox,
+        }
+    }
+
+    /// The fold chevron.
+    fn chevron(&self, theme: &ReviewTheme) -> Span {
         Span::styled(
-            if collapsed {
-                icons.collapsed
+            if self.folded {
+                theme.icons.collapsed
             } else {
-                icons.menu
+                theme.icons.menu
             },
             theme.muted,
-        ),
-        Span::raw(" "),
-        Span::styled(icons.thread, theme.thread),
-        Span::raw(" "),
-        Span::styled(
-            format!(
-                "{} comment{}",
-                comments.len(),
-                if comments.len() == 1 { "" } else { "s" }
-            ),
-            theme.thread,
-        ),
-        Span::styled(icons.separator, theme.muted),
-        Span::styled(super::notes::kind_label(thread.kind), theme.muted),
-        Span::styled(icons.separator, theme.muted),
-        Span::styled(super::notes::severity_label(thread.severity), theme.muted),
-        Span::raw(" "),
-        if thread.resolved {
-            Span::styled("resolved", theme.badge_resolved)
+        )
+    }
+
+    /// `• N new`, when comments came since it was viewed.
+    fn new_chip(&self, theme: &ReviewTheme) -> Option<Vec<Span>> {
+        let new = self.viewed.new_count();
+        (new > 0).then(|| {
+            vec![Span::styled(
+                format!("{} {new} new", theme.icons.new),
+                theme.badge_draft,
+            )]
+        })
+    }
+
+    /// The frame: resolved, waiting on you, viewed, or unviewed.
+    const fn border(&self, resolved: bool, waiting: bool, theme: &ReviewTheme) -> Style {
+        if resolved {
+            theme.threads.resolved
+        } else if waiting {
+            theme.threads.waiting
+        } else if self.viewed.is_viewed() {
+            theme.threads.viewed
         } else {
-            Span::styled("open", theme.badge_open)
-        },
-    ];
-    if let bcode_code_review::document::AnchorPlacement::Outdated(reason) = thread.placement {
-        header.push(Span::raw(" "));
-        header.push(Span::styled(outdated_label(reason), theme.badge_outdated));
+            theme.threads.unviewed
+        }
     }
-    if saving {
-        header.push(Span::raw(" "));
-        header.push(Span::styled("saving…", theme.badge_draft));
-    }
-    if notes.is_published(&thread.thread_id) {
-        header.push(Span::raw(" "));
-        header.push(Span::styled("published", theme.badge_resolved));
-    }
-    if let Some((_, start, end)) = thread.lines {
-        header.push(Span::styled(icons.separator, theme.muted));
-        header.push(Span::styled(
+}
+
+/// `L12` or `L12-18`, for line anchors.
+fn line_reference(
+    thread: &bcode_code_review::document::ThreadItem,
+    theme: &ReviewTheme,
+) -> Vec<Span> {
+    thread.lines.map_or_else(Vec::new, |(_, start, end)| {
+        vec![Span::styled(
             if start == end {
                 format!("L{end}")
             } else {
                 format!("L{start}-{end}")
             },
             theme.muted,
-        ));
-    }
-    header
+        )]
+    })
 }
 
-/// Rows of a thread: a header (a click folds it), its comments (markdown), its suggestions,
-/// and its actions. A collapsed thread is its header only.
-fn thread_rows(
+/// A comment's byline (author, age, `• new`) and its markdown, at `inner` cells.
+fn comment_section(
+    author: &str,
+    at: Option<u64>,
+    new: bool,
+    body: &str,
+    theme: &ReviewTheme,
+    inner: usize,
+) -> thread_card::Section {
+    let mut byline = vec![Span::styled(author.to_owned(), theme.title)];
+    let age = crate::conversation::ago(at);
+    if !age.is_empty() {
+        byline.push(Span::styled(
+            format!(" {} {age}", theme.icons.separator.trim()),
+            theme.muted,
+        ));
+    }
+    if new {
+        byline.push(Span::raw("  "));
+        byline.push(Span::styled(
+            format!("{} new", theme.icons.new),
+            theme.badge_draft,
+        ));
+    }
+    let mut lines = vec![Line::from_spans(byline).truncate(inner)];
+    lines.extend(markdown(body, inner, MAX_COMMENT_ROWS, theme));
+    thread_card::Section {
+        lines,
+        actions: Vec::new(),
+    }
+}
+
+/// The header chips of your own thread: its comments, kind and severity, and state.
+fn local_title(
     thread: &bcode_code_review::document::ThreadItem,
     notes: &super::notes::ReviewNotes,
-    folds: &Folds,
+    comments: &[&bcode_code_review_models::DraftComment],
+    look: &Look,
     theme: &ReviewTheme,
-    width: usize,
-    indent: usize,
-) -> ItemRows {
-    if let Some(external) = notes.external(&thread.thread_id) {
-        return external_thread_rows(thread, external, notes, theme, width, indent);
+) -> Vec<Vec<Span>> {
+    let icons = &theme.icons;
+    let mut title = vec![
+        vec![
+            look.chevron(theme),
+            Span::raw(" "),
+            Span::styled(icons.thread, theme.thread),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "{} comment{}",
+                    comments.len(),
+                    if comments.len() == 1 { "" } else { "s" }
+                ),
+                theme.thread,
+            ),
+        ],
+        vec![Span::styled(
+            format!(
+                "{}{}{}",
+                super::notes::kind_label(thread.kind),
+                icons.separator,
+                super::notes::severity_label(thread.severity)
+            ),
+            theme.muted,
+        )],
+        vec![if thread.resolved {
+            Span::styled("resolved", theme.badge_resolved)
+        } else {
+            Span::styled("open", theme.badge_open)
+        }],
+    ];
+    if let bcode_code_review::document::AnchorPlacement::Outdated(reason) = thread.placement {
+        title.push(vec![Span::styled(
+            outdated_label(reason),
+            theme.badge_outdated,
+        )]);
     }
-    if let Some(remote) = notes.remote(&thread.thread_id) {
-        let collapsed = folds.collapsed.contains(&thread.thread_id);
-        return remote_thread_rows(thread, remote, notes, collapsed, theme, width, indent);
+    if comments
+        .iter()
+        .any(|comment| super::notes::is_local(&comment.comment_id))
+    {
+        title.push(vec![Span::styled("saving…", theme.badge_draft)]);
     }
+    if notes.is_published(&thread.thread_id) {
+        title.push(vec![Span::styled("published", theme.badge_resolved)]);
+    }
+    title
+}
+
+/// The card of your own thread.
+fn local_card<'a>(
+    thread: &bcode_code_review::document::ThreadItem,
+    notes: &super::notes::ReviewNotes,
+    look: &Look,
+    theme: &ReviewTheme,
+    inner: usize,
+) -> thread_card::Card<'a> {
     let comments = notes.thread(&thread.thread_id);
-    let collapsed = folds.collapsed.contains(&thread.thread_id);
-    let header = thread_header(thread, notes, &comments, collapsed, theme, indent);
-    let mut lines = vec![Line::from_spans(header).truncate(width)];
-    let fold = header_fold(indent, width);
-    if collapsed {
-        return ItemRows::lines(lines, fold.into_iter().collect());
-    }
-    let body_indent = indent + 2;
-    let body_width = width.saturating_sub(body_indent);
-    if !thread.resolved {
-        for (index, comment) in comments.iter().enumerate() {
-            let rows = markdown(&comment.body, body_width, MAX_COMMENT_ROWS, theme);
-            let mut rows = indented(rows, &" ".repeat(body_indent), width);
-            if index > 0
-                && let Some(first) = rows.first_mut()
-                && body_indent >= 2
-            {
-                let mut spans = vec![
-                    Span::raw(" ".repeat(body_indent - 2)),
-                    Span::styled("↳ ", theme.muted),
-                ];
-                spans.extend(first.spans.iter().skip(1).cloned());
-                *first = Line::from_spans(spans).truncate(width);
-            }
-            lines.extend(rows);
-        }
-    }
-    let mut actions: Vec<ActionCells<ItemAction>> = fold.into_iter().collect();
-    let (suggestion_lines, suggestion_actions) = suggestion_rows(
+    let title = local_title(thread, notes, &comments, look, theme);
+    let mut sections: Vec<thread_card::Section> = comments
+        .iter()
+        .map(|comment| {
+            comment_section(
+                "you",
+                Some(comment.created_at_ms),
+                false,
+                &comment.body,
+                theme,
+                inner,
+            )
+        })
+        .collect();
+    let (lines, actions) = suggestion_rows(
         &thread.suggestion_ids,
         notes,
         theme,
-        body_indent,
-        width,
-        u16::try_from(lines.len()).unwrap_or(u16::MAX),
+        0,
+        inner,
+        0,
         |action| {
             ItemAction::Thread(match action {
                 SuggestionAction::Accept => ThreadAction::Accept,
@@ -1727,8 +1856,9 @@ fn thread_rows(
             })
         },
     );
-    lines.extend(suggestion_lines);
-    actions.extend(suggestion_actions);
+    if !lines.is_empty() {
+        sections.push(thread_card::Section { lines, actions });
+    }
     let buttons: Vec<(&str, ItemAction)> = if thread.resolved {
         vec![
             ("Reopen", ItemAction::Thread(ThreadAction::Resolve)),
@@ -1743,20 +1873,15 @@ fn thread_rows(
             ("Ask Bcode", ItemAction::Thread(ThreadAction::Ask)),
         ]
     };
-    let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let (rows, placed) = action_row(&buttons, row, body_indent.min(width), width, theme);
-    lines.extend(rows);
-    actions.extend(placed);
-    ItemRows::lines(lines, actions)
-}
-
-/// The fold action over a header row's cells after the indent.
-fn header_fold(indent: usize, width: usize) -> Option<ActionCells<ItemAction>> {
-    (width > indent).then(|| ActionCells {
-        row: 0,
-        cells: u16::try_from(indent).unwrap_or(u16::MAX)..u16::try_from(width).unwrap_or(u16::MAX),
-        action: ItemAction::Thread(ThreadAction::Fold),
-    })
+    thread_card::Card {
+        title,
+        viewed: Some(look.checkbox.clone()),
+        sections,
+        buttons,
+        footer: line_reference(thread, theme),
+        border: look.border(thread.resolved, false, theme),
+        folded: look.folded,
+    }
 }
 
 /// An action on the latest pending suggestion.
@@ -1825,140 +1950,133 @@ fn suggestion_rows(
     (lines, actions)
 }
 
-/// Rows of an imported (read-only) thread: a header with the provider, remote state, and
-/// mapping, then each comment with its author. Imported threads have no actions.
-fn external_thread_rows(
+/// The card of an imported (read-only) thread: its provider, remote state and mapping, then
+/// each comment with its author. Imported threads have no buttons.
+fn external_card<'a>(
     thread: &bcode_code_review::document::ThreadItem,
     external: &super::notes::ExternalThread,
     notes: &super::notes::ReviewNotes,
+    look: &Look,
     theme: &ReviewTheme,
-    width: usize,
-    indent: usize,
-) -> ItemRows {
+    inner: usize,
+) -> thread_card::Card<'a> {
     use bcode_code_review_models::{ExternalAnchorMappingStatus, ExternalReviewThreadState};
     let icons = &theme.icons;
     let comments = notes.thread(&thread.thread_id);
-    let mut header = vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled(icons.thread, theme.thread),
-        Span::raw(" "),
-        Span::styled("imported", theme.badge_ai),
-        Span::styled(icons.separator, theme.muted),
-        Span::styled(external.provider_id.clone(), theme.muted),
-        Span::styled(icons.separator, theme.muted),
-        Span::styled(
+    let mut title = vec![
+        vec![
+            look.chevron(theme),
+            Span::raw(" "),
+            Span::styled(icons.thread, theme.thread),
+            Span::raw(" "),
+            Span::styled("imported", theme.badge_ai),
+        ],
+        vec![Span::styled(
             format!(
-                "{} comment{}",
+                "{}{}{} comment{}",
+                external.provider_id,
+                icons.separator,
                 comments.len(),
                 if comments.len() == 1 { "" } else { "s" }
             ),
-            theme.thread,
-        ),
-        Span::raw(" "),
-        match external.state {
+            theme.muted,
+        )],
+        vec![match external.state {
             ExternalReviewThreadState::Open => Span::styled("open", theme.badge_open),
             ExternalReviewThreadState::Resolved => Span::styled("resolved", theme.badge_resolved),
             ExternalReviewThreadState::Outdated => Span::styled("outdated", theme.badge_outdated),
-        },
+        }],
     ];
+    if let Some(chip) = look.new_chip(theme) {
+        title.insert(1, chip);
+    }
     match external.mapping {
         ExternalAnchorMappingStatus::Exact => {}
         ExternalAnchorMappingStatus::Approximate => {
-            header.push(Span::raw(" "));
-            header.push(Span::styled("approximate", theme.badge_outdated));
+            title.push(vec![Span::styled("approximate", theme.badge_outdated)]);
         }
         ExternalAnchorMappingStatus::Unmappable => {
-            header.push(Span::raw(" "));
-            header.push(Span::styled("not in this review", theme.badge_outdated));
+            title.push(vec![Span::styled(
+                "not in this review",
+                theme.badge_outdated,
+            )]);
         }
     }
     if let bcode_code_review::document::AnchorPlacement::Outdated(reason) = thread.placement {
-        header.push(Span::raw(" "));
-        header.push(Span::styled(outdated_label(reason), theme.badge_outdated));
+        title.push(vec![Span::styled(
+            outdated_label(reason),
+            theme.badge_outdated,
+        )]);
     }
-    if let Some((_, start, end)) = thread.lines {
-        header.push(Span::styled(icons.separator, theme.muted));
-        header.push(Span::styled(
-            if start == end {
-                format!("L{end}")
-            } else {
-                format!("L{start}-{end}")
-            },
-            theme.muted,
+    let mut sections = Vec::new();
+    if let Some(message) = &external.message {
+        sections.push(thread_card::Section {
+            lines: vec![
+                Line::from_spans(vec![Span::styled(message.clone(), theme.muted)]).truncate(inner),
+            ],
+            actions: Vec::new(),
+        });
+    }
+    for comment in &comments {
+        let author = external
+            .authors
+            .get(&comment.comment_id)
+            .map_or("unknown", String::as_str);
+        sections.push(comment_section(
+            author,
+            Some(comment.created_at_ms),
+            look.new.contains(&comment.comment_id),
+            &comment.body,
+            theme,
+            inner,
         ));
     }
-    let mut lines = vec![Line::from_spans(header).truncate(width)];
-    let body_indent = indent + 2;
-    let body_width = width.saturating_sub(body_indent);
-    if let Some(message) = &external.message {
-        lines.push(
-            Line::from_spans(vec![
-                Span::raw(" ".repeat(body_indent.min(width))),
-                Span::styled(message.clone(), theme.muted),
-            ])
-            .truncate(width),
-        );
+    let resolved = external.state == ExternalReviewThreadState::Resolved;
+    thread_card::Card {
+        title,
+        viewed: Some(look.checkbox.clone()),
+        sections,
+        buttons: Vec::new(),
+        footer: line_reference(thread, theme),
+        border: look.border(resolved, false, theme),
+        folded: look.folded,
     }
-    if external.state != ExternalReviewThreadState::Resolved {
-        for comment in &comments {
-            if let Some(author) = external.authors.get(&comment.comment_id) {
-                lines.push(
-                    Line::from_spans(vec![
-                        Span::raw(" ".repeat(body_indent.min(width))),
-                        Span::styled(author.clone(), theme.title),
-                    ])
-                    .truncate(width),
-                );
-            }
-            let rows = markdown(&comment.body, body_width, MAX_COMMENT_ROWS, theme);
-            lines.extend(indented(rows, &" ".repeat(body_indent), width));
-        }
-    }
-    ItemRows::lines(lines, Vec::new())
 }
 
-/// Rows of a pull request thread read from its provider: who said what and when, how it sits
-/// on this review, and Reply, Resolve or Reopen, and Open buttons for what the provider and the
-/// viewer's permissions allow. Replies held for the next review show as drafts under it.
-fn remote_thread_rows(
+/// The card of a pull request thread read from its provider: who said what and when, how it
+/// sits on this review, and Reply, Resolve or Reopen, Open and Ask buttons for what the
+/// provider and the viewer's permissions allow. Replies held for the next review show in it.
+fn remote_card<'a>(
     thread: &bcode_code_review::document::ThreadItem,
     remote: &super::notes::RemoteThreadInfo,
     notes: &super::notes::ReviewNotes,
-    collapsed: bool,
+    look: &Look,
     theme: &ReviewTheme,
-    width: usize,
-    indent: usize,
-) -> ItemRows {
+    inner: usize,
+) -> thread_card::Card<'a> {
     let comments = notes.thread(&thread.thread_id);
     let held = comments
         .iter()
         .filter(|comment| !comment.comment_id.starts_with(super::notes::REMOTE_PREFIX))
         .count();
-    let header = remote_thread_header(thread, remote, &comments, held, theme, indent);
-    let mut lines = vec![Line::from_spans(header).truncate(width)];
-    let fold = header_fold(indent, width);
-    if collapsed {
-        return ItemRows::lines(lines, fold.into_iter().collect());
-    }
-    let body_indent = indent + 2;
-    let body_width = width.saturating_sub(body_indent);
-    let pad = " ".repeat(body_indent.min(width));
-    if !remote.resolved {
-        for comment in &comments {
+    let title = remote_title(remote, &comments, held, look, theme);
+    let sections = comments
+        .iter()
+        .map(|comment| {
             let (author, at) = remote.authors.get(&comment.comment_id).map_or_else(
                 || ("you · held for your review".to_owned(), None),
                 |(author, at)| (author.clone(), *at),
             );
-            let mut byline = vec![Span::raw(pad.clone()), Span::styled(author, theme.title)];
-            let age = crate::conversation::ago(at);
-            if !age.is_empty() {
-                byline.push(Span::styled(format!(" {age}"), theme.muted));
-            }
-            lines.push(Line::from_spans(byline).truncate(width));
-            let rows = markdown(&comment.body, body_width, MAX_COMMENT_ROWS, theme);
-            lines.extend(indented(rows, &pad, width));
-        }
-    }
+            comment_section(
+                &author,
+                at,
+                look.new.contains(&comment.comment_id),
+                &comment.body,
+                theme,
+                inner,
+            )
+        })
+        .collect();
     let mut buttons: Vec<(&str, ItemAction)> = Vec::new();
     if remote.can_reply && !remote.resolved {
         buttons.push(("Reply", ItemAction::Thread(ThreadAction::Reply)));
@@ -1975,98 +2093,91 @@ fn remote_thread_rows(
     if !remote.resolved {
         buttons.push(("Ask Bcode", ItemAction::Thread(ThreadAction::Ask)));
     }
-    let mut actions: Vec<ActionCells<ItemAction>> = fold.into_iter().collect();
-    let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let (rows, placed) = action_row(&buttons, row, body_indent.min(width), width, theme);
-    lines.extend(rows);
-    actions.extend(placed);
-    ItemRows::lines(lines, actions)
+    thread_card::Card {
+        title,
+        viewed: Some(look.checkbox.clone()),
+        sections,
+        buttons,
+        footer: line_reference(thread, theme),
+        border: look.border(remote.resolved, remote.waiting, theme),
+        folded: look.folded,
+    }
 }
 
-/// The header of a pull request thread: who started it, where, its state, and how it sits on
-/// the review.
-fn remote_thread_header(
-    thread: &bcode_code_review::document::ThreadItem,
+/// The header chips of a pull request thread: who started it, where, what is new, its state,
+/// and how it sits on the review.
+fn remote_title(
     remote: &super::notes::RemoteThreadInfo,
     comments: &[&bcode_code_review_models::DraftComment],
     held: usize,
+    look: &Look,
     theme: &ReviewTheme,
-    indent: usize,
-) -> Vec<Span> {
+) -> Vec<Vec<Span>> {
     use bcode_code_review::conversation::Placement;
     let icons = &theme.icons;
-    let first_author = comments
+    let first = comments
         .first()
-        .and_then(|comment| remote.authors.get(&comment.comment_id))
-        .map(|(author, _)| author.clone());
-    let mut header = vec![
-        Span::raw(" ".repeat(indent)),
+        .and_then(|comment| remote.authors.get(&comment.comment_id));
+    let mut lead = vec![
+        look.chevron(theme),
+        Span::raw(" "),
         Span::styled(icons.thread, theme.thread),
         Span::raw(" "),
     ];
-    if let Some(author) = first_author {
-        header.push(Span::styled(author, theme.title));
-        header.push(Span::raw(" "));
+    if let Some((author, _)) = first {
+        lead.push(Span::styled(author.clone(), theme.title));
     }
-    header.push(Span::styled(
-        format!("on {}", remote.provider_label),
-        theme.muted,
-    ));
-    header.push(Span::styled(icons.separator, theme.muted));
     let remote_count = comments.len() - held;
-    header.push(Span::styled(
-        format!(
-            "{remote_count} comment{}",
-            if remote_count == 1 { "" } else { "s" }
-        ),
-        theme.thread,
-    ));
-    let mut badge = |text: &str, style: Style| {
-        header.push(Span::raw(" "));
-        header.push(Span::styled(text.to_owned(), style));
-    };
-    if remote.new {
-        badge(&format!("{} new", icons.new), theme.badge_draft);
+    let mut title = vec![
+        lead,
+        vec![Span::styled(
+            format!(
+                "on {}{}{remote_count} comment{}",
+                remote.provider_label,
+                icons.separator,
+                if remote_count == 1 { "" } else { "s" }
+            ),
+            theme.muted,
+        )],
+    ];
+    match look.new_chip(theme) {
+        Some(chip) => title.push(chip),
+        None if remote.new && !look.viewed.is_viewed() => {
+            title.push(vec![Span::styled(
+                format!("{} new", icons.new),
+                theme.badge_draft,
+            )]);
+        }
+        None => {}
     }
     if remote.waiting {
-        badge("waiting on you", theme.pill_warning);
+        title.push(vec![Span::styled("waiting on you", theme.pill_warning)]);
     }
     if remote.resolved {
-        badge("resolved", theme.badge_resolved);
+        title.push(vec![Span::styled("resolved", theme.badge_resolved)]);
     } else if remote.outdated {
-        badge("outdated", theme.badge_outdated);
+        title.push(vec![Span::styled("outdated", theme.badge_outdated)]);
     }
-    match remote.placement {
-        Placement::Exact => {}
-        Placement::Moved => badge("moved with its code", theme.badge_outdated),
-        Placement::OnFile => badge("on an older version", theme.badge_outdated),
-        Placement::OnLayer => badge(
-            "on a file this layer no longer changes",
-            theme.badge_outdated,
-        ),
+    let placement = match remote.placement {
+        Placement::Exact => None,
+        Placement::Moved => Some("moved with its code"),
+        Placement::OnFile => Some("on an older version"),
+        Placement::OnLayer => Some("on a file this layer no longer changes"),
+    };
+    if let Some(placement) = placement {
+        title.push(vec![Span::styled(placement, theme.badge_outdated)]);
     }
     if held > 0 {
-        badge(
-            &format!(
+        title.push(vec![Span::styled(
+            format!(
                 "{} {held} {} held for your review",
                 icons.draft,
                 if held == 1 { "reply" } else { "replies" }
             ),
             theme.badge_draft,
-        );
+        )]);
     }
-    if let Some((_, start, end)) = thread.lines {
-        header.push(Span::styled(icons.separator, theme.muted));
-        header.push(Span::styled(
-            if start == end {
-                format!("L{end}")
-            } else {
-                format!("L{start}-{end}")
-            },
-            theme.muted,
-        ));
-    }
-    header
+    title
 }
 
 /// Component of one document item.

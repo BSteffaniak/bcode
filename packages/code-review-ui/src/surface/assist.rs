@@ -131,11 +131,8 @@ impl ReviewSurface {
         }
         match self.target() {
             Some(Target::Thread { thread_id, .. }) => {
-                let collapsed = !self.folds.collapsed.remove(&thread_id);
-                if collapsed {
-                    self.folds.collapsed.insert(thread_id);
-                }
-                self.folds_changed();
+                let collapsed = !self.folds.collapsed.contains(&thread_id);
+                self.fold_thread(&thread_id, collapsed);
                 self.set_status(
                     if collapsed {
                         "thread collapsed"
@@ -192,13 +189,7 @@ impl ReviewSurface {
             self.fold_files(any_open);
             return;
         }
-        let threads: std::collections::BTreeSet<String> = self
-            .notes
-            .drafts()
-            .iter()
-            .chain(self.notes.external_drafts())
-            .map(|draft| draft.thread_id.clone())
-            .collect();
+        let threads = self.notes.thread_ids();
         if threads.is_empty() {
             self.set_status("no threads to fold", StatusSeverity::Info);
             return;
@@ -206,14 +197,15 @@ impl ReviewSurface {
         let all_collapsed = threads
             .iter()
             .all(|thread| self.folds.collapsed.contains(thread));
-        if all_collapsed {
-            self.folds.collapsed.clear();
-            self.set_status("expanded every thread", StatusSeverity::Info);
-        } else {
-            self.folds.collapsed = threads;
-            self.set_status("collapsed every thread", StatusSeverity::Info);
-        }
-        self.folds_changed();
+        self.fold_threads(!all_collapsed);
+        self.set_status(
+            if all_collapsed {
+                "expanded every thread"
+            } else {
+                "collapsed every thread"
+            },
+            StatusSeverity::Info,
+        );
     }
 
     /// Fold every file to its header (`fold`), or open every file, by hand. The cursor stays on
@@ -574,7 +566,37 @@ impl ReviewSurface {
             NavKind::UnviewedFile,
             bcode_code_review::document::Direction::Forward,
             0,
-        ) || Self::run_motion(
+        ) {
+            return;
+        }
+        // Then threads not viewed (or with comments new since), loaded ones below.
+        let unviewed: std::collections::BTreeSet<&str> = self
+            .folds
+            .threads
+            .iter()
+            .filter(|(_, look)| !look.viewed.is_viewed())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let mut from = review.doc.index_of(&origin).unwrap_or(0);
+        while let Some(target) = review.doc.navigate(
+            from,
+            NavKind::Thread,
+            bcode_code_review::document::Direction::Forward,
+        ) {
+            if target.needs_load.is_none()
+                && target.opens.is_none()
+                && let ItemKey::Thread { thread_id } = &target.key
+                && unviewed.contains(thread_id.as_str())
+            {
+                review.set_cursor(target.index, AnchorPolicy::Center);
+                return;
+            }
+            if target.index <= from {
+                break;
+            }
+            from = target.index;
+        }
+        if Self::run_motion(
             review,
             origin,
             NavKind::OpenThread,
@@ -584,7 +606,7 @@ impl ReviewSurface {
             return;
         }
         self.set_status(
-            "nothing needs attention: every file is viewed and no thread is open below",
+            "nothing needs attention: every file and thread is viewed and none is open below",
             StatusSeverity::Info,
         );
     }

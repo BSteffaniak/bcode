@@ -62,6 +62,7 @@ impl ReviewSurface {
             viewed_files: std::collections::BTreeSet::new(),
             archived_at_ms: None,
             viewed_marks: Vec::new(),
+            viewed_threads: Vec::new(),
             reviewed_revisions: std::collections::BTreeMap::new(),
             presentation: None,
             stack_snapshots: Vec::new(),
@@ -196,6 +197,7 @@ impl ReviewSurface {
         review.note_splices();
         review.threads.borrow_mut().revision = None;
         review.marks_revision = None;
+        self.refresh_threads();
     }
 
     // ----------------------------------------------------------------------------------------
@@ -534,6 +536,12 @@ impl ReviewSurface {
             self.fold();
             return None;
         }
+        if action == ThreadAction::Viewed {
+            if !self.toggle_thread_viewed() {
+                self.set_status("move to a thread first", StatusSeverity::Warning);
+            }
+            return None;
+        }
         if let Some(thread_id) = self.thread_at_cursor()
             && self.remote_thread_action(&thread_id, action, None)
         {
@@ -577,18 +585,7 @@ impl ReviewSurface {
                     .delete_draft(&latest.comment_id)
                     .map(|()| Some("comment deleted"))
             }),
-            ThreadAction::Resolve => {
-                let resolved = first.resolved_at_ms.is_none();
-                self.notes
-                    .resolve(&thread_id, resolved, now_ms())
-                    .map(|()| {
-                        Some(if resolved {
-                            "thread resolved"
-                        } else {
-                            "thread reopened"
-                        })
-                    })
-            }
+            ThreadAction::Resolve => self.resolve_local(&thread_id, first.resolved_at_ms.is_none()),
             ThreadAction::Ask => {
                 self.open_composer(anchor, ComposerMode::Ask, "");
                 Ok(None)
@@ -613,6 +610,7 @@ impl ReviewSurface {
                 self.set_status("this thread has no web page", StatusSeverity::Info);
                 return None;
             }
+            ThreadAction::Viewed => return None,
         };
         match result {
             Ok(Some(message)) => self.set_status(message, StatusSeverity::Success),
@@ -621,6 +619,22 @@ impl ReviewSurface {
         }
         self.sync_notes();
         None
+    }
+
+    /// Resolve (or reopen) your own thread `thread_id`.
+    fn resolve_local(
+        &mut self,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<Option<&'static str>, String> {
+        self.notes.resolve(thread_id, resolved, now_ms())?;
+        self.sync_notes();
+        self.resolved_by_you(thread_id, resolved);
+        Ok(Some(if resolved {
+            "thread resolved"
+        } else {
+            "thread reopened"
+        }))
     }
 
     /// Cycle the cursor thread's kind or severity.
@@ -930,8 +944,9 @@ impl ReviewSurface {
         let stamp = self
             .notes
             .revision()
-            .wrapping_mul(8)
-            .wrapping_add(self.threads_filter as u64);
+            .wrapping_mul(16)
+            .wrapping_add(self.threads_filter as u64)
+            ^ self.folds.revision.rotate_left(29);
         let mut rows = review.threads.borrow_mut();
         if rows.revision == Some(stamp) {
             return;
@@ -952,7 +967,7 @@ impl ReviewSurface {
             let Some(first) = comments.first() else {
                 continue;
             };
-            if !self.threads_filter.matches_thread(first) {
+            if !self.threads_filter.matches_thread(first) || !self.listed(&first.thread_id) {
                 continue;
             }
             let resolved = first.resolved_at_ms.is_some();
@@ -966,6 +981,7 @@ impl ReviewSurface {
                     thread_id: first.thread_id.clone(),
                 },
                 Line::from_spans(vec![
+                    self.viewed_mark(&first.thread_id),
                     Span::styled(theme.icons.thread, theme.thread),
                     Span::raw(" "),
                     if resolved {
@@ -1024,12 +1040,31 @@ impl ReviewSurface {
         }
     }
 
+    /// Whether the threads filter lists `thread_id` by its viewed state.
+    fn listed(&self, thread_id: &str) -> bool {
+        self.threads_filter != super::find::ThreadsFilter::Unviewed
+            || !self.thread_viewed(thread_id).is_viewed()
+    }
+
+    /// A threads panel row's viewed mark: `✓ `, `○ `, or `• N ` when comments came since.
+    fn viewed_mark(&self, thread_id: &str) -> Span {
+        let theme = &self.theme;
+        let viewed = self.thread_viewed(thread_id);
+        match viewed.new_count() {
+            0 if viewed.is_viewed() => {
+                Span::styled(format!("{} ", theme.icons.viewed), theme.viewed)
+            }
+            0 => Span::styled(format!("{} ", theme.icons.unviewed), theme.muted),
+            new => Span::styled(format!("{} {new} ", theme.icons.new), theme.badge_draft),
+        }
+    }
+
     /// Threads panel entries of pull request threads: `(path, line, key, row)`.
     fn remote_thread_entries(&self) -> Vec<(String, u32, ItemKey, Line)> {
         let theme = &self.theme;
         let mut entries = Vec::new();
         for (thread_id, remote) in self.notes.remote_threads() {
-            if !self.threads_filter.matches_remote(remote) {
+            if !self.threads_filter.matches_remote(remote) || !self.listed(thread_id) {
                 continue;
             }
             let comments = self.notes.thread(thread_id);
@@ -1058,6 +1093,7 @@ impl ReviewSurface {
                     thread_id: thread_id.clone(),
                 },
                 Line::from_spans(vec![
+                    self.viewed_mark(thread_id),
                     Span::styled(theme.icons.thread, theme.thread),
                     Span::raw(" "),
                     Span::styled(state, style),
@@ -1087,6 +1123,7 @@ impl ReviewSurface {
         for draft in self.notes.external_drafts() {
             if !seen_external.insert(draft.thread_id.clone())
                 || !self.threads_filter.matches_thread(draft)
+                || !self.listed(&draft.thread_id)
             {
                 continue;
             }
@@ -1101,6 +1138,7 @@ impl ReviewSurface {
                     thread_id: draft.thread_id.clone(),
                 },
                 Line::from_spans(vec![
+                    self.viewed_mark(&draft.thread_id),
                     Span::styled(theme.icons.thread, theme.thread),
                     Span::raw(" "),
                     Span::styled("imported", theme.badge_ai),

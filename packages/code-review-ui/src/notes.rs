@@ -158,6 +158,8 @@ pub struct RemoteThreadInfo {
     pub url: Option<String>,
     /// Author and time per comment id.
     pub authors: std::collections::BTreeMap<String, (String, Option<u64>)>,
+    /// Comments the viewer wrote, by id.
+    pub mine: std::collections::BTreeSet<String>,
 }
 
 /// One remote thread to show: its info and comments (already anchored).
@@ -541,6 +543,49 @@ impl ReviewNotes {
             (a.created_at_ms, &a.comment_id).cmp(&(b.created_at_ms, &b.comment_id))
         });
         comments
+    }
+
+    /// Every thread shown, by id: drafts, imported and pull request threads.
+    #[must_use]
+    pub fn thread_ids(&self) -> std::collections::BTreeSet<String> {
+        self.drafts
+            .iter()
+            .filter(|draft| draft.anchor.reply_to.is_none())
+            .chain(&self.external_drafts)
+            .chain(&self.remote_drafts)
+            .map(|draft| draft.thread_id.clone())
+            .collect()
+    }
+
+    /// A thread's comments as viewed state counts them: id, and whether the viewer wrote it
+    /// (drafts and held replies are; imported comments are not).
+    #[must_use]
+    pub fn comment_refs(&self, thread_id: &str) -> Vec<(String, bool)> {
+        let remote = self.remote.get(thread_id);
+        let external = thread_id.starts_with(EXTERNAL_PREFIX);
+        self.thread(thread_id)
+            .into_iter()
+            .map(|comment| {
+                let id = &comment.comment_id;
+                let mine = remote.map_or(!external, |info| {
+                    info.mine.contains(id) || !id.starts_with(REMOTE_PREFIX)
+                });
+                (id.clone(), mine)
+            })
+            .collect()
+    }
+
+    /// Whether a thread is resolved: its forge's state, or every comment resolved.
+    #[must_use]
+    pub fn thread_resolved(&self, thread_id: &str) -> bool {
+        if let Some(info) = self.remote.get(thread_id) {
+            return info.resolved;
+        }
+        let comments = self.thread(thread_id);
+        !comments.is_empty()
+            && comments
+                .iter()
+                .all(|comment| comment.resolved_at_ms.is_some())
     }
 
     /// Every draft.

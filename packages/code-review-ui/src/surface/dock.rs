@@ -943,16 +943,19 @@ impl ReviewSurface {
         let workspace = self.workspace_mut();
         if workspace.viewed_files == stored.viewed_files
             && workspace.viewed_marks == stored.viewed_marks
+            && workspace.viewed_threads == stored.viewed_threads
         {
             return;
         }
         workspace.viewed_files.clone_from(&stored.viewed_files);
         workspace.viewed_marks.clone_from(&stored.viewed_marks);
+        workspace.viewed_threads.clone_from(&stored.viewed_threads);
         let workspace = workspace.clone();
         if let Some(review) = self.review.as_mut() {
             review.doc.set_viewed_marks(&workspace);
             review.note_splices();
         }
+        self.refresh_threads();
     }
 
     /// Move the cursor to where a navigation tool call pointed.

@@ -34,6 +34,7 @@ impl<'a> CodeReviewDb<'a> {
                 "archived_at_ms",
                 "viewed_files_json",
                 "viewed_marks_json",
+                "viewed_threads_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
                 "stack_snapshots_json",
@@ -79,6 +80,7 @@ impl<'a> CodeReviewDb<'a> {
                 "archived_at_ms",
                 "viewed_files_json",
                 "viewed_marks_json",
+                "viewed_threads_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
                 "stack_snapshots_json",
@@ -96,6 +98,7 @@ impl<'a> CodeReviewDb<'a> {
         let sources_json = serde_json::to_string(&workspace.sources)?;
         let viewed_files_json = serde_json::to_string(&workspace.viewed_files)?;
         let viewed_marks_json = serde_json::to_string(&workspace.viewed_marks)?;
+        let viewed_threads_json = serde_json::to_string(&workspace.viewed_threads)?;
         let reviewed_revisions_json = serde_json::to_string(&workspace.reviewed_revisions)?;
         let presentation_json = workspace
             .presentation
@@ -113,6 +116,7 @@ impl<'a> CodeReviewDb<'a> {
                 .value("sources_json", sources_json)
                 .value("viewed_files_json", viewed_files_json.clone())
                 .value("viewed_marks_json", viewed_marks_json.clone())
+                .value("viewed_threads_json", viewed_threads_json.clone())
                 .value("reviewed_revisions_json", reviewed_revisions_json.clone())
                 .value("presentation_v2_json", presentation_json.clone())
                 .value("stack_snapshots_json", stack_snapshots_json.clone())
@@ -134,6 +138,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("sources_json", sources_json)
             .value("viewed_files_json", viewed_files_json)
             .value("viewed_marks_json", viewed_marks_json)
+            .value("viewed_threads_json", viewed_threads_json)
             .value("reviewed_revisions_json", reviewed_revisions_json)
             .value("presentation_v2_json", presentation_json)
             .value("stack_snapshots_json", stack_snapshots_json)
@@ -1467,6 +1472,21 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(workspace_stack_snapshots_column_migration());
     source.add_migration(super::history::layer_versions_table_migration());
     source.add_migration(thread_reply_to_column_migration());
+    source.add_migration(workspace_viewed_threads_column_migration());
+}
+
+/// Threads marked viewed (see `ReviewWorkspace::viewed_threads`); older rows read as none.
+pub fn workspace_viewed_threads_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "025_workspace_viewed_threads_column".to_string(),
+        Box::new(alter_table("review_workspaces").add_column(
+            "viewed_threads_json".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
 }
 
 /// The pull request thread a draft thread replies to (see `DraftAnchor::reply_to`).
@@ -1839,6 +1859,8 @@ pub fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, StoreError> {
         viewed_files,
         archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
         viewed_marks: optional_text(row, "viewed_marks_json")
+            .map_or_else(|| Ok(Vec::new()), |json| serde_json::from_str(&json))?,
+        viewed_threads: optional_text(row, "viewed_threads_json")
             .map_or_else(|| Ok(Vec::new()), |json| serde_json::from_str(&json))?,
         reviewed_revisions: optional_text(row, "reviewed_revisions_json")
             .map_or_else(|| Ok(BTreeMap::new()), |json| serde_json::from_str(&json))?,

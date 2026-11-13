@@ -34,6 +34,8 @@ pub struct ComponentStyles {
     pub diff: DiffViewerStyle,
     /// The review's file chrome, where the theme sets it (`source.file.*`).
     pub files: FileChromeRoles,
+    /// The review's thread cards, where the theme sets them (`source.thread.*`).
+    pub threads: ThreadCardRoles,
     /// Markdown presentation.
     pub markdown: MarkdownTheme,
     /// Syntax colors for code.
@@ -53,6 +55,19 @@ pub struct FileChromeRoles {
     pub edge: Option<Style>,
     /// `source.file.label`: the label on the rule between files.
     pub label: Option<Style>,
+}
+
+/// The `source.thread.*` roles a theme sets; the review derives the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadCardRoles {
+    /// `source.thread.border`: a viewed thread's frame.
+    pub border: Option<Style>,
+    /// `source.thread.unviewed`: an unviewed thread's frame.
+    pub unviewed: Option<Style>,
+    /// `source.thread.waiting`: the frame of a thread waiting on you.
+    pub waiting: Option<Style>,
+    /// `source.thread.resolved`: a resolved thread's frame.
+    pub resolved: Option<Style>,
 }
 
 /// Derive component styles from `theme`, or terminal defaults when there is none.
@@ -144,6 +159,12 @@ pub fn component_styles(theme: Option<&ResolvedThemeDefinition>, accent: Color) 
             desk: style("source.file.desk"),
             edge: style("source.file.edge"),
             label: style("source.file.label"),
+        },
+        threads: ThreadCardRoles {
+            border: style("source.thread.border"),
+            unviewed: style("source.thread.unviewed"),
+            waiting: style("source.thread.waiting"),
+            resolved: style("source.thread.resolved"),
         },
         markdown: markdown_theme(theme, text, muted),
         syntax: syntax_palette(theme, text, muted, info, success, warning),

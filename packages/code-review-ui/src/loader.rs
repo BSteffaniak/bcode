@@ -740,6 +740,7 @@ pub fn transient_viewed_record(
         viewed_files: transient.viewed_files.clone(),
         archived_at_ms: None,
         viewed_marks: transient.viewed_marks.clone(),
+        viewed_threads: transient.viewed_threads.clone(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         // Only what an unsaved review remembers besides its viewed files: dismissed notices.
         presentation: transient

@@ -145,6 +145,7 @@ impl OpenReview {
             viewed_files: self.workspace.viewed_files.clone(),
             archived_at_ms: None,
             viewed_marks: self.workspace.viewed_marks.clone(),
+            viewed_threads: self.workspace.viewed_threads.clone(),
             reviewed_revisions: BTreeMap::new(),
             presentation: None,
             stack_snapshots: Vec::new(),

@@ -662,6 +662,12 @@ pub fn remote_notes(
                 )
             })
             .collect();
+        let mine = thread
+            .comments
+            .iter()
+            .filter(|comment| comment.author.is_viewer)
+            .map(|comment| format!("{thread_id}\u{1}{}", comment.id))
+            .collect();
         let capabilities = conversations
             .provider(key)
             .map(|provider| provider.capabilities)
@@ -687,6 +693,7 @@ pub fn remote_notes(
                     .first()
                     .and_then(|comment| comment.url.clone()),
                 authors,
+                mine,
             },
             comments,
         });

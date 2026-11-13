@@ -72,6 +72,8 @@ pub enum HeaderPart {
     Viewed,
     /// Viewed progress bar.
     Progress,
+    /// `threads x/y` text (when the review has threads).
+    Threads,
     /// Draft count.
     Drafts,
     /// Layout mode (`unified` / `split`, `nowrap`).
@@ -83,13 +85,14 @@ pub enum HeaderPart {
 /// Header parts in the order they are dropped when the row is too narrow (first dropped
 /// first). Source chips after the first collapse into a `+N` chip before anything else goes;
 /// the title is never dropped.
-pub const HEADER_ELISION_ORDER: [HeaderPart; 8] = [
+pub const HEADER_ELISION_ORDER: [HeaderPart; 9] = [
     HeaderPart::Publish,
     HeaderPart::Chip(1),
     HeaderPart::Drafts,
     HeaderPart::Totals,
     HeaderPart::Chip(0),
     HeaderPart::Progress,
+    HeaderPart::Threads,
     HeaderPart::Mode,
     HeaderPart::Viewed,
 ];
@@ -103,6 +106,8 @@ pub struct HeaderModel {
     pub sources: Vec<String>,
     /// Viewed files and all files.
     pub viewed: (usize, usize),
+    /// Viewed threads and all threads.
+    pub threads: (usize, usize),
     /// Lines added and removed across the review.
     pub totals: (u64, u64),
     /// Draft comments.
@@ -116,6 +121,10 @@ pub struct HeaderModel {
 impl HeaderModel {
     fn viewed_text(&self) -> String {
         format!("viewed {}/{}", self.viewed.0, self.viewed.1)
+    }
+
+    fn threads_text(&self) -> String {
+        format!("threads {}/{}", self.threads.0, self.threads.1)
     }
 
     fn drafts_text(&self) -> String {
@@ -243,6 +252,10 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
         ),
         (HeaderPart::Progress, PROGRESS_CELLS),
         (
+            HeaderPart::Threads,
+            text_width(&Line::raw(model.threads_text())),
+        ),
+        (
             HeaderPart::Drafts,
             text_width(&Line::raw(model.drafts_text())),
         ),
@@ -250,7 +263,12 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
         (HeaderPart::Publish, publish_button(&items, theme).width()),
     ];
     let title = text_width(&Line::raw(format!(" {}", model.title)));
-    let mut shown: Vec<HeaderPart> = left.iter().chain(&right).map(|(part, _)| *part).collect();
+    let mut shown: Vec<HeaderPart> = left
+        .iter()
+        .chain(&right)
+        .map(|(part, _)| *part)
+        .filter(|part| *part != HeaderPart::Threads || model.threads.1 > 0)
+        .collect();
     let used = |shown: &[HeaderPart]| -> u16 {
         let mut total = 0_u16;
         let mut count = 0_u16;
@@ -384,6 +402,17 @@ pub fn paint_header(
                     rect,
                 );
             }
+            HeaderPart::Threads => text(
+                cx,
+                Line::from_spans(vec![Span::styled(
+                    model.threads_text(),
+                    if model.threads.0 == model.threads.1 {
+                        theme.viewed
+                    } else {
+                        theme.muted
+                    },
+                )]),
+            ),
             HeaderPart::Drafts => text(
                 cx,
                 Line::from_spans(vec![Span::styled(
@@ -772,6 +801,7 @@ mod tests {
                 .map(|index| format!("source {index}"))
                 .collect(),
             viewed: (3, 12),
+            threads: (1, 4),
             totals: (120, 45),
             drafts: 2,
             unsaved: false,

@@ -154,6 +154,10 @@ pub struct ReviewWorkspace {
     /// unknown identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub viewed_marks: Vec<ViewedMark>,
+    /// Threads marked viewed, each pinned to the comments it had then: a comment from someone
+    /// else after that makes the thread unviewed again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewed_threads: Vec<ThreadViewMark>,
     /// Last resolved revisions per source id, recorded when a review pass completes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reviewed_revisions: BTreeMap<String, ReviewedRevision>,
@@ -170,6 +174,27 @@ pub struct ReviewWorkspace {
     /// pins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack_snapshots: Vec<ReviewStackSnapshot>,
+}
+
+/// A thread marked viewed: what it had when it was marked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadViewMark {
+    /// The review's thread id.
+    pub thread_id: String,
+    /// The comments it had (their ids).
+    pub comment_ids: Vec<String>,
+    /// When it was marked, in milliseconds since the Unix epoch.
+    pub viewed_at_ms: u64,
+}
+
+/// A thread folded or opened by hand, and how many comments it had then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadFoldMark {
+    /// Folded (else opened).
+    pub folded: bool,
+    /// Comments it had; `None` for a fold kept from before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<usize>,
 }
 
 /// A stack as its provider last resolved or confirmed it, saved with a review.
@@ -405,9 +430,13 @@ pub struct ReviewPresentationState {
     /// Last position in each stack layer of a step-through review, by workspace source id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub layer_positions: BTreeMap<String, ReviewItemKey>,
-    /// Thread ids shown collapsed (header only).
+    /// Thread ids folded by hand, from before folds recorded their comment count (read as
+    /// [`Self::thread_folds`] without a count).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub collapsed_threads: BTreeSet<String>,
+    /// Threads folded or opened by hand.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub thread_folds: BTreeMap<String, ThreadFoldMark>,
     /// AI exchange ids whose whole answer is shown instead of the preview.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub expanded_answers: BTreeSet<String>,
@@ -453,6 +482,7 @@ impl Default for ReviewPresentationState {
             expansions: Vec::new(),
             layer_positions: BTreeMap::new(),
             collapsed_threads: BTreeSet::new(),
+            thread_folds: BTreeMap::new(),
             expanded_answers: BTreeSet::new(),
             hide_resolved_threads: false,
             hide_viewed_files: false,
@@ -486,6 +516,7 @@ impl ReviewWorkspace {
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
             viewed_marks: Vec::new(),
+            viewed_threads: Vec::new(),
             reviewed_revisions: BTreeMap::new(),
             presentation: None,
             stack_snapshots: Vec::new(),

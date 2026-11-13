@@ -160,6 +160,7 @@ mod history;
 mod pointer;
 mod stack;
 mod stack_files;
+mod threads;
 
 pub use annotate::COMPOSER_SCOPE;
 pub use conversation::{BarState, ConversationMessage};
@@ -698,6 +699,7 @@ pub struct ReviewSurface {
     transient_viewed: Option<(
         std::collections::BTreeSet<String>,
         Vec<bcode_code_review_models::ViewedMark>,
+        Vec<bcode_code_review_models::ThreadViewMark>,
     )>,
     /// The open publish or import flow.
     modal: Option<Modal>,
@@ -919,7 +921,15 @@ impl ReviewSurface {
         if let Some(state) = &workspace.presentation {
             self.panels = Panels::restore(&state.panels);
             self.layer_positions.clone_from(&state.layer_positions);
-            self.folds.collapsed.clone_from(&state.collapsed_threads);
+            self.folds.hand.clone_from(&state.thread_folds);
+            for thread_id in &state.collapsed_threads {
+                self.folds.hand.entry(thread_id.clone()).or_insert(
+                    bcode_code_review_models::ThreadFoldMark {
+                        folded: true,
+                        comments: None,
+                    },
+                );
+            }
             self.folds.expanded.clone_from(&state.expanded_answers);
             self.hide_resolved = state.hide_resolved_threads;
             self.hide_viewed_files = state.hide_viewed_files;
@@ -1200,6 +1210,13 @@ impl ReviewSurface {
                 ^ self.folds.revision.wrapping_mul(0x5851_f42d),
             density: self.file_ui.density,
             separation: self.separation(),
+            threads: {
+                let config = self.services.conversation_config();
+                super::rows::thread_card::Params {
+                    mode: config.threads.card,
+                    max_width: config.threads.width,
+                }
+            },
         }
     }
 
@@ -2061,10 +2078,20 @@ impl ReviewSurface {
             workspace.viewed_marks.extend(stored.viewed_marks);
             workspace.viewed_marks.sort();
             workspace.viewed_marks.dedup();
+            for mark in stored.viewed_threads {
+                if !workspace
+                    .viewed_threads
+                    .iter()
+                    .any(|kept| kept.thread_id == mark.thread_id)
+                {
+                    workspace.viewed_threads.push(mark);
+                }
+            }
         }
         let viewed = (
             workspace.viewed_files.clone(),
             workspace.viewed_marks.clone(),
+            workspace.viewed_threads.clone(),
         );
         self.transient_viewed = Some(viewed);
     }
@@ -2577,7 +2604,14 @@ impl ReviewSurface {
                 .agent_action(super::rows::AgentAction::Open)
                 .unwrap_or(Action::Redraw),
             "viewed" => {
-                self.toggle_viewed();
+                // On a thread: the thread; else the cursor's file.
+                if !self.toggle_thread_viewed() {
+                    self.toggle_viewed();
+                }
+                Action::Redraw
+            }
+            "view_threads" | "unview_threads" | "fold_threads" | "open_threads" => {
+                self.threads_action(action);
                 Action::Redraw
             }
             "range" => {
@@ -3655,6 +3689,7 @@ impl ReviewSurface {
                 .filter(|label| self.sources.len() > 1 || *label != self.title)
                 .collect(),
             viewed,
+            threads: self.threads_progress(),
             totals,
             drafts: self.notes.draft_count(),
             unsaved: self.is_transient(),

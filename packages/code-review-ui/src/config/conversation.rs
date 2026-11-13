@@ -9,6 +9,14 @@
 //! fold_resolved = true
 //! outdated_on_file = true
 //!
+//! # Threads (yours and pull requests'); see `docs/review-thread-cards.md`.
+//! [plugins.config."bcode.code_review".conversation.threads]
+//! fold_viewed = true
+//! resolve_marks_viewed = true
+//! new_comments = "reopen"  # or "keep_folded": a folded thread stays folded, marked new
+//! card = "compact"         # header and buttons in the frame; or "roomy": rows of their own
+//! width = 110              # widest a thread card gets; 0 for the whole width
+//!
 //! [plugins.config."bcode.code_review".conversation.signals]
 //! provider = true          # ask providers that can say when conversations change
 //! min_gap_ms = 2000        # least time between two reads of the same conversations
@@ -43,6 +51,28 @@ pub enum OverviewMode {
     /// Open: the description, reviews, checks, and conversation.
     #[default]
     Expanded,
+}
+
+/// What a new comment does to a folded thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewCommentsMode {
+    /// It opens again.
+    #[default]
+    Reopen,
+    /// It stays folded, with a *new* chip.
+    KeepFolded,
+}
+
+/// How a thread card is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadCardMode {
+    /// The header in the top border and the buttons in the bottom one: no rows for the frame.
+    #[default]
+    Compact,
+    /// The header and the buttons on rows of their own inside the frame.
+    Roomy,
 }
 
 /// Which new activity makes a toast.
@@ -108,13 +138,58 @@ pub struct ConversationConfig {
     pub overview: OverviewMode,
     /// Which new activity makes a toast.
     pub notify: NotifyMode,
-    /// Resolved remote threads start folded.
+    /// Resolved threads fold by themselves.
     pub fold_resolved: bool,
+    /// Thread cards and their viewed and folded states.
+    pub threads: ThreadsConfig,
     /// Threads whose code could not be followed show on their file (else only in the threads
     /// panel).
     pub outdated_on_file: bool,
     /// When conversations are read again.
     pub signals: SignalsConfig,
+}
+
+/// `conversation.threads`: thread cards and their viewed and folded states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadsConfig {
+    /// Viewed threads fold by themselves.
+    pub fold_viewed: bool,
+    /// Resolving a thread yourself marks it viewed.
+    pub resolve_marks_viewed: bool,
+    /// What a new comment does to a folded thread.
+    pub new_comments: NewCommentsMode,
+    /// How thread cards are laid out.
+    pub card: ThreadCardMode,
+    /// Widest a thread card gets, in cells; 0 for the whole width.
+    pub width: u16,
+}
+
+impl Default for ThreadsConfig {
+    fn default() -> Self {
+        Self {
+            fold_viewed: true,
+            resolve_marks_viewed: true,
+            new_comments: NewCommentsMode::default(),
+            card: ThreadCardMode::default(),
+            width: 110,
+        }
+    }
+}
+
+impl ConversationConfig {
+    /// What folds a thread by itself.
+    #[must_use]
+    pub const fn fold_rules(&self) -> bcode_code_review::threads::FoldRules {
+        bcode_code_review::threads::FoldRules {
+            fold_viewed: self.threads.fold_viewed,
+            fold_resolved: self.fold_resolved,
+            new_comments: match self.threads.new_comments {
+                NewCommentsMode::Reopen => bcode_code_review::threads::NewComments::Reopen,
+                NewCommentsMode::KeepFolded => bcode_code_review::threads::NewComments::KeepFolded,
+            },
+        }
+    }
 }
 
 impl Default for ConversationConfig {
@@ -125,6 +200,7 @@ impl Default for ConversationConfig {
             overview: OverviewMode::default(),
             notify: NotifyMode::default(),
             fold_resolved: true,
+            threads: ThreadsConfig::default(),
             outdated_on_file: true,
             signals: SignalsConfig::default(),
         }

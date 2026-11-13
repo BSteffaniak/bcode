@@ -37,6 +37,7 @@ pub mod session;
 pub mod store;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod threads;
 pub mod viewed;
 
 pub use data::{DataError, ReviewData};

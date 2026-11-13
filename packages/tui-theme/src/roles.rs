@@ -865,6 +865,30 @@ pub const ROLES: &[RoleSpec] = &[
         None,
     ),
     role(
+        "source.thread.border",
+        RoleCategory::Source,
+        "a review thread card's frame once viewed; unset uses border.default",
+        None,
+    ),
+    role(
+        "source.thread.unviewed",
+        RoleCategory::Source,
+        "a review thread card's frame while unviewed; unset uses the accent",
+        None,
+    ),
+    role(
+        "source.thread.waiting",
+        RoleCategory::Source,
+        "a review thread card's frame when it waits on you; unset uses state.warning",
+        None,
+    ),
+    role(
+        "source.thread.resolved",
+        RoleCategory::Source,
+        "a resolved review thread card's frame; unset uses state.success, dimmed",
+        None,
+    ),
+    role(
         "diff.text",
         RoleCategory::Source,
         "diff text",

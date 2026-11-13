@@ -282,13 +282,6 @@ impl ReviewSurface {
                 }
                 let config = self.services.conversation_config();
                 let notes = conv::remote_notes(&placed, &self.talk.data, &self.talk.seen, &config);
-                if config.fold_resolved {
-                    for note in &notes {
-                        if note.info.resolved {
-                            self.folds.collapsed.insert(note.thread_id.clone());
-                        }
-                    }
-                }
                 if self.notes.set_remote(notes) {
                     self.sync_notes();
                 }
@@ -589,6 +582,10 @@ impl ReviewSurface {
                         resolved: !info.resolved,
                     },
                 );
+                self.resolved_by_you(thread_id, !info.resolved);
+            }
+            ThreadAction::Viewed => {
+                self.toggle_thread_viewed();
             }
             ThreadAction::Open => match (&info.url, host) {
                 (Some(url), Some(host)) => self.open_url(url, host),

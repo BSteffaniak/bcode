@@ -140,7 +140,7 @@ keymap_actions = [
     { id = "bcode.code_review.thread_previous", scope = "code-review", description = "Previous thread", defaults = [
         "(",
     ] },
-    { id = "bcode.code_review.viewed", scope = "code-review", description = "Mark the file viewed and go to the next unviewed file", defaults = [
+    { id = "bcode.code_review.viewed", scope = "code-review", description = "Mark the file viewed and go to the next unviewed file; on a thread, mark the thread viewed", defaults = [
         "v",
     ] },
     { id = "bcode.code_review.unviewed_next", scope = "code-review", description = "Next unviewed file", defaults = [
@@ -253,6 +253,14 @@ keymap_actions = [
     { id = "bcode.code_review.ask_file", scope = "code-review", description = "Ask Bcode about this file", defaults = [
     ] },
     { id = "bcode.code_review.collapse_file", scope = "code-review", description = "Fold this file to its header (or open it); viewed files fold by themselves", defaults = [
+    ] },
+    { id = "bcode.code_review.view_threads", scope = "code-review", description = "Mark every thread viewed (they fold until someone comments)", defaults = [
+    ] },
+    { id = "bcode.code_review.unview_threads", scope = "code-review", description = "Mark every thread unviewed", defaults = [
+    ] },
+    { id = "bcode.code_review.fold_threads", scope = "code-review", description = "Fold every thread", defaults = [
+    ] },
+    { id = "bcode.code_review.open_threads", scope = "code-review", description = "Open every thread, viewed and resolved ones too", defaults = [
     ] },
     { id = "bcode.code_review.fold_files", scope = "code-review", description = "Fold every file to its header", defaults = [
     ] },

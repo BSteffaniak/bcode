@@ -56,6 +56,8 @@ pub enum ThreadsFilter {
     /// Pull request threads waiting on the viewer: someone else spoke last on something they
     /// are part of.
     WaitingOnYou,
+    /// Threads not viewed (or with comments new since).
+    Unviewed,
 }
 
 impl ThreadsFilter {
@@ -69,7 +71,8 @@ impl ThreadsFilter {
             Self::General => Self::Resolved,
             Self::Resolved => Self::PullRequest,
             Self::PullRequest => Self::WaitingOnYou,
-            Self::WaitingOnYou => Self::All,
+            Self::WaitingOnYou => Self::Unviewed,
+            Self::Unviewed => Self::All,
         }
     }
 
@@ -77,7 +80,8 @@ impl ThreadsFilter {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::All => Self::WaitingOnYou,
+            Self::All => Self::Unviewed,
+            Self::Unviewed => Self::WaitingOnYou,
             Self::WaitingOnYou => Self::PullRequest,
             Self::PullRequest => Self::Resolved,
             Self::Resolved => Self::General,
@@ -98,15 +102,17 @@ impl ThreadsFilter {
             Self::Resolved => "resolved",
             Self::PullRequest => "on the pull request",
             Self::WaitingOnYou => "waiting on you",
+            Self::Unviewed => "unviewed",
         }
     }
 
-    /// Whether a thread (by its first comment) is listed.
+    /// Whether a thread (by its first comment) is listed. [`Self::Unviewed`] lists every
+    /// thread here; the panel checks viewed state itself.
     #[must_use]
     pub fn matches_thread(self, first: &DraftComment) -> bool {
         let open = first.resolved_at_ms.is_none();
         match self {
-            Self::All => true,
+            Self::All | Self::Unviewed => true,
             Self::Open => open,
             Self::Attention => {
                 open && (matches!(
@@ -127,7 +133,7 @@ impl ThreadsFilter {
     #[must_use]
     pub const fn matches_remote(self, remote: &crate::notes::RemoteThreadInfo) -> bool {
         match self {
-            Self::All | Self::PullRequest => true,
+            Self::All | Self::PullRequest | Self::Unviewed => true,
             Self::Open => !remote.resolved,
             Self::Attention => !remote.resolved && (remote.waiting || remote.new),
             Self::General => matches!(
@@ -146,7 +152,7 @@ impl ThreadsFilter {
             Self::All | Self::Open => true,
             Self::Attention => exchange.status == ReviewAiExchangeStatus::Failed,
             Self::General => exchange.anchor.kind == ReviewAnchorKind::Review,
-            Self::Resolved | Self::PullRequest | Self::WaitingOnYou => false,
+            Self::Resolved | Self::PullRequest | Self::WaitingOnYou | Self::Unviewed => false,
         }
     }
 }
@@ -589,7 +595,9 @@ impl ReviewSurface {
             .unwrap_or_default();
         state.panels = self.panels.state();
         state.layer_positions.clone_from(&self.layer_positions);
-        state.collapsed_threads.clone_from(&self.folds.collapsed);
+        // Folds by hand (older states listed folded threads in `collapsed_threads`).
+        state.collapsed_threads.clear();
+        state.thread_folds.clone_from(&self.folds.hand);
         state.expanded_answers.clone_from(&self.folds.expanded);
         state.hide_resolved_threads = self.hide_resolved;
         state.hide_viewed_files = self.hide_viewed_files;
@@ -666,6 +674,7 @@ impl ReviewSurface {
                 let viewed = (
                     workspace.viewed_files.clone(),
                     workspace.viewed_marks.clone(),
+                    workspace.viewed_threads.clone(),
                 );
                 let changed = self.transient_viewed.as_ref() != Some(&viewed);
                 self.transient_viewed = Some(viewed);

@@ -1318,6 +1318,7 @@ fn create_review_workspace_for_request(
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
         viewed_marks: Vec::new(),
+        viewed_threads: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
         presentation: None,
         stack_snapshots: Vec::new(),

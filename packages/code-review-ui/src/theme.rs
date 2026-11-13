@@ -24,7 +24,7 @@ pub use load::{DEFAULT_THEME, HostTheme};
 pub use tiers::Tiers;
 
 use bcode_code_review_models::ReviewFileStatus;
-use bcode_tui_theme::components::{ComponentStyles, FileChromeRoles};
+use bcode_tui_theme::components::{ComponentStyles, FileChromeRoles, ThreadCardRoles};
 use bmux_color::Rgb;
 use bmux_tui::capabilities::TerminalColorDepth;
 use bmux_tui::chrome::BorderSet;
@@ -323,6 +323,8 @@ pub struct ReviewTheme {
     pub hunk_fill: Style,
     /// File headers, the breaks between files, and the pinned headers' edge.
     pub files: FileStyles,
+    /// Frames of thread cards.
+    pub threads: ThreadStyles,
     /// Source and stack-layer header.
     pub source_header: Style,
     /// Gap row text.
@@ -453,6 +455,7 @@ impl ReviewTheme {
         let tiers = Tiers::derive(&component, styles.control_focused.fg, &alternates);
         let mut theme = Self::from_tiers(tiers, component, styles.diff, Icons::for_style(icons));
         theme.files = FileStyles::of(&tiers, styles.files);
+        theme.threads = ThreadStyles::of(&tiers, &component, styles.threads);
         theme
     }
 
@@ -547,6 +550,7 @@ impl ReviewTheme {
             hunk: diff.hunk,
             hunk_fill: tiers.canvas.patch(diff.hunk),
             files: FileStyles::of(&tiers, FileChromeRoles::default()),
+            threads: ThreadStyles::of(&tiers, &component, ThreadCardRoles::default()),
             source_header: bold(tiers.accent),
             gap: tiers.dim,
             gap_action: bold(component.link),
@@ -603,6 +607,9 @@ impl ReviewTheme {
                 self.publish.button.normal.add_modifier(Modifier::REVERSED);
             // No colors, no desk: cards fall back to a rule.
             self.files.desk = Style::new();
+            // An unviewed or waiting thread's frame is bold instead of colored.
+            self.threads.unviewed = self.threads.unviewed.add_modifier(Modifier::BOLD);
+            self.threads.waiting = self.threads.waiting.add_modifier(Modifier::BOLD);
         }
         self
     }
@@ -803,6 +810,33 @@ fn modified_status(tiers: &Tiers, taken: [Style; 3]) -> Style {
         tiers.strong
     } else {
         tiers.accent.add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Frames of thread cards, by the thread's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadStyles {
+    /// Viewed.
+    pub viewed: Style,
+    /// Not viewed (or new comments since).
+    pub unviewed: Style,
+    /// Waiting on you.
+    pub waiting: Style,
+    /// Resolved.
+    pub resolved: Style,
+}
+
+impl ThreadStyles {
+    fn of(tiers: &Tiers, component: &ComponentTheme, roles: ThreadCardRoles) -> Self {
+        let fg = |style: Style| style.fg.map_or(style, |fg| Style::new().fg(fg));
+        Self {
+            viewed: roles.border.unwrap_or_else(|| fg(component.border)),
+            unviewed: roles.unviewed.unwrap_or_else(|| fg(tiers.accent)),
+            waiting: roles.waiting.unwrap_or_else(|| fg(component.warning)),
+            resolved: roles
+                .resolved
+                .unwrap_or_else(|| fg(component.success).add_modifier(Modifier::DIM)),
+        }
     }
 }
 

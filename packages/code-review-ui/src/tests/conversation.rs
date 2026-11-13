@@ -128,6 +128,14 @@ const fn everything() -> ConversationCapabilities {
 }
 
 fn backend(fixture: &GitFixture, capabilities: ConversationCapabilities) -> Arc<TestBackend> {
+    backend_with(fixture, capabilities, &ConversationConfig::default())
+}
+
+fn backend_with(
+    fixture: &GitFixture,
+    capabilities: ConversationCapabilities,
+    config: &ConversationConfig,
+) -> Arc<TestBackend> {
     let provider = FakeProvider::new(fixture.root()).with_conversation(capabilities);
     provider.set_activity(activity());
     Arc::new(
@@ -138,7 +146,7 @@ fn backend(fixture: &GitFixture, capabilities: ConversationCapabilities) -> Arc<
                     min_gap_ms: 0,
                     ..SignalsConfig::default()
                 },
-                ..ConversationConfig::default()
+                ..config.clone()
             }),
     )
 }
@@ -352,4 +360,152 @@ fn a_provider_that_only_reads_shows_the_conversation_without_actions() {
     let bar = screen.row_text(screen.find("Approved").expect("bar").y);
     assert!(bar.contains(" Approve "), "{bar}");
     assert!(!bar.contains("Request changes"), "{bar}");
+}
+
+/// The row of the thread card's header (the row naming its first author on the forge).
+fn card_header_row(screen: &Screen) -> u16 {
+    (0..screen.height())
+        .find(|y| {
+            let row = screen.row_text(*y);
+            row.contains("raj") && row.contains("Viewed")
+        })
+        .unwrap_or_else(|| panic!("no thread card header:\n{}", screen.text()))
+}
+
+/// Click the thread card's viewed checkbox.
+fn click_viewed(scenario: &mut Scenario<crate::app::ReviewApp>) -> Screen {
+    let screen = scenario.frame();
+    let row = card_header_row(&screen);
+    let x = screen.column_of(row, "Viewed").expect("checkbox");
+    scenario.click(x, row);
+    settled(scenario)
+}
+
+/// raj replies on the thread, and the review reads the conversation again.
+fn raj_replies(
+    backend: &Arc<TestBackend>,
+    scenario: &mut Scenario<crate::app::ReviewApp>,
+) -> Screen {
+    let mut activity = activity();
+    activity.threads[0]
+        .comments
+        .push(comment("c3", "raj", "Still curious about it."));
+    backend.provider().expect("provider").set_activity(activity);
+    let screen = scenario.frame();
+    let at = screen.find("↻").expect("refresh");
+    scenario.click(at.x, at.y);
+    settled(scenario)
+}
+
+#[test]
+fn a_thread_is_a_card_and_viewing_it_folds_it_until_someone_replies() {
+    let fixture = fixture();
+    let backend = backend(&fixture, everything());
+    let (mut scenario, screen) = open_pull(&backend, &fixture);
+    // A framed card: the header in the top border, the buttons in the bottom one.
+    let header = card_header_row(&screen);
+    let top = screen.row_text(header);
+    assert!(
+        top.contains('╭') && top.contains('╮') && top.contains("○ Viewed"),
+        "{top}"
+    );
+    let bottom = (header..screen.height())
+        .find(|y| screen.row_text(*y).contains('╰'))
+        .expect("bottom border");
+    assert!(
+        screen.row_text(bottom).contains("Reply"),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.contains("Why this constant?"));
+
+    // Viewed: one row, still unresolved on the forge.
+    let screen = click_viewed(&mut scenario);
+    assert!(!screen.contains("Why this constant?"), "{}", screen.text());
+    let header = card_header_row(&screen);
+    assert!(
+        screen.row_text(header).contains("✓ Viewed"),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.row_text(header).contains('╶'));
+    let provider = backend.provider().expect("provider");
+    assert!(!provider.activity(PULL).expect("activity").threads[0].resolved);
+
+    // raj replies: the thread opens again, the reply marked new.
+    let screen = raj_replies(&backend, &mut scenario);
+    assert!(
+        screen.contains("Still curious about it."),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.contains("1 new"), "{}", screen.text());
+    assert!(
+        screen
+            .row_text(card_header_row(&screen))
+            .contains("○ Viewed")
+    );
+}
+
+#[test]
+fn folds_can_be_kept_through_new_comments_with_a_new_chip() {
+    let fixture = fixture();
+    let backend = backend_with(
+        &fixture,
+        everything(),
+        &ConversationConfig {
+            threads: crate::config::conversation::ThreadsConfig {
+                new_comments: crate::config::conversation::NewCommentsMode::KeepFolded,
+                ..crate::config::conversation::ThreadsConfig::default()
+            },
+            ..ConversationConfig::default()
+        },
+    );
+    let (mut scenario, _) = open_pull(&backend, &fixture);
+    click_viewed(&mut scenario);
+    let screen = raj_replies(&backend, &mut scenario);
+    assert!(
+        !screen.contains("Still curious about it."),
+        "{}",
+        screen.text()
+    );
+    let header = screen.row_text(card_header_row(&screen));
+    assert!(
+        header.contains("1 new") && header.contains('╶'),
+        "{}",
+        screen.text()
+    );
+}
+
+#[test]
+fn a_roomy_card_puts_its_header_and_buttons_on_rows_of_their_own() {
+    let fixture = fixture();
+    let backend = backend_with(
+        &fixture,
+        everything(),
+        &ConversationConfig {
+            threads: crate::config::conversation::ThreadsConfig {
+                card: crate::config::conversation::ThreadCardMode::Roomy,
+                ..crate::config::conversation::ThreadsConfig::default()
+            },
+            ..ConversationConfig::default()
+        },
+    );
+    let (_, screen) = open_pull(&backend, &fixture);
+    let header = card_header_row(&screen);
+    assert!(
+        screen.row_text(header - 1).contains('╭'),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.row_text(header).contains('│'), "{}", screen.text());
+    let buttons = (header..screen.height())
+        .find(|y| screen.row_text(*y).contains("Reply"))
+        .expect("buttons");
+    assert!(screen.row_text(buttons).contains('│'));
+    assert!(
+        screen.row_text(buttons + 1).contains('╰'),
+        "{}",
+        screen.text()
+    );
 }

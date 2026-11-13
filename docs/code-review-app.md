@@ -286,8 +286,13 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   (the default is configurable).
 * **The rail** marks each layer approved (✓) or changes requested (✕), with its open threads
   and a dot when something is new.
-* **The threads panel** lists pull request threads too, and filters them: *on the pull request*
-  and *waiting on you* (the filter key cycles).
+* **The threads panel** lists pull request threads too, and filters them: *on the pull request*,
+  *waiting on you* and *unviewed* (the filter key cycles).
+* **Threads are cards**, with three separate states (see
+  [`review-thread-cards.md`](review-thread-cards.md)): *resolved* (shared: settled), *viewed*
+  (yours: `v` on a thread or its ○/✓ Viewed checkbox; a comment from someone else makes it
+  unviewed again, with *N new*), and *folded* (by itself when viewed or resolved, or by hand
+  with `z` or the chevron).
 * **Publishing** offers **Review on {provider}** first: its options are the verdict (only those
   the provider accepts) and a summary, and held replies go with it. Approve and Request changes
   in the bar open it directly at that verdict for that pull request.
@@ -587,7 +592,10 @@ bcode's own (`--print-config-paths` lists them in order):
   the default, `"auto"`: folded unless something is new, or `"collapsed"`); `notify` (which new
   activity makes a toast: `"reviews_and_replies"`, the default, `"all"`, `"reviews"` or
   `"none"`); `fold_resolved` (default true); `outdated_on_file` (default true: threads whose code
-  could not be followed show on their file). Its `signals` table: `provider` (default true: use
+  could not be followed show on their file). Its `threads` table: `fold_viewed` (default true),
+  `resolve_marks_viewed` (default true), `new_comments` (`"reopen"`, the default, or
+  `"keep_folded"`), `card` (`"compact"`, the default, or `"roomy"`) and `width` (default 110;
+  0 for the whole width). Its `signals` table: `provider` (default true: use
   the provider's watch), `min_gap_ms` (default 2000: reads closer together are merged),
   `pause_unfocused` (default true), and `providers.<id>`, passed to that provider's watch as is
   (GitHub reads `interval_ms`, default 30000, at least 10000). Invalid values are reported and

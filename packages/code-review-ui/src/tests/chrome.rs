@@ -45,6 +45,7 @@ pub(super) fn host_theme(accent: Rgb) -> ComponentStyles {
     ComponentStyles {
         component,
         files: bcode_tui_theme::components::FileChromeRoles::default(),
+        threads: bcode_tui_theme::components::ThreadCardRoles::default(),
         diff: DiffViewerStyle {
             text: component.text,
             muted: style(110, 110, 120),

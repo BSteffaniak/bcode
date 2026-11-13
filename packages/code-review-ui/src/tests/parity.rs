@@ -262,15 +262,19 @@ fn threads_fold_resolved_threads_hide_and_both_persist() {
         index_where(scenario, |item| matches!(item, ReviewItem::Thread(_))).is_some()
     };
     assert!(!has_thread(&setup.scenario));
-    // Folds and the resolved filter persist with the workspace.
+    // The resolved filter persists with the workspace, and resolving it yourself marked the
+    // thread viewed (which replaces the fold by hand, and folds it by itself).
     setup.scenario.key("q");
     stable(&mut setup.scenario);
-    let presentation = stored(&setup).presentation.expect("presentation");
+    let stored = stored(&setup);
+    let presentation = stored.presentation.clone().expect("presentation");
     assert!(presentation.hide_resolved_threads);
-    assert_eq!(presentation.collapsed_threads.len(), 1);
+    assert_eq!(stored.viewed_threads.len(), 1);
+    assert!(presentation.thread_folds.is_empty() && presentation.collapsed_threads.is_empty());
     // Reopening restores them; showing resolved threads brings it back, still collapsed.
     let mut reopened = setup.workspace.clone();
     reopened.presentation = Some(presentation);
+    reopened.viewed_threads = stored.viewed_threads;
     let surface = ReviewSurface::new(
         setup.backend.services(),
         reopened.repo_root.clone(),
