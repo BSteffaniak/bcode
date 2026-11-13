@@ -4,7 +4,7 @@
 //! operations they serve in [`ConversationCapabilities`]. See
 //! `docs/review-forge-conversation.md`.
 
-use crate::ReviewBundle;
+use crate::{ReviewBundle, ReviewScope, ReviewTarget};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -663,6 +663,158 @@ pub struct ReviewSubmitResponse {
     pub message: String,
 }
 
+/// Operation that replaces a review's snapshot of its pull request threads.
+pub const OP_REVIEW_CONVERSATION_SAVE: &str = "review.conversation.save";
+/// Operation that reads a review's snapshot of its pull request threads.
+pub const OP_REVIEW_CONVERSATION_GET: &str = "review.conversation.get";
+/// Pull request threads a snapshot keeps at most.
+pub const MAX_SNAPSHOT_THREADS: usize = 1_000;
+/// Comments of one thread a snapshot keeps at most (the first, and the latest ones).
+pub const MAX_SNAPSHOT_COMMENTS: usize = 100;
+/// Bytes of one comment body a snapshot keeps at most.
+pub const MAX_SNAPSHOT_BODY_BYTES: usize = 16 * 1024;
+
+/// The id agents use for a pull request thread: `<repository>#<number>:<provider thread id>`.
+#[must_use]
+pub fn pull_thread_ref(repository: &str, number: u64, thread_id: &str) -> String {
+    format!("{repository}#{number}:{thread_id}")
+}
+
+/// Whether `id` names a pull request thread ([`pull_thread_ref`]) rather than a local one.
+#[must_use]
+pub fn is_pull_thread_ref(id: &str) -> bool {
+    id.split_once('#')
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .is_some_and(|(number, thread)| {
+            !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+                && !thread.is_empty()
+        })
+}
+
+/// How a pull request thread landed on the review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadPlacement {
+    /// On the line the forge places it on, in the same diff the review shows.
+    #[default]
+    Exact,
+    /// Carried from the commit it was written on to where that code is now.
+    Moved,
+    /// Its code is gone (or could not be followed): on its file.
+    OnFile,
+    /// The layer no longer changes its file: on the layer.
+    OnLayer,
+}
+
+/// One pull request thread as the review last read and placed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullThreadRecord {
+    /// The id agents use ([`pull_thread_ref`]).
+    pub id: String,
+    /// Provider id.
+    pub provider: String,
+    /// Provider display name.
+    pub provider_label: String,
+    /// Provider repository (`owner/name`).
+    pub repository: String,
+    /// Pull request number.
+    pub number: u64,
+    /// Where the review shows it (`path:line`, `path`, or `the review`).
+    pub location: String,
+    /// How it landed there.
+    pub placement: ThreadPlacement,
+    /// The thread as the forge reported it (its anchor is where it was written).
+    pub thread: RemoteThread,
+}
+
+/// A review's pull request threads as the review app last read them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewConversationSnapshot {
+    /// Threads, in the review's order.
+    pub threads: Vec<PullThreadRecord>,
+    /// Threads left out past [`MAX_SNAPSHOT_THREADS`].
+    #[serde(default)]
+    pub omitted: usize,
+    /// When the app read them, in milliseconds since the Unix epoch.
+    pub read_at_ms: u64,
+}
+
+impl ReviewConversationSnapshot {
+    /// The snapshot within the bounds: at most [`MAX_SNAPSHOT_THREADS`] threads (the rest
+    /// counted in `omitted`), [`MAX_SNAPSHOT_COMMENTS`] comments per thread (the first and the
+    /// latest, the cut marked in the first kept reply), and [`MAX_SNAPSHOT_BODY_BYTES`] per body
+    /// (a cut marked with `…`).
+    #[must_use]
+    pub fn bounded(mut self) -> Self {
+        if self.threads.len() > MAX_SNAPSHOT_THREADS {
+            self.omitted += self.threads.len() - MAX_SNAPSHOT_THREADS;
+            self.threads.truncate(MAX_SNAPSHOT_THREADS);
+        }
+        for record in &mut self.threads {
+            let comments = &mut record.thread.comments;
+            if comments.len() > MAX_SNAPSHOT_COMMENTS {
+                let dropped = comments.len() - MAX_SNAPSHOT_COMMENTS;
+                comments.drain(1..=dropped);
+                if let Some(next) = comments.get_mut(1) {
+                    next.body = format!("[{dropped} earlier replies left out]\n\n{}", next.body);
+                }
+            }
+            for comment in comments.iter_mut() {
+                if comment.body.len() > MAX_SNAPSHOT_BODY_BYTES {
+                    let mut end = MAX_SNAPSHOT_BODY_BYTES;
+                    while !comment.body.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    comment.body.truncate(end);
+                    comment.body.push('…');
+                }
+            }
+        }
+        self
+    }
+}
+
+/// Request payload for [`OP_REVIEW_CONVERSATION_SAVE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewConversationRequest {
+    /// Repository path.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+    /// The threads (bounded when saved).
+    pub snapshot: ReviewConversationSnapshot,
+}
+
+/// Response payload for [`OP_REVIEW_CONVERSATION_SAVE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewConversationResponse {
+    /// Threads saved.
+    pub saved: usize,
+}
+
+/// Request payload for [`OP_REVIEW_CONVERSATION_GET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewConversationRequest {
+    /// Repository path.
+    pub repo_path: PathBuf,
+    /// Review target.
+    pub target: ReviewTarget,
+    /// Review scope.
+    #[serde(default)]
+    pub scope: Option<ReviewScope>,
+}
+
+/// Response payload for [`OP_REVIEW_CONVERSATION_GET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewConversationResponse {
+    /// The saved snapshot; `None` when the app never read the review's pull requests.
+    pub snapshot: Option<ReviewConversationSnapshot>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +887,74 @@ mod tests {
         assert_eq!(
             verdicts.verdicts(),
             vec![ReviewVerdict::Comment, ReviewVerdict::Approve]
+        );
+    }
+
+    #[test]
+    fn pull_thread_refs_are_told_from_local_ids() {
+        let id = pull_thread_ref("o/r", 12, "PRRT_kw");
+        assert_eq!(id, "o/r#12:PRRT_kw");
+        assert!(is_pull_thread_ref(&id));
+        assert!(!is_pull_thread_ref("thread-0123abcd"));
+        assert!(!is_pull_thread_ref("o/r#x:T"));
+        assert!(!is_pull_thread_ref("o/r#12:"));
+    }
+
+    #[test]
+    fn snapshots_are_bounded_with_marked_cuts() {
+        let comment = |index: usize, body: String| RemoteComment {
+            id: format!("C{index}"),
+            author: Participant {
+                login: "kevin".to_owned(),
+                name: None,
+                kind: ParticipantKind::User,
+                url: None,
+                is_viewer: false,
+            },
+            body,
+            created_at_ms: None,
+            updated_at_ms: None,
+            url: None,
+            review_id: None,
+        };
+        let record = |index: usize| PullThreadRecord {
+            id: pull_thread_ref("o/r", 1, &format!("T{index}")),
+            provider: "github".to_owned(),
+            provider_label: "GitHub".to_owned(),
+            repository: "o/r".to_owned(),
+            number: 1,
+            location: "the review".to_owned(),
+            placement: ThreadPlacement::OnLayer,
+            thread: RemoteThread {
+                id: format!("T{index}"),
+                anchor: RemoteAnchor::default(),
+                resolved: false,
+                outdated: true,
+                can_reply: false,
+                can_resolve: false,
+                comments: (0..MAX_SNAPSHOT_COMMENTS + 5)
+                    .map(|index| comment(index, format!("body {index}")))
+                    .collect(),
+            },
+        };
+        let mut snapshot = ReviewConversationSnapshot {
+            threads: (0..MAX_SNAPSHOT_THREADS + 3).map(record).collect(),
+            omitted: 0,
+            read_at_ms: 1,
+        };
+        snapshot.threads[0].thread.comments[0].body = "é".repeat(MAX_SNAPSHOT_BODY_BYTES);
+        let bounded = snapshot.bounded();
+        assert_eq!(bounded.threads.len(), MAX_SNAPSHOT_THREADS);
+        assert_eq!(bounded.omitted, 3);
+        let comments = &bounded.threads[0].thread.comments;
+        assert_eq!(comments.len(), MAX_SNAPSHOT_COMMENTS);
+        assert!(comments[0].body.len() <= MAX_SNAPSHOT_BODY_BYTES + '…'.len_utf8());
+        assert!(comments[0].body.ends_with('…'));
+        assert!(comments[1].body.starts_with("[5 earlier replies left out]"));
+        assert!(comments[1].body.ends_with("body 6"));
+        assert_eq!(
+            comments.last().map(|comment| comment.body.as_str()),
+            Some("body 104")
         );
     }
 }

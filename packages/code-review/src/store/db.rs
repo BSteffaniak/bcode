@@ -1473,6 +1473,7 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(super::history::layer_versions_table_migration());
     source.add_migration(thread_reply_to_column_migration());
     source.add_migration(workspace_viewed_threads_column_migration());
+    source.add_migration(super::conversation::conversation_snapshots_table_migration());
 }
 
 /// Threads marked viewed (see `ReviewWorkspace::viewed_threads`); older rows read as none.

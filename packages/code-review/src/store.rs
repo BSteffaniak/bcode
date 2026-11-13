@@ -8,9 +8,11 @@
 //! the store holds no connection and the daemon plugin and a standalone app can use the same
 //! database concurrently.
 
+mod conversation;
 mod db;
 mod history;
 
+use conversation::{conversation_for_request, save_conversation_for_request};
 use history::{list_layer_versions_for_request, record_layer_versions_for_request};
 
 pub(crate) use db::with_database;
@@ -237,6 +239,14 @@ store_operations! {
     /// Replace a workspace's snapshot from one importer.
     save_external_import(SaveExternalReviewImportRequest) -> SaveExternalReviewImportResponse
         => save_external_import_for_request;
+    /// Replace a review's snapshot of its pull request threads.
+    save_conversation(bcode_code_review_models::SaveReviewConversationRequest)
+        -> bcode_code_review_models::SaveReviewConversationResponse
+        => save_conversation_for_request;
+    /// A review's snapshot of its pull request threads.
+    conversation(&bcode_code_review_models::GetReviewConversationRequest)
+        -> bcode_code_review_models::GetReviewConversationResponse
+        => conversation_for_request;
     /// Bind a session to the review it assists (or refresh its binding).
     bind_assistant(BindReviewAssistantRequest) -> BindReviewAssistantResponse
         => bind_assistant_for_request;

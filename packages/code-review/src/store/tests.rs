@@ -1373,3 +1373,104 @@ fn the_version_log_merges_what_each_source_saw() {
         BTreeSet::from([VersionSource::Forge, VersionSource::Observed])
     );
 }
+
+#[test]
+fn a_reviews_pull_request_threads_are_kept_per_scope_and_replaced() {
+    use bcode_code_review_models::{
+        GetReviewConversationRequest, Participant, ParticipantKind, PullThreadRecord, RemoteAnchor,
+        RemoteComment, RemoteThread, ReviewConversationSnapshot, SaveReviewConversationRequest,
+        ThreadPlacement,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = initialized_test_repository(temp.path());
+    let store = ReviewStore::new(CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    });
+    let scope = |id: &str| {
+        Some(ReviewScope::Workspace {
+            workspace_id: id.to_owned(),
+            target: ReviewTarget::WorkingTreeUnstaged,
+        })
+    };
+    let get = |id: &str| {
+        store
+            .conversation(&GetReviewConversationRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::WorkingTreeUnstaged,
+                scope: scope(id),
+            })
+            .expect("get")
+            .snapshot
+    };
+    assert_eq!(get("a"), None);
+    let record = |body: String| PullThreadRecord {
+        id: "o/r#7:T1".to_owned(),
+        provider: "github".to_owned(),
+        provider_label: "GitHub".to_owned(),
+        repository: "o/r".to_owned(),
+        number: 7,
+        location: "the review".to_owned(),
+        placement: ThreadPlacement::OnLayer,
+        thread: RemoteThread {
+            id: "T1".to_owned(),
+            anchor: RemoteAnchor {
+                path: "src/a.rs".to_owned(),
+                original_line: Some(4),
+                diff_hunk: Some("@@ -1,2 +1,4 @@\n+a".to_owned()),
+                ..RemoteAnchor::default()
+            },
+            resolved: false,
+            outdated: true,
+            can_reply: true,
+            can_resolve: true,
+            comments: vec![RemoteComment {
+                id: "C1".to_owned(),
+                author: Participant {
+                    login: "kevin".to_owned(),
+                    name: None,
+                    kind: ParticipantKind::User,
+                    url: None,
+                    is_viewer: false,
+                },
+                body,
+                created_at_ms: Some(1),
+                updated_at_ms: None,
+                url: None,
+                review_id: None,
+            }],
+        },
+    };
+    let save = |id: &str, body: &str, at: u64| {
+        store
+            .save_conversation(SaveReviewConversationRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::WorkingTreeUnstaged,
+                scope: scope(id),
+                snapshot: ReviewConversationSnapshot {
+                    threads: vec![record(body.to_owned())],
+                    omitted: 0,
+                    read_at_ms: at,
+                },
+            })
+            .expect("save")
+            .saved
+    };
+    assert_eq!(save("a", "first", 10), 1);
+    assert_eq!(save("a", &"x".repeat(40 * 1024), 20), 1);
+    save("b", "other review", 30);
+    let kept = get("a").expect("saved");
+    assert_eq!(
+        kept.read_at_ms, 20,
+        "the latest read replaces the earlier one"
+    );
+    let body = &kept.threads[0].thread.comments[0].body;
+    assert!(
+        body.len() < 17 * 1024 && body.ends_with('…'),
+        "bounded when saved"
+    );
+    let hunk = kept.threads[0].thread.anchor.diff_hunk.as_deref();
+    assert_eq!(hunk, Some("@@ -1,2 +1,4 @@\n+a"));
+    let other = get("b").expect("saved");
+    assert_eq!(other.threads[0].thread.comments[0].body, "other review");
+}

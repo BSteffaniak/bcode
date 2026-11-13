@@ -285,6 +285,17 @@ pub fn dispatch_store(
             "external_import_save_failed",
             ReviewStore::save_external_import,
         ),
+        models::OP_REVIEW_CONVERSATION_SAVE => stored(
+            request,
+            config,
+            "conversation_save_failed",
+            ReviewStore::save_conversation,
+        ),
+        models::OP_REVIEW_CONVERSATION_GET => {
+            stored(request, config, "conversation_get_failed", |store, req| {
+                store.conversation(&req)
+            })
+        }
         models::OP_REVIEW_EXTERNAL_IMPORTS_LIST => stored(
             request,
             config,

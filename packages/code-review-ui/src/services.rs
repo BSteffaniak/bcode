@@ -202,6 +202,10 @@ store_operations! {
     models::SaveExternalReviewImportRequest => models::SaveExternalReviewImportResponse,
         models::OP_REVIEW_EXTERNAL_IMPORT_SAVE,
         |store, request| store.save_external_import(request);
+    models::SaveReviewConversationRequest => models::SaveReviewConversationResponse,
+        models::OP_REVIEW_CONVERSATION_SAVE, |store, request| store.save_conversation(request);
+    models::GetReviewConversationRequest => models::GetReviewConversationResponse,
+        models::OP_REVIEW_CONVERSATION_GET, |store, request| store.conversation(&request);
     models::BindReviewAssistantRequest => models::BindReviewAssistantResponse,
         "review.assistant.bind", |store, request| store.bind_assistant(request);
     models::GetReviewAssistantRequest => models::GetReviewAssistantResponse,
