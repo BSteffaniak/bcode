@@ -9,6 +9,14 @@
 //!
 //! Every read is bounded: file lists, diff lines, content lines, and thread bodies have limits,
 //! and the result says when it was cut.
+//!
+//! Threads are the review's own (local drafts) and its pull requests' threads on their forge,
+//! read from the snapshot the review app keeps of them (see [`pull_threads`]); the operations
+//! that change threads change local ones only.
+
+pub mod pull_threads;
+
+pub use pull_threads::{PullThreadQuery, PullThreadView, PullThreadsView, ThreadOrigin};
 
 use crate::data::DataError;
 use crate::document::REVIEW_LEVEL_PATH;
@@ -16,13 +24,14 @@ use crate::store::StoreError;
 use crate::viewed::{EntryIdentity, ViewedReset, ViewedState};
 use crate::{ReviewData, ReviewStore};
 use bcode_code_review_models::{
-    DraftAnchor, DraftComment, GetReviewAssistantRequest, GetReviewWorkspaceRequest,
-    ListDraftsRequest, ListReviewSuggestionsRequest, ListReviewWorkspacesRequest,
-    PublishReviewRequest, ResolveReviewSourcesRequest, ResolveThreadRequest, ResolvedReviewStack,
-    ResolvedSource, ResolvedSourceMode, ReviewAnchorKind, ReviewAssistantLookup,
-    ReviewBlobLinesRequest, ReviewBlobRef, ReviewBlobSelector, ReviewFileHunksRequest,
-    ReviewFileStatus, ReviewIndexEntry, ReviewIndexRequest, ReviewLineKind, ReviewPatchIdsRequest,
-    ReviewScope, ReviewSuggestion, ReviewSuggestionStatus, ReviewTarget, ReviewThreadKind,
+    DraftAnchor, DraftComment, GetReviewAssistantRequest, GetReviewConversationRequest,
+    GetReviewWorkspaceRequest, ListDraftsRequest, ListReviewSuggestionsRequest,
+    ListReviewWorkspacesRequest, PublishReviewRequest, ResolveReviewSourcesRequest,
+    ResolveThreadRequest, ResolvedReviewStack, ResolvedSource, ResolvedSourceMode,
+    ReviewAnchorKind, ReviewAssistantLookup, ReviewBlobLinesRequest, ReviewBlobRef,
+    ReviewBlobSelector, ReviewConversationSnapshot, ReviewFileHunksRequest, ReviewFileStatus,
+    ReviewIndexEntry, ReviewIndexRequest, ReviewLineKind, ReviewPatchIdsRequest, ReviewScope,
+    ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus, ReviewTarget, ReviewThreadKind,
     ReviewThreadSeverity, ReviewWorkspace, RevisionRef, SaveDraftRequest,
     SaveReviewSuggestionRequest, UpdateReviewWorkspaceRequest,
 };
@@ -219,6 +228,12 @@ pub struct ReviewSummaryView {
     pub threads: usize,
     /// Threads not resolved.
     pub open_threads: usize,
+    /// Pull request threads (as the review app last read them).
+    #[serde(default)]
+    pub pull_request_threads: usize,
+    /// Pull request threads not resolved.
+    #[serde(default)]
+    pub open_pull_request_threads: usize,
     /// Pending suggestions.
     pub suggestions: usize,
 }
@@ -289,6 +304,9 @@ pub struct Location {
 pub struct ThreadView {
     /// Thread id.
     pub thread_id: String,
+    /// Always [`ThreadOrigin::Local`].
+    #[serde(default)]
+    pub origin: ThreadOrigin,
     /// Where it is (`path:line`, `path`, or `review`).
     pub location: String,
     /// Kind.
@@ -321,6 +339,19 @@ pub struct ThreadsView {
     pub suggestions: Vec<SuggestionView>,
     /// Threads left out (resolved ones when not asked for, and those past the limit).
     pub omitted: usize,
+    /// The pull requests' threads on their forge.
+    #[serde(default)]
+    pub pull_request_threads: PullThreadsView,
+}
+
+/// One thread in full: a local one, or a pull request's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThreadDetail {
+    /// A pull request thread.
+    PullRequest(Box<PullThreadView>),
+    /// A local thread.
+    Local(ThreadView),
 }
 
 /// A change an operation made.
@@ -521,7 +552,17 @@ impl<'a> ReviewTools<'a> {
     ///   cannot be read.
     pub fn summary(&mut self, review: &OpenReview) -> Result<ReviewSummaryView, AssistantError> {
         let entries = self.entries(review)?;
-        let threads = self.threads(review, true)?;
+        let threads = self.threads(
+            review,
+            &PullThreadQuery {
+                include_resolved: true,
+                ..PullThreadQuery::default()
+            },
+        )?;
+        let pull_threads = self.conversation(review)?;
+        let pull_threads = pull_threads
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.threads.as_slice());
         let sources = review
             .resolved
             .iter()
@@ -576,6 +617,11 @@ impl<'a> ReviewTools<'a> {
                 .filter(|thread| !thread.resolved)
                 .count(),
             threads: threads.threads.len() + threads.omitted,
+            pull_request_threads: pull_threads.len(),
+            open_pull_request_threads: pull_threads
+                .iter()
+                .filter(|record| !record.thread.resolved)
+                .count(),
             suggestions: threads.suggestions.len(),
         })
     }
@@ -852,7 +898,8 @@ impl<'a> ReviewTools<'a> {
         Ok(out)
     }
 
-    /// Threads (draft comments) and pending suggestions of `review`.
+    /// Threads (draft comments), pending suggestions, and a page of the pull request threads of
+    /// `review`, as `query` selects them (its page applies to the pull request threads).
     ///
     /// # Errors
     ///
@@ -860,9 +907,19 @@ impl<'a> ReviewTools<'a> {
     pub fn threads(
         &self,
         review: &OpenReview,
-        include_resolved: bool,
+        query: &PullThreadQuery,
     ) -> Result<ThreadsView, AssistantError> {
-        let drafts = self.drafts(review)?;
+        let include_resolved = query.include_resolved;
+        let drafts: Vec<DraftComment> = self
+            .drafts(review)?
+            .into_iter()
+            .filter(|draft| {
+                query
+                    .path
+                    .as_deref()
+                    .is_none_or(|path| draft.anchor.file_path == path)
+            })
+            .collect();
         let mut order: Vec<String> = Vec::new();
         let mut grouped: BTreeMap<String, Vec<DraftComment>> = BTreeMap::new();
         for draft in drafts {
@@ -891,6 +948,7 @@ impl<'a> ReviewTools<'a> {
             let first = &comments[0];
             threads.push(ThreadView {
                 thread_id,
+                origin: ThreadOrigin::Local,
                 location: location_label(&first.anchor),
                 kind: first.thread_kind,
                 severity: first.severity,
@@ -918,11 +976,85 @@ impl<'a> ReviewTools<'a> {
                 body: bounded(&suggestion.body, MAX_BODY_BYTES),
             })
             .collect();
+        let snapshot = self.conversation(review)?;
+        let mut pull_request_threads = pull_threads::page(snapshot.as_ref(), query);
+        if snapshot.is_none() && has_pull_requests(review) {
+            pull_request_threads.note = Some(pull_threads::UNREAD_NOTE.to_owned());
+        }
         Ok(ThreadsView {
             threads,
             suggestions,
             omitted,
+            pull_request_threads,
         })
+    }
+
+    /// One thread of `review` in full: a local thread (by its id), or a pull request thread
+    /// (by the id `code_review.list_threads` gives it) with the diff hunk it was written on.
+    ///
+    /// # Errors
+    ///
+    /// * [`AssistantError::NotFound`] for an unknown thread, or a pull request thread while the
+    ///   review app has not read the review's pull request threads.
+    /// * [`AssistantError::Store`] when stored state cannot be read.
+    pub fn thread(
+        &self,
+        review: &OpenReview,
+        thread_id: &str,
+    ) -> Result<ThreadDetail, AssistantError> {
+        if bcode_code_review_models::is_pull_thread_ref(thread_id) {
+            let snapshot = self
+                .conversation(review)?
+                .ok_or_else(|| AssistantError::NotFound(pull_threads::UNREAD_NOTE.to_owned()))?;
+            return pull_threads::find(&snapshot, thread_id)
+                .map(|view| ThreadDetail::PullRequest(Box::new(view)))
+                .ok_or_else(|| {
+                    AssistantError::NotFound(format!(
+                        "no pull request thread {thread_id} in this review (code_review.list_threads lists them)"
+                    ))
+                });
+        }
+        let mut comments: Vec<DraftComment> = self
+            .drafts(review)?
+            .into_iter()
+            .filter(|draft| draft.thread_id == thread_id)
+            .collect();
+        comments.sort_by_key(|comment| (comment.created_at_ms, comment.comment_id.clone()));
+        let first = comments.first().ok_or_else(|| {
+            AssistantError::NotFound(format!(
+                "no thread {thread_id} in this review (code_review.list_threads lists them)"
+            ))
+        })?;
+        Ok(ThreadDetail::Local(ThreadView {
+            thread_id: thread_id.to_owned(),
+            origin: ThreadOrigin::Local,
+            location: location_label(&first.anchor),
+            kind: first.thread_kind,
+            severity: first.severity,
+            resolved: comments
+                .iter()
+                .all(|comment| comment.resolved_at_ms.is_some()),
+            comments: comments
+                .iter()
+                .map(|comment| bounded(&comment.body, pull_threads::MAX_THREAD_BODY_BYTES))
+                .collect(),
+        }))
+    }
+
+    /// The review's pull request threads as the review app last read them.
+    fn conversation(
+        &self,
+        review: &OpenReview,
+    ) -> Result<Option<ReviewConversationSnapshot>, AssistantError> {
+        let (target, scope) = review.scope();
+        Ok(self
+            .store
+            .conversation(&GetReviewConversationRequest {
+                repo_path: review.repo_root.clone(),
+                target,
+                scope: Some(scope),
+            })?
+            .snapshot)
     }
 
     fn drafts(&self, review: &OpenReview) -> Result<Vec<DraftComment>, AssistantError> {
@@ -1161,6 +1293,7 @@ impl<'a> ReviewTools<'a> {
         thread_id: &str,
         body: &str,
     ) -> Result<Written, AssistantError> {
+        refuse_pull_thread(thread_id, "reply to")?;
         let body = checked_body(body)?;
         let anchor = self.thread_anchor(review, thread_id)?;
         let label = location_label(&anchor);
@@ -1184,6 +1317,7 @@ impl<'a> ReviewTools<'a> {
         thread_id: &str,
         resolved: bool,
     ) -> Result<Written, AssistantError> {
+        refuse_pull_thread(thread_id, if resolved { "resolve" } else { "reopen" })?;
         let anchor = self.thread_anchor(review, thread_id)?;
         let label = location_label(&anchor);
         let (target, scope) = review.scope();
@@ -1540,6 +1674,31 @@ const fn status_label(status: ReviewFileStatus) -> &'static str {
         ReviewFileStatus::Copied => "copied",
         ReviewFileStatus::Unknown => "changed",
     }
+}
+
+/// Whether `review` shows pull requests (whose threads the review app reads).
+fn has_pull_requests(review: &OpenReview) -> bool {
+    review.workspace.sources.iter().any(|source| {
+        matches!(
+            source.kind,
+            ReviewSourceKind::PullRequest { .. }
+                | ReviewSourceKind::StackLayer { .. }
+                | ReviewSourceKind::Stack { .. }
+        )
+    })
+}
+
+/// Refuse to `act` on the pull request thread `thread_id`: the tools change local threads only.
+fn refuse_pull_thread(thread_id: &str, act: &str) -> Result<(), AssistantError> {
+    if bcode_code_review_models::is_pull_thread_ref(thread_id) {
+        return Err(AssistantError::Invalid(format!(
+            "{thread_id} is a pull request thread on its forge; the review tools cannot {act} it \
+             (they change the review's local threads only). The reviewer can do it in the review \
+             app (Reply / Resolve on the thread) or on the forge; to note something for them, \
+             draft a comment with code_review.add_comment."
+        )));
+    }
+    Ok(())
 }
 
 fn checked_body(body: &str) -> Result<String, AssistantError> {

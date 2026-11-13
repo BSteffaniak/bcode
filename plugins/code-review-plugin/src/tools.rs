@@ -8,14 +8,17 @@
 //! Each tool declares its policy operation, so Bcode's permission rules govern it like any other
 //! tool:
 //!
-//! * Reads (`summary`, `list_files`, `file_diff`, `file_content`, `list_threads`,
+//! * Reads (`summary`, `list_files`, `file_diff`, `file_content`, `list_threads`, `get_thread`,
 //!   `list_reviews`) and `navigate` are read-only: allowed unless a rule says otherwise.
+//!   `list_threads` and `get_thread` read pull request threads from the snapshot the review app
+//!   keeps in the review store, so they never reach the forge.
 //!   `file_diff` and `file_content` also declare the file they read, so read path rules (such
 //!   as a denied `**/.env`) apply to them.
 //! * `pull_request` asks GitHub with the user's credentials, so it also declares the
 //!   repository's web address and web rules decide it; without a rule it asks.
 //! * Writes (`add_comment`, `reply`, `resolve_thread`, `mark_viewed`, `suggest_change`) are
-//!   mutating and ask by default.
+//!   mutating and ask by default. `reply` and `resolve_thread` change local threads only and
+//!   refuse a pull request thread.
 //! * `publish` sends the review out of the repository and asks by default. An `output_path`
 //!   must be relative to the session's working directory and stay inside it; the publish also
 //!   declares that file as a write, so write path rules apply and the prompt names it.
@@ -23,7 +26,9 @@
 //! The session's id and working directory come from the host's workspace context during
 //! preparation and travel to the invocation in the preparation descriptor.
 
-use bcode_code_review::assistant::{AssistantError, Location, ReviewRef, ReviewTools, Side};
+use bcode_code_review::assistant::{
+    AssistantError, Location, PullThreadQuery, ReviewRef, ReviewTools, Side,
+};
 use bcode_code_review::viewed::ViewedReset;
 use bcode_code_review::{CodeReviewConfig, ReviewData, ReviewStore};
 use bcode_code_review_models::{ReviewSourceKind, ReviewThreadKind, ReviewThreadSeverity};
@@ -162,11 +167,27 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.list_threads",
         access: Access::Read,
-        description: "List the review's comment threads (location, kind, severity, resolved, comments) and pending suggested changes.",
+        description: "List the review's comment threads: its own local threads (location, kind, severity, resolved, comments), pending suggested changes, and a page of its pull requests' threads on the forge (origin pull_request: author, comments, resolved, outdated, where each was written and where the review shows it now), as the review app last read them. Pass a thread_id to code_review.get_thread to read one in full.",
         schema: || {
             with_review(
-                json!({"include_resolved": {"type": "boolean", "description": "Include resolved threads (default false)."}}),
+                json!({
+                    "include_resolved": {"type": "boolean", "description": "Include resolved threads (default false)."},
+                    "path": {"type": "string", "description": "Only threads on this file."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "First pull request thread of the page (next_offset of the previous page)."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Pull request threads per page (default 50)."},
+                }),
                 &[],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.get_thread",
+        access: Access::Read,
+        description: "Read one thread in full: a local thread, or a pull request thread with every comment and reply in order, its authors, resolved and outdated state, where it was written (path, original lines, commit), where the review shows it now, and the diff hunk it was written on.",
+        schema: || {
+            with_review(
+                json!({"thread_id": {"type": "string", "description": "Thread id from code_review.list_threads (or a prompt)."}}),
+                &["thread_id"],
             )
         },
     },
@@ -200,7 +221,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.reply",
         access: Access::Write,
-        description: "Reply in a review thread with a draft comment.",
+        description: "Reply in one of the review's local threads with a draft comment. Pull request threads cannot be replied to with this tool.",
         schema: || {
             with_review(
                 json!({
@@ -214,7 +235,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.resolve_thread",
         access: Access::Write,
-        description: "Resolve a review thread, or reopen it.",
+        description: "Resolve one of the review's local threads, or reopen it. Pull request threads cannot be resolved with this tool.",
         schema: || {
             with_review(
                 json!({
@@ -516,6 +537,8 @@ struct Arguments {
     start_line: Option<u32>,
     count: Option<u32>,
     include_resolved: Option<bool>,
+    offset: Option<usize>,
+    limit: Option<usize>,
     body: Option<String>,
     kind: Option<ReviewThreadKind>,
     severity: Option<ReviewThreadSeverity>,
@@ -538,6 +561,15 @@ impl Arguments {
             end_line: self.end_line,
             side: self.side.unwrap_or_default(),
             source: self.source.clone(),
+        }
+    }
+
+    fn thread_query(&self) -> PullThreadQuery {
+        PullThreadQuery {
+            include_resolved: self.include_resolved.unwrap_or(false),
+            path: self.path.clone().filter(|path| !path.is_empty()),
+            offset: self.offset.unwrap_or(0),
+            limit: self.limit,
         }
     }
 
@@ -626,9 +658,11 @@ fn run(
             arguments.start_line,
             arguments.count,
         ),
-        "code_review.list_threads" => {
-            encode(&tools.threads(&review, arguments.include_resolved.unwrap_or(false))?)
-        }
+        "code_review.list_threads" => encode(&tools.threads(&review, &arguments.thread_query())?),
+        "code_review.get_thread" => encode(&tools.thread(
+            &review,
+            Arguments::required(arguments.thread_id.as_ref(), "thread_id")?,
+        )?),
         "code_review.pull_request" => pull_request(&review),
         "code_review.navigate" => {
             let label = tools.locate(&review, &arguments.location())?;

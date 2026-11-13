@@ -185,6 +185,7 @@ fn reads_are_read_only_and_changes_ask_for_permission() {
         "code_review.file_diff",
         "code_review.file_content",
         "code_review.list_threads",
+        "code_review.get_thread",
         "code_review.pull_request",
         "code_review.navigate",
         "code_review.add_comment",
@@ -462,6 +463,216 @@ fn file_reads_declare_the_file_so_read_rules_apply() {
         assert!(
             escaping.error.is_some(),
             "{tool} refuses paths outside the repository"
+        );
+    }
+}
+
+/// The pull request threads the review app read, as the snapshot it keeps holds them: one
+/// outdated thread written on a file the review no longer changes, with replies.
+fn pull_snapshot(replies: usize) -> bcode_code_review_models::ReviewConversationSnapshot {
+    use bcode_code_review_models::{
+        DiffSide, Participant, ParticipantKind, PullThreadRecord, RemoteAnchor, RemoteComment,
+        RemoteThread, ReviewConversationSnapshot, ThreadPlacement, pull_thread_ref,
+    };
+    let comment = |index: usize, login: &str, body: String| RemoteComment {
+        id: format!("C{index}"),
+        author: Participant {
+            login: login.to_owned(),
+            name: None,
+            kind: ParticipantKind::User,
+            url: None,
+            is_viewer: false,
+        },
+        body,
+        created_at_ms: Some(1_000 + u64::try_from(index).unwrap_or_default()),
+        updated_at_ms: None,
+        url: Some(format!("https://github.com/o/r/pull/7#discussion_r{index}")),
+        review_id: None,
+    };
+    let mut comments = vec![comment(
+        0,
+        "kevin",
+        "This retry loop never backs off.".to_owned(),
+    )];
+    comments.extend((1..=replies).map(|index| comment(index, "ana", format!("reply {index}"))));
+    let outdated = PullThreadRecord {
+        id: pull_thread_ref("o/r", 7, "PRRT_1"),
+        provider: "github".to_owned(),
+        provider_label: "GitHub".to_owned(),
+        repository: "o/r".to_owned(),
+        number: 7,
+        location: "the review".to_owned(),
+        placement: ThreadPlacement::OnLayer,
+        thread: RemoteThread {
+            id: "PRRT_1".to_owned(),
+            anchor: RemoteAnchor {
+                path: "src/retry.rs".to_owned(),
+                side: DiffSide::New,
+                original_line: Some(14),
+                original_start_line: Some(12),
+                original_commit_oid: Some("0ld".to_owned()),
+                diff_hunk: Some("@@ -10,3 +10,6 @@ fn send()\n+loop {\n+    send()?;".to_owned()),
+                ..RemoteAnchor::default()
+            },
+            resolved: false,
+            outdated: true,
+            can_reply: true,
+            can_resolve: true,
+            comments,
+        },
+    };
+    let mut resolved = outdated.clone();
+    resolved.id = pull_thread_ref("o/r", 7, "PRRT_2");
+    resolved.thread.id = "PRRT_2".to_owned();
+    resolved.thread.resolved = true;
+    resolved.thread.outdated = false;
+    resolved.thread.anchor.path = "README.md".to_owned();
+    resolved.location = "README.md".to_owned();
+    ReviewConversationSnapshot {
+        threads: vec![outdated, resolved],
+        omitted: 0,
+        read_at_ms: 42,
+    }
+}
+
+#[test]
+fn pull_request_threads_are_listed_and_read_from_the_apps_snapshot() {
+    let mut harness = Harness::new();
+    let workspace = harness.bind(SESSION);
+
+    // Before the app read the pull request threads, there are none, and nothing says why for a
+    // review without pull requests.
+    let listed = harness.json("code_review.list_threads", &json!({}), SESSION);
+    assert_eq!(listed["pull_request_threads"]["total"], 0, "{listed}");
+    let unread = harness.call(
+        "code_review.get_thread",
+        &json!({"thread_id": "o/r#7:PRRT_1"}),
+        SESSION,
+    );
+    assert!(
+        unread.is_error && unread.output.contains("has not read"),
+        "{}",
+        unread.output
+    );
+
+    let (target, scope) = bcode_code_review::scope::annotation_scope(&workspace);
+    harness
+        .store()
+        .save_conversation(bcode_code_review_models::SaveReviewConversationRequest {
+            repo_path: harness.fixture.root().to_path_buf(),
+            target,
+            scope: Some(scope),
+            snapshot: pull_snapshot(6),
+        })
+        .expect("save");
+
+    let listed = harness.json("code_review.list_threads", &json!({}), SESSION);
+    let page = &listed["pull_request_threads"];
+    assert_eq!(page["total"], 1, "resolved ones are left out: {listed}");
+    assert_eq!(page["omitted_resolved"], 1);
+    assert_eq!(page["read_at_ms"], 42);
+    let thread = &page["threads"][0];
+    assert_eq!(thread["thread_id"], "o/r#7:PRRT_1");
+    assert_eq!(thread["origin"], "pull_request");
+    assert_eq!(thread["pull_request"], "o/r#7");
+    assert_eq!(thread["outdated"], true);
+    assert_eq!(thread["placement"], "on_layer");
+    assert_eq!(thread["written_on"]["path"], "src/retry.rs");
+    assert_eq!(thread["written_on"]["original_lines"], "12-14");
+    assert_eq!(thread["written_on"]["commit"], "0ld");
+    assert_eq!(thread["authors"], json!(["kevin", "ana"]));
+    // A listing shows the first comment and the latest ones, and says what it left out.
+    let bodies: Vec<&str> = thread["comments"]
+        .as_array()
+        .expect("comments")
+        .iter()
+        .filter_map(|comment| comment["body"].as_str())
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            "This retry loop never backs off.",
+            "reply 4",
+            "reply 5",
+            "reply 6"
+        ]
+    );
+    assert_eq!(thread["comments_omitted"], 3);
+    assert!(
+        thread.get("diff_hunk").is_none(),
+        "hunks only in full reads"
+    );
+
+    let all = harness.json(
+        "code_review.list_threads",
+        &json!({"include_resolved": true, "limit": 1}),
+        SESSION,
+    );
+    let page = &all["pull_request_threads"];
+    assert_eq!(
+        (page["total"].as_u64(), page["next_offset"].as_u64()),
+        (Some(2), Some(1))
+    );
+    let second = harness.json(
+        "code_review.list_threads",
+        &json!({"include_resolved": true, "limit": 1, "offset": 1}),
+        SESSION,
+    );
+    assert_eq!(
+        second["pull_request_threads"]["threads"][0]["thread_id"],
+        "o/r#7:PRRT_2"
+    );
+    assert!(second["pull_request_threads"].get("next_offset").is_none());
+    let on_file = harness.json(
+        "code_review.list_threads",
+        &json!({"include_resolved": true, "path": "README.md"}),
+        SESSION,
+    );
+    assert_eq!(on_file["pull_request_threads"]["total"], 1, "{on_file}");
+
+    let full = harness.json(
+        "code_review.get_thread",
+        &json!({"thread_id": "o/r#7:PRRT_1"}),
+        SESSION,
+    );
+    assert_eq!(full["comments"].as_array().map(Vec::len), Some(7), "{full}");
+    assert_eq!(full["comments"][6]["body"], "reply 6");
+    assert!(
+        full["diff_hunk"]
+            .as_str()
+            .is_some_and(|hunk| hunk.ends_with("+    send()?;")),
+        "{full}"
+    );
+    assert_eq!(full["url"], "https://github.com/o/r/pull/7#discussion_r0");
+}
+
+#[test]
+fn pull_request_threads_are_not_replied_to_or_resolved_by_the_tools() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    for (tool, arguments) in [
+        (
+            "code_review.reply",
+            json!({"thread_id": "o/r#7:PRRT_1", "body": "Fixed."}),
+        ),
+        (
+            "code_review.resolve_thread",
+            json!({"thread_id": "o/r#7:PRRT_1"}),
+        ),
+    ] {
+        // The write still asks first like any other.
+        let prepared = harness.prepare(tool, &arguments, SESSION);
+        assert_eq!(
+            prepared.authorization[0].metadata["requires_permission"], true,
+            "{tool}"
+        );
+        let response = harness.call(tool, &arguments, SESSION);
+        assert!(response.is_error, "{tool}");
+        assert!(
+            response.output.contains("pull request thread")
+                && response.output.contains("local threads only"),
+            "{tool}: {}",
+            response.output
         );
     }
 }
