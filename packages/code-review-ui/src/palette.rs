@@ -83,6 +83,10 @@ pub enum OverlayKind {
     Help,
     /// A menu of chosen actions.
     Menu,
+    /// One file through a stack's layers.
+    StackFile,
+    /// Files several layers of a stack change.
+    Overlaps,
 }
 
 /// Action id prefix of the palette's go-to-line entry (followed by the line number).
@@ -279,6 +283,8 @@ impl Overlay {
             OverlayKind::Palette => (" Commands ", "enter run · esc close"),
             OverlayKind::Help => (" Keys ", "enter run · esc close"),
             OverlayKind::Menu => (" Actions ", "enter run · esc close"),
+            OverlayKind::StackFile => (" This file through the stack ", "enter go to · esc close"),
+            OverlayKind::Overlaps => (" Files several layers change ", "enter go to · esc close"),
         };
         let max = Size::new(
             area.width.saturating_sub(4).min(84),

@@ -11,6 +11,11 @@ impl<'a> CodeReviewDb<'a> {
         Self { db }
     }
 
+    /// The database, for queries kept in other modules.
+    pub(super) const fn db(&self) -> &'a dyn Database {
+        self.db
+    }
+
     pub async fn list_workspaces(
         &self,
         repo_root: &Path,
@@ -1451,6 +1456,7 @@ pub fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(thread_blob_oid_column_migration());
     source.add_migration(review_assistant_sessions_table_migration());
     source.add_migration(workspace_stack_snapshots_column_migration());
+    source.add_migration(super::history::layer_versions_table_migration());
     source
 }
 

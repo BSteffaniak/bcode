@@ -44,6 +44,7 @@ pub mod config;
 pub mod context;
 pub mod entry;
 pub mod files;
+pub mod history;
 pub mod home;
 pub mod host;
 pub mod import;

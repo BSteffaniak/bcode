@@ -103,6 +103,7 @@ pub fn manifest() -> ReviewSourceProviderManifest {
             batched: ReviewSourceBatchCapabilities {
                 pulls_fetch: true,
                 pulls_get: true,
+                pulls_history: true,
             },
         },
     }
@@ -168,6 +169,32 @@ impl ReviewSourceProvider for GitHubReviewSource {
             .map(|(branch, pulls)| (branch, stack_candidates(&repository, &pulls.with_base)))
             .collect();
         Ok(response)
+    }
+
+    fn get_history(
+        &self,
+        request: &bcode_code_review_models::ReviewSourcePullsHistoryRequest,
+    ) -> ProviderResult<bcode_code_review_models::ReviewSourcePullsHistoryResponse> {
+        let repository = Repository::resolve(&request.repo_path, request.repository.as_deref())?;
+        let github = repository.github(&request.repo_path);
+        let items = github
+            .pull_request_histories(&repository.0, &request.numbers)
+            .map_err(ReviewSourceError::from)?;
+        let histories: Vec<bcode_code_review_models::PullHistory> = items
+            .into_iter()
+            .map(|(number, items)| bcode_code_review_models::PullHistory {
+                number,
+                events: history_events(items),
+            })
+            .collect();
+        if request.fetch {
+            let remote = repository.fetch_remote(&request.repo_path);
+            fetch_versions(&request.repo_path, &remote, &histories);
+        }
+        Ok(bcode_code_review_models::ReviewSourcePullsHistoryResponse {
+            repository: repository.display(),
+            histories,
+        })
     }
 
     fn resolve_stack(
@@ -482,6 +509,116 @@ fn pulls_get_response(
         }
     }
     response
+}
+
+/// Milliseconds since the Unix epoch of an RFC 3339 time (as GitHub writes them).
+fn millis(time: &str) -> Option<u64> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(time).ok()?;
+    u64::try_from(parsed.timestamp_millis()).ok()
+}
+
+/// GitHub's timeline items as push events, oldest first; items without a readable time are
+/// left out.
+fn history_events(
+    items: Vec<bcode_forge::HistoryItem>,
+) -> Vec<bcode_code_review_models::PullHistoryEvent> {
+    use bcode_code_review_models::PullHistoryEvent;
+    let mut events: Vec<PullHistoryEvent> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            bcode_forge::HistoryItem::ForcePushed {
+                at,
+                actor,
+                before,
+                after,
+            } => Some(PullHistoryEvent::ForcePushed {
+                at_ms: millis(&at)?,
+                actor,
+                before_oid: before,
+                after_oid: after,
+            }),
+            bcode_forge::HistoryItem::Commit { oid, at } => Some(PullHistoryEvent::CommitsPushed {
+                at_ms: millis(&at)?,
+                head_oid: oid,
+            }),
+            bcode_forge::HistoryItem::BaseChanged { at, from, to } => {
+                Some(PullHistoryEvent::BaseChanged {
+                    at_ms: millis(&at)?,
+                    from,
+                    to,
+                })
+            }
+        })
+        .collect();
+    events.sort_by_key(|event| match event {
+        PullHistoryEvent::ForcePushed { at_ms, .. }
+        | PullHistoryEvent::CommitsPushed { at_ms, .. }
+        | PullHistoryEvent::BaseChanged { at_ms, .. } => *at_ms,
+    });
+    events
+}
+
+/// Reference namespace old versions' commits are fetched into, so they are kept.
+pub const VERSION_REF_NAMESPACE: &str = "refs/bcode-review/version";
+
+/// Most commits fetched one by one when fetching them together fails (one of them may be gone).
+const MAX_SINGLE_FETCHES: usize = 50;
+
+/// Make the commits `histories` name local where GitHub still has them: one fetch for all of
+/// those missing, then, when that fails (a commit GitHub no longer serves fails the whole fetch),
+/// one fetch each. Failures leave versions unavailable; they are not errors.
+fn fetch_versions(
+    repo_path: &Path,
+    remote: &str,
+    histories: &[bcode_code_review_models::PullHistory],
+) {
+    use bcode_code_review_models::PullHistoryEvent;
+    if validate_remote(remote).is_err() {
+        return;
+    }
+    let named: BTreeSet<&str> = histories
+        .iter()
+        .flat_map(|history| &history.events)
+        .flat_map(|event| match event {
+            PullHistoryEvent::ForcePushed {
+                before_oid,
+                after_oid,
+                ..
+            } => vec![before_oid.as_deref(), after_oid.as_deref()],
+            PullHistoryEvent::CommitsPushed { head_oid, .. } => vec![Some(head_oid.as_str())],
+            PullHistoryEvent::BaseChanged { .. } => Vec::new(),
+        })
+        .flatten()
+        .collect();
+    let named: Vec<&str> = named.into_iter().collect();
+    let Ok(local) = local_commits(repo_path, &named) else {
+        return;
+    };
+    let missing: Vec<&str> = named
+        .into_iter()
+        .filter(|oid| oid.len() == 40 && !local.contains(*oid))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let refspec = |oid: &str| format!("{oid}:{VERSION_REF_NAMESPACE}/{oid}");
+    let fetch = |oids: &[&str]| {
+        let refspecs: Vec<String> = oids.iter().map(|oid| refspec(oid)).collect();
+        let mut args = vec![
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            remote,
+        ];
+        args.extend(refspecs.iter().map(String::as_str));
+        git(repo_path, &args).is_ok()
+    };
+    if !fetch(&missing) {
+        for oid in missing.iter().take(MAX_SINGLE_FETCHES) {
+            fetch(std::slice::from_ref(oid));
+        }
+    }
 }
 
 /// The open pull requests `query` names (see [`parse_pull_query`]), as a list.

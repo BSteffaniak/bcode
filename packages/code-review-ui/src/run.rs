@@ -165,7 +165,8 @@ impl App {
                 Update::exit()
             }
             Action::None if outcome == EventOutcome::Ignored => Update::none(),
-            Action::Redraw | Action::None => Update::redraw(),
+            // The app opens comparisons itself; one reaching here only needs drawing.
+            Action::Redraw | Action::None | Action::OpenReview { .. } => Update::redraw(),
         }
     }
 

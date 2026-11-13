@@ -162,6 +162,120 @@ fn numbers_query(count: usize) -> String {
     query
 }
 
+/// Pull requests per request of [`GitHub::pull_request_histories`]: up to 100 timeline items
+/// each, so a request stays inside GitHub's node limits.
+const HISTORIES_PER_QUERY: usize = 20;
+
+/// The GraphQL query for the push timeline of each of `count` pull requests by number (`p<i>`
+/// for `$n<i>`): force pushes, pushed commits, and base changes, newest 100 of each.
+fn histories_query(count: usize) -> String {
+    use std::fmt::Write as _;
+    let mut query = String::from("query($owner: String!, $name: String!");
+    for index in 0..count {
+        let _ = write!(query, ", $n{index}: Int!");
+    }
+    query.push_str(") {\n  repository(owner: $owner, name: $name) {\n");
+    for index in 0..count {
+        let _ = writeln!(
+            query,
+            "    p{index}: pullRequest(number: $n{index}) {{ number timelineItems(last: 100, \
+             itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, PULL_REQUEST_COMMIT, BASE_REF_CHANGED_EVENT]) \
+             {{ nodes {{ __typename \
+             ... on HeadRefForcePushedEvent {{ createdAt actor {{ login }} \
+             beforeCommit {{ oid }} afterCommit {{ oid }} }} \
+             ... on PullRequestCommit {{ commit {{ oid committedDate }} }} \
+             ... on BaseRefChangedEvent {{ createdAt previousRefName currentRefName }} }} }} }}"
+        );
+    }
+    query.push_str("  }\n}");
+    query
+}
+
+/// One push-related item of a pull request's timeline, as GitHub reports it (times are
+/// RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryItem {
+    /// The head was replaced.
+    ForcePushed {
+        /// When.
+        at: String,
+        /// Who pushed.
+        actor: Option<String>,
+        /// The head before, when GitHub still has it.
+        before: Option<String>,
+        /// The head after, when GitHub still has it.
+        after: Option<String>,
+    },
+    /// A commit of the pull request.
+    Commit {
+        /// The commit.
+        oid: String,
+        /// When it was committed.
+        at: String,
+    },
+    /// The base branch changed.
+    BaseChanged {
+        /// When.
+        at: String,
+        /// The branch before.
+        from: Option<String>,
+        /// The branch after.
+        to: Option<String>,
+    },
+}
+
+/// The timeline items (`p0` to `p<count - 1>`) of a response to [`histories_query`], oldest
+/// first; `None` for a number GitHub does not know.
+///
+/// # Errors
+/// * [`ForgeError::Failed`] when the response reports other errors or lacks the repository.
+pub fn parse_histories(
+    value: &Value,
+    count: usize,
+) -> Result<Vec<Option<Vec<HistoryItem>>>, ForgeError> {
+    if let Some(errors) = response_errors(value) {
+        let not_found = |error: &&Value| error["type"].as_str() == Some("NOT_FOUND");
+        if !errors.iter().all(not_found) {
+            return Err(answered_with(&errors));
+        }
+    }
+    let repository = &value["data"]["repository"];
+    if !repository.is_object() {
+        return Err(ForgeError::Failed(
+            "GitHub did not return the repository".into(),
+        ));
+    }
+    let text = |value: &Value| value.as_str().map(str::to_owned);
+    Ok((0..count)
+        .map(|index| {
+            let nodes = repository[format!("p{index}")]["timelineItems"]["nodes"].as_array()?;
+            Some(
+                nodes
+                    .iter()
+                    .filter_map(|node| match node["__typename"].as_str()? {
+                        "HeadRefForcePushedEvent" => Some(HistoryItem::ForcePushed {
+                            at: text(&node["createdAt"])?,
+                            actor: text(&node["actor"]["login"]),
+                            before: text(&node["beforeCommit"]["oid"]),
+                            after: text(&node["afterCommit"]["oid"]),
+                        }),
+                        "PullRequestCommit" => Some(HistoryItem::Commit {
+                            oid: text(&node["commit"]["oid"])?,
+                            at: text(&node["commit"]["committedDate"])?,
+                        }),
+                        "BaseRefChangedEvent" => Some(HistoryItem::BaseChanged {
+                            at: text(&node["createdAt"])?,
+                            from: text(&node["previousRefName"]),
+                            to: text(&node["currentRefName"]),
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
 /// Run `request` for each chunk of `items` (`size` items each) on its own thread, answers in
 /// chunk order; the first failure fails the call.
 fn each_chunk<T: Sync, A: Send>(
@@ -470,6 +584,36 @@ impl GitHub {
                     Ok((branch.clone(), parse_branch_pull_requests(&value, index)?))
                 })
                 .collect::<Result<Vec<_>, ForgeError>>()
+        })?;
+        Ok(chunks.into_iter().flatten().collect())
+    }
+
+    /// The push timeline of pull requests `numbers` of `repository` (see [`HistoryItem`]), oldest
+    /// first: 20 per GraphQL request, the requests in parallel. A number GitHub does not know is
+    /// left out.
+    ///
+    /// # Errors
+    /// As [`Self::branch_pull_requests`]; the first failing request fails the call.
+    pub fn pull_request_histories(
+        &self,
+        repository: &RepositoryRef,
+        numbers: &[u64],
+    ) -> Result<BTreeMap<u64, Vec<HistoryItem>>, ForgeError> {
+        let chunks = each_chunk(numbers, HISTORIES_PER_QUERY, |chunk| {
+            let names: Vec<String> = (0..chunk.len()).map(|index| format!("n{index}")).collect();
+            let variables: Vec<(&str, Variable<'_>)> = names
+                .iter()
+                .zip(chunk)
+                .map(|(name, number)| (name.as_str(), Variable::Number(*number)))
+                .collect();
+            let (value, _) = self.query(repository, &histories_query(chunk.len()), &variables)?;
+            let histories = parse_histories(&value, chunk.len())?;
+            Ok(chunk
+                .iter()
+                .copied()
+                .zip(histories)
+                .filter_map(|(number, history)| Some((number, history?)))
+                .collect::<Vec<_>>())
         })?;
         Ok(chunks.into_iter().flatten().collect())
     }
@@ -978,6 +1122,53 @@ mod tests {
         // Any other error fails the batch.
         let failed = json!({ "data": { "repository": {} }, "errors": [{ "type": "RATE_LIMITED", "message": "slow down" }] });
         assert!(parse_numbered_pull_requests(&failed, 1).is_err());
+    }
+
+    #[test]
+    fn push_timelines_are_read_per_pull_request() {
+        let query = histories_query(2);
+        for needle in [
+            "$n1: Int!",
+            "HEAD_REF_FORCE_PUSHED_EVENT",
+            "p1: pullRequest(number: $n1)",
+        ] {
+            assert!(query.contains(needle), "{needle}: {query}");
+        }
+        let value = json!({ "data": { "repository": {
+            "p0": { "number": 7, "timelineItems": { "nodes": [
+                { "__typename": "PullRequestCommit",
+                  "commit": { "oid": "a1", "committedDate": "2026-11-01T10:00:00Z" } },
+                { "__typename": "HeadRefForcePushedEvent", "createdAt": "2026-11-02T10:00:00Z",
+                  "actor": { "login": "octocat" },
+                  "beforeCommit": { "oid": "a1" }, "afterCommit": { "oid": "a2" } },
+                { "__typename": "BaseRefChangedEvent", "createdAt": "2026-11-03T10:00:00Z",
+                  "previousRefName": "main", "currentRefName": "feature" },
+                { "__typename": "IssueComment" },
+            ] } },
+            "p1": null,
+        } } });
+        let histories = parse_histories(&value, 2).unwrap();
+        assert_eq!(
+            histories[0],
+            Some(vec![
+                HistoryItem::Commit {
+                    oid: "a1".into(),
+                    at: "2026-11-01T10:00:00Z".into(),
+                },
+                HistoryItem::ForcePushed {
+                    at: "2026-11-02T10:00:00Z".into(),
+                    actor: Some("octocat".into()),
+                    before: Some("a1".into()),
+                    after: Some("a2".into()),
+                },
+                HistoryItem::BaseChanged {
+                    at: "2026-11-03T10:00:00Z".into(),
+                    from: Some("main".into()),
+                    to: Some("feature".into()),
+                },
+            ])
+        );
+        assert_eq!(histories[1], None);
     }
 
     #[test]

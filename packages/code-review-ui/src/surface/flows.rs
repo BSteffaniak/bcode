@@ -31,6 +31,8 @@ pub enum Modal {
     Publish(PublishFlow),
     /// Importing an external review.
     Import(ImportFlow),
+    /// The stack's history.
+    History(super::super::history::HistoryPanel),
 }
 
 impl ReviewSurface {
@@ -465,6 +467,10 @@ impl ReviewSurface {
                 let outcome = flow.key(stroke);
                 self.import_outcome(outcome, host)
             }
+            Some(Modal::History(panel)) => {
+                let outcome = panel.key(stroke);
+                self.history_outcome(outcome, host)
+            }
             None => Action::None,
         }
     }
@@ -480,7 +486,7 @@ impl ReviewSurface {
                 let outcome = flow.paste(text);
                 self.import_outcome(outcome, host)
             }
-            None => Action::None,
+            Some(Modal::History(_)) | None => Action::None,
         }
     }
 
@@ -496,7 +502,7 @@ impl ReviewSurface {
                 let outcome = flow.mouse(event, &theme);
                 self.import_outcome(outcome, host)
             }
-            None => Action::None,
+            Some(Modal::History(_)) | None => Action::None,
         }
     }
 

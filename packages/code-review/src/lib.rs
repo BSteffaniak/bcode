@@ -28,6 +28,7 @@ pub mod cache;
 pub mod data;
 pub mod discovery;
 pub mod document;
+pub mod history;
 pub mod provider;
 pub mod publish_plan;
 pub mod scope;

@@ -176,6 +176,7 @@ impl ReviewSourceProvider for ChainProvider {
                 batched: ReviewSourceBatchCapabilities {
                     pulls_fetch: true,
                     pulls_get: true,
+                    pulls_history: false,
                 },
             },
         }

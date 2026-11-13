@@ -185,6 +185,7 @@ impl FakeProvider {
                         batched: ReviewSourceBatchCapabilities {
                             pulls_fetch: self.batch_fetch,
                             pulls_get: false,
+                            pulls_history: false,
                         },
                     },
                 })

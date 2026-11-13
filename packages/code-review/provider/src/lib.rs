@@ -19,11 +19,12 @@
 use bcode_code_review_models::{
     OP_REVIEW_DISCOVERY_DISCOVER, OP_REVIEW_DISCOVERY_MANIFEST, OP_REVIEW_SOURCE_MANIFEST,
     OP_REVIEW_SOURCE_PULL_FETCH, OP_REVIEW_SOURCE_PULLS_FETCH, OP_REVIEW_SOURCE_PULLS_GET,
-    OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE, REVIEW_SOURCE_ERROR_FAILED,
-    ReviewDiscoveryManifest, ReviewDiscoveryRequest, ReviewDiscoveryResponse,
-    ReviewPullFetchResult, ReviewSourceProviderManifest, ReviewSourcePullFetchRequest,
-    ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse, ReviewSourcePullsGetRequest,
-    ReviewSourcePullsGetResponse, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
+    OP_REVIEW_SOURCE_PULLS_HISTORY, OP_REVIEW_SOURCE_PULLS_LIST, OP_REVIEW_SOURCE_STACK_RESOLVE,
+    REVIEW_SOURCE_ERROR_FAILED, ReviewDiscoveryManifest, ReviewDiscoveryRequest,
+    ReviewDiscoveryResponse, ReviewPullFetchResult, ReviewSourceProviderManifest,
+    ReviewSourcePullFetchRequest, ReviewSourcePullsFetchRequest, ReviewSourcePullsFetchResponse,
+    ReviewSourcePullsGetRequest, ReviewSourcePullsGetResponse, ReviewSourcePullsHistoryRequest,
+    ReviewSourcePullsHistoryResponse, ReviewSourcePullsListRequest, ReviewSourcePullsListResponse,
     ReviewSourceStackResolveRequest, ReviewSourceStackResolveResponse,
 };
 use serde::Serialize;
@@ -151,6 +152,23 @@ pub trait ReviewSourceProvider: Send + Sync {
         ))
     }
 
+    /// Several pull requests' push histories (force pushes, pushed commits, base changes),
+    /// optionally making the commits they name local.
+    ///
+    /// # Errors
+    /// The provider's failure; [`ERROR_UNSUPPORTED_OPERATION`] when the provider does not
+    /// support it (its manifest says so), which is the default.
+    fn get_history(
+        &self,
+        request: &ReviewSourcePullsHistoryRequest,
+    ) -> ProviderResult<ReviewSourcePullsHistoryResponse> {
+        let _ = request;
+        Err(ProviderCallError::new(
+            ERROR_UNSUPPORTED_OPERATION,
+            format!("{} does not report push history", self.manifest().label),
+        ))
+    }
+
     /// The stack containing a pull request.
     ///
     /// # Errors
@@ -218,6 +236,7 @@ pub fn serve_review_source(
         OP_REVIEW_SOURCE_MANIFEST => encode(&provider.manifest()),
         OP_REVIEW_SOURCE_PULLS_LIST => encode(&provider.list_pulls(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULLS_GET => encode(&provider.get_pulls(&decode(payload)?)?),
+        OP_REVIEW_SOURCE_PULLS_HISTORY => encode(&provider.get_history(&decode(payload)?)?),
         OP_REVIEW_SOURCE_STACK_RESOLVE => encode(&provider.resolve_stack(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULL_FETCH => encode(&provider.fetch_pull(&decode(payload)?)?),
         OP_REVIEW_SOURCE_PULLS_FETCH => encode(&provider.fetch_pulls(&decode(payload)?)?),
@@ -295,6 +314,13 @@ impl ReviewSourceProvider for JsonReviewSource {
         request: &ReviewSourcePullsGetRequest,
     ) -> ProviderResult<ReviewSourcePullsGetResponse> {
         call(&self.invoke, OP_REVIEW_SOURCE_PULLS_GET, request)
+    }
+
+    fn get_history(
+        &self,
+        request: &ReviewSourcePullsHistoryRequest,
+    ) -> ProviderResult<ReviewSourcePullsHistoryResponse> {
+        call(&self.invoke, OP_REVIEW_SOURCE_PULLS_HISTORY, request)
     }
 
     fn resolve_stack(

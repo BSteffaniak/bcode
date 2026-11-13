@@ -37,6 +37,12 @@ pub enum Message {
     StackConfirmed(Box<session::StackNews>),
     /// What is still loading after the first frame (`None`: nothing).
     Filling(Option<String>),
+    /// The stack's history (quietly loaded, for the layer strip), or why it could not be.
+    History(Result<bcode_code_review_models::StackTimeline, String>),
+    /// The stack's history for the history panel, or why it could not be read.
+    HistoryPanel(Result<bcode_code_review_models::StackTimeline, String>),
+    /// A comparison from the history panel: its title and comparisons, or the failure.
+    HistoryCompared(Result<(String, Vec<bcode_code_review::history::compare::Comparison>), String>),
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.
@@ -328,6 +334,8 @@ impl Streamer<'_> {
                 }
             }
             session::OpenEvent::Stack(news) => {
+                // Every stack seen is a version of each of its layers, kept in the version log.
+                record_observed(self.services, self.repo_path, &news);
                 if live {
                     self.inbox.push(Message::StackConfirmed(Box::new(news)));
                 } else {
@@ -440,6 +448,38 @@ impl Streamer<'_> {
             .await,
         ))
     }
+}
+
+/// Record the versions of `news`'s layers in the version log, without waiting.
+fn record_observed(
+    services: &ReviewServices,
+    repo_path: &std::path::Path,
+    news: &session::StackNews,
+) {
+    let at_ms = news
+        .confirmed_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+        .unwrap_or(0);
+    let versions = bcode_code_review::history::observed_versions(
+        &news.provider,
+        &news.repository,
+        &news.stack,
+        at_ms,
+    );
+    if versions.is_empty() {
+        return;
+    }
+    let (services, repo_path) = (services.clone(), repo_path.to_path_buf());
+    tokio::spawn(async move {
+        let _: Result<bcode_code_review_models::RecordLayerVersionsResponse, _> = services
+            .call(bcode_code_review_models::RecordLayerVersionsRequest {
+                repo_path,
+                versions,
+            })
+            .await;
+    });
 }
 
 /// What an open reported so far: each source with whether it is only pending, and failures.

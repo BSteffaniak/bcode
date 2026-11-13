@@ -123,6 +123,9 @@ pub struct ReviewSourceBatchCapabilities {
     /// `review_source.pulls.get` (several pull requests by number in one call) is supported.
     #[serde(default)]
     pub pulls_get: bool,
+    /// `review_source.pulls.history` (several pull requests' push history) is supported.
+    #[serde(default)]
+    pub pulls_history: bool,
 }
 
 /// Response payload for `review_source.manifest`.

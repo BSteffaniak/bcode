@@ -103,6 +103,9 @@ pub struct ReviewApp {
     keymap_stale: bool,
     /// The review whose sources the wizard edits (reopened when the edit is canceled).
     editing: Option<Box<ReviewWorkspace>>,
+    /// The reviews a comparison was opened from (the stack history), most recent last: closing
+    /// a review returns to the one before it instead of home.
+    return_to: Vec<ReviewWorkspace>,
 }
 
 impl std::fmt::Debug for ReviewApp {
@@ -141,6 +144,7 @@ impl ReviewApp {
             opened_reviews: 0,
             keymap_stale: true,
             editing: None,
+            return_to: Vec::new(),
         };
         match entry {
             Entry::Home => app.show_home(false),
@@ -382,6 +386,15 @@ impl ReviewApp {
     /// A review's action, with its close turned into the way back to home (or into the
     /// source editor when the review asked for it).
     fn review_action(&mut self, action: Action, host: &UiContext) -> Action {
+        if let Action::OpenReview { title, sources } = action {
+            // A comparison opens as its own review; closing it comes back here.
+            if let Route::Review(review) = &self.route {
+                self.return_to.push(review.edit_target());
+            }
+            let workspace = transient_workspace(self.repo.clone(), Some(title), sources);
+            self.open_review(workspace, Some(host));
+            return Action::Redraw;
+        }
         let Action::Close { edit_sources } = action else {
             return action;
         };
@@ -393,6 +406,10 @@ impl ReviewApp {
             self.editing = Some(Box::new(workspace));
             self.route = Route::Wizard(Box::new(wizard));
             self.keymap_stale = true;
+            return Action::Redraw;
+        }
+        if let Some(previous) = self.return_to.pop() {
+            self.open_review(previous, Some(host));
             return Action::Redraw;
         }
         self.show_home(true);

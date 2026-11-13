@@ -236,6 +236,7 @@ impl FakeProvider {
                             batched: ReviewSourceBatchCapabilities {
                                 pulls_fetch: false,
                                 pulls_get: true,
+                                pulls_history: false,
                             },
                         },
                     })

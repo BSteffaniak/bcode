@@ -1953,6 +1953,7 @@ dependencies = [
  "bcode_code_review_models",
  "bcode_code_review_provider",
  "bcode_forge",
+ "chrono",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

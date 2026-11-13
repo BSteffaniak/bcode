@@ -151,6 +151,10 @@ data_operations! {
 }
 
 store_operations! {
+    models::RecordLayerVersionsRequest => models::RecordLayerVersionsResponse,
+        models::OP_REVIEW_HISTORY_RECORD, |store, request| store.record_layer_versions(request);
+    models::ListLayerVersionsRequest => models::ListLayerVersionsResponse,
+        models::OP_REVIEW_HISTORY_LIST, |store, request| store.list_layer_versions(&request);
     models::ListReviewWorkspacesRequest => models::ListReviewWorkspacesResponse,
         models::OP_REVIEW_WORKSPACE_LIST, |store, request| store.list_workspaces(&request);
     models::CreateReviewWorkspaceRequest => models::CreateReviewWorkspaceResponse,

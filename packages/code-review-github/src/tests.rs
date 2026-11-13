@@ -627,3 +627,69 @@ fn pulls_by_number_answer_open_ones_and_name_the_rest() {
     assert_eq!(open, [2, 1]);
     assert_eq!(response.not_open, [3, 4, 5]);
 }
+
+#[test]
+fn push_history_reads_in_order_and_old_versions_are_fetched_where_still_served() {
+    use bcode_code_review_models::{PullHistory, PullHistoryEvent};
+    let events = history_events(vec![
+        bcode_forge::HistoryItem::ForcePushed {
+            at: "2026-11-02T10:00:00Z".into(),
+            actor: Some("octocat".into()),
+            before: Some("a".repeat(40)),
+            after: Some("b".repeat(40)),
+        },
+        bcode_forge::HistoryItem::Commit {
+            oid: "a".repeat(40),
+            at: "2026-11-01T10:00:00Z".into(),
+        },
+        bcode_forge::HistoryItem::BaseChanged {
+            at: "not a time".into(),
+            from: None,
+            to: None,
+        },
+    ]);
+    assert_eq!(
+        events,
+        [
+            PullHistoryEvent::CommitsPushed {
+                at_ms: 1_793_527_200_000,
+                head_oid: "a".repeat(40),
+            },
+            PullHistoryEvent::ForcePushed {
+                at_ms: 1_793_613_600_000,
+                actor: Some("octocat".into()),
+                before_oid: Some("a".repeat(40)),
+                after_oid: Some("b".repeat(40)),
+            },
+        ]
+    );
+
+    // A version that only the upstream has (a force push replaced it there), and one that no
+    // longer exists anywhere: the first is fetched and kept under a review-owned reference.
+    let (_dir, upstream, clone) = upstream_and_clone();
+    let only_upstream = run(&upstream, &["rev-parse", "refs/pull/7/head"]);
+    let gone = "e".repeat(40);
+    fetch_versions(
+        &clone,
+        "origin",
+        &[PullHistory {
+            number: 7,
+            events: vec![PullHistoryEvent::ForcePushed {
+                at_ms: 0,
+                actor: None,
+                before_oid: Some(gone),
+                after_oid: Some(only_upstream.clone()),
+            }],
+        }],
+    );
+    assert_eq!(
+        run(
+            &clone,
+            &[
+                "rev-parse",
+                &format!("{VERSION_REF_NAMESPACE}/{only_upstream}")
+            ]
+        ),
+        only_upstream
+    );
+}

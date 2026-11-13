@@ -9,6 +9,9 @@
 //! database concurrently.
 
 mod db;
+mod history;
+
+use history::{list_layer_versions_for_request, record_layer_versions_for_request};
 
 pub(crate) use db::with_database;
 use db::{
@@ -164,6 +167,14 @@ impl ReviewStore {
 }
 
 store_operations! {
+    /// Record versions of pull requests in the version log.
+    record_layer_versions(bcode_code_review_models::RecordLayerVersionsRequest)
+        -> bcode_code_review_models::RecordLayerVersionsResponse
+        => record_layer_versions_for_request;
+    /// Versions of pull requests from the version log.
+    list_layer_versions(&bcode_code_review_models::ListLayerVersionsRequest)
+        -> bcode_code_review_models::ListLayerVersionsResponse
+        => list_layer_versions_for_request;
     /// Workspaces of a repository, newest first.
     list_workspaces(&ListReviewWorkspacesRequest) -> ListReviewWorkspacesResponse
         => list_review_workspaces_for_request;

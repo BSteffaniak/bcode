@@ -15,6 +15,14 @@ pub enum Action {
         /// The review asks to edit its sources instead of returning home.
         edit_sources: bool,
     },
+    /// Open a review of `sources` (a comparison from the stack history), and return to the
+    /// review that asked when it closes.
+    OpenReview {
+        /// Its title.
+        title: String,
+        /// Its sources.
+        sources: Vec<bcode_code_review_models::ReviewSourceKind>,
+    },
     /// Open a Bcode session, handing it the terminal, and return to the review afterwards.
     OpenSession {
         /// Session to open.

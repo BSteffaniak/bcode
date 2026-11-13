@@ -6,11 +6,13 @@
 
 mod assistant;
 mod data;
+mod history;
 mod review_discovery;
 mod review_source;
 
 pub use assistant::*;
 pub use data::*;
+pub use history::*;
 pub use review_discovery::*;
 pub use review_source::*;
 

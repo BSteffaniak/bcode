@@ -4,7 +4,7 @@
 //! read-only.
 
 use super::app::{app, create, fixture, open, settled, stored};
-use crate::app::ReviewApp;
+use crate::app::{ReviewApp, RouteName};
 use crate::entry::Entry;
 use crate::notes::NoteScope;
 use crate::publish::Step;
@@ -93,7 +93,7 @@ fn cursor(scenario: &Scenario<ReviewApp>) -> Option<ItemKey> {
 fn publish_step(scenario: &Scenario<ReviewApp>) -> Option<Step> {
     match scenario.surface().review()?.modal()? {
         Modal::Publish(flow) => Some(flow.step().clone()),
-        Modal::Import(_) => None,
+        Modal::Import(_) | Modal::History(_) => None,
     }
 }
 
@@ -917,4 +917,163 @@ fn excluded_threads_stay_out_and_option_fields_take_every_letter() {
     let written = std::fs::read_to_string(fixture.root().join("jkq.md")).expect("export written");
     assert!(written.contains("keep this"), "{written}");
     assert!(!written.contains("drop this"), "{written}");
+}
+
+/// Add a commit adding `path` to `branch` of `fixture`, dated now (the fixture dates its own
+/// commits in the past), through a temporary worktree.
+fn push_to(fixture: &GitFixture, branch: &str, path: &str) {
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let checkout = worktree.path().join("checkout");
+    let now = format!(
+        "@{} +0000",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+    );
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("GIT_AUTHOR_DATE", &now)
+            .env("GIT_COMMITTER_DATE", &now)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(
+        fixture.root(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            checkout.to_str().expect("path"),
+            branch,
+        ],
+    );
+    std::fs::write(checkout.join(path), "pushed later\n").expect("write");
+    git(&checkout, &["add", path]);
+    git(&checkout, &["commit", "-q", "-m", "pushed later"]);
+    git(
+        fixture.root(),
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            checkout.to_str().expect("path"),
+        ],
+    );
+}
+
+#[test]
+fn the_stack_history_shows_a_push_and_opens_what_it_changed_returning_after() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(
+        &backend,
+        &fixture,
+        "History",
+        vec![layer(101), layer(102), layer(103)],
+    );
+    // Opening the review records each layer's version; then the top layer is pushed again.
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[2], "pushed-later.txt");
+
+    scenario.key("shift+b");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("Stack history"), "{}", screen.text());
+    // One push since the stack was first seen: it changed the top layer only.
+    assert!(screen.contains("#103 changed"), "{}", screen.text());
+
+    // The top layer (the stack's fourth, #100 to #103), from before the push to now.
+    for _ in 0..3 {
+        scenario.key("down");
+    }
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert_eq!(scenario.surface().route_name(), RouteName::Review);
+    let review = scenario.surface().review().expect("comparison review");
+    assert!(review.is_transient());
+    assert!(
+        review
+            .workspace()
+            .is_some_and(|workspace| workspace.title.starts_with("#103")),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.contains("pushed-later.txt"), "{}", screen.text());
+
+    // Closing the comparison comes back to the review it came from.
+    scenario.key("q");
+    settled(&mut scenario);
+    let back = scenario.surface().review().expect("back in the review");
+    assert_eq!(
+        back.workspace().map(|workspace| workspace.id.clone()),
+        Some(workspace.id)
+    );
+}
+
+#[test]
+fn files_several_layers_change_are_listed_and_each_jumps_to_its_layer() {
+    use crate::testing::fixture::STACK_SHARED_FILE;
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Overlaps",
+        vec![layer(101), layer(102), layer(103)],
+    );
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let run = |scenario: &mut Scenario<ReviewApp>, command: &str| {
+        scenario.key(":");
+        scenario.paste(command);
+        scenario.key("enter");
+        settled(scenario)
+    };
+    let screen = run(&mut scenario, "files several layers");
+    assert!(
+        screen.contains("Files several layers change"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        screen.contains(&format!("{STACK_SHARED_FILE}: ")),
+        "{}",
+        screen.text()
+    );
+    // The first layer listed for the shared file: entering it shows that layer, at that file.
+    scenario.key("enter");
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    let file = review
+        .cursor()
+        .and_then(|key| key.file())
+        .expect("a file at the cursor");
+    assert_eq!(file.path, STACK_SHARED_FILE);
+
+    // The same file through the stack lists every layer that changes it.
+    let screen = run(&mut scenario, "this file through the stack");
+    assert!(
+        screen.contains("This file through the stack"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        screen.contains(&format!("{STACK_SHARED_FILE}: changed by")),
+        "{}",
+        screen.text()
+    );
 }

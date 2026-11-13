@@ -155,8 +155,10 @@ mod dock;
 mod feed;
 mod find;
 mod flows;
+mod history;
 mod pointer;
 mod stack;
+mod stack_files;
 
 pub use annotate::COMPOSER_SCOPE;
 pub use dock::{ASSISTANT_PANE_ID, ASSISTANT_SCOPE, DockResult};
@@ -683,6 +685,10 @@ pub struct ReviewSurface {
     stack_confirmed_at: Option<std::time::SystemTime>,
     /// Sources that failed after the first frame.
     failed_sources: BTreeSet<String>,
+    /// The stack this review last saw (and its provider), for its history.
+    stack_news: Option<bcode_code_review::session::StackNews>,
+    /// The stack's history, once read.
+    stack_history: Option<bcode_code_review_models::StackTimeline>,
     /// The open running now: cancelled when another starts or the surface goes away.
     opening: OpenInFlight,
     /// Text to copy once the host is at hand, and what it is.
@@ -808,6 +814,8 @@ impl ReviewSurface {
             filling_note: None,
             stack_confirmed_at: None,
             failed_sources: BTreeSet::new(),
+            stack_news: None,
+            stack_history: None,
             opening: OpenInFlight::default(),
             clipboard: None,
             exit_armed: false,
@@ -1763,7 +1771,12 @@ impl ReviewSurface {
                     review.token = token;
                     review.working_tree = working_tree;
                 }
+                // Every layer is in: how the stack changed lately is read for the layer strip.
+                self.load_history_quietly(host);
             }
+            Message::History(result) => self.apply_history(result),
+            Message::HistoryPanel(result) => self.apply_history_panel(result),
+            Message::HistoryCompared(result) => self.apply_history_compared(result),
             Message::OpenFailed(error) => {
                 self.switching = false;
                 if self.review.is_some() {
@@ -2017,6 +2030,7 @@ impl ReviewSurface {
     /// strip, and saved with the review so it opens at once next time.
     fn apply_stack_news(&mut self, news: bcode_code_review::session::StackNews) {
         self.stack_confirmed_at = Some(news.confirmed_at);
+        self.stack_news = Some(news.clone());
         let confirmed_at_ms = news
             .confirmed_at
             .duration_since(std::time::UNIX_EPOCH)
@@ -2409,11 +2423,21 @@ impl ReviewSurface {
             self.goto_line(line);
             return Some(Action::Redraw);
         }
+        if let Some(target) = action.strip_prefix(stack_files::STACK_FILE_PREFIX) {
+            return Some(if self.jump_to_stack_file(target) {
+                Action::Redraw
+            } else {
+                Action::None
+            });
+        }
         if let Some(command) = super::agent::AiCommand::from_action(action) {
             self.ai_command(command);
             return Some(Action::Redraw);
         }
         match action {
+            "stack_history" => self.open_history(host),
+            "stack_file" => self.open_file_through_stack(),
+            "stack_overlaps" => self.open_stack_overlaps(),
             "fold" => self.fold(),
             "fold_all" => self.fold_all(),
             "resolved_toggle" => self.toggle_resolved(),
@@ -3300,6 +3324,7 @@ impl ReviewSurface {
         match self.modal.as_mut() {
             Some(Modal::Publish(flow)) => flow.paint(&theme, area, cx),
             Some(Modal::Import(flow)) => flow.paint(&theme, area, cx),
+            Some(Modal::History(panel)) => panel.paint(&theme, area, cx),
             None => {}
         }
         if self.publish.open

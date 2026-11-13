@@ -76,7 +76,7 @@ impl ReviewSurface {
     }
 
     /// [`Self::apply_stack_view`] on layer `wanted` (a workspace source id), else the current one.
-    fn show_stack_layer(&mut self, wanted: Option<&str>) {
+    pub(super) fn show_stack_layer(&mut self, wanted: Option<&str>) {
         if !self.steps_through_stack() {
             return;
         }
@@ -459,6 +459,10 @@ impl ReviewSurface {
         ) {
             spans.push(Span::styled(separator, theme.muted));
             spans.push(Span::styled(status, theme.muted));
+        }
+        if let Some(summary) = self.last_push_summary() {
+            spans.push(Span::styled(separator, theme.muted));
+            spans.push(Span::styled(summary, theme.muted));
         }
         let line = Line::from_spans(spans).truncate(usize::from(area.width));
         cx.paint_component(&TextBlock::new(Text::from_lines(vec![line])), area);

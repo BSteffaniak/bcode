@@ -1289,3 +1289,74 @@ fn concurrent_first_opens_of_a_fresh_database_all_succeed() {
         assert!(opened.expect("fresh database opens"), "schema is migrated");
     }
 }
+
+#[test]
+fn the_version_log_merges_what_each_source_saw() {
+    use bcode_code_review_models::{
+        LayerVersion, ListLayerVersionsRequest, RecordLayerVersionsRequest, VersionSource,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = initialized_test_repository(temp.path());
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let version = |number: u64, head: &str, at: u64, source: VersionSource| LayerVersion {
+        provider: "github".into(),
+        repository: "o/r".into(),
+        number,
+        head_oid: head.into(),
+        base_oid: None,
+        base_branch: None,
+        seen_at_ms: at,
+        actor: None,
+        sources: BTreeSet::from([source]),
+    };
+    let record = |versions: Vec<LayerVersion>| {
+        super::history::record_layer_versions_for_request(
+            RecordLayerVersionsRequest {
+                repo_path: repo.clone(),
+                versions,
+            },
+            &config,
+        )
+        .expect("record")
+        .added
+    };
+    assert_eq!(
+        record(vec![
+            version(1, "a1", 200, VersionSource::Observed),
+            version(1, "a2", 300, VersionSource::Observed),
+            version(2, "b1", 100, VersionSource::Observed),
+        ]),
+        3
+    );
+    // The forge saw a1 earlier, and knows who pushed it and on what.
+    let mut pushed = version(1, "a1", 150, VersionSource::Forge);
+    pushed.actor = Some("octocat".into());
+    pushed.base_branch = Some("main".into());
+    assert_eq!(record(vec![pushed]), 0);
+    let listed = super::history::list_layer_versions_for_request(
+        &ListLayerVersionsRequest {
+            repo_path: repo.clone(),
+            provider: "github".into(),
+            repository: "o/r".into(),
+            numbers: vec![1],
+        },
+        &config,
+    )
+    .expect("list")
+    .versions;
+    let heads: Vec<&str> = listed
+        .iter()
+        .map(|version| version.head_oid.as_str())
+        .collect();
+    assert_eq!(heads, ["a1", "a2"]);
+    assert_eq!(listed[0].seen_at_ms, 150);
+    assert_eq!(listed[0].actor.as_deref(), Some("octocat"));
+    assert_eq!(listed[0].base_branch.as_deref(), Some("main"));
+    assert_eq!(
+        listed[0].sources,
+        BTreeSet::from([VersionSource::Forge, VersionSource::Observed])
+    );
+}
