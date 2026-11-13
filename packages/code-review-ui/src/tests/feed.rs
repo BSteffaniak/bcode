@@ -426,3 +426,61 @@ fn deleting_a_question_stops_following_its_session() {
     assert!(!screen.contains("Is this needed?"), "{}", screen.text());
     assert!(follow.is_closed(), "the session is still followed");
 }
+
+/// The row of the AI card's header.
+fn ai_header_row(screen: &crate::testing::harness::Screen) -> u16 {
+    (0..screen.height())
+        .find(|y| {
+            let row = screen.row_text(*y);
+            row.contains("Bcode") && row.contains("Viewed")
+        })
+        .unwrap_or_else(|| panic!("no AI card header:\n{}", screen.text()))
+}
+
+#[test]
+fn an_answer_is_a_card_like_a_thread_viewed_folds_it_and_the_header_finds_it() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 120, 60);
+    let (session, prompt) = ask(&mut setup, "Is this needed?");
+    let screen = send(
+        &mut setup,
+        &session,
+        snapshot(vec![user(&prompt), assistant("No, drop it.", false)], false),
+    );
+    // On the threads' frame: the header in the top border, the buttons in the bottom one.
+    let header = ai_header_row(&screen);
+    let top = screen.row_text(header);
+    assert!(top.contains('╭') && top.contains("○ Viewed"), "{top}");
+    assert!(screen.contains("No, drop it."));
+    assert!(screen.contains("threads 0/1"), "{}", screen.text());
+    // Viewed: one row.
+    let x = screen.column_of(header, "Viewed").expect("checkbox");
+    setup.scenario.click(x, header);
+    let screen = stable(&mut setup.scenario);
+    assert!(!screen.contains("No, drop it."), "{}", screen.text());
+    let header = ai_header_row(&screen);
+    assert!(
+        screen.row_text(header).contains("✓ Viewed"),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.row_text(header).contains('╶'));
+    assert!(screen.contains("threads 1/1"), "{}", screen.text());
+    // `z` opens it by hand, still viewed.
+    setup.scenario.key("z");
+    let screen = stable(&mut setup.scenario);
+    assert!(screen.contains("No, drop it."), "{}", screen.text());
+    // Unviewed again, the header's count goes to it from the top.
+    setup.scenario.key("v");
+    stable(&mut setup.scenario);
+    setup.scenario.key("g");
+    let screen = stable(&mut setup.scenario);
+    let count = screen.find("threads 0/1").expect("count");
+    setup.scenario.click(count.x, count.y);
+    stable(&mut setup.scenario);
+    assert!(
+        matches!(cursor(&setup.scenario), ItemKey::AgentThread { .. }),
+        "{:?}",
+        cursor(&setup.scenario)
+    );
+}

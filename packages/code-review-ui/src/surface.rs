@@ -2545,6 +2545,9 @@ impl ReviewSurface {
     /// Review actions: comments, threads, AI answers, viewed marks, selection, copying, search,
     /// the palette, and help.
     fn review_action(&mut self, action: &str, host: &UiContext) -> Option<Action> {
+        if self.fold_and_view_action(action) {
+            return Some(Action::Redraw);
+        }
         Some(match action {
             "palette" | "help" => {
                 self.open_overlay(action == "help", host);
@@ -2576,10 +2579,6 @@ impl ReviewSurface {
                 self.toggle_file_collapsed();
                 Action::Redraw
             }
-            "fold_files" | "open_files" => {
-                self.fold_files(action == "fold_files");
-                Action::Redraw
-            }
             "copy_path" => {
                 self.copy_file_path();
                 Action::Redraw
@@ -2608,10 +2607,6 @@ impl ReviewSurface {
                 if !self.toggle_thread_viewed() {
                     self.toggle_viewed();
                 }
-                Action::Redraw
-            }
-            "view_threads" | "unview_threads" | "fold_threads" | "open_threads" => {
-                self.threads_action(action);
                 Action::Redraw
             }
             "range" => {
@@ -3215,7 +3210,30 @@ impl ReviewSurface {
         Action::Redraw
     }
 
+    /// `threads N/M` in the header: a click goes to the next thread or answer not viewed.
+    fn header_threads_click(&mut self, event: &Event) -> bool {
+        let Event::Mouse(mouse) = event else {
+            return false;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let position = mouse.position;
+        let hit = self.header.as_ref().is_some_and(|(row, plan)| {
+            plan.area(HeaderPart::Threads).is_some_and(|part| {
+                Rect::new(row.x + part.x, row.y, part.width, 1).contains(position)
+            })
+        });
+        if hit {
+            self.next_unviewed_card();
+        }
+        hit
+    }
+
     fn publish_input(&mut self, event: &Event, host: &UiContext) -> Action {
+        if self.header_threads_click(event) {
+            return Action::Redraw;
+        }
         let Some((row, plan)) = &self.header else {
             self.publish.close();
             return Action::Redraw;
@@ -4125,7 +4143,8 @@ impl ReviewSurface {
                 show_all: &self.talk.show_all,
                 viewed_layers: viewed,
                 overview: self.services.conversation_config().overview,
-                revision: self.talk.card_revision(),
+                threads: &self.folds.threads,
+                revision: self.talk.card_revision() ^ self.folds.revision.rotate_left(17),
             },
         };
         // Lay out (twice when the cursor must be revealed: the reveal needs the synced index).

@@ -125,8 +125,20 @@ The parts:
 * **Roomy** (`threads.card = "roomy"`): plain top and bottom borders, with the header and the
   buttons on rows of their own inside the frame (two more rows per thread).
 
-Your drafts, imported threads and pull request threads all use the same frame
-(`rows/thread_card.rs`). AI answer cards are a later step (see [Phases](#phases)).
+Your drafts, imported threads, pull request threads and AI answer cards all use the same frame
+(`rows/thread_card.rs`).
+
+**AI answer cards** are cards like the rest:
+* The header is `✦ Bcode`, its status (with the spinner while it works), its usage, and the
+  Viewed checkbox.
+* The body is sections: the question, the turn, a permission prompt, and suggestions.
+* The frame is the accent while unviewed, the warning color while it needs you, the error
+  color when it failed, and muted once viewed.
+* Bcode's answer counts as a comment from someone else. A card is keyed `ai:<exchange id>`,
+  and its one "comment" is the exchange's latest update, so a new answer (a follow-up) makes a
+  viewed card unviewed again.
+* `z` and the chevron fold it like a thread. **More**/**Less** still show the whole answer or
+  its preview.
 
 ## Interaction
 
@@ -204,15 +216,20 @@ Implemented, not committed.
   * state colors, the width cap, the left edge for review- and layer-level threads;
   * narrow and ASCII fallbacks, and the theme roles.
 * **Around it:**
+  * AI answer cards on the frame, viewed and folded like threads;
   * the threads panel's viewed marks and *unviewed* filter;
-  * the `threads N/M` header count;
-  * attention through unviewed threads, between unviewed files and open threads.
+  * the `threads N/M` header count (threads and answers): a click, or the
+    `unviewed_thread_next` action, goes to the next one not viewed;
+  * attention through unviewed threads and answers, between unviewed files and open threads;
+  * the pull request bar's *N new*:
+    * reviews and conversation comments since the pull request was last looked at;
+    * in its threads, what view marks say: nothing in a viewed thread, the comments since in
+      one viewed before, and comments since last looked at in one never viewed.
 * **Tests:**
   * core tests for staleness and every fold rule;
-  * screen tests for the card frame, viewing to fold, a reply from someone else reopening it,
-    `keep_folded` keeping it folded with *1 new*, the roomy layout, and persistence.
-* **Not done:**
-  * the pull request bar's *N new* still comes from when the pull request was last looked at,
-    not from view marks;
-  * AI answer cards are not on the frame yet;
-  * the header count is not a button.
+  * screen tests for:
+    * the card frame, viewing to fold, and a reply from someone else reopening it;
+    * `keep_folded` keeping it folded with *1 new*;
+    * the bar's *1 new* clearing once viewed;
+    * the roomy layout, and persistence;
+    * an AI card on the frame: viewed folds it, `z` opens it, and the header count finds it.

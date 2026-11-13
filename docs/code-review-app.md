@@ -105,7 +105,9 @@ that exits.
 ### AI cards
 
 Asking Bcode (a new question, a follow-up, or an AI command) never leaves the review. The cursor
-moves to the question's card below its anchor, and the card follows the linked session live:
+moves to the question's card below its anchor, and the card follows the linked session live. It
+is framed like a comment thread, with a Viewed checkbox (`v`), and it folds with `z` or its
+chevron (see [`review-thread-cards.md`](review-thread-cards.md)):
 
 * The title shows a spinner while the turn runs, the status (`asking…`, `working…`,
   `needs you`, `stopping…`, `answered`, `stopped`, `failed`), the session's tokens and estimated
@@ -113,7 +115,7 @@ moves to the question's card below its anchor, and the card follows the linked s
 * The body is the question's turn: `▍you` and the question as asked, reasoning collapsed to
   `▸ thinking · N words` (a click opens it), tool lines `◌` running, `✓` done, `✗` failed with
   the last three lines of output and an `All N lines` expander, the answer as markdown that
-  streams in (its last rows while streaming; `z`/More shows the whole answer), notices, and
+  streams in (its last rows while streaming; More shows the whole answer), notices, and
   errors.
 * A pending permission request of the session replaces the card's actions with its prompt:
   `y` allow, `a` always, `n` decline, `d` never (scope `code-review-feed`; Always and Never
@@ -461,7 +463,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `shift+l` | Show only the changes since your last review (toggle) |
 | `shift+m` | Mark the review pass complete |
 | `enter` | Actions of the thread or AI answer (reveals a gap) |
-| `z` | Collapse or expand the thread (whole or preview AI answer) |
+| `z` | Fold or open the thread or AI answer (its More shows a whole answer) |
 | `shift+z` | Collapse every thread (expand all when all are collapsed); on a file's header, fold every file (open all when all are folded) |
 | `shift+h` | Show / hide resolved threads |
 | `h` | Show / hide viewed files in the file panel |

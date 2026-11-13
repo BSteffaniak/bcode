@@ -21,6 +21,15 @@ use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
 use bmux_tui::text_width::display_width;
 
+/// Key prefix of AI answer cards in view marks and folds.
+pub const AI_PREFIX: &str = "ai:";
+
+/// The card key of an AI answer item (by its exchange or suggestion id).
+#[must_use]
+pub fn ai_key(id: &str) -> String {
+    format!("{AI_PREFIX}{id}")
+}
+
 /// Least width that keeps the card's sides.
 const MIN_FRAMED: usize = 40;
 
@@ -446,10 +455,8 @@ impl Out<'_> {
         let (spans, actions, used) = if fits || buttons.is_empty() {
             (spans, actions, used)
         } else {
-            // On a row of their own, then a plain bottom.
-            let (row_spans, row_actions, _) = self.buttons(buttons, self.indent + 2, self.row());
-            self.actions.extend(row_actions);
-            self.content_row(row_spans);
+            // On rows of their own (wrapped), then a plain bottom.
+            self.wrapped_buttons(buttons);
             (Vec::new(), Vec::new(), 0)
         };
         self.actions.extend(actions);
@@ -495,11 +502,40 @@ impl Out<'_> {
             content.extend(footer.iter().cloned());
             self.content_row(content);
         } else {
-            self.actions.extend(actions);
-            self.content_row(spans);
+            self.wrapped_buttons(buttons);
             if !footer.is_empty() {
                 self.content_row(footer.to_vec());
             }
+        }
+    }
+
+    /// `buttons` on content rows, wrapped to the inner width.
+    fn wrapped_buttons(&mut self, buttons: &[(&str, ItemAction)]) {
+        let inner = self.inner();
+        let separator = display_width(self.theme.icons.separator);
+        let mut row: Vec<(&str, ItemAction)> = Vec::new();
+        let mut used = 0;
+        for button in buttons {
+            let width = display_width(button.0);
+            let gap = if row.is_empty() { 0 } else { separator };
+            if !row.is_empty() && used + gap + width > inner {
+                let (spans, actions, _) = self.buttons(&row, self.indent + 2, self.row());
+                self.actions.extend(actions);
+                self.content_row(spans);
+                row.clear();
+                used = 0;
+            }
+            used += if row.is_empty() {
+                width
+            } else {
+                separator + width
+            };
+            row.push(*button);
+        }
+        if !row.is_empty() {
+            let (spans, actions, _) = self.buttons(&row, self.indent + 2, self.row());
+            self.actions.extend(actions);
+            self.content_row(spans);
         }
     }
 }

@@ -726,7 +726,8 @@ impl ReviewSurface {
             show_all: &self.talk.show_all,
             viewed_layers,
             overview: self.services.conversation_config().overview,
-            revision: self.talk.card_revision(),
+            threads: &self.folds.threads,
+            revision: self.talk.card_revision() ^ self.folds.revision.rotate_left(17),
         }
     }
 

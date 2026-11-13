@@ -445,6 +445,16 @@ fn a_thread_is_a_card_and_viewing_it_folds_it_until_someone_replies() {
             .row_text(card_header_row(&screen))
             .contains("○ Viewed")
     );
+    // The bar counts it as new until the thread is viewed again.
+    let bar = |screen: &Screen| {
+        screen
+            .find("Approved")
+            .map(|at| screen.row_text(at.y))
+            .unwrap_or_default()
+    };
+    assert!(bar(&screen).contains("1 new"), "{}", screen.text());
+    let screen = click_viewed(&mut scenario);
+    assert!(!bar(&screen).contains(" new"), "{}", screen.text());
 }
 
 #[test]

@@ -1,5 +1,7 @@
 //! Rows of an AI card: a live, abbreviated feed of the question's turn in its linked session.
 //!
+//! * It is a card on the same frame as comment threads ([`super::thread_card`]): folded with
+//!   `z` or its chevron, a Viewed checkbox (a new answer makes it unviewed again).
 //! * The header carries the card's state: a spinner while the session works, the status, the
 //!   session's tokens and cost, and the time the turn has run.
 //! * The body is the turn: the question (`▍you`), reasoning collapsed to `▸ thinking · N words`,
@@ -12,9 +14,9 @@
 //! whatever the session did.
 
 use super::{
-    ActionCells, AgentAction, Folds, ItemAction, ItemRows, MAX_ANSWER_ROWS,
-    MAX_EXPANDED_ANSWER_ROWS, SuggestionAction, action_row, indented, markdown_rows,
-    outdated_label, suggestion_rows,
+    ActionCells, AgentAction, Folds, ItemAction, ItemRows, Look, MAX_ANSWER_ROWS,
+    MAX_EXPANDED_ANSWER_ROWS, SuggestionAction, action_row, indented, line_reference,
+    markdown_rows, outdated_label, suggestion_rows, thread_card,
 };
 use crate::agent::feed::{FeedItem, PendingPermission, TOOL_TAIL_LINES, ToolLine, ToolState, Turn};
 use crate::agent::{AgentPhase, AgentState, AgentStreams};
@@ -86,15 +88,15 @@ pub fn is_newest(exchange: &ReviewAiExchange, notes: &crate::notes::ReviewNotes)
         .is_none_or(|newest| newest.exchange_id == exchange.exchange_id)
 }
 
-/// Header of an AI card: icon, spinner and status, usage, and an outdated label. Returns
-/// whether the question or the observation of its session failed (a retry applies).
+/// Header chips of an AI card after its lead: spinner and status, usage, and an outdated label.
+/// Returns whether the question or the observation of its session failed (a retry applies),
+/// and whether it needs you.
 fn header(
     agent: &bcode_code_review::document::AgentThreadItem,
     status: Option<ReviewAiExchangeStatus>,
     live: Option<(&AgentState, crate::agent::LiveClock)>,
     theme: &ReviewTheme,
-    indent: usize,
-) -> (Vec<Span>, bool) {
+) -> (Vec<Vec<Span>>, bool, bool) {
     let icons = &theme.icons;
     let (label, style, failed) = match (status, live) {
         (Some(ReviewAiExchangeStatus::Failed), _) => ("failed", theme.error, true),
@@ -111,23 +113,19 @@ fn header(
         },
         _ => ("suggestion", theme.badge_ai, false),
     };
-    let mut spans = vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled(icons.ai, theme.badge_ai),
-        Span::raw(" "),
-        Span::styled("Bcode", theme.badge_ai),
-        Span::raw(" "),
-    ];
+    let needs_you = live.is_some_and(|(state, _)| state.needs_you());
+    let mut state_chip = Vec::new();
     let spinning = matches!(status, Some(ReviewAiExchangeStatus::Pending))
         || live.is_some_and(|(state, _)| state.working && !state.needs_you());
     if spinning {
         let spinner = Spinner::named(icons.spinner).unwrap_or_else(Spinner::braille);
         let step = live.map_or(0, |(_, clock)| clock.step);
         let elapsed = DEFAULT_INTERVAL.saturating_mul(u32::try_from(step % 64).unwrap_or(0));
-        spans.push(spinner.span(elapsed, theme.accent));
-        spans.push(Span::raw(" "));
+        state_chip.push(spinner.span(elapsed, theme.accent));
+        state_chip.push(Span::raw(" "));
     }
-    spans.push(Span::styled(label, style));
+    state_chip.push(Span::styled(label, style));
+    let mut chips = vec![state_chip];
     if let Some((state, clock)) = live {
         let mut usage = Vec::new();
         if state.feed.tokens > 0 {
@@ -139,16 +137,17 @@ fn header(
         if state.working && clock.seconds > 0 {
             usage.push(format!("{}s", clock.seconds));
         }
-        for part in usage {
-            spans.push(Span::styled(icons.separator, theme.tiers.dim));
-            spans.push(Span::styled(part, theme.muted));
+        if !usage.is_empty() {
+            chips.push(vec![Span::styled(usage.join(icons.separator), theme.muted)]);
         }
     }
     if let bcode_code_review::document::AnchorPlacement::Outdated(reason) = agent.placement {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(outdated_label(reason), theme.badge_outdated));
+        chips.push(vec![Span::styled(
+            outdated_label(reason),
+            theme.badge_outdated,
+        )]);
     }
-    (spans, failed)
+    (chips, failed, needs_you)
 }
 
 /// Builds a card's rows while tracking clickable cells.
@@ -401,7 +400,6 @@ impl Card<'_> {
         folds: &Folds,
     ) -> bool {
         let theme = self.theme;
-        self.question(&exchange.question);
         if let Some(error) = &exchange.error {
             self.alert(error.lines().next().unwrap_or_default());
         }
@@ -593,16 +591,53 @@ fn labelled(label: &str, key: &str) -> String {
     }
 }
 
-/// Rows of an AI card.
+/// A body builder whose lines are `width` cells (the card's inner width).
+const fn body(theme: &ReviewTheme, width: usize) -> Card<'_> {
+    Card {
+        theme,
+        width,
+        pad: String::new(),
+        body_width: width,
+        lines: Vec::new(),
+        actions: Vec::new(),
+    }
+}
+
+/// An AI card's header chips: the lead (chevron, `✦ Bcode`), what is new, then `chips`.
+fn title(chips: Vec<Vec<Span>>, look: &Look, theme: &ReviewTheme) -> Vec<Vec<Span>> {
+    let mut title = vec![vec![
+        look.chevron(theme),
+        Span::raw(" "),
+        Span::styled(theme.icons.ai, theme.badge_ai),
+        Span::raw(" "),
+        Span::styled("Bcode", theme.badge_ai),
+    ]];
+    title.extend(look.new_chip(theme));
+    title.extend(chips);
+    title
+}
+
+/// `card` as a section of the frame, when it has lines.
+fn section(card: Card<'_>, sections: &mut Vec<thread_card::Section>) {
+    if !card.lines.is_empty() {
+        sections.push(thread_card::Section {
+            lines: card.lines,
+            actions: card.actions,
+        });
+    }
+}
+
+/// Rows of an AI card: a card on the threads' frame (see [`thread_card`]), its sections the
+/// question, the turn, a permission prompt, and suggestions.
 pub(super) fn agent_rows(
     agent: &bcode_code_review::document::AgentThreadItem,
     notes: &crate::notes::ReviewNotes,
     agents: &AgentStreams,
     folds: &Folds,
+    layout: thread_card::Layout,
     theme: &ReviewTheme,
-    width: usize,
-    indent: usize,
 ) -> ItemRows {
+    let inner = layout.inner();
     let exchange = agent
         .exchange_id
         .as_deref()
@@ -610,52 +645,43 @@ pub(super) fn agent_rows(
     let session = exchange.and_then(|exchange| exchange.session_id.as_deref());
     let state = session.and_then(|session| agents.state(session));
     let live = state.zip(session.map(|session| agents.clock(session)));
-    let (header, failed) = header(
-        agent,
-        exchange.map(|exchange| exchange.status),
-        live,
-        theme,
-        indent,
-    );
-    let body_indent = (indent + 2).min(width);
-    let mut card = Card {
-        theme,
-        width,
-        pad: " ".repeat(body_indent),
-        body_width: width.saturating_sub(body_indent),
-        lines: vec![Line::from_spans(header).truncate(width)],
-        actions: Vec::new(),
-    };
+    let (chips, failed, needs_you) =
+        header(agent, exchange.map(|exchange| exchange.status), live, theme);
+    let look = Look::of(&thread_card::ai_key(&agent.id), folds, theme);
+    let title = title(chips, &look, theme);
+    let mut sections = Vec::new();
+    if let Some(exchange) = exchange {
+        let mut question = body(theme, inner);
+        question.question(&exchange.question);
+        section(question, &mut sections);
+    }
+    let mut turn = body(theme, inner);
     let active = exchange
-        .is_some_and(|exchange| card.exchange(exchange, state, is_newest(exchange, notes), folds));
+        .is_some_and(|exchange| turn.exchange(exchange, state, is_newest(exchange, notes), folds));
+    section(turn, &mut sections);
     let permission = state
         .filter(|_| active)
         .and_then(|state| state.feed.permission.as_ref());
     if let Some(permission) = permission {
-        card.permission(
+        let mut prompt = body(theme, inner);
+        prompt.permission(
             permission,
             agents.is_answering(&permission.permission_id),
             agents.keys(),
         );
+        section(prompt, &mut sections);
     }
-    let row = card.row();
-    let (suggestion_lines, suggestion_actions) = suggestion_rows(
-        &agent.suggestion_ids,
-        notes,
-        theme,
-        body_indent,
-        width,
-        row,
-        |action| {
+    let (lines, actions) =
+        suggestion_rows(&agent.suggestion_ids, notes, theme, 0, inner, 0, |action| {
             ItemAction::Agent(match action {
                 SuggestionAction::Accept => AgentAction::Accept,
                 SuggestionAction::Refine => AgentAction::Refine,
                 SuggestionAction::Reject => AgentAction::Reject,
             })
-        },
-    );
-    card.lines.extend(suggestion_lines);
-    card.actions.extend(suggestion_actions);
+        });
+    if !lines.is_empty() {
+        sections.push(thread_card::Section { lines, actions });
+    }
     let working = active && state.is_some_and(|state| state.working);
     let answered = exchange
         .zip(state)
@@ -676,14 +702,33 @@ pub(super) fn agent_rows(
             retry: failed,
         }
     };
-    let buttons = card_buttons(&CardButtons {
+    let owned = card_buttons(&CardButtons {
         keys: agents.keys(),
         linked: session.is_some(),
         exchange: exchange.is_some(),
         mode,
     });
-    card.buttons(&buttons);
-    ItemRows::lines(card.lines, card.actions)
+    let buttons: Vec<(&str, ItemAction)> = owned
+        .iter()
+        .map(|(label, action)| (label.as_str(), *action))
+        .collect();
+    let border = if failed {
+        theme.error
+    } else if needs_you {
+        theme.threads.waiting
+    } else {
+        look.border(false, false, theme)
+    };
+    thread_card::Card {
+        title,
+        viewed: exchange.map(|_| look.checkbox.clone()),
+        sections,
+        buttons,
+        footer: line_reference(agent.lines, theme),
+        border,
+        folded: look.folded,
+    }
+    .rows(layout, theme)
 }
 
 /// What an AI card offers besides opening its session.

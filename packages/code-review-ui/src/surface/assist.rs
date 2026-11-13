@@ -98,7 +98,36 @@ impl ReviewSurface {
     // Folding and the resolved filter
     // ----------------------------------------------------------------------------------------
 
-    /// Fold the cursor's thread, or show the whole (or the preview of the) cursor's AI answer.
+    /// Show the whole (or the preview of the) cursor's AI answer (its More and Less button).
+    pub(super) fn toggle_answer_expanded(&mut self) {
+        let Some(Target::Agent {
+            exchange_id: Some(exchange_id),
+            ..
+        }) = self.target()
+        else {
+            self.set_status("move to an AI answer first", StatusSeverity::Warning);
+            return;
+        };
+        if self.answer_text(&exchange_id).is_none() {
+            self.set_status("this question has no answer yet", StatusSeverity::Warning);
+            return;
+        }
+        let expanded = !self.folds.expanded.remove(&exchange_id);
+        if expanded {
+            self.folds.expanded.insert(exchange_id);
+        }
+        self.folds_changed();
+        self.set_status(
+            if expanded {
+                "showing the whole answer"
+            } else {
+                "showing the answer preview"
+            },
+            StatusSeverity::Info,
+        );
+    }
+
+    /// Fold the cursor's thread or AI answer (or its file, or pull request card).
     pub(super) fn fold(&mut self) {
         // On a file's header, details, or end: the file folds to its header.
         let on_file = self.review.as_ref().is_some_and(|review| {
@@ -142,24 +171,17 @@ impl ReviewSurface {
                     StatusSeverity::Info,
                 );
             }
-            Some(Target::Agent {
-                exchange_id: Some(exchange_id),
-                ..
-            }) => {
-                if self.answer_text(&exchange_id).is_none() {
-                    self.set_status("this question has no answer yet", StatusSeverity::Warning);
+            Some(Target::Agent { .. }) => {
+                let Some(key) = self.card_key_at_cursor() else {
                     return;
-                }
-                let expanded = !self.folds.expanded.remove(&exchange_id);
-                if expanded {
-                    self.folds.expanded.insert(exchange_id);
-                }
-                self.folds_changed();
+                };
+                let collapsed = !self.folds.collapsed.contains(&key);
+                self.fold_thread(&key, collapsed);
                 self.set_status(
-                    if expanded {
-                        "showing the whole answer"
+                    if collapsed {
+                        "answer collapsed"
                     } else {
-                        "showing the answer preview"
+                        "answer expanded"
                     },
                     StatusSeverity::Info,
                 );
@@ -189,7 +211,7 @@ impl ReviewSurface {
             self.fold_files(any_open);
             return;
         }
-        let threads = self.notes.thread_ids();
+        let threads = self.card_ids();
         if threads.is_empty() {
             self.set_status("no threads to fold", StatusSeverity::Info);
             return;
@@ -552,6 +574,62 @@ impl ReviewSurface {
         );
     }
 
+    /// Move to the next thread or AI answer below the cursor that is not viewed (loaded ones).
+    /// Returns whether there was one.
+    fn unviewed_card_below(&mut self) -> bool {
+        let unviewed: std::collections::BTreeSet<String> = self
+            .folds
+            .threads
+            .iter()
+            .filter(|(_, look)| !look.viewed.is_viewed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let Some(review) = self.review.as_mut() else {
+            return false;
+        };
+        let mut from = review
+            .cursor
+            .as_ref()
+            .and_then(|cursor| review.doc.index_of(cursor))
+            .unwrap_or(0);
+        while let Some(target) = review.doc.navigate(
+            from,
+            NavKind::Thread,
+            bcode_code_review::document::Direction::Forward,
+        ) {
+            let key = match &target.key {
+                ItemKey::Thread { thread_id } => Some(thread_id.clone()),
+                ItemKey::AgentThread { id } => Some(crate::rows::thread_card::ai_key(id)),
+                _ => None,
+            };
+            if target.needs_load.is_none()
+                && target.opens.is_none()
+                && key.is_some_and(|key| unviewed.contains(&key))
+            {
+                review.set_cursor(target.index, AnchorPolicy::Center);
+                return true;
+            }
+            if target.index <= from {
+                break;
+            }
+            from = target.index;
+        }
+        false
+    }
+
+    /// The next thread or answer not viewed, from the cursor, else from the top.
+    pub(super) fn next_unviewed_card(&mut self) {
+        if self.unviewed_card_below() {
+            return;
+        }
+        if let Some(review) = self.review.as_mut() {
+            review.set_cursor(0, AnchorPolicy::ItemTopAtTop);
+        }
+        if !self.unviewed_card_below() {
+            self.set_status("every thread and answer is viewed", StatusSeverity::Info);
+        }
+    }
+
     /// Next unviewed file, else the next open thread.
     pub(super) fn attention_next(&mut self) {
         let Some(review) = self.review.as_mut() else {
@@ -569,33 +647,13 @@ impl ReviewSurface {
         ) {
             return;
         }
-        // Then threads not viewed (or with comments new since), loaded ones below.
-        let unviewed: std::collections::BTreeSet<&str> = self
-            .folds
-            .threads
-            .iter()
-            .filter(|(_, look)| !look.viewed.is_viewed())
-            .map(|(id, _)| id.as_str())
-            .collect();
-        let mut from = review.doc.index_of(&origin).unwrap_or(0);
-        while let Some(target) = review.doc.navigate(
-            from,
-            NavKind::Thread,
-            bcode_code_review::document::Direction::Forward,
-        ) {
-            if target.needs_load.is_none()
-                && target.opens.is_none()
-                && let ItemKey::Thread { thread_id } = &target.key
-                && unviewed.contains(thread_id.as_str())
-            {
-                review.set_cursor(target.index, AnchorPolicy::Center);
-                return;
-            }
-            if target.index <= from {
-                break;
-            }
-            from = target.index;
+        // Then threads and answers not viewed (or with something new since), below.
+        if self.unviewed_card_below() {
+            return;
         }
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
         if Self::run_motion(
             review,
             origin,

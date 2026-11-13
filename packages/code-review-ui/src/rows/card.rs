@@ -82,6 +82,8 @@ pub struct CardContext<'a> {
     pub viewed_layers: usize,
     /// How cards open by default.
     pub overview: OverviewMode,
+    /// Each thread's viewed state, by the review's thread id.
+    pub threads: &'a BTreeMap<String, super::ThreadLook>,
     /// Changes whenever anything a card shows changed.
     pub revision: u64,
 }
@@ -294,7 +296,7 @@ fn status_parts(
         entry.and_then(|entry| entry.activity.as_ref()),
         entry.and_then(|entry| entry.error.as_ref()),
     ) {
-        (Some(activity), _) => summary_spans(activity, cx.seen(&link.pull), theme),
+        (Some(activity), _) => summary_spans(activity, new_count(activity, &link.pull, cx), theme),
         (None, Some(error)) => vec![(
             Span::styled(
                 format!("could not read the conversation: {error}"),
@@ -740,7 +742,7 @@ fn comments(
 /// The summary of `activity`: state, decision, approvers, checks, open threads, what is new.
 fn summary_spans(
     activity: &PullActivity,
-    seen: Option<u64>,
+    new: usize,
     theme: &ReviewTheme,
 ) -> Vec<(Span, Option<CardAction>)> {
     let icons = theme.icons;
@@ -832,33 +834,57 @@ fn summary_spans(
             Some(CardAction::ShowNew),
         ));
     }
-    if conv::is_new(activity, seen) {
-        let count = new_count(activity, seen.unwrap_or(0));
+    if new > 0 {
         spans.push(separator());
         spans.push((
-            Span::styled(format!("{} {count} new", icons.new), theme.badge_draft),
+            Span::styled(format!("{} {new} new", icons.new), theme.badge_draft),
             Some(CardAction::ShowNew),
         ));
     }
     spans
 }
 
-/// How many reviews and comments from others are newer than `seen`.
-fn new_count(activity: &PullActivity, seen: u64) -> usize {
+/// What is new on the pull request `key` for the viewer:
+///
+/// * reviews and conversation comments from others since it was last looked at;
+/// * in its threads, what view marks say: nothing in a viewed thread, the comments since in one
+///   viewed before, and in one never viewed, comments from others since it was last looked at.
+///
+/// Nothing is new on a pull request never looked at.
+fn new_count(activity: &PullActivity, key: &PullKey, cx: &CardContext<'_>) -> usize {
+    let Some(seen) = cx.seen(key) else {
+        return 0;
+    };
+    let fresh = |comment: &bcode_code_review_models::RemoteComment| {
+        !comment.author.is_viewer
+            && comment.updated_at_ms.or(comment.created_at_ms).unwrap_or(0) > seen
+    };
     let reviews = activity
         .reviews
         .iter()
         .filter(|review| !review.author.is_viewer && review.at_ms.unwrap_or(0) > seen)
         .count();
-    let comments = activity
+    let conversation = activity
+        .comments
+        .iter()
+        .filter(|comment| fresh(comment))
+        .count();
+    let pull = key.id();
+    let threads: usize = activity
         .threads
         .iter()
-        .flat_map(|thread| &thread.comments)
-        .chain(&activity.comments)
-        .filter(|comment| {
-            !comment.author.is_viewer
-                && comment.updated_at_ms.or(comment.created_at_ms).unwrap_or(0) > seen
+        .map(|thread| {
+            let id = crate::notes::remote_thread_id(&pull, &thread.id);
+            match cx.threads.get(&id).map(|look| look.viewed) {
+                Some(bcode_code_review::threads::ThreadViewed::Viewed) => 0,
+                Some(bcode_code_review::threads::ThreadViewed::Stale { new }) => new,
+                _ => thread
+                    .comments
+                    .iter()
+                    .filter(|comment| fresh(comment))
+                    .count(),
+            }
         })
-        .count();
-    reviews + comments
+        .sum();
+    reviews + conversation + threads
 }

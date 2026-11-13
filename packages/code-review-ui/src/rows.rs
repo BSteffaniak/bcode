@@ -790,9 +790,16 @@ impl RowContext<'_> {
                 self.notes,
                 self.agents,
                 self.folds,
+                self.params.threads.layout(
+                    // An answer on the review as a whole starts at the left edge.
+                    if agent.placement == bcode_code_review::document::AnchorPlacement::Review {
+                        0
+                    } else {
+                        self.gutter_indent(width)
+                    },
+                    cells,
+                ),
                 styles,
-                cells,
-                self.gutter_indent(width),
             ),
             // The composer is laid out live (see `composer_layout`), never cached.
             ReviewItem::Composer(_) => ItemRows::single(Line::default()),
@@ -1632,7 +1639,7 @@ fn thread_rows(
     } else {
         indent
     };
-    let look = Look::of(thread, folds, theme);
+    let look = Look::of(&thread.thread_id, folds, theme);
     let layout = card.layout(indent, width);
     let inner = layout.inner();
     if let Some(external) = notes.external(&thread.thread_id) {
@@ -1653,12 +1660,9 @@ struct Look {
 }
 
 impl Look {
-    fn of(
-        thread: &bcode_code_review::document::ThreadItem,
-        folds: &Folds,
-        theme: &ReviewTheme,
-    ) -> Self {
-        let look = folds.threads.get(&thread.thread_id);
+    /// How the card with `key` (a thread id, or an AI answer's [`thread_card::ai_key`]) looks.
+    fn of(key: &str, folds: &Folds, theme: &ReviewTheme) -> Self {
+        let look = folds.threads.get(key);
         let viewed = look.map_or(bcode_code_review::threads::ThreadViewed::Unviewed, |look| {
             look.viewed
         });
@@ -1668,7 +1672,7 @@ impl Look {
             Span::styled(format!("{} Viewed", theme.icons.unviewed), theme.muted)
         };
         Self {
-            folded: folds.collapsed.contains(&thread.thread_id),
+            folded: folds.collapsed.contains(key),
             viewed,
             new: look.map(|look| look.new.clone()).unwrap_or_default(),
             checkbox,
@@ -1714,10 +1718,10 @@ impl Look {
 
 /// `L12` or `L12-18`, for line anchors.
 fn line_reference(
-    thread: &bcode_code_review::document::ThreadItem,
+    lines: Option<(bcode_code_review_models::ReviewLineSide, u32, u32)>,
     theme: &ReviewTheme,
 ) -> Vec<Span> {
-    thread.lines.map_or_else(Vec::new, |(_, start, end)| {
+    lines.map_or_else(Vec::new, |(_, start, end)| {
         vec![Span::styled(
             if start == end {
                 format!("L{end}")
@@ -1878,7 +1882,7 @@ fn local_card<'a>(
         viewed: Some(look.checkbox.clone()),
         sections,
         buttons,
-        footer: line_reference(thread, theme),
+        footer: line_reference(thread.lines, theme),
         border: look.border(thread.resolved, false, theme),
         folded: look.folded,
     }
@@ -2037,7 +2041,7 @@ fn external_card<'a>(
         viewed: Some(look.checkbox.clone()),
         sections,
         buttons: Vec::new(),
-        footer: line_reference(thread, theme),
+        footer: line_reference(thread.lines, theme),
         border: look.border(resolved, false, theme),
         folded: look.folded,
     }
@@ -2098,7 +2102,7 @@ fn remote_card<'a>(
         viewed: Some(look.checkbox.clone()),
         sections,
         buttons,
-        footer: line_reference(thread, theme),
+        footer: line_reference(thread.lines, theme),
         border: look.border(remote.resolved, remote.waiting, theme),
         folded: look.folded,
     }

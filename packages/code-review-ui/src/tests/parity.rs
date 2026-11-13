@@ -468,13 +468,21 @@ fn ai_answers_follow_up_copy_suggest_draft_and_decide_suggestions() {
             .iter()
             .all(|exchange| exchange.session_id.as_deref() == Some(session.as_str()))
     );
-    // `z` on an answer shows the whole answer (and the preview again).
+    // `z` on an answer folds it, as it does a thread.
     let agent = index_where(&setup.scenario, |item| {
         matches!(item, ReviewItem::AgentThread(_))
     })
     .unwrap();
     move_to(&mut setup.scenario, agent);
     setup.scenario.key("z");
+    stable(&mut setup.scenario);
+    assert_eq!(setup.scenario.surface().status(), Some("answer collapsed"));
+    setup.scenario.key("z");
+    stable(&mut setup.scenario);
+    // Its More button shows the whole answer (and Less the preview again).
+    let screen = setup.scenario.frame();
+    let more = screen.find("More").expect("More");
+    setup.scenario.click(more.x, more.y);
     stable(&mut setup.scenario);
     assert_eq!(
         setup.scenario.surface().status(),
@@ -882,7 +890,9 @@ fn motions_reach_open_threads_answers_and_attention_and_answers_reconnect() {
     // Showing the whole answer is kept with the review.
     let at = index_where(&setup.scenario, is_answer).unwrap();
     move_to(&mut setup.scenario, at);
-    setup.scenario.key("z");
+    let screen = setup.scenario.frame();
+    let more = screen.find("More").expect("More");
+    setup.scenario.click(more.x, more.y);
     stable(&mut setup.scenario);
     setup.scenario.key("q");
     stable(&mut setup.scenario);

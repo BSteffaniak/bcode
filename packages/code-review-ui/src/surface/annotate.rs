@@ -672,7 +672,7 @@ impl ReviewSurface {
             AgentAction::Refine => self.decide_suggestion(ReviewSuggestionStatus::Refining),
             AgentAction::Reject => self.decide_suggestion(ReviewSuggestionStatus::Rejected),
             AgentAction::FollowUp => self.follow_up(),
-            AgentAction::Expand => self.fold(),
+            AgentAction::Expand => self.toggle_answer_expanded(),
             AgentAction::Suggest => self.suggest_from_answer(),
             AgentAction::Draft => self.draft_from_answer(),
             AgentAction::Copy => self.copy_answer(),

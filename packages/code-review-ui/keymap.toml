@@ -254,6 +254,8 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.collapse_file", scope = "code-review", description = "Fold this file to its header (or open it); viewed files fold by themselves", defaults = [
     ] },
+    { id = "bcode.code_review.unviewed_thread_next", scope = "code-review", description = "Next thread or AI answer not viewed (also a click on threads N/M)", defaults = [
+    ] },
     { id = "bcode.code_review.view_threads", scope = "code-review", description = "Mark every thread viewed (they fold until someone comments)", defaults = [
     ] },
     { id = "bcode.code_review.unview_threads", scope = "code-review", description = "Mark every thread unviewed", defaults = [
