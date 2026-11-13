@@ -31,7 +31,8 @@ const ACTIVITY_FIELDS: &str = "number title url state isDraft headRefOid body up
     ... on Mannequin { login url } } } } \
     reviewThreads(first: 100) { nodes { id isResolved isOutdated viewerCanReply \
     viewerCanResolve viewerCanUnresolve path line startLine originalLine originalStartLine \
-    diffSide startDiffSide subjectType comments(first: 100) { nodes { id body createdAt \
+    diffSide startDiffSide subjectType opening: comments(first: 1) { nodes { diffHunk } } \
+    comments(first: 100) { nodes { id body createdAt \
     updatedAt url author { __typename login url } pullRequestReview { id } \
     originalCommit { oid } } } } } \
     comments(last: 100) { nodes { id body createdAt updatedAt url \
@@ -273,6 +274,10 @@ fn parse_thread(node: &Value, viewer: Option<&str>) -> Option<RemoteThread> {
                 .next()
                 .and_then(|comment| text(&comment["originalCommit"]["oid"])),
             file_level: node["subjectType"].as_str() == Some("FILE"),
+            diff_hunk: nodes(&node["opening"])
+                .next()
+                .and_then(|comment| text(&comment["diffHunk"]))
+                .map(|hunk| bounded_hunk(&hunk)),
         },
         resolved,
         outdated: flag("isOutdated"),
@@ -284,6 +289,35 @@ fn parse_thread(node: &Value, viewer: Option<&str>) -> Option<RemoteThread> {
         },
         comments,
     })
+}
+
+/// Lines of a thread's diff hunk kept (the last ones: the hunk ends at the commented line).
+const MAX_HUNK_LINES: usize = 40;
+/// Bytes of a thread's diff hunk kept.
+const MAX_HUNK_BYTES: usize = 4 * 1024;
+
+/// The end of `hunk` within [`MAX_HUNK_LINES`] and [`MAX_HUNK_BYTES`], with a first line saying
+/// how many lines were left out when any were.
+fn bounded_hunk(hunk: &str) -> String {
+    let lines: Vec<&str> = hunk.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut bytes = 0;
+    for line in lines.iter().rev() {
+        if kept.len() == MAX_HUNK_LINES || bytes + line.len() + 1 > MAX_HUNK_BYTES {
+            break;
+        }
+        bytes += line.len() + 1;
+        kept.push(line);
+    }
+    kept.reverse();
+    let omitted = lines.len() - kept.len();
+    if omitted == 0 {
+        return kept.join("\n");
+    }
+    format!(
+        "… {omitted} earlier lines of the hunk left out\n{}",
+        kept.join("\n")
+    )
 }
 
 /// A check run's or status's state.

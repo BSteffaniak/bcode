@@ -268,6 +268,11 @@ pub struct RemoteAnchor {
     /// The comment is on the file, not a line.
     #[serde(default)]
     pub file_level: bool,
+    /// The diff the comment was written on, ending at its line, as the forge shows it (kept
+    /// when the thread is outdated). Bounded by the provider; a cut is marked on its first
+    /// line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_hunk: Option<String>,
 }
 
 /// One comment: on a thread, or in the conversation.

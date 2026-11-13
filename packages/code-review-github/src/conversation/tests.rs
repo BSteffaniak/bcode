@@ -43,6 +43,7 @@ fn activity_node() -> Value {
               "viewerCanResolve": true, "viewerCanUnresolve": false, "path": "src/a.rs",
               "line": 12, "startLine": 10, "originalLine": 11, "originalStartLine": 9,
               "diffSide": "RIGHT", "startDiffSide": "RIGHT", "subjectType": "LINE",
+              "opening": { "nodes": [ { "diffHunk": "@@ -8,3 +8,4 @@ fn parse()\n context\n-old\n+new" } ] },
               "comments": { "nodes": [
                   { "id": "C1", "body": "Why?", "createdAt": "2026-11-11T01:00:00Z",
                     "updatedAt": "2026-11-11T01:00:00Z", "url": "c1",
@@ -156,6 +157,7 @@ fn reads_a_pull_requests_conversation() {
             original_start_line: Some(9),
             original_commit_oid: Some("first".into()),
             file_level: false,
+            diff_hunk: Some("@@ -8,3 +8,4 @@ fn parse()\n context\n-old\n+new".into()),
         }
     );
     assert!(open.can_reply && open.can_resolve && !open.resolved && !open.outdated);
@@ -167,6 +169,7 @@ fn reads_a_pull_requests_conversation() {
     assert!(resolved.anchor.file_level);
     assert_eq!(resolved.anchor.side, DiffSide::Old);
     assert_eq!(resolved.anchor.line, None);
+    assert!(resolved.anchor.diff_hunk.is_none(), "no opening comment");
 
     // Conversation comments.
     assert_eq!(activity.comments.len(), 1);
@@ -531,4 +534,31 @@ fn live_activity_and_an_unchanged_watch() {
     let second = watch_pulls(&request(Some(first.cursor.clone()))).expect("check");
     assert_eq!(second.changed, [] as [u64; 0], "nothing changed in between");
     assert_eq!(second.cursor, first.cursor);
+}
+
+/// A long hunk keeps its end (where the comment is), within the line and byte bounds, and says
+/// what it left out.
+#[test]
+fn diff_hunks_keep_their_end_within_bounds() {
+    let hunk: Vec<String> = (0..100).map(|line| format!("+line {line}")).collect();
+    let mut node = activity_node();
+    node["reviewThreads"]["nodes"][0]["opening"]["nodes"][0]["diffHunk"] =
+        Value::String(hunk.join("\n"));
+    let thread = parse_thread(&node["reviewThreads"]["nodes"][0], None).expect("thread");
+    let kept = thread.anchor.diff_hunk.expect("hunk");
+    let lines: Vec<&str> = kept.lines().collect();
+    assert_eq!(lines[0], "… 60 earlier lines of the hunk left out");
+    assert_eq!(lines[1], "+line 60");
+    assert_eq!(lines.last(), Some(&"+line 99"));
+
+    let wide: Vec<String> = (0..10)
+        .map(|line| format!("+{line} {}", "x".repeat(1_000)))
+        .collect();
+    node["reviewThreads"]["nodes"][0]["opening"]["nodes"][0]["diffHunk"] =
+        Value::String(wide.join("\n"));
+    let thread = parse_thread(&node["reviewThreads"]["nodes"][0], None).expect("thread");
+    let kept = thread.anchor.diff_hunk.expect("hunk");
+    assert!(kept.len() <= 4 * 1024 + 64);
+    assert!(kept.starts_with("… 6 earlier lines"));
+    assert!(kept.ends_with(&format!("+9 {}", "x".repeat(1_000))));
 }
