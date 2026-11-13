@@ -1967,7 +1967,7 @@ impl ChatLoopState {
             super::model_flow::ModelPickerAction::Cancel
                 | super::model_flow::ModelPickerAction::Select(_)
                 | super::model_flow::ModelPickerAction::SelectWithConnection { .. }
-                | super::model_flow::ModelPickerAction::Reapprove(_)
+                | super::model_flow::ModelPickerAction::Approve(_)
         ) {
             self.model_picker = None;
         }
@@ -3461,6 +3461,19 @@ fn plugin_command_presentation(
     }
 }
 
+/// One-time hint for other agents' credentials Bcode found but has not connected.
+fn external_connection_notice(applications: &[String]) -> Option<String> {
+    let (last, rest) = applications.split_last()?;
+    let named = if rest.is_empty() {
+        last.clone()
+    } else {
+        format!("{} and {last}", rest.join(", "))
+    };
+    Some(format!(
+        "Found {named} credentials on this computer. Bcode can use them in place, without copying them: open /model and choose Connect."
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn apply_effect_result(
     settings: &mut TuiRuntimeSettings,
@@ -3916,6 +3929,14 @@ pub fn apply_effect_result(
                 report_nonfatal_tui_error(chat, &format!("Ralph {action:?} action failed"), &error);
             }
         },
+        TuiEffectResult::ExternalConnectionsAnnounced { result } => {
+            // Optional hint: discovery failures are not worth interrupting the user for.
+            if let Ok(applications) = result
+                && let Some(message) = external_connection_notice(&applications)
+            {
+                chat.app.push_ephemeral_system_plain(message);
+            }
+        }
         TuiEffectResult::ModelProvidersLoaded { result } => match result {
             Ok(providers) if providers.len() > 1 => {
                 loop_state.provider_picker =
@@ -3927,7 +3948,7 @@ pub fn apply_effect_result(
                     providers.first().map(|provider| provider.plugin_id.clone());
                 chat.replace_effect(TuiEffect::LoadModelPicker {
                     provider_plugin_id,
-                    reapprove: None,
+                    approve: None,
                 });
                 chat.app.set_status("loading models…".to_owned());
             }
@@ -4018,16 +4039,19 @@ pub fn apply_effect_result(
             provider_plugin_id,
             result,
             connections,
+            unconnected,
             reapproval,
         } => {
             // A connection can supply models even when the provider's own listing fails,
             // for example with only another agent's sign-in and no API key.
             let models = match result {
                 Ok(models) => Some(models),
-                Err(_) if !connections.is_empty() => Some(bcode_model::ModelList {
-                    models: Vec::new(),
-                    catalog: bcode_model::ModelCatalogHints::default(),
-                }),
+                Err(_) if !connections.is_empty() || !unconnected.is_empty() => {
+                    Some(bcode_model::ModelList {
+                        models: Vec::new(),
+                        catalog: bcode_model::ModelCatalogHints::default(),
+                    })
+                }
                 Err(error) => {
                     report_nonfatal_client_error(chat, "Model list unavailable", &error);
                     None
@@ -4045,6 +4069,7 @@ pub fn apply_effect_result(
                 let mut picker =
                     super::model_picker::ModelPickerApp::from_model_list(models, status);
                 picker.add_connections(connections);
+                picker.add_unconnected(unconnected);
                 loop_state.model_picker_generation =
                     loop_state.model_picker_generation.wrapping_add(1);
                 loop_state.model_picker = Some(RootModelPicker {
@@ -8734,4 +8759,19 @@ pub fn request_execution_picker(chat: &mut ActiveChat, state: &mut ChatLoopState
         draft: chat.app.composer().text().to_owned(),
         working_directory,
     });
+}
+
+#[cfg(test)]
+mod external_connection_notice_tests {
+    #[test]
+    fn notice_names_each_new_source_once_and_is_absent_without_any() {
+        assert_eq!(super::external_connection_notice(&[]), None);
+        let message = super::external_connection_notice(&[
+            "Codex (ChatGPT sign-in)".to_owned(),
+            "OpenCode".to_owned(),
+        ])
+        .unwrap();
+        assert!(message.starts_with("Found Codex (ChatGPT sign-in) and OpenCode credentials"));
+        assert!(message.contains("/model"));
+    }
 }

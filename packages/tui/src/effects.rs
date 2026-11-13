@@ -696,7 +696,7 @@ mod managed_model_filter_tests {
             TuiEffect::LoadModelProviders,
             TuiEffect::LoadModelPicker {
                 provider_plugin_id: None,
-                reapprove: None,
+                approve: None,
             },
             TuiEffect::ResolvePermission {
                 permission_id: "p".into(),
@@ -996,6 +996,9 @@ pub enum TuiEffect {
     },
     /// Load model providers before opening the root model picker.
     LoadModelProviders,
+    /// Find other agents' credentials not yet connected or announced, and record them as
+    /// announced. Presence-only discovery; never reads credentials.
+    AnnounceExternalConnections,
     /// Load portable auth-pool status before opening the subscription picker.
     LoadAuthPoolPicker { session_id: SessionId },
     /// Persist or clear an auth-pool preference.
@@ -1014,8 +1017,8 @@ pub enum TuiEffect {
     LoadModelPicker {
         /// Selected provider plugin, or the default provider.
         provider_plugin_id: Option<String>,
-        /// Approve this connection again before loading, after the user confirmed it.
-        reapprove: Option<Box<bcode_provider_auth_models::external::ExternalAuthCandidate>>,
+        /// Approve this connection before loading, after the user confirmed it.
+        approve: Option<Box<bcode_provider_auth_models::external::ExternalAuthCandidate>>,
     },
     /// Load skills before opening the root skill picker.
     LoadSkillPicker,
@@ -1455,6 +1458,11 @@ pub enum TuiEffectResult {
         /// Opened surface or error.
         result: Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, TuiError>,
     },
+    /// Newly found, unconnected credentials of other coding agents, by application.
+    ExternalConnectionsAnnounced {
+        /// Applications to mention, or the discovery failure.
+        result: Result<Vec<String>, ClientError>,
+    },
     /// Model providers for the root picker loaded.
     ModelProvidersLoaded {
         /// Loaded plugin service summaries.
@@ -1490,6 +1498,8 @@ pub enum TuiEffectResult {
         result: Result<bcode_model::ModelList, ClientError>,
         /// Approved connections for this provider; empty when unavailable.
         connections: Vec<bcode_provider_auth_models::external::ExternalAuthConnection>,
+        /// Discovered, not yet approved credential sources for this provider.
+        unconnected: Vec<bcode_provider_auth_models::external::ExternalAuthCandidate>,
         /// Outcome of a requested re-approval, if one was requested.
         reapproval: Option<Result<(), String>>,
     },
@@ -1743,6 +1753,9 @@ impl TuiEffectResult {
             Self::RalphStarted { result } => DaemonObservation::from_tui_result(result),
             Self::PluginSurfaceOpened { result, .. } => DaemonObservation::from_tui_result(result),
             Self::ModelProvidersLoaded { result } => DaemonObservation::from_client_result(result),
+            Self::ExternalConnectionsAnnounced { result } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::AuthPoolPickerLoaded { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
@@ -1880,6 +1893,7 @@ enum EffectKey {
     RalphStart,
     PluginSurface,
     ModelProviders,
+    ExternalConnectionNotice,
     ModelCheck,
     ModelPicker,
     AuthPoolPicker,
@@ -2185,6 +2199,9 @@ impl TuiEffect {
             Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
                 result: Err(client_error),
             },
+            Self::AnnounceExternalConnections => TuiEffectResult::ExternalConnectionsAnnounced {
+                result: Err(client_error),
+            },
             Self::LoadAuthPoolPicker { session_id } => TuiEffectResult::AuthPoolPickerLoaded {
                 session_id,
                 result: Err(client_error),
@@ -2213,6 +2230,7 @@ impl TuiEffect {
                 provider_plugin_id,
                 result: Err(client_error),
                 connections: Vec::new(),
+                unconnected: Vec::new(),
                 reapproval: None,
             },
             Self::LoadSkillPicker => TuiEffectResult::SkillPickerLoaded {
@@ -2322,6 +2340,7 @@ impl TuiEffect {
             | Self::RalphStart { .. }
             | Self::OpenPluginSurface { .. }
             | Self::LoadModelProviders
+            | Self::AnnounceExternalConnections
             | Self::LoadAuthPoolPicker { .. }
             | Self::SetAuthPoolPreference { .. }
             | Self::CheckSelectedModel { .. }
@@ -2606,6 +2625,7 @@ impl TuiEffect {
             Self::RalphStart { .. } => EffectKey::RalphStart,
             Self::OpenPluginSurface { .. } => EffectKey::PluginSurface,
             Self::LoadModelProviders => EffectKey::ModelProviders,
+            Self::AnnounceExternalConnections => EffectKey::ExternalConnectionNotice,
             Self::LoadAuthPoolPicker { .. } => EffectKey::AuthPoolPicker,
             Self::SetAuthPoolPreference { .. } => EffectKey::AuthPoolPreference,
             Self::CheckSelectedModel { .. } => EffectKey::ModelCheck,
@@ -3364,6 +3384,9 @@ impl TuiEffect {
                 .await;
                 TuiEffectResult::PluginSurfaceOpened { plugin_id, result }
             }
+            Self::AnnounceExternalConnections => TuiEffectResult::ExternalConnectionsAnnounced {
+                result: announce_external_connections(&client).await,
+            },
             Self::LoadModelProviders => TuiEffectResult::ModelProvidersLoaded {
                 result: client.plugin_services().await.map(|services| {
                     services
@@ -3425,10 +3448,10 @@ impl TuiEffect {
             }
             Self::LoadModelPicker {
                 provider_plugin_id,
-                reapprove,
+                approve,
             } => {
                 use bcode_provider_auth_models::external::ExternalAuthApplication as _;
-                let reapproval = match reapprove {
+                let reapproval = match approve {
                     Some(candidate) => Some(
                         client
                             .approve_external_auth(*candidate)
@@ -3438,7 +3461,7 @@ impl TuiEffect {
                     ),
                     None => None,
                 };
-                let connections = match &provider_plugin_id {
+                let connections: Vec<_> = match &provider_plugin_id {
                     Some(provider) => client
                         .external_auth_status()
                         .await
@@ -3451,10 +3474,36 @@ impl TuiEffect {
                         .unwrap_or_default(),
                     None => Vec::new(),
                 };
+                let discovery_enabled = bcode_config::load_config().is_ok_and(|config| {
+                    config.onboarding.credential_discovery_enabled(
+                        false,
+                        &bcode_config::ProcessConfigEnvironment,
+                    )
+                });
+                let unconnected = match &provider_plugin_id {
+                    Some(provider) if discovery_enabled => client
+                        .discover_external_auth()
+                        .await
+                        .map(|candidates| {
+                            candidates
+                                .into_iter()
+                                .filter(|candidate| {
+                                    candidate.available
+                                        && candidate.target.plugin_id == *provider
+                                        && !connections.iter().any(|connection| {
+                                            connection.grant.binding_id == candidate.binding_id
+                                        })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
                 TuiEffectResult::ModelPickerLoaded {
                     result: client.session_model_list(provider_plugin_id.clone()).await,
                     provider_plugin_id,
                     connections,
+                    unconnected,
                     reapproval,
                 }
             }
@@ -4871,4 +4920,45 @@ mod progress_routing_tests {
             ]
         );
     }
+}
+
+/// Applications whose discovered credentials are neither connected nor already announced.
+/// Records them as announced so each source is mentioned once.
+async fn announce_external_connections(client: &BcodeClient) -> Result<Vec<String>, ClientError> {
+    use bcode_provider_auth_models::external::ExternalAuthApplication as _;
+    let unavailable = |error: bcode_provider_auth_models::external::ExternalAuthError| {
+        ClientError::Protocol(error.to_string())
+    };
+    let candidates = client.discover_external_auth().await.map_err(unavailable)?;
+    let approved: std::collections::BTreeSet<String> = client
+        .list_external_auth()
+        .await
+        .map_err(unavailable)?
+        .into_iter()
+        .map(|grant| grant.binding_id)
+        .collect();
+    let path = bcode_config::external_notices::default_path();
+    let announced = bcode_config::external_notices::load_from(&path).unwrap_or_default();
+    let new: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.available
+                && !approved.contains(&candidate.binding_id)
+                && !announced.contains(&candidate.binding_id)
+        })
+        .collect();
+    if !new.is_empty() {
+        // Best effort: a failed write mentions the source again next time, nothing worse.
+        let _ = bcode_config::external_notices::record_at(
+            &path,
+            new.iter().map(|candidate| candidate.binding_id.clone()),
+        );
+    }
+    let mut applications: Vec<String> = new
+        .into_iter()
+        .map(|candidate| candidate.application)
+        .collect();
+    applications.sort();
+    applications.dedup();
+    Ok(applications)
 }

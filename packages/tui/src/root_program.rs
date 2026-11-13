@@ -1416,15 +1416,15 @@ impl BcodeRuntimeModel {
                         self.chat
                             .replace_effect(super::effects::TuiEffect::LoadModelPicker {
                                 provider_plugin_id,
-                                reapprove: None,
+                                approve: None,
                             });
                         self.chat.app.set_status("loading models…".to_owned());
                     }
-                    super::model_flow::ModelPickerAction::Reapprove(candidate) => {
+                    super::model_flow::ModelPickerAction::Approve(candidate) => {
                         self.chat
                             .replace_effect(super::effects::TuiEffect::LoadModelPicker {
                                 provider_plugin_id,
-                                reapprove: Some(candidate),
+                                approve: Some(candidate),
                             });
                         self.chat.app.set_status("approving connection…".to_owned());
                     }

@@ -88,7 +88,7 @@ impl Program for ExecutionPicker {
                         ModelPickerAction::Check(_)
                         | ModelPickerAction::Continue
                         | ModelPickerAction::SelectWithConnection { .. }
-                        | ModelPickerAction::Reapprove(_) => {}
+                        | ModelPickerAction::Approve(_) => {}
                     }
                 }
             }

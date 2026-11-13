@@ -15,8 +15,8 @@ pub enum ModelPickerAction {
         model_id: String,
         binding_id: String,
     },
-    /// Approve a connection again after its source changed accounts, then reload.
-    Reapprove(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
+    /// Approve a connection (first time, or again after an account change), then reload.
+    Approve(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
     Check(String),
 }
 
@@ -30,8 +30,15 @@ pub fn submit(picker: &mut model_picker::ModelPickerApp) -> ModelPickerAction {
             model_id,
             binding_id,
         },
-        Some(model_picker::ConnectionChoice::Reapprove(candidate)) => {
-            ModelPickerAction::Reapprove(candidate)
+        Some(model_picker::ConnectionChoice::Approve(candidate)) => {
+            ModelPickerAction::Approve(candidate)
+        }
+        Some(model_picker::ConnectionChoice::Connect(candidate)) => {
+            if picker.confirm_connect() {
+                ModelPickerAction::Approve(candidate)
+            } else {
+                ModelPickerAction::Continue
+            }
         }
         Some(model_picker::ConnectionChoice::Unavailable(message)) => {
             picker.set_status(message);
@@ -225,6 +232,30 @@ mod tests {
     use super::*;
     use bcode_provider_auth_models::external::ExternalConnectionStatus;
     use model_picker::connection_tests::{connection, picker};
+
+    #[test]
+    fn connecting_discovered_credentials_needs_a_second_enter() {
+        let mut app = picker(&[]);
+        app.add_unconnected(vec![
+            bcode_provider_auth_models::external::ExternalAuthCandidate {
+                binding_id: "binding-new".into(),
+                target: bcode_provider_auth_models::external::ExternalAuthTarget {
+                    plugin_id: "provider.plugin".into(),
+                    provider_id: "provider".into(),
+                    method_id: "chatgpt".into(),
+                    source_id: "codex-chatgpt".into(),
+                },
+                application: "Codex".into(),
+                available: true,
+            },
+        ]);
+        assert!(matches!(submit(&mut app), ModelPickerAction::Continue));
+        assert!(app.status().contains("Press Enter again"));
+        assert!(matches!(
+            submit(&mut app),
+            ModelPickerAction::Approve(candidate) if candidate.binding_id == "binding-new"
+        ));
+    }
 
     #[test]
     fn submitting_a_connection_row_selects_with_its_binding_or_explains_the_fix() {

@@ -31,6 +31,7 @@ pub mod contexts;
 pub mod edit;
 /// Explicit execution defaults, independent of provider authentication configuration.
 pub mod execution;
+pub mod external_notices;
 pub use execution::{ExecutionConfig, ExecutionPreference};
 pub mod judgement;
 pub mod milestones;

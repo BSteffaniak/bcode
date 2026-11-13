@@ -464,6 +464,12 @@ fn apply_initial_config(
             None
         }
     };
+    if config
+        .onboarding
+        .credential_discovery_enabled(false, &bcode_config::ProcessConfigEnvironment)
+    {
+        chat.start_effect(TuiEffect::AnnounceExternalConnections);
+    }
     if chat.app.managed_execution_session().is_none() {
         chat.start_effect(TuiEffect::ReconcileAuthSecurity {
             config: Box::new(config),

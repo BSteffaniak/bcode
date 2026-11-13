@@ -68,6 +68,10 @@ pub struct ModelPickerApp {
     mode: ModelPickerMode,
     /// Rows that use an approved external credential connection, by source index.
     connections: BTreeMap<usize, bcode_provider_auth_models::external::ExternalAuthConnection>,
+    /// Rows offering to connect discovered credentials, by source index.
+    unconnected: BTreeMap<usize, bcode_provider_auth_models::external::ExternalAuthCandidate>,
+    /// Row whose connection the user has been asked to confirm.
+    confirming: Option<usize>,
 }
 
 /// What submitting the highlighted connection row means.
@@ -80,8 +84,10 @@ pub enum ConnectionChoice {
         /// Connection binding to select with it.
         binding_id: String,
     },
-    /// The source now belongs to another account; approve it again.
-    Reapprove(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
+    /// Approve this connection (again, when its source changed accounts).
+    Approve(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
+    /// Connect discovered credentials; needs a second confirmation before approving.
+    Connect(Box<bcode_provider_auth_models::external::ExternalAuthCandidate>),
     /// Not usable now; the message names the fix.
     Unavailable(String),
 }
@@ -144,6 +150,8 @@ impl ModelPickerApp {
             sort_direction: ModelSortDirection::Desc,
             mode: ModelPickerMode::Actions,
             connections: BTreeMap::new(),
+            unconnected: BTreeMap::new(),
+            confirming: None,
         };
         app.refresh_filter();
         app
@@ -175,18 +183,56 @@ impl ModelPickerApp {
         self.refresh_filter();
     }
 
+    /// Add a row offering to connect each discovered, not yet approved credential source.
+    pub fn add_unconnected(
+        &mut self,
+        candidates: Vec<bcode_provider_auth_models::external::ExternalAuthCandidate>,
+    ) {
+        for candidate in candidates {
+            let Some(model) = recommended_model(&format!("Connect {}", candidate.application))
+            else {
+                continue;
+            };
+            self.models.push(model);
+            self.unconnected.insert(self.models.len() - 1, candidate);
+        }
+        self.refresh_filter();
+    }
+
+    /// Ask for confirmation of the highlighted connect row; true when it was already asked.
+    pub fn confirm_connect(&mut self) -> bool {
+        let Some(index) = self.list.selected_source_index() else {
+            return false;
+        };
+        if self.confirming == Some(index) {
+            self.confirming = None;
+            return true;
+        }
+        if let Some(candidate) = self.unconnected.get(&index) {
+            self.status = format!(
+                "Press Enter again to let every local Bcode application use {} credentials for {}. Requests use that account's quota or billing; nothing is copied.",
+                candidate.application, candidate.target.provider_id
+            );
+            self.confirming = Some(index);
+        }
+        false
+    }
+
     /// What submitting the highlighted row means, when it uses a connection.
     #[must_use]
     pub fn selected_connection(&self) -> Option<ConnectionChoice> {
         use bcode_provider_auth_models::external::ExternalConnectionStatus;
         let index = self.list.selected_source_index()?;
+        if let Some(candidate) = self.unconnected.get(&index) {
+            return Some(ConnectionChoice::Connect(Box::new(candidate.clone())));
+        }
         let connection = self.connections.get(&index)?;
         Some(match connection.status {
             ExternalConnectionStatus::Ready { .. } => ConnectionChoice::Use {
                 model_id: self.models[index].model_id.clone(),
                 binding_id: connection.grant.binding_id.clone(),
             },
-            ExternalConnectionStatus::AccountChanged => ConnectionChoice::Reapprove(Box::new(
+            ExternalConnectionStatus::AccountChanged => ConnectionChoice::Approve(Box::new(
                 bcode_provider_auth_models::external::ExternalAuthCandidate {
                     binding_id: connection.grant.binding_id.clone(),
                     target: connection.grant.target.clone(),
@@ -688,6 +734,10 @@ impl ModelPickerApp {
             .map(|index| {
                 let model = &self.models[*index];
                 let mut row = ModelPickerRow::from_model(model);
+                if self.unconnected.contains_key(index) {
+                    row.state = "Not connected · Enter to connect".into();
+                    return row;
+                }
                 if let Some(connection) = self.connections.get(index) {
                     row.model_id =
                         format!("{} · via {}", row.model_id, connection.grant.application);
@@ -1734,7 +1784,7 @@ pub mod connection_tests {
         select_row_containing(&mut app, "listed · via Codex");
         assert!(matches!(
             app.selected_connection(),
-            Some(ConnectionChoice::Reapprove(candidate)) if candidate.binding_id == "binding-changed"
+            Some(ConnectionChoice::Approve(candidate)) if candidate.binding_id == "binding-changed"
         ));
     }
 }

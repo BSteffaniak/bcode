@@ -55,7 +55,11 @@ with explicit consent. Nothing is imported into sshenv, copied, refreshed, or re
   models, one row per model each approved connection can use ("model · via Codex"). Selecting a
   ready row sets the session's model and connection together, applied from the next turn like a
   model change. Selecting a row whose source changed accounts approves it again and reloads the
-  picker. The choice is recorded on the session's `model_changed` event and survives daemon
+  picker. Discovered credentials that are not connected yet appear as "Connect …" rows; pressing
+  Enter asks for confirmation and a second Enter approves them. When a chat opens, Bcode mentions
+  newly found, unconnected credentials once (recorded in `external-connection-notices.toml` in the
+  state directory, binding digests only), honoring the discovery opt-out. The choice is recorded on
+  the session's `model_changed` event and survives daemon
   restarts; if the connection later becomes unusable, the session keeps it and requests fail with
   the reason rather than switching to another account.
 * **ChatGPT tokens** from Codex are delivered without the refresh token. The source declares the
