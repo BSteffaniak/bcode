@@ -8838,3 +8838,116 @@ mod external_connection_notice_tests {
         assert!(message.contains("/model"));
     }
 }
+
+#[cfg(all(test, unix))]
+mod typed_input_tests {
+    use std::time::Duration;
+
+    /// A daemon status this build's client accepts.
+    fn matching_daemon_status() -> bcode_ipc::DaemonStatus {
+        let (_path, digest) = bcode_daemon_lifecycle::current_executable_identity()
+            .expect("current executable identity");
+        bcode_ipc::DaemonStatus {
+            namespace: bcode_ipc::daemon_namespace(),
+            protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
+            build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+            executable_digest: Some(digest),
+            storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            state_location_id: Some(bcode_ipc::state_location_id()),
+            ..bcode_ipc::DaemonStatus::default()
+        }
+    }
+
+    fn typed(text: &str) -> bcode_tool::ToolInvocationInput {
+        bcode_tool::ToolInvocationInput {
+            invocation_id: "call".into(),
+            input_id: format!("typed-{text}"),
+            producer_id: "bcode.shell".into(),
+            schema: "bcode.shell.invocation-input".into(),
+            schema_version: 1,
+            payload: serde_json::json!({"type": "input", "text": text}),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_input_reaches_the_daemon_in_order_on_one_connection() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/bct-{}",
+            bcode_session_models::SessionId::new()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .expect("socket directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("typed.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let daemon = matching_daemon_status();
+        let session_id = bcode_session_models::SessionId::new();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            let envelope =
+                bcode_ipc::response_envelope(hello.request_id, &response).expect("hello response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello");
+            let mut received = Vec::new();
+            while received.len() < 3 {
+                let request = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("typed input request");
+                let bcode_ipc::Request::InvocationInput {
+                    session_id: actual,
+                    input,
+                } = bcode_ipc::decode_request(&request.payload).expect("decode request")
+                else {
+                    panic!("expected typed input");
+                };
+                assert_eq!(actual, session_id);
+                received.push(input.payload["text"].as_str().unwrap().to_owned());
+                let accepted = bcode_ipc::response_envelope(
+                    request.request_id,
+                    &bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::InvocationInputAccepted),
+                )
+                .expect("accepted response");
+                bcode_ipc::send_envelope(&mut stream, &accepted)
+                    .await
+                    .expect("send accepted");
+            }
+            // Every keystroke came on the one connection.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err()
+            );
+            received
+        });
+
+        let client = bcode_client::BcodeClient::new(endpoint)
+            .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning)
+            .with_request_timeout(Duration::from_secs(5));
+        let mut state = super::ChatLoopState::new(&client, &client, false);
+        for text in ["a", "b", "\r"] {
+            state.send_typed_input(session_id, typed(text));
+        }
+        let received = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("inputs arrive")
+            .expect("daemon task");
+        assert_eq!(received, ["a", "b", "\r"]);
+        drop(state);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}

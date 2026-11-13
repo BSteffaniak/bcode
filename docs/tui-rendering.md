@@ -358,6 +358,14 @@ eight columns per wheel tick or Left/Right key, clamped to the widest shown line
 Up/Down and PageUp/PageDown navigate source screen rows. This is an inline expansion, not a
 separate full-screen modal. Normal transcript scrolling exposes the expanded rows.
 
+A focused running shell command can also be typed into: `i` (`shell.terminal.input`) starts
+typing, after which every key, Escape included, and every paste become invocation input for that
+command, encoded as a terminal keyboard sends them (with the program's cursor-key mode, and
+bracketed pastes when the program asks for them). `ctrl+]` (`shell.terminal.input-exit`) stops
+typing, and typing ends with the command. A row under the command says when keys go to it. The
+adapter makes the input through `PluginTuiVisualAdapter::content_invocation_input`; the host
+sends it in order on one connection.
+
 Native shell selection uses BMUX cell geometry and UTF-8 source bytes, not painted-row offsets.
 Soft wraps share one logical-line identity; hard-line transitions insert newlines. Clipped wide
 screen fragments are not selectable. The host retains bounded source text with successful
