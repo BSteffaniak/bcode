@@ -96,7 +96,7 @@ impl ReviewSurface {
                 inbox.push(Message::NoteDone(result));
             }));
         }
-        while let Some((exchange, text)) = self.asks.pop_front() {
+        while let Some((exchange, asked)) = self.asks.pop_front() {
             if exchange.session_id.is_none() {
                 self.fresh_asks.insert(exchange.exchange_id.clone());
             }
@@ -106,7 +106,7 @@ impl ReviewSurface {
             let services = self.services.clone();
             let inbox = self.inbox.clone();
             host.spawn(Box::pin(async move {
-                let result = agent::ask(services, scope, exchange, text, binding, now_ms()).await;
+                let result = agent::ask(services, scope, exchange, asked, binding, now_ms()).await;
                 inbox.push(Message::Asked(Box::new(result)));
             }));
         }
@@ -279,6 +279,7 @@ impl ReviewSurface {
         let mode = composer.mode.clone();
         let classify = (composer.kind, composer.severity);
         let remote_reply = composer.remote_reply;
+        let thread = composer.thread.clone();
         self.close_composer();
         let now = now_ms();
         let result = match mode {
@@ -314,7 +315,7 @@ impl ReviewSurface {
                 .update_draft(&comment_id, text)
                 .map(|()| "comment updated"),
             ComposerMode::Ask => {
-                self.ask_question(&anchor, text, now);
+                self.ask_about(&anchor, text, now, thread.as_deref());
                 Ok(ASKING_STATUS)
             }
         };
@@ -601,6 +602,9 @@ impl ReviewSurface {
             ThreadAction::Resolve => self.resolve_local(&thread_id, first.resolved_at_ms.is_none()),
             ThreadAction::Ask => {
                 self.open_composer(anchor, ComposerMode::Ask, "");
+                if let Some(composer) = self.composer.as_mut() {
+                    composer.thread = Some(thread_id);
+                }
                 Ok(None)
             }
             ThreadAction::Fold => {
@@ -743,6 +747,18 @@ impl ReviewSurface {
     /// anchor already has a linked session (an earlier question, or a linked thread), the
     /// question is a follow-up in that session.
     pub(super) fn ask_question(&mut self, anchor: &DocAnchor, question: String, now: u64) {
+        self.ask_about(anchor, question, now, None);
+    }
+
+    /// [`Self::ask_question`], asked from the thread `thread_id` (local or a pull request's):
+    /// the thread's comments, state, and where it was written go with the question.
+    pub(super) fn ask_about(
+        &mut self,
+        anchor: &DocAnchor,
+        question: String,
+        now: u64,
+        thread_id: Option<&str>,
+    ) {
         self.next_exchange += 1;
         let draft_anchor = anchor.to_draft_anchor();
         let identity = notes::anchor_identity(&draft_anchor);
@@ -772,17 +788,15 @@ impl ReviewSurface {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        let path = exchange.anchor.file_path.clone();
-        let mut seen = std::collections::BTreeSet::new();
-        let threads: Vec<String> = self
-            .notes
-            .drafts()
-            .iter()
-            .filter(|draft| draft.anchor.file_path == path && seen.insert(&draft.thread_id))
-            .filter_map(|draft| self.notes.thread(&draft.thread_id).first().copied())
-            .take(agent::MAX_PROMPT_THREADS)
-            .map(|first| format!("{}: {}", location_label(&first.anchor), first.body.trim()))
-            .collect();
+        let thread = thread_id.and_then(|thread_id| self.ask_thread(thread_id));
+        let path = thread
+            .as_ref()
+            .and_then(|thread| thread.written_on.as_ref())
+            .map_or_else(
+                || exchange.anchor.file_path.clone(),
+                |written| written.path.clone(),
+            );
+        let (threads, threads_omitted) = self.other_threads(&path, thread_id);
         let context = AskContext {
             title: self.title.clone(),
             repo: self.repo_path.clone(),
@@ -793,17 +807,189 @@ impl ReviewSurface {
                 .map(|source| source.label.clone())
                 .collect(),
             threads,
+            threads_omitted,
+            threads_on: path,
             path: exchange.anchor.file_path.clone(),
             old: anchor_range(anchor, ReviewLineSide::Old),
             new: anchor_range(anchor, ReviewLineSide::New),
             lines: self.anchor_lines(anchor),
+            thread,
             question,
         };
         self.notes.put_exchange(exchange.clone());
         let exchange_id = exchange.exchange_id.clone();
-        self.asks.push_back((exchange, agent::prompt(&context)));
+        let asked = agent::Asked {
+            prompt: agent::prompt(&context),
+            title: agent::session_title(&context),
+        };
+        self.asks.push_back((exchange, asked));
         self.sync_notes();
         self.focus_card(&exchange_id);
+    }
+
+    /// The other threads on `path` (or the review, for the review-level path) a question lists:
+    /// the review's own and its pull requests', one line each, without `except`; and how many
+    /// were left out past [`agent::MAX_PROMPT_THREADS`].
+    fn other_threads(&self, path: &str, except: Option<&str>) -> (Vec<String>, usize) {
+        let mut seen = std::collections::BTreeSet::new();
+        let local = self
+            .notes
+            .drafts()
+            .iter()
+            .filter(|draft| draft.anchor.reply_to.is_none())
+            .filter(|draft| draft.anchor.file_path == path && seen.insert(&draft.thread_id))
+            .filter(|draft| Some(draft.thread_id.as_str()) != except)
+            .filter_map(|draft| self.notes.thread(&draft.thread_id).first().copied())
+            .map(|first| format!("{}: {}", location_label(&first.anchor), first.body.trim()));
+        let review_level = path == bcode_code_review::document::REVIEW_LEVEL_PATH;
+        let remote = self
+            .notes
+            .remote_threads()
+            .iter()
+            .filter(|(thread_id, _)| Some(thread_id.as_str()) != except)
+            .filter(|(thread_id, info)| {
+                info.thread.anchor.path == path
+                    || self.notes.thread(thread_id).first().is_some_and(|first| {
+                        first.anchor.file_path == path
+                            || (review_level && first.anchor.kind == ReviewAnchorKind::Review)
+                    })
+            })
+            .map(|(_, info)| {
+                let written = &info.thread.anchor;
+                let lines = written
+                    .original_line
+                    .or(written.line)
+                    .map_or_else(String::new, |line| format!(":{line}"));
+                let mut state = Vec::new();
+                if info.outdated {
+                    state.push("outdated");
+                }
+                if info.resolved {
+                    state.push("resolved");
+                }
+                let state = if state.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", state.join(", "))
+                };
+                let first = info.thread.comments.first();
+                format!(
+                    "{}{lines} by {} ({} {}#{}{state}; thread id {}): {}",
+                    written.path,
+                    first.map_or("unknown", |comment| comment.author.login.as_str()),
+                    info.provider_label,
+                    info.repository,
+                    info.number,
+                    bcode_code_review_models::pull_thread_ref(
+                        &info.repository,
+                        info.number,
+                        &info.remote_id
+                    ),
+                    first.map_or("", |comment| comment.body.trim()),
+                )
+            });
+        let all: Vec<String> = local.chain(remote).collect();
+        let omitted = all.len().saturating_sub(agent::MAX_PROMPT_THREADS);
+        (
+            all.into_iter().take(agent::MAX_PROMPT_THREADS).collect(),
+            omitted,
+        )
+    }
+
+    /// The thread `thread_id` as a question asked from it carries it.
+    fn ask_thread(&self, thread_id: &str) -> Option<agent::AskThread> {
+        let comments = self.notes.thread(thread_id);
+        let first = comments.first()?;
+        let shown_at = location_label(&first.anchor);
+        if let Some(info) = self.notes.remote(thread_id) {
+            let written = &info.thread.anchor;
+            let lines = written
+                .original_line
+                .map(|end| (written.original_start_line.unwrap_or(end), end));
+            let shown_at = format!(
+                "{} ({})",
+                if shown_at == "review" {
+                    "the whole review"
+                } else {
+                    shown_at.as_str()
+                },
+                match info.placement {
+                    bcode_code_review::conversation::Placement::Exact => "where it was written",
+                    bcode_code_review::conversation::Placement::Moved => "moved with its code",
+                    bcode_code_review::conversation::Placement::OnFile => {
+                        "on its file: its lines are gone from the code the review shows"
+                    }
+                    bcode_code_review::conversation::Placement::OnLayer => {
+                        "on the pull request: the review no longer changes its file"
+                    }
+                }
+            );
+            return Some(agent::AskThread {
+                origin: format!(
+                    "a {} thread on pull request {}#{}",
+                    info.provider_label, info.repository, info.number
+                ),
+                id: bcode_code_review_models::pull_thread_ref(
+                    &info.repository,
+                    info.number,
+                    &info.remote_id,
+                ),
+                resolved: info.resolved,
+                outdated: info.outdated,
+                written_on: Some(agent::WrittenOn {
+                    path: written.path.clone(),
+                    lines: lines.filter(|_| !written.file_level),
+                    old_side: written.side == bcode_code_review_models::DiffSide::Old,
+                    commit: written.original_commit_oid.clone(),
+                }),
+                shown_at,
+                comments: info
+                    .thread
+                    .comments
+                    .iter()
+                    .map(|comment| agent::AskComment {
+                        author: comment.author.login.clone(),
+                        body: comment.body.clone(),
+                    })
+                    .chain(
+                        // Replies held for the next review, under the thread.
+                        comments
+                            .iter()
+                            .filter(|comment| comment.anchor.reply_to.is_some())
+                            .map(|comment| agent::AskComment {
+                                author: "you (held reply, not sent yet)".to_owned(),
+                                body: comment.body.clone(),
+                            }),
+                    )
+                    .collect(),
+                diff_hunk: written.diff_hunk.clone(),
+                url: info.url.clone(),
+            });
+        }
+        let external = self.notes.external(thread_id);
+        Some(agent::AskThread {
+            origin: external.map_or_else(
+                || "a thread of this review (local draft comments, not published)".to_owned(),
+                |external| format!("a thread imported from {}", external.provider_id),
+            ),
+            id: thread_id.to_owned(),
+            resolved: first.resolved_at_ms.is_some(),
+            outdated: false,
+            written_on: None,
+            shown_at,
+            comments: comments
+                .iter()
+                .map(|comment| agent::AskComment {
+                    author: external
+                        .and_then(|external| external.authors.get(&comment.comment_id))
+                        .cloned()
+                        .unwrap_or_else(|| "the reviewer (draft)".to_owned()),
+                    body: comment.body.clone(),
+                })
+                .collect(),
+            diff_hunk: None,
+            url: external.and_then(|external| external.url.clone()),
+        })
     }
 
     /// Diff lines of a line anchor, `+`/`-`/` ` prefixed (bounded).

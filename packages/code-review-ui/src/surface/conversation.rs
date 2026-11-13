@@ -117,6 +117,11 @@ pub struct ConversationUi {
     pub view_revision: u64,
     /// Card parts clicked, to run once the host is at hand: source id and action.
     pub card_clicks: Vec<(String, CardAction)>,
+    /// The pull request threads last saved for the review tools, and where.
+    pub saved_threads: Option<(
+        crate::notes::NoteScope,
+        Vec<bcode_code_review_models::PullThreadRecord>,
+    )>,
 }
 
 impl ConversationUi {
@@ -285,6 +290,7 @@ impl ReviewSurface {
                 if self.notes.set_remote(notes) {
                     self.sync_notes();
                 }
+                self.save_pull_threads(&placed, host);
             }
             ConversationMessage::Due => {
                 self.talk.data.due();
@@ -313,6 +319,55 @@ impl ReviewSurface {
                 self.apply_change(key, thread.as_deref(), &change, result, host);
             }
         }
+    }
+
+    /// Keep the placed pull request threads in the review store, where the review tools read
+    /// them, when they changed since they were last kept.
+    fn save_pull_threads(&mut self, placed: &[(PullKey, PlacedThread)], host: &UiContext) {
+        let threads: Vec<bcode_code_review_models::PullThreadRecord> = placed
+            .iter()
+            .map(|(key, placed)| bcode_code_review_models::PullThreadRecord {
+                id: bcode_code_review_models::pull_thread_ref(
+                    &key.repository,
+                    key.number,
+                    &placed.thread.id,
+                ),
+                provider: key.provider.clone(),
+                provider_label: self
+                    .talk
+                    .data
+                    .provider(key)
+                    .map_or_else(|| key.provider.clone(), |provider| provider.label.clone()),
+                repository: key.repository.clone(),
+                number: key.number,
+                location: bcode_code_review::assistant::location_label(&placed.anchor),
+                placement: placed.placement.into(),
+                thread: placed.thread.clone(),
+            })
+            .collect();
+        let scope = self.note_scope();
+        let saved = (scope.clone(), threads);
+        if self.talk.saved_threads.as_ref() == Some(&saved) {
+            return;
+        }
+        let threads = saved.1.clone();
+        self.talk.saved_threads = Some(saved);
+        let services = self.services.clone();
+        host.spawn(Box::pin(async move {
+            // The tools say when they have nothing; a failed save only leaves them older.
+            let _ = services
+                .call(bcode_code_review_models::SaveReviewConversationRequest {
+                    repo_path: scope.repo_path,
+                    target: scope.target,
+                    scope: scope.scope,
+                    snapshot: bcode_code_review_models::ReviewConversationSnapshot {
+                        threads,
+                        omitted: 0,
+                        read_at_ms: crate::history::now_ms(),
+                    },
+                })
+                .await;
+        }));
     }
 
     /// Start every provider watch the review's pull requests need and that is not running.
@@ -600,6 +655,9 @@ impl ReviewSurface {
                     .map(|first| self.doc_anchor(&first.anchor));
                 if let Some(anchor) = anchor {
                     self.open_composer(anchor, crate::composer::ComposerMode::Ask, "");
+                    if let Some(composer) = self.composer.as_mut() {
+                        composer.thread = Some(thread_id.to_owned());
+                    }
                 }
             }
             ThreadAction::Fold => self.fold(),

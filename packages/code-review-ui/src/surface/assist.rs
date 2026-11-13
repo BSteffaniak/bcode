@@ -476,8 +476,7 @@ impl ReviewSurface {
     /// Ask a structured AI command about the cursor's anchor (a thread's or answer's anchor on
     /// those items).
     pub(super) fn ai_command(&mut self, command: AiCommand) {
-        let anchor = self.question_anchor();
-        let Some(anchor) = anchor else {
+        let Some((anchor, thread)) = self.question_target() else {
             self.set_status(
                 format!(
                     "move to a line, range, file, or thread to {}",
@@ -487,7 +486,12 @@ impl ReviewSurface {
             );
             return;
         };
-        self.ask_question(&anchor, command.instruction().to_owned(), now_ms());
+        self.ask_about(
+            &anchor,
+            command.instruction().to_owned(),
+            now_ms(),
+            thread.as_deref(),
+        );
         self.sync_notes();
         self.set_status(
             format!("asked Bcode to {}", command.label()),
@@ -495,8 +499,9 @@ impl ReviewSurface {
         );
     }
 
-    /// Anchor a question at the cursor is about.
-    fn question_anchor(&self) -> Option<bcode_code_review::document::DocAnchor> {
+    /// Anchor a question at the cursor is about, and the thread it is asked from when the
+    /// cursor is on one.
+    fn question_target(&self) -> Option<(bcode_code_review::document::DocAnchor, Option<String>)> {
         match self.target() {
             Some(Target::Thread { thread_id, .. }) => {
                 let first = self
@@ -504,23 +509,28 @@ impl ReviewSurface {
                     .thread(&thread_id)
                     .first()
                     .map(|first| first.anchor.clone())?;
-                Some(self.doc_anchor(&first))
+                Some((self.doc_anchor(&first), Some(thread_id)))
             }
             Some(Target::Agent {
                 exchange_id: Some(exchange_id),
                 ..
             }) => {
                 let anchor = self.notes.exchange(&exchange_id)?.anchor.clone();
-                Some(self.doc_anchor(&anchor))
+                Some((self.doc_anchor(&anchor), None))
             }
-            _ => self.cursor_anchor(),
+            _ => self.cursor_anchor().map(|anchor| (anchor, None)),
         }
     }
 
     /// Ask a follow-up question in the cursor answer's linked session.
     pub(super) fn follow_up(&mut self) {
-        match self.question_anchor() {
-            Some(anchor) => self.open_composer(anchor, ComposerMode::Ask, ""),
+        match self.question_target() {
+            Some((anchor, thread)) => {
+                self.open_composer(anchor, ComposerMode::Ask, "");
+                if let Some(composer) = self.composer.as_mut() {
+                    composer.thread = thread;
+                }
+            }
             None => self.set_status("move to an AI answer first", StatusSeverity::Warning),
         }
     }

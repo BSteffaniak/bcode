@@ -570,3 +570,157 @@ fn asking_about_a_thread_on_the_pull_request_as_a_whole_opens_the_composer_under
         "the composer is under the pull request's card"
     );
 }
+
+/// #102 with an outdated thread kevin wrote on a file the layer no longer changes (so the review
+/// shows it on the pull request), with a reply, next to the thread on the layer's file.
+fn activity_with_outdated_thread() -> PullActivity {
+    let mut activity = activity();
+    activity.threads.push(RemoteThread {
+        id: "thread-gone".to_owned(),
+        anchor: RemoteAnchor {
+            path: "src/retry.rs".to_owned(),
+            side: DiffSide::New,
+            line: None,
+            original_line: Some(14),
+            original_start_line: Some(12),
+            original_commit_oid: Some("0ldc0mm1t".to_owned()),
+            diff_hunk: Some(
+                "@@ -10,3 +10,6 @@ fn send()\n context\n+loop {\n+    send()?;\n+}".to_owned(),
+            ),
+            ..RemoteAnchor::default()
+        },
+        resolved: false,
+        outdated: true,
+        can_reply: true,
+        can_resolve: true,
+        comments: vec![
+            comment("k1", "kevin", "This retry loop never backs off."),
+            comment("k2", "octocat", "Backoff comes in the next layer."),
+        ],
+    });
+    activity
+}
+
+/// The prompt and title of the only question asked so far.
+fn asked(backend: &Arc<TestBackend>) -> (String, String) {
+    let sessions = backend.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let messages = backend.messages();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    (messages[0].1.clone(), sessions[0].1.clone())
+}
+
+#[test]
+fn asking_from_an_outdated_pull_request_thread_carries_the_thread() {
+    let fixture = fixture();
+    let backend = backend(&fixture, everything());
+    backend
+        .provider()
+        .expect("provider")
+        .set_activity(activity_with_outdated_thread());
+    let (mut scenario, screen) = open_pull(&backend, &fixture);
+    assert!(
+        screen.contains("This retry loop never backs off."),
+        "{}",
+        screen.text()
+    );
+    // Ask from kevin's thread: the second "Ask Bcode" under his comment.
+    let kevin = screen.find("This retry loop").expect("thread").y;
+    let row = (kevin..screen.height())
+        .find(|&y| screen.row_text(y).contains("Ask Bcode"))
+        .expect("Ask Bcode on the thread");
+    let x = screen.column_of(row, "Ask Bcode").expect("button");
+    scenario.click(x + 1, row);
+    settled(&mut scenario);
+    scenario.paste("Is this still a problem?");
+    scenario.key("enter");
+    settled(&mut scenario);
+
+    let (prompt, title) = asked(&backend);
+    for part in [
+        "a Fake forge thread on pull request",
+        "#102",
+        "outdated: its code changed since it was written",
+        "Thread id: ",
+        ":thread-gone (code_review.get_thread reads it in full)",
+        "Written on: src/retry.rs, new lines 12-14, at commit 0ldc0mm1t",
+        "on the pull request: the review no longer changes its file",
+        "```diff\n@@ -10,3 +10,6 @@ fn send()\n context\n+loop {\n+    send()?;\n+}\n```",
+        "--- kevin:\nThis retry loop never backs off.",
+        "--- octocat:\nBackoff comes in the next layer.",
+        "code_review.list_threads and code_review.get_thread",
+        "Asked about: the whole review",
+        "Other review threads on src/retry.rs:\nnone",
+        "Question:\nIs this still a problem?",
+    ] {
+        assert!(prompt.contains(part), "{part:?} missing from:\n{prompt}");
+    }
+    assert!(
+        prompt.find("--- kevin").expect("kevin") < prompt.find("--- octocat").expect("octocat"),
+        "comments in order"
+    );
+    assert!(!prompt.contains("review.context.get"), "{prompt}");
+    assert_eq!(title, "Review: src/retry.rs · kevin");
+
+    // The review tools read the same threads from the review store.
+    let surface = scenario.surface();
+    let workspace = surface
+        .review()
+        .and_then(|review| review.workspace())
+        .expect("workspace");
+    let scope = crate::notes::NoteScope::for_workspace(workspace);
+    let saved: bcode_code_review_models::GetReviewConversationResponse =
+        backend.call_now(bcode_code_review_models::GetReviewConversationRequest {
+            repo_path: scope.repo_path,
+            target: scope.target,
+            scope: scope.scope,
+        });
+    let snapshot = saved.snapshot.expect("saved for the review tools");
+    let ids: Vec<&str> = snapshot
+        .threads
+        .iter()
+        .map(|record| record.thread.id.as_str())
+        .collect();
+    assert_eq!(ids, ["thread-1", "thread-gone"]);
+    let gone = &snapshot.threads[1];
+    assert_eq!(
+        gone.placement,
+        bcode_code_review_models::ThreadPlacement::OnLayer
+    );
+    assert!(gone.thread.anchor.diff_hunk.is_some());
+}
+
+#[test]
+fn a_question_on_a_file_lists_its_pull_request_threads() {
+    let fixture = fixture();
+    let backend = backend(&fixture, everything());
+    let (mut scenario, screen) = open_pull(&backend, &fixture);
+    // Ask about the layer's file from its header.
+    let at = screen
+        .find(" Ask Bcode ")
+        .unwrap_or_else(|| panic!("no file Ask:\n{}", screen.text()));
+    scenario.click(at.x + 1, at.y);
+    settled(&mut scenario);
+    scenario.paste("What does this file do?");
+    scenario.key("enter");
+    settled(&mut scenario);
+    let (prompt, title) = asked(&backend);
+    let others = prompt
+        .split_once(&format!(
+            "Other review threads on {}:\n",
+            GitFixture::stack_layer_path(2)
+        ))
+        .map(|(_, rest)| rest)
+        .expect("other threads");
+    let line = others.lines().next().unwrap_or_default();
+    assert!(
+        line.contains(":3 by raj (Fake forge")
+            && line.contains("#102")
+            && line.contains("Why this constant?"),
+        "{prompt}"
+    );
+    assert_eq!(
+        title,
+        format!("Review: {}", GitFixture::stack_layer_path(2))
+    );
+}

@@ -687,7 +687,10 @@ pub struct ReviewSurface {
     /// Whether stored presentation state was applied to the opened document.
     restored: bool,
     /// Questions to send from the next poll.
-    asks: VecDeque<(bcode_code_review_models::ReviewAiExchange, String)>,
+    asks: VecDeque<(
+        bcode_code_review_models::ReviewAiExchange,
+        crate::agent::Asked,
+    )>,
     /// Questions on their way that create their own session, by exchange id.
     fresh_asks: std::collections::BTreeSet<String>,
     next_exchange: u64,

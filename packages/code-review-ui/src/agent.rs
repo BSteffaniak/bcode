@@ -1,7 +1,8 @@
 //! AI questions on review anchors.
 //!
 //! * Asking creates a durable AI exchange (`review.ai_exchange.save`, pending), a Bcode session
-//!   in the repository titled `Review: <path>`, sends the bounded prompt, links the session to
+//!   in the repository titled after the file (or pull request) and, for a question asked from a
+//!   thread, its author ([`session_title`]), sends the bounded prompt, links the session to
 //!   the anchor's thread (`thread.link_session`), and saves the exchange as linked. A failure
 //!   after the exchange exists records it as failed; a failed save is never retried
 //!   automatically, so no second session is created for one question.
@@ -35,16 +36,39 @@ use bcode_session_view_models::{
     SessionConnectionViewStatus, SessionViewSnapshot, TranscriptViewItemKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Lines of the anchored diff sent with a question.
 pub const MAX_PROMPT_LINES: usize = 80;
 /// Bytes of the whole prompt.
-const MAX_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_PROMPT_BYTES: usize = 24 * 1024;
+/// Bytes of the question kept (it is never cut to make room for context).
+const MAX_QUESTION_BYTES: usize = 4 * 1024;
 /// Other threads of the file listed in a prompt, and characters kept of each.
 pub const MAX_PROMPT_THREADS: usize = 12;
 const MAX_PROMPT_THREAD_CHARS: usize = 160;
+/// Comments of the asked-about thread sent at most (the first and the latest).
+pub const MAX_THREAD_COMMENTS: usize = 12;
+/// Bytes of one comment of the asked-about thread.
+const MAX_THREAD_COMMENT_BYTES: usize = 2 * 1024;
+/// Bytes of all comments of the asked-about thread.
+const MAX_THREAD_BYTES: usize = 8 * 1024;
+/// Lines and bytes of the diff hunk the asked-about thread was written on (its end is kept).
+const MAX_HUNK_LINES: usize = 40;
+const MAX_HUNK_BYTES: usize = 3 * 1024;
+/// Characters of a session title.
+const MAX_TITLE_CHARS: usize = 80;
+
+/// Marks the context cut to leave room for the question.
+const CONTEXT_CUT: &str = "\n[… context cut to fit; the code_review tools read the rest]\n";
+
+/// The review tools a question's session can call to read more.
+const TOOLS_LINE: &str = "Read more of this review with the code_review tools: \
+code_review.list_threads and code_review.get_thread (its local threads and its pull requests' \
+threads), code_review.file_diff, code_review.file_content, code_review.summary, and \
+code_review.pull_request.";
 
 /// A structured AI review command with a fixed instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,9 +167,13 @@ pub struct AskContext {
     pub repo: PathBuf,
     /// Labels of the review's included sources.
     pub sources: Vec<String>,
-    /// Other threads on the same file (or the review): `location: first comment`, bounded by
+    /// Other threads on the same file (or the review): one line each, bounded by
     /// [`MAX_PROMPT_THREADS`].
     pub threads: Vec<String>,
+    /// Other threads left out of `threads`.
+    pub threads_omitted: usize,
+    /// What `threads` are on: a file path, or the review-level marker.
+    pub threads_on: String,
     /// File path, or the review-level marker.
     pub path: String,
     /// Old and new line ranges.
@@ -154,11 +182,181 @@ pub struct AskContext {
     pub new: Option<(u32, u32)>,
     /// Anchored diff lines (`+`, `-`, or ` ` prefixed), bounded by [`MAX_PROMPT_LINES`].
     pub lines: Vec<String>,
+    /// The thread the question was asked from.
+    pub thread: Option<AskThread>,
     /// The question.
     pub question: String,
 }
 
-/// The bounded prompt sent to the session.
+/// The thread a question was asked from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AskThread {
+    /// Where it comes from (`a local draft thread`, `a GitHub thread on pull request o/r#7`).
+    pub origin: String,
+    /// Its id for `code_review.get_thread`.
+    pub id: String,
+    /// Resolved.
+    pub resolved: bool,
+    /// Its forge considers its code changed since it was written.
+    pub outdated: bool,
+    /// Where it was written, when that differs from where the review shows it.
+    pub written_on: Option<WrittenOn>,
+    /// Where the review shows it, and why there.
+    pub shown_at: String,
+    /// Comments, oldest first.
+    pub comments: Vec<AskComment>,
+    /// The diff its first comment was written on.
+    pub diff_hunk: Option<String>,
+    /// Web page.
+    pub url: Option<String>,
+}
+
+/// Where a pull request thread was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenOn {
+    /// File path.
+    pub path: String,
+    /// Lines as written (first, last), when on lines.
+    pub lines: Option<(u32, u32)>,
+    /// On the old side of the diff.
+    pub old_side: bool,
+    /// The head commit it was written on.
+    pub commit: Option<String>,
+}
+
+/// One comment of the asked-about thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskComment {
+    /// Author.
+    pub author: String,
+    /// Body.
+    pub body: String,
+}
+
+/// `text` cut to `max` bytes on a character boundary, with `marker` when cut.
+fn cut(text: &str, max: usize, marker: &str) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &text[..end])
+}
+
+/// The end of `hunk` within [`MAX_HUNK_LINES`] and [`MAX_HUNK_BYTES`], saying what was left out.
+fn hunk_tail(hunk: &str) -> String {
+    let lines: Vec<&str> = hunk.lines().collect();
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    for line in lines.iter().rev() {
+        if kept.len() == MAX_HUNK_LINES || bytes + line.len() + 1 > MAX_HUNK_BYTES {
+            break;
+        }
+        bytes += line.len() + 1;
+        kept.push(*line);
+    }
+    kept.reverse();
+    let omitted = lines.len() - kept.len();
+    if omitted == 0 {
+        return kept.join("\n");
+    }
+    format!("[{omitted} earlier lines left out]\n{}", kept.join("\n"))
+}
+
+/// The thread section of a prompt: its state, where it was written and shown, the diff it was
+/// written on, and its comments (the first and as many of the latest as fit, the rest counted).
+fn thread_section(thread: &AskThread) -> String {
+    let mut state = Vec::new();
+    if thread.outdated {
+        state.push("outdated: its code changed since it was written");
+    }
+    state.push(if thread.resolved { "resolved" } else { "open" });
+    let mut text = format!(
+        "The question is about {} ({}).\nThread id: {} (code_review.get_thread reads it in full)\n",
+        thread.origin,
+        state.join(", "),
+        thread.id,
+    );
+    if let Some(written) = &thread.written_on {
+        let lines = written.lines.map_or_else(
+            || "the whole file".to_owned(),
+            |(start, end)| {
+                let side = if written.old_side { "old" } else { "new" };
+                if start == end {
+                    format!("{side} line {end}")
+                } else {
+                    format!("{side} lines {start}-{end}")
+                }
+            },
+        );
+        let _ = write!(text, "Written on: {}, {lines}", written.path);
+        if let Some(commit) = &written.commit {
+            let _ = write!(text, ", at commit {commit}");
+        }
+        text.push('\n');
+    }
+    let _ = writeln!(text, "Shown in this review: {}", thread.shown_at);
+    if let Some(url) = &thread.url {
+        let _ = writeln!(text, "Link: {url}");
+    }
+    if let Some(hunk) = thread
+        .diff_hunk
+        .as_deref()
+        .filter(|hunk| !hunk.trim().is_empty())
+    {
+        let _ = write!(
+            text,
+            "\nThe diff it was written on (the comment is on its last lines):\n```diff\n{}\n```\n",
+            hunk_tail(hunk)
+        );
+    }
+    let comment = |item: &AskComment| {
+        format!(
+            "--- {}:\n{}\n",
+            item.author,
+            cut(
+                item.body.trim(),
+                MAX_THREAD_COMMENT_BYTES,
+                "\n[comment cut]"
+            )
+        )
+    };
+    let Some((first, rest)) = thread.comments.split_first() else {
+        text.push_str("\nThe thread has no comments.\n");
+        return text;
+    };
+    let first = comment(first);
+    let mut budget = MAX_THREAD_BYTES.saturating_sub(first.len());
+    let mut latest = Vec::new();
+    for item in rest.iter().rev().take(MAX_THREAD_COMMENTS - 1) {
+        let item = comment(item);
+        if item.len() > budget {
+            break;
+        }
+        budget -= item.len();
+        latest.push(item);
+    }
+    latest.reverse();
+    let omitted = rest.len() - latest.len();
+    text.push_str("\nComments, oldest first:\n");
+    text.push_str(&first);
+    if omitted > 0 {
+        let _ = writeln!(
+            text,
+            "[{omitted} replies left out; code_review.get_thread reads them all]"
+        );
+    }
+    for item in latest {
+        text.push_str(&item);
+    }
+    text
+}
+
+/// The bounded prompt sent to the session. Every part has its own bound; the question is kept
+/// whole (up to its own bound) and what comes before it is cut, marked, when the whole is too
+/// long.
 #[must_use]
 pub fn prompt(context: &AskContext) -> String {
     let range = |range: Option<(u32, u32)>| {
@@ -173,7 +371,7 @@ pub fn prompt(context: &AskContext) -> String {
         .take(MAX_PROMPT_LINES)
         .map(String::as_str)
         .collect();
-    let threads: Vec<String> = context
+    let mut threads: Vec<String> = context
         .threads
         .iter()
         .take(MAX_PROMPT_THREADS)
@@ -186,31 +384,108 @@ pub fn prompt(context: &AskContext) -> String {
             format!("- {thread}")
         })
         .collect();
+    let omitted =
+        context.threads_omitted + context.threads.len().saturating_sub(MAX_PROMPT_THREADS);
+    if omitted > 0 {
+        threads.push(format!(
+            "- … {omitted} more (code_review.list_threads lists them)"
+        ));
+    }
     let threads = if threads.is_empty() {
         "none".to_owned()
     } else {
         threads.join("\n")
     };
     let mut text = format!(
-        "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nSources: {}\nFile: {}\nOld lines: {}\nNew lines: {}\n\nSelected diff lines:\n```diff\n{}\n```\n\nOther review threads on this file:\n{}\n\nReview context is also available through the code-review plugin service `bcode.code_review/v1` (`review.context.get`, `review.comments.list`, `review.thread.get`, `review.diff.get`).\n\nQuestion:\n{}\n",
+        "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nSources: {}\n",
         context.title,
         context.repo.display(),
         context.sources.join(", "),
-        context.path,
-        range(context.old),
-        range(context.new),
-        lines.join("\n"),
-        threads,
-        context.question.trim(),
     );
-    if text.len() > MAX_PROMPT_BYTES {
-        let mut end = MAX_PROMPT_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
+    if let Some(thread) = &context.thread {
+        text.push('\n');
+        text.push_str(&thread_section(thread));
     }
+    let place = |path: &str| {
+        if path == bcode_code_review::document::REVIEW_LEVEL_PATH {
+            "the review".to_owned()
+        } else {
+            path.to_owned()
+        }
+    };
+    if context.path == bcode_code_review::document::REVIEW_LEVEL_PATH {
+        text.push_str("\nAsked about: the whole review\n");
+    } else {
+        let _ = write!(
+            text,
+            "\nFile: {}\nOld lines: {}\nNew lines: {}\n",
+            context.path,
+            range(context.old),
+            range(context.new),
+        );
+    }
+    if !lines.is_empty() {
+        let _ = write!(
+            text,
+            "\nSelected diff lines:\n```diff\n{}\n```\n",
+            lines.join("\n")
+        );
+    }
+    let _ = write!(
+        text,
+        "\nOther review threads on {}:\n{threads}\n\n{TOOLS_LINE}\n",
+        place(&context.threads_on)
+    );
+    let question = format!(
+        "\nQuestion:\n{}\n",
+        cut(
+            context.question.trim(),
+            MAX_QUESTION_BYTES,
+            "\n[question cut]"
+        )
+    );
+    let room = MAX_PROMPT_BYTES.saturating_sub(question.len());
+    if text.len() > room {
+        text = cut(&text, room.saturating_sub(CONTEXT_CUT.len()), CONTEXT_CUT);
+    }
+    text.push_str(&question);
     text
+}
+
+/// The title of a question's new session: the file (or pull request) and, for a question asked
+/// from a thread, its author; the review's title for a question about the whole review.
+#[must_use]
+pub fn session_title(context: &AskContext) -> String {
+    let review_level = context.path == bcode_code_review::document::REVIEW_LEVEL_PATH;
+    let place = context
+        .thread
+        .as_ref()
+        .and_then(|thread| thread.written_on.as_ref())
+        .map(|written| written.path.clone())
+        .or_else(|| (!review_level).then(|| context.path.clone()))
+        .unwrap_or_else(|| context.title.clone());
+    let author = context
+        .thread
+        .as_ref()
+        .and_then(|thread| thread.comments.first())
+        .map(|comment| comment.author.as_str());
+    let title = author.map_or_else(
+        || format!("Review: {place}"),
+        |author| format!("Review: {place} · {author}"),
+    );
+    match title.char_indices().nth(MAX_TITLE_CHARS) {
+        Some((end, _)) => format!("{}…", &title[..end]),
+        None => title,
+    }
+}
+
+/// A question ready to send: its prompt, and the title of its session when it starts one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asked {
+    /// The prompt.
+    pub prompt: String,
+    /// The new session's title ([`session_title`]).
+    pub title: String,
 }
 
 /// Ask: persist the exchange, create the session and bind it to the review (`binding`, whose
@@ -226,7 +501,7 @@ pub async fn ask(
     services: ReviewServices,
     scope: NoteScope,
     mut exchange: ReviewAiExchange,
-    text: String,
+    question: Asked,
     binding: bcode_code_review_models::ReviewAssistantBinding,
     now_ms: u64,
 ) -> Result<ReviewAiExchange, Box<(ReviewAiExchange, String)>> {
@@ -250,6 +525,10 @@ pub async fn ask(
         Ok(saved) => saved,
         Err(error) => return Err(Box::new((exchange, error))),
     };
+    let Asked {
+        prompt: text,
+        title,
+    } = question;
     let follow_up = exchange.session_id.clone();
     let linked = async {
         if let Some(session) = follow_up {
@@ -263,7 +542,7 @@ pub async fn ask(
         let session = services
             .host()
             .create_session(
-                format!("Review: {}", exchange.anchor.file_path),
+                title,
                 scope.repo_path.clone(),
                 crate::host::review_session_origin(
                     crate::host::ReviewSessionPurpose::Question,
@@ -890,12 +1169,15 @@ mod tests {
             threads: (0..40)
                 .map(|index| format!("src/lib.rs:{index}: {}", "y".repeat(400)))
                 .collect(),
+            threads_omitted: 0,
+            threads_on: "src/lib.rs".to_owned(),
             path: "src/lib.rs".to_owned(),
             old: Some((3, 4)),
             new: None,
             lines: (0..500)
                 .map(|line| format!("+line {line} {}", "x".repeat(80)))
                 .collect(),
+            thread: None,
             question: "  Why?  ".to_owned(),
         };
         let text = prompt(&context);
@@ -916,4 +1198,107 @@ mod tests {
         assert!(!text.contains(&"y".repeat(200)), "threads are shortened");
         assert!(text.contains("Question:\nWhy?"));
     }
+
+    fn context(thread: Option<AskThread>, path: &str) -> AskContext {
+        AskContext {
+            title: "#7 Retry sends".to_owned(),
+            repo: PathBuf::from("/repo"),
+            sources: vec!["Pull request o/r#7".to_owned()],
+            threads: Vec::new(),
+            threads_omitted: 0,
+            threads_on: path.to_owned(),
+            path: path.to_owned(),
+            old: None,
+            new: None,
+            lines: Vec::new(),
+            thread,
+            question: "Still a problem?".to_owned(),
+        }
+    }
+
+    fn thread(comments: Vec<AskComment>) -> AskThread {
+        AskThread {
+            origin: "a GitHub thread on pull request o/r#7".to_owned(),
+            id: "o/r#7:T1".to_owned(),
+            resolved: false,
+            outdated: true,
+            written_on: Some(WrittenOn {
+                path: "src/retry.rs".to_owned(),
+                lines: Some((12, 14)),
+                old_side: false,
+                commit: Some("abc".to_owned()),
+            }),
+            shown_at: "the whole review".to_owned(),
+            comments,
+            diff_hunk: Some(
+                (0..100)
+                    .map(|line| format!("+line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            url: None,
+        }
+    }
+
+    fn said(author: &str, body: String) -> AskComment {
+        AskComment {
+            author: author.to_owned(),
+            body,
+        }
+    }
+
+    #[test]
+    fn a_long_thread_keeps_its_first_and_latest_comments_and_its_hunks_end() {
+        let mut comments = vec![said("kevin", "The opening comment.".to_owned())];
+        comments.extend((1..=30).map(|index| said("ana", format!("reply {index}"))));
+        comments.push(said("ana", "y".repeat(5_000)));
+        let text = prompt(&context(Some(thread(comments)), REVIEW));
+        assert!(text.contains("--- kevin:\nThe opening comment."), "{text}");
+        assert!(text.contains("replies left out; code_review.get_thread reads them all"));
+        assert!(text.contains("reply 30"), "the latest replies are kept");
+        assert!(!text.contains("reply 1\n"), "the middle ones are left out");
+        assert!(
+            text.contains("[comment cut]"),
+            "a long comment is cut, marked"
+        );
+        assert!(!text.contains(&"y".repeat(2_100)));
+        assert!(text.contains("[60 earlier lines left out]\n+line 60"));
+        assert!(text.contains("+line 99\n```"));
+        assert!(text.contains("Written on: src/retry.rs, new lines 12-14, at commit abc"));
+        assert!(text.contains("outdated: its code changed since it was written, open"));
+        assert!(text.ends_with("Question:\nStill a problem?\n"));
+    }
+
+    #[test]
+    fn the_question_survives_when_the_context_is_too_long() {
+        let mut long = context(None, "src/lib.rs");
+        long.lines = (0..MAX_PROMPT_LINES)
+            .map(|line| format!("+{line} {}", "x".repeat(400)))
+            .collect();
+        long.question = "q".repeat(10_000);
+        let text = prompt(&long);
+        assert!(text.len() <= MAX_PROMPT_BYTES, "{}", text.len());
+        assert!(text.contains("[… context cut to fit; the code_review tools read the rest]"));
+        assert!(text.contains(&format!("Question:\n{}", "q".repeat(4_000))));
+        assert!(text.ends_with("[question cut]\n"));
+    }
+
+    #[test]
+    fn session_titles_name_the_file_or_review_and_the_threads_author() {
+        let from_thread = context(Some(thread(vec![said("kevin", "Why?".to_owned())])), REVIEW);
+        assert_eq!(session_title(&from_thread), "Review: src/retry.rs · kevin");
+        assert_eq!(
+            session_title(&context(None, "src/lib.rs")),
+            "Review: src/lib.rs"
+        );
+        assert_eq!(
+            session_title(&context(None, REVIEW)),
+            "Review: #7 Retry sends"
+        );
+        let mut long = context(None, REVIEW);
+        long.title = "t".repeat(200);
+        assert!(session_title(&long).chars().count() <= MAX_TITLE_CHARS + 1);
+    }
+
+    const REVIEW: &str = bcode_code_review::document::REVIEW_LEVEL_PATH;
 }

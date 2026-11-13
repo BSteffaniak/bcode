@@ -127,6 +127,8 @@ pub struct Composer {
     pub completion: Option<PathCompletion>,
     /// Where a reply to a pull request thread goes by default (`None` for other composers).
     pub remote_reply: Option<crate::config::conversation::ReplyMode>,
+    /// The thread a question is asked from (its comments go with the question).
+    pub thread: Option<String>,
     policy: TextInputPolicy,
     revision: u64,
     completion_generation: u64,
@@ -151,6 +153,7 @@ impl Composer {
             severity: ReviewThreadSeverity::Info,
             completion: None,
             remote_reply: None,
+            thread: None,
             policy,
             revision: 0,
             completion_generation: 0,

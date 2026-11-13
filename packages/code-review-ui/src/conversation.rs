@@ -694,6 +694,9 @@ pub fn remote_notes(
                     .and_then(|comment| comment.url.clone()),
                 authors,
                 mine,
+                repository: key.repository.clone(),
+                number: key.number,
+                thread: thread.clone(),
             },
             comments,
         });

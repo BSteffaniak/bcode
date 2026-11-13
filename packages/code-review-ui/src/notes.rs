@@ -160,6 +160,12 @@ pub struct RemoteThreadInfo {
     pub authors: std::collections::BTreeMap<String, (String, Option<u64>)>,
     /// Comments the viewer wrote, by id.
     pub mine: std::collections::BTreeSet<String>,
+    /// Provider repository.
+    pub repository: String,
+    /// Pull request number.
+    pub number: u64,
+    /// The thread as the forge reported it (where it was written, its comments and diff hunk).
+    pub thread: bcode_code_review_models::RemoteThread,
 }
 
 /// One remote thread to show: its info and comments (already anchored).

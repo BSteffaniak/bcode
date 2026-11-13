@@ -161,6 +161,17 @@ pub enum Placement {
     OnLayer,
 }
 
+impl From<Placement> for bcode_code_review_models::ThreadPlacement {
+    fn from(placement: Placement) -> Self {
+        match placement {
+            Placement::Exact => Self::Exact,
+            Placement::Moved => Self::Moved,
+            Placement::OnFile => Self::OnFile,
+            Placement::OnLayer => Self::OnLayer,
+        }
+    }
+}
+
 /// A thread with its place in the review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedThread {
