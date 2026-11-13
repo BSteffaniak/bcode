@@ -5,7 +5,7 @@ use std::cell::Cell;
 use bcode_git::models::{
     ChangeKind, CommandStatus, DiffFileStatus, LineStats, StatusEntry, SubmoduleState,
 };
-use bmux_tui::component::{Element, LayoutId};
+use bmux_tui::component::{Component, Constraints, Element, LayoutCx, LayoutId};
 use bmux_tui::composition::{
     Column, Flex, HitArea, Row as BoxRow, SizeBox, Stack, Surface, TextBlock,
 };
@@ -1762,14 +1762,9 @@ const fn on_panel(style: Style, panel: Style) -> Style {
     }
 }
 
-fn modal<'a>(
-    app: &'a App,
-    title: &str,
-    width: u16,
-    height: u16,
-    child: impl bmux_tui::component::Component + 'a,
-) -> Element<'a> {
-    let frame = ModalFrame::new(
+/// The frame of a popup at most `width` x `height` cells.
+fn modal_frame(app: &App, title: &str, width: u16, height: u16) -> ModalFrame {
+    ModalFrame::new(
         ModalSizing::new(Size::new(20, 5), Size::new(width, height), Insets::all(1)),
         modal_theme(app),
     )
@@ -1777,8 +1772,35 @@ fn modal<'a>(
         format!(" {title} "),
         app.theme.title_focused,
     )]))
-    .placement(ModalPlacement::Centered);
+    .placement(ModalPlacement::Centered)
+}
+
+fn modal<'a>(
+    app: &'a App,
+    title: &str,
+    width: u16,
+    height: u16,
+    child: impl bmux_tui::component::Component + 'a,
+) -> Element<'a> {
+    let frame = modal_frame(app, title, width, height);
     Element::new(ModalFrameComponent::new("popup", frame, child))
+}
+
+/// Widest menu popup, in cells.
+const MENU_WIDTH: u16 = 80;
+
+/// Rows `notes` take, word-wrapped across the content width of a menu popup titled `title`
+/// on the current screen: the same layout the popup paints them with.
+fn note_rows(app: &App, title: &str, notes: &TextBlock) -> u16 {
+    let (width, height) = app.size.get();
+    let content = modal_frame(app, title, MENU_WIDTH, u16::MAX)
+        .content_area(Rect::new(0, 0, width, height))
+        .width;
+    let layout = notes.layout(
+        Constraints::for_width(u64::from(content)),
+        &mut LayoutCx::default(),
+    );
+    u16::try_from(layout.size.height).unwrap_or(u16::MAX)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1787,7 +1809,12 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
     match app.popups.last()? {
         Popup::Menu(menu) => {
             let visible = frame.popup.len();
-            let notes = u16::try_from(menu.notes.len()).unwrap_or(u16::MAX);
+            // Notes wrap rather than being cut off: a note may name a long configuration path.
+            let note_block = (!menu.notes.is_empty())
+                .then(|| TextBlock::new(Text::from_lines(menu.notes.clone())).wrap(TextWrap::Word));
+            let notes = note_block
+                .as_ref()
+                .map_or(0, |block| note_rows(app, &menu.title, block));
             let height = u16::try_from(visible)
                 .unwrap_or(u16::MAX)
                 .saturating_add(if menu.filter.is_some() { 7 } else { 4 })
@@ -1803,10 +1830,8 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 POPUP_SCROLLBAR,
             );
             let mut column = Column::new();
-            if !menu.notes.is_empty() {
-                column = column.child(
-                    TextBlock::new(Text::from_lines(menu.notes.clone())).wrap(TextWrap::None),
-                );
+            if let Some(notes) = note_block {
+                column = column.child(notes);
             }
             if let Some(filter) = &menu.filter {
                 column = column.child(
@@ -1821,7 +1846,7 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 );
             }
             column = column.flex(Flex::new(1, items));
-            Some(modal(app, &menu.title, 80, height, column))
+            Some(modal(app, &menu.title, MENU_WIDTH, height, column))
         }
         Popup::Text(view) => {
             let height = u16::try_from(view.lines.len())

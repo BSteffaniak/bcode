@@ -188,6 +188,11 @@ mod tests {
     impl Harness {
         /// bcode's saved palette is nord; the git UI has no choice of its own.
         fn new() -> Self {
+            Self::pinned(None)
+        }
+
+        /// As [`Self::new`], with the palette pinned by `theme_pinned_by` when set.
+        fn pinned(theme_pinned_by: Option<&str>) -> Self {
             let repo = tempfile::tempdir().expect("repo");
             let status = std::process::Command::new("git")
                 .args(["init", "--quiet"])
@@ -208,6 +213,7 @@ mod tests {
             let mut config = LoadedConfig {
                 state_file: state,
                 config_dir: dir.path().to_path_buf(),
+                theme_pinned_by: theme_pinned_by.map(str::to_owned),
                 ..LoadedConfig::default()
             };
             config.saved_appearance.theme = Some("nord".to_owned());
@@ -406,5 +412,35 @@ mod tests {
         }
         harness.key("escape");
         assert_eq!(harness.app.theme, harness.theme_of("nord"));
+    }
+
+    #[test]
+    fn a_long_pinned_by_note_wraps_inside_the_picker() {
+        let origin = "/home/someone/.config/bcode/bcode-git.toml: theme.name";
+        let mut harness = Harness::pinned(Some(origin));
+        harness.key("ctrl+w");
+        harness.key("t");
+        assert_eq!(
+            harness
+                .picker()
+                .expect("open")
+                .pinned_by(bcode_tui_theme::picker::AppearanceAxis::Palette),
+            Some(origin)
+        );
+        for (width, height) in [(100, 40), (60, 40)] {
+            let screen = crate::render_text(&mut harness.app, width, height).join("\n");
+            // Words wrap at spaces, so the origin's file and key may land on separate rows.
+            for part in [
+                "Palette pinned by",
+                "/home/someone/.config/bcode/bcode-git.toml:",
+                "theme.name;",
+                "only the profile applies.",
+                "Follow Bcode",
+                "enter apply",
+            ] {
+                assert!(screen.contains(part), "{width}x{height}: {part}\n{screen}");
+            }
+        }
+        harness.key("escape");
     }
 }

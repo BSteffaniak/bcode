@@ -160,12 +160,8 @@ impl AppPicker {
             chosen: following,
         }];
         rows.push(heading(AppearanceAxis::Palette));
-        if let Some(pinned_by) = &self.pinned_by {
-            rows.push(pinned(
-                AppearanceAxis::Palette,
-                &self.pinned_palette,
-                pinned_by,
-            ));
+        if self.pinned_by.is_some() {
+            rows.push(pinned(AppearanceAxis::Palette, &self.pinned_palette));
         } else {
             let selected = self.selection.palettes().selected_index();
             rows.extend(self.selection.palettes().entries().iter().enumerate().map(
@@ -178,12 +174,8 @@ impl AppPicker {
             ));
         }
         rows.push(heading(AppearanceAxis::Profile));
-        if let Some(pinned_by) = &self.profile_pinned_by {
-            rows.push(pinned(
-                AppearanceAxis::Profile,
-                &self.pinned_profile,
-                pinned_by,
-            ));
+        if self.profile_pinned_by.is_some() {
+            rows.push(pinned(AppearanceAxis::Profile, &self.pinned_profile));
             return rows;
         }
         let selected = self.selection.profiles().selected_index();
@@ -313,11 +305,15 @@ fn heading(axis: AppearanceAxis) -> AppPickerRow {
     }
 }
 
-fn pinned(axis: AppearanceAxis, label: &str, pinned_by: &str) -> AppPickerRow {
+/// Detail of a pinned row; [`AppPicker::pinned_note`] names where it is pinned, which may be
+/// too long for a row.
+const PINNED_DETAIL: &str = "pinned in configuration";
+
+fn pinned(axis: AppearanceAxis, label: &str) -> AppPickerRow {
     AppPickerRow {
         kind: AppPickerRowKind::Pinned(axis),
         label: label.to_owned(),
-        detail: Some(format!("pinned by {pinned_by}")),
+        detail: Some(PINNED_DETAIL.to_owned()),
         chosen: true,
     }
 }
@@ -496,7 +492,7 @@ mod tests {
         );
         let pinned = &rows[row_of(&picker, AppPickerRowKind::Pinned(AppearanceAxis::Palette))];
         assert_eq!(pinned.label, "Nord");
-        assert_eq!(pinned.detail.as_deref(), Some("pinned by review config"));
+        assert_eq!(pinned.detail.as_deref(), Some("pinned in configuration"));
         assert_eq!(
             picker.pinned_by(AppearanceAxis::Palette),
             Some("review config")
@@ -541,7 +537,7 @@ mod tests {
         );
         let pinned = &rows[row_of(&picker, AppPickerRowKind::Pinned(AppearanceAxis::Profile))];
         assert_eq!(pinned.label, "Bare");
-        assert_eq!(pinned.detail.as_deref(), Some("pinned by review config"));
+        assert_eq!(pinned.detail.as_deref(), Some("pinned in configuration"));
         assert_eq!(
             picker.pinned_note().as_deref(),
             Some("Profile pinned by review config; only the palette applies.")
