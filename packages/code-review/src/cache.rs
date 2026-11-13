@@ -1,32 +1,47 @@
 //! The on-disk cache: what a review computed or learned that is costly to get again, kept across
 //! processes so a review opens from disk and is confirmed afterwards.
 //!
-//! It is separate from the review store and disposable: never needed for correctness, bounded in
-//! size, rebuilt from scratch when it is unreadable or from another schema version, and safe to
-//! delete at any time. Every failure is a miss (reads) or a skipped write; none reaches a caller.
+//! It is separate from the review store and disposable: never needed for correctness, bounded by
+//! age (each kind's entries are dropped [`CacheKind::kept_for`] after they were written), rebuilt
+//! from scratch when it is unreadable, and safe to delete at any time. Every failure is a miss
+//! (reads) or a skipped write; none reaches a caller.
 //!
-//! Entries are bytes under a kind and a key:
+//! Entries are text under a kind and a key:
 //!
 //! * content-addressed answers that never change ([`CacheKind::MergeBase`],
 //!   [`CacheKind::Index`]): keyed by commit ids, so they need no invalidation;
 //! * provider facts ([`CacheKind::Pull`], [`CacheKind::Stack`]): suggestions shown at once and
 //!   confirmed with the provider afterwards, with when they were written.
 //!
+//! One worker thread owns the database; calls send it requests. Reads wait for their answer and
+//! come first: writes are held until no read has arrived for [`WRITE_DELAY`] and then written in
+//! small transactions, so a burst of reads (opening a review) never waits behind writes. A read
+//! also sees the writes still held, so it sees every earlier write.
 //! See `docs/review-loading-architecture.md`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use switchy::database::query::{FilterableQuery as _, where_eq, where_gte, where_in, where_lt};
+use switchy::database::schema::{Column, DataType, create_table};
+use switchy::database::{Database, DatabaseError, DatabaseValue, Row};
+use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
+use switchy::schema::runner::MigrationRunner;
 
 /// Environment variable naming the cache file, or `off` to disable it.
 pub const CODE_REVIEW_CACHE_ENV: &str = "BCODE_CODE_REVIEW_CACHE";
 
-/// Schema version; any other version found on disk is dropped and rebuilt.
-const SCHEMA_VERSION: i64 = 1;
-
-/// How long a write waits for another process holding the database.
+const TABLE: &str = "review_cache_entries";
+const MIGRATIONS_TABLE: &str = "__bcode_review_cache_migrations";
+/// Keys per `IN (…)` query.
+const KEYS_PER_QUERY: usize = 400;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long without a read before held writes start.
+const WRITE_DELAY: Duration = Duration::from_millis(200);
+/// Entries per write transaction; reads are answered between them.
+const WRITE_CHUNK: usize = 64;
 
 /// What an entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,6 +57,8 @@ pub enum CacheKind {
 }
 
 impl CacheKind {
+    const ALL: [Self; 4] = [Self::MergeBase, Self::Index, Self::Pull, Self::Stack];
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::MergeBase => "merge_base",
@@ -51,31 +68,58 @@ impl CacheKind {
         }
     }
 
-    /// Most entries kept; past it, the oldest tenth is dropped.
-    const fn max_entries(self) -> i64 {
+    /// How long entries are kept after they were written (rewriting one renews it).
+    #[must_use]
+    pub const fn kept_for(self) -> Duration {
         match self {
-            Self::MergeBase => 200_000,
-            Self::Index => 4_000,
-            Self::Pull => 20_000,
-            Self::Stack => 1_000,
+            Self::MergeBase => Duration::from_hours(90 * 24),
+            Self::Index | Self::Pull => Duration::from_hours(30 * 24),
+            Self::Stack => crate::provider::STACK_KEPT,
         }
     }
 }
 
-/// An entry read back: its bytes and when it was written.
+/// An entry read back: its text and when it was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheEntry {
-    /// The stored bytes.
-    pub value: Vec<u8>,
+    /// The stored text.
+    pub value: String,
     /// When it was written.
     pub written: SystemTime,
 }
 
-/// The on-disk cache (see the module docs). Cheap to share behind an `Arc`; calls block briefly.
+type Entries = BTreeMap<String, CacheEntry>;
+
+/// A request to the worker that owns the database.
+enum Request {
+    Get {
+        kind: CacheKind,
+        keys: Vec<String>,
+        reply: mpsc::Sender<Entries>,
+    },
+    Prefixed {
+        kind: CacheKind,
+        prefix: String,
+        reply: mpsc::Sender<Entries>,
+    },
+    Put {
+        kind: CacheKind,
+        entries: Vec<(String, String)>,
+    },
+}
+
+/// The worker thread and the way to reach it.
+#[derive(Debug)]
+struct Worker {
+    requests: mpsc::Sender<Request>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// The on-disk cache (see the module docs). Share it behind an `Arc`; reads block briefly.
 #[derive(Debug, Default)]
 pub struct ReviewCache {
     /// `None`: disabled, or the file could not be opened.
-    connection: Option<Mutex<rusqlite::Connection>>,
+    worker: Mutex<Option<Worker>>,
 }
 
 impl ReviewCache {
@@ -86,20 +130,11 @@ impl ReviewCache {
     }
 
     /// The cache at `path` (its directory is created), rebuilt when unreadable; disabled when it
-    /// cannot be opened at all.
+    /// cannot be opened at all (another process holding it, say).
     #[must_use]
     pub fn open(path: &Path) -> Self {
-        let connection = open_connection(path).or_else(|| {
-            // Unreadable (corrupt, or not a database): start over.
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = path.as_os_str().to_owned();
-                file.push(suffix);
-                let _ = std::fs::remove_file(PathBuf::from(file));
-            }
-            open_connection(path)
-        });
         Self {
-            connection: connection.map(Mutex::new),
+            worker: Mutex::new(start(path)),
         }
     }
 
@@ -120,154 +155,331 @@ impl ReviewCache {
 
     /// Whether entries are kept.
     #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.connection.is_some()
+    pub fn enabled(&self) -> bool {
+        self.lock().is_some()
     }
 
     /// The entries of `kind` stored under `keys` (missing ones are absent).
     #[must_use]
-    pub fn get_many(&self, kind: CacheKind, keys: &[String]) -> BTreeMap<String, CacheEntry> {
+    pub fn get_many(&self, kind: CacheKind, keys: &[String]) -> Entries {
         if keys.is_empty() {
-            return BTreeMap::new();
+            return Entries::new();
         }
-        self.with(|connection| {
-            let mut found = BTreeMap::new();
-            let mut statement = connection.prepare_cached(
-                "SELECT value, written_ms FROM entries WHERE kind = ?1 AND key = ?2",
-            )?;
-            for key in keys {
-                let row = statement.query_row(rusqlite::params![kind.as_str(), key], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-                });
-                match row {
-                    Ok((value, written_ms)) => {
-                        found.insert(
-                            key.clone(),
-                            CacheEntry {
-                                value,
-                                written: time_of(written_ms),
-                            },
-                        );
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(found)
+        self.ask(|reply| Request::Get {
+            kind,
+            keys: keys.to_vec(),
+            reply,
         })
-        .unwrap_or_default()
     }
 
     /// The entries of `kind` whose keys start with `prefix`.
     #[must_use]
-    pub fn get_prefixed(&self, kind: CacheKind, prefix: &str) -> BTreeMap<String, CacheEntry> {
-        self.with(|connection| {
-            // Keys in [prefix, prefix + U+10FFFF): a range scan of the primary key.
-            let end = format!("{prefix}\u{10ffff}");
-            let mut statement = connection.prepare_cached(
-                "SELECT key, value, written_ms FROM entries \
-                 WHERE kind = ?1 AND key >= ?2 AND key < ?3",
-            )?;
-            let rows =
-                statement.query_map(rusqlite::params![kind.as_str(), prefix, end], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        CacheEntry {
-                            value: row.get(1)?,
-                            written: time_of(row.get(2)?),
-                        },
-                    ))
-                })?;
-            rows.collect::<Result<BTreeMap<_, _>, _>>()
+    pub fn get_prefixed(&self, kind: CacheKind, prefix: &str) -> Entries {
+        self.ask(|reply| Request::Prefixed {
+            kind,
+            prefix: prefix.to_owned(),
+            reply,
         })
-        .unwrap_or_default()
     }
 
-    /// Store `entries` of `kind` (replacing what their keys held), then drop the oldest entries
-    /// of `kind` past its bound.
-    pub fn put_many(&self, kind: CacheKind, entries: &[(String, Vec<u8>)]) {
+    /// Store `entries` of `kind`, replacing what their keys held. Does not wait for the write.
+    pub fn put_many(&self, kind: CacheKind, entries: &[(String, String)]) {
         if entries.is_empty() {
             return;
         }
-        let now = millis_of(SystemTime::now());
-        let _ = self.with(|connection| {
-            let transaction = connection.transaction()?;
-            {
-                let mut statement = transaction.prepare_cached(
-                    "INSERT OR REPLACE INTO entries (kind, key, value, written_ms) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?;
-                for (key, value) in entries {
-                    statement.execute(rusqlite::params![kind.as_str(), key, value, now])?;
-                }
-            }
-            let count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM entries WHERE kind = ?1",
-                [kind.as_str()],
-                |row| row.get(0),
-            )?;
-            let max = kind.max_entries();
-            if count > max {
-                // Drop down to 90% of the bound, oldest first.
-                let excess = count - max + max / 10;
-                transaction.execute(
-                    "DELETE FROM entries WHERE kind = ?1 AND key IN \
-                     (SELECT key FROM entries WHERE kind = ?1 ORDER BY written_ms, key LIMIT ?2)",
-                    rusqlite::params![kind.as_str(), excess],
-                )?;
-            }
-            transaction.commit()
-        });
+        if let Some(worker) = self.lock().as_ref() {
+            let _ = worker.requests.send(Request::Put {
+                kind,
+                entries: entries.to_vec(),
+            });
+        }
     }
 
-    /// Run `operation` on the connection; `None` when disabled or it fails.
-    fn with<T>(
-        &self,
-        operation: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T>,
-    ) -> Option<T> {
-        let mut connection = self
-            .connection
-            .as_ref()?
+    fn ask(&self, request: impl FnOnce(mpsc::Sender<Entries>) -> Request) -> Entries {
+        let (reply, answer) = mpsc::channel();
+        let sent = self
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        operation(&mut connection).ok()
+            .as_ref()
+            .is_some_and(|worker| worker.requests.send(request(reply)).is_ok());
+        if !sent {
+            return Entries::new();
+        }
+        answer.recv().unwrap_or_default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Worker>> {
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
-/// Open (creating) the database at `path` with the current schema; `None` when it cannot be.
-fn open_connection(path: &Path) -> Option<rusqlite::Connection> {
+impl Drop for ReviewCache {
+    /// Finish the writes sent so far before the database closes.
+    fn drop(&mut self) {
+        let worker = self.lock().take();
+        if let Some(Worker { requests, thread }) = worker {
+            drop(requests);
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Start the worker for the database at `path`: open it (rebuilding a file that is not a
+/// readable cache), migrate it, drop expired entries, then answer requests until every sender is
+/// gone. `None` when it cannot be opened.
+fn start(path: &Path) -> Option<Worker> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let connection = rusqlite::Connection::open(path).ok()?;
-    connection.busy_timeout(BUSY_TIMEOUT).ok()?;
-    // Shared by the daemon plugin and standalone apps: readers never wait for a writer.
-    connection
-        .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+    let path = path.to_path_buf();
+    let (ready, opened) = mpsc::channel();
+    let (requests, incoming) = mpsc::channel::<Request>();
+    let thread = std::thread::Builder::new()
+        .name("review-cache".to_owned())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = ready.send(false);
+                return;
+            };
+            let Some(database) = runtime.block_on(open_or_rebuild(&path)) else {
+                let _ = ready.send(false);
+                return;
+            };
+            let _ = ready.send(true);
+            runtime.block_on(serve(database.as_ref(), incoming));
+        })
         .ok()?;
-    connection
-        .execute_batch("PRAGMA synchronous = NORMAL;")
-        .ok()?;
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .ok()?;
-    if version != SCHEMA_VERSION {
-        connection
-            .execute_batch(&format!(
-                "DROP TABLE IF EXISTS entries;
-                 CREATE TABLE entries (
-                     kind TEXT NOT NULL,
-                     key TEXT NOT NULL,
-                     value BLOB NOT NULL,
-                     written_ms INTEGER NOT NULL,
-                     PRIMARY KEY (kind, key)
-                 ) WITHOUT ROWID;
-                 CREATE INDEX entries_age ON entries (kind, written_ms);
-                 PRAGMA user_version = {SCHEMA_VERSION};"
-            ))
-            .ok()?;
+    if opened.recv().unwrap_or(false) {
+        Some(Worker { requests, thread })
+    } else {
+        let _ = thread.join();
+        None
     }
-    Some(connection)
+}
+
+async fn open_or_rebuild(path: &Path) -> Option<Box<dyn Database>> {
+    match open_database(path).await {
+        Ok(database) => Some(database),
+        // Held by another process: this one does without.
+        Err(error) if is_lock_error(&error) => None,
+        // Unreadable or from an incompatible version: start over.
+        Err(_) => {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut file = path.as_os_str().to_owned();
+                file.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(file));
+            }
+            open_database(path).await.ok()
+        }
+    }
+}
+
+async fn open_database(path: &Path) -> Result<Box<dyn Database>, String> {
+    let database = switchy::database_connection::builder()
+        .turso()
+        .with_path(path)
+        .with_busy_timeout(BUSY_TIMEOUT)
+        .with_multiprocess_wal(false)
+        .build()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut source = CodeMigrationSource::new();
+    source.add_migration(CodeMigration::new(
+        "001_review_cache_entries".to_owned(),
+        Box::new(
+            create_table(TABLE)
+                .if_not_exists(true)
+                .column(column("id", DataType::Text))
+                .column(column("kind", DataType::Text))
+                .column(column("key", DataType::Text))
+                .column(column("value", DataType::Text))
+                .column(column("written_ms", DataType::BigInt))
+                .primary_key("id"),
+        ),
+        None,
+    ));
+    MigrationRunner::new(Box::new(source))
+        .with_table_name(MIGRATIONS_TABLE.to_owned())
+        .run(database.as_ref())
+        .await
+        .map_err(|error| error.to_string())?;
+    let now = SystemTime::now();
+    for kind in CacheKind::ALL {
+        let expired = millis_of(now.checked_sub(kind.kept_for()).unwrap_or(UNIX_EPOCH));
+        database
+            .delete(TABLE)
+            .filter(Box::new(where_eq("kind", kind.as_str())))
+            .filter(Box::new(where_lt("written_ms", expired)))
+            .execute(database.as_ref())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(database)
+}
+
+fn is_lock_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "locking error",
+        "failed locking file",
+        "database is locked",
+        "busy",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn column(name: &str, data_type: DataType) -> Column {
+    Column {
+        name: name.to_owned(),
+        nullable: false,
+        auto_increment: false,
+        data_type,
+        default: None,
+    }
+}
+
+/// A row's id: its kind and key.
+fn id(kind: CacheKind, key: &str) -> String {
+    format!("{}\u{1}{key}", kind.as_str())
+}
+
+/// Writes held until a quiet moment, oldest first.
+type Held = std::collections::VecDeque<(CacheKind, String, String)>;
+
+/// Answer `incoming` until every sender is gone, then write what is held.
+async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
+    let mut held = Held::new();
+    loop {
+        let request = if held.is_empty() {
+            incoming
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            incoming.recv_timeout(WRITE_DELAY)
+        };
+        match request {
+            Ok(Request::Put { kind, entries }) => {
+                held.extend(entries.into_iter().map(|(key, value)| (kind, key, value)));
+            }
+            Ok(read) => answer(database, read, &held).await,
+            // Quiet: write a chunk, then look for reads again.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let chunk: Vec<_> = held.drain(..held.len().min(WRITE_CHUNK)).collect();
+                let _ = put(database, chunk).await;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = put(database, held.into_iter().collect()).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Answer a read from the database and the writes still `held` (which are newer).
+async fn answer(database: &dyn Database, request: Request, held: &Held) {
+    let now = SystemTime::now();
+    let newer = |kind: CacheKind, wanted: &dyn Fn(&str) -> bool| -> Entries {
+        held.iter()
+            .filter(|(held_kind, key, _)| *held_kind == kind && wanted(key))
+            .map(|(_, key, value)| {
+                (
+                    key.clone(),
+                    CacheEntry {
+                        value: value.clone(),
+                        written: now,
+                    },
+                )
+            })
+            .collect()
+    };
+    match request {
+        Request::Get { kind, keys, reply } => {
+            let mut found = Entries::new();
+            for chunk in keys.chunks(KEYS_PER_QUERY) {
+                let ids: Vec<DatabaseValue> = chunk
+                    .iter()
+                    .map(|key| DatabaseValue::String(id(kind, key)))
+                    .collect();
+                if let Ok(rows) = database
+                    .select(TABLE)
+                    .columns(&["key", "value", "written_ms"])
+                    .filter(Box::new(where_in("id", ids)))
+                    .execute(database)
+                    .await
+                {
+                    found.extend(rows.iter().filter_map(entry_of));
+                }
+            }
+            let wanted: std::collections::BTreeSet<&str> =
+                keys.iter().map(String::as_str).collect();
+            found.extend(newer(kind, &|key| wanted.contains(key)));
+            let _ = reply.send(found);
+        }
+        Request::Prefixed {
+            kind,
+            prefix,
+            reply,
+        } => {
+            // Keys in [prefix, prefix + U+10FFFF).
+            let end = format!("{prefix}\u{10ffff}");
+            let rows = database
+                .select(TABLE)
+                .columns(&["key", "value", "written_ms"])
+                .filter(Box::new(where_eq("kind", kind.as_str())))
+                .filter(Box::new(where_gte("key", prefix.clone())))
+                .filter(Box::new(where_lt("key", end)))
+                .execute(database)
+                .await
+                .unwrap_or_default();
+            let mut found: Entries = rows.iter().filter_map(entry_of).collect();
+            found.extend(newer(kind, &|key| key.starts_with(prefix.as_str())));
+            let _ = reply.send(found);
+        }
+        Request::Put { .. } => {}
+    }
+}
+
+async fn put(
+    database: &dyn Database,
+    entries: Vec<(CacheKind, String, String)>,
+) -> Result<(), DatabaseError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let now = millis_of(SystemTime::now());
+    let transaction = database.begin_transaction().await?;
+    for (kind, key, value) in entries {
+        transaction
+            .upsert(TABLE)
+            .unique(&["id"])
+            .value("id", id(kind, &key))
+            .value("kind", kind.as_str())
+            .value("key", key)
+            .value("value", value)
+            .value("written_ms", now)
+            .execute(&*transaction)
+            .await?;
+    }
+    transaction.commit().await
+}
+
+fn entry_of(row: &Row) -> Option<(String, CacheEntry)> {
+    let text = |column: &str| {
+        row.get(column)
+            .and_then(|value| value.as_str().map(str::to_owned))
+    };
+    Some((
+        text("key")?,
+        CacheEntry {
+            value: text("value")?,
+            written: time_of(row.get("written_ms")?.as_i64()?),
+        },
+    ))
 }
 
 fn millis_of(time: SystemTime) -> i64 {
@@ -285,10 +497,6 @@ fn time_of(millis: i64) -> SystemTime {
 mod tests {
     use super::*;
 
-    fn bytes(text: &str) -> Vec<u8> {
-        text.as_bytes().to_vec()
-    }
-
     #[test]
     fn entries_round_trip_by_key_and_prefix_and_survive_reopening() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -298,27 +506,32 @@ mod tests {
         cache.put_many(
             CacheKind::Pull,
             &[
-                ("gh|o/r|1".into(), bytes("one")),
-                ("gh|o/r|2".into(), bytes("two")),
-                ("gh|x/y|1".into(), bytes("other")),
+                ("gh|o/r|1".into(), "one".into()),
+                ("gh|o/r|2".into(), "two".into()),
+                ("gh|x/y|1".into(), "other".into()),
             ],
         );
-        cache.put_many(CacheKind::Stack, &[("gh|o/r|1".into(), bytes("stack"))]);
+        cache.put_many(CacheKind::Stack, &[("gh|o/r|1".into(), "stack".into())]);
+        // Later writes replace earlier ones.
+        cache.put_many(CacheKind::Pull, &[("gh|o/r|2".into(), "two again".into())]);
         let found = cache.get_many(CacheKind::Pull, &["gh|o/r|1".into(), "gh|o/r|9".into()]);
         assert_eq!(found.len(), 1);
-        assert_eq!(found["gh|o/r|1"].value, bytes("one"));
+        assert_eq!(found["gh|o/r|1"].value, "one");
         assert!(found["gh|o/r|1"].written <= SystemTime::now());
-        let scoped: Vec<String> = cache
-            .get_prefixed(CacheKind::Pull, "gh|o/r|")
-            .into_keys()
-            .collect();
-        assert_eq!(scoped, ["gh|o/r|1", "gh|o/r|2"]);
+        let scoped = cache.get_prefixed(CacheKind::Pull, "gh|o/r|");
+        assert_eq!(
+            scoped
+                .values()
+                .map(|entry| entry.value.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two again"]
+        );
         drop(cache);
-        // Another process (or a later run) reads the same entries.
+        // A later run (or another process) reads the same entries.
         let again = ReviewCache::open(&path);
         assert_eq!(
             again.get_many(CacheKind::Stack, &["gh|o/r|1".into()])["gh|o/r|1"].value,
-            bytes("stack")
+            "stack"
         );
     }
 
@@ -333,35 +546,33 @@ mod tests {
         .unwrap();
         let cache = ReviewCache::open(&path);
         assert!(cache.enabled());
-        cache.put_many(CacheKind::MergeBase, &[("a|b".into(), bytes("c"))]);
+        cache.put_many(CacheKind::MergeBase, &[("a|b".into(), "c".into())]);
         assert_eq!(
             cache.get_many(CacheKind::MergeBase, &["a|b".into()]).len(),
             1
         );
         let disabled = ReviewCache::disabled();
-        disabled.put_many(CacheKind::MergeBase, &[("a|b".into(), bytes("c"))]);
-        assert!(
+        assert!(!disabled.enabled());
+        disabled.put_many(CacheKind::MergeBase, &[("a|b".into(), "c".into())]);
+        assert_eq!(
             disabled
                 .get_many(CacheKind::MergeBase, &["a|b".into()])
-                .is_empty()
+                .len(),
+            0
         );
     }
 
     #[test]
-    fn the_oldest_entries_go_first_past_a_kinds_bound() {
+    fn many_keys_are_read_in_bounded_queries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = ReviewCache::open(&dir.path().join("cache.db"));
-        let max = usize::try_from(CacheKind::Stack.max_entries()).unwrap();
-        let entries: Vec<(String, Vec<u8>)> = (0..=max)
-            .map(|index| (format!("{index:06}"), bytes("s")))
+        let entries: Vec<(String, String)> = (0..1_000)
+            .map(|index| (format!("{index:04}"), index.to_string()))
             .collect();
-        // Written in two rounds so the first is older.
-        cache.put_many(CacheKind::Stack, &entries[..10]);
-        std::thread::sleep(Duration::from_millis(5));
-        cache.put_many(CacheKind::Stack, &entries[10..]);
-        let kept = cache.get_prefixed(CacheKind::Stack, "");
-        assert!(kept.len() <= max, "{}", kept.len());
-        assert!(!kept.contains_key("000000"));
-        assert!(kept.contains_key(&format!("{max:06}")));
+        cache.put_many(CacheKind::Index, &entries);
+        let keys: Vec<String> = entries.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(cache.get_many(CacheKind::Index, &keys).len(), 1_000);
+        // Kinds do not see each other's entries.
+        assert_eq!(cache.get_many(CacheKind::Pull, &keys).len(), 0);
     }
 }

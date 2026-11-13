@@ -85,7 +85,7 @@ impl KnownStacks {
                 stack: stack.clone(),
             },
         );
-        if let (Some(bottom), Ok(bytes)) = (stack.layers.first(), serde_json::to_vec(stack)) {
+        if let (Some(bottom), Ok(bytes)) = (stack.layers.first(), serde_json::to_string(stack)) {
             self.disk.put_many(
                 CacheKind::Stack,
                 &[(format!("{}{}", prefix(&scope), bottom.pull.number), bytes)],
@@ -128,7 +128,7 @@ impl KnownStacks {
             .filter_map(|entry| {
                 Some(KnownStack {
                     confirmed: entry.written,
-                    stack: serde_json::from_slice(&entry.value).ok()?,
+                    stack: serde_json::from_str(&entry.value).ok()?,
                 })
             })
             .collect();
@@ -201,7 +201,7 @@ impl KnownPulls {
             for pull in pulls {
                 serial += 1;
                 if self.disk.enabled()
-                    && let Ok(bytes) = serde_json::to_vec(pull)
+                    && let Ok(bytes) = serde_json::to_string(pull)
                 {
                     stored.push((format!("{}{}", prefix(&scope), pull.number), bytes));
                 }
@@ -235,7 +235,7 @@ impl KnownPulls {
             .disk
             .get_many(CacheKind::Pull, std::slice::from_ref(&stored))
             .remove(&stored)?;
-        serde_json::from_slice(&entry.value).ok()
+        serde_json::from_str(&entry.value).ok()
     }
 }
 

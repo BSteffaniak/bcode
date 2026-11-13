@@ -246,6 +246,8 @@ impl ReviewData {
         let root = self.repo_root(&request.repo_path)?;
         // Listings an earlier run kept on disk are read in one go before any git runs.
         index::prefetch(&self.indexes, &root, &request.sources);
+        // The rest of the commit-to-commit diffs in one git process.
+        index::list_together(&self.indexes, &root, &request.sources);
         let workers = request.sources.len().clamp(1, INDEX_WORKERS);
         let chunk = request.sources.len().div_ceil(workers).max(1);
         let indexes = std::thread::scope(|scope| {

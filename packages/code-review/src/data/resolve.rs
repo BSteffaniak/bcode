@@ -441,10 +441,8 @@ impl MergeBases {
         let found = self.disk.get_many(CacheKind::MergeBase, &keys);
         let mut memory = self.lock();
         for (pair, key) in pairs.iter().zip(&keys) {
-            if let Some(entry) = found.get(key)
-                && let Ok(base) = String::from_utf8(entry.value.clone())
-            {
-                memory.insert(pair.clone(), MergeBase::Found(base));
+            if let Some(entry) = found.get(key) {
+                memory.insert(pair.clone(), MergeBase::Found(entry.value.clone()));
             }
         }
     }
@@ -460,7 +458,7 @@ impl MergeBases {
                     memory.clear();
                 }
                 if let Some(base) = &base {
-                    stored.push((disk_key(&key), base.clone().into_bytes()));
+                    stored.push((disk_key(&key), base.clone()));
                 }
                 memory.insert(key, MergeBase::of(base));
             }

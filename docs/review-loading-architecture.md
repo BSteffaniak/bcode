@@ -5,10 +5,11 @@ looks at is on screen as soon as the facts it needs are known locally (milliseco
 else arrives around it without ever blocking it, and the cost of a review grows with what is
 looked at, not with the size of the stack or the repository.
 
-This replaces the current open path, where one loader resolves every source (asking providers,
-resolving revisions, listing every file of every source) and the screen appears only when all of
-it is done. Measured on an 87-layer stack: ~10 s to the first frame, most of it spent on work the
-first frame does not need (resolving the stack a second time, listing 86 other layers' files).
+This replaced an open path where one loader resolved every source (asking providers, resolving
+revisions, listing every file of every source) and the screen appeared only when all of it was
+done. Measured on an 87-layer stack: ~10 s to the first frame, most of it spent on work the first
+frame did not need (resolving the stack a second time, listing 86 other layers' files). See
+[Status](#status) for what is built and measured.
 
 ## Decisions
 
@@ -46,7 +47,7 @@ first frame does not need (resolving the stack a second time, listing 86 other l
 
 ## Layers
 
-```
+```text
   UI (code-review-ui)        screen, rail, banner, file panel: subscribes to session events
         │
   ReviewSession              review model + scheduler + caches; emits events     (code-review)
@@ -85,10 +86,9 @@ the same code inside Bcode. Its integrations follow the same rule.
   in-process (by provider and contributor id). A third-party provider works in both `bcode
   review` and `bcode-review` when Bcode is running; nothing built in depends on it.
 
-Today, by contrast, the standalone binary reaches GitHub and Graphite only through the Bcode
-daemon (located, verified, and started on first use), every call is serialized through it, the
-GitHub plugin runs at most two calls at once, and progress events and cancellation do not cross
-the host.
+Before this, the standalone binary reached GitHub and Graphite only through the Bcode daemon
+(located, verified, and started on first use) and every call was serialized through it. Progress
+events and cancellation still do not cross the host for plugin-backed providers.
 
 ### Git engine (`packages/code-review`, data layer)
 
@@ -197,8 +197,15 @@ a comment belongs to) uses confirmed layers only.
 | discovery answers | contributor + tips of the refs it read | until those refs move | memory |
 | stack snapshot of a review | review source | revalidated on open | review store (with the workspace) |
 
-The on-disk cache database is separate from the review store: disposable, size-bounded, never
-needed for correctness, safe to delete.
+The on-disk cache database is separate from the review store: disposable, bounded by age (merge
+bases kept 90 days, listings and pull requests 30, stacks 7, pruned when it opens), never needed
+for correctness, safe to delete. It goes through Switchy (Turso), like the review store, with one
+worker thread owning the connection; writes do not wait. It is `review-cache.db` in Bcode's state directory
+(`code-review/`), or the file `BCODE_CODE_REVIEW_CACHE` names (`off` disables it); an unreadable
+file is rebuilt; one another process holds leaves this process without it. Stacks are kept for 7 days: a review shows a kept stack
+at once and confirms it after its first frame. A screen that needs the stack as it is now uses one
+as it is for 30 s, confirms it (one `pulls.get`) up to 1 h old, and resolves it again past that,
+because confirming does not see pull requests opened on top of the stack.
 
 ## Performance budgets (checked in tests)
 
@@ -209,20 +216,45 @@ On a synthetic 100-layer stack with local commits and a fake provider with reali
 * every layer indexed: < 1 s, without delaying any interactive request by more than one unit;
 * a cold open: the screen immediately; the requested layer after one provider round trip.
 
-## Phases
+## Status
 
-0. **Providers as libraries** (done): the provider and contributor traits in
-   `packages/code-review/provider`;
-   `code-review-github` and `code-review-graphite` extracted from the plugins, which become
-   wrappers; git discovery called in-process; the registry merging built-in and plugin-backed
-   providers.
-1. **Git engine:** remove the global data lock; bounded parallel pool; content-addressed
-   in-memory caches; `review.index.get_many` and batched commit checks.
-2. **Session and document:** `ReviewSession` with model, scheduler, and events; incremental
-   document groups; render-first open from the wizard and from saved stack snapshots; progress
-   in the rail and banner.
-3. **Forge facts:** the client fact cache, `review_source.pulls.get`, revalidation and deltas;
-   concurrent provider calls and parallel batches.
-4. **Cold open:** provisional layers from discovery; progress events from providers through the
-   host; cancellation.
-5. **Persistence and budgets:** the on-disk cache database; latency budget tests in CI.
+Every phase below is built; where it differs from the plan, it says so.
+
+0. **Providers as libraries.** Traits in `packages/code-review/provider`; GitHub and Graphite
+   in `code-review-github` and `code-review-graphite`, wrapped by the plugins; git discovery
+   in-process; the registry merges built-in and plugin-backed providers.
+1. **Git engine.** No global data lock (a lock per cache, a bounded git process pool);
+   content-addressed index and merge-base caches; `review.index.get_many`. Merge bases of a
+   stack come from one `git rev-list --parents --boundary` walk (a layer on the layer below it,
+   a layer's fork point from the trunk), falling back to `git merge-base` per pair only for what
+   the walk cannot settle; commits the walk names need no separate existence check. Every
+   commit-to-commit listing a request needs is read with one `git diff-tree --stdin`. The
+   repository root is found without git in the usual layout.
+2. **Session.** `session::open` in `packages/code-review`: the first source first (with the rest
+   of its stack as pending placeholders), then the rest, as events; `ControlFlow::Break` from the
+   event callback cancels it between stages and listing batches. The planned priority scheduler
+   (interactive, near, background classes) is not built: there are two phases, first source and
+   rest, which is what the first frame needs.
+3. **Forge facts.** `review_source.pulls.get` (GitHub: aliased GraphQL, 50 per request,
+   requests in parallel); remembered stacks are confirmed with it, and a confirmation that shows
+   a layer closed or rebased onto another branch resolves the stack again. Pull requests every
+   provider answer reports are kept (in memory and on disk), so discovery starts from a known
+   head branch without a lookup. Forge requests run concurrently; a stack walk looks up every
+   hinted branch at once, alongside the pull request itself.
+4. **Cold open.** Discovery's chain is shown in the wizard and on home as unconfirmed while the
+   provider resolves the stack. Provider progress events are not built: with every hint looked
+   up at once, a cold walk is one or two round trips, and the unconfirmed chain already fills the
+   screen before it.
+5. **Persistence and budgets.** The cache database above backs index listings, merge bases,
+   pull requests, and stacks. The budgets are checked by
+   `session::budgets` (a synthetic 100-layer stack, a provider with a 250 ms round trip), which
+   asserts exactly what each path asks the provider and, run alone in release, the timings:
+   `cargo test --release -p bcode_code_review budgets -- --ignored --nocapture`.
+
+Measured with that test in release on a heavily loaded machine (where starting a git process
+costs 20–40 ms): first frame from the wizard ~105 ms, of a saved review ~52 ms, cold ~350 ms
+(one round trip plus the first frame); every layer listed in 0.36–0.83 s. The first frames miss
+their 50 ms budget there by the two git processes they need (the history walk and one diff); on
+an idle machine they fit. On the real 87-layer stack: confirming it takes one request
+(0.5–0.9 s); resolving it cold 2.5–3.5 s, nearly all of it GitHub answering the batched branch
+queries.

@@ -8,6 +8,7 @@ use bcode_code_review_models::{
     ReviewIndexResponse, RevisionRef,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -140,11 +141,145 @@ pub fn prefetch(cache: &Mutex<IndexCache>, root: &Path, sources: &[ResolvedSourc
     for (stored, entry) in found {
         if let (Some(key), Ok(listing)) = (
             by_disk_key.get(&stored),
-            serde_json::from_slice::<IndexListing>(&entry.value),
+            serde_json::from_str::<IndexListing>(&entry.value),
         ) {
             memory.insert(key.clone(), Arc::new(listing));
         }
     }
+}
+
+/// List every commit-to-commit diff of `sources` that `cache` does not hold yet with one
+/// `git diff-tree --stdin` (instead of a `git diff` each), keeping the listings in `cache` and on
+/// disk. Sources it cannot cover (paths, live sides, a head shared with another source) and
+/// everything when git or its output is unexpected are left to [`index_page`], one at a time.
+pub fn list_together(cache: &Mutex<IndexCache>, root: &Path, sources: &[ResolvedSource]) {
+    let mut heads: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+    {
+        let mut memory = lock(cache);
+        for source in sources {
+            let (
+                ResolvedSourceMode::Diff,
+                RevisionRef::Commit { oid: base },
+                RevisionRef::Commit { oid: head },
+            ) = (&source.mode, &source.base, &source.head)
+            else {
+                continue;
+            };
+            if !source.paths.is_empty()
+                || git::validate_oid(base).is_err()
+                || git::validate_oid(head).is_err()
+            {
+                continue;
+            }
+            let Ok((key, true)) = listing_key(root, source) else {
+                continue;
+            };
+            if memory.get(&key).is_none() && !heads.contains_key(head.as_str()) {
+                heads.insert(head, (base, key));
+            }
+        }
+    }
+    // One diff is as quick alone; the batch pays off from two.
+    if heads.len() < 2 {
+        return;
+    }
+    let input = heads
+        .iter()
+        .fold(String::new(), |mut input, (head, (base, _))| {
+            let _ = writeln!(input, "{head} {base}");
+            input
+        });
+    let mut args = vec![
+        "diff-tree",
+        "--stdin",
+        "-r",
+        "--raw",
+        "--numstat",
+        "-z",
+        "--no-abbrev",
+    ];
+    args.extend(DIFF_COMMON);
+    let Ok(output) = git::output_with_input(root, &args, &input) else {
+        return;
+    };
+    let tokens = git::split_nul(&output);
+    let Some(segments) = diff_tree_segments(&tokens, &heads) else {
+        return;
+    };
+    let disk = Arc::clone(&lock(cache).disk);
+    let mut stored = Vec::new();
+    let mut listings = Vec::new();
+    for (head, (_, key)) in &heads {
+        // A pair without changes prints nothing.
+        let segment = segments.get(head).map_or_else(Vec::new, |tokens| {
+            let mut bytes = tokens.join("\0").into_bytes();
+            bytes.push(0);
+            bytes
+        });
+        let Ok(entries) = parse_raw_numstat("", &segment) else {
+            return;
+        };
+        let (additions, deletions) = totals(&entries);
+        let listing = IndexListing {
+            fingerprint: fingerprint(&[key.as_bytes(), &segment]),
+            entries,
+            additions,
+            deletions,
+        };
+        if disk.enabled()
+            && let Ok(text) = serde_json::to_string(&listing)
+        {
+            stored.push((disk_key(key), text));
+        }
+        listings.push((key.clone(), Arc::new(listing)));
+    }
+    disk.put_many(CacheKind::Index, &stored);
+    let mut memory = lock(cache);
+    for (key, listing) in listings {
+        memory.insert(key, listing);
+    }
+}
+
+/// `git diff-tree --stdin -z` output split per commit: each commit's header (its id), then its
+/// raw records (each with one path, or two for a rename or copy), then its numstat records (one
+/// token, or a token and two paths for a rename or copy). `None` for anything else.
+fn diff_tree_segments<'a>(
+    tokens: &'a [String],
+    heads: &BTreeMap<&str, (&str, String)>,
+) -> Option<BTreeMap<&'a str, Vec<String>>> {
+    let mut segments: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut current: Option<&str> = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let paths = if let Some(record) = token.strip_prefix(':') {
+            let status = record.rsplit(' ').next()?;
+            if status.starts_with(['R', 'C']) { 2 } else { 1 }
+        } else if token.matches('\t').count() >= 2 {
+            usize::from(token.ends_with('\t')) * 2
+        } else if heads.contains_key(token.as_str()) && !segments.contains_key(token.as_str()) {
+            current = Some(token);
+            segments.insert(token, Vec::new());
+            index += 1;
+            continue;
+        } else {
+            return None;
+        };
+        let segment = segments.get_mut(current?)?;
+        segment.extend(tokens.get(index..=index + paths)?.iter().cloned());
+        index += paths + 1;
+    }
+    Some(segments)
+}
+
+/// Lines added and removed across `entries`.
+fn totals(entries: &[ReviewIndexEntry]) -> (u64, u64) {
+    entries.iter().fold((0_u64, 0_u64), |(add, del), entry| {
+        (
+            add.saturating_add(u64::from(entry.additions)),
+            del.saturating_add(u64::from(entry.deletions)),
+        )
+    })
 }
 
 fn listing(
@@ -163,7 +298,7 @@ fn listing(
             .get_many(CacheKind::Index, &[disk_key(&key)])
             .into_values()
             .next()
-        && let Ok(listing) = serde_json::from_slice::<IndexListing>(&entry.value)
+        && let Ok(listing) = serde_json::from_str::<IndexListing>(&entry.value)
     {
         let listing = Arc::new(listing);
         lock(cache).insert(key, Arc::clone(&listing));
@@ -185,12 +320,7 @@ fn listing(
             (output, entries)
         }
     };
-    let (additions, deletions) = entries.iter().fold((0_u64, 0_u64), |(add, del), entry| {
-        (
-            add.saturating_add(u64::from(entry.additions)),
-            del.saturating_add(u64::from(entry.deletions)),
-        )
-    });
+    let (additions, deletions) = totals(&entries);
     let listing = Arc::new(IndexListing {
         fingerprint: fingerprint(&[key.as_bytes(), &output]),
         entries,
@@ -199,9 +329,9 @@ fn listing(
     });
     if immutable {
         if disk.enabled()
-            && let Ok(bytes) = serde_json::to_vec(listing.as_ref())
+            && let Ok(text) = serde_json::to_string(listing.as_ref())
         {
-            disk.put_many(CacheKind::Index, &[(disk_key(&key), bytes)]);
+            disk.put_many(CacheKind::Index, &[(disk_key(&key), text)]);
         }
         lock(cache).insert(key, Arc::clone(&listing));
     }
@@ -470,4 +600,85 @@ fn lock(cache: &Mutex<IndexCache>) -> std::sync::MutexGuard<'_, IndexCache> {
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::fixture::{
+        BASE_BRANCH, FixtureSpec, GitFixture, HEAD_BRANCH, STACK_BRANCHES,
+    };
+
+    fn commit(root: &Path, rev: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(root)
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn listings_from_one_diff_tree_match_one_diff_each() {
+        // Renames, mode changes, binary and special entries, deletions, and an empty diff.
+        let fixture = GitFixture::generate(FixtureSpec::small());
+        let root = fixture.root();
+        let chain = [
+            BASE_BRANCH,
+            HEAD_BRANCH,
+            STACK_BRANCHES[0],
+            STACK_BRANCHES[1],
+        ];
+        let mut sources: Vec<ResolvedSource> = chain
+            .windows(2)
+            .enumerate()
+            .map(|(index, pair)| ResolvedSource {
+                source_id: format!("s{index}"),
+                base: RevisionRef::commit(commit(root, pair[0])),
+                head: RevisionRef::commit(commit(root, pair[1])),
+                mode: ResolvedSourceMode::Diff,
+                paths: Vec::new(),
+                line_range: None,
+                part: None,
+            })
+            .collect();
+        let tip = commit(root, STACK_BRANCHES[2]);
+        sources.push(ResolvedSource {
+            source_id: "empty".into(),
+            base: RevisionRef::commit(tip.clone()),
+            head: RevisionRef::commit(tip),
+            ..sources[0].clone()
+        });
+        let together = Mutex::new(IndexCache::default());
+        list_together(&together, root, &sources);
+        assert_eq!(cached_listing_count(&together), sources.len());
+        let alone = Mutex::new(IndexCache::default());
+        for source in &sources {
+            let batched = listing(&together, root, source).expect("batched");
+            let single = listing(&alone, root, source).expect("single");
+            let paths = |listing: &IndexListing| {
+                listing
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let mut entry = entry.clone();
+                        entry.source_id.clear();
+                        entry
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(paths(&batched), paths(&single), "{}", source.source_id);
+            assert_eq!(
+                (batched.additions, batched.deletions),
+                (single.additions, single.deletions)
+            );
+        }
+        assert_eq!(
+            listing(&together, root, &sources[3])
+                .expect("empty")
+                .entries
+                .len(),
+            0
+        );
+    }
 }
