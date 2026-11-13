@@ -199,6 +199,17 @@ impl TuiTheme {
         self
     }
 
+    /// Styles of the activity row: spinner, text, and shimmer, from the theme's `activity.*`
+    /// roles, falling back to the info style and bold activity text.
+    fn activity_styles(self, surfaces: super::theme::SurfaceTheme) -> (Style, Style, Style) {
+        let spinner = surfaces.activity_spinner.unwrap_or(self.info);
+        let text = surfaces.activity_text.unwrap_or(self.info);
+        let shimmer = surfaces
+            .activity_shimmer
+            .unwrap_or_else(|| text.add_modifier(Modifier::BOLD));
+        (spinner, text, shimmer)
+    }
+
     pub const fn modal_theme(self) -> bmux_tui_components::modal_frame::ModalTheme {
         let theme = bmux_tui_components::modal_frame::ModalTheme::new(
             self.overlay,
@@ -326,6 +337,7 @@ pub struct FrameLayout {
     area: Rect,
     header: Rect,
     pub(crate) body: Rect,
+    activity: Rect,
     status: Rect,
     composer: Rect,
     composer_content: Rect,
@@ -342,6 +354,13 @@ impl FrameLayout {
     #[must_use]
     pub const fn status(self) -> Rect {
         self.status
+    }
+
+    /// Return the activity row; empty unless the theme gives activity its own row and the
+    /// app is busy.
+    #[must_use]
+    pub const fn activity(self) -> Rect {
+        self.activity
     }
 
     /// Return the composer panel area.
@@ -365,12 +384,14 @@ pub fn transcript_area_for_frame(app: &BmuxApp, area: Rect) -> Rect {
 struct ScreenRows {
     header: Rect,
     body: Rect,
+    activity: Rect,
     status: Rect,
     composer: Rect,
 }
 
 /// Stack the header (when the theme shows it) at the top and the composer with the status
-/// line at the bottom, the status line above or below the composer as the theme places it.
+/// line at the bottom, the status line above or below the composer as the theme places it,
+/// and, while busy, an activity row above them when the theme gives activity its own row.
 /// The body takes the rows in between.
 fn screen_rows(app: &BmuxApp, area: Rect) -> ScreenRows {
     let chrome = TuiTheme::for_app(app);
@@ -385,6 +406,18 @@ fn screen_rows(app: &BmuxApp, area: Rect) -> ScreenRows {
     );
     let bottom_height = composer_height.saturating_add(status_height);
     let bottom_y = area.bottom().saturating_sub(bottom_height).max(top);
+    let activity_height = u16::from(
+        app.presented_theme().unit_chrome.activity.placement
+            == bcode_tui_theme::chrome::ActivityPlacement::Line
+            && app.busy_since().is_some()
+            && bottom_y > top,
+    );
+    let activity = Rect::new(
+        area.x,
+        bottom_y.saturating_sub(activity_height),
+        area.width,
+        activity_height,
+    );
     let (status_y, composer_y) = match chrome.status.placement {
         bcode_tui_theme::chrome::StatusPlacement::AboveComposer => {
             (bottom_y, bottom_y.saturating_add(status_height))
@@ -395,7 +428,8 @@ fn screen_rows(app: &BmuxApp, area: Rect) -> ScreenRows {
     };
     ScreenRows {
         header,
-        body: Rect::new(area.x, top, area.width, bottom_y.saturating_sub(top)),
+        body: Rect::new(area.x, top, area.width, activity.y.saturating_sub(top)),
+        activity,
         status: Rect::new(area.x, status_y, area.width, status_height),
         composer: Rect::new(area.x, composer_y, area.width, composer_height),
     }
@@ -556,6 +590,15 @@ pub fn render_prepared_damage_with(
         );
         render_status(app, layout.status, frame, theme, chrome.transcript_position);
     }
+    if !layout.activity.is_empty() && intersects(layout.activity) {
+        frame.fill(
+            LocalRect::terminal(layout.activity),
+            " ",
+            app.presented_theme().canvas,
+        );
+        let line = activity_line(app, theme, std::time::Instant::now());
+        frame.write_line(LocalRect::terminal(layout.activity), &line);
+    }
     if let Some(confirmation) = &app.queue_recovery.confirmation {
         let text = format!(
             "{}\n\nType /queue-confirm to explicitly confirm these settings.\nType /queue-dismiss to return without resuming.",
@@ -630,6 +673,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
     let ScreenRows {
         header,
         body,
+        activity,
         status,
         composer,
     } = screen_rows(app, area);
@@ -657,6 +701,7 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         area,
         header,
         body,
+        activity,
         status,
         composer,
         composer_content: composer_content_area(composer, TuiTheme::for_app(app)),
@@ -817,7 +862,7 @@ fn composer_content_area(area: Rect, theme: TuiTheme) -> Rect {
         &state,
         &policy,
         &submit,
-        super::composer_submit::ComposerPresentation {
+        &super::composer_submit::ComposerPresentation {
             theme,
             focused: false,
             enabled: false,
@@ -1000,60 +1045,107 @@ fn statusline_spans(
             )
             .spans(width);
     }
-    let mut line = ChromeLine::new(separator, muted).required(
-        activity_label(
-            app.activity(),
-            app.activity_elapsed(),
-            app.daemon_connection(),
-            app.spinner_step(),
-        ),
-        theme.info,
-        true,
-    );
-
-    let mut token_segments = compact_statusline_token_segments(&app.token_summary()).into_iter();
-    if let Some((context_segment, _)) = token_segments.next() {
-        line = line.required(context_segment, muted, false);
+    let mut line = ChromeLine::new(separator, muted);
+    for segment in theme.status.segments.iter() {
+        line = push_status_segment(line, segment, app, theme, position);
     }
-    for (token_segment, priority) in token_segments {
-        line = line.optional(token_segment, muted, priority, false);
-    }
-
-    let child_activity = app.child_activity_text();
-    if !child_activity.is_empty() {
-        line = line.optional(child_activity, theme.info, 20, true);
-    }
-    let persistent_activity =
-        bcode_session_view::presentation::persistent_activity_text(app.session_view_snapshot());
-    if let Some(text) = &persistent_activity {
-        line = line.required(text.clone(), theme.info, true);
-    }
-    for contribution in app.plugin_status() {
-        if persistent_activity.is_some() && contribution.metadata.contains_key("run_id") {
-            continue;
-        }
-        line = line.optional(
-            contribution.text.clone(),
-            theme.info,
-            u8::try_from(contribution.priority).unwrap_or(u8::MAX - 1),
-            true,
-        );
-    }
-
-    let status_text = statusline_status_text(app);
-    if !status_text.is_empty() {
-        line = line.optional(status_text, muted, 90, true);
-    }
-    if let Some(label) = position.label() {
-        line = line.optional(label, muted, 100, false);
-    }
-
-    let key_hints = compact_key_hints(app.key_hints());
-    if !key_hints.is_empty() {
-        line = line.optional(key_hints, muted, 10, false);
-    }
-
     line.spans(width)
+}
+
+/// Append one status line segment to `line`.
+fn push_status_segment(
+    mut line: ChromeLine,
+    segment: bcode_tui_theme::chrome::StatusSegment,
+    app: &BmuxApp,
+    theme: TuiTheme,
+    position: TranscriptStatusPosition,
+) -> ChromeLine {
+    use bcode_tui_theme::chrome::StatusSegment;
+    let muted = theme.muted;
+    match segment {
+        StatusSegment::Activity => {
+            // With its own row, busy activity leaves the status line to idle and connection
+            // states.
+            let own_row = app.presented_theme().unit_chrome.activity.placement
+                == bcode_tui_theme::chrome::ActivityPlacement::Line
+                && app.busy_since().is_some();
+            let activity = if own_row {
+                &ActivityState::Idle
+            } else {
+                app.activity()
+            };
+            let label = activity_label(
+                activity,
+                app.activity_elapsed(),
+                app.daemon_connection(),
+                app.spinner_step(),
+            );
+            if !(own_row && label == "ready") {
+                line = line.required(label, theme.info, true);
+            }
+        }
+        StatusSegment::Context | StatusSegment::Usage => {
+            let mut token_segments =
+                compact_statusline_token_segments(&app.token_summary()).into_iter();
+            let context = token_segments.next();
+            if segment == StatusSegment::Context {
+                if let Some((context_segment, _)) = context {
+                    line = line.required(context_segment, muted, false);
+                }
+            } else {
+                for (token_segment, priority) in token_segments {
+                    line = line.optional(token_segment, muted, priority, false);
+                }
+            }
+        }
+        StatusSegment::Children => {
+            let child_activity = app.child_activity_text();
+            if !child_activity.is_empty() {
+                line = line.optional(child_activity, theme.info, 20, true);
+            }
+        }
+        StatusSegment::Progress => {
+            if let Some(text) = bcode_session_view::presentation::persistent_activity_text(
+                app.session_view_snapshot(),
+            ) {
+                line = line.required(text, theme.info, true);
+            }
+        }
+        StatusSegment::Plugins => {
+            let persistent_activity = bcode_session_view::presentation::persistent_activity_text(
+                app.session_view_snapshot(),
+            );
+            for contribution in app.plugin_status() {
+                if persistent_activity.is_some() && contribution.metadata.contains_key("run_id") {
+                    continue;
+                }
+                line = line.optional(
+                    contribution.text.clone(),
+                    theme.info,
+                    u8::try_from(contribution.priority).unwrap_or(u8::MAX - 1),
+                    true,
+                );
+            }
+        }
+        StatusSegment::Message => {
+            let status_text = statusline_status_text(app);
+            if !status_text.is_empty() {
+                line = line.optional(status_text, muted, 90, true);
+            }
+        }
+        StatusSegment::Position => {
+            if let Some(label) = position.label() {
+                line = line.optional(label, muted, 100, false);
+            }
+        }
+        StatusSegment::Hints => {
+            let key_hints = compact_key_hints(app.key_hints());
+            if !key_hints.is_empty() {
+                line = line.optional(key_hints, muted, 10, false);
+            }
+        }
+    }
+    line
 }
 
 fn statusline_status_text(app: &BmuxApp) -> String {
@@ -1202,6 +1294,80 @@ fn tool_activity_label(tool_name: &str) -> String {
     format!("tool {tool_name}")
 }
 
+/// Cells the activity shimmer highlights at once.
+const SHIMMER_CELLS: usize = 3;
+
+/// The activity row: the spinner frame, then a verb (one per busy period, with an ellipsis)
+/// or the detailed activity label, then the busy period's elapsed time in muted text. A
+/// shimmering theme sweeps a highlight across the verb or label as motion allows.
+fn activity_line(app: &BmuxApp, theme: TuiTheme, now: std::time::Instant) -> Line {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    let chrome = app.presented_theme().unit_chrome.activity;
+    let (spinner_style, text_style, shimmer_style) =
+        theme.activity_styles(app.presented_theme().surfaces);
+    let step = app.spinner_step();
+    let frame = chrome.spinner.map_or_else(
+        || spinner_frame(step).to_owned(),
+        |frames| {
+            let frames: Vec<&str> = frames.as_str().graphemes(true).collect();
+            frames
+                .get(step % frames.len().max(1))
+                .copied()
+                .unwrap_or_default()
+                .to_owned()
+        },
+    );
+    let elapsed = app.busy_since().map_or(std::time::Duration::ZERO, |since| {
+        now.saturating_duration_since(since)
+    });
+    let busy_periods = usize::try_from(app.busy_periods()).unwrap_or_default();
+    let text = chrome.verbs.cycled(busy_periods).map_or_else(
+        || {
+            let label = activity_label(
+                app.activity(),
+                app.activity_elapsed(),
+                app.daemon_connection(),
+                step,
+            );
+            // The label leads with its own spinner frame; the row draws the theme's.
+            label
+                .split_once(' ')
+                .map_or_else(|| label.clone(), |(_, rest)| rest.to_owned())
+        },
+        |verb| format!("{verb}…"),
+    );
+    let mut spans = vec![Span::styled(frame, spinner_style), Span::raw(" ")];
+    if chrome.shimmer
+        && !matches!(
+            app.motion_policy().motion(),
+            bcode_tui_theme::chrome::Motion::None
+        )
+    {
+        let graphemes: Vec<&str> = text.graphemes(true).collect();
+        let cycle = graphemes.len().saturating_add(SHIMMER_CELLS * 2).max(1);
+        let start = step % cycle;
+        for (index, grapheme) in graphemes.iter().enumerate() {
+            let lit = index.saturating_add(SHIMMER_CELLS) >= start && index < start;
+            let style = if lit { shimmer_style } else { text_style };
+            spans.push(Span::styled((*grapheme).to_owned(), style));
+        }
+    } else {
+        spans.push(Span::styled(text, text_style));
+    }
+    if !chrome.verbs.is_empty() {
+        spans.push(Span::styled(
+            format!(" ({})", format_activity_elapsed_seconds(elapsed)),
+            theme.muted,
+        ));
+    }
+    Line::from_spans(spans)
+}
+
+/// Whole seconds of a busy period, as activity rows show them (`12s`).
+fn format_activity_elapsed_seconds(elapsed: std::time::Duration) -> String {
+    format!("{}s", elapsed.as_secs())
+}
+
 /// The spinner frame for the `activity_frame`th activity tick.
 fn spinner_frame(activity_frame: usize) -> &'static str {
     // Frames repeat, so only the position within a cycle matters.
@@ -1228,7 +1394,7 @@ fn render_composer(app: &mut BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>, t
         &state,
         &policy,
         &app.composer_submit,
-        super::composer_submit::ComposerPresentation {
+        &super::composer_submit::ComposerPresentation {
             theme,
             focused: app.cursor_visible(),
             enabled: !app.composer().text().trim().is_empty(),

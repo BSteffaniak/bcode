@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chrome::{
-    ComposerChrome, MAX_STATUS_INDENT, MarkerGlyphs, RawChrome, StatusChrome, TuiBorders, TuiChrome,
+    ActivityChrome, ComposerChrome, MAX_STATUS_INDENT, MarkerGlyphs, RawChrome, StatusChrome,
+    TuiBorders, TuiChrome,
 };
 use crate::contrast::ContrastAdjustment;
 use crate::expr::{self, ColorContext, Evaluated};
@@ -1039,6 +1040,7 @@ fn resolve_chrome(
             .map_or_else(StatusChrome::default, |status| StatusChrome {
                 placement: status.placement.unwrap_or_default(),
                 indent: status.indent.unwrap_or(0).min(MAX_STATUS_INDENT),
+                segments: status.segments.unwrap_or_default(),
             }),
         composer: raw
             .composer
@@ -1059,6 +1061,15 @@ fn resolve_chrome(
                 connector: markers.connector,
             }),
         follow: raw.follow.unwrap_or_default(),
+        activity: raw
+            .activity
+            .as_ref()
+            .map_or_else(ActivityChrome::default, |activity| ActivityChrome {
+                placement: activity.placement.unwrap_or_default(),
+                spinner: activity.spinner,
+                verbs: activity.verbs.unwrap_or_default(),
+                shimmer: activity.shimmer.unwrap_or(false),
+            }),
     })
 }
 

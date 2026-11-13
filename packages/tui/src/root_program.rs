@@ -2984,10 +2984,10 @@ impl BcodeRuntimeModel {
         if invalidation == super::invalidation::UiInvalidation::Paint
             && let Some(layout) = self.committed_layout
         {
-            let regions = temporal_damage.iter().filter_map(|damage| match damage {
-                super::app::TemporalDamage::Composer => Some(layout.composer()),
-                super::app::TemporalDamage::Status => Some(layout.status()),
-                super::app::TemporalDamage::Full => None,
+            let regions = temporal_damage.iter().flat_map(|damage| match damage {
+                super::app::TemporalDamage::Composer => vec![layout.composer()],
+                super::app::TemporalDamage::Status => vec![layout.status(), layout.activity()],
+                super::app::TemporalDamage::Full => Vec::new(),
             });
             let composer =
                 (self.composer_damage == ComposerDamage::Edited).then(|| layout.composer());

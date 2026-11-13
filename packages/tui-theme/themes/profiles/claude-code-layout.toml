@@ -8,6 +8,7 @@ kind           = "profile"
 schema_version = 2
 
 [chrome.tui]
+activity      = { placement = "line", spinner = "·✢✳✶✻✽", shimmer = true, verbs = ["Mulling", "Pondering", "Brewing", "Baking", "Cooking", "Warping", "Jitterbugging", "Shenaniganing", "Sautéing", "Crunching"] }
 borders       = { panel = "single", dialog = "single", tool = "none", composer = "rules" }
 composer      = { prompt = "❯ ", title = "hidden", placeholder = "", controls = "hidden" }
 density       = "cozy"
@@ -19,7 +20,7 @@ separators    = { status = "plain" }
 session_start = "hidden"
 markers       = { user = "❯", assistant = "⏺", bullet = "⏺", connector = "⎿" }
 speaker       = "marker"
-status        = { placement = "below_composer", indent = 2 }
+status        = { placement = "below_composer", indent = 2, segments = ["message", "hints"] }
 surfaces      = "flat"
 
 # Tool calls: a status-colored bullet, the tool's display name, and its target in parentheses;

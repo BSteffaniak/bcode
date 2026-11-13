@@ -151,7 +151,8 @@ surfaces  = "layered"       # flat | layered
 motion    = "subtle"        # none | subtle | full
 header    = "shown"         # shown | hidden: the header row at the top of the screen
 session_start = "shown"     # shown | hidden: the marker at the start of a session
-status    = { placement = "above_composer", indent = 0 }   # above_composer | below_composer; indent 0..=8
+status    = { placement = "above_composer", indent = 0, segments = ["activity", "context", "usage", "children", "progress", "plugins", "message", "position", "hints"] }
+activity  = { placement = "status", spinner = "⠋⠙⠹", verbs = [], shimmer = false }
 composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls = "shown" }
 ```
 
@@ -166,6 +167,14 @@ composer  = { prompt = "❯ ", title = "shown", placeholder = "Ask…", controls
   speaker's marker glyph (styled by its label role) precedes the first body row, and the body
   hangs beside it. The marker column is the glyph's measured width plus one cell; narrower than
   four body cells, and for collapsed or summarized messages, the heading row returns.
+* `status.segments` lists the shown status segments in display order (unknown or repeated
+  names are rejected); the default shows every segment in the order above.
+* `activity.placement = "line"` moves what the agent is doing from the status line to its own
+  row directly above the composer block, present only while busy. `spinner` sets the spinner
+  frames (one grapheme each); `verbs` replaces the detailed activity label with one verb per
+  busy period followed by the period's elapsed seconds; `shimmer` sweeps a three-cell
+  `activity.shimmer` highlight across the text unless motion is `none`. The `activity.spinner`,
+  `activity.text`, and `activity.shimmer` roles style the row.
 * `follow = "reply"` holds a new submission's or reply's first row at the viewport top until it
   overflows; `latest` keeps the latest content at the bottom instead. Neither pulls a reader who
   scrolled away from the latest content; a submission returns to it under `latest`.

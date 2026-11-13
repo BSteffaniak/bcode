@@ -70,7 +70,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 |---|---|---|
 | 1 | Markdown code blocks need their own syntax roles (ANSI there, RGB in diffs) | open |
 | 2 | Hide the header row and the session-start marker | done: `header`, `session_start` |
-| 3 | Status line placement and alignment; footer row below the input | placement and indent done (`status`); segment selection open |
+| 3 | Status line placement and alignment; footer row below the input | done: `status` placement, indent, segments |
 | 4 | Composer: rule borders, prompt glyph, no title, placeholder and send control optional | done: `borders.composer = "rules"`, `composer`, `composer.*` roles |
 | 5 | Message markers: per-speaker prefix glyph and style, full-row user background, no heading row | done: `speaker = "marker"`, `markers`, full-width panel containers |
 | 6 | Tool header template (`{tool}({target})`), per-tool display names, status-colored marker | done: `header.template`, `display_name`, `bullet` |
@@ -79,7 +79,7 @@ Status of the presentation vocabulary needed by the `claude-code-layout` profile
 | 9 | Reasoning summary template with duration | template done; reasoning duration needs activity timing in the session view (open) |
 | 10 | Turn summary row (duration and completion time) | open |
 | 11 | Markdown presentation options (heading markers, bullets, list spacing, code frame, table header alignment, quote glyph, smart quotes) | open |
-| 12 | Activity line: placement, spinner frames, verbs, shimmer | open |
+| 12 | Activity line: placement, spinner frames, verbs, shimmer | done: `activity`, `activity.*` roles |
 | 13 | Docked permission and question surfaces with numbered option lists | open |
 | 14 | Scroll policy: follow newest instead of holding a new reply at the top | done: `follow = "latest"` |
 | 15 | Session banner | open |

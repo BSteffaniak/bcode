@@ -5,7 +5,8 @@ use bcode_presentation_policy::models::{
     UnitKind,
 };
 use bcode_tui_theme::chrome::{
-    BorderStyle, ComposerChrome, Density, IconSet, SpeakerStyle, StatusChrome, Visibility,
+    ActivityChrome, BorderStyle, ComposerChrome, Density, IconSet, SpeakerStyle, StatusChrome,
+    Visibility,
 };
 use bcode_tui_theme::definition::{
     ContainerBorder, ContainerLayout, ContainerRecipe, ContainerWidth, ResolvedThemeDefinition,
@@ -41,6 +42,8 @@ pub struct UnitChrome {
     pub status: StatusChrome,
     /// Composer prompt, title, placeholder, and controls.
     pub composer: ComposerChrome,
+    /// Activity placement, spinner, verbs, and shimmer.
+    pub activity: ActivityChrome,
 }
 
 /// Header icon candidates for one tool category, most specific first.
@@ -82,6 +85,7 @@ impl UnitChrome {
             header: theme.chrome.header,
             status: theme.chrome.status,
             composer: theme.chrome.composer,
+            activity: theme.chrome.activity,
         })
     }
 

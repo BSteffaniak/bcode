@@ -339,6 +339,10 @@ pub struct BmuxApp {
     activity_elapsed: Duration,
     activity: ActivityState,
     activity_started_at: Instant,
+    /// Start of the current busy period (any non-idle activity), across activity phases.
+    busy_since: Option<Instant>,
+    /// Number of busy periods begun; selects per-period presentation such as a spinner verb.
+    busy_periods: u64,
     daemon_connection: DaemonConnectionState,
     execution_mode_indicator: Option<String>,
     #[cfg(test)]
@@ -514,6 +518,8 @@ impl BmuxApp {
             activity_elapsed: Duration::ZERO,
             activity: ActivityState::Idle,
             activity_started_at: now,
+            busy_since: None,
+            busy_periods: 0,
             daemon_connection: DaemonConnectionState::Connecting,
             execution_mode_indicator: None,
             #[cfg(test)]
@@ -4292,12 +4298,40 @@ impl BmuxApp {
 
     fn set_activity(&mut self, activity: ActivityState) {
         if self.activity != activity {
+            let now = Instant::now();
             if !self.activity.same_phase_as(&activity) {
-                self.activity_started_at = Instant::now();
+                self.activity_started_at = now;
                 self.activity_elapsed = Duration::ZERO;
+            }
+            match (&self.activity, &activity) {
+                (ActivityState::Idle, ActivityState::Idle) => {}
+                (ActivityState::Idle, _) => {
+                    self.busy_since = Some(now);
+                    self.busy_periods = self.busy_periods.wrapping_add(1);
+                }
+                (_, ActivityState::Idle) => self.busy_since = None,
+                _ => {}
             }
             self.activity = activity;
         }
+    }
+
+    /// Set the activity directly, as session events would.
+    #[cfg(test)]
+    pub(crate) fn set_activity_for_test(&mut self, activity: ActivityState) {
+        self.set_activity(activity);
+    }
+
+    /// Start of the current busy period, or `None` while idle.
+    #[must_use]
+    pub const fn busy_since(&self) -> Option<Instant> {
+        self.busy_since
+    }
+
+    /// Number of busy periods begun so far.
+    #[must_use]
+    pub const fn busy_periods(&self) -> u64 {
+        self.busy_periods
     }
 
     fn add_streaming_delta(&mut self, text: &str, application: SessionEventApplication) {

@@ -192,6 +192,24 @@ pub const ROLES: &[RoleSpec] = &[
         Some(DerivedStyle::bg("mix($text, $background, 0.05)")),
     ),
     role(
+        "activity.spinner",
+        RoleCategory::Base,
+        "the activity spinner; unset uses state.info",
+        None,
+    ),
+    role(
+        "activity.text",
+        RoleCategory::Base,
+        "the activity verb or label; unset uses state.info",
+        None,
+    ),
+    role(
+        "activity.shimmer",
+        RoleCategory::Base,
+        "the highlight sweeping across activity text; unset uses bold activity text",
+        None,
+    ),
+    role(
         "composer.border",
         RoleCategory::Base,
         "the composer's border; unset uses the focused accent",

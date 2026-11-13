@@ -268,6 +268,12 @@ pub struct SurfaceTheme {
     pub composer_border: Option<bmux_tui::style::Style>,
     /// The composer's fill (`composer.surface`); `None` uses the raised surface.
     pub composer_surface: Option<bmux_tui::style::Style>,
+    /// The activity spinner (`activity.spinner`).
+    pub activity_spinner: Option<bmux_tui::style::Style>,
+    /// Activity text (`activity.text`).
+    pub activity_text: Option<bmux_tui::style::Style>,
+    /// The highlight sweeping across activity text (`activity.shimmer`).
+    pub activity_shimmer: Option<bmux_tui::style::Style>,
 }
 
 /// Fully resolved target theme derived from app state and configuration.
@@ -673,6 +679,9 @@ pub(crate) fn resolved_definition_theme(
         scrim: component_theme.surfaces.scrim,
         composer_border: style("composer.border"),
         composer_surface: style("composer.surface"),
+        activity_spinner: style("activity.spinner"),
+        activity_text: style("activity.text"),
+        activity_shimmer: style("activity.shimmer"),
     };
     let selection = component_theme.selected;
     let info = component_theme.info;

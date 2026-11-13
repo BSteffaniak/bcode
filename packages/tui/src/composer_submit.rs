@@ -260,10 +260,10 @@ pub fn panel<'a>(
     state: &'a RefCell<TextInputState>,
     policy: &'a TextInputPolicy,
     submit: &'a ComposerSubmit,
-    presentation: ComposerPresentation,
+    presentation: &ComposerPresentation,
     placeholder: &'a str,
 ) -> impl Component + 'a {
-    let ComposerPresentation {
+    let &ComposerPresentation {
         theme,
         focused,
         enabled,
@@ -443,7 +443,7 @@ mod tests {
                 &state,
                 &policy,
                 submit,
-                ComposerPresentation {
+                &ComposerPresentation {
                     theme,
                     focused: false,
                     enabled: !text.trim().is_empty(),
@@ -608,7 +608,7 @@ mod tests {
             &state,
             &policy,
             &submit,
-            ComposerPresentation {
+            &ComposerPresentation {
                 theme: TuiTheme::for_theme_id("terminal-native"),
                 focused: true,
                 enabled: true,
@@ -654,7 +654,7 @@ mod tests {
                 &state,
                 &policy,
                 &submit,
-                ComposerPresentation {
+                &ComposerPresentation {
                     theme,
                     focused: true,
                     enabled: true,
@@ -810,7 +810,7 @@ mod tests {
             &state,
             &policy,
             &submit,
-            ComposerPresentation {
+            &ComposerPresentation {
                 theme,
                 focused: false,
                 enabled: false,

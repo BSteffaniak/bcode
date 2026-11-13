@@ -55,6 +55,15 @@ fg = "$accent"
 [styles."surface.raised"]
 fg = "$text"
 
+[styles."activity.spinner"]
+fg = "$brand"
+
+[styles."activity.text"]
+fg = "$brand"
+
+[styles."activity.shimmer"]
+fg = "$brand_glow"
+
 [styles."composer.border"]
 fg = "$rule"
 

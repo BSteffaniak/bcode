@@ -162,13 +162,113 @@ pub enum StatusPlacement {
     BelowComposer,
 }
 
-/// Status line placement and indentation.
+/// One segment of the status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusSegment {
+    /// Connection state, readiness, and (unless it has its own row) what the agent is doing.
+    Activity,
+    /// Context window use.
+    Context,
+    /// Token and cost accounting.
+    Usage,
+    /// Child session activity.
+    Children,
+    /// Long-running background progress.
+    Progress,
+    /// Plugin status contributions.
+    Plugins,
+    /// The latest status message and execution mode.
+    Message,
+    /// The reading position in the transcript.
+    Position,
+    /// Key hints.
+    Hints,
+}
+
+impl StatusSegment {
+    /// Every segment, in the default order.
+    pub const ALL: [Self; 9] = [
+        Self::Activity,
+        Self::Context,
+        Self::Usage,
+        Self::Children,
+        Self::Progress,
+        Self::Plugins,
+        Self::Message,
+        Self::Position,
+        Self::Hints,
+    ];
+}
+
+/// The status line's segments, in display order; stored inline so chrome stays `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StatusSegments {
+    len: u8,
+    items: [StatusSegment; StatusSegment::ALL.len()],
+}
+
+impl Default for StatusSegments {
+    fn default() -> Self {
+        Self {
+            len: u8::try_from(StatusSegment::ALL.len()).unwrap_or(u8::MAX),
+            items: StatusSegment::ALL,
+        }
+    }
+}
+
+impl StatusSegments {
+    /// `segments` in order, each at most once; `None` when one repeats.
+    #[must_use]
+    pub fn new(segments: &[StatusSegment]) -> Option<Self> {
+        let mut items = StatusSegment::ALL;
+        for (index, segment) in segments.iter().enumerate() {
+            if segments[..index].contains(segment) {
+                return None;
+            }
+            items[index] = *segment;
+        }
+        Some(Self {
+            len: u8::try_from(segments.len()).ok()?,
+            items,
+        })
+    }
+
+    /// The segments, in display order.
+    pub fn iter(&self) -> impl Iterator<Item = StatusSegment> + '_ {
+        self.items[..usize::from(self.len)].iter().copied()
+    }
+}
+
+impl std::fmt::Debug for StatusSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl Serialize for StatusSegments {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusSegments {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let segments = Vec::<StatusSegment>::deserialize(deserializer)?;
+        Self::new(&segments)
+            .ok_or_else(|| serde::de::Error::custom("status segments must not repeat"))
+    }
+}
+
+/// Status line placement, indentation, and segments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StatusChrome {
     /// Placement relative to the composer.
     pub placement: StatusPlacement,
     /// Leading blank columns, at most [`MAX_STATUS_INDENT`].
     pub indent: u8,
+    /// Shown segments in display order; segments left out are not shown.
+    pub segments: StatusSegments,
 }
 
 /// Widest status line indent.
@@ -257,6 +357,136 @@ pub struct MarkerGlyphs {
     pub connector: Option<ChromeText>,
 }
 
+/// Most items in a [`ChromeList`].
+pub const MAX_CHROME_LIST_ITEMS: usize = 32;
+
+/// Most bytes of all items of a [`ChromeList`].
+pub const MAX_CHROME_LIST_BYTES: usize = 384;
+
+/// A short list of chrome texts (spinner verbs, for example), stored inline so resolved chrome
+/// stays `Copy`.
+///
+/// At most [`MAX_CHROME_LIST_ITEMS`] items of at most [`MAX_CHROME_TEXT_BYTES`] bytes each,
+/// [`MAX_CHROME_LIST_BYTES`] in all, none empty or containing control characters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChromeList {
+    len: u16,
+    bytes: [u8; MAX_CHROME_LIST_BYTES],
+}
+
+impl Default for ChromeList {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; MAX_CHROME_LIST_BYTES],
+        }
+    }
+}
+
+impl ChromeList {
+    /// `items` when they fit the bounds.
+    #[must_use]
+    pub fn new<S: AsRef<str>>(items: &[S]) -> Option<Self> {
+        if items.len() > MAX_CHROME_LIST_ITEMS {
+            return None;
+        }
+        let mut list = Self::default();
+        let mut len = 0;
+        for (index, item) in items.iter().enumerate() {
+            let item = item.as_ref();
+            if item.is_empty()
+                || item.len() > MAX_CHROME_TEXT_BYTES
+                || item.chars().any(char::is_control)
+            {
+                return None;
+            }
+            // Items are joined by a line feed, which no item may contain.
+            let separator = usize::from(index > 0);
+            if len + separator + item.len() > MAX_CHROME_LIST_BYTES {
+                return None;
+            }
+            if separator == 1 {
+                list.bytes[len] = b'\n';
+                len += 1;
+            }
+            list.bytes[len..len + item.len()].copy_from_slice(item.as_bytes());
+            len += item.len();
+        }
+        list.len = u16::try_from(len).ok()?;
+        Some(list)
+    }
+
+    /// The items, in order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        let text = std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default();
+        text.split('\n').filter(|item| !item.is_empty())
+    }
+
+    /// Whether the list has no items.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The `index`th item, wrapping around the list; `None` when empty.
+    #[must_use]
+    pub fn cycled(&self, index: usize) -> Option<&str> {
+        let count = self.iter().count();
+        (count > 0)
+            .then(|| self.iter().nth(index % count))
+            .flatten()
+    }
+}
+
+impl std::fmt::Debug for ChromeList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl Serialize for ChromeList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChromeList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let items = Vec::<String>::deserialize(deserializer)?;
+        Self::new(&items).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "chrome lists hold at most {MAX_CHROME_LIST_ITEMS} non-empty single-line items of \
+                 at most {MAX_CHROME_TEXT_BYTES} bytes, {MAX_CHROME_LIST_BYTES} bytes in all"
+            ))
+        })
+    }
+}
+
+/// Where activity (the spinner and what the agent is doing) is shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityPlacement {
+    /// As the status line's first segment.
+    #[default]
+    Status,
+    /// On its own row above the composer, present only while busy.
+    Line,
+}
+
+/// Activity presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActivityChrome {
+    /// Where activity is shown.
+    pub placement: ActivityPlacement,
+    /// Spinner frames, one grapheme each; `None` keeps the renderer's spinner.
+    pub spinner: Option<ChromeText>,
+    /// Verbs describing the agent at work; one is chosen per busy period and shown in place of
+    /// the detailed activity label. Empty shows the label.
+    pub verbs: ChromeList,
+    /// Sweep a highlight (`activity.shimmer`) across the activity text, as motion allows.
+    pub shimmer: bool,
+}
+
 /// The input composer's chrome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComposerChrome {
@@ -316,6 +546,8 @@ pub struct TuiChrome {
     pub markers: MarkerGlyphs,
     /// What the transcript keeps in view as replies arrive.
     pub follow: FollowPolicy,
+    /// Activity presentation.
+    pub activity: ActivityChrome,
 }
 
 /// Maximum focus gradient colors.
@@ -357,6 +589,8 @@ pub(crate) struct RawStatus {
     pub placement: Option<StatusPlacement>,
     #[serde(default)]
     pub indent: Option<u8>,
+    #[serde(default)]
+    pub segments: Option<StatusSegments>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -370,6 +604,19 @@ pub(crate) struct RawComposer {
     pub placeholder: Option<ChromeText>,
     #[serde(default)]
     pub controls: Option<Visibility>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawActivity {
+    #[serde(default)]
+    pub placement: Option<ActivityPlacement>,
+    #[serde(default)]
+    pub spinner: Option<ChromeText>,
+    #[serde(default)]
+    pub verbs: Option<ChromeList>,
+    #[serde(default)]
+    pub shimmer: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -416,6 +663,8 @@ pub(crate) struct RawTuiChrome {
     pub markers: Option<RawMarkers>,
     #[serde(default)]
     pub follow: Option<FollowPolicy>,
+    #[serde(default)]
+    pub activity: Option<RawActivity>,
 }
 
 /// `[chrome]` table: the terminal section plus opaque sections for other renderers.
@@ -476,45 +725,21 @@ impl RawTuiChrome {
             session_start,
             follow
         );
-        if let Some(status) = &other.status {
-            let target = self.status.get_or_insert_with(RawStatus::default);
-            if status.placement.is_some() {
-                target.placement = status.placement;
-            }
-            if status.indent.is_some() {
-                target.indent = status.indent;
-            }
+        // Nested tables merge per field: set fields in `other` win.
+        macro_rules! overlay {
+            ($table:ident, $raw:ident: $($field:ident),*) => {
+                if let Some(source) = &other.$table {
+                    let target = self.$table.get_or_insert_with($raw::default);
+                    $(if source.$field.is_some() {
+                        target.$field = source.$field;
+                    })*
+                }
+            };
         }
-        if let Some(markers) = &other.markers {
-            let target = self.markers.get_or_insert_with(RawMarkers::default);
-            if markers.user.is_some() {
-                target.user = markers.user;
-            }
-            if markers.assistant.is_some() {
-                target.assistant = markers.assistant;
-            }
-            if markers.bullet.is_some() {
-                target.bullet = markers.bullet;
-            }
-            if markers.connector.is_some() {
-                target.connector = markers.connector;
-            }
-        }
-        if let Some(composer) = &other.composer {
-            let target = self.composer.get_or_insert_with(RawComposer::default);
-            if composer.prompt.is_some() {
-                target.prompt = composer.prompt;
-            }
-            if composer.title.is_some() {
-                target.title = composer.title;
-            }
-            if composer.placeholder.is_some() {
-                target.placeholder = composer.placeholder;
-            }
-            if composer.controls.is_some() {
-                target.controls = composer.controls;
-            }
-        }
+        overlay!(activity, RawActivity: placement, spinner, verbs, shimmer);
+        overlay!(markers, RawMarkers: user, assistant, bullet, connector);
+        overlay!(composer, RawComposer: prompt, title, placeholder, controls);
+        overlay!(status, RawStatus: placement, indent, segments);
     }
 }
 
@@ -610,5 +835,28 @@ mod tests {
                 .is_err()
         );
         assert!(toml::from_str::<RawChrome>("[tui]\nheader = \"faded\"").is_err());
+    }
+
+    #[test]
+    fn chrome_lists_are_bounded_single_line_items() {
+        let list = ChromeList::new(&["Mulling", "Pondering", "中文"]).expect("fits");
+        assert_eq!(
+            list.iter().collect::<Vec<_>>(),
+            ["Mulling", "Pondering", "中文"]
+        );
+        assert_eq!(list.cycled(4), Some("Pondering"));
+        assert_eq!(ChromeList::default().cycled(0), None);
+        assert!(ChromeList::new(&[""]).is_none());
+        assert!(ChromeList::new(&["a\nb"]).is_none());
+        assert!(ChromeList::new(&["x".repeat(MAX_CHROME_TEXT_BYTES + 1)]).is_none());
+        assert!(ChromeList::new(&vec!["x"; MAX_CHROME_LIST_ITEMS + 1]).is_none());
+        let parsed: RawChrome = toml::from_str(
+            "[tui]\nactivity = { placement = \"line\", spinner = \"✢✳\", verbs = [\"Mulling\"], shimmer = true }",
+        )
+        .unwrap();
+        let activity = parsed.tui.unwrap().activity.unwrap();
+        assert_eq!(activity.placement, Some(ActivityPlacement::Line));
+        assert_eq!(activity.verbs.map(|verbs| verbs.iter().count()), Some(1));
+        assert!(toml::from_str::<RawChrome>("[tui]\nactivity = { verbs = [\"\"] }").is_err());
     }
 }

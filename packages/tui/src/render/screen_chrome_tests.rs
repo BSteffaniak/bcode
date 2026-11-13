@@ -1,6 +1,9 @@
-//! Behavior of screen chrome: the header row, status line placement, and composer chrome.
+//! Behavior of screen chrome: the header row, status line placement, composer chrome, and the
+//! activity line.
 
-use bcode_tui_theme::chrome::{BorderStyle, ChromeText, StatusPlacement, TuiChrome, Visibility};
+use bcode_tui_theme::chrome::{
+    ActivityPlacement, BorderStyle, ChromeList, ChromeText, StatusPlacement, TuiChrome, Visibility,
+};
 use bmux_tui::buffer::Buffer;
 use bmux_tui::frame::Frame;
 
@@ -128,4 +131,110 @@ fn hidden_composer_controls_release_the_editor_reservation() {
         super::super::composer_submit::trailing_exclusion(size, Visibility::Hidden),
         0
     );
+}
+
+/// A busy frame: its layout, painted rows, the activity text and shimmer styles, and the
+/// activity row.
+fn busy_frame(
+    edit: impl FnOnce(&mut TuiChrome),
+) -> (FrameLayout, Vec<String>, (Style, Style), Line) {
+    let mut app = app_with(edit);
+    app.set_activity_for_test(crate::activity::ActivityState::RunningTool {
+        name: "shell.run".to_owned(),
+    });
+    let area = Rect::new(0, 0, 60, 20);
+    let layout = prepare_frame(&mut app, area).expect("layout");
+    let mut buffer = Buffer::empty(area);
+    render(&mut app, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+    let theme = TuiTheme::for_app(&app);
+    let line = activity_line(&app, theme, std::time::Instant::now());
+    let (_, text, shimmer) = theme.activity_styles(app.presented_theme().surfaces);
+    drop(app);
+    let rows = (0..20)
+        .map(|y| buffer.row_symbols(y).expect("row"))
+        .collect();
+    (layout, rows, (text, shimmer), line)
+}
+
+#[test]
+fn an_activity_line_appears_above_the_composer_only_while_busy() {
+    let line_activity = |chrome: &mut TuiChrome| {
+        chrome.activity.placement = ActivityPlacement::Line;
+        chrome.activity.spinner = ChromeText::new("✢✳");
+        chrome.activity.verbs = ChromeList::new(&["Mulling"]).expect("verbs");
+    };
+    let (idle, _, _) = frame(line_activity, 60, 20);
+    assert!(idle.activity().is_empty(), "no activity row while idle");
+
+    let (busy, rows, _, _) = busy_frame(line_activity);
+    assert_eq!(busy.activity().height, 1);
+    assert_eq!(
+        busy.activity().bottom(),
+        busy.status().y.min(busy.composer().y)
+    );
+    assert_eq!(busy.body().bottom(), busy.activity().y);
+    let activity = &rows[usize::from(busy.activity().y)];
+    assert!(activity.starts_with("✢ Mulling… ("), "{activity:?}");
+    let status = &rows[usize::from(busy.status().y)];
+    assert!(
+        !status.contains("tool shell.run"),
+        "the status line leaves busy activity: {status:?}"
+    );
+
+    // Without its own row, activity stays the status line's first segment.
+    let (status_only, rows, _, _) = busy_frame(|_| {});
+    assert!(status_only.activity().is_empty());
+    assert!(rows[usize::from(status_only.status().y)].contains("tool shell.run"));
+}
+
+#[test]
+fn shimmer_highlights_a_bounded_window_of_the_activity_text() {
+    let (_, _, (text, shimmer), line) = busy_frame(|chrome| {
+        chrome.activity.placement = ActivityPlacement::Line;
+        chrome.activity.verbs = ChromeList::new(&["Mulling"]).expect("verbs");
+        chrome.activity.shimmer = true;
+    });
+    let lit = line
+        .spans
+        .iter()
+        .filter(|span| span.style == shimmer && span.style != text)
+        .count();
+    assert!(lit <= SHIMMER_CELLS, "{line:?}");
+}
+
+#[test]
+fn status_segments_select_and_order_the_status_line() {
+    use bcode_tui_theme::chrome::{StatusSegment, StatusSegments};
+    let status_row = |segments: Option<&[StatusSegment]>| {
+        let mut app = app_with(|chrome| {
+            if let Some(segments) = segments {
+                chrome.status.segments = StatusSegments::new(segments).expect("segments");
+            }
+        });
+        app.set_status("saved".to_owned());
+        let area = Rect::new(0, 0, 100, 20);
+        let layout = prepare_frame(&mut app, area).expect("layout");
+        let mut buffer = Buffer::empty(area);
+        render(&mut app, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        drop(app);
+        buffer
+            .row_symbols(layout.status().y)
+            .expect("row")
+            .trim_end()
+            .to_owned()
+    };
+    let default = status_row(None);
+    assert!(
+        default.starts_with("ready") && default.contains("saved"),
+        "{default:?}"
+    );
+    let reordered = status_row(Some(&[StatusSegment::Message, StatusSegment::Activity]));
+    assert!(
+        reordered.starts_with("saved") && reordered.ends_with("ready"),
+        "{reordered:?}"
+    );
+    let message_only = status_row(Some(&[StatusSegment::Message]));
+    assert_eq!(message_only, "saved");
+    assert_eq!(status_row(Some(&[])), "");
+    assert!(StatusSegments::new(&[StatusSegment::Hints, StatusSegment::Hints]).is_none());
 }
