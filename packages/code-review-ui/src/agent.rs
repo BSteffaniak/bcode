@@ -61,8 +61,17 @@ const MAX_HUNK_BYTES: usize = 3 * 1024;
 /// Characters of a session title.
 const MAX_TITLE_CHARS: usize = 80;
 
+/// Bytes of the review title and of the sources line in a prompt.
+const MAX_HEAD_FIELD_BYTES: usize = 512;
+/// Bytes below which the selected diff lines are left out rather than shortened.
+const MIN_DIFF_BYTES: usize = 256;
+
 /// Marks the context cut to leave room for the question.
 const CONTEXT_CUT: &str = "\n[… context cut to fit; the code_review tools read the rest]\n";
+/// Opens the selected diff lines of a prompt.
+const DIFF_OPEN: &str = "\nSelected diff lines:\n```diff\n";
+/// Closes a code block.
+const FENCE_CLOSE: &str = "```\n";
 
 /// The review tools a question's session can call to read more.
 const TOOLS_LINE: &str = "Read more of this review with the code_review tools: \
@@ -245,6 +254,73 @@ fn cut(text: &str, max: usize, marker: &str) -> String {
     format!("{}{marker}", &text[..end])
 }
 
+/// Whether `text` leaves a markdown code block open (an odd number of fence lines).
+fn leaves_fence_open(text: &str) -> bool {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count()
+        % 2
+        == 1
+}
+
+/// `text` cut like [`cut`], closing a code block the cut left open before `marker`, so what
+/// follows is not read as code. The closing fence may take up to 4 bytes past `max`.
+fn cut_closed(text: &str, max: usize, marker: &str) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut kept = cut(text, max, "");
+    if leaves_fence_open(&kept) {
+        kept.push_str("\n```");
+    }
+    kept.push_str(marker);
+    kept
+}
+
+/// The selected diff lines as a code block within `room` bytes: the first lines that fit (a
+/// first line too long for the room shortened), the rest counted after the block; nothing when
+/// the room is too small to show any.
+fn diff_block(lines: &[&str], room: usize) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let left_out = |count: usize| {
+        format!("[{count} more selected lines left out; code_review.file_diff reads them]\n")
+    };
+    let frame = DIFF_OPEN.len() + FENCE_CLOSE.len() + left_out(lines.len()).len();
+    if room < frame + MIN_DIFF_BYTES {
+        let note = "\n[the selected lines are left out to fit; code_review.file_diff reads them]\n";
+        return if note.len() <= room {
+            note.to_owned()
+        } else {
+            String::new()
+        };
+    }
+    let mut budget = room - frame;
+    let mut block = DIFF_OPEN.to_owned();
+    let mut shown = 0;
+    for line in lines {
+        if line.len() < budget {
+            block.push_str(line);
+            block.push('\n');
+            budget -= line.len() + 1;
+            shown += 1;
+        } else {
+            if shown == 0 {
+                block.push_str(&cut(line, budget.saturating_sub(4), "…"));
+                block.push('\n');
+                shown = 1;
+            }
+            break;
+        }
+    }
+    block.push_str(FENCE_CLOSE);
+    if shown < lines.len() {
+        block.push_str(&left_out(lines.len() - shown));
+    }
+    block
+}
+
 /// The end of `hunk` within [`MAX_HUNK_LINES`] and [`MAX_HUNK_BYTES`], saying what was left out.
 fn hunk_tail(hunk: &str) -> String {
     let lines: Vec<&str> = hunk.lines().collect();
@@ -316,7 +392,7 @@ fn thread_section(thread: &AskThread) -> String {
         format!(
             "--- {}:\n{}\n",
             item.author,
-            cut(
+            cut_closed(
                 item.body.trim(),
                 MAX_THREAD_COMMENT_BYTES,
                 "\n[comment cut]"
@@ -354,9 +430,12 @@ fn thread_section(thread: &AskThread) -> String {
     text
 }
 
-/// The bounded prompt sent to the session. Every part has its own bound; the question is kept
-/// whole (up to its own bound) and what comes before it is cut, marked, when the whole is too
-/// long.
+/// The bounded prompt sent to the session.
+///
+/// Every part has its own bound, and the whole fits [`MAX_PROMPT_BYTES`]: the other threads, the
+/// tools line, and the question (up to its own bound) are always kept; the selected diff lines
+/// take the room left (the rest counted); and only when even that is not enough is the context
+/// before them cut, marked, closing any code block the cut left open.
 #[must_use]
 pub fn prompt(context: &AskContext) -> String {
     let range = |range: Option<(u32, u32)>| {
@@ -398,9 +477,9 @@ pub fn prompt(context: &AskContext) -> String {
     };
     let mut text = format!(
         "You are helping with a local code review in Bcode.\n\nReview: {}\nRepository: {}\nSources: {}\n",
-        context.title,
+        cut(&context.title, MAX_HEAD_FIELD_BYTES, "…"),
         context.repo.display(),
-        context.sources.join(", "),
+        cut(&context.sources.join(", "), MAX_HEAD_FIELD_BYTES, "…"),
     );
     if let Some(thread) = &context.thread {
         text.push('\n');
@@ -424,31 +503,27 @@ pub fn prompt(context: &AskContext) -> String {
             range(context.new),
         );
     }
-    if !lines.is_empty() {
-        let _ = write!(
-            text,
-            "\nSelected diff lines:\n```diff\n{}\n```\n",
-            lines.join("\n")
-        );
-    }
-    let _ = write!(
-        text,
-        "\nOther review threads on {}:\n{threads}\n\n{TOOLS_LINE}\n",
-        place(&context.threads_on)
-    );
-    let question = format!(
-        "\nQuestion:\n{}\n",
+    let tail = format!(
+        "\nOther review threads on {}:\n{threads}\n\n{TOOLS_LINE}\n\nQuestion:\n{}\n",
+        place(&context.threads_on),
         cut(
             context.question.trim(),
             MAX_QUESTION_BYTES,
             "\n[question cut]"
         )
     );
-    let room = MAX_PROMPT_BYTES.saturating_sub(question.len());
-    if text.len() > room {
-        text = cut(&text, room.saturating_sub(CONTEXT_CUT.len()), CONTEXT_CUT);
+    let room = MAX_PROMPT_BYTES.saturating_sub(tail.len());
+    if text.len() + CONTEXT_CUT.len() > room {
+        // The closing fence `cut_closed` may add is kept within the room.
+        text = cut_closed(
+            &text,
+            room.saturating_sub(CONTEXT_CUT.len() + 4),
+            CONTEXT_CUT,
+        );
+    } else {
+        text.push_str(&diff_block(&lines, room - text.len()));
     }
-    text.push_str(&question);
+    text.push_str(&tail);
     text
 }
 
@@ -1269,18 +1344,69 @@ mod tests {
         assert!(text.ends_with("Question:\nStill a problem?\n"));
     }
 
+    /// The prompt before its question, checking that no code block is left open there.
+    fn before_question(text: &str) -> &str {
+        let at = text.rfind("\nQuestion:\n").expect("the question");
+        let before = &text[..at];
+        assert!(!leaves_fence_open(before), "an open code block:\n{text}");
+        before
+    }
+
     #[test]
     fn the_question_survives_when_the_context_is_too_long() {
         let mut long = context(None, "src/lib.rs");
         long.lines = (0..MAX_PROMPT_LINES)
             .map(|line| format!("+{line} {}", "x".repeat(400)))
             .collect();
+        long.threads = vec!["kevin: Why retry here?".to_owned()];
         long.question = "q".repeat(10_000);
         let text = prompt(&long);
         assert!(text.len() <= MAX_PROMPT_BYTES, "{}", text.len());
-        assert!(text.contains("[… context cut to fit; the code_review tools read the rest]"));
+        let before = before_question(&text);
+        assert!(before.contains("+0 x"), "the first lines are shown");
+        assert!(
+            before.contains("more selected lines left out; code_review.file_diff reads them"),
+            "{before}"
+        );
+        assert!(before.contains("Other review threads on src/lib.rs:\n- kevin: Why retry here?"));
+        assert!(before.contains(TOOLS_LINE));
         assert!(text.contains(&format!("Question:\n{}", "q".repeat(4_000))));
         assert!(text.ends_with("[question cut]\n"));
+    }
+
+    #[test]
+    fn a_long_thread_and_minified_lines_leave_no_code_block_open() {
+        let mut comments = vec![said("kevin", "k".repeat(3_000))];
+        comments.extend((1..=8).map(|index| said("ana", format!("{index} {}", "a".repeat(1_500)))));
+        let mut long = context(Some(thread(comments)), "src/app.min.js");
+        long.lines = (0..MAX_PROMPT_LINES)
+            .map(|line| format!("+{line} {}", "m".repeat(4_000)))
+            .collect();
+        long.threads = vec!["kevin: Minified?".to_owned()];
+        let text = prompt(&long);
+        assert!(text.len() <= MAX_PROMPT_BYTES, "{}", text.len());
+        let before = before_question(&text);
+        assert!(before.contains("--- kevin:"), "the thread is kept");
+        assert!(before.contains("Other review threads on src/app.min.js:\n- kevin: Minified?"));
+        assert!(before.contains(TOOLS_LINE));
+        assert!(text.ends_with("Question:\nStill a problem?\n"));
+    }
+
+    #[test]
+    fn a_comment_cut_inside_its_code_block_closes_it() {
+        let body = format!("Try this:\n```rust\n{}", "let x = 1;\n".repeat(400));
+        let text = prompt(&context(Some(thread(vec![said("kevin", body)])), REVIEW));
+        let before = before_question(&text);
+        assert!(before.contains("```\n[comment cut]"), "{before}");
+    }
+
+    #[test]
+    fn a_context_cut_closes_the_code_block_it_cut() {
+        let text = format!("head\n```diff\n{}", "+line\n".repeat(100));
+        let kept = cut_closed(&text, 200, CONTEXT_CUT);
+        assert!(!leaves_fence_open(&kept), "{kept}");
+        assert!(kept.ends_with(CONTEXT_CUT));
+        assert!(kept.len() <= 200 + 4 + CONTEXT_CUT.len());
     }
 
     #[test]

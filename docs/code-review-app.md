@@ -125,8 +125,10 @@ What a question sends:
   left out.
 * The review tools the session can call to read more (`code_review.list_threads`,
   `code_review.get_thread`, `code_review.file_diff`, ...), then the question. Every part has its
-  own bound and the whole prompt at most 24 KiB; the question is never cut to make room for
-  context (cuts are marked).
+  own bound and the whole prompt at most 24 KiB: the other threads, the tools line, and the
+  question are always kept; the diff lines take the room left (the first lines, the rest
+  counted); only if that is not enough is the context before them cut. Cuts are marked, and a
+  cut never leaves a code block open (a comment cut inside its code block closes it).
 
 A question's new session is titled after its file (for a pull request thread, the file it was
 written on) and, asked from a thread, its first comment's author (`Review: src/retry.rs ·
