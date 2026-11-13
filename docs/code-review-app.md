@@ -523,11 +523,20 @@ bcode's own (`--print-config-paths` lists them in order):
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.
   `none` or `unbind` removes a default.
-* `[tui.theme]`: the theme, shared with the rest of bcode: `name` (a bundled theme such as
-  `bcode-dark`, `bcode-light`, `nord` or `monochrome`, or one from the theme directories),
-  `overlays` applied after it, and extra theme files or directories in `paths`. Themes are
-  discovered through `bcode_tui_theme` like `bcode-git`'s; the visual system above derives every
-  color the app uses from the chosen theme.
+* `[tui.theme]`: the theme, selected exactly as bcode's chat interface selects it:
+  `name` (the palette or theme, such as `catppuccin-mocha`, `nord` or `bcode-dark`; default
+  `terminal-native`), `profile` (applied over the palette before other overlays), `overlays`,
+  `variant` (`auto`, `dark` or `light`) and extra theme files or directories in `paths`. The
+  palette and profile saved by bcode's appearance picker (`[theme]` in bcode's user state,
+  `$BCODE_TUI_STATE` or `tui.toml` in the state directory: `$BCODE_STATE_DIR`,
+  `$XDG_STATE_HOME/bcode` or `~/.local/state/bcode`) replace the configured ones when they
+  resolve; one that does not is reported and the configured one is kept. With `variant = "auto"`
+  the app asks the terminal for its colors and presents the light variant on a light background
+  (else `COLORFGBG`, else dark). Both resolve through `bcode_tui_theme::appearance`, the code
+  bcode and `bcode-git` use. The theme follows changes while the app runs: configuration files,
+  the user state file and theme files are checked every 750 ms, so choosing a palette in bcode's
+  appearance picker restyles an open review. The visual system above derives every color the
+  app uses from the chosen theme.
 * `[tui] color_depth`: `auto` (the default: no colors under `NO_COLOR` or a dumb terminal, else
   full color), `truecolor`, `ansi256`, `ansi16`, or `none`, as in bcode.
 * `[tui.diff_viewer]`: bcode's diff layout preference, followed unless the review's own table

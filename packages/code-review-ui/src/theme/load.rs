@@ -1,20 +1,17 @@
 //! The configured bcode theme, resolved into shared component styles.
 //!
-//! The theme is selected by `[tui.theme]`, discovered with `bcode_tui_theme::discovery` like
-//! every bcode program, and mapped to the shared component styles by
-//! `bcode_tui_theme::components`, so the review looks like the rest of bcode.
+//! The theme is selected exactly as bcode selects it: `[tui.theme]` with the palette and profile
+//! the appearance picker saved in user state, resolved by `bcode_tui_theme::appearance` and
+//! mapped to the shared component styles by `bcode_tui_theme::components`, so the review looks
+//! like the rest of bcode.
 
-use std::path::Path;
-
+use bcode_tui_theme::appearance::{AppearanceResolution, AppearanceSources};
 use bcode_tui_theme::components::{ComponentStyles, component_styles};
-use bcode_tui_theme::definition::{ResolvedThemeDefinition, ThemeCatalog, ThemeSelection};
-use bcode_tui_theme::discovery::{default_theme_roots, discover_themes};
+use bcode_tui_theme::definition::{ResolvedThemeDefinition, ThemeSelection};
+use bmux_tui::capabilities::TerminalBackground;
 use bmux_tui::style::Color;
 
-use crate::config::ThemeChoice;
-
-/// Theme used when configuration names none.
-pub const DEFAULT_THEME: &str = "bcode-dark";
+pub use bcode_tui_theme::appearance::DEFAULT_THEME;
 
 /// Accent used when the theme defines no `accent` color.
 const DEFAULT_ACCENT: Color = Color::Cyan;
@@ -31,40 +28,37 @@ pub struct HostTheme {
 }
 
 impl HostTheme {
-    /// Resolve the configured theme, falling back to [`DEFAULT_THEME`] and then to built-in
-    /// colors. Returns the theme and any diagnostic.
+    /// Resolve the theme `sources` select for a terminal with `background`. Returns the theme
+    /// and any diagnostics ([`Self::from_resolution`]).
     #[must_use]
     pub fn load(
-        choice: &ThemeChoice,
-        config_dir: &Path,
-        project_root: &Path,
-    ) -> (Self, Option<String>) {
-        let name = if choice.name.is_empty() {
-            DEFAULT_THEME
-        } else {
-            choice.name.as_str()
-        };
-        let roots = default_theme_roots(config_dir, project_root, &choice.paths);
-        let catalog = discover_themes(&roots)
-            .map(|discovered| discovered.catalog)
-            .or_else(|_| ThemeCatalog::bundled());
-        let catalog = match catalog {
-            Ok(catalog) => catalog,
-            Err(error) => return (Self::fallback(), Some(error.to_string())),
-        };
-        let selection = ThemeSelection::new(name).overlays(choice.overlays.clone());
-        match catalog.resolve(&selection) {
-            Ok(resolved) => (Self::from_definition(Some(&resolved)), None),
+        sources: &AppearanceSources,
+        background: TerminalBackground,
+    ) -> (Self, Vec<String>) {
+        Self::from_resolution(&sources.resolve(background))
+    }
+
+    /// The theme of a resolved appearance. A selection that does not resolve falls back to
+    /// [`DEFAULT_THEME`] and then to built-in colors; the diagnostics say why, along with saved
+    /// choices that could not apply.
+    #[must_use]
+    pub fn from_resolution(resolution: &AppearanceResolution) -> (Self, Vec<String>) {
+        let mut diagnostics: Vec<String> =
+            resolution.notices.iter().map(ToString::to_string).collect();
+        let theme = match &resolution.resolved {
+            Ok(resolved) => Self::from_definition(Some(resolved)),
             Err(error) => {
-                let fallback = catalog
-                    .resolve(&ThemeSelection::new(DEFAULT_THEME))
+                diagnostics.push(format!("theme {}: {error}", resolution.preferences.name));
+                resolution
+                    .catalog
+                    .resolve(&ThemeSelection::new(DEFAULT_THEME).variant(resolution.variant))
                     .map_or_else(
                         |_| Self::fallback(),
                         |resolved| Self::from_definition(Some(&resolved)),
-                    );
-                (fallback, Some(format!("theme {name}: {error}")))
+                    )
             }
-        }
+        };
+        (theme, diagnostics)
     }
 
     /// Built-in colors used when no theme can be resolved.
@@ -89,25 +83,67 @@ impl HostTheme {
 
 #[cfg(test)]
 mod tests {
+    use bcode_tui_theme::appearance::{SavedAppearance, ThemePreferences};
+
     use super::*;
+
+    fn sources(
+        dir: &std::path::Path,
+        configured: &str,
+        saved: SavedAppearance,
+    ) -> AppearanceSources {
+        AppearanceSources {
+            configured: ThemePreferences {
+                name: configured.to_owned(),
+                ..ThemePreferences::default()
+            },
+            saved,
+            watched_files: Vec::new(),
+            user_config_dir: dir.to_path_buf(),
+            project_root: dir.to_path_buf(),
+        }
+    }
 
     #[test]
     fn configured_theme_resolves_and_unknown_themes_fall_back_with_a_diagnostic() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let choice = ThemeChoice {
-            name: DEFAULT_THEME.to_owned(),
-            ..ThemeChoice::default()
-        };
-        let (theme, diagnostic) = HostTheme::load(&choice, dir.path(), dir.path());
+        let (theme, diagnostics) = HostTheme::load(
+            &sources(dir.path(), DEFAULT_THEME, SavedAppearance::default()),
+            TerminalBackground::Unknown,
+        );
         assert_eq!(theme.id, DEFAULT_THEME);
-        assert!(diagnostic.is_none(), "{diagnostic:?}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
-        let missing = ThemeChoice {
-            name: "no-such-theme".to_owned(),
-            ..ThemeChoice::default()
-        };
-        let (fallback, diagnostic) = HostTheme::load(&missing, dir.path(), dir.path());
+        let (fallback, diagnostics) = HostTheme::load(
+            &sources(dir.path(), "no-such-theme", SavedAppearance::default()),
+            TerminalBackground::Unknown,
+        );
         assert_eq!(fallback, theme);
-        assert!(diagnostic.is_some_and(|message| message.contains("no-such-theme")));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("no-such-theme"))
+        );
+    }
+
+    #[test]
+    fn the_palette_saved_by_the_appearance_picker_is_presented() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let saved = SavedAppearance {
+            theme: Some("catppuccin-mocha".to_owned()),
+            profile: Some("structured".to_owned()),
+        };
+        let (theme, diagnostics) = HostTheme::load(
+            &sources(dir.path(), "nord", saved),
+            TerminalBackground::Unknown,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(theme.id, "catppuccin-mocha");
+        let (configured, _) = HostTheme::load(
+            &sources(dir.path(), "nord", SavedAppearance::default()),
+            TerminalBackground::Unknown,
+        );
+        assert_eq!(configured.id, "nord");
+        assert_ne!(theme.styles, configured.styles);
     }
 }

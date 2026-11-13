@@ -284,7 +284,8 @@ and arrays such as `windows` or `custom_commands` are replaced):
 
 Keybindings and the theme also honour bcode's shared sections: `[tui.keybindings.scopes."git.*"]`
 is the base that `keybindings` refines key by key, and each unset `theme` field falls back to
-`[tui.theme]`, so the git UI follows your bcode theme unless told otherwise.
+bcode's theme selection (see [Themes](#themes) below), so the git UI follows your bcode theme
+unless told otherwise.
 
 Problems are reported in the UI (and by `--print-config-paths`) with the file, profile and key
 that caused them, for example
@@ -598,9 +599,28 @@ bcode-git --import-lazygit --nested >> ~/.config/bcode/bcode.toml
 Custom command placeholders are `{file}`, `{branch}`, `{commit}`, `{remote}`, `{tag}`, `{stash}`,
 `{current_branch}`, `{repo}` and `{prompt.<name>}`. Values are shell-quoted.
 
-Themes come from `[theme]` (`name`, `overlays`, `paths`), falling back to bcode's `[tui.theme]`
-(default `bcode-dark`). Besides the standard roles the UI reads
-optional `git.*` roles; see [TUI themes](tui-themes.md#git-client-roles).
+### Themes
+
+The theme is selected exactly as bcode's chat interface selects it, through
+`bcode_tui_theme::appearance`:
+
+* `[tui.theme]` in `bcode.toml`: `name` (the palette or theme; default `terminal-native`),
+  `profile` (applied over the palette before other overlays), `overlays`, `variant` (`auto`,
+  `dark` or `light`) and extra theme files or directories in `paths`.
+* The palette and profile saved by bcode's appearance picker (`[theme]` in bcode's user state:
+  `$BCODE_TUI_STATE`, else `tui.toml` in `$BCODE_STATE_DIR`, `$XDG_STATE_HOME/bcode` or
+  `~/.local/state/bcode`) replace the configured ones when they resolve; one that does not is
+  reported and the configured one is kept.
+* The git UI's own `[theme]` (`name`, `overlays`, `paths`) replaces the matching fields. A `name`
+  here is a theme chosen for the git UI specifically, so it also wins over the saved palette.
+
+With `variant = "auto"` the UI asks the terminal for its colors and presents the light variant on
+a light background (else `COLORFGBG`, else dark). The theme follows changes while the UI runs:
+configuration files of both families, the user state file and theme files are checked every
+750 ms, so choosing a palette in bcode's appearance picker restyles an open `bcode git`.
+
+Besides the standard roles the UI reads optional `git.*` roles; see
+[TUI themes](tui-themes.md#git-client-roles).
 
 ## Keybindings
 

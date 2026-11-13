@@ -1132,7 +1132,11 @@ fn assert_solid_modal(harness: &mut Harness) {
 
 #[test]
 fn modals_have_a_solid_background() {
-    let mut harness = Harness::new(changed_repo);
+    // A theme with surface colors; `terminal-native` keeps the terminal's own background.
+    let mut harness = Harness::with_config(
+        changed_repo,
+        configured("[tui.theme]\nname = \"bcode-dark\"\n"),
+    );
     harness.keys(&["c"]);
     harness.paste("Typed summary");
     assert_solid_modal(&mut harness);

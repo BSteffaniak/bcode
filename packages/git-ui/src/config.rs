@@ -5,7 +5,8 @@
 //!
 //! * `[plugins.config."bcode.git".ui]` — [`GitUiConfig`]
 //! * `[tui.keybindings.scopes."git.*"]` — keybinding overrides
-//! * `[tui.theme]` — theme selection shared with the rest of bcode
+//! * `[tui.theme]` — theme selection shared with the rest of bcode, under the palette and profile
+//!   the appearance picker saved in bcode's user state ([`appearance_sources`])
 //!
 //! Files are discovered and composed by `bcode_config_layers`, the same policy bcode uses.
 
@@ -13,8 +14,12 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use bcode_config_layers::user_state::{
+    SavedTuiAppearance, default_tui_state_path_with_environment,
+};
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 use bcode_git::models::CommitMessageSource;
+use bcode_tui_theme::appearance::{AppearanceSources, SavedAppearance, ThemePreferences};
 use serde::{Deserialize, Serialize};
 
 /// Behavior and presentation settings.
@@ -682,7 +687,8 @@ fn default_custom_scope() -> String {
     "git.global".to_owned()
 }
 
-/// Theme settings in the git UI schema. Each unset field falls back to `[tui.theme]`.
+/// Theme settings in the git UI schema. Each unset field falls back to `[tui.theme]`; a `name`
+/// here also takes precedence over the palette saved by bcode's appearance picker.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThemeSettings {
@@ -695,17 +701,6 @@ pub struct ThemeSettings {
     /// Extra theme files or directories.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<PathBuf>>,
-}
-
-/// Effective theme selection.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ThemeChoice {
-    /// Theme id; empty selects the default.
-    pub name: String,
-    /// Overlays applied after the base theme.
-    pub overlays: Vec<String>,
-    /// Extra theme files or directories.
-    pub paths: Vec<PathBuf>,
 }
 
 /// Where the git UI settings live inside `bcode.toml`; the dedicated files use the same schema
@@ -743,8 +738,13 @@ pub struct LoadedConfig {
     pub ui: GitUiConfig,
     /// Effective `scope -> key -> action` overrides for `git.*` scopes.
     pub keybindings: BTreeMap<String, BTreeMap<String, String>>,
-    /// Effective theme selection.
-    pub theme: ThemeChoice,
+    /// Configured theme selection: `[tui.theme]` with the git UI schema's theme fields over it.
+    pub theme: ThemePreferences,
+    /// Palette and profile the appearance picker saved in bcode's user state.
+    pub saved_appearance: SavedAppearance,
+    /// Files whose change may change the theme: configuration candidates of both families,
+    /// present or not, and the user state file.
+    pub appearance_files: Vec<PathBuf>,
     /// Problems found while loading; defaults are used for affected sections.
     pub diagnostics: Vec<String>,
     /// bcode user configuration directory.
@@ -759,6 +759,8 @@ pub struct LoadedConfig {
     pub git_profile: Option<String>,
     /// Whether `[plugins] disabled` lists the `bcode.git` plugin.
     pub plugin_disabled: bool,
+    /// Command-line layers this configuration was loaded with, for reloading it.
+    pub options: ConfigOptions,
 }
 
 impl LoadedConfig {
@@ -902,10 +904,14 @@ pub fn load_in(
 ) -> LoadedConfig {
     let mut loaded = LoadedConfig {
         config_dir: user_config_home(environment).join("bcode"),
+        options: options.clone(),
         ..LoadedConfig::default()
     };
+    let bcode_candidates =
+        bcode_config_layers::default_config_paths_from_with_environment(start, environment);
+    let git_candidates = git_config_paths_in(start, environment);
     let bcode = match bcode_config_layers::load_layered_from_paths(
-        &bcode_config_layers::default_config_paths_from_with_environment(start, environment),
+        &bcode_candidates,
         &ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None),
         toml::Table::new(),
     ) {
@@ -923,7 +929,7 @@ pub fn load_in(
         .unwrap_or_default();
     let base = section(&bcode_table);
     let git = match bcode_config_layers::load_layered_from_paths(
-        &git_config_paths_in(start, environment),
+        &git_candidates,
         &git_overrides(options, environment),
         base.clone(),
     ) {
@@ -978,7 +984,51 @@ pub fn load_in(
             )
     };
     apply(&bcode_table, &ui, &locate, &mut loaded);
+    load_appearance(&mut loaded, bcode_candidates, git_candidates, environment);
     loaded
+}
+
+/// Read the saved appearance and list the files the theme depends on.
+fn load_appearance(
+    loaded: &mut LoadedConfig,
+    bcode_candidates: Vec<PathBuf>,
+    git_candidates: Vec<PathBuf>,
+    environment: &impl ConfigEnvironment,
+) {
+    let state = default_tui_state_path_with_environment(environment);
+    match SavedTuiAppearance::load(&state) {
+        Ok(saved) => {
+            loaded.saved_appearance = SavedAppearance {
+                // A palette named for the git UI is chosen for it specifically.
+                theme: saved.theme.filter(|_| loaded.ui.theme.name.is_none()),
+                profile: saved.profile,
+            };
+        }
+        Err(error) => loaded
+            .diagnostics
+            .push(format!("saved appearance not loaded: {error}")),
+    }
+    let mut files = bcode_candidates;
+    files.extend(git_candidates);
+    files.extend(loaded.files.iter().cloned());
+    files.extend(loaded.git_files.iter().cloned());
+    files.push(state);
+    files.sort();
+    files.dedup();
+    loaded.appearance_files = files;
+}
+
+/// The theme inputs of `loaded` for a repository at `project_root`, which also holds project
+/// themes.
+#[must_use]
+pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> AppearanceSources {
+    AppearanceSources {
+        configured: loaded.theme.clone(),
+        saved: loaded.saved_appearance.clone(),
+        watched_files: loaded.appearance_files.clone(),
+        user_config_dir: loaded.config_dir.clone(),
+        project_root: project_root.to_path_buf(),
+    }
 }
 
 /// Name an origin, spelling inline layers as the variable or flag that supplied them.
@@ -1107,15 +1157,11 @@ fn apply(
     }
 
     // Theme: bcode's shared selection, with the git UI schema's fields taking precedence.
-    if let Some(toml::Value::Table(theme)) = lookup(bcode, &["tui", "theme"]) {
-        if let Some(name) = theme.get("name").and_then(toml::Value::as_str) {
-            name.clone_into(&mut loaded.theme.name);
+    if let Some(theme) = lookup(bcode, &["tui", "theme"]) {
+        match ThemePreferences::from_toml(theme) {
+            Ok(theme) => loaded.theme = theme,
+            Err(error) => loaded.diagnostics.push(format!("tui.theme: {error}")),
         }
-        loaded.theme.overlays = string_list(theme.get("overlays"));
-        loaded.theme.paths = string_list(theme.get("paths"))
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
     }
     let own = &loaded.ui.theme;
     if let Some(name) = &own.name {
@@ -1311,7 +1357,12 @@ mod tests {
         }
 
         fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
-            (name == "XDG_CONFIG_HOME").then(|| self.config_home.clone().into_os_string())
+            match name {
+                "XDG_CONFIG_HOME" => Some(self.config_home.clone().into_os_string()),
+                // Bcode's user state lives beside the configuration home.
+                "XDG_STATE_HOME" => Some(self.config_home.join("state").into_os_string()),
+                _ => None,
+            }
         }
 
         fn current_dir(&self) -> PathBuf {
@@ -1329,6 +1380,50 @@ mod tests {
 
     fn load(start: &Path) -> LoadedConfig {
         load_with(start, &ConfigOptions::default())
+    }
+
+    #[test]
+    fn the_appearance_saved_in_user_state_applies_unless_the_git_ui_names_a_theme() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("repo");
+        let state = repo.join(".test-config-home/state/bcode/tui.toml");
+        std::fs::create_dir_all(state.parent().expect("state dir")).expect("state dir");
+        std::fs::write(
+            &state,
+            "[theme]\nname = \"catppuccin-mocha\"\nprofile = \"structured\"\n",
+        )
+        .expect("user state");
+        std::fs::write(
+            repo.join("bcode.toml"),
+            "[tui.theme]\nname = \"nord\"\nvariant = \"dark\"\n",
+        )
+        .expect("config");
+        let loaded = load(repo);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.appearance_files.contains(&state));
+        let resolution = appearance_sources(&loaded, repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Light);
+        assert_eq!(resolution.preferences.name, "catppuccin-mocha");
+        assert_eq!(
+            resolution.preferences.profile.as_deref(),
+            Some("structured")
+        );
+        assert_eq!(
+            resolution.variant,
+            bcode_tui_theme::definition::ResolvedThemeVariant::Dark
+        );
+
+        std::fs::write(repo.join("bcode-git.toml"), "[theme]\nname = \"dracula\"\n")
+            .expect("git config");
+        let loaded = load(repo);
+        let resolution = appearance_sources(&loaded, repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Light);
+        assert_eq!(resolution.preferences.name, "dracula");
+        assert_eq!(
+            resolution.preferences.profile.as_deref(),
+            Some("structured")
+        );
     }
 
     #[test]

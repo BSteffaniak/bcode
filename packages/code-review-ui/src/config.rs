@@ -8,7 +8,8 @@
 //!   stack may have and whether more warn or stop (`[…stack] max_layers`, `over_limit`;
 //!   [`ReviewStackLimit`]), and presentation settings.
 //! * `[tui.keybindings.scopes."code-review*"]` — keybinding overrides of the review scopes.
-//! * `[tui.theme]` — theme selection shared with the rest of bcode.
+//! * `[tui.theme]` — theme selection shared with the rest of bcode, under the palette and profile
+//!   the appearance picker saved in bcode's user state ([`appearance_sources`]).
 //! * `[tui.diff_viewer]` — bcode's diff layout preference, which the review follows unless its
 //!   own table sets a layout ([`view`]).
 //!
@@ -19,7 +20,11 @@ use std::path::{Path, PathBuf};
 
 use bcode_code_review::CodeReviewConfig;
 use bcode_code_review_models::ReviewStackLimit;
+use bcode_config_layers::user_state::{
+    SavedTuiAppearance, default_tui_state_path_with_environment,
+};
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
+use bcode_tui_theme::appearance::{AppearanceSources, SavedAppearance, ThemePreferences};
 
 pub mod view;
 
@@ -30,17 +35,6 @@ pub const PLUGIN_ID: &str = "bcode.code_review";
 
 /// Prefix of every review keymap scope.
 pub const SCOPE_PREFIX: &str = "code-review";
-
-/// Effective theme selection.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ThemeChoice {
-    /// Theme id; empty selects the default.
-    pub name: String,
-    /// Overlays applied after the base theme.
-    pub overlays: Vec<String>,
-    /// Extra theme files or directories.
-    pub paths: Vec<PathBuf>,
-}
 
 /// Terminal color depth policy (`[tui] color_depth`), shared with bcode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -113,8 +107,13 @@ pub struct LoadedConfig {
     pub stack_limit: ReviewStackLimit,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
-    /// Effective theme selection.
-    pub theme: ThemeChoice,
+    /// Configured theme selection (`[tui.theme]`).
+    pub theme: ThemePreferences,
+    /// Palette and profile the appearance picker saved in bcode's user state.
+    pub saved_appearance: SavedAppearance,
+    /// Files whose change may change the theme: configuration candidates, present or not, and
+    /// the user state file.
+    pub appearance_files: Vec<PathBuf>,
     /// Terminal color depth from `[tui] color_depth`.
     pub color_depth: ColorDepthChoice,
     /// Whether `[plugins] disabled` lists the code review plugin.
@@ -138,8 +137,10 @@ pub fn load(start: &Path) -> LoadedConfig {
 #[must_use]
 pub fn load_in(start: &Path, environment: &impl ConfigEnvironment) -> LoadedConfig {
     let config_dir = user_config_home(environment).join("bcode");
-    match bcode_config_layers::load_layered_from_paths(
-        &bcode_config_layers::default_config_paths_from_with_environment(start, environment),
+    let candidates =
+        bcode_config_layers::default_config_paths_from_with_environment(start, environment);
+    let mut loaded = match bcode_config_layers::load_layered_from_paths(
+        &candidates,
         &ConfigLoadOverrides::from_config_environment_with_cli(environment, None, None),
         toml::Table::new(),
     ) {
@@ -153,6 +154,37 @@ pub fn load_in(start: &Path, environment: &impl ConfigEnvironment) -> LoadedConf
             diagnostics: vec![format!("bcode.toml configuration not loaded: {error}")],
             ..LoadedConfig::default()
         },
+    };
+    let state = default_tui_state_path_with_environment(environment);
+    match SavedTuiAppearance::load(&state) {
+        Ok(saved) => {
+            loaded.saved_appearance = SavedAppearance {
+                theme: saved.theme,
+                profile: saved.profile,
+            };
+        }
+        Err(error) => loaded
+            .diagnostics
+            .push(format!("saved appearance not loaded: {error}")),
+    }
+    let mut files = candidates;
+    files.extend(loaded.files.iter().cloned());
+    files.push(state);
+    files.sort();
+    files.dedup();
+    loaded.appearance_files = files;
+    loaded
+}
+
+/// The theme inputs of `loaded` for a review of `project_root`, which also holds project themes.
+#[must_use]
+pub fn appearance_sources(loaded: &LoadedConfig, project_root: &Path) -> AppearanceSources {
+    AppearanceSources {
+        configured: loaded.theme.clone(),
+        saved: loaded.saved_appearance.clone(),
+        watched_files: loaded.appearance_files.clone(),
+        user_config_dir: loaded.config_dir.clone(),
+        project_root: project_root.to_path_buf(),
     }
 }
 
@@ -243,15 +275,11 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
             ),
         }
     }
-    if let Some(toml::Value::Table(theme)) = lookup(bcode, &["tui", "theme"]) {
-        if let Some(name) = theme.get("name").and_then(toml::Value::as_str) {
-            name.clone_into(&mut loaded.theme.name);
+    if let Some(theme) = lookup(bcode, &["tui", "theme"]) {
+        match ThemePreferences::from_toml(theme) {
+            Ok(theme) => loaded.theme = theme,
+            Err(error) => loaded.diagnostics.push(format!("tui.theme: {error}")),
         }
-        loaded.theme.overlays = string_list(theme.get("overlays"));
-        loaded.theme.paths = string_list(theme.get("paths"))
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
     }
     loaded
 }
@@ -495,6 +523,62 @@ mod tests {
         assert_eq!(loaded.theme.name, "dracula");
         assert_eq!(loaded.config_dir, home.join(".config/bcode"));
         assert_eq!(loaded.files.len(), 2, "{:?}", loaded.files);
+    }
+
+    #[test]
+    fn the_appearance_saved_in_user_state_is_loaded_and_watched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(home.join(".config/bcode")).expect("config dir");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(
+            home.join(".config/bcode/bcode.toml"),
+            "[tui.theme]\nname = \"nord\"\nprofile = \"bare\"\nvariant = \"light\"\n",
+        )
+        .expect("user config");
+        std::fs::write(
+            state.join("tui.toml"),
+            "[theme]\nname = \"catppuccin-mocha\"\nprofile = \"structured\"\n",
+        )
+        .expect("user state");
+        let environment = TestEnvironment(BTreeMap::from([
+            ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+            (
+                "BCODE_STATE_DIR".to_owned(),
+                state.to_string_lossy().into_owned(),
+            ),
+        ]));
+        let loaded = load_in(&repo, &environment);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.theme.profile.as_deref(), Some("bare"));
+        assert_eq!(
+            loaded.theme.variant,
+            bcode_tui_theme::appearance::VariantPreference::Light
+        );
+        assert_eq!(
+            loaded.saved_appearance,
+            SavedAppearance {
+                theme: Some("catppuccin-mocha".to_owned()),
+                profile: Some("structured".to_owned()),
+            }
+        );
+        assert!(loaded.appearance_files.contains(&state.join("tui.toml")));
+        assert!(loaded.appearance_files.contains(&repo.join("bcode.toml")));
+
+        let resolution = appearance_sources(&loaded, &repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Unknown);
+        assert_eq!(resolution.preferences.name, "catppuccin-mocha");
+        assert_eq!(
+            resolution.preferences.profile.as_deref(),
+            Some("structured")
+        );
+        assert_eq!(
+            resolution.variant,
+            bcode_tui_theme::definition::ResolvedThemeVariant::Light
+        );
     }
 
     struct TestEnvironment(BTreeMap<String, String>);

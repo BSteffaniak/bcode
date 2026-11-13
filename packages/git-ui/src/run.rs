@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bcode_git::{CommandLog, Repository};
+use bcode_tui_theme::appearance::{AppearanceSources, AppearanceWatcher, VariantPreference};
+use bmux_tui::capabilities::{TerminalBackground, TerminalCapabilities};
 use bmux_tui::component::{Constraints, LayoutCx};
 use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
 use bmux_tui::geometry::{Rect, Size};
@@ -38,6 +40,72 @@ pub struct RunOptions {
     /// How to start the shared daemon (see [`daemon_launch`]); `None` never uses one. Its
     /// socket lives in `state_dir` (or the default state directory).
     pub daemon: Option<bcode_git_daemon::Launch>,
+}
+
+/// How often the appearance watcher checks its files for changes.
+const APPEARANCE_INTERVAL: Duration = Duration::from_millis(750);
+
+/// What the theme is resolved from, and how to read it again.
+#[derive(Debug, Clone)]
+pub struct AppearanceInputs {
+    /// The sources the current theme was resolved from.
+    pub sources: AppearanceSources,
+    /// Directory configuration is loaded for.
+    pub start: PathBuf,
+    /// Command-line configuration layers.
+    pub options: crate::config::ConfigOptions,
+}
+
+impl AppearanceInputs {
+    /// Ask the terminal for its colors when the variant follows it, then [`Self::watch`].
+    fn start(
+        &self,
+        handle: bmux_tui_runtime::RuntimeHandle<Msg>,
+        root: PathBuf,
+    ) -> AppearanceWatcher {
+        if self.sources.configured.variant == VariantPreference::Auto {
+            // Replies arrive as terminal input; terminals that ignore the query never answer
+            // and nothing waits on them.
+            let mut stdout = std::io::stdout();
+            let _ = std::io::Write::write_all(
+                &mut stdout,
+                bmux_tui::capabilities::TerminalColorReport::QUERY,
+            )
+            .and_then(|()| std::io::Write::flush(&mut stdout));
+        }
+        self.watch(handle, root)
+    }
+
+    /// Present bcode's theme selection while the session runs: restyle when configuration, the
+    /// saved appearance or theme files change, or when the terminal reports its background.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    fn watch(
+        &self,
+        handle: bmux_tui_runtime::RuntimeHandle<Msg>,
+        root: PathBuf,
+    ) -> AppearanceWatcher {
+        let Self { start, options, .. } = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        AppearanceWatcher::spawn(
+            self.sources.clone(),
+            TerminalCapabilities::detect().background,
+            APPEARANCE_INTERVAL,
+            move || {
+                crate::config::appearance_sources(
+                    &crate::config::load_with(&start, &options),
+                    &root,
+                )
+            },
+            move |resolution| {
+                let (theme, _) = GitTheme::from_resolution(&resolution);
+                // The watcher thread is outside the runtime, so it may wait for room.
+                let _ = runtime.block_on(handle.send(Msg::Theme(Box::new(theme))));
+            },
+        )
+    }
 }
 
 /// Hidden argument of the binaries that makes them serve as the shared daemon on the
@@ -208,10 +276,17 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .collect();
     let keymap = Keymap::new(extra, loaded.keybindings.clone())
         .map_err(|error| RunError::Keymap(format!("invalid git keybindings: {error}")))?;
-    let (theme, theme_error) = GitTheme::load(&loaded.theme, &loaded.config_dir, repo.root());
+    let sources = crate::config::appearance_sources(&loaded, repo.root());
+    let (theme, theme_diagnostics) =
+        GitTheme::load(&sources, TerminalCapabilities::detect().background);
     let mut diagnostics = loaded.diagnostics.clone();
-    diagnostics.extend(theme_error);
+    diagnostics.extend(theme_diagnostics);
     let mut app = App::new(repo, loaded.ui, keymap, theme, options.host, diagnostics);
+    app.appearance = Some(AppearanceInputs {
+        sources,
+        start: options.path.clone(),
+        options: loaded.options,
+    });
     app.env_message = options.commit_message;
     let cache = options
         .state_dir
@@ -334,30 +409,13 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     app.set_watching(live.watching());
     app.set_live_session(live);
     let (animating, frame_ms) = app.animation();
+    let appearance = app.appearance.clone();
+    let root = app.repo.root().to_path_buf();
     let (runtime, handle) = Runtime::new(app, presenter, RuntimeConfig::default());
+    let watcher = appearance.map(|inputs| inputs.start(handle.clone(), root));
+    let reporter = watcher.as_ref().map(AppearanceWatcher::background_reporter);
 
-    let input_handle = handle.clone();
-    let input = tokio::spawn(async move {
-        let mut input = bmux_tui_runtime::ManagedTerminalInput::start(64);
-        loop {
-            match input.recv().await {
-                Some(Ok(Some(event))) => {
-                    if input_handle.send_terminal(event).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(None)) => {}
-                Some(Err(error)) => {
-                    let _ = input_handle
-                        .send(Msg::InputFailed(format!("input: {error}")))
-                        .await;
-                    break;
-                }
-                None => break,
-            }
-        }
-        input.shutdown().await;
-    });
+    let input = spawn_input(handle.clone(), reporter);
     let tick_handle = handle.clone();
     let tick = tokio::spawn(async move {
         loop {
@@ -391,6 +449,7 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     let _ = handle.send(Msg::Metadata).await;
 
     let result = Box::pin(runtime.run()).await;
+    drop(watcher);
     input.abort();
     let _ = input.await;
     tick.abort();
@@ -407,6 +466,42 @@ async fn session(mut app: App) -> Result<(App, Option<String>), RunError> {
     };
     drop(guard);
     Ok((app, error))
+}
+
+/// Forward terminal input to the runtime, reporting the terminal's background to `reporter`.
+fn spawn_input(
+    input_handle: bmux_tui_runtime::RuntimeHandle<Msg>,
+    reporter: Option<bcode_tui_theme::appearance::BackgroundReporter>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut input = bmux_tui_runtime::ManagedTerminalInput::start(64);
+        loop {
+            match input.recv().await {
+                Some(Ok(Some(event))) => {
+                    if let (Some(reporter), bmux_tui::event::Event::User(tag)) = (&reporter, &event)
+                        && tag == bmux_tui_runtime::TERMINAL_COLORS_EVENT
+                    {
+                        let background = input.terminal_colors().background_appearance();
+                        if background != TerminalBackground::Unknown {
+                            reporter.report(background);
+                        }
+                    }
+                    if input_handle.send_terminal(event).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(None)) => {}
+                Some(Err(error)) => {
+                    let _ = input_handle
+                        .send(Msg::InputFailed(format!("input: {error}")))
+                        .await;
+                    break;
+                }
+                None => break,
+            }
+        }
+        input.shutdown().await;
+    })
 }
 
 /// Live state for this session: from the shared daemon when configured and reachable, else

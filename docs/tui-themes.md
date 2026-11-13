@@ -592,7 +592,7 @@ Bcode merges configuration in this order, with later files overriding earlier fi
 2. `<repository>/bcode.toml`;
 3. `<repository>/.bcode/bcode.toml`.
 
-Use the user file to define a global default. Use either repository file to define a project default without changing global configuration. Interactive selection is separate: the appearance picker and `/theme apply` persist only the selected theme name to global user state (`$BCODE_TUI_STATE` or the Bcode state directory's `tui.toml`). They never create or rewrite `bcode.toml`. `/theme reset` clears that state override and returns to the merged configured default.
+Use the user file to define a global default. Use either repository file to define a project default without changing global configuration. Interactive selection is separate: the appearance picker and `/theme apply` persist only the selected theme name to global user state (`$BCODE_TUI_STATE` or the Bcode state directory's `tui.toml`). They never create or rewrite `bcode.toml`. `/theme reset` clears that state override and returns to the merged configured default. The review app (`bcode review`, `bcode-review`) and the git client (`bcode git`, `bcode-git`) select their theme the same way, through `bcode_tui_theme::appearance`: configuration, then the saved palette and profile, then the variant for the terminal. They follow changes to these files while they run.
 
 A complete selection looks like:
 

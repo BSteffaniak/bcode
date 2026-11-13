@@ -219,6 +219,8 @@ pub enum Msg {
     Live(Box<bcode_git_live::LiveUpdate>),
     /// Reload the side panels' git metadata (refs, stashes, tags, worktrees, …).
     Metadata,
+    /// bcode's theme selection changed: present this theme.
+    Theme(Box<GitTheme>),
     /// Terminal input failed.
     InputFailed(String),
 }
@@ -316,6 +318,9 @@ pub struct App {
     pub(crate) config: GitUiConfig,
     pub(crate) keymap: Keymap,
     pub(crate) theme: GitTheme,
+    /// What the theme is resolved from, kept current while a terminal session runs; `None`
+    /// keeps the theme fixed.
+    pub(crate) appearance: Option<crate::run::AppearanceInputs>,
     pub(crate) cx: PresentContext,
     pub(crate) host: Arc<dyn GitUiHost>,
 
@@ -471,6 +476,7 @@ impl App {
             config,
             keymap,
             theme,
+            appearance: None,
             cx,
             host,
             pulls: crate::pulls::PullRequests::new(None, None),
@@ -2817,6 +2823,7 @@ impl App {
             }
             Msg::Live(live) => self.install_live(*live),
             Msg::Metadata => Update::none().maybe(self.reload_metadata()),
+            Msg::Theme(theme) => self.set_theme(*theme),
             Msg::Main(generation, content) => {
                 if generation == self.main_generation {
                     self.install_main(*content);
@@ -2889,6 +2896,21 @@ impl App {
                 Update::exit()
             }
         }
+    }
+}
+
+impl App {
+    /// Present `theme` from now on: panels restyle at once and the main view reloads with it.
+    pub fn set_theme(&mut self, theme: GitTheme) -> Update<Msg> {
+        if theme == self.theme {
+            return Update::none();
+        }
+        let (branches, _) = crate::branches::BranchColors::new(&self.config.branches, &theme);
+        self.cx.branches = branches;
+        self.cx.theme = theme.clone();
+        self.theme = theme;
+        self.refresh_branch_colors();
+        Update::redraw().maybe(self.sync_main(true))
     }
 }
 

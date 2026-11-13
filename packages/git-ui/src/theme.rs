@@ -4,17 +4,13 @@
 //! `diff.*`, `syntax.*`) and optional git roles (`git.*`). Missing roles fall back to colorful
 //! defaults derived from the theme's state colors so every theme stays readable.
 
-use std::path::Path;
-
 use bcode_syntax_render::SyntaxRole;
-use bcode_tui_theme::definition::{ResolvedThemeDefinition, ThemeCatalog, ThemeSelection};
-use bcode_tui_theme::discovery::{default_theme_roots, discover_themes};
+use bcode_tui_theme::appearance::{AppearanceResolution, AppearanceSources};
+use bcode_tui_theme::definition::{ResolvedThemeDefinition, ThemeSelection};
+use bmux_tui::capabilities::TerminalBackground;
 use bmux_tui::style::{Color, Modifier, Style};
 
-use crate::config::ThemeChoice;
-
-/// Theme used when configuration names none.
-pub const DEFAULT_THEME: &str = "bcode-dark";
+pub use bcode_tui_theme::appearance::DEFAULT_THEME;
 
 /// Resolved styles for every element the UI paints.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,40 +74,38 @@ pub struct GitTheme {
 }
 
 impl GitTheme {
-    /// Resolve the configured theme, falling back to [`DEFAULT_THEME`] and then to built-in
-    /// colors. Returns the theme and any diagnostic.
+    /// Resolve the theme `sources` select (bcode's selection: configuration under the saved
+    /// appearance) for a terminal with `background`. Returns the theme and any diagnostics
+    /// ([`Self::from_resolution`]).
     #[must_use]
     pub fn load(
-        choice: &ThemeChoice,
-        config_dir: &Path,
-        project_root: &Path,
-    ) -> (Self, Option<String>) {
-        let name = if choice.name.is_empty() {
-            DEFAULT_THEME
-        } else {
-            choice.name.as_str()
-        };
-        let roots = default_theme_roots(config_dir, project_root, &choice.paths);
-        let catalog = discover_themes(&roots)
-            .map(|discovered| discovered.catalog)
-            .or_else(|_| ThemeCatalog::bundled());
-        let catalog = match catalog {
-            Ok(catalog) => catalog,
-            Err(error) => return (Self::fallback(), Some(error.to_string())),
-        };
-        let selection = ThemeSelection::new(name).overlays(choice.overlays.clone());
-        match catalog.resolve(&selection) {
-            Ok(resolved) => (Self::from_definition(&resolved), None),
+        sources: &AppearanceSources,
+        background: TerminalBackground,
+    ) -> (Self, Vec<String>) {
+        Self::from_resolution(&sources.resolve(background))
+    }
+
+    /// The theme of a resolved appearance. A selection that does not resolve falls back to
+    /// [`DEFAULT_THEME`] and then to built-in colors; the diagnostics say why, along with saved
+    /// choices that could not apply.
+    #[must_use]
+    pub fn from_resolution(resolution: &AppearanceResolution) -> (Self, Vec<String>) {
+        let mut diagnostics: Vec<String> =
+            resolution.notices.iter().map(ToString::to_string).collect();
+        let theme = match &resolution.resolved {
+            Ok(resolved) => Self::from_definition(resolved),
             Err(error) => {
-                let fallback = catalog
-                    .resolve(&ThemeSelection::new(DEFAULT_THEME))
+                diagnostics.push(format!("theme {}: {error}", resolution.preferences.name));
+                resolution
+                    .catalog
+                    .resolve(&ThemeSelection::new(DEFAULT_THEME).variant(resolution.variant))
                     .map_or_else(
                         |_| Self::fallback(),
                         |resolved| Self::from_definition(&resolved),
-                    );
-                (fallback, Some(format!("theme {name}: {error}")))
+                    )
             }
-        }
+        };
+        (theme, diagnostics)
     }
 
     /// Built-in colors used when no theme can be resolved.
@@ -356,7 +350,7 @@ mod tests {
 
     #[test]
     fn every_bundled_theme_distinguishes_additions_from_removals() {
-        let catalog = ThemeCatalog::bundled().unwrap();
+        let catalog = bcode_tui_theme::definition::ThemeCatalog::bundled().unwrap();
         for definition in catalog
             .definitions()
             .filter(|definition| definition.kind() == bcode_tui_theme::definition::ThemeKind::Theme)
@@ -370,18 +364,63 @@ mod tests {
         }
     }
 
+    fn sources(
+        dir: &std::path::Path,
+        configured: &str,
+        saved: bcode_tui_theme::appearance::SavedAppearance,
+    ) -> AppearanceSources {
+        AppearanceSources {
+            configured: bcode_tui_theme::appearance::ThemePreferences {
+                name: configured.to_owned(),
+                ..bcode_tui_theme::appearance::ThemePreferences::default()
+            },
+            saved,
+            watched_files: Vec::new(),
+            user_config_dir: dir.to_path_buf(),
+            project_root: dir.to_path_buf(),
+        }
+    }
+
     #[test]
     fn missing_theme_falls_back_with_diagnostic() {
-        let dir = std::env::temp_dir();
-        let (theme, diagnostic) = GitTheme::load(
-            &ThemeChoice {
-                name: "does-not-exist".into(),
-                ..ThemeChoice::default()
-            },
-            &dir,
-            &dir,
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (theme, diagnostics) = GitTheme::load(
+            &sources(
+                dir.path(),
+                "does-not-exist",
+                bcode_tui_theme::appearance::SavedAppearance::default(),
+            ),
+            TerminalBackground::Unknown,
         );
-        assert!(diagnostic.is_some());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|message| message.contains("does-not-exist"))
+        );
         assert_eq!(theme.syntax(SyntaxRole::Text), theme.syntax[0]);
+    }
+
+    #[test]
+    fn the_palette_saved_by_the_appearance_picker_is_presented() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let saved = bcode_tui_theme::appearance::SavedAppearance {
+            theme: Some("catppuccin-mocha".to_owned()),
+            profile: None,
+        };
+        let (picked, diagnostics) = GitTheme::load(
+            &sources(dir.path(), "nord", saved),
+            TerminalBackground::Unknown,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let expected = GitTheme::from_definition(
+            &bcode_tui_theme::definition::ThemeCatalog::bundled()
+                .expect("bundled")
+                .resolve(
+                    &ThemeSelection::new("catppuccin-mocha")
+                        .variant(bcode_tui_theme::definition::ResolvedThemeVariant::Dark),
+                )
+                .expect("resolves"),
+        );
+        assert_eq!(picked, expected);
     }
 }

@@ -10,6 +10,9 @@
 //! * After each presented frame the app is polled again, so data needed by the new viewport is
 //!   requested at once; while the app keeps reporting changes (animations, spinners) frames
 //!   continue at the runtime cadence, and the loop goes idle when nothing changes.
+//! * With the standalone host the theme follows bcode's: an appearance watcher re-resolves it
+//!   when configuration, the saved appearance or theme files change, or when the terminal
+//!   reports its background, and the host restyles the app.
 //! * Opening a session in Bcode ends the runtime, runs the host's open command with the terminal
 //!   handed over, and resumes the app where it was.
 
@@ -19,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use bcode_code_review::ReviewStore;
 use bcode_session_models::SessionId;
+use bcode_tui_theme::appearance::{AppearanceWatcher, VariantPreference};
 use bcode_tui_theme::components::ComponentStyles;
 use bmux_tui::capabilities::{TerminalCapabilities, TerminalColorDepth};
 use bmux_tui::crossterm::{CrosstermTerminalGuard, terminal_size};
@@ -44,6 +48,9 @@ use crate::view::View;
 
 /// Terminal input events buffered before the reader waits for the app.
 const INPUT_BUFFER: usize = 64;
+
+/// How often the appearance watcher checks its files for changes.
+const APPEARANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Inputs for [`run`] and [`build_app`].
 pub struct RunOptions {
@@ -102,6 +109,10 @@ pub struct App {
     open_session: Option<SessionId>,
     quit: bool,
     diagnostics: Vec<String>,
+    /// Keeps the standalone host's theme current; `None` when the host owns its theme.
+    appearance: Option<AppearanceWatcher>,
+    /// Whether to ask the terminal for its colors, which select the light or dark variant.
+    query_terminal_colors: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -209,11 +220,14 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let keymap = crate::keymap::registry(loaded.keybindings.clone())
         .map_err(|error| RunError::Keymap(format!("invalid review keybindings: {error}")))?;
     let mut diagnostics = loaded.diagnostics.clone();
+    let mut appearance = None;
     let host = if let Some(host) = options.host {
         host
     } else {
-        let (theme, theme_error) = HostTheme::load(&loaded.theme, &loaded.config_dir, &repo);
-        diagnostics.extend(theme_error);
+        let sources = crate::config::appearance_sources(&loaded, &repo);
+        let background = TerminalCapabilities::detect().background;
+        let (theme, theme_diagnostics) = HostTheme::load(&sources, background);
+        diagnostics.extend(theme_diagnostics);
         let access = options
             .bcode_program
             .map_or(BcodeAccess::Installed, |program| BcodeAccess::Running {
@@ -223,8 +237,17 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
                 ),
                 program,
             });
-        Arc::new(StandaloneHost::new(access, theme)) as Arc<dyn ReviewHost>
+        let standalone = Arc::new(StandaloneHost::new(access, theme));
+        appearance = Some(watch_appearance(
+            sources,
+            background,
+            repo.clone(),
+            Arc::clone(&standalone),
+        ));
+        standalone as Arc<dyn ReviewHost>
     };
+    let query_terminal_colors =
+        appearance.is_some() && loaded.theme.variant == VariantPreference::Auto;
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host))
         .with_stack_limit(loaded.stack_limit)
         // Disposable: a review opens from what an earlier run computed and learned, then confirms
@@ -246,7 +269,30 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         open_session: None,
         quit: false,
         diagnostics,
+        appearance,
+        query_terminal_colors,
     })
+}
+
+/// Restyle `host` whenever bcode's theme selection for `repo` changes.
+fn watch_appearance(
+    sources: bcode_tui_theme::appearance::AppearanceSources,
+    background: bmux_tui::capabilities::TerminalBackground,
+    repo: PathBuf,
+    host: Arc<StandaloneHost>,
+) -> AppearanceWatcher {
+    AppearanceWatcher::spawn(
+        sources,
+        background,
+        APPEARANCE_INTERVAL,
+        move || crate::config::appearance_sources(&crate::config::load(&repo), &repo),
+        move |resolution| {
+            let (theme, _) = HostTheme::from_resolution(&resolution);
+            if host.theme() != theme {
+                host.set_theme(theme);
+            }
+        },
+    )
 }
 
 /// Render the current state into plain text rows, without a terminal. Intended for tests and
@@ -435,6 +481,20 @@ async fn session(app: App, target: &WakeTarget) -> Result<App, RunError> {
     let size = terminal_size().map_err(terminal_error)?;
     let presenter = AppPresenter::new(Rect::new(0, 0, size.width, size.height), app.color_depth);
     app.wake_pending.store(false, Ordering::Release);
+    let reporter = app
+        .appearance
+        .as_ref()
+        .map(AppearanceWatcher::background_reporter);
+    if app.query_terminal_colors {
+        // Replies arrive as terminal input; terminals that ignore the query never answer and
+        // nothing waits on them.
+        let mut stdout = std::io::stdout();
+        let _ = std::io::Write::write_all(
+            &mut stdout,
+            bmux_tui::capabilities::TerminalColorReport::QUERY,
+        )
+        .and_then(|()| std::io::Write::flush(&mut stdout));
+    }
     let (runtime, handle) =
         bmux_tui_runtime::Runtime::new(app, presenter, bmux_tui_runtime::RuntimeConfig::default());
     set_target(target, Some(handle.clone()));
@@ -445,6 +505,14 @@ async fn session(app: App, target: &WakeTarget) -> Result<App, RunError> {
         loop {
             match input.recv().await {
                 Some(Ok(Some(event))) => {
+                    if let (Some(reporter), bmux_tui::event::Event::User(tag)) = (&reporter, &event)
+                        && tag == bmux_tui_runtime::TERMINAL_COLORS_EVENT
+                    {
+                        let background = input.terminal_colors().background_appearance();
+                        if background != bmux_tui::capabilities::TerminalBackground::Unknown {
+                            reporter.report(background);
+                        }
+                    }
                     if input_handle.send_terminal(event).await.is_err() {
                         break;
                     }
