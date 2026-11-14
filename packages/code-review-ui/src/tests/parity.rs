@@ -876,6 +876,7 @@ fn motions_reach_open_threads_answers_and_attention_and_answers_reconnect() {
     stopped
         .try_send(SessionViewFollowUpdate::Disconnected {
             message: "daemon went away".to_owned(),
+            code: None,
         })
         .unwrap();
     let screen = stable(&mut setup.scenario);

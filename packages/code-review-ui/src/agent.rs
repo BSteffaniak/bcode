@@ -860,6 +860,26 @@ impl AgentState {
     }
 }
 
+/// What a card says when following its session stopped: what happened and what to do, by the
+/// daemon's code; the daemon's own message only when there is nothing better to say.
+#[must_use]
+pub fn follow_failure(code: Option<&str>, message: &str) -> String {
+    match code {
+        Some("session_active_elsewhere") => "Another Bcode (an older build's daemon) has this \
+             session open. Quit it, then Retry."
+            .to_owned(),
+        Some("session_migration_failed") => format!(
+            "This session was written by an older Bcode and could not be brought forward. \
+             Open it in Bcode to see why. ({message})"
+        ),
+        Some("session_not_found") => "This answer's session no longer exists.".to_owned(),
+        Some("projection_stale" | "session_unavailable") => {
+            "Bcode could not read this session right now. Retry in a moment.".to_owned()
+        }
+        _ => format!("Lost the connection to Bcode: {message}"),
+    }
+}
+
 const fn projection() -> ProjectionWindowRequest {
     ProjectionWindowRequest {
         projection: SessionProjectionKind::Transcript,
@@ -1080,10 +1100,13 @@ impl AgentStreams {
                     Ok(SessionViewFollowUpdate::Snapshot(snapshot)) => {
                         latest = Some(AgentState::from_snapshot(&snapshot));
                     }
-                    Ok(SessionViewFollowUpdate::Disconnected { message }) => {
+                    Ok(SessionViewFollowUpdate::Disconnected { message, code }) => {
                         stopped.push(session.clone());
                         let last = latest.as_ref().or_else(|| self.states.get(session));
-                        latest = Some(AgentState::stopped_following(last, message));
+                        latest = Some(AgentState::stopped_following(
+                            last,
+                            follow_failure(code.as_deref(), &message),
+                        ));
                         break;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,

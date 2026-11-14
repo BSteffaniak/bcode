@@ -70,6 +70,9 @@ pub enum SessionViewFollowUpdate {
     Disconnected {
         /// Human-readable failure message.
         message: String,
+        /// The daemon's stable error code, when the daemon answered with one (for example
+        /// `session_active_elsewhere`), so a client can say what to do instead of the message.
+        code: Option<String>,
     },
 }
 
@@ -105,9 +108,14 @@ pub async fn follow_session_view(
     sink: &mut impl SessionViewSink,
 ) {
     if let Err(error) = Box::pin(follow_attached(&client, &follow, sink)).await {
+        let code = match &error {
+            ClientError::Server { code, .. } => Some(code.clone()),
+            _ => None,
+        };
         let _ = sink
             .deliver(SessionViewFollowUpdate::Disconnected {
                 message: error.to_string(),
+                code,
             })
             .await;
     }
@@ -202,7 +210,43 @@ async fn follow_attached(
 
 /// Attach to the session and build its view from the projection window, submissions, pending
 /// permissions, runtime work, and pending interactions.
+/// Daemon codes for a session whose stored history an older Bcode wrote: opening it (preparing it)
+/// migrates it forward, as any client opening it does.
+const MIGRATION_REQUIRED: [&str; 2] = [
+    "session_migration_required",
+    "session_storage_migration_required",
+];
+
+/// Attach to the followed session. A session written by an older Bcode is prepared (migrated
+/// forward) first, then attached, instead of failing: following is opening it.
 async fn attach(
+    client: &BcodeClient,
+    connection: &mut ClientConnection,
+    follow: &SessionViewFollow,
+) -> Result<SessionView, ClientError> {
+    match attach_once(client, connection, follow).await {
+        Err(ClientError::Server { code, .. }) if MIGRATION_REQUIRED.contains(&code.as_str()) => {
+            let prepared = connection
+                .prepare_session_open_until_terminal(follow.session_id, |_| {})
+                .await?;
+            match prepared.outcome {
+                Some(
+                    bcode_session_models::SessionOpenTerminalOutcome::Ready
+                    | bcode_session_models::SessionOpenTerminalOutcome::DegradedReadOnly { .. },
+                ) => attach_once(client, connection, follow).await,
+                outcome => Err(ClientError::Server {
+                    code: "session_migration_failed".to_owned(),
+                    message: format!(
+                        "the session could not be migrated to this Bcode: {outcome:?}"
+                    ),
+                }),
+            }
+        }
+        other => other,
+    }
+}
+
+async fn attach_once(
     client: &BcodeClient,
     connection: &mut ClientConnection,
     follow: &SessionViewFollow,

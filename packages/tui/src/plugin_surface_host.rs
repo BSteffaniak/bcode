@@ -968,7 +968,7 @@ impl bcode_session_view::follow::SessionViewSink for PluginSessionViewSink {
             SessionViewFollowUpdate::Snapshot(snapshot) => {
                 PluginSessionViewUpdate::Snapshot(snapshot)
             }
-            SessionViewFollowUpdate::Disconnected { message } => {
+            SessionViewFollowUpdate::Disconnected { message, .. } => {
                 PluginSessionViewUpdate::Disconnected { message }
             }
         };

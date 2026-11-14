@@ -35,6 +35,11 @@ pub const REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY: &str = "unsupported_reposi
 pub const REVIEW_SOURCE_ERROR_UNAUTHENTICATED: &str = "unauthenticated";
 /// Error code: the requested pull request is not open in the repository.
 pub const REVIEW_SOURCE_ERROR_PULL_NOT_FOUND: &str = "pull_not_found";
+/// Error code: the requested pull request exists but was closed or merged.
+///
+/// Its message says which. A stack layer closed by a restack reports this, not
+/// [`REVIEW_SOURCE_ERROR_PULL_NOT_FOUND`].
+pub const REVIEW_SOURCE_ERROR_PULL_CLOSED: &str = "pull_closed";
 /// Error code: fetching the pull request's commits failed.
 pub const REVIEW_SOURCE_ERROR_FETCH_FAILED: &str = "fetch_failed";
 /// Error code: the provider could not be reached or answered with an error.
@@ -43,6 +48,12 @@ pub const REVIEW_SOURCE_ERROR_FAILED: &str = "provider_failed";
 pub const REVIEW_SOURCE_ERROR_CANCELLED: &str = "cancelled";
 /// Diagnostic code: the provider failed while the client gathered a source's resolution.
 pub const REVIEW_DIAGNOSTIC_PROVIDER_FAILED: &str = "provider_failed";
+/// Diagnostic code: the source's pull request was closed, merged, or no longer exists.
+///
+/// The provider answered [`REVIEW_SOURCE_ERROR_PULL_CLOSED`] or
+/// [`REVIEW_SOURCE_ERROR_PULL_NOT_FOUND`]. For a stack layer, the stack changed since the review
+/// was saved.
+pub const REVIEW_DIAGNOSTIC_PULL_GONE: &str = "pull_gone";
 
 /// Layer limit of a stack when the configuration sets none.
 pub const DEFAULT_REVIEW_STACK_MAX_LAYERS: usize = 64;

@@ -1078,3 +1078,46 @@ fn files_several_layers_change_are_listed_and_each_jumps_to_its_layer() {
         screen.text()
     );
 }
+
+#[test]
+fn a_step_through_review_follows_its_stack_when_layers_were_closed() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    // Saved before a restack: #999 has since been closed; the stack is now #100 to #103.
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Step through",
+        vec![layer(101), layer(999), layer(102)],
+    );
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    // The notice comes once the stack is known and the review opened again with its layers.
+    let mut screen = settled(&mut scenario);
+    for _ in 0..3 {
+        if screen.contains("The stack changed") {
+            break;
+        }
+        screen = settled(&mut scenario);
+    }
+    // One notice of what changed, no failure.
+    assert!(screen.contains("The stack changed"), "{}", screen.text());
+    assert!(
+        screen.contains("#999 closed or merged"),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.contains("could not be opened"), "{}", screen.text());
+    assert!(!screen.contains("source-"), "{}", screen.text());
+    // The review now has the stack's layers, in its order, and keeps the ones it had.
+    let numbers: Vec<u64> = stored(&backend, &fixture, &workspace.id)
+        .sources
+        .iter()
+        .filter_map(|source| match source.kind {
+            ReviewSourceKind::StackLayer { number, .. } => Some(number),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, [100, 101, 102, 103]);
+    let kept = stored(&backend, &fixture, &workspace.id);
+    assert_eq!(kept.sources[1].id, "source-1");
+}

@@ -209,6 +209,16 @@ fn resolve_source(
                         kind.label()
                     ),
                 },
+                Some(ReviewSourceProviderOutcome::Failed { code, message })
+                    if code == bcode_code_review_models::REVIEW_SOURCE_ERROR_PULL_CLOSED
+                        || code == bcode_code_review_models::REVIEW_SOURCE_ERROR_PULL_NOT_FOUND =>
+                {
+                    Resolution::Diagnostic {
+                        severity: ReviewSourceDiagnosticSeverity::Warning,
+                        code: bcode_code_review_models::REVIEW_DIAGNOSTIC_PULL_GONE,
+                        message: format!("{}: {message}", kind.label()),
+                    }
+                }
                 Some(ReviewSourceProviderOutcome::Failed { code, message }) => {
                     Resolution::Diagnostic {
                         severity: ReviewSourceDiagnosticSeverity::Error,

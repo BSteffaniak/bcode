@@ -387,13 +387,17 @@ fn a_stopped_stream_keeps_the_answer_and_drops_the_prompt() {
         .expect("subscribed")
         .try_send(SessionViewFollowUpdate::Disconnected {
             message: "daemon went away".to_owned(),
+            code: None,
         })
         .expect("delivered");
     let screen = stable(&mut setup.scenario);
     let text = screen.text();
     assert!(screen.contains("stream stopped"), "{text}");
     assert!(screen.contains("Callers expect the new name."), "{text}");
-    assert!(screen.contains("⚠ daemon went away"), "{text}");
+    assert!(
+        screen.contains("⚠ Lost the connection to Bcode: daemon went away"),
+        "{text}"
+    );
     // The request can no longer be answered here, so its keys are the review's again.
     assert!(!screen.contains("Allow y"), "{text}");
     setup.scenario.key("y");
@@ -482,5 +486,17 @@ fn an_answer_is_a_card_like_a_thread_viewed_folds_it_and_the_header_finds_it() {
         matches!(cursor(&setup.scenario), ItemKey::AgentThread { .. }),
         "{:?}",
         cursor(&setup.scenario)
+    );
+}
+
+#[test]
+fn a_session_held_by_another_daemon_says_what_to_do() {
+    assert_eq!(
+        crate::agent::follow_failure(Some("session_active_elsewhere"), "owned elsewhere"),
+        "Another Bcode (an older build's daemon) has this session open. Quit it, then Retry."
+    );
+    assert!(
+        crate::agent::follow_failure(None, "connection refused")
+            .starts_with("Lost the connection to Bcode")
     );
 }

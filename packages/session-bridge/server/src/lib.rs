@@ -823,7 +823,7 @@ impl Bridge {
         task.abort();
         match first {
             Some(SessionViewFollowUpdate::Snapshot(snapshot)) => Ok(*snapshot),
-            Some(SessionViewFollowUpdate::Disconnected { message }) => {
+            Some(SessionViewFollowUpdate::Disconnected { message, .. }) => {
                 Err(error("session_unavailable", &message))
             }
             None => Err(error("session_unavailable", "the session view ended")),
@@ -912,7 +912,7 @@ async fn emit_observations(
                     .await;
                 sequence += 1;
             }
-            Some(SessionViewFollowUpdate::Disconnected { message }) => return message,
+            Some(SessionViewFollowUpdate::Disconnected { message, .. }) => return message,
             None => {}
         }
         drop(bridge);

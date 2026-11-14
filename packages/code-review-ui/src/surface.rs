@@ -158,6 +158,7 @@ mod find;
 mod flows;
 mod history;
 mod pointer;
+mod reconcile;
 mod stack;
 mod stack_files;
 mod threads;
@@ -744,6 +745,11 @@ pub struct ReviewSurface {
     failed_sources: BTreeSet<String>,
     /// The stack this review last saw (and its provider), for its history.
     stack_news: Option<bcode_code_review::session::StackNews>,
+    /// Stack layers whose pull requests left the stack, held until the stack is known (see
+    /// `reconcile`).
+    gone_layers: std::collections::BTreeSet<String>,
+    /// The review's sources changed: open it again once the host is at hand.
+    reopen_pending: bool,
     /// The stack's history, once read.
     stack_history: Option<bcode_code_review_models::StackTimeline>,
     /// The review's pull request conversations and their bar.
@@ -872,6 +878,8 @@ impl ReviewSurface {
             stack_confirmed_at: None,
             failed_sources: BTreeSet::new(),
             stack_news: None,
+            gone_layers: std::collections::BTreeSet::new(),
+            reopen_pending: false,
             stack_history: None,
             talk: conversation::ConversationUi::default(),
             opening: OpenInFlight::default(),
@@ -2101,6 +2109,7 @@ impl ReviewSurface {
 
     fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
+        let opened_complete = opened.complete;
         let was_filling = std::mem::replace(&mut self.filling, !opened.complete);
         let (first_open, deepest_stack) = (self.review.is_none(), deepest_stack(&opened));
         self.refreshing = false;
@@ -2160,16 +2169,7 @@ impl ReviewSurface {
         if self.since_last.is_none() {
             self.pass_revisions.clone_from(&review.revisions);
         }
-        if !review.diagnostics.is_empty() {
-            let body = review
-                .diagnostics
-                .iter()
-                .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            self.toasts
-                .push(ToastSeverity::Warning, "Some sources failed", Some(body));
-        }
+        self.note_failed_sources(&review.diagnostics, opened_complete);
         if first_open {
             self.warn_about_stack_size(deepest_stack);
         }
@@ -2245,6 +2245,7 @@ impl ReviewSurface {
     fn apply_stack_news(&mut self, news: bcode_code_review::session::StackNews) {
         self.stack_confirmed_at = Some(news.confirmed_at);
         self.stack_news = Some(news.clone());
+        self.reconcile_stack();
         let confirmed_at_ms = news
             .confirmed_at
             .duration_since(std::time::UNIX_EPOCH)
@@ -2279,14 +2280,55 @@ impl ReviewSurface {
         self.request_save();
     }
 
+    /// Say which sources failed to open, by their labels, except stack layers that left the stack
+    /// (held for reconciling). Once the review is `complete`, layers that left with no stack to
+    /// match them to are named.
+    fn note_failed_sources(&mut self, diagnostics: &[ReviewSourceDiagnostic], complete: bool) {
+        let shown: Vec<&ReviewSourceDiagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| !self.hold_gone_layer(diagnostic))
+            .collect();
+        if !shown.is_empty() {
+            let body = shown
+                .iter()
+                .map(|diagnostic| {
+                    format!(
+                        "{}: {}",
+                        self.source_label(&diagnostic.source_id),
+                        diagnostic.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.toasts
+                .push(ToastSeverity::Warning, "Some sources failed", Some(body));
+        }
+        if complete {
+            self.report_gone_layers();
+        }
+    }
+
+    /// A source's label (what the review calls it), else its id.
+    fn source_label(&self, source_id: &str) -> String {
+        self.sources
+            .iter()
+            .find(|source| source.id == source_id)
+            .map_or_else(|| source_id.to_owned(), |source| source.label.clone())
+    }
+
     /// A source that failed after the first frame: its group stops loading and the layer strip
     /// and rail say it failed.
     fn apply_source_failed(&mut self, diagnostic: ReviewSourceDiagnostic) {
-        self.toasts.push(
-            ToastSeverity::Warning,
-            format!("{} could not be opened", diagnostic.source_id),
-            Some(format!("{}: {}", diagnostic.code, diagnostic.message)),
-        );
+        if !self.hold_gone_layer(&diagnostic) {
+            self.toasts.push(
+                ToastSeverity::Warning,
+                format!(
+                    "{} could not be opened",
+                    self.source_label(&diagnostic.source_id)
+                ),
+                Some(diagnostic.message.clone()),
+            );
+        }
         self.failed_sources.insert(diagnostic.source_id.clone());
         let Some(review) = self.review.as_mut() else {
             return;
@@ -5142,6 +5184,11 @@ impl View for ReviewSurface {
         }
         if let Some(action) = self.pending_action.take() {
             return action;
+        }
+        if self.reopen_pending && self.review.is_some() && self.closing.is_none() {
+            self.reopen_pending = false;
+            self.reopen(host);
+            changed = true;
         }
         if let Some(started) = self.closing {
             self.pump_notes(host);

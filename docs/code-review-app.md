@@ -150,6 +150,10 @@ The card:
   only when the request can be remembered). While the turn runs, `esc` or `ctrl+c` stops it.
   These keys apply only on such a card; elsewhere the same keys keep their review meaning.
 * `o` opens the session in Bcode (`Open in Bcode`).
+* A session written by an older Bcode is brought forward when the card follows it (as opening it
+  in Bcode does), so a card never fails for that alone. When a card cannot follow its session,
+  it says why and what to do: another Bcode (an older build's daemon) has the session open, the
+  session no longer exists, or the connection to Bcode was lost. **Retry** follows it again.
 * When a card needs the reviewer while it is off screen (a permission request, an answer, a
   failure), a toast names its location; the scrollbar marks every card.
 
@@ -310,6 +314,14 @@ starts with its banner, the file panel groups files under one row per pull reque
 the current one open, and a strip under the rail names the pull request the cursor is in. The
 choice is kept with the review. A whole-stack review (one source for the entire stack) is one
 diff labeled by layer and is not affected.
+
+**When the stack changes.** A step-through review saves one source per layer. After a restack,
+layers whose pull requests were closed or merged are not errors: once the stack is read again
+(from a layer still open), the review's layers are matched to it. Layers that left are removed
+and new layers are added in stack order (existing ones keep their position, comments and
+viewed state), the review is saved and opened again, and one notice says what changed ("The
+stack changed: #1 closed or merged (removed); #3 added"). If no layer is left to read the stack
+from, one notice names the closed layers. Failures name sources by their labels.
 
 ### Pull request conversations
 

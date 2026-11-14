@@ -60,6 +60,9 @@ pub enum ReviewSourceError {
     /// The pull request is not open in the repository.
     #[error("pull request #{0} is not open in {1}")]
     PullNotFound(u64, String),
+    /// The pull request exists but was merged (`true`) or closed without merging.
+    #[error("pull request #{0} in {1} was {state}", state = if *.2 { "merged" } else { "closed" })]
+    PullClosed(u64, String, bool),
     /// `git fetch` or reading the fetched references failed.
     #[error("fetch failed: {0}")]
     Fetch(String),
@@ -89,6 +92,7 @@ impl ReviewSourceError {
             Self::UnsupportedRepository(_) => REVIEW_SOURCE_ERROR_UNSUPPORTED_REPOSITORY,
             Self::Unauthenticated(_) => REVIEW_SOURCE_ERROR_UNAUTHENTICATED,
             Self::PullNotFound(..) => REVIEW_SOURCE_ERROR_PULL_NOT_FOUND,
+            Self::PullClosed(..) => bcode_code_review_models::REVIEW_SOURCE_ERROR_PULL_CLOSED,
             Self::Fetch(_) => REVIEW_SOURCE_ERROR_FETCH_FAILED,
             Self::Failed(_) => REVIEW_SOURCE_ERROR_FAILED,
             Self::Cancelled => bcode_code_review_models::REVIEW_SOURCE_ERROR_CANCELLED,
@@ -732,6 +736,23 @@ fn lookup_pulls(
 
 /// Open pull requests whose head branch lives in the repository itself. A fork's head branch
 /// names a branch in another repository, so it cannot be a stack layer's base.
+/// Why pull request `number` cannot start a stack: closed or merged when GitHub knows it (`pull`),
+/// else not found.
+fn closed_or_missing(
+    repository: &Repository,
+    pull: Option<&PullRequest>,
+    number: u64,
+) -> ReviewSourceError {
+    match pull.map(|pull| pull.state) {
+        Some(state) if !state.is_open() => ReviewSourceError::PullClosed(
+            number,
+            repository.display(),
+            state == bcode_forge::models::PullRequestState::Merged,
+        ),
+        _ => ReviewSourceError::PullNotFound(number, repository.display()),
+    }
+}
+
 fn stack_candidates(repository: &Repository, pulls: &[PullRequest]) -> Vec<PullRequestSummary> {
     let full_name = repository.0.full_name();
     pulls
@@ -787,7 +808,7 @@ fn resolve_stack(
     let lookup = lookup?;
     let start = stack_candidates(repository, lookup.pull_request.as_slice())
         .pop()
-        .ok_or_else(|| ReviewSourceError::PullNotFound(number, repository.display()))?;
+        .ok_or_else(|| closed_or_missing(repository, lookup.pull_request.as_ref(), number))?;
     let default_branch = default_branch(repository, lookup.default_branch.as_deref());
     let default_branch = default_branch.as_deref();
     let known: BTreeMap<String, BranchNeighbors> = prefetched

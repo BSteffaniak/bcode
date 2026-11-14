@@ -149,7 +149,14 @@ enum Request {
 struct Worker {
     requests: mpsc::Sender<Request>,
     thread: std::thread::JoinHandle<()>,
+    /// Signalled when the worker has written what it held and closed the database.
+    finished: mpsc::Receiver<()>,
 }
+
+/// Longest a dropped cache waits for its last writes. The entries are disposable and the database
+/// survives being left mid-write (an unreadable file is rebuilt on open), so a slow disk never holds
+/// the program open past this.
+const CLOSE_BUDGET: Duration = Duration::from_millis(250);
 
 /// The on-disk cache (see the module docs). Share it behind an `Arc`; reads block briefly.
 #[derive(Debug, Default)]
@@ -250,14 +257,39 @@ impl ReviewCache {
     }
 }
 
-impl Drop for ReviewCache {
-    /// Finish the writes sent so far before the database closes.
-    fn drop(&mut self) {
+impl ReviewCache {
+    /// Write what is held and close, waiting as long as that takes.
+    pub fn close(self) {
+        self.finish(None);
+    }
+
+    /// Let the worker write what it holds and close the database, waiting at most `budget`
+    /// (as long as it takes when `None`); a worker still busy after that is left to finish on
+    /// its own, or be stopped by the process exiting.
+    fn finish(&self, budget: Option<Duration>) {
         let worker = self.lock().take();
-        if let Some(Worker { requests, thread }) = worker {
+        if let Some(Worker {
+            requests,
+            thread,
+            finished,
+        }) = worker
+        {
             drop(requests);
-            let _ = thread.join();
+            let done = budget.map_or_else(
+                || finished.recv().is_ok(),
+                |budget| finished.recv_timeout(budget).is_ok(),
+            );
+            if done {
+                let _ = thread.join();
+            }
         }
+    }
+}
+
+impl Drop for ReviewCache {
+    /// Close, waiting at most [`CLOSE_BUDGET`] for the last writes.
+    fn drop(&mut self) {
+        self.finish(Some(CLOSE_BUDGET));
     }
 }
 
@@ -271,6 +303,7 @@ fn start(path: &Path) -> Option<Worker> {
     let path = path.to_path_buf();
     let (ready, opened) = mpsc::channel();
     let (requests, incoming) = mpsc::channel::<Request>();
+    let (finish, finished) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("review-cache".to_owned())
         .spawn(move || {
@@ -287,10 +320,16 @@ fn start(path: &Path) -> Option<Worker> {
             };
             let _ = ready.send(true);
             runtime.block_on(serve(database.as_ref(), incoming));
+            drop(database);
+            let _ = finish.send(());
         })
         .ok()?;
     if opened.recv().unwrap_or(false) {
-        Some(Worker { requests, thread })
+        Some(Worker {
+            requests,
+            thread,
+            finished,
+        })
     } else {
         let _ = thread.join();
         None
@@ -353,6 +392,10 @@ async fn open_database(path: &Path) -> Result<Box<dyn Database>, String> {
             .execute(database.as_ref())
             .await
             .map_err(|error| error.to_string())?;
+        // Kept to size here, off the way out (closing writes only what is held).
+        trim(database.as_ref(), kind, kind.max_entries())
+            .await
+            .map_err(|error| error.to_string())?;
     }
     Ok(database)
 }
@@ -388,7 +431,8 @@ fn id(kind: CacheKind, key: &str) -> String {
 type Held = std::collections::VecDeque<(CacheKind, String, String)>;
 
 /// Answer `incoming` until every sender is gone, then write what is held. Once every held write
-/// is written, the kinds written to are trimmed to their size.
+/// is written in a quiet moment, the kinds written to are trimmed to their size; closing only
+/// writes (the next open trims).
 async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
     let mut held = Held::new();
     let mut grown = std::collections::BTreeSet::new();
@@ -418,9 +462,6 @@ async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = put(database, held.into_iter().collect()).await;
-                for kind in grown {
-                    let _ = trim(database, kind, kind.max_entries()).await;
-                }
                 return;
             }
         }
@@ -654,8 +695,9 @@ mod tests {
             cache.put_many(CacheKind::Stack, &entries[100..]);
             // Another kind is not trimmed by this one's size.
             cache.put_many(CacheKind::Pull, &[("p".into(), "p".into())]);
+            // Closing writes what is held; opening trims what grew past its size.
+            cache.close();
         }
-        // Closing writes what is held and trims what grew.
         let cache = ReviewCache::open(&path);
         let kept = cache.get_prefixed(CacheKind::Stack, "");
         assert_eq!(kept.len(), max * 9 / 10);
@@ -676,5 +718,28 @@ mod tests {
         assert_eq!(cache.get_many(CacheKind::Index, &keys).len(), 1_000);
         // Kinds do not see each other's entries.
         assert_eq!(cache.get_many(CacheKind::Pull, &keys).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_busy_cache_does_not_wait_for_its_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = ReviewCache::open(&dir.path().join("cache.db"));
+        // Enough held writes that writing them takes well past the close budget.
+        let entries: Vec<(String, String)> = (0..20_000)
+            .map(|index| (format!("{index:06}"), "x".repeat(200)))
+            .collect();
+        cache.put_many(CacheKind::Hunks, &entries);
+        let started = std::time::Instant::now();
+        drop(cache);
+        assert!(
+            started.elapsed() < CLOSE_BUDGET + Duration::from_millis(250),
+            "dropping waited {:?}",
+            started.elapsed()
+        );
     }
 }

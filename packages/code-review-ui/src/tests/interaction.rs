@@ -1027,6 +1027,7 @@ fn asking_bcode_stays_in_the_review_and_opening_the_session_restores_position() 
     sender
         .try_send(SessionViewFollowUpdate::Disconnected {
             message: "daemon went away".to_owned(),
+            code: None,
         })
         .unwrap();
     let screen = stable(&mut setup.scenario);
