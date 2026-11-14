@@ -219,6 +219,19 @@ impl Comparing {
         before.is_some_and(|before| before != self.snapshot())
     }
 
+    /// The banner as the menu opened on it, when the menu opened comparing with what the
+    /// reviewer last looked at (picking that again in the menu brings the banner back).
+    fn preview_banner(&self) -> Option<BannerState> {
+        self.snapshot
+            .as_ref()
+            .filter(|before| {
+                before.baseline == Baseline::LastLooked
+                    && before.picks.is_empty()
+                    && before.stack_at.is_none()
+            })
+            .map(|before| before.banner)
+    }
+
     /// The menu closed putting back what it opened on: returns that choice.
     pub(super) const fn take_snapshot(&mut self) -> Option<CompareSnapshot> {
         self.snapshot.take()
@@ -1269,7 +1282,11 @@ impl ReviewSurface {
         self.comparing.timeline = None;
         self.comparing.ago = ago;
         self.comparing.stack_at = None;
-        if baseline != Baseline::LastLooked {
+        if baseline == Baseline::LastLooked {
+            if let Some(banner) = self.comparing.preview_banner() {
+                self.comparing.banner = banner;
+            }
+        } else {
             self.comparing.banner = BannerState::Hidden;
         }
         if baseline != Baseline::Off && self.stack_history.is_none() {

@@ -1254,6 +1254,42 @@ fn a_time_picked_in_the_menu_reopens_marked_as_that_time() {
 }
 
 #[test]
+fn previewing_away_and_back_keeps_the_banner_and_saves_nothing() {
+    use crate::compare_menu::MenuChoice;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let review = scenario.surface().review().expect("review");
+    assert!(review.comparing().banner_shown());
+    let before = review.presentation().compare;
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::PreviousPush);
+    scenario.key("space");
+    settled(&mut scenario);
+    assert!(
+        !scenario
+            .surface()
+            .review()
+            .unwrap()
+            .comparing()
+            .banner_shown()
+    );
+    menu_to(&mut scenario, MenuChoice::LastLooked);
+    scenario.key("space");
+    settled(&mut scenario);
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_none());
+    assert!(review.comparing().banner_shown());
+    assert!(
+        screen.contains("Changed since you looked"),
+        "{}",
+        screen.text()
+    );
+    assert_eq!(review.presentation().compare, before);
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
