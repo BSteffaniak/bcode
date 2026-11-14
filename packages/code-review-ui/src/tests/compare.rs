@@ -600,3 +600,45 @@ fn clicking_a_summary_rows_view_button_switches_the_whole_screen() {
         Some(CompareView::Full)
     );
 }
+
+#[test]
+fn a_files_versions_step_with_alt_comma_and_alt_period() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(&backend, &fixture, "Step keys", vec![layer(101)]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+m");
+    scenario.key("q");
+    settled(&mut scenario);
+    for path in ["second.txt", "third.txt"] {
+        push_to(&fixture, STACK_BRANCHES[0], path);
+        let mut scenario = resume(&fixture, &backend, &workspace.id);
+        settled(&mut scenario);
+        scenario.key("q");
+        settled(&mut scenario);
+    }
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let doc = document(&scenario);
+    let second = FileKey::new(source_of(doc, 101), None, "second.txt");
+    let index = doc
+        .index_of(&bcode_code_review::document::ItemKey::FileHeader(Arc::new(
+            second.clone(),
+        )))
+        .expect("the file's header");
+    // Put the cursor on the file's header by clicking it.
+    let screen = settled(&mut scenario);
+    let row = (0..screen.height())
+        .find(|y| screen.row_text(*y).contains("second.txt"))
+        .unwrap_or_else(|| panic!("the header shows ({index}): {}", screen.text()));
+    let x = screen.column_of(row, "second.txt").expect("column");
+    scenario.click(x, row);
+    settled(&mut scenario);
+    scenario.key("alt+,");
+    settled(&mut scenario);
+    assert!(document(&scenario).file_override(&second).is_some());
+    scenario.key("alt+.");
+    settled(&mut scenario);
+    assert!(document(&scenario).file_override(&second).is_none());
+}

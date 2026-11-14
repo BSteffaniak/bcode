@@ -197,9 +197,11 @@ keymap_actions = [
     { id = "bcode.code_review.compare_push", scope = "code-review", description = "Compare pushes of the stack…", defaults = [
     ] },
     { id = "bcode.code_review.file_version_previous", scope = "code-review", description = "This file's previous version (in a comparison)", defaults = [
+        "alt+,",
         "alt+[",
     ] },
     { id = "bcode.code_review.file_version_next", scope = "code-review", description = "This file's next version (in a comparison)", defaults = [
+        "alt+.",
         "alt+]",
     ] },
     { id = "bcode.code_review.complete_pass", scope = "code-review", description = "Mark the review pass complete", defaults = [
