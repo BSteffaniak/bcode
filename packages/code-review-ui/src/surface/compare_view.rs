@@ -474,6 +474,18 @@ impl ReviewSurface {
                 self.sync_compare_menu();
                 Action::Redraw
             }
+            CompareMenuOutcome::ApplyAndClose(choice) if choice.opens_picker() => {
+                // What the menu previewed stays pending until that picker compares (kept) or
+                // is cancelled (put back).
+                self.modal = None;
+                self.apply_menu_choice(choice, host);
+                let opened = self.comparing.timeline.is_some()
+                    || matches!(self.modal, Some(Modal::Versions(_)));
+                if !opened {
+                    self.keep_previewed();
+                }
+                Action::Redraw
+            }
             CompareMenuOutcome::ApplyAndClose(choice) => {
                 self.close_compare_menu();
                 if choice != self.current_menu_choice() || choice.opens_picker() {
@@ -508,6 +520,11 @@ impl ReviewSurface {
     /// on).
     fn close_compare_menu(&mut self) {
         self.modal = None;
+        self.keep_previewed();
+    }
+
+    /// Keep what the menu previewed (saved when it differs from what it opened on).
+    fn keep_previewed(&mut self) {
         if self.comparing.end_preview() {
             self.persist_compare_choice();
         }
@@ -571,11 +588,15 @@ impl ReviewSurface {
                 let to = focus.to.unwrap_or(len);
                 self.comparing.timeline = None;
                 self.compare_columns(from, to, host);
+                // Opened from the menu: what it previewed is kept with the pushes compared.
+                self.keep_previewed();
                 return Some(Action::Redraw);
             }
             KeyCode::Escape | KeyCode::Char('q') => {
                 self.comparing.timeline = None;
                 self.status = None;
+                // Opened from the menu: what it previewed is put back too.
+                self.put_back_compare(host);
                 return Some(Action::Redraw);
             }
             _ => return Some(Action::None),
@@ -660,6 +681,8 @@ impl ReviewSurface {
         match outcome {
             MenuOutcome::Close => {
                 self.modal = None;
+                // Opened from the comparison menu: what it previewed is put back too.
+                self.put_back_compare(host);
                 Action::Redraw
             }
             MenuOutcome::Redraw => Action::Redraw,
@@ -667,6 +690,7 @@ impl ReviewSurface {
             MenuOutcome::Chose(pick) => {
                 self.modal = None;
                 self.pick_versions(number, pick.from, pick.to, host);
+                self.keep_previewed();
                 Action::Redraw
             }
         }

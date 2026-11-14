@@ -1498,6 +1498,7 @@ impl ReviewSurface {
                 return;
             }
             self.comparing.snapshot = None;
+            self.comparing.files_shown = None;
         }
         let (baseline, only_changed) = (self.comparing.baseline, self.comparing.only_changed);
         let ago = self.comparing.ago;

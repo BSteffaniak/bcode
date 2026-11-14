@@ -1366,6 +1366,77 @@ fn escape_puts_back_which_layers_show_their_hidden_files() {
 }
 
 #[test]
+fn cancelling_a_picker_opened_from_the_menu_puts_back_its_previews() {
+    use crate::compare_menu::MenuChoice;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let saved = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .expect("review")
+            .presentation()
+            .compare
+    };
+    let before = saved(&scenario);
+    let only_changed = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .expect("review")
+            .comparing()
+            .only_changed()
+    };
+    // The push timeline, left with esc: the preview before it is put back, nothing saved.
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::OnlyChanged);
+    scenario.key("space");
+    settled(&mut scenario);
+    assert!(only_changed(&scenario));
+    menu_to(&mut scenario, MenuChoice::Push);
+    scenario.key("space");
+    settled(&mut scenario);
+    assert!(scenario.surface().review().unwrap().modal().is_none());
+    scenario.key("escape");
+    settled(&mut scenario);
+    assert!(!only_changed(&scenario));
+    assert_eq!(saved(&scenario), before);
+
+    // The version picker, closed with esc: the same.
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::OnlyChanged);
+    scenario.key("space");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Version);
+    scenario.key("space");
+    settled(&mut scenario);
+    assert!(matches!(
+        scenario.surface().review().unwrap().modal(),
+        Some(crate::surface::Modal::Versions(_))
+    ));
+    scenario.key("escape");
+    settled(&mut scenario);
+    assert!(scenario.surface().review().unwrap().modal().is_none());
+    assert!(!only_changed(&scenario));
+    assert_eq!(saved(&scenario), before);
+
+    // The push timeline, compared with enter: the preview is kept and saved.
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::OnlyChanged);
+    scenario.key("space");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Push);
+    scenario.key("space");
+    settled(&mut scenario);
+    scenario.key("enter");
+    settled(&mut scenario);
+    assert!(only_changed(&scenario));
+    assert!(saved(&scenario).only_changed);
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
