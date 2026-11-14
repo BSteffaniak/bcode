@@ -623,6 +623,9 @@ pub struct ReviewDocument {
     pub(super) compare_files_shown: BTreeSet<String>,
     /// Removed-since markers whose text shows, by file and new-side line.
     pub(super) expanded_removals: BTreeSet<(FileKey, u32)>,
+    /// Sources left out of the document (pull requests without real changes, when only those
+    /// are shown).
+    pub(super) filtered: BTreeSet<String>,
 }
 
 /// Viewport, protected, and prefetch block ranges (inclusive).
@@ -685,6 +688,7 @@ impl ReviewDocument {
             comparisons: BTreeMap::new(),
             compare_files_shown: BTreeSet::new(),
             expanded_removals: BTreeSet::new(),
+            filtered: BTreeSet::new(),
         };
         for input in sources {
             doc.add_source(input, show_headers);
@@ -2239,7 +2243,41 @@ impl ReviewDocument {
 
     /// Whether file `file` (an index into the files) is in a hidden group.
     pub(super) fn file_hidden(&self, file: usize) -> bool {
-        self.groups[self.files[file].group].hidden || self.compare_hidden(file)
+        self.group_hidden(self.files[file].group) || self.compare_hidden(file)
+    }
+
+    /// Whether group `group` contributes no items: focused away, or filtered out.
+    pub(super) fn group_hidden(&self, group: usize) -> bool {
+        self.groups[group].hidden || self.filtered.contains(&self.groups[group].source.source_id)
+    }
+
+    /// Leave the groups of `sources` out of the document (their files keep their state), and
+    /// show every other group again. Returns whether anything changed.
+    pub fn set_filtered_sources(&mut self, sources: BTreeSet<String>) -> bool {
+        if self.filtered == sources {
+            return false;
+        }
+        let before = std::mem::replace(&mut self.filtered, sources);
+        let changed: Vec<usize> = (0..self.groups.len())
+            .filter(|group| {
+                let source = &self.groups[*group].source.source_id;
+                before.contains(source) != self.filtered.contains(source)
+            })
+            .collect();
+        for group in changed {
+            let header = self.groups[group].header_block;
+            self.rebuild_block(header);
+            for file in self.groups[group].files.clone() {
+                self.rebuild_file(file);
+            }
+        }
+        true
+    }
+
+    /// Whether source `source_id` is left out of the document.
+    #[must_use]
+    pub fn source_filtered(&self, source_id: &str) -> bool {
+        self.filtered.contains(source_id)
     }
 
     /// Files of group `index` (see [`GroupInfo::index`]), in document order.

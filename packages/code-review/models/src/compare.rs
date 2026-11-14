@@ -27,6 +27,48 @@ pub const MAX_LOOK_HEADS_PER_PULL: usize = 32;
 /// Most layers one [`ReviewCompareLayersRequest`] compares.
 pub const REVIEW_COMPARE_MAX_LAYERS: usize = 256;
 
+/// What a review compares its pull request layers with (kept in the workspace's presentation
+/// state, so a reopened review compares the same way; [`Self::LastLooked`] resolves again on
+/// every open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewCompareBaseline {
+    /// Each layer's version the reviewer last looked at.
+    #[default]
+    LastLooked,
+    /// Each layer's version before the stack's latest push.
+    PreviousPush,
+    /// Each layer's version at `from_ms` against its version at `to_ms` (`None`: now).
+    Between {
+        /// From the versions current then, in milliseconds since the Unix epoch.
+        from_ms: u64,
+        /// To the versions current then; `None` for the current versions.
+        #[serde(default)]
+        to_ms: Option<u64>,
+    },
+    /// No comparison: the full change.
+    Off,
+}
+
+/// How a review compares its pull request layers, kept in its presentation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReviewCompareChoice {
+    /// What layers are compared with; `None` follows configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<ReviewCompareBaseline>,
+    /// Only pull requests with real changes since the baseline are shown.
+    #[serde(default)]
+    pub only_changed: bool,
+}
+
+impl ReviewCompareChoice {
+    /// Whether nothing was chosen.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// How a reviewer looked at a version of a pull request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

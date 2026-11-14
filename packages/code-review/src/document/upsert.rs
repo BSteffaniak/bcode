@@ -38,6 +38,7 @@ impl ReviewDocument {
         rebuilt.comparisons = std::mem::take(&mut self.comparisons);
         rebuilt.compare_files_shown = std::mem::take(&mut self.compare_files_shown);
         rebuilt.expanded_removals = std::mem::take(&mut self.expanded_removals);
+        rebuilt.filtered = std::mem::take(&mut self.filtered);
         rebuilt.tick = self.tick;
         rebuilt.next_ticket = self.next_ticket;
         for (group, hidden) in rebuilt.groups.iter_mut().zip(regrouped.hidden) {

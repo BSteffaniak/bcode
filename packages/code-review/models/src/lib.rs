@@ -467,6 +467,9 @@ pub struct ReviewPresentationState {
     /// they are not shown again unless configured to.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub dismissed_notices: BTreeSet<String>,
+    /// How pull request layers are compared with earlier versions.
+    #[serde(default, skip_serializing_if = "ReviewCompareChoice::is_default")]
+    pub compare: ReviewCompareChoice,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -493,6 +496,7 @@ impl Default for ReviewPresentationState {
             collapsed_files: BTreeSet::new(),
             opened_files: BTreeSet::new(),
             dismissed_notices: BTreeSet::new(),
+            compare: ReviewCompareChoice::default(),
         }
     }
 }

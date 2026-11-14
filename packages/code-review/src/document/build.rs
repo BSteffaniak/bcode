@@ -93,7 +93,7 @@ impl ReviewDocument {
     pub(super) fn build_block(&self, block: usize) -> Built {
         let hidden = match self.blocks[block].kind {
             BlockKind::ReviewNotes => false,
-            BlockKind::SourceHeader(group) => self.groups[group].hidden,
+            BlockKind::SourceHeader(group) => self.group_hidden(group),
             BlockKind::File(file) => self.file_hidden(file),
         };
         if hidden {
@@ -415,6 +415,7 @@ impl ReviewDocument {
             layers: layers.clone(),
             thread_count: self.file_annotations[file].len(),
             since: self.since_of(file),
+            versions: self.file_versions(file),
             position: u32::try_from(file - group.files.start + 1).unwrap_or(u32::MAX),
             count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),
             collapsed: self.folded(file),

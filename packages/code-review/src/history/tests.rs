@@ -1,10 +1,9 @@
 //! A three-layer stack pushed three times, read back from its reflogs: the first push, then the
 //! bottom layer edited with the two above restacked onto it, then a commit added on top.
 
-use super::compare::{changes_since, layer_changes, stack_at, whole_stack_since};
 use super::reflog::reflog_versions;
 use super::*;
-use bcode_code_review_models::{PullRequestSummary, ReviewSourceKind, ReviewStackLayer};
+use bcode_code_review_models::{PullRequestSummary, ReviewStackLayer};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -53,15 +52,6 @@ impl Repo {
 
     fn head(&self, branch: &str) -> String {
         self.git(0, &["rev-parse", branch])
-    }
-
-    /// The files `base..head` changes.
-    fn changed(&self, source: &ReviewSourceKind) -> Vec<String> {
-        let ReviewSourceKind::CommitRange { base, head, .. } = source else {
-            panic!("{source:?}");
-        };
-        let listed = self.git(0, &["diff", "--name-only", base, head]);
-        listed.lines().map(str::to_owned).collect()
     }
 }
 
@@ -197,60 +187,62 @@ fn reflogs_show_which_push_changed_which_layer_and_which_only_moved() {
 
 #[test]
 fn comparisons_show_what_the_author_changed_without_what_moved_underneath() {
-    let (repo, heads) = restacked();
+    use bcode_code_review_models::{DeltaKind, LayerPair, VersionPoint};
+    let (repo, _) = restacked();
     let timeline = history(&repo);
     let [first, second, _] = PUSHES;
     let after_first = first * 1000 + 1;
-
-    // A rebase-only version compares as no change at all.
-    let rebased = layer_changes(&repo.root, &timeline.layers[1], 0, 1)
-        .expect("compare")
-        .expect("different heads");
-    assert!(rebased.rebase_removed);
-    assert_eq!(repo.changed(&rebased.source), Vec::<String>::new());
-
-    // Since the first push: only the edited layer and the commit on top, nothing from rebases.
-    let since = changes_since(&repo.root, &timeline, after_first, false).expect("since");
-    let changed: Vec<(u64, Vec<String>)> = since
+    let point = |version: &TimelineVersion| VersionPoint {
+        head_oid: version.version.head_oid.clone(),
+        fork_oid: version.fork_oid.clone(),
+    };
+    // Each layer from its version at `at_ms` to its newest.
+    let since = |at_ms: u64| -> Vec<LayerPair> {
+        timeline
+            .layers
+            .iter()
+            .map(|layer| LayerPair {
+                number: layer.number,
+                from: version_at(layer, at_ms).map(|index| point(&layer.versions[index])),
+                to: point(layer.versions.last().expect("a version")),
+            })
+            .collect()
+    };
+    let disk = crate::cache::ReviewCache::disabled();
+    let deltas =
+        super::delta::layer_deltas(&repo.root, &disk, &since(after_first)).expect("compare");
+    let found: Vec<(u64, DeltaKind, Vec<String>)> = deltas
         .iter()
-        .map(|comparison| (comparison.number, repo.changed(&comparison.source)))
-        .collect();
-    assert_eq!(
-        changed,
-        [
-            (1, vec!["l1.txt".to_owned()]),
-            (3, vec!["l3-more.txt".to_owned()]),
-        ]
-    );
-    // Asked for, the rebased layer is there too, with nothing in it.
-    let all = changes_since(&repo.root, &timeline, after_first, true).expect("since");
-    assert_eq!(all.len(), 3);
-    assert_eq!(repo.changed(&all[1].source), Vec::<String>::new());
-
-    // The stack as it was after the first push: each layer's own change then.
-    let then = stack_at(&timeline, after_first);
-    let heads_then: Vec<&str> = then
-        .iter()
-        .map(|comparison| match &comparison.source {
-            ReviewSourceKind::CommitRange { head, .. } => head.as_str(),
-            other => panic!("{other:?}"),
+        .map(|delta| {
+            (
+                delta.pair.number,
+                delta.kind,
+                delta.files.iter().map(|file| file.path.clone()).collect(),
+            )
         })
         .collect();
+    // Since the first push: the edited layer and the commit on top; the layer between was only
+    // rebased.
     assert_eq!(
-        heads_then,
-        heads[0].iter().map(String::as_str).collect::<Vec<_>>()
+        found,
+        [
+            (1, DeltaKind::Changed, vec!["l1.txt".to_owned()]),
+            (2, DeltaKind::RebasedOnly, Vec::new()),
+            (3, DeltaKind::Changed, vec!["l3-more.txt".to_owned()]),
+        ]
     );
-    assert_eq!(repo.changed(&then[1].source), ["l2.txt"]);
-
-    // The whole stack since the first push: the edit and the new commit, together.
-    let whole = whole_stack_since(&repo.root, &timeline, after_first)
-        .expect("whole")
-        .expect("a stack then and now");
-    assert_eq!(repo.changed(&whole.source), ["l1.txt", "l3-more.txt"]);
-    // Nothing happened since the last push but the commit on top.
-    let latest = changes_since(&repo.root, &timeline, second * 1000 + 1, false).expect("since");
-    assert_eq!(latest.len(), 1);
-    assert_eq!(latest[0].number, 3);
+    // Since the second push only the commit on top changed anything.
+    let latest =
+        super::delta::layer_deltas(&repo.root, &disk, &since(second * 1000 + 1)).expect("compare");
+    let kinds: Vec<DeltaKind> = latest.iter().map(|delta| delta.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            DeltaKind::Unchanged,
+            DeltaKind::Unchanged,
+            DeltaKind::Changed
+        ]
+    );
 }
 
 #[test]

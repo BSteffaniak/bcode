@@ -7,7 +7,7 @@
 //! change replayed on today's base). Viewed state always uses each file's own identity, so it
 //! reads the same in both views.
 
-use super::items::CompareView;
+use super::items::{CompareView, FileVersionsItem};
 use super::keys::FileKey;
 use super::review::{Pending, ReviewDocument, Ticket};
 use bcode_code_review_models::{
@@ -31,6 +31,9 @@ pub struct GroupComparison {
     /// to another pair of versions), by path. One whose version is not the source's head is
     /// historical for that file.
     pub files: BTreeMap<String, LayerDelta>,
+    /// The layer's version steps, oldest first: each pair of consecutive versions compared.
+    /// File headers say in which steps their file changed, and a file can be stepped to one.
+    pub steps: Vec<LayerDelta>,
 }
 
 /// One file's lines new since the baseline.
@@ -331,6 +334,31 @@ impl ReviewDocument {
         self.group_comparison(self.files[index].group)?
             .files
             .get(&self.files[index].entry.path)
+    }
+
+    /// File `file`'s versions in its layer, once the layer's steps are known.
+    pub(super) fn file_versions(&self, file: usize) -> Option<FileVersionsItem> {
+        let comparison = self.group_comparison(self.files[file].group)?;
+        let steps = &comparison.steps;
+        if steps.is_empty() {
+            return None;
+        }
+        let path = &self.files[file].entry.path;
+        let changed: Vec<usize> = (0..steps.len())
+            .filter(|index| steps[*index].file(path).changed())
+            .collect();
+        let shown = comparison
+            .files
+            .get(path)
+            .and_then(|delta| steps.iter().position(|step| step.pair == delta.pair));
+        let before = shown.unwrap_or(steps.len());
+        Some(FileVersionsItem {
+            changed_in: changed.len(),
+            steps: steps.len(),
+            shown,
+            previous: changed.iter().any(|index| *index < before),
+            next: shown.is_some(),
+        })
     }
 
     /// How file `file` changed since its source's baseline.

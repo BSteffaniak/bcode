@@ -56,6 +56,23 @@ pub struct CompareNoteItem {
     pub files_shown: bool,
 }
 
+/// A file's versions in its pull request: in how many of the layer's version steps it
+/// changed, and which step it shows when stepped to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileVersionsItem {
+    /// Steps (pairs of consecutive versions) that changed the file.
+    pub changed_in: usize,
+    /// Steps of the layer.
+    pub steps: usize,
+    /// The step shown (0-based: versions `shown + 1` to `shown + 2`), when the file was stepped
+    /// to one; `None` when it is compared like its layer.
+    pub shown: Option<usize>,
+    /// Whether an earlier step changed the file.
+    pub previous: bool,
+    /// Whether a later step can be shown (or the layer's comparison again).
+    pub next: bool,
+}
+
 /// Lines of the baseline's own change that the current change no longer has: a marker between
 /// lines, expandable to the removed text (read-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +224,8 @@ pub struct FileHeaderItem {
     pub thread_count: usize,
     /// How the file changed since the comparison's baseline, when its source is compared.
     pub since: Option<FileSince>,
+    /// The file's versions in its pull request, once its layer's version steps are known.
+    pub versions: Option<FileVersionsItem>,
     /// Position of the file in its group (1-based).
     pub position: u32,
     /// Files in its group.

@@ -39,10 +39,10 @@ pub use compare::GroupComparison;
 pub use interval::IntervalSet;
 pub use items::{
     AgentThreadItem, AnchorPlacement, CompareNoteItem, CompareView, ComposerItem, FileDetailsItem,
-    FileEndItem, FileHeaderItem, FileLoad, FileNoticeItem, GapItem, GapState, HunkHeaderItem,
-    LayerNumber, LayoutMode, LineContent, LineItem, LineKind, LinePairItem, OutdatedReason,
-    PairSide, PlaceholderItem, RemovedSinceItem, ReviewItem, SourceHeaderItem, SourceIntroItem,
-    StackLayerLabel, ThreadItem,
+    FileEndItem, FileHeaderItem, FileLoad, FileNoticeItem, FileVersionsItem, GapItem, GapState,
+    HunkHeaderItem, LayerNumber, LayoutMode, LineContent, LineItem, LineKind, LinePairItem,
+    OutdatedReason, PairSide, PlaceholderItem, RemovedSinceItem, ReviewItem, SourceHeaderItem,
+    SourceIntroItem, StackLayerLabel, ThreadItem,
 };
 pub use keys::{FileKey, FileNoticeKind, FileRef, ItemKey};
 pub use navigation::{
