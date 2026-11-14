@@ -1008,6 +1008,7 @@ impl ReviewSurface {
             Err(error) => {
                 // The layers still computing show the full change.
                 let pending: Vec<String> = self.comparing.pairs.keys().cloned().collect();
+                let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
                 if let Some(review) = self.review.as_mut() {
                     for source_id in &pending {
                         if review
@@ -1020,7 +1021,11 @@ impl ReviewSurface {
                         }
                     }
                     review.note_splices();
+                    // The panel's group rows and the open menu stop saying "comparing".
+                    review.rebuild_files(&theme, hide_viewed);
                 }
+                self.apply_compare_filter();
+                self.sync_compare_menu();
                 self.set_status(
                     format!("could not compare: {error}"),
                     StatusSeverity::Warning,

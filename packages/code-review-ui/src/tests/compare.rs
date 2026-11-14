@@ -1002,6 +1002,35 @@ fn stepping_a_files_version_updates_its_row_in_the_file_panel() {
 }
 
 #[test]
+fn a_failed_comparison_leaves_no_row_saying_it_is_still_comparing() {
+    let (fixture, backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    settled(&mut scenario);
+    scenario.key("shift+o");
+    settled(&mut scenario);
+    // The bottom layer moves and the review is refreshed; comparing it again fails.
+    backend.set_failing(bcode_code_review_models::OP_REVIEW_COMPARE_LAYERS, true);
+    push_to(&fixture, STACK_BRANCHES[0], "pushed-while-open.txt");
+    refresh(&fixture, &mut scenario, "failing");
+    let doc = document(&scenario);
+    assert!(doc.comparison(&source_of(doc, 101)).is_none());
+    let labels = tree_labels(&scenario);
+    assert!(
+        !labels.iter().any(|label| label.contains("comparing")),
+        "{labels:?}"
+    );
+    scenario.key("b");
+    let screen = settled(&mut scenario);
+    let Some(crate::surface::Modal::Compare(menu)) = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.modal())
+    else {
+        panic!("the menu: {}", screen.text());
+    };
+    assert!(menu.state().progress.is_none(), "{:?}", menu.state());
+}
+
+#[test]
 fn the_history_marks_versions_the_reviewer_viewed_without_a_completed_pass() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
