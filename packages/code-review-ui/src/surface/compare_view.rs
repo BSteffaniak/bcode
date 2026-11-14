@@ -68,6 +68,12 @@ fn summary(counts: CompareCounts, active: bool) -> [String; 2] {
     ]
 }
 
+/// The summary of `counts` in full (every compared source's delta in).
+pub(super) fn summary_text(counts: CompareCounts) -> String {
+    let [text, _] = summary(counts, true);
+    text
+}
+
 impl ReviewSurface {
     /// The comparison row's content.
     fn compare_bar_model(&self) -> CompareBar {
@@ -664,6 +670,14 @@ impl ReviewSurface {
             }
             "compare_only_changed" => {
                 self.toggle_only_changed();
+                Action::Redraw
+            }
+            "compare_show_files" => {
+                let hidden = self
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.files.hidden_files() > 0);
+                self.show_compare_hidden(hidden);
                 Action::Redraw
             }
             "compare_off" => {

@@ -250,6 +250,23 @@ impl ReviewDocument {
         changed
     }
 
+    /// Whether the comparison hides `file` now (an unchanged file in the changes view, or any
+    /// file of a layer only rebased, until its source's hidden files are shown).
+    #[must_use]
+    pub fn file_compare_hidden(&self, file: &FileKey) -> bool {
+        self.file_index
+            .get(file)
+            .is_some_and(|index| self.compare_hidden(*index))
+    }
+
+    /// Whether the comparison would hide `file` were its source's hidden files not shown.
+    #[must_use]
+    pub fn file_compare_hideable(&self, file: &FileKey) -> bool {
+        self.file_index
+            .get(file)
+            .is_some_and(|index| self.hidden_by_comparison(*index))
+    }
+
     /// Whether the files a comparison hides in source `source_id` are shown.
     #[must_use]
     pub fn compare_files_shown(&self, source_id: &str) -> bool {

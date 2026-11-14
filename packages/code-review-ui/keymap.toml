@@ -183,10 +183,12 @@ keymap_actions = [
     { id = "bcode.code_review.compare_view", scope = "code-review", description = "Only what changed since you looked / the full change with what is new marked", defaults = [
         "shift+l",
     ] },
-    { id = "bcode.code_review.compare_baseline", scope = "code-review", description = "Changes since…: choose what pull requests are compared with", defaults = [
+    { id = "bcode.code_review.compare_baseline", scope = "code-review", description = "Compare: choose what changes are shown since, and the view options (previews live)", defaults = [
         "b",
     ] },
     { id = "bcode.code_review.compare_only_changed", scope = "code-review", description = "Compare: only pull requests with real changes", defaults = [
+    ] },
+    { id = "bcode.code_review.compare_show_files", scope = "code-review", description = "Compare: show or hide the files the comparison hides (unchanged since then)", defaults = [
     ] },
     { id = "bcode.code_review.compare_off", scope = "code-review", description = "Compare: full change (no comparison)", defaults = [
     ] },

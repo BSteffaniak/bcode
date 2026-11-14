@@ -1113,3 +1113,226 @@ fn clicking_menu_rows_picks_them_in_place() {
     assert!(review.modal().is_none());
     assert_eq!(review.comparing().view(), CompareView::Changes);
 }
+
+/// The file panel's text: its rows, inside its border.
+fn panel_text(scenario: &Scenario<ReviewApp>, screen: &Screen) -> Vec<String> {
+    let area = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.body_area(crate::surface::FILES_PANE_ID))
+        .expect("the file panel");
+    (area.y..area.y + area.height)
+        .map(|y| {
+            screen
+                .row_text(y)
+                .chars()
+                .skip(usize::from(area.x))
+                .take(usize::from(area.width))
+                .collect()
+        })
+        .collect()
+}
+
+/// Click the first cell of `needle` inside the file panel.
+fn click_in_panel(scenario: &mut Scenario<ReviewApp>, screen: &Screen, needle: &str) {
+    let area = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.body_area(crate::surface::FILES_PANE_ID))
+        .expect("the file panel");
+    let (x, y) = (area.y..area.y + area.height)
+        .find_map(|y| {
+            let x = screen.column_of(y, needle)?;
+            (x >= area.x && x < area.right()).then_some((x, y))
+        })
+        .unwrap_or_else(|| panic!("no {needle} in the panel: {}", screen.text()));
+    scenario.click(x, y);
+}
+
+fn tree_labels(scenario: &Scenario<ReviewApp>) -> Vec<String> {
+    scenario
+        .surface()
+        .review()
+        .and_then(|review| review.file_tree())
+        .map(|tree| tree.items().iter().map(|item| item.label.clone()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_file_panel_says_what_changed_since_the_baseline_one_layer_at_a_time() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let screen = settled(&mut scenario);
+    let panel = panel_text(&scenario, &screen).join("\n");
+    // The legend names the comparison and what it found for the layer shown.
+    assert!(panel.contains("Changes since you last looked"), "{panel}");
+    assert!(panel.contains("1 of 3 files changed since you"), "{panel}");
+    // The new file is marked; the unchanged ones are listed (the full view).
+    let labels = tree_labels(&scenario);
+    assert!(
+        labels.iter().any(|label| label == "+ A restacked.txt"),
+        "{labels:?}"
+    );
+    assert!(
+        labels.iter().any(|label| label == "A layer_1.rs"),
+        "{labels:?}"
+    );
+
+    // Only what changed: the unchanged files leave the panel as they leave the document.
+    scenario.key("shift+l");
+    let screen = settled(&mut scenario);
+    let labels = tree_labels(&scenario);
+    assert!(
+        !labels.iter().any(|label| label.contains("layer_1.rs")),
+        "{labels:?}"
+    );
+    let doc = document(&scenario);
+    let bottom = source_of(doc, 101);
+    assert!(doc.file_compare_hidden(&FileKey::new(bottom.clone(), None, "stack/layer_1.rs")));
+    let panel = panel_text(&scenario, &screen).join("\n");
+    assert!(panel.contains("2 files hidden: unchanged"), "{panel}");
+    assert!(panel.contains("only what changed"), "{panel}");
+    // A click on the legend shows them, dimmed, in both.
+    click_in_panel(&mut scenario, &screen, "[show]");
+    let screen = settled(&mut scenario);
+    let labels = tree_labels(&scenario);
+    assert!(
+        labels.iter().any(|label| label.contains("layer_1.rs")),
+        "{labels:?}"
+    );
+    assert!(document(&scenario).compare_files_shown(&bottom));
+    let panel = panel_text(&scenario, &screen).join("\n");
+    assert!(panel.contains("[hide]"), "{panel}");
+    click_in_panel(&mut scenario, &screen, "[hide]");
+    settled(&mut scenario);
+    assert!(!document(&scenario).compare_files_shown(&bottom));
+    scenario.key("shift+l");
+    settled(&mut scenario);
+
+    // A layer only rebased: the panel says plainly that nothing changed.
+    scenario.key(".");
+    let screen = settled(&mut scenario);
+    let panel = panel_text(&scenario, &screen).join("\n");
+    assert!(
+        panel.contains("No changes since you last looked") && panel.contains("only rebased"),
+        "{panel}"
+    );
+    assert!(panel.contains("2 files hidden"), "{panel}");
+    let tree = scenario.surface().review().unwrap().file_tree().unwrap();
+    assert_eq!(tree.file_count(), 0);
+    assert_eq!(tree.hidden_files(), 2);
+}
+
+#[test]
+fn the_file_panel_says_what_changed_with_every_layer_shown() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    settled(&mut scenario);
+    scenario.key("shift+o");
+    let screen = settled(&mut scenario);
+    let panel = panel_text(&scenario, &screen).join("\n");
+    assert!(
+        panel.contains("1 of 3 PRs changed · 2 rebased only"),
+        "{panel}"
+    );
+    assert!(panel.contains("4 files hidden"), "{panel}");
+    // Each group says what its comparison found; the rebased ones keep their row.
+    let labels = tree_labels(&scenario);
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("#101") && label.contains("● +1 −0 · 1 file")),
+        "{labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("#102") && label.contains("○ rebased only · 2 hidden")),
+        "{labels:?}"
+    );
+    // Only pull requests with real changes: the panel says what that hides, and shows it again.
+    run(
+        &mut scenario,
+        "Compare: only pull requests with real changes",
+    );
+    let screen = settled(&mut scenario);
+    let panel = panel_text(&scenario, &screen).join("\n");
+    assert!(panel.contains("2 pull requests hidden"), "{panel}");
+    assert!(
+        !tree_labels(&scenario)
+            .iter()
+            .any(|label| label.starts_with("#102"))
+    );
+    click_in_panel(&mut scenario, &screen, "[show all]");
+    settled(&mut scenario);
+    assert!(
+        !scenario
+            .surface()
+            .review()
+            .unwrap()
+            .comparing()
+            .only_changed()
+    );
+    assert!(
+        tree_labels(&scenario)
+            .iter()
+            .any(|label| label.starts_with("#102"))
+    );
+
+    // Narrow and short: the legend wraps inside the panel and its rows still take clicks.
+    for (width, height) in [(64_u16, 18_u16), (100, 12), (70, 40)] {
+        scenario.resize(width, height);
+        let screen = settled(&mut scenario);
+        if let Some(area) = scenario
+            .surface()
+            .review()
+            .and_then(|review| review.body_area(crate::surface::FILES_PANE_ID))
+        {
+            assert!(area.right() <= width && area.bottom() <= height, "{area:?}");
+            for index in 0..4 {
+                if let Some(row) = scenario
+                    .surface()
+                    .review()
+                    .and_then(|review| review.body_area(&format!("review.files.legend.{index}")))
+                {
+                    assert!(
+                        row.x >= area.x && row.right() <= area.right(),
+                        "{width}x{height}: {row:?} {area:?}\n{}",
+                        screen.text()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_summary_rows_show_button_shows_hidden_files_in_the_document_and_the_panel() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    settled(&mut scenario);
+    scenario.key("shift+l");
+    let screen = settled(&mut scenario);
+    assert_eq!(
+        scenario
+            .surface()
+            .review()
+            .unwrap()
+            .file_tree()
+            .unwrap()
+            .hidden_files(),
+        2
+    );
+    let row = (0..screen.height())
+        .find(|y| screen.row_text(*y).contains("[show 2 unchanged]"))
+        .unwrap_or_else(|| panic!("the summary row: {}", screen.text()));
+    let x = screen.column_of(row, "[show 2 unchanged]").expect("column");
+    scenario.click(x + 1, row);
+    // Rows measured before lay out again beside the files shown.
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("[hide them]"), "{}", screen.text());
+    let tree = scenario.surface().review().unwrap().file_tree().unwrap();
+    assert_eq!(tree.hidden_files(), 0);
+    assert!(
+        tree.items()
+            .iter()
+            .any(|item| item.label.contains("layer_1.rs"))
+    );
+}

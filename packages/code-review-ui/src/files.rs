@@ -13,11 +13,18 @@
 //! * A filter keeps matching files and their ancestors; every word of the query must occur in
 //!   the path (case-insensitive). While filtering, directories cannot collapse, so every match
 //!   stays visible.
+//! * Under a comparison the tree says how each file changed since the baseline, the way the
+//!   document shows it: changed and new files are marked and their since counts shown,
+//!   unchanged files are dimmed, files the comparison hides in the document (unchanged files in
+//!   the changes view, every file of a layer only rebased) are left out and counted on their
+//!   group, and files the baseline's change had that the current one dropped are listed, struck
+//!   through and inert, at the end of their group. Group rows say what the source's comparison
+//!   found; a compared group shows even when the comparison hides all its files.
 
 use super::rows::{change_bar, count_spans};
 use super::theme::{ReviewTheme, status_letter};
 use bcode_code_review::document::{FileRef, ItemKey, ReviewDocument, ReviewItem};
-use bcode_code_review_models::{ReviewFileStatus, ReviewIndexFlag};
+use bcode_code_review_models::{DeltaKind, FileSince, ReviewFileStatus, ReviewIndexFlag};
 use bmux_tui::style::Modifier;
 use bmux_tui::text::{Line, Span};
 use bmux_tui_components::tree_view::TreeViewItem;
@@ -33,6 +40,21 @@ struct Decorations {
     threads: u32,
     drafts: u32,
     layers: Vec<u64>,
+    /// How the file changed since its source's baseline, when compared.
+    since: Option<FileSince>,
+}
+
+/// What a group's comparison found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GroupCompare {
+    /// What it found; `None` while it computes.
+    kind: Option<DeltaKind>,
+    added: u64,
+    removed: u64,
+    /// Files changed (or new, or dropped) since the baseline.
+    changed_files: usize,
+    /// Files the comparison hides in the document, left out of the tree.
+    hidden: usize,
 }
 
 /// Aggregates of a directory or group.
@@ -59,9 +81,28 @@ struct FileRow {
 
 #[derive(Debug, Clone)]
 enum NodeKind {
-    Group { label: String, totals: Totals },
-    Dir { name: String, totals: Totals },
+    Group {
+        label: String,
+        totals: Totals,
+        compare: Option<GroupCompare>,
+    },
+    Dir {
+        name: String,
+        totals: Totals,
+    },
     File(FileRow),
+    /// A file the baseline's change had that the current change dropped (inert).
+    Gone {
+        path: String,
+    },
+}
+
+/// A group while the tree is assembled.
+struct GroupRows {
+    source: String,
+    part: Option<u32>,
+    rows: Vec<FileRow>,
+    hidden: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -102,36 +143,41 @@ pub struct FileTree {
     matches: usize,
     /// Viewed files are left out (with directories that keep no file).
     hide_viewed: bool,
+    /// Files the comparison hides in the document, left out of the tree.
+    hidden: usize,
+    /// Files the comparison would hide, shown anyway (dimmed in the document).
+    hideable_shown: usize,
+    /// Every file of the tree's sources, hidden ones included.
+    total: usize,
+    /// The sources the tree shows, in order.
+    sources: Vec<String>,
 }
 
 impl FileTree {
     /// The tree of every file in `doc`.
     #[must_use]
     pub fn new(doc: &ReviewDocument, theme: &ReviewTheme) -> Self {
-        let mut groups: Vec<(String, Option<u32>, Vec<FileRow>)> = Vec::new();
-        let focus = doc.focus();
-        for file in doc.file_keys() {
-            // One layer at a time: only the focused source's files.
-            if focus.is_some_and(|focus| focus != file.source_id)
-                || doc.source_filtered(&file.source_id)
-            {
-                continue;
-            }
-            let Some(row) = file_row(doc, file) else {
-                continue;
-            };
-            match groups.last_mut() {
-                Some((source, part, rows)) if *source == file.source_id && *part == file.part => {
-                    rows.push(row);
-                }
-                _ => groups.push((file.source_id.clone(), file.part, vec![row])),
-            }
-        }
+        let (groups, hideable_shown) = collect_groups(doc);
         let grouped = groups.len() > 1;
-        let mut tree = Self::default();
-        for (source, part, rows) in groups {
+        let mut tree = Self {
+            hideable_shown,
+            ..Self::default()
+        };
+        for GroupRows {
+            source,
+            part,
+            rows,
+            hidden,
+        } in groups
+        {
+            tree.hidden += hidden;
+            tree.total += hidden + rows.len();
+            if !tree.sources.contains(&source) {
+                tree.sources.push(source.clone());
+            }
             let depth = if grouped {
-                let label = group_label(doc, &source, part, theme);
+                let label = group_label(doc, &source, part);
+                let compare = group_compare(doc, &source, hidden);
                 tree.push(
                     format!("g{SEP}{source}{SEP}{}", part_text(part)),
                     0,
@@ -139,6 +185,7 @@ impl FileTree {
                     NodeKind::Group {
                         label,
                         totals: Totals::default(),
+                        compare,
                     },
                 );
                 1
@@ -168,6 +215,17 @@ impl FileTree {
             }
             let prefix = format!("{source}{SEP}{}{SEP}", part_text(part));
             tree.emit(&mut dirs, 0, depth, parent, &prefix, "");
+            // Files the baseline's change had and the current one dropped, once per source.
+            if part.is_none_or(|part| part == 0) {
+                for path in dropped_paths(doc, &source) {
+                    tree.push(
+                        format!("x{SEP}{prefix}{path}"),
+                        depth,
+                        parent,
+                        NodeKind::Gone { path },
+                    );
+                }
+            }
         }
         tree.aggregate();
         tree.item_of = vec![None; tree.nodes.len()];
@@ -284,8 +342,32 @@ impl FileTree {
     pub fn expandable_ids(&self) -> impl Iterator<Item = &str> {
         self.nodes
             .iter()
-            .filter(|node| !matches!(node.kind, NodeKind::File(_)))
+            .filter(|node| matches!(node.kind, NodeKind::Group { .. } | NodeKind::Dir { .. }))
             .map(|node| node.id.as_str())
+    }
+
+    /// Files the comparison hides in the document, left out of the tree.
+    #[must_use]
+    pub const fn hidden_files(&self) -> usize {
+        self.hidden
+    }
+
+    /// Files the comparison would hide, shown anyway.
+    #[must_use]
+    pub const fn hideable_shown(&self) -> usize {
+        self.hideable_shown
+    }
+
+    /// Every file of the tree's sources, the hidden ones included.
+    #[must_use]
+    pub const fn total_files(&self) -> usize {
+        self.total
+    }
+
+    /// The sources the tree shows, in order.
+    #[must_use]
+    pub fn sources(&self) -> &[String] {
+        &self.sources
     }
 
     /// Files in the tree.
@@ -326,9 +408,12 @@ impl FileTree {
     /// Whether `id` is a directory or group row.
     #[must_use]
     pub fn is_expandable(&self, id: &str) -> bool {
-        self.ids
-            .get(id)
-            .is_some_and(|index| !matches!(self.nodes[*index].kind, NodeKind::File(_)))
+        self.ids.get(id).is_some_and(|index| {
+            matches!(
+                self.nodes[*index].kind,
+                NodeKind::Group { .. } | NodeKind::Dir { .. }
+            )
+        })
     }
 
     /// The first file under the directory or group `id`, in tree order.
@@ -391,15 +476,28 @@ impl FileTree {
         let mut keep = vec![false; self.nodes.len()];
         let mut matches = 0;
         for (index, node) in self.nodes.iter().enumerate() {
-            let NodeKind::File(row) = &node.kind else {
-                continue;
+            let path = match &node.kind {
+                NodeKind::File(row) => {
+                    if self.hide_viewed && row.decorations.viewed {
+                        continue;
+                    }
+                    &row.file.path
+                }
+                NodeKind::Gone { path } => path,
+                // A compared group says what its comparison found even with no file shown.
+                NodeKind::Group {
+                    compare: Some(_), ..
+                } if !filtering => {
+                    keep[index] = true;
+                    continue;
+                }
+                _ => continue,
             };
-            if self.hide_viewed && row.decorations.viewed {
-                continue;
-            }
-            let path = row.file.path.to_lowercase();
+            let path = path.to_lowercase();
             if self.query.iter().all(|word| path.contains(word.as_str())) {
-                matches += 1;
+                if matches!(node.kind, NodeKind::File(_)) {
+                    matches += 1;
+                }
                 keep[index] = true;
                 let mut parent = node.parent;
                 while let Some(ancestor) = parent {
@@ -431,7 +529,7 @@ impl FileTree {
         let Some(&index) = self.files.get(file) else {
             return false;
         };
-        let Some(decorations) = header(doc, file).map(decorations_of) else {
+        let Some(decorations) = header(doc, file).map(|header| decorations_of(doc, header)) else {
             return false;
         };
         let NodeKind::File(row) = &mut self.nodes[index].kind else {
@@ -471,74 +569,123 @@ impl FileTree {
         true
     }
 
+    /// A file row: status, name, and decorations, marked by how it changed since the baseline.
+    fn file_item(node: &Node, row: &FileRow, theme: &ReviewTheme) -> TreeViewItem {
+        let icons = &theme.icons;
+        let decorations = &row.decorations;
+        let since = decorations.since;
+        let name_style = if row.decorations.viewed {
+            theme.path_viewed
+        } else if since == Some(FileSince::Unchanged) {
+            // The same as at the baseline: receded.
+            theme.muted
+        } else if row.status == ReviewFileStatus::Deleted {
+            theme.text.add_modifier(Modifier::CROSSED_OUT)
+        } else if since.is_some_and(FileSince::changed) {
+            theme.text.add_modifier(Modifier::BOLD)
+        } else {
+            theme.text
+        };
+        let mut spans = Vec::new();
+        // Changed and new files stand out with a mark before their status.
+        match since {
+            Some(FileSince::Changed { .. }) => {
+                spans.push(Span::styled(icons.since_changed, theme.since.badge));
+                spans.push(Span::raw(" "));
+            }
+            Some(FileSince::New { .. }) => {
+                spans.push(Span::styled(icons.since_new_to_you, theme.since.badge));
+                spans.push(Span::raw(" "));
+            }
+            _ => {}
+        }
+        let status_style = if since == Some(FileSince::Unchanged) {
+            theme.muted
+        } else {
+            theme.status(row.status)
+        };
+        spans.push(Span::styled(status_letter(row.status), status_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(row.name.clone(), name_style));
+        let label = Line::from_spans(spans);
+        let mut trailing = Vec::new();
+        if !decorations.layers.is_empty() {
+            let layers: Vec<String> = decorations
+                .layers
+                .iter()
+                .map(|layer| format!("#{layer}"))
+                .collect();
+            trailing.push(Line::from_spans(vec![Span::styled(
+                layers.join(" "),
+                theme.badge_open,
+            )]));
+        }
+        if decorations.drafts > 0 {
+            trailing.push(badge(icons.draft, decorations.drafts, theme.badge_draft));
+        }
+        if decorations.threads > 0 {
+            trailing.push(badge(icons.thread, decorations.threads, theme.badge_open));
+        }
+        if row.binary {
+            trailing.push(Line::from_spans(vec![Span::styled(
+                "bin",
+                theme.status_binary,
+            )]));
+        } else {
+            trailing.push(Line::from_spans(change_bar(
+                row.additions,
+                row.deletions,
+                theme,
+            )));
+            trailing.push(Line::from_spans(count_spans(
+                row.additions,
+                row.deletions,
+                theme,
+            )));
+        }
+        if let Some(since) = since_badge(since, theme) {
+            trailing.push(since);
+        }
+        trailing.push(Line::from_spans(vec![if decorations.viewed {
+            Span::styled(icons.viewed, theme.viewed)
+        } else {
+            Span::styled(icons.unviewed, theme.muted)
+        }]));
+        TreeViewItem::rich(node.id.clone(), label, node.depth).trailing(trailing)
+    }
+
     fn item(&self, index: usize, theme: &ReviewTheme, filtering: bool) -> TreeViewItem {
         let node = &self.nodes[index];
         let icons = &theme.icons;
         match &node.kind {
-            NodeKind::File(row) => {
-                let name_style = if row.decorations.viewed {
-                    theme.path_viewed
-                } else if row.status == ReviewFileStatus::Deleted {
-                    theme.text.add_modifier(Modifier::CROSSED_OUT)
-                } else {
-                    theme.text
-                };
-                let label = Line::from_spans(vec![
-                    Span::styled(status_letter(row.status), theme.status(row.status)),
+            NodeKind::File(row) => Self::file_item(node, row, theme),
+            NodeKind::Gone { path } => TreeViewItem::rich(
+                node.id.clone(),
+                Line::from_spans(vec![
+                    Span::styled(icons.minus, theme.muted),
                     Span::raw(" "),
-                    Span::styled(row.name.clone(), name_style),
-                ]);
-                let decorations = &row.decorations;
-                let mut trailing = Vec::new();
-                if !decorations.layers.is_empty() {
-                    let layers: Vec<String> = decorations
-                        .layers
-                        .iter()
-                        .map(|layer| format!("#{layer}"))
-                        .collect();
-                    trailing.push(Line::from_spans(vec![Span::styled(
-                        layers.join(" "),
-                        theme.badge_open,
-                    )]));
-                }
-                if decorations.drafts > 0 {
-                    trailing.push(badge(icons.draft, decorations.drafts, theme.badge_draft));
-                }
-                if decorations.threads > 0 {
-                    trailing.push(badge(icons.thread, decorations.threads, theme.badge_open));
-                }
-                if row.binary {
-                    trailing.push(Line::from_spans(vec![Span::styled(
-                        "bin",
-                        theme.status_binary,
-                    )]));
-                } else {
-                    trailing.push(Line::from_spans(change_bar(
-                        row.additions,
-                        row.deletions,
-                        theme,
-                    )));
-                    trailing.push(Line::from_spans(count_spans(
-                        row.additions,
-                        row.deletions,
-                        theme,
-                    )));
-                }
-                trailing.push(Line::from_spans(vec![if decorations.viewed {
-                    Span::styled(icons.viewed, theme.viewed)
-                } else {
-                    Span::styled(icons.unviewed, theme.muted)
-                }]));
-                TreeViewItem::rich(node.id.clone(), label, node.depth).trailing(trailing)
-            }
+                    Span::styled(
+                        path.clone(),
+                        theme.muted.add_modifier(Modifier::CROSSED_OUT),
+                    ),
+                ]),
+                node.depth,
+            )
+            .trailing([Line::from_spans(vec![Span::styled(
+                "dropped since",
+                theme.muted,
+            )])])
+            .disabled(true),
             NodeKind::Dir { name, totals }
             | NodeKind::Group {
                 label: name,
                 totals,
+                ..
             } => {
-                // Directories end with a slash; source groups are named, not paths.
-                let label = if matches!(node.kind, NodeKind::Group { .. }) {
-                    Line::from_spans(vec![Span::styled(name.clone(), theme.source_header)])
+                // Directories end with a slash; source groups are named, not paths, and say
+                // what their comparison found.
+                let label = if let NodeKind::Group { compare, .. } = &node.kind {
+                    group_line(name, compare.as_ref(), theme)
                 } else {
                     Line::from_spans(vec![Span::styled(format!("{name}/"), theme.directory)])
                 };
@@ -549,11 +696,27 @@ impl FileTree {
                 if totals.threads > 0 {
                     trailing.push(badge(icons.thread, totals.threads, theme.badge_open));
                 }
-                trailing.push(Line::from_spans(count_spans(
-                    totals.additions,
-                    totals.deletions,
-                    theme,
-                )));
+                // A compared group's label says what changed since the baseline: its whole
+                // change's counts give that room. With no file shown, it says nothing more.
+                let compared = matches!(
+                    node.kind,
+                    NodeKind::Group {
+                        compare: Some(_),
+                        ..
+                    }
+                );
+                if !compared {
+                    trailing.push(Line::from_spans(count_spans(
+                        totals.additions,
+                        totals.deletions,
+                        theme,
+                    )));
+                }
+                if compared && totals.files == 0 {
+                    return TreeViewItem::rich(node.id.clone(), label, node.depth)
+                        .trailing(trailing)
+                        .expandable(!filtering);
+                }
                 trailing.push(if totals.files > 0 && totals.viewed == totals.files {
                     Line::from_spans(vec![Span::styled(
                         format!("{} {}", icons.viewed, totals.files),
@@ -600,13 +763,17 @@ fn header<'a>(
     }
 }
 
-fn decorations_of(header: &bcode_code_review::document::FileHeaderItem) -> Decorations {
+fn decorations_of(
+    doc: &ReviewDocument,
+    header: &bcode_code_review::document::FileHeaderItem,
+) -> Decorations {
     Decorations {
         viewed: header.viewed,
         threads: u32::try_from(header.thread_count).unwrap_or(u32::MAX),
         // Draft counts arrive with the annotation pipeline.
         drafts: 0,
         layers: header.layers.clone(),
+        since: doc.file_since(&header.file),
     }
 }
 
@@ -624,23 +791,59 @@ fn file_row(doc: &ReviewDocument, file: &FileRef) -> Option<FileRow> {
         additions: u64::from(header.additions),
         deletions: u64::from(header.deletions),
         binary: header.flags.contains(&ReviewIndexFlag::Binary),
-        decorations: decorations_of(header),
+        decorations: decorations_of(doc, header),
     })
 }
 
+/// The files the tree shows, grouped by source and part (hidden ones counted on their group),
+/// and how many files the comparison would hide are shown anyway.
+fn collect_groups(doc: &ReviewDocument) -> (Vec<GroupRows>, usize) {
+    let mut groups: Vec<GroupRows> = Vec::new();
+    let mut hideable_shown = 0;
+    let focus = doc.focus();
+    for file in doc.file_keys() {
+        // One layer at a time: only the focused source's files.
+        if focus.is_some_and(|focus| focus != file.source_id)
+            || doc.source_filtered(&file.source_id)
+        {
+            continue;
+        }
+        let same = groups.last().is_some_and(|group| {
+            (group.source.as_str(), group.part) == (file.source_id.as_str(), file.part)
+        });
+        if !same {
+            groups.push(GroupRows {
+                source: file.source_id.clone(),
+                part: file.part,
+                rows: Vec::new(),
+                hidden: 0,
+            });
+        }
+        let Some(group) = groups.last_mut() else {
+            continue;
+        };
+        // Left out here as in the document, and counted on the group.
+        if doc.file_compare_hidden(file) {
+            group.hidden += 1;
+            continue;
+        }
+        if doc.file_compare_hideable(file) {
+            hideable_shown += 1;
+        }
+        if let Some(row) = file_row(doc, file) {
+            group.rows.push(row);
+        }
+    }
+    (groups, hideable_shown)
+}
+
 /// Label of a source group row: its header label, or a stack layer's pull request.
-fn group_label(
-    doc: &ReviewDocument,
-    source: &str,
-    part: Option<u32>,
-    theme: &ReviewTheme,
-) -> String {
+fn group_label(doc: &ReviewDocument, source: &str, part: Option<u32>) -> String {
     let key = ItemKey::SourceHeader {
         source_id: source.to_owned(),
         part,
     };
-    let label = doc
-        .index_of(&key)
+    doc.index_of(&key)
         .and_then(|index| match doc.item(index) {
             // A stack layer is named by its pull request, the way its banner and tab name it.
             Some(ReviewItem::SourceHeader(header)) => Some(match &header.layer {
@@ -649,33 +852,121 @@ fn group_label(
             }),
             _ => None,
         })
-        .unwrap_or_else(|| source.to_owned());
-    match compare_badge(doc, source, theme) {
-        Some(badge) => format!("{label}  {badge}"),
-        None => label,
-    }
+        .unwrap_or_else(|| source.to_owned())
 }
 
-/// How a compared source changed since its baseline, briefly (`● +40 −12`, `○ rebased`).
-fn compare_badge(doc: &ReviewDocument, source: &str, theme: &ReviewTheme) -> Option<String> {
-    use bcode_code_review_models::DeltaKind;
-    let delta = doc.comparison(source)?.delta.as_ref()?;
+/// What source `source`'s comparison found, when it is compared.
+fn group_compare(doc: &ReviewDocument, source: &str, hidden: usize) -> Option<GroupCompare> {
+    let comparison = doc.comparison(source)?;
+    let summary = doc.comparison_summary(source).unwrap_or_default();
+    Some(GroupCompare {
+        kind: comparison.delta.as_ref().map(|delta| delta.kind),
+        added: summary.added,
+        removed: summary.removed,
+        changed_files: summary.files,
+        hidden,
+    })
+}
+
+/// Paths source `source`'s baseline change had that its current change dropped.
+fn dropped_paths(doc: &ReviewDocument, source: &str) -> Vec<String> {
+    doc.comparison(source)
+        .and_then(|comparison| comparison.delta.as_ref())
+        .map(|delta| {
+            delta
+                .files
+                .iter()
+                .filter(|file| file.since == FileSince::Dropped)
+                .map(|file| file.path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A group row's label: its name, then what its comparison found (`● +40 −12 · 3 files`,
+/// `○ rebased only · 4 hidden`). Groups with nothing to look at again recede.
+fn group_line(name: &str, compare: Option<&GroupCompare>, theme: &ReviewTheme) -> Line {
     let icons = &theme.icons;
-    Some(match delta.kind {
-        DeltaKind::Changed | DeltaKind::WithRebase => {
-            let (added, removed) = delta.totals();
-            let glyph = if delta.kind == DeltaKind::WithRebase {
+    let Some(compare) = compare else {
+        return Line::from_spans(vec![Span::styled(name.to_owned(), theme.source_header)]);
+    };
+    let quiet = matches!(
+        compare.kind,
+        Some(DeltaKind::Unchanged | DeltaKind::RebasedOnly)
+    );
+    let mut spans = vec![Span::styled(
+        name.to_owned(),
+        if quiet {
+            theme.muted
+        } else {
+            theme.source_header
+        },
+    )];
+    let (badge, style) = match compare.kind {
+        None => (format!("{} comparing", icons.ellipsis), theme.muted),
+        Some(kind @ (DeltaKind::Changed | DeltaKind::WithRebase)) => {
+            let glyph = if kind == DeltaKind::WithRebase {
                 icons.since_with_rebase
             } else {
                 icons.since_changed
             };
-            format!("{glyph} +{added} {}{removed}", icons.minus)
+            let files = compare.changed_files;
+            (
+                format!(
+                    "{glyph} +{} {}{} · {files} file{}",
+                    compare.added,
+                    icons.minus,
+                    compare.removed,
+                    if files == 1 { "" } else { "s" }
+                ),
+                theme.since.badge,
+            )
         }
-        DeltaKind::RebasedOnly => format!("{} rebased", icons.since_rebased),
-        DeltaKind::Unchanged => format!("{} unchanged", icons.since_unchanged),
-        DeltaKind::NewToYou => format!("{} new to you", icons.since_new_to_you),
-        DeltaKind::Unavailable => format!("{} unavailable", icons.since_unavailable),
-    })
+        Some(DeltaKind::RebasedOnly) => {
+            (format!("{} rebased only", icons.since_rebased), theme.muted)
+        }
+        Some(DeltaKind::Unchanged) => {
+            (format!("{} no changes", icons.since_unchanged), theme.muted)
+        }
+        Some(DeltaKind::NewToYou) => (
+            format!("{} new to you", icons.since_new_to_you),
+            theme.accent,
+        ),
+        Some(DeltaKind::Unavailable) => (
+            format!("{} baseline gone", icons.since_unavailable),
+            theme.notice,
+        ),
+    };
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(badge, style));
+    if compare.hidden > 0 {
+        spans.push(Span::styled(
+            format!(" · {} hidden", compare.hidden),
+            theme.muted,
+        ));
+    }
+    Line::from_spans(spans)
+}
+
+/// A file row's since counts (`+3 −1`, `new +12`), when it changed since the baseline.
+fn since_badge(since: Option<FileSince>, theme: &ReviewTheme) -> Option<Line> {
+    let minus = theme.icons.minus;
+    let text = match since? {
+        FileSince::Changed { added, removed } => {
+            let delta = if theme.icons.menu.is_ascii() {
+                "d"
+            } else {
+                "Δ"
+            };
+            format!("{delta}+{added}{minus}{removed}")
+        }
+        FileSince::New { added, .. } => format!("new +{added}"),
+        _ => return None,
+    };
+    Some(Line::from_spans(vec![Span::styled(
+        text,
+        theme.since.badge,
+    )]))
 }
 
 fn file_totals(row: &FileRow) -> Totals {
@@ -718,7 +1009,7 @@ mod tests {
     use crate::testing::harness::paint;
     use crate::theme::IconStyle;
     use bcode_code_review::document::DocumentConfig;
-    use bcode_code_review::testing::document::{Fake, SynthFile};
+    use bcode_code_review::testing::document::{Fake, SOURCE, SynthFile};
     use bmux_tui::component::{Component, Constraints, LayoutCx};
     use bmux_tui::geometry::Size;
     use bmux_tui::paint::LocalRect;
@@ -852,6 +1143,237 @@ mod tests {
                 assert!(text.contains("ファイル"), "{text}");
                 assert!(text.contains('🦀'), "{text}");
                 assert!(text.contains("e\u{301}te\u{301}"), "{text}");
+            }
+        }
+    }
+
+    fn delta(
+        kind: DeltaKind,
+        files: Vec<(&str, FileSince)>,
+    ) -> bcode_code_review_models::LayerDelta {
+        use bcode_code_review_models::{DeltaFile, LayerDelta, LayerPair, VersionPoint};
+        let mut files: Vec<DeltaFile> = files
+            .into_iter()
+            .map(|(path, since)| DeltaFile {
+                path: path.to_owned(),
+                since,
+            })
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        LayerDelta {
+            pair: LayerPair {
+                number: 7,
+                from: Some(VersionPoint {
+                    head_oid: "old".into(),
+                    fork_oid: None,
+                }),
+                to: VersionPoint {
+                    head_oid: "head".into(),
+                    fork_oid: None,
+                },
+            },
+            kind,
+            replay_oid: Some("replay".into()),
+            files,
+        }
+    }
+
+    fn compare(
+        doc: &mut ReviewDocument,
+        source: &str,
+        delta: bcode_code_review_models::LayerDelta,
+        view: bcode_code_review::document::CompareView,
+    ) {
+        doc.set_comparison(
+            source,
+            Some(bcode_code_review::document::GroupComparison {
+                delta: Some(delta),
+                view,
+                ..Default::default()
+            }),
+        );
+    }
+
+    fn compared() -> Fake {
+        Fake::new(vec![
+            SynthFile::added("src/changed.rs", 10),
+            SynthFile::added("src/new.rs", 4),
+            SynthFile::added("src/same.rs", 6),
+        ])
+    }
+
+    fn changed_delta() -> bcode_code_review_models::LayerDelta {
+        delta(
+            DeltaKind::Changed,
+            vec![
+                (
+                    "src/changed.rs",
+                    FileSince::Changed {
+                        added: 3,
+                        removed: 1,
+                    },
+                ),
+                (
+                    "src/new.rs",
+                    FileSince::New {
+                        added: 4,
+                        removed: 0,
+                    },
+                ),
+                ("src/gone.rs", FileSince::Dropped),
+            ],
+        )
+    }
+
+    fn label_of<'a>(tree: &'a FileTree, needle: &str) -> &'a TreeViewItem {
+        tree.items()
+            .iter()
+            .find(|item| item.label.contains(needle))
+            .unwrap_or_else(|| panic!("no row {needle}: {:?}", tree.items()))
+    }
+
+    #[test]
+    fn compared_files_are_marked_receded_and_dropped_ones_listed() {
+        use bcode_code_review::document::CompareView;
+        let fake = compared();
+        let mut doc = fake.document(DocumentConfig::default());
+        compare(&mut doc, SOURCE, changed_delta(), CompareView::Full);
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let tree = FileTree::new(&doc, &theme);
+        // Changed and new files are marked before their status, with their since counts.
+        let changed = label_of(&tree, "changed.rs");
+        assert!(changed.label.starts_with("● "), "{:?}", changed.label);
+        let trailing: Vec<String> = changed.trailing.iter().map(Line::plain_text).collect();
+        assert!(trailing.contains(&"Δ+3−1".to_owned()), "{trailing:?}");
+        assert!(label_of(&tree, "new.rs").label.starts_with("+ "));
+        // The unchanged file is listed, unmarked, in the full view.
+        let same = label_of(&tree, "same.rs");
+        assert!(same.label.starts_with("A "), "{:?}", same.label);
+        // The dropped file is listed, struck through and inert.
+        let gone = label_of(&tree, "src/gone.rs");
+        assert!(gone.disabled);
+        assert!(tree.file_of(&gone.id).is_none());
+        assert!(!tree.is_expandable(&gone.id));
+        assert_eq!(tree.hidden_files(), 0);
+        assert_eq!(tree.file_count(), 3);
+    }
+
+    #[test]
+    fn the_changes_view_leaves_out_unchanged_files_like_the_document() {
+        use bcode_code_review::document::CompareView;
+        let fake = compared();
+        let mut doc = fake.document(DocumentConfig::default());
+        compare(&mut doc, SOURCE, changed_delta(), CompareView::Changes);
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let tree = FileTree::new(&doc, &theme);
+        assert!(
+            !tree
+                .items()
+                .iter()
+                .any(|item| item.label.contains("same.rs"))
+        );
+        assert_eq!(tree.hidden_files(), 1);
+        assert_eq!(tree.total_files(), 3);
+        // Shown anyway: back in the tree, counted as shown.
+        doc.set_compare_files_shown(SOURCE, true);
+        let tree = FileTree::new(&doc, &theme);
+        assert!(
+            tree.items()
+                .iter()
+                .any(|item| item.label.contains("same.rs"))
+        );
+        assert_eq!(tree.hidden_files(), 0);
+        assert_eq!(tree.hideable_shown(), 1);
+    }
+
+    #[test]
+    fn group_rows_say_what_each_comparison_found_and_stay_when_all_is_hidden() {
+        use bcode_code_review::document::CompareView;
+        let fake = compared();
+        let mut doc = ReviewDocument::new(
+            std::path::PathBuf::from("/repo"),
+            vec![fake.input("a"), fake.input("b"), fake.input("c")],
+            DocumentConfig::default(),
+        );
+        compare(&mut doc, "a", changed_delta(), CompareView::Full);
+        compare(
+            &mut doc,
+            "b",
+            delta(DeltaKind::RebasedOnly, Vec::new()),
+            CompareView::Full,
+        );
+        doc.set_comparison(
+            "c",
+            Some(bcode_code_review::document::GroupComparison::default()),
+        );
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let tree = FileTree::new(&doc, &theme);
+        let groups: Vec<&str> = tree
+            .items()
+            .iter()
+            .filter(|item| item.depth == 0 && item.id.starts_with('g'))
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(groups.len(), 3, "{groups:?}");
+        assert!(groups[0].ends_with("● +7 −1 · 3 files"), "{groups:?}");
+        // Only rebased: every file hidden, the group still says so.
+        assert!(
+            groups[1].ends_with("○ rebased only · 3 hidden"),
+            "{groups:?}"
+        );
+        assert!(groups[2].ends_with("⋯ comparing"), "{groups:?}");
+        assert_eq!(tree.hidden_files(), 3);
+        assert_eq!(tree.sources(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn compared_rows_stay_inside_tiny_widths() {
+        use bcode_code_review::document::CompareView;
+        let fake = compared();
+        let mut doc = ReviewDocument::new(
+            std::path::PathBuf::from("/repo"),
+            vec![fake.input("漢字ソース"), fake.input("b")],
+            DocumentConfig::default(),
+        );
+        compare(&mut doc, "漢字ソース", changed_delta(), CompareView::Full);
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let tree = FileTree::new(&doc, &theme);
+        let state = RefCell::new(TreeViewState::new(None));
+        state
+            .borrow_mut()
+            .set_expanded_ids(tree.expandable_ids().map(str::to_owned));
+        let component = TreeViewComponent::new("tree", tree.items(), &state)
+            .items_revision(tree.revision())
+            .trailing_layout(
+                TreeViewTrailingLayout::new()
+                    .min_label_width(10)
+                    .label_overflow(TreeViewLabelOverflow::Ellipsis),
+            );
+        let height = u16::try_from(tree.items().len()).unwrap();
+        for width in [0_u16, 1, 2, 4, 9, 18, 30, 60] {
+            let screen = paint(width + 2, height, |area, cx| {
+                let layout = component.layout(
+                    Constraints::tight(Size::new(width, area.height)),
+                    &mut LayoutCx::new(),
+                );
+                cx.with_child(1, 0, LocalRect::new(0, 0, width, area.height), |cx| {
+                    component.paint(&layout, cx);
+                });
+            });
+            for y in 0..height {
+                assert_eq!(screen.cell(0, y).unwrap().symbol, " ", "{width}: {y}");
+                assert_eq!(
+                    screen.cell(width + 1, y).unwrap().symbol,
+                    " ",
+                    "{width}: {y}"
+                );
+                assert!(!screen.row_text(y).contains('\u{fffd}'));
+            }
+            for hit in screen.hits() {
+                assert!(
+                    hit.area.x >= 1 && hit.area.right() <= width + 1,
+                    "{width}: {hit:?}"
+                );
             }
         }
     }

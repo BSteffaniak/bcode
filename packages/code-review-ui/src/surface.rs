@@ -152,6 +152,7 @@ enum Phase {
 mod annotate;
 mod assist;
 mod compare;
+mod compare_legend;
 mod compare_view;
 mod conversation;
 mod dock;
@@ -3381,11 +3382,7 @@ impl ReviewSurface {
             .is_some_and(|area| area.contains(mouse.position));
         if pressed {
             self.focus_at(mouse.position);
-            // The file panel's hide action.
-            if in_files && self.files_action_at(mouse.position) {
-                self.panels.toggle_files();
-                self.focus = Focus::Review;
-                self.persist_panels();
+            if in_files && self.files_chrome_click(mouse.position) {
                 return Action::Redraw;
             }
         }
@@ -3577,6 +3574,18 @@ impl ReviewSurface {
         state.set_vertical_offset(next);
         self.tree_scroll.set(state);
         true
+    }
+
+    /// Run a press on the file panel's chrome at `position`: its hide action, or a row of the
+    /// comparison legend. Returns whether it was one.
+    fn files_chrome_click(&mut self, position: bmux_tui::geometry::Point) -> bool {
+        if self.files_action_at(position) {
+            self.panels.toggle_files();
+            self.focus = Focus::Review;
+            self.persist_panels();
+            return true;
+        }
+        self.legend_click(position)
     }
 
     /// Whether `position` is on the file panel's hide action, from the pane's own title layout.
@@ -4471,15 +4480,22 @@ impl ReviewSurface {
             Span::styled(theme.icons.filter, theme.accent),
             Span::raw(" "),
         ])]));
-        let content = Column::new()
-            .id("review.files.content")
-            .child(
-                Row::new()
-                    .id("review.files.filter_row")
-                    .child(prompt)
-                    .flex(Flex::new(1, filter)),
-            )
-            .flex(Flex::new(1, viewport));
+        let mut content = Column::new().id("review.files.content").child(
+            Row::new()
+                .id("review.files.filter_row")
+                .child(prompt)
+                .flex(Flex::new(1, filter)),
+        );
+        // The comparison legend: each row its own block, wrapping within the panel, so its
+        // click target is the rect it is laid out in.
+        for (index, row) in self.compare_legend().into_iter().enumerate() {
+            content = content.child(
+                TextBlock::new(Text::from_lines(vec![row.line]))
+                    .id(format!("{}{index}", compare_legend::LEGEND_ROW_ID))
+                    .wrap(bmux_tui::text::TextWrap::Word),
+            );
+        }
+        let content = content.flex(Flex::new(1, viewport));
         Self::pane(
             FILES_PANE_ID,
             self.files_pane_chrome(review),
