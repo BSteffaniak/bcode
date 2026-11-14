@@ -36,6 +36,7 @@ impl ReviewDocument {
         rebuilt.composer.clone_from(&self.composer);
         rebuilt.marks = std::mem::take(&mut self.marks);
         rebuilt.comparisons = std::mem::take(&mut self.comparisons);
+        rebuilt.comparison_summaries = std::mem::take(&mut self.comparison_summaries);
         rebuilt.compare_files_shown = std::mem::take(&mut self.compare_files_shown);
         rebuilt.expanded_removals = std::mem::take(&mut self.expanded_removals);
         rebuilt.filtered = std::mem::take(&mut self.filtered);

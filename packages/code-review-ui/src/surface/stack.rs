@@ -308,13 +308,18 @@ impl ReviewSurface {
 
     /// Index of the rail entry the cursor is in.
     pub(super) fn current_layer(&self, entries: &[RailEntry]) -> Option<usize> {
+        let source = self.cursor_source()?;
+        entries.iter().position(|entry| entry.source_id == source)
+    }
+
+    /// The source the cursor is in, else the layer last entered.
+    pub(super) fn cursor_source(&self) -> Option<String> {
         let review = self.review.as_ref()?;
-        let source = match review.doc.item(review.cursor_index)? {
+        match review.doc.item(review.cursor_index)? {
             ReviewItem::SourceHeader(header) => Some(header.source_id.clone()),
             item => item.file().map(|file: &FileRef| file.source_id.clone()),
         }
-        .or_else(|| self.rail_layer.clone())?;
-        entries.iter().position(|entry| entry.source_id == source)
+        .or_else(|| self.rail_layer.clone())
     }
 
     /// Step to the next or previous layer (wrapping), remembering the position in the one left.
@@ -492,12 +497,9 @@ impl ReviewSurface {
         };
         let (glyph, text, style) = match delta.kind {
             DeltaKind::Changed | DeltaKind::WithRebase => {
-                let (added, removed) = delta.totals();
-                let files = delta
-                    .files
-                    .iter()
-                    .filter(|file| file.since.changed())
-                    .count();
+                // Summed when the comparison was set: painting costs nothing per file.
+                let summary = review.doc.comparison_summary(source_id).unwrap_or_default();
+                let (added, removed, files) = (summary.added, summary.removed, summary.files);
                 let glyph = if delta.kind == DeltaKind::WithRebase {
                     icons.since_with_rebase
                 } else {

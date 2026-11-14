@@ -1,27 +1,30 @@
 //! Comparisons on the review screen (see `docs/review-stack-history.md`).
 //!
-//! A review of pull request layers compares each layer, in place, with a baseline: by default
-//! the version the reviewer last looked at (from the looks recorded as the reviewer works,
-//! seeded from completed passes and the reviewer's own reviews on the forge, pinned for the
-//! session); else the version before the stack's latest push, the versions at some time or
-//! between two pushes, or two versions picked for one pull request. Each layer's delta is
-//! computed in one batched call and laid over the document; nothing about the review's sources
-//! changes. Looks are recorded when a file is marked viewed, a comment or AI question is made, a
-//! pass is completed, or a layer stays current for the dwell time.
+//! A review compares each of its sources, in place, with a baseline. Pull requests (stack
+//! layers and single pull requests) are compared by default with the version the reviewer last
+//! looked at (from the looks recorded as the reviewer works, seeded from completed passes and
+//! the reviewer's own reviews on the forge, pinned for the session); else with the version
+//! before the stack's latest push, the versions at some time or between two pushes, or two
+//! versions picked for one pull request. Other sources (a branch, a range, a whole stack) are
+//! compared with the revisions of the review's last completed pass. Every delta is computed in
+//! one batched call and laid over the document; nothing about the review's sources changes.
+//! Looks are recorded when a file is marked viewed, a comment or AI question is made, a pass is
+//! completed, or a layer stays current for the dwell time.
 
-use super::super::loader::Message;
+use super::super::loader::{Message, StepsArrived};
 use super::ReviewSurface;
 use crate::compare_bar::{BannerPlan, BarPlan};
 use crate::config::compare::{BaselineLook, RebasedLayers, StartView};
 use crate::context::UiContext;
-use bcode_code_review::document::{CompareView, FileKey, GroupComparison};
+use bcode_code_review::document::{CompareView, FileKey, GroupComparison, VersionStep};
 use bcode_code_review::history::looks::{self, BaselineRule, LastLooked};
 use bcode_code_review::history::version_at;
 use bcode_code_review_models::{
     ChangeKind, DeltaKind, LayerDelta, LayerLook, LayerPair, LayerTimeline, ListLayerLooksRequest,
     ListLayerLooksResponse, LookKind, RecordLayerLooksRequest, RecordLayerLooksResponse,
-    ReviewCompareBaseline as Baseline, ReviewCompareLayersRequest, ReviewCompareLayersResponse,
-    ReviewVersionsKeepRequest, ReviewVersionsKeepResponse, StackTimeline, VersionPoint,
+    ResolvedSourceMode, ReviewCompareBaseline as Baseline, ReviewCompareLayersRequest,
+    ReviewCompareLayersResponse, ReviewSourceKind, ReviewVersionsKeepRequest,
+    ReviewVersionsKeepResponse, ReviewedRevision, StackTimeline, VersionPoint,
 };
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::status_bar::StatusSeverity;
@@ -69,8 +72,17 @@ pub struct Comparing {
     asked: BTreeSet<u64>,
     /// Layers whose looks were listed.
     listed: BTreeSet<u64>,
-    /// Each layer's last-looked baseline, pinned when first resolved.
-    baselines: BTreeMap<u64, LastLooked>,
+    /// Layers whose looks could not be read: not compared with what was looked at, and asked
+    /// again when the review is refreshed.
+    failed: BTreeSet<u64>,
+    /// Each layer's last-looked baseline, pinned when first resolved, with the head the layer
+    /// had when it was pinned.
+    baselines: BTreeMap<u64, (String, LastLooked)>,
+    /// The saved baseline, restored: kept only while no layer moved since the reviewer last
+    /// looked (checked once every layer's looks are in).
+    restored: Option<Baseline>,
+    /// Looks recorded in this session, in order.
+    session_looks: Vec<LayerLook>,
     /// The pair each compared source shows (or is computing), by source id.
     pairs: BTreeMap<String, Compared>,
     /// How compared sources show their files.
@@ -93,9 +105,11 @@ pub struct Comparing {
     dwell: Option<(u64, String, Instant)>,
     /// Layers whose version steps were asked for, with the head they were asked at.
     steps_asked: BTreeSet<(u64, String)>,
+    /// Heads the history was read again for, because it did not know them.
+    history_asked: BTreeSet<String>,
     /// Each layer's version steps, by number, once computed (they belong to the layer, not to
-    /// what it is compared with).
-    steps: BTreeMap<u64, Vec<LayerDelta>>,
+    /// what it is compared with), with the head they were computed for.
+    steps: BTreeMap<u64, LayerSteps>,
     /// The push timeline while it has the keyboard.
     pub(super) timeline: Option<TimelineFocus>,
     /// The comparison row as last painted.
@@ -146,9 +160,11 @@ impl Comparing {
         self.moved = true;
     }
 
-    /// The document was replaced: it has no overlays, so every layer is laid over again.
+    /// The document was replaced (opened or refreshed): it has no overlays, so every layer is
+    /// laid over again; looks that could not be read are asked for again.
     pub(super) fn document_replaced(&mut self) {
         self.pairs.clear();
+        self.failed.clear();
         self.moved = true;
     }
 
@@ -157,24 +173,109 @@ impl Comparing {
         std::mem::replace(&mut self.moved, false)
     }
 
-    /// The looks of layer `number`.
+    /// The looks of layer `number`: those listed and those recorded in this session.
     pub(super) fn looks_of(&self, number: u64) -> Vec<LayerLook> {
         self.looks
             .iter()
             .flatten()
+            .chain(&self.session_looks)
             .filter(|look| look.number == number)
             .cloned()
             .collect()
     }
+
+    /// Heads the reviewer engaged with (viewed, commented, asked, completed a pass, reviewed),
+    /// from the looks listed and those recorded in this session.
+    pub(super) fn engaged_heads(&self) -> BTreeSet<String> {
+        self.looks
+            .iter()
+            .flatten()
+            .chain(&self.session_looks)
+            .filter(|look| look.kind.engaged())
+            .map(|look| look.head_oid.clone())
+            .collect()
+    }
 }
 
-/// One step-through layer of the review.
+/// A layer's version steps and the head they were computed for.
+#[derive(Debug, Clone, Default)]
+struct LayerSteps {
+    head: String,
+    current_version: usize,
+    steps: Vec<VersionStep>,
+}
+
+/// One pull request of the review: a step-through stack layer (by its top layer) or a single
+/// pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LayerSource {
     pub source_id: String,
+    pub provider: String,
+    pub repository: String,
     pub number: u64,
     pub head: String,
     pub fork: String,
+}
+
+/// A source of the review that is not a pull request (a branch, a range, a whole stack): it is
+/// compared with the revisions of the review's last completed pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlainSource {
+    source_id: String,
+    head: String,
+    base: String,
+}
+
+/// The pair comparing a source that is not a pull request from `reviewed` (the last completed
+/// pass) to its current `head` and `base`; `None` without a pass that recorded both commits.
+fn plain_pair(source: &PlainSource, reviewed: Option<&ReviewedRevision>) -> Option<LayerPair> {
+    let reviewed = reviewed?;
+    let from = VersionPoint {
+        head_oid: reviewed.reviewed_head_oid.clone()?,
+        fork_oid: Some(reviewed.reviewed_base_oid.clone()?),
+    };
+    Some(LayerPair {
+        number: 0,
+        from: Some(from),
+        to: VersionPoint {
+            head_oid: source.head.clone(),
+            fork_oid: Some(source.base.clone()),
+        },
+    })
+}
+
+/// The baseline of a layer that moved to `head` while the review was open, its baseline
+/// `pinned` until then: the newer of the pinned look and the newest look of this session that
+/// `rule` counts (the version the reviewer engaged with before the move).
+fn moved_baseline(
+    pinned: &LastLooked,
+    session_looks: &[LayerLook],
+    number: u64,
+    head: &str,
+    rule: BaselineRule,
+) -> LastLooked {
+    let order = |look: &LayerLook| (look.looked_at_ms, look.kind);
+    let engaged = session_looks
+        .iter()
+        .filter(|look| look.number == number)
+        .filter(|look| rule == BaselineRule::Opened || look.kind.engaged())
+        .max_by_key(|look| order(look));
+    let newest = match (engaged, pinned.look()) {
+        (Some(session), Some(pinned)) => {
+            if order(session) >= order(pinned) {
+                session
+            } else {
+                pinned
+            }
+        }
+        (Some(look), None) | (None, Some(look)) => look,
+        (None, None) => return LastLooked::NewToYou,
+    };
+    if newest.head_oid == head {
+        LastLooked::Unchanged(newest.clone())
+    } else {
+        LastLooked::Since(newest.clone())
+    }
 }
 
 impl LayerSource {
@@ -261,8 +362,46 @@ pub(super) fn column_time(timeline: &StackTimeline, column: usize) -> Option<u64
         .map(|push| push.at_ms.saturating_sub(1))
 }
 
+/// One of the reviewer's reviews on the forge: number, commit, and time.
+type ForgeReview = (u64, String, u64);
+
+/// What the rule in effect makes of each source: source, head shown, layer number (0 for a
+/// source that is not a pull request), and rule.
+type Wanted = Vec<(String, String, u64, Rule)>;
+
+/// Record `looks` and keep their heads' commits with refs, releasing the heads pruned.
+async fn record_and_keep(
+    services: &crate::services::ReviewServices,
+    repo: &std::path::Path,
+    looks: Vec<LayerLook>,
+) {
+    let keep: Vec<String> = looks
+        .iter()
+        .map(|look| look.head_oid.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let recorded: Result<RecordLayerLooksResponse, _> = services
+        .call(RecordLayerLooksRequest {
+            repo_path: repo.to_path_buf(),
+            looks,
+        })
+        .await;
+    let release = recorded
+        .map(|recorded| recorded.pruned_heads)
+        .unwrap_or_default();
+    let _: Result<ReviewVersionsKeepResponse, _> = services
+        .call(ReviewVersionsKeepRequest {
+            repo_path: repo.to_path_buf(),
+            keep,
+            release,
+        })
+        .await;
+}
+
 impl ReviewSurface {
-    /// The review's pull request layers: step-through stack-layer sources, by their top layer.
+    /// The review's pull requests: step-through stack-layer sources (by their top layer) and
+    /// single pull request sources.
     pub(super) fn layer_sources(&self) -> Vec<LayerSource> {
         let Some(review) = self.review.as_ref() else {
             return Vec::new();
@@ -272,22 +411,96 @@ impl ReviewSurface {
             .groups()
             .filter(|group| !group.loading && group.source.part.is_none())
             .filter_map(|group| {
-                let stack = group.stack.filter(|stack| !stack.whole)?;
-                let layer = stack.stack.layers.last()?;
+                let source_id = group.source.source_id.clone();
+                let (provider, repository, kind_number) = self.pull_scope_of(&source_id)?;
+                let (number, head, fork) = match group.stack {
+                    Some(stack) if stack.whole => return None,
+                    Some(stack) => {
+                        let layer = stack.stack.layers.last()?;
+                        (layer.number, layer.head_oid.clone(), layer.base_oid.clone())
+                    }
+                    None => (
+                        kind_number?,
+                        group.source.head.commit_oid()?.to_owned(),
+                        group.source.base.commit_oid()?.to_owned(),
+                    ),
+                };
                 Some(LayerSource {
-                    source_id: group.source.source_id.clone(),
-                    number: layer.number,
-                    head: layer.head_oid.clone(),
-                    fork: layer.base_oid.clone(),
+                    source_id,
+                    provider,
+                    repository,
+                    number,
+                    head,
+                    fork,
                 })
             })
             .collect()
     }
 
-    /// The provider and repository the review's pull requests belong to.
-    pub(super) fn pulls_scope(&self) -> Option<(String, String)> {
-        let news = self.stack_news.as_ref()?;
-        Some((news.provider.clone(), news.repository.clone()))
+    /// The provider, repository, and pull request number (for a single pull request) of source
+    /// `source_id`: from its kind, else from the stack the review follows. `None` for a source
+    /// that is not about pull requests.
+    fn pull_scope_of(&self, source_id: &str) -> Option<(String, String, Option<u64>)> {
+        let kind = &self
+            .sources
+            .iter()
+            .find(|source| source.id == source_id)?
+            .kind;
+        match kind {
+            ReviewSourceKind::PullRequest {
+                provider,
+                repository,
+                number,
+            } => Some((provider.clone(), repository.clone(), Some(*number))),
+            ReviewSourceKind::StackLayer {
+                provider,
+                repository,
+                ..
+            }
+            | ReviewSourceKind::Stack {
+                provider,
+                repository,
+                ..
+            } => Some((provider.clone(), repository.clone(), None)),
+            _ => None,
+        }
+    }
+
+    /// The review's sources that are not pull requests and show a diff between two commits (a
+    /// branch, a range, a whole stack): compared with the review's last completed pass.
+    fn plain_sources(&self) -> Vec<PlainSource> {
+        let Some(review) = self.review.as_ref() else {
+            return Vec::new();
+        };
+        let layers: BTreeSet<String> = self
+            .layer_sources()
+            .into_iter()
+            .map(|layer| layer.source_id)
+            .collect();
+        review
+            .doc
+            .groups()
+            .filter(|group| {
+                !group.loading
+                    && group.source.part.is_none()
+                    && group.source.mode == ResolvedSourceMode::Diff
+                    && !layers.contains(&group.source.source_id)
+            })
+            .filter(|group| {
+                // A pull request source whose stack or commits are not known is not plain.
+                group.stack.map_or_else(
+                    || self.pull_scope_of(&group.source.source_id).is_none(),
+                    |stack| stack.whole,
+                )
+            })
+            .filter_map(|group| {
+                Some(PlainSource {
+                    source_id: group.source.source_id.clone(),
+                    head: group.source.head.commit_oid()?.to_owned(),
+                    base: group.source.base.commit_oid()?.to_owned(),
+                })
+            })
+            .collect()
     }
 
     fn review_id(&self) -> Option<String> {
@@ -300,20 +513,21 @@ impl ReviewSurface {
             .flatten()
     }
 
-    /// Whether the review compares pull requests: it has layers and knows their repository.
+    /// Whether the review compares its sources: it has pull requests, or other sources a
+    /// completed pass recorded.
     pub(super) fn compares_pulls(&self) -> bool {
-        self.comparing.started && self.pulls_scope().is_some() && !self.layer_sources().is_empty()
+        self.comparing.started
+            && (!self.layer_sources().is_empty() || !self.plain_sources().is_empty())
     }
 
-    /// Ask for the reviewer's looks at the review's layers once its stack is known, seeding
-    /// them first from the passes this review recorded; restore the baseline the review last
-    /// compared with (else the configured one).
+    /// Ask for the reviewer's looks at the review's pull requests once its sources are known,
+    /// seeding them first from the passes this review recorded; restore the baseline the
+    /// review last compared with (else the configured one).
     pub(super) fn start_comparison(&mut self, host: &UiContext) {
-        if self.comparing.started || self.pulls_scope().is_none() {
+        if self.comparing.started {
             return;
         }
-        let layers = self.layer_sources();
-        if layers.is_empty() {
+        if self.layer_sources().is_empty() && self.plain_sources().is_empty() {
             return;
         }
         self.comparing.started = true;
@@ -322,13 +536,13 @@ impl ReviewSurface {
             .workspace
             .as_ref()
             .and_then(|workspace| workspace.presentation.as_ref());
-        self.comparing.baseline = presentation
-            .and_then(|state| state.compare.baseline)
-            .unwrap_or_else(|| {
-                config
-                    .default_baseline
-                    .baseline(super::super::history::now_ms())
-            });
+        let saved = presentation.and_then(|state| state.compare.baseline);
+        self.comparing.restored = saved.filter(|saved| *saved != Baseline::LastLooked);
+        self.comparing.baseline = saved.unwrap_or_else(|| {
+            config
+                .default_baseline
+                .baseline(super::super::history::now_ms())
+        });
         self.comparing.only_changed = presentation.is_some_and(|state| state.compare.only_changed)
             || config.rebased_layers == RebasedLayers::Hide;
         self.comparing.view = match config.start_view {
@@ -341,70 +555,73 @@ impl ReviewSurface {
     /// List the reviewer's looks at the layers not asked about yet (layers arrive after the
     /// first frame), seeding them first from the passes this review recorded.
     fn list_looks(&mut self, host: &UiContext) {
-        let Some((provider, repository)) = self.pulls_scope() else {
-            return;
-        };
         let layers: Vec<LayerSource> = self
             .layer_sources()
             .into_iter()
-            .filter(|layer| !self.comparing.asked.contains(&layer.number))
+            .filter(|layer| {
+                !self.comparing.asked.contains(&layer.number)
+                    && !self.comparing.failed.contains(&layer.number)
+            })
             .collect();
         if layers.is_empty() {
             return;
         }
-        let reviewed: Vec<(u64, bcode_code_review_models::ReviewedRevision)> = self
-            .workspace
-            .as_ref()
-            .map(|workspace| {
-                layers
-                    .iter()
-                    .filter_map(|layer| {
-                        let revision = workspace.reviewed_revisions.get(&layer.source_id)?;
-                        Some((layer.number, revision.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let seeded = looks::pass_looks(
-            &provider,
-            &repository,
-            &reviewed,
-            self.review_id().as_deref(),
-        );
-        let numbers: Vec<u64> = layers.iter().map(|layer| layer.number).collect();
-        self.comparing.asked.extend(numbers.iter().copied());
-        let (services, inbox, repo) = (
-            self.services.clone(),
-            self.inbox.clone(),
-            self.repo_path.clone(),
-        );
-        host.spawn(Box::pin(async move {
-            if !seeded.is_empty() {
-                let _: Result<RecordLayerLooksResponse, _> = services
-                    .call(RecordLayerLooksRequest {
-                        repo_path: repo.clone(),
-                        looks: seeded,
+        let review_id = self.review_id();
+        // One listing per repository (a review's pull requests are normally of one).
+        let mut scopes: BTreeMap<(String, String), Vec<LayerSource>> = BTreeMap::new();
+        for layer in layers {
+            scopes
+                .entry((layer.provider.clone(), layer.repository.clone()))
+                .or_default()
+                .push(layer);
+        }
+        for ((provider, repository), layers) in scopes {
+            let reviewed: Vec<(u64, ReviewedRevision)> = self
+                .workspace
+                .as_ref()
+                .map(|workspace| {
+                    layers
+                        .iter()
+                        .filter_map(|layer| {
+                            let revision = workspace.reviewed_revisions.get(&layer.source_id)?;
+                            Some((layer.number, revision.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let seeded = looks::pass_looks(&provider, &repository, &reviewed, review_id.as_deref());
+            let numbers: Vec<u64> = layers.iter().map(|layer| layer.number).collect();
+            self.comparing.asked.extend(numbers.iter().copied());
+            let (services, inbox, repo) = (
+                self.services.clone(),
+                self.inbox.clone(),
+                self.repo_path.clone(),
+            );
+            host.spawn(Box::pin(async move {
+                if !seeded.is_empty() {
+                    record_and_keep(&services, &repo, seeded).await;
+                }
+                let listed: Result<ListLayerLooksResponse, _> = services
+                    .call(ListLayerLooksRequest {
+                        repo_path: repo,
+                        provider,
+                        repository,
+                        numbers: numbers.clone(),
                     })
                     .await;
-            }
-            let listed: Result<ListLayerLooksResponse, _> = services
-                .call(ListLayerLooksRequest {
-                    repo_path: repo,
-                    provider,
-                    repository,
-                    numbers: numbers.clone(),
-                })
-                .await;
-            inbox.push(Message::Looks(
-                numbers,
-                listed
-                    .map(|listed| listed.looks)
-                    .map_err(|error| error.message),
-            ));
-        }));
+                inbox.push(Message::Looks(
+                    numbers,
+                    listed
+                        .map(|listed| listed.looks)
+                        .map_err(|error| error.message),
+                ));
+            }));
+        }
     }
 
-    /// The looks at layers `numbers` arrived: compare those layers with their baselines.
+    /// The looks at layers `numbers` arrived: compare those layers with their baselines. When
+    /// they could not be read, those layers are not compared with what was looked at (until
+    /// the review is refreshed), so the rest of the review is not held up.
     pub(super) fn apply_looks(
         &mut self,
         numbers: &[u64],
@@ -418,32 +635,96 @@ impl ReviewSurface {
                     .looks
                     .get_or_insert_with(Vec::new)
                     .extend(looks);
-                self.refresh_comparison(host);
             }
-            Err(error) => self.set_status(
-                format!("could not read what you looked at before: {error}"),
-                StatusSeverity::Warning,
-            ),
+            Err(error) => {
+                for number in numbers {
+                    self.comparing.asked.remove(number);
+                    self.comparing.failed.insert(*number);
+                }
+                self.set_status(
+                    format!("could not read what you looked at before: {error} (r tries again)"),
+                    StatusSeverity::Warning,
+                );
+            }
+        }
+        self.check_restored_baseline();
+        self.refresh_comparison(host);
+        self.decide_banner();
+    }
+
+    /// Once every layer's looks are in: a restored baseline other than "you last looked"
+    /// yields to it when some layer moved since the reviewer last looked, so a changed stack
+    /// reopens showing what is new since then (with the banner).
+    fn check_restored_baseline(&mut self) {
+        if self.comparing.restored.is_none() || !self.looks_settled() {
+            return;
+        }
+        self.comparing.restored = None;
+        let rule = self.baseline_rule();
+        let looks = self.comparing.looks.clone().unwrap_or_default();
+        let moved = self.layer_sources().iter().any(|layer| {
+            matches!(
+                looks::last_looked(&looks, layer.number, &layer.head, rule),
+                LastLooked::Since(_)
+            )
+        }) || self.plain_sources().iter().any(|source| {
+            self.reviewed_revision(&source.source_id)
+                .and_then(|revision| revision.reviewed_head_oid.as_deref())
+                .is_some_and(|head| head != source.head)
+        });
+        if moved {
+            self.comparing.baseline = Baseline::LastLooked;
+            self.comparing.picks.clear();
+            self.comparing.banner = BannerState::Undecided;
         }
     }
 
-    /// The last-looked rule for `layer`: its pinned baseline (a layer that moved while open is
-    /// compared with the head it had).
-    fn last_looked_pair(&mut self, layer: &LayerSource) -> Option<LayerPair> {
-        let rule = match self.services.compare_config().baseline_look {
+    /// Whether every pull request's looks were listed (or could not be read).
+    fn looks_settled(&self) -> bool {
+        self.layer_sources().iter().all(|layer| {
+            self.comparing.listed.contains(&layer.number)
+                || self.comparing.failed.contains(&layer.number)
+        })
+    }
+
+    /// The revisions the review's last completed pass recorded for source `source_id`.
+    fn reviewed_revision(&self, source_id: &str) -> Option<&ReviewedRevision> {
+        self.workspace.as_ref()?.reviewed_revisions.get(source_id)
+    }
+
+    /// Which looks count for the baseline, by configuration.
+    const fn baseline_rule(&self) -> BaselineRule {
+        match self.services.compare_config().baseline_look {
             BaselineLook::Engaged => BaselineRule::Engaged,
             BaselineLook::Opened => BaselineRule::Opened,
-        };
+        }
+    }
+
+    /// The last-looked rule for `layer`: its pinned baseline; a layer that moved while open is
+    /// compared from the version the reviewer engaged with before the move, else from its
+    /// pinned baseline.
+    fn last_looked_pair(&mut self, layer: &LayerSource) -> Option<LayerPair> {
+        let rule = self.baseline_rule();
         let looks = self.comparing.looks.as_ref()?;
-        let baseline = self
-            .comparing
-            .baselines
-            .entry(layer.number)
-            .or_insert_with(|| looks::last_looked(looks, layer.number, &layer.head, rule));
-        if let LastLooked::Unchanged(look) = baseline
-            && look.head_oid != layer.head
-        {
-            *baseline = LastLooked::Since(look.clone());
+        let (pinned_head, baseline) =
+            self.comparing
+                .baselines
+                .entry(layer.number)
+                .or_insert_with(|| {
+                    (
+                        layer.head.clone(),
+                        looks::last_looked(looks, layer.number, &layer.head, rule),
+                    )
+                });
+        if *pinned_head != layer.head {
+            *baseline = moved_baseline(
+                baseline,
+                &self.comparing.session_looks,
+                layer.number,
+                &layer.head,
+                rule,
+            );
+            pinned_head.clone_from(&layer.head);
         }
         let baseline = baseline.clone();
         let timeline = self.stack_history.as_ref().and_then(|history| {
@@ -470,9 +751,15 @@ impl ReviewSurface {
             Baseline::LastLooked => {
                 if self.comparing.listed.contains(&layer.number) {
                     self.last_looked_pair(layer).map_or(Rule::None, Rule::Pair)
+                } else if self.comparing.failed.contains(&layer.number) {
+                    Rule::None
                 } else {
                     Rule::Wait
                 }
+            }
+            // Without a stack there is no history: nothing to compare by time.
+            Baseline::PreviousPush | Baseline::Between { .. } if self.stack_news.is_none() => {
+                Rule::None
             }
             Baseline::PreviousPush => self.stack_history.as_ref().map_or(Rule::Wait, |history| {
                 before_last_push(history).map_or(Rule::None, |from_ms| {
@@ -485,73 +772,104 @@ impl ReviewSurface {
         }
     }
 
-    /// Compare each layer by the rule in effect, computing only the pairs that changed (a
-    /// layer that moved, a baseline chosen, or a source listed since). With the last-looked
-    /// rule nothing is compared when the reviewer never looked at any layer.
-    pub(super) fn refresh_comparison(&mut self, host: &UiContext) {
-        let layers = self.layer_sources();
-        if layers.is_empty() || !self.comparing.started {
-            return;
+    /// What the rule in effect makes of a source that is not a pull request: with "you last
+    /// looked", the last completed pass to now; nothing otherwise.
+    fn plain_rule(&self, source: &PlainSource) -> Rule {
+        if self.comparing.baseline != Baseline::LastLooked {
+            return Rule::None;
         }
-        self.list_looks(host);
-        let mut wanted: Vec<(LayerSource, Rule)> = Vec::new();
-        for layer in layers {
+        plain_pair(source, self.reviewed_revision(&source.source_id)).map_or(Rule::None, Rule::Pair)
+    }
+
+    /// The version steps of layer `number` for the head it shows, when computed.
+    fn steps_for(&self, number: u64, head: &str) -> LayerSteps {
+        self.comparing
+            .steps
+            .get(&number)
+            .filter(|steps| steps.head == head)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// What the rule in effect makes of each source. With the last-looked rule no pull request
+    /// is compared when the reviewer never looked at any.
+    fn wanted_rules(&mut self) -> Wanted {
+        let mut wanted: Wanted = Vec::new();
+        for layer in self.layer_sources() {
             let rule = self.rule_for(&layer);
-            wanted.push((layer, rule));
+            wanted.push((layer.source_id, layer.head, layer.number, rule));
         }
         if self.comparing.baseline == Baseline::LastLooked
             && !self
                 .comparing
                 .baselines
                 .values()
-                .any(|baseline| baseline.look().is_some())
+                .any(|(_, baseline)| baseline.look().is_some())
         {
             // Never looked at any layer: a first visit shows the review as it is (but for the
             // pull requests whose versions were picked).
-            for (layer, rule) in &mut wanted {
-                if matches!(rule, Rule::Pair(_))
-                    && !self.comparing.picks.contains_key(&layer.number)
-                {
+            for (_, _, number, rule) in &mut wanted {
+                if matches!(rule, Rule::Pair(_)) && !self.comparing.picks.contains_key(number) {
                     *rule = Rule::None;
                 }
             }
         }
+        for source in self.plain_sources() {
+            let rule = self.plain_rule(&source);
+            wanted.push((source.source_id, source.head, 0, rule));
+        }
+        wanted
+    }
+
+    /// Compare each source by the rule in effect, computing only the pairs that changed (a
+    /// layer that moved, a baseline chosen, or a source listed since). With the last-looked
+    /// rule no pull request is compared when the reviewer never looked at any.
+    pub(super) fn refresh_comparison(&mut self, host: &UiContext) {
+        if !self.comparing.started {
+            return;
+        }
+        self.check_restored_baseline();
+        self.list_looks(host);
+        let wanted = self.wanted_rules();
+        if wanted.is_empty() {
+            return;
+        }
         let view = self.comparing.view;
         let mut asked = Vec::new();
-        for (layer, rule) in wanted {
+        for (source_id, head, number, rule) in wanted {
             let pair = match rule {
                 Rule::Wait => continue,
                 Rule::None => {
-                    if self.comparing.pairs.remove(&layer.source_id).is_some()
+                    if self.comparing.pairs.remove(&source_id).is_some()
                         && let Some(review) = self.review.as_mut()
                     {
-                        review.doc.set_comparison(&layer.source_id, None);
+                        review.doc.set_comparison(&source_id, None);
                     }
                     continue;
                 }
                 Rule::Pair(pair) => pair,
             };
             let compared = Compared {
-                historical: pair.to.head_oid != layer.head,
+                historical: pair.to.head_oid != head,
                 pair,
             };
-            if self.comparing.pairs.get(&layer.source_id) == Some(&compared) {
+            if self.comparing.pairs.get(&source_id) == Some(&compared) {
                 continue;
             }
-            let steps = self
-                .comparing
-                .steps
-                .get(&layer.number)
-                .cloned()
-                .unwrap_or_default();
+            let steps = if number == 0 {
+                LayerSteps::default()
+            } else {
+                self.steps_for(number, &head)
+            };
             if let Some(review) = self.review.as_mut() {
                 review.doc.set_comparison(
-                    &layer.source_id,
+                    &source_id,
                     Some(GroupComparison {
                         delta: None,
                         view,
                         historical: compared.historical,
-                        steps,
+                        steps: steps.steps,
+                        current_version: steps.current_version,
                         ..GroupComparison::default()
                     }),
                 );
@@ -559,7 +877,7 @@ impl ReviewSurface {
             if !asked.contains(&compared.pair) {
                 asked.push(compared.pair.clone());
             }
-            self.comparing.pairs.insert(layer.source_id, compared);
+            self.comparing.pairs.insert(source_id, compared);
         }
         self.apply_compare_filter();
         if let Some(review) = self.review.as_mut() {
@@ -594,11 +912,9 @@ impl ReviewSurface {
 
     /// The pull request number of the layer the cursor is in.
     pub(super) fn current_layer_number(&self) -> Option<u64> {
-        let entries = self.rail_entries();
-        let source = entries
-            .get(self.current_layer(&entries)?)?
-            .source_id
-            .clone();
+        // The cursor's source, else the layer last entered (as the rail reads it, without
+        // building the rail's labels).
+        let source = self.cursor_source()?;
         self.layer_sources()
             .into_iter()
             .find(|layer| layer.source_id == source)
@@ -641,11 +957,11 @@ impl ReviewSurface {
         for delta in deltas {
             for (source_id, compared) in &self.comparing.pairs {
                 if compared.pair == delta.pair {
-                    let steps = self
-                        .comparing
-                        .steps
-                        .get(&compared.pair.number)
-                        .cloned()
+                    // The steps the source already carries (they belong to its head).
+                    let (steps, current_version) = review
+                        .doc
+                        .comparison(source_id)
+                        .map(|comparison| (comparison.steps.clone(), comparison.current_version))
                         .unwrap_or_default();
                     review.doc.set_comparison(
                         source_id,
@@ -654,6 +970,7 @@ impl ReviewSurface {
                             view,
                             historical: compared.historical,
                             steps,
+                            current_version,
                             ..GroupComparison::default()
                         }),
                     );
@@ -673,13 +990,10 @@ impl ReviewSurface {
     /// Once every compared layer's delta is in: show the banner when, compared with what the
     /// reviewer last looked at, some layer moved.
     fn decide_banner(&mut self) {
-        let all_listed = self
-            .layer_sources()
-            .iter()
-            .all(|layer| self.comparing.listed.contains(&layer.number));
         if self.comparing.banner != BannerState::Undecided
             || self.compare_pending() > 0
-            || !all_listed
+            || !self.looks_settled()
+            || self.comparing.restored.is_some()
         {
             return;
         }
@@ -719,8 +1033,10 @@ impl ReviewSurface {
 
     /// How many compared layers found what.
     pub(super) fn compare_counts(&self) -> CompareCounts {
+        let others = self.plain_sources().len();
         let mut counts = CompareCounts {
-            layers: self.layer_sources().len(),
+            layers: self.layer_sources().len() + others,
+            others,
             ..CompareCounts::default()
         };
         for source in self.comparing.pairs.keys() {
@@ -815,9 +1131,11 @@ impl ReviewSurface {
         );
     }
 
-    /// Compare every layer by `baseline` (clearing single picks), kept for the next open.
+    /// Compare every layer by `baseline` (clearing single picks), kept for the next open
+    /// (while no layer moved since the reviewer last looked).
     pub(super) fn set_compare_baseline(&mut self, baseline: Baseline, host: &UiContext) {
         self.comparing.baseline = baseline;
+        self.comparing.restored = None;
         self.comparing.picks.clear();
         self.comparing.timeline = None;
         if baseline != Baseline::LastLooked {
@@ -912,6 +1230,7 @@ impl ReviewSurface {
             );
         }
         self.comparing.baseline = Baseline::Off;
+        self.comparing.restored = None;
         self.comparing.picks = picks;
         self.comparing.banner = BannerState::Hidden;
         self.refresh_comparison(host);
@@ -940,11 +1259,16 @@ impl ReviewSurface {
         );
     }
 
+    /// Keep the comparison choice for the next open. Versions picked for single pull requests
+    /// (and the stack as it was) are for this session: the baseline under them is not saved.
     fn persist_compare_choice(&mut self) {
         let (baseline, only_changed) = (self.comparing.baseline, self.comparing.only_changed);
+        let picked = !self.comparing.picks.is_empty();
         if let Some(workspace) = self.workspace.as_mut() {
             let state = workspace.presentation.get_or_insert_with(Default::default);
-            state.compare.baseline = Some(baseline);
+            if !picked {
+                state.compare.baseline = Some(baseline);
+            }
             state.compare.only_changed = only_changed;
         }
         self.persist_presentation(true);
@@ -967,7 +1291,7 @@ impl ReviewSurface {
                     .comparing
                     .baselines
                     .values()
-                    .filter_map(|baseline| match baseline {
+                    .filter_map(|(_, baseline)| match baseline {
                         LastLooked::Since(look) => Some(look.looked_at_ms),
                         _ => None,
                     })
@@ -976,7 +1300,7 @@ impl ReviewSurface {
                     .comparing
                     .baselines
                     .values()
-                    .any(|baseline| baseline.look().is_some());
+                    .any(|(_, baseline)| baseline.look().is_some());
                 let detail = match newest {
                     Some(at) if at > 0 => format!(" · {}", ago(at, now)),
                     None if looked => " · nothing new".to_owned(),
@@ -1017,9 +1341,6 @@ impl ReviewSurface {
     /// compared up to an older version records nothing: the reviewer is not looking at the
     /// current one.
     pub(super) fn record_layer_looks(&mut self, source_id: Option<&str>, kind: LookKind) {
-        let Some((provider, repository)) = self.pulls_scope() else {
-            return;
-        };
         let review_id = self.review_id();
         let now = super::annotate::now_ms();
         for layer in self.layer_sources() {
@@ -1041,16 +1362,18 @@ impl ReviewSurface {
             {
                 continue;
             }
-            self.comparing.pending.push(LayerLook {
-                provider: provider.clone(),
-                repository: repository.clone(),
+            let look = LayerLook {
+                provider: layer.provider,
+                repository: layer.repository,
                 number: layer.number,
                 head_oid: layer.head,
                 fork_oid: Some(layer.fork),
                 kind,
                 looked_at_ms: now,
                 review_id: review_id.clone(),
-            });
+            };
+            self.comparing.session_looks.push(look.clone());
+            self.comparing.pending.push(look);
         }
     }
 
@@ -1085,19 +1408,20 @@ impl ReviewSurface {
     /// Record the reviewer's own reviews on the forge as `reviewed` looks (read with each pull
     /// request's conversation).
     pub(super) fn record_forge_looks(&mut self) {
-        let Some((provider, repository)) = self.pulls_scope() else {
-            return;
-        };
-        let numbers: BTreeSet<u64> = self
+        let scopes: BTreeMap<u64, (String, String)> = self
             .layer_sources()
-            .iter()
-            .map(|layer| layer.number)
+            .into_iter()
+            .map(|layer| (layer.number, (layer.provider, layer.repository)))
             .collect();
-        let mut reviews = Vec::new();
+        if scopes.is_empty() {
+            return;
+        }
+        // By provider and repository: each review's number, commit, and time.
+        let mut reviews: BTreeMap<(String, String), Vec<ForgeReview>> = BTreeMap::new();
         for link in &self.talk.data.links {
-            if !numbers.contains(&link.pull.number) {
+            let Some(scope) = scopes.get(&link.pull.number) else {
                 continue;
-            }
+            };
             let Some(activity) = self.talk.data.activity(&link.pull) else {
                 continue;
             };
@@ -1105,17 +1429,24 @@ impl ReviewSurface {
                 if let (true, Some(commit), Some(at)) =
                     (review.author.is_viewer, &review.commit_oid, review.at_ms)
                 {
-                    reviews.push((link.pull.number, commit.clone(), at));
+                    reviews.entry(scope.clone()).or_default().push((
+                        link.pull.number,
+                        commit.clone(),
+                        at,
+                    ));
                 }
             }
         }
-        for look in looks::forge_review_looks(&provider, &repository, &reviews) {
-            if self
-                .comparing
-                .recorded
-                .insert((look.number, look.head_oid.clone(), look.kind))
-            {
-                self.comparing.pending.push(look);
+        for ((provider, repository), reviews) in reviews {
+            for look in looks::forge_review_looks(&provider, &repository, &reviews) {
+                if self
+                    .comparing
+                    .recorded
+                    .insert((look.number, look.head_oid.clone(), look.kind))
+                {
+                    self.comparing.session_looks.push(look.clone());
+                    self.comparing.pending.push(look);
+                }
             }
         }
     }
@@ -1126,30 +1457,9 @@ impl ReviewSurface {
             return;
         }
         let looks = std::mem::take(&mut self.comparing.pending);
-        let keep: Vec<String> = looks
-            .iter()
-            .map(|look| look.head_oid.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
         let (services, repo) = (self.services.clone(), self.repo_path.clone());
         host.spawn(Box::pin(async move {
-            let recorded: Result<RecordLayerLooksResponse, _> = services
-                .call(RecordLayerLooksRequest {
-                    repo_path: repo.clone(),
-                    looks,
-                })
-                .await;
-            let release = recorded
-                .map(|recorded| recorded.pruned_heads)
-                .unwrap_or_default();
-            let _: Result<ReviewVersionsKeepResponse, _> = services
-                .call(ReviewVersionsKeepRequest {
-                    repo_path: repo,
-                    keep,
-                    release,
-                })
-                .await;
+            record_and_keep(&services, &repo, looks).await;
         }));
     }
 
@@ -1181,29 +1491,49 @@ impl ReviewSurface {
         else {
             return;
         };
+        // A history that does not know the head shown yet (a push seen before the history
+        // was read again) is read again once and waited for: steps from it would end at an
+        // older version.
+        let Some(current) = versions
+            .versions
+            .iter()
+            .rposition(|version| version.version.head_oid == layer.head)
+        else {
+            if self.comparing.history_asked.insert(layer.head) {
+                self.load_history_quietly(host);
+            }
+            return;
+        };
         if versions.versions.len() < 2 {
             return;
         }
-        let pairs: Vec<LayerPair> = (1..versions.versions.len())
+        let asked: Vec<(LayerPair, usize, usize)> = (1..versions.versions.len())
             .filter(|index| {
                 versions.versions[*index].kind != ChangeKind::Unavailable
                     && versions.versions[*index - 1].kind != ChangeKind::Unavailable
             })
-            .map(|index| LayerPair {
-                number,
-                from: Some(point_of(versions, index - 1, &layer)),
-                to: point_of(versions, index, &layer),
+            .map(|index| {
+                let pair = LayerPair {
+                    number,
+                    from: Some(point_of(versions, index - 1, &layer)),
+                    to: point_of(versions, index, &layer),
+                };
+                (pair, index, index + 1)
             })
             .collect();
-        self.comparing.steps_asked.insert((number, layer.head));
-        if pairs.is_empty() {
+        self.comparing
+            .steps_asked
+            .insert((number, layer.head.clone()));
+        if asked.is_empty() {
             return;
         }
+        let pairs: Vec<LayerPair> = asked.iter().map(|(pair, _, _)| pair.clone()).collect();
         let (services, inbox, repo) = (
             self.services.clone(),
             self.inbox.clone(),
             self.repo_path.clone(),
         );
+        let head = layer.head;
         host.spawn(Box::pin(async move {
             let result: Result<ReviewCompareLayersResponse, _> = services
                 .call(ReviewCompareLayersRequest {
@@ -1211,33 +1541,57 @@ impl ReviewSurface {
                     pairs,
                 })
                 .await;
-            inbox.push(Message::CompareSteps(
+            inbox.push(Message::CompareSteps(Box::new(StepsArrived {
                 number,
-                result
+                head,
+                current_version: current + 1,
+                versions: asked,
+                result: result
                     .map(|response| response.deltas)
                     .map_err(|error| error.message),
-            ));
+            })));
         }));
     }
 
-    /// Layer `number`'s version steps arrived: its file headers show each file's versions.
-    pub(super) fn apply_steps(&mut self, number: u64, result: Result<Vec<LayerDelta>, String>) {
-        let Ok(steps) = result else {
+    /// A layer's version steps arrived: its file headers show each file's versions (when the
+    /// layer still shows the head they were computed for).
+    pub(super) fn apply_steps(&mut self, arrived: StepsArrived) {
+        let Ok(deltas) = arrived.result else {
             return;
         };
-        self.comparing.steps.insert(number, steps.clone());
+        let steps: Vec<VersionStep> = arrived
+            .versions
+            .into_iter()
+            .filter_map(|(pair, from, to)| {
+                let delta = deltas.iter().find(|delta| delta.pair == pair)?.clone();
+                Some(VersionStep { from, to, delta })
+            })
+            .collect();
+        let layer_steps = LayerSteps {
+            head: arrived.head,
+            current_version: arrived.current_version,
+            steps,
+        };
         let Some(layer) = self
             .layer_sources()
             .into_iter()
-            .find(|layer| layer.number == number)
+            .find(|layer| layer.number == arrived.number)
         else {
             return;
         };
+        let current = layer.head == layer_steps.head;
+        self.comparing
+            .steps
+            .insert(arrived.number, layer_steps.clone());
+        if !current {
+            return;
+        }
         let Some(review) = self.review.as_mut() else {
             return;
         };
         if let Some(mut comparison) = review.doc.comparison(&layer.source_id).cloned() {
-            comparison.steps = steps;
+            comparison.steps = layer_steps.steps;
+            comparison.current_version = layer_steps.current_version;
             review
                 .doc
                 .set_comparison(&layer.source_id, Some(comparison));
@@ -1271,12 +1625,12 @@ impl ReviewSurface {
             return;
         }
         let changed: Vec<usize> = (0..steps.len())
-            .filter(|index| steps[*index].file(&file.path).changed())
+            .filter(|index| steps[*index].delta.file(&file.path).changed())
             .collect();
         let shown = review
             .doc
             .file_override(&file)
-            .and_then(|delta| steps.iter().position(|step| step.pair == delta.pair));
+            .and_then(|delta| steps.iter().position(|step| step.delta.pair == delta.pair));
         let target = match (shown, forward) {
             (None, false) => changed.last().copied(),
             (None, true) => None,
@@ -1284,7 +1638,7 @@ impl ReviewSurface {
             (Some(at), true) => changed.iter().find(|index| **index > at).copied(),
         };
         let delta = match (shown, target) {
-            (_, Some(index)) => Some(steps[index].clone()),
+            (_, Some(index)) => Some(steps[index].delta.clone()),
             (Some(_), None) if forward => None,
             _ => {
                 self.set_status(
@@ -1298,19 +1652,21 @@ impl ReviewSurface {
                 return;
             }
         };
-        let newest = steps.len();
+        let current = if comparison.current_version > 0 {
+            comparison.current_version
+        } else {
+            steps.last().map_or(0, |step| step.to)
+        };
         let label = delta.as_ref().and_then(|delta| {
-            let index = steps.iter().position(|step| step.pair == delta.pair)?;
-            let older = if index + 1 < newest {
+            let step = steps.iter().find(|step| step.delta.pair == delta.pair)?;
+            let older = if step.to < current {
                 " (an older version: read-only)"
             } else {
                 ""
             };
             Some(format!(
                 "{}: v{} → v{}{older}",
-                file.path,
-                index + 1,
-                index + 2
+                file.path, step.from, step.to
             ))
         });
         if let Some(review) = self.review.as_mut()
@@ -1328,8 +1684,10 @@ impl ReviewSurface {
 /// What a comparison found across the review's layers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompareCounts {
-    /// Layers of the review.
+    /// Sources of the review that are compared (pull requests and others).
     pub layers: usize,
+    /// Of those, sources that are not pull requests.
+    pub others: usize,
     /// Changed (including with the rebase).
     pub changed: usize,
     /// Of those, compared with the rebase.
@@ -1391,6 +1749,8 @@ mod tests {
     fn layer() -> LayerSource {
         LayerSource {
             source_id: "s".into(),
+            provider: "p".into(),
+            repository: "o/r".into(),
             number: 7,
             head: "c".into(),
             fork: "now-fork".into(),

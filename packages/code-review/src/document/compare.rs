@@ -31,9 +31,56 @@ pub struct GroupComparison {
     /// to another pair of versions), by path. One whose version is not the source's head is
     /// historical for that file.
     pub files: BTreeMap<String, LayerDelta>,
-    /// The layer's version steps, oldest first: each pair of consecutive versions compared.
-    /// File headers say in which steps their file changed, and a file can be stepped to one.
-    pub steps: Vec<LayerDelta>,
+    /// The layer's version steps, oldest first: each pair of consecutive available versions
+    /// compared. File headers say in which steps their file changed, and a file can be stepped
+    /// to one.
+    pub steps: Vec<VersionStep>,
+    /// The number (1-based, as the layer's version list counts them) of the version the source
+    /// shows; `0` when not known (the newest step's version is assumed).
+    pub current_version: usize,
+}
+
+/// Two consecutive available versions of a layer compared.
+///
+/// Versions are numbered as the layer's version list counts them (1-based, unavailable versions
+/// included), so numbers stay truthful when a version between others cannot be had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionStep {
+    /// The older version's number.
+    pub from: usize,
+    /// The newer version's number.
+    pub to: usize,
+    /// The comparison from the older version to the newer.
+    pub delta: LayerDelta,
+}
+
+/// What a source's comparison found, summed once when it is set: lines added and removed
+/// since the baseline, and files that changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ComparisonSummary {
+    /// Lines added since the baseline.
+    pub added: u64,
+    /// Lines removed since the baseline.
+    pub removed: u64,
+    /// Files changed since the baseline.
+    pub files: usize,
+}
+
+impl ComparisonSummary {
+    /// The summary of `delta`.
+    #[must_use]
+    pub fn of(delta: &LayerDelta) -> Self {
+        let (added, removed) = delta.totals();
+        Self {
+            added,
+            removed,
+            files: delta
+                .files
+                .iter()
+                .filter(|file| file.since.changed())
+                .count(),
+        }
+    }
 }
 
 /// One file's lines new since the baseline.
@@ -95,12 +142,29 @@ impl ReviewDocument {
         };
         let marks_stale =
             replay_of(self.comparisons.get(source_id)) != replay_of(comparison.as_ref());
+        let summary = comparison
+            .as_ref()
+            .and_then(|comparison| comparison.delta.as_ref())
+            .map(ComparisonSummary::of);
+        match summary {
+            Some(summary) => self
+                .comparison_summaries
+                .insert(source_id.to_owned(), summary),
+            None => self.comparison_summaries.remove(source_id),
+        };
         match comparison {
             Some(comparison) => self.comparisons.insert(source_id.to_owned(), comparison),
             None => self.comparisons.remove(source_id),
         };
         self.reapply(source_id, marks_stale);
         true
+    }
+
+    /// What source `source_id`'s comparison found, once its delta is in (summed when the
+    /// comparison was set, so painting badges every frame costs nothing per file).
+    #[must_use]
+    pub fn comparison_summary(&self, source_id: &str) -> Option<ComparisonSummary> {
+        self.comparison_summaries.get(source_id).copied()
     }
 
     /// Show every compared source in `view`. Returns whether anything changed.
@@ -345,16 +409,26 @@ impl ReviewDocument {
         }
         let path = &self.files[file].entry.path;
         let changed: Vec<usize> = (0..steps.len())
-            .filter(|index| steps[*index].file(path).changed())
+            .filter(|index| steps[*index].delta.file(path).changed())
             .collect();
         let shown = comparison
             .files
             .get(path)
-            .and_then(|delta| steps.iter().position(|step| step.pair == delta.pair));
+            .and_then(|delta| steps.iter().position(|step| step.delta.pair == delta.pair));
         let before = shown.unwrap_or(steps.len());
+        let newest = steps.last().map_or(0, |step| step.to);
+        let version = shown.map_or(
+            if comparison.current_version > 0 {
+                comparison.current_version
+            } else {
+                newest
+            },
+            |index| steps[index].to,
+        );
         Some(FileVersionsItem {
             changed_in: changed.len(),
             steps: steps.len(),
+            version,
             shown,
             previous: changed.iter().any(|index| *index < before),
             next: shown.is_some(),

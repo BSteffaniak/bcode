@@ -2019,7 +2019,7 @@ impl ReviewSurface {
             Message::Import(result) => self.apply_import(result),
             Message::Looks(numbers, result) => self.apply_looks(&numbers, result, host),
             Message::Compared(result) => self.apply_compared(result),
-            Message::CompareSteps(number, result) => self.apply_steps(number, result),
+            Message::CompareSteps(arrived) => self.apply_steps(*arrived),
             Message::PathCompletions { generation, result } => {
                 if let Some(composer) = self.composer.as_mut() {
                     composer.answer_completion(generation, result);

@@ -601,6 +601,273 @@ fn clicking_a_summary_rows_view_button_switches_the_whole_screen() {
     );
 }
 
+/// Refresh the review the way a change in the checkout does (a file staged, named after
+/// `tag`), so its sources are resolved again with what the provider says now.
+fn refresh(fixture: &GitFixture, scenario: &mut Scenario<ReviewApp>, tag: &str) {
+    let path = format!("refresh-{tag}.txt");
+    std::fs::write(fixture.root().join(&path), "staged\n").expect("write");
+    fixture.run(&["add", &path]);
+    scenario.key("r");
+    settled(scenario);
+}
+
+/// The file headers' versions of `path`, when shown.
+fn versions_of(
+    doc: &ReviewDocument,
+    path: &str,
+) -> Option<bcode_code_review::document::FileVersionsItem> {
+    (0..doc.len()).find_map(|index| match doc.item(index) {
+        Some(bcode_code_review::document::ReviewItem::FileHeader(header))
+            if header.file.path == path =>
+        {
+            header.versions
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn a_layer_pushed_while_open_is_compared_from_what_was_engaged_with_this_session() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(&backend, &fixture, "Moving", vec![layer(101)]);
+    // A completed pass at the first version.
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+m");
+    scenario.key("q");
+    settled(&mut scenario);
+    // Pushed once: reopened, the push is new since the pass.
+    push_to(&fixture, STACK_BRANCHES[0], "first-push.txt");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let doc = document(&scenario);
+    let source = source_of(doc, 101);
+    let first = FileKey::new(source.clone(), None, "first-push.txt");
+    assert!(matches!(
+        doc.file_since(&first),
+        Some(FileSince::New { .. })
+    ));
+    // The reviewer marks a file viewed (engaging with this version), then the author pushes
+    // again and the review is refreshed.
+    scenario.key("n");
+    scenario.key("v");
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[0], "second-push.txt");
+    refresh(&fixture, &mut scenario, "second");
+    let doc = document(&scenario);
+    let second = FileKey::new(source.clone(), None, "second-push.txt");
+    // Compared from the version engaged with: only the second push is new.
+    assert!(
+        matches!(doc.file_since(&second), Some(FileSince::New { .. })),
+        "{:?} {:?} {:?}",
+        doc.file_since(&second),
+        doc.file_keys().collect::<Vec<_>>(),
+        doc.comparison(&source)
+    );
+    assert!(
+        !matches!(doc.file_since(&first), Some(FileSince::New { .. })),
+        "{:?}",
+        doc.file_since(&first)
+    );
+    // The file headers know the newest push (the history read again after the refresh).
+    let versions = versions_of(doc, "second-push.txt");
+    assert!(
+        versions.is_some_and(
+            |versions| versions.changed_in == 1 && versions.version == versions.steps + 1
+        ),
+        "{versions:?}"
+    );
+}
+
+#[test]
+fn a_saved_full_change_yields_to_what_is_new_when_the_stack_moved() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(
+        &backend,
+        &fixture,
+        "Saved choice",
+        vec![layer(101), layer(102), layer(103)],
+    );
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+m");
+    run(&mut scenario, "Compare: full change");
+    scenario.key("q");
+    settled(&mut scenario);
+    // Nothing moved: the choice is kept.
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert_eq!(
+        review.comparing().baseline(),
+        bcode_code_review_models::ReviewCompareBaseline::Off
+    );
+    scenario.key("q");
+    settled(&mut scenario);
+    // Restacked: the reopened review shows what is new since the reviewer looked.
+    restack(&fixture);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert_eq!(
+        review.comparing().baseline(),
+        bcode_code_review_models::ReviewCompareBaseline::LastLooked
+    );
+    assert!(review.comparing().banner_shown());
+    assert_eq!(kind_of(document(&scenario), 101), Some(DeltaKind::Changed));
+}
+
+#[test]
+fn looks_seeded_from_a_pass_keep_their_heads_with_refs() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(&backend, &fixture, "Seeded", vec![layer(101)]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+m");
+    scenario.key("q");
+    settled(&mut scenario);
+    let refs = |fixture: &GitFixture| {
+        let output = std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/bcode-review/looked",
+            ])
+            .current_dir(fixture.root())
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let kept = refs(&fixture);
+    assert_ne!(kept, "");
+    // Refs lost (as before looks kept them): reopening seeds the pass again and keeps it.
+    for name in kept.lines() {
+        fixture.run(&["update-ref", "-d", name]);
+    }
+    assert_eq!(refs(&fixture), "");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    assert_eq!(refs(&fixture), kept);
+}
+
+#[test]
+fn looks_that_cannot_be_read_do_not_hold_up_the_review() {
+    use bcode_code_review_models::OP_REVIEW_LOOKS_LIST;
+    let (fixture, backend, id, scenario) = reopened_after_a_restack(TestBackend::default());
+    drop(scenario);
+    backend.set_failing(OP_REVIEW_LOOKS_LIST, true);
+    let mut scenario = resume(&fixture, &backend, &id);
+    let screen = settled(&mut scenario);
+    assert!(
+        screen.contains("could not read what you looked at before"),
+        "{}",
+        screen.text()
+    );
+    let review = scenario.surface().review().expect("review");
+    assert!(!review.comparing().active());
+    assert!(!review.comparing().banner_shown());
+    // Readable again: a refresh asks again and compares.
+    backend.set_failing(OP_REVIEW_LOOKS_LIST, false);
+    refresh(&fixture, &mut scenario, "again");
+    settled(&mut scenario);
+    assert_eq!(kind_of(document(&scenario), 101), Some(DeltaKind::Changed));
+}
+
+#[test]
+fn a_single_pull_request_is_compared_with_what_was_looked_at() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let pull = bcode_code_review_models::ReviewSourceKind::PullRequest {
+        provider: FAKE_PROVIDER.to_owned(),
+        repository: FAKE_REPOSITORY.to_owned(),
+        number: 101,
+    };
+    let workspace = create(&backend, &fixture, "One pull request", vec![pull]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("n");
+    scenario.key("v");
+    scenario.key("q");
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[0], "pushed-later.txt");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    let screen = settled(&mut scenario);
+    let doc = document(&scenario);
+    let source = doc
+        .groups()
+        .next()
+        .map(|group| group.source.source_id.clone())
+        .expect("a source");
+    let delta = doc
+        .comparison(&source)
+        .and_then(|comparison| comparison.delta.as_ref());
+    assert_eq!(delta.map(|delta| delta.kind), Some(DeltaKind::Changed));
+    let pushed = FileKey::new(source, None, "pushed-later.txt");
+    assert!(matches!(
+        doc.file_since(&pushed),
+        Some(FileSince::New { .. })
+    ));
+    assert!(
+        scenario
+            .surface()
+            .review()
+            .unwrap()
+            .comparing()
+            .banner_shown()
+    );
+    assert!(
+        screen.contains("Changes since: [you last looked"),
+        "{}",
+        screen.text()
+    );
+}
+
+#[test]
+fn a_branch_is_compared_with_the_last_completed_pass() {
+    use crate::testing::fixture::HEAD_BRANCH;
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let branch = bcode_code_review_models::ReviewSourceKind::BranchCompare {
+        base_branch: HEAD_BRANCH.to_owned(),
+        head_branch: STACK_BRANCHES[0].to_owned(),
+        merge_base: true,
+    };
+    let workspace = create(&backend, &fixture, "Branch", vec![branch]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    assert!(!scenario.surface().review().unwrap().comparing().active());
+    scenario.key("shift+m");
+    scenario.key("q");
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[0], "pushed-later.txt");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    let screen = settled(&mut scenario);
+    let doc = document(&scenario);
+    let source = doc
+        .groups()
+        .next()
+        .map(|group| group.source.source_id.clone())
+        .expect("a source");
+    let pushed = FileKey::new(source.clone(), None, "pushed-later.txt");
+    assert!(
+        matches!(doc.file_since(&pushed), Some(FileSince::New { .. })),
+        "{:?}",
+        doc.comparison(&source)
+    );
+    assert!(
+        screen.contains("1 of 1 source changed"),
+        "{}",
+        screen.text()
+    );
+    // Only what changed, in place.
+    scenario.key("shift+l");
+    settled(&mut scenario);
+    assert!(document(&scenario).file_shows_changes(&pushed));
+}
+
 #[test]
 fn a_files_versions_step_with_alt_comma_and_alt_period() {
     let fixture = fixture();
@@ -641,4 +908,50 @@ fn a_files_versions_step_with_alt_comma_and_alt_period() {
     scenario.key("alt+.");
     settled(&mut scenario);
     assert!(document(&scenario).file_override(&second).is_none());
+}
+
+#[test]
+fn the_history_marks_versions_the_reviewer_viewed_without_a_completed_pass() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(&backend, &fixture, "Marks", vec![layer(101), layer(102)]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let viewed_head = document(&scenario)
+        .groups()
+        .find_map(|group| {
+            let layer = group.stack?.stack.layers.last()?;
+            (layer.number == 101).then(|| layer.head_oid.clone())
+        })
+        .expect("#101's head");
+    // A file of #101 viewed; no pass completed.
+    scenario.key("n");
+    scenario.key("v");
+    scenario.key("q");
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[0], "pushed-later.txt");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+b");
+    settled(&mut scenario);
+    let Some(crate::surface::Modal::History(panel)) = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.modal())
+    else {
+        panic!("the history matrix");
+    };
+    let timeline = panel.timeline().expect("a timeline");
+    let versions = &timeline
+        .layers
+        .iter()
+        .find(|layer| layer.number == 101)
+        .expect("#101")
+        .versions;
+    let viewed = versions
+        .iter()
+        .find(|version| version.version.head_oid == viewed_head)
+        .expect("the viewed version");
+    assert!(viewed.reviewed, "{versions:?}");
+    assert!(!versions.last().expect("newest").reviewed, "{versions:?}");
 }

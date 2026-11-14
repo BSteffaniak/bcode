@@ -35,7 +35,7 @@ pub(crate) mod tests;
 
 pub use anchors::{AnchorLines, AnchorTarget, Annotations, DocAnchor, target_of};
 pub use build::estimate_rows;
-pub use compare::GroupComparison;
+pub use compare::{ComparisonSummary, GroupComparison, VersionStep};
 pub use interval::IntervalSet;
 pub use items::{
     AgentThreadItem, AnchorPlacement, CompareNoteItem, CompareView, ComposerItem, FileDetailsItem,

@@ -508,9 +508,9 @@ enum ContentStamp {
         layers: usize,
         /// How the file changed since a comparison's baseline.
         since: Option<bcode_code_review_models::FileSince>,
-        /// The file's versions: steps that changed it, steps, the step shown, and whether it
-        /// can step back and forward.
-        versions: Option<(usize, usize, Option<usize>, bool, bool)>,
+        /// The file's versions: steps that changed it, steps, the version shown, the step
+        /// shown, and whether it can step back and forward.
+        versions: Option<(usize, usize, usize, Option<usize>, bool, bool)>,
     },
     /// A file's break: whether the file (and the next) is folded, and the next file's place.
     End {
@@ -557,6 +557,7 @@ impl ContentStamp {
                     (
                         versions.changed_in,
                         versions.steps,
+                        versions.version,
                         versions.shown,
                         versions.previous,
                         versions.next,

@@ -39,7 +39,11 @@ fn summary(counts: CompareCounts, active: bool) -> [String; 2] {
     let mut parts = vec![format!(
         "{} of {} changed",
         counts.changed,
-        plural(counts.layers, "PR", "PRs")
+        if counts.others == 0 {
+            plural(counts.layers, "PR", "PRs")
+        } else {
+            plural(counts.layers, "source", "sources")
+        }
     )];
     if counts.rebased > 0 {
         parts.push(format!("{} rebased only", counts.rebased));
@@ -300,7 +304,7 @@ impl ReviewSurface {
     pub(super) fn open_compare_menu(&mut self) {
         if !self.compares_pulls() {
             self.set_status(
-                "comparisons need pull request layers whose stack is known",
+                "nothing to compare: no pull request, and no completed pass of another source",
                 StatusSeverity::Info,
             );
             return;

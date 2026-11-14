@@ -619,6 +619,8 @@ pub struct ReviewDocument {
     pub(super) revision: u64,
     /// Comparison overlays, by source id.
     pub(super) comparisons: BTreeMap<String, GroupComparison>,
+    /// What each comparison found, summed when it was set, by source id.
+    pub(super) comparison_summaries: BTreeMap<String, super::compare::ComparisonSummary>,
     /// Sources whose files a comparison hides are shown anyway.
     pub(super) compare_files_shown: BTreeSet<String>,
     /// Removed-since markers whose text shows, by file and new-side line.
@@ -686,6 +688,7 @@ impl ReviewDocument {
             splices: Vec::new(),
             revision: 0,
             comparisons: BTreeMap::new(),
+            comparison_summaries: BTreeMap::new(),
             compare_files_shown: BTreeSet::new(),
             expanded_removals: BTreeSet::new(),
             filtered: BTreeSet::new(),

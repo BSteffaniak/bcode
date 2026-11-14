@@ -658,3 +658,57 @@ fn stepping_one_file_to_other_versions_overrides_only_that_file() {
     assert!(texts(&doc, "a.txt").iter().any(|text| text == "a25 third"));
     crate::testing::document::assert_consistent(&doc, "after stepping a file");
 }
+
+/// The versions file `path`'s header shows.
+fn header_versions(doc: &ReviewDocument, path: &str) -> Option<super::super::FileVersionsItem> {
+    (0..doc.len()).find_map(|index| match doc.item(index) {
+        Some(ReviewItem::FileHeader(header)) if header.file.path == path => header.versions,
+        _ => None,
+    })
+}
+
+#[test]
+fn version_numbers_stay_truthful_when_a_version_between_others_is_unavailable() {
+    use super::super::{ComparisonSummary, VersionStep};
+    let layer = layer();
+    let third = third(&layer);
+    let service = ReviewData::default();
+    let mut doc = open_at(&service, &layer, &third);
+    serve(&service, &mut doc);
+    let step = delta_between(&service, &layer, &layer.second, &third);
+    // Versions 1 to 4 of which 2 is unavailable: the steps are 1 → (none), 3 → 4.
+    doc.set_comparison(
+        SOURCE,
+        Some(GroupComparison {
+            delta: Some(step.clone()),
+            view: CompareView::Full,
+            steps: vec![VersionStep {
+                from: 3,
+                to: 4,
+                delta: step.clone(),
+            }],
+            current_version: 4,
+            ..GroupComparison::default()
+        }),
+    );
+    serve(&service, &mut doc);
+    let versions = header_versions(&doc, "a.txt").expect("a.txt's versions");
+    assert_eq!(
+        (versions.version, versions.steps, versions.changed_in),
+        (4, 1, 1)
+    );
+    // Stepped to the only step: still version 4 (the step's newer version).
+    assert!(doc.set_file_comparison(&file("a.txt"), Some(step.clone())));
+    serve(&service, &mut doc);
+    let versions = header_versions(&doc, "a.txt").expect("a.txt's versions");
+    assert_eq!((versions.version, versions.shown), (4, Some(0)));
+    // The summary is the delta's, summed once.
+    assert_eq!(
+        doc.comparison_summary(SOURCE),
+        Some(ComparisonSummary::of(&step))
+    );
+    let summary = ComparisonSummary::of(&step);
+    assert_eq!((summary.added, summary.removed), step.totals());
+    doc.set_comparison(SOURCE, None);
+    assert_eq!(doc.comparison_summary(SOURCE), None);
+}

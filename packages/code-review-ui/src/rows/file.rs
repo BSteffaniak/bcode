@@ -203,7 +203,7 @@ fn version_spans(
     others: usize,
 ) -> Option<VersionSteps> {
     let versions = item.versions?;
-    let shown = versions.shown.map_or(versions.steps + 1, |shown| shown + 2);
+    let shown = versions.version;
     let step = |enabled: bool, glyph: &'static str| {
         Span::styled(glyph, if enabled { theme.accent } else { theme.muted })
     };
@@ -832,6 +832,7 @@ mod tests {
         let versions = bcode_code_review::document::FileVersionsItem {
             changed_in: 2,
             steps: 4,
+            version: 3,
             shown: Some(1),
             previous: true,
             next: true,

@@ -12,20 +12,19 @@ use bcode_code_review_models::{ReviewCompareBaseline, StackTimeline};
 use bmux_tui_components::status_bar::StatusSeverity;
 
 impl ReviewSurface {
-    /// What a history is about: the stack this review last saw, and what was reviewed of it.
+    /// What a history is about: the stack this review last saw, and the heads the reviewer
+    /// engaged with (their looks, and the passes of this review before looks were listed).
     fn history_scope(&self) -> Option<HistoryScope> {
         let news = self.stack_news.as_ref()?;
-        let reviewed_heads = self
-            .workspace
-            .as_ref()
-            .map(|workspace| {
+        let mut reviewed_heads = self.comparing.engaged_heads();
+        if let Some(workspace) = self.workspace.as_ref() {
+            reviewed_heads.extend(
                 workspace
                     .reviewed_revisions
                     .values()
-                    .filter_map(|revision| revision.reviewed_head_oid.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .filter_map(|revision| revision.reviewed_head_oid.clone()),
+            );
+        }
         Some(HistoryScope {
             repo_path: self.repo_path.clone(),
             provider: news.provider.clone(),

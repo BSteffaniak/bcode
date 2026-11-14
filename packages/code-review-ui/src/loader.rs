@@ -112,11 +112,8 @@ pub enum Message {
     ),
     /// Layers were compared with their baselines.
     Compared(Result<Vec<bcode_code_review_models::LayerDelta>, String>),
-    /// A layer's version steps (each pair of consecutive versions compared), by number.
-    CompareSteps(
-        u64,
-        Result<Vec<bcode_code_review_models::LayerDelta>, String>,
-    ),
+    /// A layer's version steps (each pair of consecutive available versions compared).
+    CompareSteps(Box<StepsArrived>),
     /// Paths matching the composer's `@word`, for the completion tagged `generation`.
     PathCompletions {
         /// Completion generation the search was made for.
@@ -210,6 +207,21 @@ pub struct ViewedInputs {
 
 /// Fingerprints loaded while opening a review at most; files beyond get theirs with their hunks.
 const MAX_OPEN_FINGERPRINTS: usize = 2_000;
+
+/// A layer's version steps, computed for the head the layer showed when they were asked for.
+#[derive(Debug)]
+pub struct StepsArrived {
+    /// Pull request number.
+    pub number: u64,
+    /// The head the layer showed.
+    pub head: String,
+    /// The number (1-based) of the version the layer showed.
+    pub current_version: usize,
+    /// Each step asked: its pair, and its older and newer version numbers (1-based).
+    pub versions: Vec<(bcode_code_review_models::LayerPair, usize, usize)>,
+    /// The steps compared.
+    pub result: Result<Vec<bcode_code_review_models::LayerDelta>, String>,
+}
 
 /// A source that arrived after the first frame.
 #[derive(Debug)]

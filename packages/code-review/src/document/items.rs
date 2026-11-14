@@ -64,8 +64,10 @@ pub struct FileVersionsItem {
     pub changed_in: usize,
     /// Steps of the layer.
     pub steps: usize,
-    /// The step shown (0-based: versions `shown + 1` to `shown + 2`), when the file was stepped
-    /// to one; `None` when it is compared like its layer.
+    /// The number of the version shown (1-based, as the layer's version list counts them).
+    pub version: usize,
+    /// The step shown (0-based, into the layer's steps), when the file was stepped to one;
+    /// `None` when it is compared like its layer.
     pub shown: Option<usize>,
     /// Whether an earlier step changed the file.
     pub previous: bool,
