@@ -2017,7 +2017,7 @@ impl ReviewSurface {
             Message::SavedAs(result) => self.finish_save_review(*result),
             Message::Publish(result) => self.apply_publish(result),
             Message::Import(result) => self.apply_import(result),
-            Message::Looks(result) => self.apply_looks(result, host),
+            Message::Looks(numbers, result) => self.apply_looks(&numbers, result, host),
             Message::Compared(result) => self.apply_compared(result),
             Message::CompareSteps(number, result) => self.apply_steps(number, result),
             Message::PathCompletions { generation, result } => {

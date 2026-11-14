@@ -508,6 +508,9 @@ enum ContentStamp {
         layers: usize,
         /// How the file changed since a comparison's baseline.
         since: Option<bcode_code_review_models::FileSince>,
+        /// The file's versions: steps that changed it, steps, the step shown, and whether it
+        /// can step back and forward.
+        versions: Option<(usize, usize, Option<usize>, bool, bool)>,
     },
     /// A file's break: whether the file (and the next) is folded, and the next file's place.
     End {
@@ -550,6 +553,15 @@ impl ContentStamp {
                 counts: (None, None),
                 layers: header.layers.len(),
                 since: header.since,
+                versions: header.versions.map(|versions| {
+                    (
+                        versions.changed_in,
+                        versions.steps,
+                        versions.shown,
+                        versions.previous,
+                        versions.next,
+                    )
+                }),
             },
             ReviewItem::FileDetails(details) => Self::File {
                 flags: u8::from(details.viewed) | u8::from(details.collapsed) << 1,
@@ -557,6 +569,7 @@ impl ContentStamp {
                 counts: (details.line_count, details.hunks),
                 layers: details.layers.len(),
                 since: None,
+                versions: None,
             },
             ReviewItem::FileEnd(end) => Self::End {
                 folded: end.folded,

@@ -106,7 +106,10 @@ pub enum Message {
     /// Work of the import flow finished.
     Import(super::import::ImportResult),
     /// The reviewer's looks at the review's layers were listed.
-    Looks(Result<Vec<bcode_code_review_models::LayerLook>, String>),
+    Looks(
+        Vec<u64>,
+        Result<Vec<bcode_code_review_models::LayerLook>, String>,
+    ),
     /// Layers were compared with their baselines.
     Compared(Result<Vec<bcode_code_review_models::LayerDelta>, String>),
     /// A layer's version steps (each pair of consecutive versions compared), by number.

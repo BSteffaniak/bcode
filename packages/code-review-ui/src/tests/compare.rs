@@ -281,6 +281,19 @@ fn a_restacked_stack_reopens_with_the_banner_its_badges_and_rebased_layers_colla
         Some(id)
     );
 
+    // The edited layer's file headers say in which pushes each file changed.
+    let edited_versions = (0..doc.len()).find_map(|index| match doc.item(index) {
+        Some(bcode_code_review::document::ReviewItem::FileHeader(header))
+            if header.file.path == "restacked.txt" =>
+        {
+            Some(header.versions)
+        }
+        _ => None,
+    });
+    assert!(
+        matches!(edited_versions, Some(Some(versions)) if versions.changed_in == 1),
+        "{edited_versions:?}"
+    );
     // Only what changed, and back: the same files, the same viewed progress.
     let files: Vec<_> = doc.file_keys().cloned().collect();
     let progress = doc.viewed_progress();
@@ -406,6 +419,27 @@ fn a_version_of_one_pull_request_is_compared_in_place_and_an_older_one_is_read_o
         review.workspace().map(|workspace| workspace.id.clone()),
         Some(workspace.id)
     );
+
+    // The pull request's file headers say in which pushes each file changed.
+    let doc = document(&scenario);
+    let headers: Vec<_> = (0..doc.len())
+        .filter_map(|index| match doc.item(index) {
+            Some(bcode_code_review::document::ReviewItem::FileHeader(header)) => {
+                Some((header.file.path.clone(), header.versions))
+            }
+            _ => None,
+        })
+        .collect();
+    let third_versions = headers
+        .iter()
+        .find(|(path, _)| path == "third.txt")
+        .and_then(|(_, versions)| *versions);
+    assert!(
+        third_versions.is_some_and(|versions| versions.changed_in == 1 && versions.steps >= 2),
+        "{headers:?}"
+    );
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("changed in 1 of"), "{}", screen.text());
 
     // Two older versions: read-only, only what changed.
     run(&mut scenario, "Compare versions of this pull request");

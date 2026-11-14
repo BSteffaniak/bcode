@@ -65,6 +65,10 @@ pub struct Comparing {
     started: bool,
     /// The reviewer's looks at the review's layers, once listed.
     looks: Option<Vec<LayerLook>>,
+    /// Layers whose looks were asked for.
+    asked: BTreeSet<u64>,
+    /// Layers whose looks were listed.
+    listed: BTreeSet<u64>,
     /// Each layer's last-looked baseline, pinned when first resolved.
     baselines: BTreeMap<u64, LastLooked>,
     /// The pair each compared source shows (or is computing), by source id.
@@ -89,6 +93,9 @@ pub struct Comparing {
     dwell: Option<(u64, String, Instant)>,
     /// Layers whose version steps were asked for, with the head they were asked at.
     steps_asked: BTreeSet<(u64, String)>,
+    /// Each layer's version steps, by number, once computed (they belong to the layer, not to
+    /// what it is compared with).
+    steps: BTreeMap<u64, Vec<LayerDelta>>,
     /// The push timeline while it has the keyboard.
     pub(super) timeline: Option<TimelineFocus>,
     /// The comparison row as last painted.
@@ -302,12 +309,9 @@ impl ReviewSurface {
     /// them first from the passes this review recorded; restore the baseline the review last
     /// compared with (else the configured one).
     pub(super) fn start_comparison(&mut self, host: &UiContext) {
-        if self.comparing.started {
+        if self.comparing.started || self.pulls_scope().is_none() {
             return;
         }
-        let Some((provider, repository)) = self.pulls_scope() else {
-            return;
-        };
         let layers = self.layer_sources();
         if layers.is_empty() {
             return;
@@ -331,6 +335,23 @@ impl ReviewSurface {
             StartView::Full => CompareView::Full,
             StartView::Changes => CompareView::Changes,
         };
+        self.list_looks(host);
+    }
+
+    /// List the reviewer's looks at the layers not asked about yet (layers arrive after the
+    /// first frame), seeding them first from the passes this review recorded.
+    fn list_looks(&mut self, host: &UiContext) {
+        let Some((provider, repository)) = self.pulls_scope() else {
+            return;
+        };
+        let layers: Vec<LayerSource> = self
+            .layer_sources()
+            .into_iter()
+            .filter(|layer| !self.comparing.asked.contains(&layer.number))
+            .collect();
+        if layers.is_empty() {
+            return;
+        }
         let reviewed: Vec<(u64, bcode_code_review_models::ReviewedRevision)> = self
             .workspace
             .as_ref()
@@ -351,6 +372,7 @@ impl ReviewSurface {
             self.review_id().as_deref(),
         );
         let numbers: Vec<u64> = layers.iter().map(|layer| layer.number).collect();
+        self.comparing.asked.extend(numbers.iter().copied());
         let (services, inbox, repo) = (
             self.services.clone(),
             self.inbox.clone(),
@@ -370,10 +392,11 @@ impl ReviewSurface {
                     repo_path: repo,
                     provider,
                     repository,
-                    numbers,
+                    numbers: numbers.clone(),
                 })
                 .await;
             inbox.push(Message::Looks(
+                numbers,
                 listed
                     .map(|listed| listed.looks)
                     .map_err(|error| error.message),
@@ -381,11 +404,20 @@ impl ReviewSurface {
         }));
     }
 
-    /// The looks arrived: compare every layer with its baseline.
-    pub(super) fn apply_looks(&mut self, result: Result<Vec<LayerLook>, String>, host: &UiContext) {
+    /// The looks at layers `numbers` arrived: compare those layers with their baselines.
+    pub(super) fn apply_looks(
+        &mut self,
+        numbers: &[u64],
+        result: Result<Vec<LayerLook>, String>,
+        host: &UiContext,
+    ) {
         match result {
             Ok(looks) => {
-                self.comparing.looks = Some(looks);
+                self.comparing.listed.extend(numbers.iter().copied());
+                self.comparing
+                    .looks
+                    .get_or_insert_with(Vec::new)
+                    .extend(looks);
                 self.refresh_comparison(host);
             }
             Err(error) => self.set_status(
@@ -435,10 +467,13 @@ impl ReviewSurface {
         }
         match self.comparing.baseline {
             Baseline::Off => Rule::None,
-            Baseline::LastLooked => match self.comparing.looks {
-                None => Rule::Wait,
-                Some(_) => self.last_looked_pair(layer).map_or(Rule::None, Rule::Pair),
-            },
+            Baseline::LastLooked => {
+                if self.comparing.listed.contains(&layer.number) {
+                    self.last_looked_pair(layer).map_or(Rule::None, Rule::Pair)
+                } else {
+                    Rule::Wait
+                }
+            }
             Baseline::PreviousPush => self.stack_history.as_ref().map_or(Rule::Wait, |history| {
                 before_last_push(history).map_or(Rule::None, |from_ms| {
                     between(Some(history), layer, from_ms, None)
@@ -458,6 +493,7 @@ impl ReviewSurface {
         if layers.is_empty() || !self.comparing.started {
             return;
         }
+        self.list_looks(host);
         let mut wanted: Vec<(LayerSource, Rule)> = Vec::new();
         for layer in layers {
             let rule = self.rule_for(&layer);
@@ -502,6 +538,12 @@ impl ReviewSurface {
             if self.comparing.pairs.get(&layer.source_id) == Some(&compared) {
                 continue;
             }
+            let steps = self
+                .comparing
+                .steps
+                .get(&layer.number)
+                .cloned()
+                .unwrap_or_default();
             if let Some(review) = self.review.as_mut() {
                 review.doc.set_comparison(
                     &layer.source_id,
@@ -509,6 +551,7 @@ impl ReviewSurface {
                         delta: None,
                         view,
                         historical: compared.historical,
+                        steps,
                         ..GroupComparison::default()
                     }),
                 );
@@ -598,10 +641,11 @@ impl ReviewSurface {
         for delta in deltas {
             for (source_id, compared) in &self.comparing.pairs {
                 if compared.pair == delta.pair {
-                    let steps = review
-                        .doc
-                        .comparison(source_id)
-                        .map(|comparison| comparison.steps.clone())
+                    let steps = self
+                        .comparing
+                        .steps
+                        .get(&compared.pair.number)
+                        .cloned()
                         .unwrap_or_default();
                     review.doc.set_comparison(
                         source_id,
@@ -629,7 +673,14 @@ impl ReviewSurface {
     /// Once every compared layer's delta is in: show the banner when, compared with what the
     /// reviewer last looked at, some layer moved.
     fn decide_banner(&mut self) {
-        if self.comparing.banner != BannerState::Undecided || self.compare_pending() > 0 {
+        let all_listed = self
+            .layer_sources()
+            .iter()
+            .all(|layer| self.comparing.listed.contains(&layer.number));
+        if self.comparing.banner != BannerState::Undecided
+            || self.compare_pending() > 0
+            || !all_listed
+        {
             return;
         }
         let counts = self.compare_counts();
@@ -921,9 +972,15 @@ impl ReviewSurface {
                         _ => None,
                     })
                     .max();
+                let looked = self
+                    .comparing
+                    .baselines
+                    .values()
+                    .any(|baseline| baseline.look().is_some());
                 let detail = match newest {
                     Some(at) if at > 0 => format!(" · {}", ago(at, now)),
-                    None if self.comparing.looks.is_some() => " · nothing new".to_owned(),
+                    None if looked => " · nothing new".to_owned(),
+                    None if self.comparing.looks.is_some() => " · not yet".to_owned(),
                     _ => String::new(),
                 };
                 [format!("you last looked{detail}"), "last looked".to_owned()]
@@ -1168,6 +1225,7 @@ impl ReviewSurface {
         let Ok(steps) = result else {
             return;
         };
+        self.comparing.steps.insert(number, steps.clone());
         let Some(layer) = self
             .layer_sources()
             .into_iter()
@@ -1240,10 +1298,16 @@ impl ReviewSurface {
                 return;
             }
         };
+        let newest = steps.len();
         let label = delta.as_ref().and_then(|delta| {
             let index = steps.iter().position(|step| step.pair == delta.pair)?;
+            let older = if index + 1 < newest {
+                " (an older version: read-only)"
+            } else {
+                ""
+            };
             Some(format!(
-                "{}: v{} → v{} (read-only)",
+                "{}: v{} → v{}{older}",
                 file.path,
                 index + 1,
                 index + 2
