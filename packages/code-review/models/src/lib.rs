@@ -5,6 +5,7 @@
 //! Shared code review models for Bcode.
 
 mod assistant;
+mod compare;
 mod conversation;
 mod data;
 mod history;
@@ -12,6 +13,7 @@ mod review_discovery;
 mod review_source;
 
 pub use assistant::*;
+pub use compare::*;
 pub use conversation::*;
 pub use data::*;
 pub use history::*;

@@ -11,9 +11,11 @@
 mod conversation;
 mod db;
 mod history;
+mod looks;
 
 use conversation::{conversation_for_request, save_conversation_for_request};
 use history::{list_layer_versions_for_request, record_layer_versions_for_request};
+use looks::{list_layer_looks_for_request, record_layer_looks_for_request};
 
 pub(crate) use db::with_database;
 use db::{
@@ -177,6 +179,14 @@ store_operations! {
     list_layer_versions(&bcode_code_review_models::ListLayerVersionsRequest)
         -> bcode_code_review_models::ListLayerVersionsResponse
         => list_layer_versions_for_request;
+    /// Record looks: which versions of pull requests the reviewer saw.
+    record_layer_looks(bcode_code_review_models::RecordLayerLooksRequest)
+        -> bcode_code_review_models::RecordLayerLooksResponse
+        => record_layer_looks_for_request;
+    /// Looks at pull requests.
+    list_layer_looks(&bcode_code_review_models::ListLayerLooksRequest)
+        -> bcode_code_review_models::ListLayerLooksResponse
+        => list_layer_looks_for_request;
     /// Workspaces of a repository, newest first.
     list_workspaces(&ListReviewWorkspacesRequest) -> ListReviewWorkspacesResponse
         => list_review_workspaces_for_request;

@@ -307,3 +307,254 @@ fn forge_pushes_become_versions_on_the_base_branch_of_their_time() {
         ]
     );
 }
+
+mod deltas {
+    use super::super::delta::{keep_versions, layer_deltas, marks};
+    use super::*;
+    use crate::cache::ReviewCache;
+    use bcode_code_review_models::{
+        DeltaFile, DeltaKind, FileSince, LayerPair, RemovedSince, ReviewCompareMarksRequest,
+        VersionPoint,
+    };
+
+    fn point(head: &str, fork: Option<&str>) -> VersionPoint {
+        VersionPoint {
+            head_oid: head.to_owned(),
+            fork_oid: fork.map(str::to_owned),
+        }
+    }
+
+    fn pair(number: u64, from: Option<VersionPoint>, to: VersionPoint) -> LayerPair {
+        LayerPair { number, from, to }
+    }
+
+    fn empty_repo() -> Repo {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo {
+            root: dir.path().to_path_buf(),
+            _dir: dir,
+        };
+        repo.git(PUSHES[0], &["init", "-q", "-b", "main"]);
+        repo
+    }
+
+    #[test]
+    fn one_edited_layer_reads_changed_and_the_restacked_ones_rebased_only() {
+        let (repo, heads) = restacked();
+        let base = repo.git(0, &["rev-parse", "main"]);
+        let disk = ReviewCache::disabled();
+        // Each layer from the first push to the second, forks as the stack had them.
+        let pairs = [
+            pair(
+                1,
+                Some(point(&heads[0][0], Some(&base))),
+                point(&heads[1][0], Some(&base)),
+            ),
+            pair(
+                2,
+                Some(point(&heads[0][1], Some(&heads[0][0]))),
+                point(&heads[1][1], Some(&heads[1][0])),
+            ),
+            pair(
+                3,
+                Some(point(&heads[1][2], Some(&heads[1][1]))),
+                point(&heads[2][2], Some(&heads[2][1])),
+            ),
+            pair(
+                3,
+                Some(point(&heads[2][2], Some(&heads[2][1]))),
+                point(&heads[2][2], Some(&heads[2][1])),
+            ),
+            pair(2, None, point(&heads[1][1], Some(&heads[1][0]))),
+        ];
+        let deltas = layer_deltas(&repo.root, &disk, &pairs).expect("deltas");
+        let kinds: Vec<DeltaKind> = deltas.iter().map(|delta| delta.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                DeltaKind::Changed,
+                DeltaKind::RebasedOnly,
+                DeltaKind::Changed,
+                DeltaKind::Unchanged,
+                DeltaKind::NewToYou,
+            ]
+        );
+        assert_eq!(
+            deltas[0].files,
+            [DeltaFile {
+                path: "l1.txt".into(),
+                since: FileSince::Changed {
+                    added: 1,
+                    removed: 1
+                },
+            }]
+        );
+        // A fast-forward: the commit on top is a file new to the layer's change.
+        assert_eq!(
+            deltas[2].files,
+            [DeltaFile {
+                path: "l3-more.txt".into(),
+                since: FileSince::New {
+                    added: 1,
+                    removed: 0
+                },
+            }]
+        );
+        // The same fork point needs no replay: the old head is its own.
+        assert_eq!(deltas[2].replay_oid.as_deref(), Some(heads[1][2].as_str()));
+
+        // Replay commits are deterministic: computed again from scratch, the same ids.
+        let again = layer_deltas(&repo.root, &disk, &pairs[1..2]).expect("deltas");
+        assert_eq!(again[0].replay_oid, deltas[1].replay_oid);
+        assert_ne!(deltas[1].replay_oid.as_deref(), Some(heads[0][1].as_str()));
+    }
+
+    #[test]
+    fn cached_deltas_and_marks_answer_as_fresh_ones_do() {
+        let (repo, heads) = restacked();
+        let base = repo.git(0, &["rev-parse", "main"]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = ReviewCache::open(&dir.path().join("cache.db"));
+        let pairs = [pair(
+            2,
+            Some(point(&heads[0][1], Some(&heads[0][0]))),
+            point(&heads[2][1], Some(&heads[2][0])),
+        )];
+        let fresh = layer_deltas(&repo.root, &ReviewCache::disabled(), &pairs).expect("fresh");
+        let first = layer_deltas(&repo.root, &disk, &pairs).expect("first");
+        let cached = layer_deltas(&repo.root, &disk, &pairs).expect("cached");
+        assert_eq!(fresh, first);
+        assert_eq!(first, cached);
+        let request = ReviewCompareMarksRequest {
+            repo_path: repo.root.clone(),
+            fork_oid: base,
+            replay_oid: heads[0][0].clone(),
+            head_oid: heads[1][0].clone(),
+            path: "l1.txt".into(),
+            old_path: None,
+        };
+        let first = marks(&repo.root, &disk, &request).expect("marks");
+        assert_eq!(first.new_lines, [(1, 1)]);
+        assert_eq!(marks(&repo.root, &disk, &request).expect("cached"), first);
+    }
+
+    #[test]
+    fn a_retargeted_layer_with_the_same_change_is_rebased_only() {
+        let (repo, heads) = restacked();
+        let base = repo.git(0, &["rev-parse", "main"]);
+        // Layer 2 moves off layer 1, straight onto the trunk.
+        repo.git(
+            PUSHES[2],
+            &["rebase", "-q", "--onto", "main", &heads[2][0], "l2"],
+        );
+        let retargeted = repo.head("l2");
+        let deltas = layer_deltas(
+            &repo.root,
+            &ReviewCache::disabled(),
+            &[pair(
+                2,
+                Some(point(&heads[1][1], Some(&heads[1][0]))),
+                point(&retargeted, Some(&base)),
+            )],
+        )
+        .expect("deltas");
+        assert_eq!(deltas[0].kind, DeltaKind::RebasedOnly);
+    }
+
+    #[test]
+    fn a_conflicting_replay_compares_with_the_rebase_and_missing_commits_are_unavailable() {
+        let repo = empty_repo();
+        let at = PUSHES[0];
+        repo.commit(at, "f.txt", "a\n");
+        let base = repo.head("main");
+        repo.git(at, &["checkout", "-q", "-b", "l1"]);
+        repo.commit(at, "f.txt", "b\n");
+        let l1_old = repo.head("l1");
+        repo.git(at, &["checkout", "-q", "-b", "l2"]);
+        repo.commit(at, "f.txt", "c\n");
+        let l2_old = repo.head("l2");
+        // Layer 1 rewrites the line; layer 2 is redone on top of it by hand.
+        repo.git(at, &["checkout", "-q", "l1"]);
+        repo.write("f.txt", "x\n");
+        repo.git(at, &["commit", "-q", "-a", "--amend", "--no-edit"]);
+        let l1_new = repo.head("l1");
+        repo.git(at, &["checkout", "-q", "-b", "l2-new"]);
+        repo.commit(at, "f.txt", "y\n");
+        let l2_new = repo.head("l2-new");
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        let deltas = layer_deltas(
+            &repo.root,
+            &ReviewCache::disabled(),
+            &[
+                pair(
+                    2,
+                    Some(point(&l2_old, Some(&l1_old))),
+                    point(&l2_new, Some(&l1_new)),
+                ),
+                pair(2, Some(point(missing, Some(&base))), point(&l2_new, None)),
+            ],
+        )
+        .expect("deltas");
+        assert_eq!(deltas[0].kind, DeltaKind::WithRebase);
+        assert_eq!(deltas[0].replay_oid.as_deref(), Some(l2_old.as_str()));
+        assert_eq!(deltas[0].files.len(), 1);
+        assert_eq!(deltas[1].kind, DeltaKind::Unavailable);
+    }
+
+    #[test]
+    fn marks_tell_new_lines_from_newly_removed_and_removed_since_lines() {
+        let repo = empty_repo();
+        let at = PUSHES[0];
+        repo.commit(at, "f.txt", "a\nb\nc\nd\ne\n");
+        let fork = repo.head("main");
+        repo.git(at, &["checkout", "-q", "-b", "l1"]);
+        // The baseline adds `x`; the current version drops it again, removes the fork's `d`,
+        // and adds `y`.
+        repo.commit(at, "f.txt", "a\nb\nx\nc\nd\ne\n");
+        let baseline = repo.head("l1");
+        repo.write("f.txt", "a\nb\nc\ne\ny\n");
+        repo.git(at, &["commit", "-q", "-a", "--amend", "--no-edit"]);
+        let head = repo.head("l1");
+        let request = ReviewCompareMarksRequest {
+            repo_path: repo.root.clone(),
+            fork_oid: fork,
+            replay_oid: baseline,
+            head_oid: head,
+            path: "f.txt".into(),
+            old_path: None,
+        };
+        let marked = marks(&repo.root, &ReviewCache::disabled(), &request).expect("marks");
+        assert_eq!(marked.new_lines, [(5, 5)]);
+        assert_eq!(marked.newly_removed, [(4, 4)]);
+        assert_eq!(
+            marked.removed_since,
+            [RemovedSince {
+                before_new_line: 3,
+                lines: vec!["x".into()],
+            }]
+        );
+        assert!(!marked.too_large);
+    }
+
+    #[test]
+    fn looked_heads_are_kept_with_refs_until_released() {
+        let (repo, heads) = restacked();
+        let missing = "0123456789abcdef0123456789abcdef01234567".to_owned();
+        let kept = keep_versions(&repo.root, &[heads[0][0].clone(), missing], &[]).expect("keep");
+        assert_eq!(kept, (1, 0));
+        let refs = repo.git(
+            0,
+            &["for-each-ref", "--format=%(refname)", "refs/bcode-review"],
+        );
+        assert_eq!(refs, format!("refs/bcode-review/version/{}", heads[0][0]));
+        assert_eq!(
+            keep_versions(&repo.root, &[], &[heads[0][0].clone()]).expect("release"),
+            (0, 1)
+        );
+        let refs = repo.git(
+            0,
+            &["for-each-ref", "--format=%(refname)", "refs/bcode-review"],
+        );
+        assert_eq!(refs, "");
+    }
+}

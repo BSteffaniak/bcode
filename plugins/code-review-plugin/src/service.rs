@@ -51,6 +51,9 @@ pub fn dispatch_data(data: &ReviewData, request: &ServiceRequest) -> Option<Serv
         models::OP_REVIEW_REPO_STATE => serve(request, |req| data.repo_state(&req)),
         models::OP_REVIEW_REVISIONS_COMPARE => serve(request, |req| data.revisions_compare(&req)),
         models::OP_REVIEW_PATCH_IDS_GET => serve(request, |req| data.patch_ids_get(&req)),
+        models::OP_REVIEW_COMPARE_LAYERS => serve(request, |req| data.compare_layers(&req)),
+        models::OP_REVIEW_COMPARE_MARKS => serve(request, |req| data.compare_marks(&req)),
+        models::OP_REVIEW_VERSIONS_KEEP => serve(request, |req| data.versions_keep(&req)),
         _ => return None,
     })
 }

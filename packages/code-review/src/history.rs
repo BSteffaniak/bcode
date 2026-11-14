@@ -6,16 +6,21 @@
 //!   forge reports ([`forge::forge_versions`]).
 //! * [`timeline`] orders them per layer, finds where each version's own change starts (its *fork
 //!   point*), and classifies each change: content, rebase only, commits added, retargeted.
-//! * [`compare`] turns two points in that history into review sources. A layer's change is
-//!   compared with the rebase taken out: the old change is replayed on the new base
-//!   (`git merge-tree`), and the review shows what differs from there.
+//! * [`delta`] compares a layer between two versions with the rebase taken out: the old change
+//!   is replayed on the new base (`git merge-tree`), and what differs from there is the layer's
+//!   delta, down to per-file summaries and line marks.
+//! * [`looks`] chooses each layer's "since you last looked" baseline from the looks recorded as
+//!   the reviewer works.
+//! * [`compare`] turns two points in that history into review sources.
 //!
 //! The git work is batched: one existence check, one history walk, one `merge-tree --stdin`, and
 //! one tree lookup per timeline, however many layers and versions.
 
 pub mod compare;
+pub mod delta;
 pub mod forge;
 mod graph;
+pub mod looks;
 pub mod reflog;
 
 use crate::data::DataError;
@@ -205,7 +210,10 @@ fn versions_per_layer(
 }
 
 /// The commits among `oids` that exist locally.
-fn present_commits(root: &Path, oids: &BTreeSet<&str>) -> Result<BTreeSet<String>, DataError> {
+pub(crate) fn present_commits(
+    root: &Path,
+    oids: &BTreeSet<&str>,
+) -> Result<BTreeSet<String>, DataError> {
     let oids: Vec<&str> = oids
         .iter()
         .copied()

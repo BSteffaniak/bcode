@@ -127,6 +127,29 @@ pub fn output(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>, DataError> {
     ))
 }
 
+/// Run git with extra environment variables and return its standard output.
+///
+/// # Errors
+///
+/// * [`DataError::Io`] when git cannot be started.
+/// * [`DataError::Git`] when git exits unsuccessfully.
+pub fn output_with_env(
+    repo_root: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<Vec<u8>, DataError> {
+    let _slot = Slot::acquire();
+    let mut command = command(repo_root, args);
+    command.envs(env.iter().copied());
+    let output = command.output()?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    Err(DataError::Git(
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
 /// Run git with `input` on its standard input and return its standard output.
 ///
 /// # Errors

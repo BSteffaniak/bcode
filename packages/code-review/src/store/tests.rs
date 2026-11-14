@@ -1474,3 +1474,105 @@ fn a_reviews_pull_request_threads_are_kept_per_scope_and_replaced() {
     let other = get("b").expect("saved");
     assert_eq!(other.threads[0].thread.comments[0].body, "other review");
 }
+
+#[test]
+fn looks_upsert_by_head_and_kind_seed_idempotently_and_prune_old_heads() {
+    use crate::history::looks::pass_looks;
+    use bcode_code_review_models::{
+        LayerLook, ListLayerLooksRequest, LookKind, MAX_LOOK_HEADS_PER_PULL,
+        RecordLayerLooksRequest, ReviewedRevision,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = initialized_test_repository(temp.path());
+    let store = ReviewStore::new(CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    });
+    let look = |number: u64, head: &str, kind: LookKind, at: u64| LayerLook {
+        provider: "github".into(),
+        repository: "o/r".into(),
+        number,
+        head_oid: head.into(),
+        fork_oid: None,
+        kind,
+        looked_at_ms: at,
+        review_id: None,
+    };
+    let record = |looks: Vec<LayerLook>| {
+        store
+            .record_layer_looks(RecordLayerLooksRequest {
+                repo_path: repo.clone(),
+                looks,
+            })
+            .expect("record")
+    };
+    let list = |numbers: Vec<u64>| {
+        store
+            .list_layer_looks(&ListLayerLooksRequest {
+                repo_path: repo.clone(),
+                provider: "github".into(),
+                repository: "o/r".into(),
+                numbers,
+            })
+            .expect("list")
+            .looks
+    };
+    assert_eq!(
+        record(vec![
+            look(1, "a", LookKind::Viewed, 100),
+            look(1, "a", LookKind::Opened, 90),
+            look(2, "b", LookKind::Commented, 50),
+        ])
+        .recorded,
+        3
+    );
+    // A repeated look moves its time forward and learns its fork point; an older one changes
+    // nothing.
+    let mut later = look(1, "a", LookKind::Viewed, 200);
+    later.fork_oid = Some("f".into());
+    assert_eq!(
+        record(vec![later, look(1, "a", LookKind::Opened, 10)]).recorded,
+        1
+    );
+    let looks = list(vec![1]);
+    assert_eq!(looks.len(), 2);
+    let viewed = looks
+        .iter()
+        .find(|look| look.kind == LookKind::Viewed)
+        .expect("viewed");
+    assert_eq!(
+        (viewed.looked_at_ms, viewed.fork_oid.as_deref()),
+        (200, Some("f"))
+    );
+
+    // Seeding from completed passes is idempotent.
+    let reviewed = [(
+        2,
+        ReviewedRevision {
+            reviewed_base_oid: Some("base".into()),
+            reviewed_head_oid: Some("b0".into()),
+            recorded_at_ms: Some(40),
+        },
+    )];
+    let seeded = pass_looks("github", "o/r", &reviewed, Some("w1"));
+    assert_eq!(record(seeded.clone()).recorded, 1);
+    assert_eq!(record(seeded).recorded, 0);
+    assert_eq!(list(vec![2]).len(), 2);
+
+    // Past the cap, the heads looked at longest ago are pruned and reported.
+    let many: Vec<LayerLook> = (0..MAX_LOOK_HEADS_PER_PULL + 2)
+        .map(|index| {
+            look(
+                3,
+                &format!("h{index:02}"),
+                LookKind::Viewed,
+                1_000 + index as u64,
+            )
+        })
+        .collect();
+    let response = record(many);
+    assert_eq!(response.pruned_heads, ["h01", "h00"]);
+    let kept = list(vec![3]);
+    assert_eq!(kept.len(), MAX_LOOK_HEADS_PER_PULL);
+    assert!(kept.iter().all(|look| look.head_oid != "h00"));
+}

@@ -647,7 +647,7 @@ fn history_events(
 }
 
 /// Reference namespace old versions' commits are fetched into, so they are kept.
-pub const VERSION_REF_NAMESPACE: &str = "refs/bcode-review/version";
+pub use bcode_code_review_models::VERSION_REF_NAMESPACE;
 
 /// Most commits fetched one by one when fetching them together fails (one of them may be gone).
 const MAX_SINGLE_FETCHES: usize = 50;

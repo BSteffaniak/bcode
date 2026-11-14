@@ -10,7 +10,8 @@
 //! Entries are text under a kind and a key:
 //!
 //! * content-addressed answers that never change ([`CacheKind::MergeBase`],
-//!   [`CacheKind::Index`]): keyed by commit ids, so they need no invalidation;
+//!   [`CacheKind::Index`], and the comparison kinds [`CacheKind::Replay`], [`CacheKind::Delta`],
+//!   [`CacheKind::Marks`]): keyed by commit ids, so they need no invalidation;
 //! * provider facts ([`CacheKind::Pull`], [`CacheKind::Stack`]): suggestions shown at once and
 //!   confirmed with the provider afterwards, with when they were written.
 //!
@@ -63,10 +64,17 @@ pub enum CacheKind {
     Discovery,
     /// A pull request's conversation as a provider reported it.
     Activity,
+    /// An old version's change replayed on a new fork point: the replay commit, or that it
+    /// conflicted.
+    Replay,
+    /// A layer's delta between a replay commit and a head.
+    Delta,
+    /// One file's line marks between a fork point, a replay commit, and a head.
+    Marks,
 }
 
 impl CacheKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 10] = [
         Self::MergeBase,
         Self::Index,
         Self::Pull,
@@ -74,6 +82,9 @@ impl CacheKind {
         Self::Hunks,
         Self::Discovery,
         Self::Activity,
+        Self::Replay,
+        Self::Delta,
+        Self::Marks,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -85,6 +96,9 @@ impl CacheKind {
             Self::Hunks => "hunks",
             Self::Discovery => "discovery",
             Self::Activity => "activity",
+            Self::Replay => "replay",
+            Self::Delta => "delta",
+            Self::Marks => "marks",
         }
     }
 
@@ -94,7 +108,8 @@ impl CacheKind {
         match self {
             Self::MergeBase => 200_000,
             Self::Index => 4_000,
-            Self::Pull | Self::Hunks => 20_000,
+            Self::Pull | Self::Hunks | Self::Marks => 20_000,
+            Self::Replay | Self::Delta => 10_000,
             Self::Stack => 1_000,
             Self::Discovery | Self::Activity => 2_000,
         }
@@ -105,9 +120,13 @@ impl CacheKind {
     pub const fn kept_for(self) -> Duration {
         match self {
             Self::MergeBase => Duration::from_hours(90 * 24),
-            Self::Index | Self::Pull | Self::Hunks | Self::Discovery => {
-                Duration::from_hours(30 * 24)
-            }
+            Self::Index
+            | Self::Pull
+            | Self::Hunks
+            | Self::Discovery
+            | Self::Replay
+            | Self::Delta
+            | Self::Marks => Duration::from_hours(30 * 24),
             Self::Stack => crate::provider::STACK_KEPT,
             // A conversation is shown at once and refreshed; older than this is not worth it.
             Self::Activity => Duration::from_hours(7 * 24),

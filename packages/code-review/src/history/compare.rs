@@ -2,7 +2,7 @@
 //!
 //! A layer's change between two versions is shown with the rebase taken out. The old version's
 //! own change (from its fork point to its head) is replayed on the new version's fork point with
-//! `git merge-tree`, and wrapped in a local commit. The review then compares that commit with the
+//! `git merge-tree`, and wrapped in a deterministic local commit. The review then compares that commit with the
 //! new head: exactly what the author changed, without what moved underneath. When the replay
 //! conflicts, the comparison falls back to head against head, and says so.
 //!
@@ -119,14 +119,6 @@ pub fn trees_of(root: &Path, commits: &[&str]) -> Result<Vec<Option<String>>, Da
         .collect())
 }
 
-/// A commit with `tree` on top of `parent` (not on any branch), to compare from.
-fn commit_of(root: &Path, tree: &str, parent: &str, message: &str) -> Result<String, DataError> {
-    git::validate_oid(tree)?;
-    git::validate_oid(parent)?;
-    let output = git::output(root, &["commit-tree", tree, "-p", parent, "-m", message])?;
-    Ok(String::from_utf8_lossy(&output).trim().to_owned())
-}
-
 /// The comparison from `from` to `to`, two versions of layer `number`: the old change replayed
 /// on the new fork point against the new head; head against head when either fork point is
 /// unknown or the replay conflicts. `None` when they are the same commit.
@@ -142,16 +134,11 @@ fn compare_versions(
         return Ok(None);
     }
     let head = to.version.head_oid.clone();
-    if let (Replay::Clean(tree), Some(new_fork)) = (replayed, to.fork_oid.as_deref()) {
-        let base = commit_of(
-            root,
-            &tree,
-            new_fork,
-            &format!(
-                "#{number} at {} replayed on {new_fork}",
-                from.version.head_oid
-            ),
-        )?;
+    if let (Replay::Clean(tree), Some(old_fork), Some(new_fork)) =
+        (replayed, from.fork_oid.as_deref(), to.fork_oid.as_deref())
+    {
+        let base =
+            super::delta::replay_commit(root, &tree, old_fork, new_fork, &from.version.head_oid)?;
         return Ok(Some(Comparison {
             number,
             source: ReviewSourceKind::CommitRange {

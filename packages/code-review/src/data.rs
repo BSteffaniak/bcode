@@ -21,6 +21,7 @@ mod search;
 mod stack;
 
 pub use blob::{BlobService, CatFileRegistry};
+pub use stack::MAX_ATTRIBUTION_LINES;
 
 use bcode_code_review_models::{
     REVIEW_ERROR_CURSOR_STALE, REVIEW_ERROR_GIT_FAILED, REVIEW_ERROR_INVALID_REQUEST,
@@ -102,6 +103,8 @@ pub struct ReviewData {
     indexes: Mutex<index::IndexCache>,
     hunks: Mutex<hunks::HunkCache>,
     merge_bases: resolve::MergeBases,
+    /// The on-disk cache, for comparisons (disabled by default).
+    disk: Arc<crate::cache::ReviewCache>,
 }
 
 impl ReviewData {
@@ -112,7 +115,8 @@ impl ReviewData {
         Self {
             indexes: Mutex::new(index::IndexCache::with_disk(Arc::clone(&disk))),
             hunks: Mutex::new(hunks::HunkCache::with_disk(Arc::clone(&disk))),
-            merge_bases: resolve::MergeBases::with_disk(disk),
+            merge_bases: resolve::MergeBases::with_disk(Arc::clone(&disk)),
+            disk,
             ..Self::default()
         }
     }
@@ -204,6 +208,55 @@ impl ReviewData {
     ) -> Result<ReviewPatchIdsResponse, DataError> {
         let root = self.repo_root(&request.repo_path)?;
         rereview::patch_ids(&root, request)
+    }
+
+    /// Compare layers between versions, the rebase taken out (see
+    /// [`crate::history::delta::layer_deltas`]).
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::InvalidRequest`] for too many layers, invalid object ids, or repository
+    ///   paths.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn compare_layers(
+        &self,
+        request: &bcode_code_review_models::ReviewCompareLayersRequest,
+    ) -> Result<bcode_code_review_models::ReviewCompareLayersResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        Ok(bcode_code_review_models::ReviewCompareLayersResponse {
+            deltas: crate::history::delta::layer_deltas(&root, &self.disk, &request.pairs)?,
+        })
+    }
+
+    /// Mark one file's lines new since a baseline (see [`crate::history::delta::marks`]).
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::InvalidRequest`] for invalid object ids or repository paths.
+    /// * [`DataError::PathRejected`] for unconfined paths.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn compare_marks(
+        &self,
+        request: &bcode_code_review_models::ReviewCompareMarksRequest,
+    ) -> Result<bcode_code_review_models::ReviewCompareMarksResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        crate::history::delta::marks(&root, &self.disk, request)
+    }
+
+    /// Keep version heads' commits with refs, or stop keeping them.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::InvalidRequest`] for invalid object ids or repository paths.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn versions_keep(
+        &self,
+        request: &bcode_code_review_models::ReviewVersionsKeepRequest,
+    ) -> Result<bcode_code_review_models::ReviewVersionsKeepResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        let (kept, released) =
+            crate::history::delta::keep_versions(&root, &request.keep, &request.release)?;
+        Ok(bcode_code_review_models::ReviewVersionsKeepResponse { kept, released })
     }
 
     /// Compute the cheap change token for working-tree and index sources.

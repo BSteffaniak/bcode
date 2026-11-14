@@ -148,6 +148,12 @@ data_operations! {
         models::OP_REVIEW_REVISIONS_COMPARE, revisions_compare;
     models::ReviewPatchIdsRequest => models::ReviewPatchIdsResponse,
         models::OP_REVIEW_PATCH_IDS_GET, patch_ids_get;
+    models::ReviewCompareLayersRequest => models::ReviewCompareLayersResponse,
+        models::OP_REVIEW_COMPARE_LAYERS, compare_layers;
+    models::ReviewCompareMarksRequest => models::ReviewCompareMarksResponse,
+        models::OP_REVIEW_COMPARE_MARKS, compare_marks;
+    models::ReviewVersionsKeepRequest => models::ReviewVersionsKeepResponse,
+        models::OP_REVIEW_VERSIONS_KEEP, versions_keep;
 }
 
 store_operations! {
@@ -155,6 +161,10 @@ store_operations! {
         models::OP_REVIEW_HISTORY_RECORD, |store, request| store.record_layer_versions(request);
     models::ListLayerVersionsRequest => models::ListLayerVersionsResponse,
         models::OP_REVIEW_HISTORY_LIST, |store, request| store.list_layer_versions(&request);
+    models::RecordLayerLooksRequest => models::RecordLayerLooksResponse,
+        models::OP_REVIEW_LOOKS_RECORD, |store, request| store.record_layer_looks(request);
+    models::ListLayerLooksRequest => models::ListLayerLooksResponse,
+        models::OP_REVIEW_LOOKS_LIST, |store, request| store.list_layer_looks(&request);
     models::ListReviewWorkspacesRequest => models::ListReviewWorkspacesResponse,
         models::OP_REVIEW_WORKSPACE_LIST, |store, request| store.list_workspaces(&request);
     models::CreateReviewWorkspaceRequest => models::CreateReviewWorkspaceResponse,
