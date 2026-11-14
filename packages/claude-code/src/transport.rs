@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -18,6 +18,61 @@ use tokio::{
 };
 
 type Pending = oneshot::Sender<Result<Value, Error>>;
+
+/// Native events awaiting the single consumer, bounded by the bytes they hold rather than
+/// by count: a healthy session streams thousands of small frames in bursts, and only a
+/// consumer that has fallen this far behind is a real capacity fault.
+#[derive(Clone)]
+struct EventSender {
+    tx: mpsc::UnboundedSender<(Event, usize)>,
+    queued: Arc<AtomicUsize>,
+    limit: usize,
+}
+/// Receiving half of [`EventSender`].
+struct EventReceiver {
+    rx: mpsc::UnboundedReceiver<(Event, usize)>,
+    queued: Arc<AtomicUsize>,
+}
+/// An event queue holding at most `limit` bytes of native frames.
+fn event_channel(limit: usize) -> (EventSender, EventReceiver) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    (
+        EventSender {
+            tx,
+            queued: Arc::clone(&queued),
+            limit,
+        },
+        EventReceiver { rx, queued },
+    )
+}
+impl EventSender {
+    fn send(&self, event: Event, bytes: usize) -> Result<(), Error> {
+        let bytes = bytes.max(1);
+        let held = self.queued.fetch_add(bytes, Ordering::AcqRel);
+        if held.saturating_add(bytes) > self.limit {
+            self.queued.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(Error::Capacity);
+        }
+        self.tx.send((event, bytes)).map_err(|_| {
+            self.queued.fetch_sub(bytes, Ordering::AcqRel);
+            Error::Closed
+        })
+    }
+}
+impl EventReceiver {
+    async fn recv(&mut self) -> Option<Event> {
+        let (event, bytes) = self.rx.recv().await?;
+        self.queued.fetch_sub(bytes, Ordering::AcqRel);
+        Some(event)
+    }
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
+        let (event, bytes) = self.rx.try_recv()?;
+        self.queued.fetch_sub(bytes, Ordering::AcqRel);
+        Ok(event)
+    }
+}
 struct State {
     pending: BTreeMap<String, Pending>,
     callbacks: BTreeMap<String, CallbackRequest>,
@@ -29,6 +84,8 @@ struct State {
     expected_session_id: Option<String>,
     confirmed_session_id: Option<String>,
     initialization_request_id: Option<String>,
+    /// Tools of frames skipped for uncorrelatable attribution; their task frames are skipped too.
+    skipped_tools: BTreeSet<String>,
 }
 impl State {
     fn settlement(&self) -> Settlement {
@@ -247,7 +304,7 @@ pub struct ClaudeClient {
 /// Dropping kills/reaps the process asynchronously and invalidates callbacks.
 pub struct ClaudeSession {
     client: ClaudeClient,
-    events: mpsc::Receiver<Event>,
+    events: EventReceiver,
     supervisor: Option<JoinHandle<()>>,
 }
 /// Independently awaitable request. Dropping/cancelling abandons the local waiter only;
@@ -404,7 +461,7 @@ impl ClaudeSession {
         let stdin = child.stdin.take().ok_or(Error::Closed)?;
         let stdout = child.stdout.take().ok_or(Error::Closed)?;
         let stderr = child.stderr.take().ok_or(Error::Closed)?;
-        let (event_tx, events) = mpsc::channel(options.limits.queued_events);
+        let (event_tx, events) = event_channel(options.limits.queued_event_bytes);
         let (write_tx, write_rx) = mpsc::channel(options.limits.queued_writes);
         let (stop, stopped) = watch::channel(false);
         let shared = Arc::new(Shared {
@@ -424,6 +481,7 @@ impl ClaudeSession {
                 expected_session_id,
                 confirmed_session_id: None,
                 initialization_request_id: None,
+                skipped_tools: BTreeSet::new(),
             }),
             stop,
             writes: write_tx,
@@ -1019,10 +1077,12 @@ async fn drain(mut reader: impl AsyncRead + Unpin) -> std::io::Result<()> {
 async fn read_stdout(
     mut stdout: tokio::process::ChildStdout,
     shared: Arc<Shared>,
-    events: mpsc::Sender<Event>,
+    events: EventSender,
 ) {
     let mut chunk = [0_u8; 8192];
     let mut frame = Vec::new();
+    // An oversized line is skipped to its end; the session continues after it.
+    let mut skipping = false;
     let mut failed = false;
     loop {
         let count = match stdout.read(&mut chunk).await {
@@ -1034,25 +1094,29 @@ async fn read_stdout(
                 continue;
             }
             if *byte == b'\n' {
+                if skipping {
+                    skipping = false;
+                    failed = fault_on(
+                        &shared,
+                        send_event(&events, skipped_frame("oversized_frame", None), 64),
+                    );
+                    continue;
+                }
                 if frame.is_empty() {
                     continue;
                 }
-                let result = crate::attribution::decode_frame(&frame)
-                    .map_err(|_| Error::Protocol)
-                    .and_then(|value| route(value, &shared, &events));
+                let bytes = frame.len();
+                let result = crate::attribution::decode_frame(&frame).map_or_else(
+                    |_| send_event(&events, skipped_frame("unreadable_frame", None), 64),
+                    |value| route_frame(value, bytes, &shared, &events),
+                );
                 frame.clear();
-                if let Err(error) = result {
-                    shared.fail(match error {
-                        Error::Capacity => Fault::Capacity,
-                        Error::SessionIdentity => Fault::SessionIdentity,
-                        _ => Fault::Protocol,
-                    });
-                    failed = true;
-                }
+                failed = fault_on(&shared, result);
+            } else if skipping {
+                // Discard the rest of the oversized line.
             } else if frame.len() >= shared.limits.frame_bytes {
-                shared.fail(Fault::Capacity);
                 frame.clear();
-                failed = true;
+                skipping = true;
             } else {
                 frame.push(*byte);
             }
@@ -1063,6 +1127,20 @@ async fn read_stdout(
     } else {
         Fault::Protocol
     });
+}
+
+/// Apply a routing failure; returns whether the transport faulted. Only a native identity
+/// mismatch or a consumer that stopped draining is a fault.
+fn fault_on(shared: &Shared, result: Result<(), Error>) -> bool {
+    let Err(error) = result else {
+        return false;
+    };
+    shared.fail(match error {
+        Error::SessionIdentity => Fault::SessionIdentity,
+        Error::Capacity => Fault::Capacity,
+        _ => Fault::Protocol,
+    });
+    true
 }
 fn configure_without_tools(command: &mut tokio::process::Command) {
     command.args([
@@ -1091,8 +1169,8 @@ fn sdk_server_configuration(servers: Vec<String>) -> Result<BTreeMap<String, Val
     }
     Ok(native_servers)
 }
-fn send_event(events: &mpsc::Sender<Event>, event: Event) -> Result<(), Error> {
-    events.try_send(event).map_err(|_| Error::Capacity)
+fn send_event(events: &EventSender, event: Event, bytes: usize) -> Result<(), Error> {
+    events.send(event, bytes)
 }
 fn confirm_identity(state: &mut State, id: &str) -> Result<(), Error> {
     crate::launch::validate_id(id)?;
@@ -1195,26 +1273,65 @@ fn sdk_startup_response(request: &CallbackRequest, initializing: bool) -> Option
     Some(json!({"mcp_response": {"jsonrpc":"2.0", "id":id, "result":result}}))
 }
 
+/// A frame the adapter could not use, relayed so the host can see it was skipped. Carries
+/// only the frame's type and a fixed reason code, never native content.
+fn skipped_frame(code: &'static str, value: Option<&Value>) -> Event {
+    let field = |name: &str| {
+        value
+            .and_then(|value| value.get(name))
+            .and_then(Value::as_str)
+            .filter(|text| text.len() <= 64 && text.chars().all(|c| c.is_ascii_graphic()))
+            .map(ToOwned::to_owned)
+    };
+    Event::Message(NativeMessage::Notice(json!({
+        "type": crate::ADAPTER_NOTICE_TYPE,
+        "code": code,
+        "frame_type": field("type"),
+        "frame_subtype": field("subtype"),
+    })))
+}
+
 fn handle_control_request(
     value: &Value,
     shared: &Shared,
     state: &mut State,
-    events: &mpsc::Sender<Event>,
+    events: &EventSender,
+    bytes: usize,
 ) -> Result<(), Error> {
-    let id = value
+    let Some(id) = value
         .get("request_id")
         .and_then(Value::as_str)
-        .ok_or(Error::Protocol)?;
-    crate::launch::validate_id(id)?;
+        .filter(|id| crate::launch::validate_id(id).is_ok())
+    else {
+        return send_event(
+            events,
+            skipped_frame("unreadable_control_request", Some(value)),
+            64,
+        );
+    };
+    let request = value
+        .get("request")
+        .cloned()
+        .and_then(|request| serde_json::from_value::<CallbackRequest>(request).ok());
     if state.callbacks.contains_key(id) {
-        return Err(Error::Protocol);
+        // A repeat of a request already being answered: answering it again would answer both.
+        return send_event(
+            events,
+            skipped_frame("duplicate_control_request", Some(value)),
+            64,
+        );
     }
-    if state.callbacks.len() >= shared.limits.active_callbacks {
-        return Err(Error::Capacity);
-    }
-    let request: CallbackRequest =
-        serde_json::from_value(value.get("request").cloned().ok_or(Error::Protocol)?)
-            .map_err(|_| Error::Protocol)?;
+    let refusal = if state.callbacks.len() >= shared.limits.active_callbacks {
+        "too_many_control_requests"
+    } else {
+        "unsupported_control_request"
+    };
+    // A request the adapter cannot serve is refused, so the native agent never waits on it.
+    let Some(request) = request.filter(|_| state.callbacks.len() < shared.limits.active_callbacks)
+    else {
+        let _ = shared.enqueue(&control_error(id), None);
+        return send_event(events, skipped_frame(refusal, value.get("request")), 64);
+    };
     record_sdk_metadata(&request, shared);
     if let CallbackRequest::McpMessage { server_name, .. } = &request
         && shared.sdk_servers.contains(server_name)
@@ -1237,29 +1354,77 @@ fn handle_control_request(
             request_id: id.to_owned(),
             request,
         },
+        bytes,
     )
 }
-fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<(), Error> {
-    let kind = value
+
+/// Remember the tools a skipped frame started, within a fixed bound.
+fn remember_skipped_tools(state: &mut State, value: &Value) {
+    const MAX_SKIPPED_TOOLS: usize = 256;
+    let tools = value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| block.get("id").and_then(Value::as_str));
+    for tool in tools {
+        if state.skipped_tools.len() < MAX_SKIPPED_TOOLS {
+            state.skipped_tools.insert(tool.to_owned());
+        }
+    }
+}
+
+/// A refusal of native control request `id`.
+fn control_error(id: &str) -> Value {
+    json!({"type":"control_response","response":{"subtype":"error","request_id":id,
+        "error":"unsupported by this host"}})
+}
+
+#[cfg(test)]
+fn route(value: Value, shared: &Shared, events: &EventSender) -> Result<(), Error> {
+    route_frame(value, 512, shared, events)
+}
+
+/// Route one native frame of `bytes` bytes. Only a native session identity mismatch and a
+/// consumer that stopped draining are faults; a frame the adapter does not understand is
+/// relayed as a notice and the session continues.
+fn route_frame(
+    value: Value,
+    bytes: usize,
+    shared: &Shared,
+    events: &EventSender,
+) -> Result<(), Error> {
+    let Some(kind) = value
         .get("type")
         .and_then(Value::as_str)
-        .ok_or(Error::Protocol)?;
+        .map(ToOwned::to_owned)
+    else {
+        return send_event(events, skipped_frame("untyped_frame", None), 64);
+    };
     let mut state = shared.lock();
     if state.fault.is_some() {
         return Ok(());
     }
-    match kind {
+    match kind.as_str() {
         "control_response" => {
-            handle_control_response(&value, shared, &mut state)?;
+            if handle_control_response(&value, shared, &mut state).is_err() {
+                drop(state);
+                send_event(
+                    events,
+                    skipped_frame("unreadable_control_response", Some(&value)),
+                    64,
+                )?;
+            }
         }
         "control_request" => {
-            handle_control_request(&value, shared, &mut state, events)?;
+            handle_control_request(&value, shared, &mut state, events, bytes)?;
         }
         "control_cancel_request" => {
-            let id = value
-                .get("request_id")
-                .and_then(Value::as_str)
-                .ok_or(Error::Protocol)?;
+            let Some(id) = value.get("request_id").and_then(Value::as_str) else {
+                drop(state);
+                return send_event(events, skipped_frame("unreadable_control_cancel", None), 64);
+            };
             state.responding.remove(id);
             if state.callbacks.remove(id).is_some() {
                 send_event(
@@ -1267,70 +1432,127 @@ fn route(value: Value, shared: &Shared, events: &mpsc::Sender<Event>) -> Result<
                     Event::CallbackCancelled {
                         request_id: id.to_owned(),
                     },
+                    64,
                 )?;
             }
         }
-        "system" | "assistant" | "user" | "result" | "stream_event" | "command_lifecycle"
-        | "rate_limit_event" => {
-            if kind == "system" && value.get("subtype").and_then(Value::as_str) == Some("init") {
-                let id = value
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .ok_or(Error::SessionIdentity)?;
-                confirm_identity(&mut state, id)?;
-                shared.identity_changed.notify_waiters();
-            } else if value.get("parent_tool_use_id").is_none_or(Value::is_null)
-                && let Some(id) = value.get("session_id")
-            {
-                let id = id.as_str().ok_or(Error::SessionIdentity)?;
-                if state
+        "system" | "assistant" | "user" | "result" | "stream_event" => {
+            route_message(value, &kind, bytes, shared, state, events)?;
+        }
+        // Informational frames (progress, keep-alive, summaries, rate limits) and frame types
+        // newer than this adapter carry nothing it must act on: relayed, never fatal.
+        _ => {
+            if let Some(id) = value.get("session_id").and_then(Value::as_str)
+                && value.get("parent_tool_use_id").is_none_or(Value::is_null)
+                && state
                     .confirmed_session_id
                     .as_deref()
                     .is_some_and(|confirmed| confirmed != id)
-                    || state
-                        .expected_session_id
-                        .as_deref()
-                        .is_some_and(|expected| expected != id)
-                {
-                    return Err(Error::SessionIdentity);
-                }
-            }
-            let attribution = state.attribution.observe_delivery(&value)?;
-            if attribution.is_some() {
-                let id = value
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .ok_or(Error::SessionIdentity)?;
-                confirm_identity(&mut state, id)?;
-                shared.identity_changed.notify_waiters();
-            }
-            let previous = state.settlement();
-            // A session-scoped/startup/stale result cannot settle an attributed attempt.
-            if kind != "result"
-                || state.attributed_mode != Some(true)
-                || state.attribution.answers_current(attribution.as_ref())
             {
-                state.lifecycle.observe(&value)?;
+                return Err(Error::SessionIdentity);
             }
-            let next = state.settlement();
             drop(state);
-            let message = match kind {
-                "system" => NativeMessage::System(value),
-                "assistant" => NativeMessage::Assistant(value),
-                "user" => NativeMessage::User(value),
-                "result" => NativeMessage::Result(value),
-                "stream_event" => NativeMessage::Stream(value),
-                _ => NativeMessage::Notice(value),
-            };
-            if let Some(attribution) = attribution {
-                send_event(events, Event::Attribution(attribution))?;
-            }
-            send_event(events, Event::Message(message))?;
-            if next != previous {
-                send_event(events, Event::Settlement(next))?;
-            }
+            send_event(events, Event::Message(NativeMessage::Notice(value)), bytes)?;
         }
-        _ => return Err(Error::Protocol),
+    }
+    Ok(())
+}
+
+fn route_message(
+    value: Value,
+    kind: &str,
+    bytes: usize,
+    shared: &Shared,
+    mut state: MutexGuard<'_, State>,
+    events: &EventSender,
+) -> Result<(), Error> {
+    if kind == "system" && value.get("subtype").and_then(Value::as_str) == Some("init") {
+        let id = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or(Error::SessionIdentity)?;
+        confirm_identity(&mut state, id)?;
+        shared.identity_changed.notify_waiters();
+    } else if value.get("parent_tool_use_id").is_none_or(Value::is_null)
+        && let Some(id) = value.get("session_id")
+    {
+        let id = id.as_str().ok_or(Error::SessionIdentity)?;
+        if state
+            .confirmed_session_id
+            .as_deref()
+            .is_some_and(|confirmed| confirmed != id)
+            || state
+                .expected_session_id
+                .as_deref()
+                .is_some_and(|expected| expected != id)
+        {
+            return Err(Error::SessionIdentity);
+        }
+    }
+    // A frame whose submission cannot be correlated (one already retired, say) is skipped,
+    // with its tools' task frames, so it is never credited to a later submission.
+    let attribution = match state.attribution.observe_delivery(&value) {
+        Ok(attribution) => attribution,
+        Err(Error::SessionIdentity) => return Err(Error::SessionIdentity),
+        Err(_) => {
+            remember_skipped_tools(&mut state, &value);
+            drop(state);
+            return send_event(
+                events,
+                skipped_frame("uncorrelated_frame", Some(&value)),
+                64,
+            );
+        }
+    };
+    if value
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .is_some_and(|tool| state.skipped_tools.contains(tool))
+    {
+        drop(state);
+        return send_event(
+            events,
+            skipped_frame("uncorrelated_frame", Some(&value)),
+            64,
+        );
+    }
+    let mut notices = Vec::new();
+    if attribution.is_some() {
+        let id = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or(Error::SessionIdentity)?;
+        confirm_identity(&mut state, id)?;
+        shared.identity_changed.notify_waiters();
+    }
+    let previous = state.settlement();
+    // A session-scoped/startup/stale result cannot settle an attributed attempt.
+    if (kind != "result"
+        || state.attributed_mode != Some(true)
+        || state.attribution.answers_current(attribution.as_ref()))
+        && state.lifecycle.observe(&value).is_err()
+    {
+        // A lifecycle shape this adapter does not know leaves settlement where it was.
+        notices.push(skipped_frame("unreadable_lifecycle", Some(&value)));
+    }
+    let next = state.settlement();
+    drop(state);
+    let message = match kind {
+        "system" => NativeMessage::System(value),
+        "assistant" => NativeMessage::Assistant(value),
+        "user" => NativeMessage::User(value),
+        "result" => NativeMessage::Result(value),
+        _ => NativeMessage::Stream(value),
+    };
+    for notice in notices {
+        send_event(events, notice, 64)?;
+    }
+    if let Some(attribution) = attribution {
+        send_event(events, Event::Attribution(attribution), 512)?;
+    }
+    send_event(events, Event::Message(message), bytes)?;
+    if next != previous {
+        send_event(events, Event::Settlement(next), 64)?;
     }
     Ok(())
 }
@@ -1422,6 +1644,7 @@ mod sdk_handshake_tests {
                 expected_session_id: None,
                 confirmed_session_id: None,
                 initialization_request_id: None,
+                skipped_tools: BTreeSet::new(),
             }),
             stop,
             writes,
@@ -1461,7 +1684,7 @@ mod sdk_handshake_tests {
     async fn model_selection_waits_for_exact_control_ack_before_prompt() {
         let (client, mut written) = handshake_transport();
         client.shared.initialized.store(2, Ordering::Release);
-        let (events, _received) = mpsc::channel(8);
+        let (events, _received) = event_channel(1 << 20);
         let initialize = json!({"models":[{"value":"known","displayName":"Known"}]});
         let select = client.select_model_before_prompt(&initialize, "known");
         let native = async {
@@ -1500,7 +1723,7 @@ mod sdk_handshake_tests {
             .model_selection_contract =
             crate::models::ModelSelectionContract::AdvertisedAliasResolution;
         client.shared.initialized.store(2, Ordering::Release);
-        let (events, _received) = mpsc::channel(8);
+        let (events, _received) = event_channel(1 << 20);
         let initialize = json!({"models":[{"value":"haiku","displayName":"Native alias"}]});
         let select = client.select_model_before_prompt(&initialize, "haiku");
         let native = async {
@@ -1533,7 +1756,7 @@ mod sdk_handshake_tests {
     async fn approval_response_allows_correlated_mcp_call_without_replaying_approval() {
         let (client, mut written) = handshake_transport();
         client.shared.initialized.store(2, Ordering::Release);
-        let (events, mut received) = mpsc::channel(8);
+        let (events, mut received) = event_channel(1 << 20);
         route(
             json!({"type":"control_request","request_id":"approval",
                 "request":{"subtype":"can_use_tool","tool_name":"mcp__bcode-tools__filesystem_read",
@@ -1645,7 +1868,7 @@ mod sdk_handshake_tests {
     #[tokio::test]
     async fn refresh_retains_correlation_and_routes_catalog_after_startup() {
         let (client, mut written) = handshake_transport();
-        let (events, mut received) = mpsc::channel(8);
+        let (events, mut received) = event_channel(1 << 20);
         route(
             json!({"type":"control_request","request_id":"startup-list",
             "request":{"subtype":"mcp_message","server_name":"bcode-tools",
@@ -1733,7 +1956,7 @@ mod sdk_handshake_tests {
     fn startup_negotiation_needs_no_plugin_consumer_or_tool_grant() {
         let (client, mut written) = handshake_transport();
         let shared = &client.shared;
-        let (events, mut received) = mpsc::channel(8);
+        let (events, mut received) = event_channel(1 << 20);
         for (id, method) in [
             (Some(json!(0)), "initialize"),
             (None, "notifications/initialized"),
@@ -1834,6 +2057,7 @@ mod retired_delivery_tests {
                     expected_session_id: None,
                     confirmed_session_id: None,
                     initialization_request_id: None,
+                    skipped_tools: BTreeSet::new(),
                 }),
                 stop,
                 writes,
@@ -1844,22 +2068,25 @@ mod retired_delivery_tests {
                 sdk_servers: BTreeSet::new(),
                 sdk_metadata: std::array::from_fn(|_| AtomicU64::new(0)),
             };
-            let (events, mut received) = mpsc::channel(8);
-            assert!(
-                route(
-                    json!({"type":"assistant","uuid":frame_id,"user_message_uuid":A,
-                "message":{"content":[{"type":"tool_use","id":"late-tool","name":"Bash"}]}}),
-                    &shared,
-                    &events
-                )
-                .is_err()
-            );
-            // Same fail-closed transition used by read_stdout. Subsequent native
-            // task frames cannot escape the fault and be associated with B.
-            shared.fail(Fault::Protocol);
+            let (events, mut received) = event_channel(1 << 20);
+            route(
+                json!({"type":"assistant","uuid":frame_id,"user_message_uuid":A,
+            "message":{"content":[{"type":"tool_use","id":"late-tool","name":"Bash"}]}}),
+                &shared,
+                &events,
+            )
+            .unwrap();
+            // Its task frames are skipped too, so neither can be associated with B; the
+            // session itself continues.
             route(json!({"type":"system","subtype":"task_started","task_id":"late-task","tool_use_id":"late-tool"}), &shared, &events).unwrap();
+            for _ in 0..2 {
+                let Ok(Event::Message(NativeMessage::Notice(notice))) = received.try_recv() else {
+                    panic!("only skipped-frame notices reach consumers");
+                };
+                assert_eq!(notice["code"], "uncorrelated_frame");
+            }
             assert!(received.try_recv().is_err());
-            assert_eq!(shared.lock().settlement(), Settlement::Uncertain);
+            assert!(shared.lock().fault.is_none());
         }
     }
 }

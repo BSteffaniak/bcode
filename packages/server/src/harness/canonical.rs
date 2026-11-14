@@ -136,15 +136,29 @@ fn verify_recorded_release_lifetime(
     provenance
         .validate()
         .map_err(|_| ManagedHarnessError::Invalid)?;
-    if provenance.daemon_instance_id == state.daemon_status.instance_id
-        || state.daemon_status.state_location_id.as_deref()
-            != Some(provenance.state_location_id.as_str())
-        || bcode_daemon_lifecycle::execution_lifetime_status(
-            &state.state_root,
-            &provenance.daemon_instance_id,
-            &provenance.artifact_id,
-            &provenance.state_location_id,
-        ) != bcode_daemon_lifecycle::ExecutionLifetimeStatus::Released
+    if state.daemon_status.state_location_id.as_deref()
+        != Some(provenance.state_location_id.as_str())
+    {
+        return Err(ManagedHarnessError::StaleOwner);
+    }
+    if provenance.daemon_instance_id == state.daemon_status.instance_id {
+        // This daemon closed the transport and its plugin proved the reap: the release record
+        // is first-hand evidence, unlike a previous daemon's, whose end must be proved.
+        return (state
+            .daemon_status
+            .artifact_id
+            .as_ref()
+            .map(ToString::to_string)
+            == Some(provenance.artifact_id.clone()))
+        .then_some(())
+        .ok_or(ManagedHarnessError::StaleOwner);
+    }
+    if bcode_daemon_lifecycle::execution_lifetime_status(
+        &state.state_root,
+        &provenance.daemon_instance_id,
+        &provenance.artifact_id,
+        &provenance.state_location_id,
+    ) != bcode_daemon_lifecycle::ExecutionLifetimeStatus::Released
     {
         return Err(ManagedHarnessError::StaleOwner);
     }

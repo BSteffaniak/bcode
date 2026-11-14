@@ -182,6 +182,14 @@ impl ConfigurationViews {
             .bindings
             .get(&owner.session_id)
             .ok_or(ManagedHarnessError::Unavailable)?;
+        // A view pinned by an earlier generation of the session in this daemon belongs to a
+        // released transport: the resumed generation is resolved as after a restart.
+        if binding.owner.session_id == owner.session_id
+            && binding.owner.daemon_id == owner.daemon_id
+            && binding.owner.generation < owner.generation
+        {
+            return Err(ManagedHarnessError::Unavailable);
+        }
         if binding.owner != *owner {
             tracing::debug!(target: "bcode_server::harness",
                 generation = binding.owner.generation == owner.generation,

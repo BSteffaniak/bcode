@@ -450,6 +450,29 @@ impl Cli {
         )
     }
 
+    /// The daemon's recent warnings, for failure messages.
+    fn daemon_warnings(&self) -> String {
+        let Ok(entries) = std::fs::read_dir(self.root.path().join("state/logs")) else {
+            return String::new();
+        };
+        let mut warnings = entries
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .flat_map(|log| {
+                log.lines()
+                    .filter(|line| {
+                        ["WARN", "ERROR"].iter().any(|level| line.contains(level))
+                            && !line.contains("idle_shutdown")
+                    })
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let keep = warnings.len().saturating_sub(12);
+        warnings.drain(..keep);
+        warnings.join("\n")
+    }
+
     fn native_timings(&self) -> Value {
         let mut values = serde_json::Map::new();
         for label in [
@@ -606,10 +629,11 @@ impl Cli {
         );
         assert!(
             reply.ok,
-            "real observation application failed; value={} output={} native_timings={}",
+            "real observation application failed; value={} output={} native_timings={} daemon_warnings={}",
             reply.value,
             reply.output,
-            self.native_timings()
+            self.native_timings(),
+            self.daemon_warnings()
         );
         assert_eq!(reply.value["kind"]["kind"], "observations");
         reply.value["kind"]["response"].clone()
@@ -986,6 +1010,59 @@ fn the_conversations_agent_decides_native_approvals_without_asking() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!cli.native.join("approval-allow.effect").exists());
+}
+
+#[test]
+fn native_frames_newer_than_the_adapter_never_end_the_conversation() {
+    let cli = Cli::new("multi_turn");
+    std::fs::write(cli.native.join("noisy"), "").unwrap();
+    let (confirmed, mut after) = cli.confirmed_first_turn();
+    let sent = cli.send_turn(
+        &confirmed,
+        "turn-2",
+        "submit-2",
+        "55555555-5555-4555-8555-000000000002",
+    );
+    assert_eq!(sent.value["kind"]["kind"], "receipt", "{}", sent.value);
+    // Progress, keep-alive and unknown frames, a background task and a burst of streaming
+    // deltas arrive mid-turn: the turn still completes on a connected native session.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut tasks = Vec::new();
+    loop {
+        let page = cli.observe(&confirmed, after.as_deref());
+        assert_ne!(
+            page["status"]["connectivity"], "disconnected",
+            "the native session stays connected; page={page}"
+        );
+        let mut terminal = false;
+        for item in page["observations"].as_array().unwrap() {
+            let kind = &item["kind"];
+            if kind["kind"] == "subagent" {
+                tasks.push(kind["status"].as_str().unwrap_or_default().to_owned());
+            }
+            terminal |= kind["kind"] == "execution"
+                && kind["event"]["event"] == "submission_terminal"
+                && kind["event"]["attempt"]["submission_id"] == "submit-2";
+        }
+        after = page["next_after"].as_str().map(str::to_owned);
+        if terminal {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "turn-2 must complete; last page={page}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(cli.native.join("turn-2.effect").exists());
+    assert_eq!(
+        tasks,
+        [
+            "started a command: Type-check the crate",
+            "command completed: Type-check the crate — no errors"
+        ]
+    );
+    cli.stop();
 }
 
 #[test]

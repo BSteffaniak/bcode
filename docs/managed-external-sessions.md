@@ -463,6 +463,15 @@ replayed.
 A termination or hangup signal (for example system shutdown or logout) is handled like an
 explicit stop, so the release above is recorded.
 
+A native process that ends while its daemon keeps running (it crashed, or its transport was
+stopped) is recovered the same way without a restart. The interactive client sees the session's
+native connection end for its attached generation and requests recovery; the daemon closes the
+ended transport, records `TransportReleased` once the plugin proves the reap, and admits
+`RecoveryPrepared` from that release. A release recorded by the recovering daemon itself is
+first-hand evidence, so the daemon need not differ and no released execution lifetime is
+required; an *abandoned* transport (no release) is still recoverable only by a different daemon.
+The plugin replaces its closed process record when the next generation opens the resume.
+
 A daemon that ends without releasing (killed, crashed, power loss) leaves no
 `TransportReleased`. Its native children are stdio processes that end with it. Recovery is then
 admitted as an *abandoned* transport: `RecoveryPrepared` carries `abandoned = true` and
@@ -481,6 +490,20 @@ page leaves those locators owned by an older generation. Any earlier generation 
 session whose locator row precedes the current `RecoveryPrepared` transfer is released history:
 the recovered generation starts with no retained predecessor, and consecutive recoveries remain
 usable.
+
+### Native frames the adapter does not understand
+
+A native session is never ended because of what it sends. Frame types newer than the adapter
+(progress, keep-alive, summaries) are relayed as notices; malformed frames, unusable lifecycle
+or correlation shapes, unparseable and oversized lines are skipped with a fixed-reason notice
+that the conversation reports once per kind; control requests the adapter cannot serve are
+refused so the native agent never waits on them; and frames that cannot be correlated with a
+live submission (with their tools' task frames) are skipped so they are never credited to a
+later one. Only a native session identity mismatch, or a consumer that stops draining a
+byte-bounded event queue, ends the transport, and the reason is recorded in the conversation.
+Lost observation bookkeeping is reported once as a gap on the next committed page and cleared
+when that page is committed. An idle poll that carries nothing new and reports an unchanged
+status is not written to history.
 
 ### Idle shutdown
 

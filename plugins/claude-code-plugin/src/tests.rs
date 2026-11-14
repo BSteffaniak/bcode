@@ -181,6 +181,7 @@ fn observation_ack_boundary_retires_1100_attempts_without_losing_pending_work() 
         retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
         gap: false,
+        gap_page: None,
         acknowledged: None,
         retired_attempts: Vec::new(),
     };
@@ -474,6 +475,7 @@ fn eof_stream_fixture() -> (HarnessPreparedSession, HarnessSessionTarget, Stream
         retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
         gap: false,
+        gap_page: None,
         acknowledged: None,
         retired_attempts: Vec::new(),
     };
@@ -937,6 +939,7 @@ fn bounded_queue_never_silently_evicts_unacknowledged_history() {
         retention: retention::PageRetention::new("test-connection".into()),
         observations: VecDeque::new(),
         gap: false,
+        gap_page: None,
         acknowledged: None,
         retired_attempts: Vec::new(),
     };

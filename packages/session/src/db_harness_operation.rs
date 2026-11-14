@@ -711,13 +711,14 @@ async fn inventory_directory(
     let event = inventory_canonical_event(db, owner.session_id, sequence).await?;
     let op = operation(&event)?;
     if op.owner != *owner {
-        // Only the immediately preceding generation of another daemon (released, or abandoned
-        // by a dead daemon) can seed an empty new directory. This computes commitments, not
-        // authority: transactional recovery validation still checks the exact transfer.
+        // Only the immediately preceding generation can seed an empty new directory: one
+        // released (by any daemon) or abandoned by a dead daemon. This computes commitments,
+        // not authority: transactional recovery validation still checks the exact transfer.
         if !matches!(&op.record, R::RecoveryPrepared { .. })
             && op.owner.session_id == owner.session_id
             && op.owner.generation.checked_add(1) == Some(owner.generation)
-            && op.owner.daemon_id != owner.daemon_id
+            && (op.owner.daemon_id != owner.daemon_id
+                || matches!(&op.record, R::TransportReleased { .. }))
         {
             return Ok(None);
         }

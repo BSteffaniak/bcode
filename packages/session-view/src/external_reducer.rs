@@ -618,17 +618,41 @@ impl SessionView {
                 self.snapshot.native_context_compactions =
                     self.snapshot.native_context_compactions.saturating_add(1);
             }
+            interaction @ (ExternalEffect::QuestionAsked { .. }
+            | ExternalEffect::QuestionAnswered { .. }
+            | ExternalEffect::InteractionRequested(_)
+            | ExternalEffect::InteractionResolved { .. }) => {
+                self.apply_external_interaction_effect(journal, event, interaction, remaining);
+            }
+            ExternalEffect::NativeConnection { generation, ended } => {
+                self.observe_native_connection(generation, ended);
+            }
+        }
+    }
+
+    /// Native questions and other interactions: their cards and pending requests.
+    fn apply_external_interaction_effect(
+        &mut self,
+        journal: &mut ExternalJournal,
+        event: &SessionEvent,
+        effect: ExternalEffect,
+        remaining: usize,
+    ) {
+        match effect {
             ExternalEffect::QuestionAsked {
                 id,
                 interaction_id,
                 text,
-            } => self.upsert_external_item(
-                journal,
-                event,
-                TranscriptViewItemId::new(id),
-                question_card(interaction_id, text, InteractionViewState::Pending, None),
-                remaining,
-            ),
+            } => {
+                let card = question_card(interaction_id, text, InteractionViewState::Pending, None);
+                self.upsert_external_item(
+                    journal,
+                    event,
+                    TranscriptViewItemId::new(id),
+                    card,
+                    remaining,
+                );
+            }
             ExternalEffect::QuestionAnswered { id, answer } => {
                 self.answer_question_card(journal, event, id, &answer, remaining);
             }
@@ -642,6 +666,18 @@ impl SessionView {
                 self.resolve_external_interaction(journal, generation, &request_id);
                 self.close_question_card(journal, event, generation, &request_id, remaining);
             }
+            _ => {}
+        }
+    }
+
+    /// Track whether the native process connection of the latest generation ended.
+    const fn observe_native_connection(&mut self, generation: u64, ended: bool) {
+        if ended {
+            self.snapshot.native_connection_ended = Some(generation);
+        } else if let Some(previous) = self.snapshot.native_connection_ended
+            && previous <= generation
+        {
+            self.snapshot.native_connection_ended = None;
         }
     }
 

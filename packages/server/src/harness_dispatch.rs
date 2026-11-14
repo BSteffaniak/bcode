@@ -175,6 +175,13 @@ pub trait ManagedSessionBackend: Send + Sync {
         let _ = owner;
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
     }
+    /// Close and durably release this daemon's transport for `session_id` so it can be
+    /// resumed, as daemon shutdown does for every session. Used when the native process
+    /// ended while this daemon kept running.
+    fn release_ended_transport(&self, session_id: SessionId) -> Task<'_, ()> {
+        let _ = session_id;
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
     /// Deliver an already-CAS-published exact resume under renewed caller admission.
     fn resume_recovery<'a>(
         &'a self,
@@ -632,6 +639,37 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
         Box::pin(async move {
             self.runtime.verify_owner(&owner).await?;
             self.owners.lock().await.insert(owner.session_id, owner);
+            Ok(())
+        })
+    }
+
+    fn release_ended_transport(&self, session_id: SessionId) -> Task<'_, ()> {
+        Box::pin(async move {
+            let owner = self
+                .owners
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .ok_or(ManagedHarnessError::Conflict)?;
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            let mutation_id = format!("release:{}", uuid::Uuid::new_v4());
+            let response = self
+                .runtime
+                .close(&owner, mutation_id.clone())
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(target: "bcode_server::harness", stage = "release_close", category = %error, "ended native transport release failed");
+                })?;
+            record_shutdown_transport_release(&state, &owner, mutation_id, &response)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(target: "bcode_server::harness", stage = "release_record", category = %error, "ended native transport release failed");
+                })?;
+            self.owners.lock().await.remove(&session_id);
             Ok(())
         })
     }
@@ -2005,11 +2043,27 @@ async fn dispatch_recovery(
     {
         return Err(failure(ManagedHarnessError::StaleOwner));
     }
-    let released = state
+    let mut released = state
         .sessions
         .session_external_harness_transport_release(&snapshot.owner)
         .await
         .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    // A native process that ended while this daemon kept running has no release yet:
+    // release it now, as shutdown would have, so the conversation resumes.
+    if released.is_none()
+        && snapshot.owner.daemon_id == state.daemon_status.instance_id
+        && let Some(backend) = state.managed_sessions.get()
+    {
+        if let Err(error) = backend.release_ended_transport(query.session_id).await {
+            tracing::warn!(target: "bcode_server::harness", category = %error, "ended native transport could not be released for recovery");
+            return Err(failure(error));
+        }
+        released = state
+            .sessions
+            .session_external_harness_transport_release(&snapshot.owner)
+            .await
+            .map_err(|_| failure(ManagedHarnessError::Storage))?;
+    }
     let (sequence, release, abandoned) = if let Some((sequence, release)) = released {
         (sequence, release, false)
     } else {

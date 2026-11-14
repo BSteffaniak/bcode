@@ -69,7 +69,11 @@ struct StreamState {
     wake: Arc<observation_wake::ObservationWake>,
     normalizer: Normalizer,
     observations: VecDeque<HarnessObservation>,
+    /// Evidence was lost and the host has not yet committed a page saying so. It clears once
+    /// that page is committed: a gap is reported, never a permanent state.
     gap: bool,
+    /// Retention page that reports the current gap.
+    gap_page: Option<String>,
     acknowledged: Option<String>,
     retention: retention::PageRetention,
     retired_attempts: Vec<HarnessAttemptIdentity>,
@@ -87,33 +91,42 @@ impl StreamState {
                 "message": diagnostic.message(),
             }),
         }) else {
-            self.gap = true;
+            self.report_gap();
             return false;
         };
         self.push(vec![observation])
     }
 
+    /// Queue observations for the host. Returns whether all were kept; when the host has
+    /// fallen too far behind they are dropped and a gap is reported, but the native session
+    /// continues either way.
     fn push(&mut self, observations: Vec<HarnessObservation>) -> bool {
         // Native evidence may be staged without producing observations yet; either way
         // the next page can differ, so wake any waiting observer.
         self.wake.notify();
         if self.observations.len().saturating_add(observations.len()) > MAX_RETAINED_OBSERVATIONS {
-            self.gap = true;
+            self.report_gap();
             return false;
         }
         if observations
             .iter()
             .any(|value| value.completeness == HarnessCompleteness::Gap)
         {
-            self.gap = true;
+            self.report_gap();
         }
         self.observations.extend(observations);
-        !self.gap
+        true
+    }
+
+    /// Report lost evidence on the next committed page.
+    fn report_gap(&mut self) {
+        self.gap = true;
+        self.gap_page = None;
     }
 }
 impl StreamState {
     fn disconnected(&mut self) {
-        self.gap = true;
+        self.report_gap();
         let evidence = self.normalizer.connection_lost();
         let _ = self.push(evidence);
     }
@@ -145,6 +158,11 @@ impl StreamState {
             self.retired_attempts
                 .extend(self.normalizer.retire_acknowledged());
         }
+        if self.gap_page.is_some() && self.gap_page.as_deref() == self.retention.acknowledged_page()
+        {
+            self.gap = false;
+            self.gap_page = None;
+        }
         if let Some(retention) = &observe.retention {
             self.normalizer
                 .apply_hydration(&retention.hydration)
@@ -159,8 +177,8 @@ impl StreamState {
             let staged = self
                 .normalizer
                 .pump_batch(budget, MAX_PUMPED_RECORDS_PER_PAGE);
-            if !staged.is_empty() && !self.push(staged) {
-                return Err(HarnessFailure::Uncertain);
+            if !staged.is_empty() {
+                self.push(staged);
             }
         }
         let (staged, unacknowledged, hydrating) = self.normalizer.pump_state();
@@ -214,6 +232,9 @@ impl StreamState {
             || !hydration_requests.is_empty();
         let (retention, observations) = if retain {
             let (retention, observations) = self.retention.offer(observations)?;
+            if self.gap && self.gap_page.is_none() {
+                self.gap_page = Some(retention.page_id.clone());
+            }
             (Some(retention), observations)
         } else {
             (None, observations)
@@ -1003,7 +1024,23 @@ impl PluginState {
         close: bool,
     ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
         let operation = if close { "close" } else { "interrupt" };
-        let process = self.process(instance, &control.target)?;
+        // A process whose transport already ended can still be closed: its reap is the
+        // release evidence that lets the conversation resume.
+        let process = if close {
+            let process = self.retained_process(instance, &control.target)?;
+            if process.closed {
+                return if process.released_close.as_ref() == Some(control) {
+                    Ok(HarnessServiceResponseKind::Acknowledged {
+                        mutation_id: control.mutation_id.clone(),
+                    })
+                } else {
+                    Err(HarnessFailure::Conflict)
+                };
+            }
+            process
+        } else {
+            self.process(instance, &control.target)?
+        };
         if process.controls.contains_key(&control.mutation_id) {
             return Err(HarnessFailure::Uncertain);
         }
@@ -1227,6 +1264,18 @@ impl PluginState {
         }
         Ok(process)
     }
+    /// A later generation resuming a conversation whose process this plugin closed and reaped
+    /// replaces it; the closed process is only a record of an earlier generation.
+    fn release_superseded_process(&mut self, open: &HarnessOpenRequest) {
+        if self
+            .processes
+            .get(&open.session_id)
+            .is_some_and(|process| process.closed && process.open.generation < open.generation)
+        {
+            self.release_closed_processes();
+        }
+    }
+
     fn release_closed_processes(&mut self) {
         let closed: Vec<_> = self
             .processes
@@ -1347,6 +1396,7 @@ impl PluginState {
         context: &NativeServiceContext,
         model: Option<&bcode_harness_models::HarnessModelSelection>,
     ) -> Result<HarnessServiceResponseKind, HarnessFailure> {
+        self.release_superseded_process(open);
         if (self.opens.contains_key(&open.session_id)
             || self.processes.contains_key(&open.session_id))
             && !model_selection::same_selection(self.model_selections.get(&open.session_id), model)
@@ -1594,6 +1644,7 @@ async fn prepare_stream(
         normalizer,
         observations: VecDeque::new(),
         gap: false,
+        gap_page: None,
     }));
     Ok(PreparedStream {
         model_evidence,
@@ -1653,6 +1704,7 @@ mod host_tools_diagnostic_tests {
             ),
             observations: VecDeque::new(),
             gap: false,
+            gap_page: None,
             acknowledged: None,
             retention: retention::PageRetention::new("diagnostic-test".into()),
             retired_attempts: Vec::new(),
@@ -1761,20 +1813,18 @@ async fn normalize_session_event(
     } else {
         None
     };
-    let (accepted, reject_callback) = reader_state.lock().map_or((false, None), |mut stream| {
+    let reject_callback = reader_state.lock().map_or(None, |mut stream| {
         let mut observations = confirmation;
         observations.extend(stream.normalizer.event(event));
         let reject = unsupported_callback.filter(|id| !stream.normalizer.pending.contains_key(id));
-        (stream.push(observations), reject)
+        // Lost bookkeeping is reported as a gap; it never ends a live native session.
+        stream.push(observations);
+        reject
     });
     if let Some(id) = reject_callback {
         let _ = client
             .respond(&id, bcode_claude_code::CallbackResponse::Error)
             .await;
-    }
-    if !accepted {
-        client.terminate();
-        return false;
     }
     true
 }
@@ -1784,7 +1834,11 @@ async fn drain_session(
     reader_state: Arc<Mutex<StreamState>>,
     tool_queue: Option<Arc<Mutex<tool_bridge::Queue>>>,
 ) {
-    while let Ok(event) = session.next_event().await {
+    let ended = loop {
+        let event = match session.next_event().await {
+            Ok(event) => event,
+            Err(error) => break Some(error),
+        };
         if let Event::Message(bcode_claude_code::NativeMessage::System(value)) = &event
             && value["subtype"] == "init"
             && let Ok(mut stream) = reader_state.lock()
@@ -1841,9 +1895,9 @@ async fn drain_session(
             }
         }
         if !normalize_session_event(&session.client(), &reader_state, event).await {
-            break;
+            break None;
         }
-    }
+    };
     if let Some(queue) = &tool_queue
         && let Ok(mut queue) = queue.lock()
         && let Some(scope) = queue.scope().cloned()
@@ -1851,9 +1905,40 @@ async fn drain_session(
         let _ = queue.revoke(&scope);
     }
     if let Ok(mut stream) = reader_state.lock() {
+        if let Some(error) = ended
+            && let Some(observation) = stream.normalizer.observation(connection_ended(&error))
+        {
+            stream.push(vec![observation]);
+        }
         stream.disconnected();
     }
     session.close().await;
+}
+
+/// Why the native connection ended, for the conversation.
+fn connection_ended(error: &bcode_claude_code::Error) -> HarnessObservationKind {
+    let (code, message) = match error {
+        bcode_claude_code::Error::Closed => (
+            "native_process_ended",
+            "the Claude Code process ended; resuming the conversation",
+        ),
+        bcode_claude_code::Error::Capacity => (
+            "native_output_backlog",
+            "stopped reading Claude Code because its output backed up; resuming the conversation",
+        ),
+        bcode_claude_code::Error::SessionIdentity => (
+            "native_identity_mismatch",
+            "Claude Code reported a different conversation, so Bcode stopped it",
+        ),
+        _ => (
+            "native_protocol_error",
+            "Claude Code's output could not be read; resuming the conversation",
+        ),
+    };
+    HarnessObservationKind::Diagnostic {
+        code: code.into(),
+        message: message.into(),
+    }
 }
 
 /// Map a native control failure. Admission refusals happen before any native write; a

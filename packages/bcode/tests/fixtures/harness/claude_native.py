@@ -81,6 +81,32 @@ def stream_event(session, event):
           "parent_tool_use_id":None, "event":event})
 
 
+def noisy_turn(session, content):
+    """Frames a current native CLI sends that older adapters treated as fatal, a background
+    task that starts and finishes, and a burst of streaming deltas.
+
+    Enabled only by the explicit `noisy` oracle."""
+    emit({"type":"tool_progress", "tool_use_id":"fixture-progress", "tool_name":"Bash",
+          "elapsed_time_seconds":21, "session_id":session})
+    emit({"type":"keep_alive"})
+    emit({"type":"future_frame_kind", "session_id":session})
+    emit({"type":"system", "subtype":"task_started", "task_id":"fixture-task-" + content,
+          "task_type":"local_bash", "description":"Type-check the crate", "session_id":session})
+    message_id = "msg_noisy_" + content
+    stream_event(session, {"type":"message_start", "message":{"id":message_id,
+                 "type":"message", "role":"assistant", "content":[],
+                 "model":"claude-fixture", "usage":{"input_tokens":1, "output_tokens":0}}})
+    stream_event(session, {"type":"content_block_start", "index":0,
+                 "content_block":{"type":"text", "text":""}})
+    for _ in range(500):
+        stream_event(session, {"type":"content_block_delta", "index":0,
+                     "delta":{"type":"text_delta", "text":"."}})
+    stream_event(session, {"type":"content_block_stop", "index":0})
+    stream_event(session, {"type":"message_stop"})
+    emit({"type":"system", "subtype":"task_notification", "task_id":"fixture-task-" + content,
+          "status":"completed", "summary":"no errors", "session_id":session})
+
+
 def rich_turn(root, session, submission_uuid, content):
     """Partial-message streaming, thinking, one native tool and its result.
 
@@ -274,6 +300,13 @@ def main():
             submission_uuid_seen = submission_uuid
             emit({"type":"system", "subtype":"session_state_changed",
                   "session_id":session, "state":"running"})
+            crash = root / "crash-on"
+            if crash.exists() and crash.read_text(encoding="utf-8").strip() == content:
+                # The native process dies mid-turn; the host must resume the conversation.
+                crash.unlink()
+                raise SystemExit(90)
+            if (root / "noisy").exists():
+                noisy_turn(session, content)
             rich = (root / "rich-output").exists()
             if rich:
                 rich_turn(root, session, submission_uuid, content)

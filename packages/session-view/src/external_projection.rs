@@ -159,6 +159,13 @@ pub enum ExternalEffect {
         /// The question and its options.
         text: String,
     },
+    /// The native process connection of `generation` ended (or resumed, when `ended` is false).
+    NativeConnection {
+        /// Ownership generation the page reported.
+        generation: u64,
+        /// Whether the connection ended.
+        ended: bool,
+    },
     /// A native question was answered; its card shows the answer in place of the prompt to
     /// answer.
     QuestionAnswered {
@@ -376,6 +383,14 @@ fn project_operation(
             for observation in &page.observations {
                 project_observation(builder, observation, Some(instance))?;
             }
+            builder
+                .projection
+                .effects
+                .push(ExternalEffect::NativeConnection {
+                    generation: operation.owner.generation,
+                    ended: page.status.connectivity
+                        == bcode_harness_models::HarnessConnectivity::Disconnected,
+                });
         }
     }
     Ok(())
@@ -505,7 +520,15 @@ fn project_observation(
             native_agent_id,
             status,
         } => {
-            let text = format!("{} subagent {native_agent_id}: {status}", builder.label());
+            // The adapter reports what the task is and how it ended; its id is only a fallback.
+            let label = builder.label();
+            let text = if status.starts_with("started ") {
+                format!("{label} {status}")
+            } else if status.contains(':') {
+                format!("{label}'s {status}")
+            } else {
+                format!("{label} background task {native_agent_id}: {status}")
+            };
             builder.notice(text);
             return Ok(());
         }
@@ -637,11 +660,9 @@ fn excerpt(text: &str) -> String {
     excerpt
 }
 
-/// Opening of the block announcing the conversation's Bcode agent to a native agent at the
-/// start of a message: `<bcode-agent name="NAME">` … `</bcode-agent>`, then the message.
-pub const AGENT_BLOCK_OPEN: &str = "<bcode-agent name=\"";
-/// Closing of the agent block.
-pub const AGENT_BLOCK_CLOSE: &str = "</bcode-agent>";
+pub use bcode_session_models::external_harness::{
+    AGENT_BLOCK_CLOSE, AGENT_BLOCK_OPEN, split_agent_block,
+};
 
 /// A message announcing `agent` and its `instructions` before `text`.
 #[must_use]
@@ -659,21 +680,6 @@ These instructions replace any earlier Bcode agent instructions."
         block.push_str(instructions.trim());
     }
     format!("{block}\n{AGENT_BLOCK_CLOSE}\n\n{text}")
-}
-
-/// The announced agent name and the message itself, for display.
-#[must_use]
-pub fn split_agent_block(text: &str) -> (Option<&str>, &str) {
-    let Some(rest) = text.strip_prefix(AGENT_BLOCK_OPEN) else {
-        return (None, text);
-    };
-    let Some((name, _)) = rest.split_once("\">") else {
-        return (None, text);
-    };
-    let Some((_, message)) = rest.split_once(AGENT_BLOCK_CLOSE) else {
-        return (None, text);
-    };
-    (Some(name), message.trim_start_matches('\n'))
 }
 
 /// Response identities of native approvals the conversation's agent policy answered.

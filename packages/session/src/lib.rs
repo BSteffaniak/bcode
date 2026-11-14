@@ -3646,6 +3646,8 @@ fn managed_submission_text(kind: &SessionEventKind) -> Option<&str> {
 }
 
 fn title_from_first_prompt(prompt: &str) -> String {
+    // The agent announcement Bcode adds for a native agent is not what the user wrote.
+    let (_, prompt) = bcode_session_models::external_harness::split_agent_block(prompt);
     let first_content_line = prompt
         .lines()
         .map(str::trim)
@@ -3675,6 +3677,15 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
         format!("{truncated}…")
     } else {
         truncated
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    #[test]
+    fn a_title_comes_from_what_the_user_wrote_not_the_agent_announcement() {
+        let prompt = "<bcode-agent name=\"build\">\nThe Bcode agent for this conversation is now build.\n</bcode-agent>\n\nFix the flaky test";
+        assert_eq!(super::title_from_first_prompt(prompt), "Fix the flaky test");
     }
 }
 

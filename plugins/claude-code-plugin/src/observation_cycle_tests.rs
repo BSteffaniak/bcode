@@ -131,29 +131,31 @@ fn is_foreground_outcome(item: &HarnessObservation) -> bool {
 }
 
 #[test]
-fn missing_result_subtype_fails_closed_after_committed_cycles() {
+fn a_malformed_result_is_reported_as_a_gap_and_observation_continues() {
     let (prepared, target, mut stream, _) = staged_foreground(None);
     let mut request = eof_observe_request(target);
     let mut committed = CommittedPages::default();
-    // Missing native disposition is malformed evidence, not a retention failure.
-    // Every committed ACK is valid; pumping the malformed result produces a gap.
-    for cycle in 1..=8 {
-        match stream.observation_page(&prepared, &request, &Settlement::Unsupported) {
-            Ok(HarnessServiceResponseKind::Observations(page)) => {
-                assert!(!page.observations.iter().any(is_foreground_outcome));
-                request.retention = committed.commit(&page);
-                request.after = page.next_after;
-            }
-            Err(HarnessFailure::Uncertain) => {
-                assert!(cycle > 1, "earlier records must still be delivered");
-                assert!(stream.gap);
-                assert!(!stream.observations.iter().any(is_foreground_outcome));
-                return;
-            }
-            other => panic!("observation cycle {cycle}: {other:?}"),
+    // Missing native disposition is malformed evidence: it never becomes a fabricated
+    // outcome. It is reported once as a gap; after that page is committed, pages are complete
+    // again and the session keeps being observed.
+    let mut reported = false;
+    for cycle in 1..=12 {
+        let Ok(HarnessServiceResponseKind::Observations(page)) =
+            stream.observation_page(&prepared, &request, &Settlement::Unsupported)
+        else {
+            panic!("observation cycle {cycle} must keep producing pages");
+        };
+        assert!(!page.observations.iter().any(is_foreground_outcome));
+        if page.completeness == HarnessCompleteness::Gap {
+            reported = true;
+        } else if reported {
+            assert!(!stream.gap, "a committed gap report clears the gap");
+            return;
         }
+        request.retention = committed.commit(&page);
+        request.after = page.next_after;
     }
-    panic!("malformed result must fail closed within bounded cycles");
+    panic!("the gap must be reported, then cleared after its page is committed");
 }
 
 #[test]

@@ -44,6 +44,10 @@ pub struct Normalizer {
     /// Last cumulative `total_cost_usd` (in micros) this process reported. Claude reports a
     /// running process total on every result; usage observations carry only the increment.
     reported_cost_micros: Option<u64>,
+    /// Kinds of skipped native frames already reported, so each is reported once.
+    skipped_reported: std::collections::BTreeSet<String>,
+    /// Kind and description of running background tasks, by native task id.
+    task_descriptions: BTreeMap<String, (&'static str, String)>,
 }
 impl Normalizer {
     #[cfg(test)]
@@ -70,6 +74,8 @@ impl Normalizer {
             blocks: display::BlockNumbering::new(),
             model: None,
             reported_cost_micros: None,
+            skipped_reported: std::collections::BTreeSet::new(),
+            task_descriptions: BTreeMap::new(),
         }
     }
     /// Whether transient live updates wait for the next observe page.
@@ -235,13 +241,13 @@ impl Normalizer {
                         detail: serde_json::json!({"code": "compacted"}),
                     });
                 }
-                if let Some("task_started" | "task_notification") =
+                if let Some(subtype @ ("task_started" | "task_notification")) =
                     value.get("subtype").and_then(Value::as_str)
                     && let Some(id) = bounded_id(value.get("task_id"))
                 {
                     kinds.push(HarnessObservationKind::Subagent {
+                        status: self.task_status(subtype, &id, &value),
                         native_agent_id: id,
-                        status: "native activity observed".into(),
                     });
                 }
             }
@@ -270,9 +276,78 @@ impl Normalizer {
                     status: status(&state),
                 });
             }
-            Event::Message(NativeMessage::Stream(_) | NativeMessage::Notice(_)) => {}
+            Event::Message(NativeMessage::Notice(value)) => {
+                kinds.extend(self.skipped_frame(&value));
+            }
+            Event::Message(NativeMessage::Stream(_)) => {}
         }
         self.observations_from_kinds(kinds)
+    }
+    /// What a background task or subagent is doing, from its native task frames: what it is
+    /// (`started: …`) and how it ended (`completed: …`), remembering each task's description.
+    fn task_status(&mut self, subtype: &str, id: &str, value: &Value) -> String {
+        const MAX_TASKS: usize = 256;
+        const MAX_TEXT: usize = 200;
+        let text = |name: &str| {
+            value
+                .get(name)
+                .and_then(Value::as_str)
+                .map(|text| text.lines().next().unwrap_or("").trim())
+                .filter(|text| !text.is_empty())
+                .map(|text| text.chars().take(MAX_TEXT).collect::<String>())
+        };
+        let kind = match value.get("task_type").and_then(Value::as_str) {
+            Some(kind) if kind.contains("agent") => "subagent",
+            Some(kind) if kind.contains("bash") || kind.contains("shell") => "command",
+            _ => "task",
+        };
+        if subtype == "task_started" {
+            let description = text("description").unwrap_or_else(|| kind.to_owned());
+            if self.task_descriptions.len() < MAX_TASKS {
+                self.task_descriptions
+                    .insert(id.to_owned(), (kind, description.clone()));
+            }
+            return format!("started a {kind}: {description}");
+        }
+        let (kind, description) = self.task_descriptions.remove(id).unwrap_or_else(|| {
+            (
+                kind,
+                text("description").unwrap_or_else(|| "background work".to_owned()),
+            )
+        });
+        let outcome = text("status").unwrap_or_else(|| "updated".to_owned());
+        let ended = format!("{kind} {outcome}: {description}");
+        match text("summary") {
+            Some(summary) => format!("{ended} — {summary}"),
+            None => ended,
+        }
+    }
+
+    /// A diagnostic for a native frame the transport skipped, the first time that kind of
+    /// frame is skipped. Informational notices (progress, keep-alive) report nothing.
+    fn skipped_frame(&mut self, value: &Value) -> Option<HarnessObservationKind> {
+        const MAX_REPORTED: usize = 64;
+        if value.get("type").and_then(Value::as_str) != Some(bcode_claude_code::ADAPTER_NOTICE_TYPE)
+        {
+            return None;
+        }
+        let field = |name: &str| value.get(name).and_then(Value::as_str).unwrap_or("");
+        let code = field("code");
+        let frame = match (field("frame_type"), field("frame_subtype")) {
+            ("", _) => "frame".to_owned(),
+            (kind, "") => format!("`{kind}` frame"),
+            (kind, subtype) => format!("`{kind}/{subtype}` frame"),
+        };
+        let key = format!("{code}:{frame}");
+        if self.skipped_reported.len() >= MAX_REPORTED || !self.skipped_reported.insert(key) {
+            return None;
+        }
+        Some(HarnessObservationKind::Diagnostic {
+            code: "native_frame_skipped".into(),
+            message: format!(
+                "skipped a {frame} it could not use ({code}); the conversation continues"
+            ),
+        })
     }
     /// Record one native callback as a pending interaction, or report it as unsupported;
     /// `None` when the callback exceeds bounds or lacks host-admitted scope.

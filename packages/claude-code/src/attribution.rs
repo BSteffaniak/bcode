@@ -227,10 +227,11 @@ impl AttributionLedger {
                 Err(Error::Protocol)
             };
         }
-        if self.frames.len() >= Self::MAX_FRAMES {
-            return Err(Error::Capacity);
+        // Past the bound the frame is still attributed; only its repeat detection is lost,
+        // so a long turn never stops being observed.
+        if self.frames.len() < Self::MAX_FRAMES {
+            self.frames.insert(frame_id.to_owned(), attribution.clone());
         }
-        self.frames.insert(frame_id.to_owned(), attribution.clone());
         Ok(Some(attribution))
     }
 }
@@ -406,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_frame_evidence_has_a_hard_bound() {
+    fn retained_frame_evidence_is_bounded_but_a_long_turn_stays_attributed() {
         let mut retained = ledger();
         for index in 0..AttributionLedger::MAX_FRAMES {
             let mut frame = reply();
@@ -415,7 +416,8 @@ mod tests {
         }
         let mut frame = reply();
         frame["uuid"] = json!("00000000-0000-4000-8000-ffffffffffff");
-        assert!(matches!(retained.observe(&frame), Err(Error::Capacity)));
+        assert!(retained.observe(&frame).unwrap().is_some());
+        assert_eq!(retained.frames.len(), AttributionLedger::MAX_FRAMES);
     }
 
     #[test]

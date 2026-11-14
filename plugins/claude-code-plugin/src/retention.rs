@@ -24,6 +24,10 @@ impl PageRetention {
     pub const fn pending(&self) -> bool {
         self.pending.is_some()
     }
+    /// Page the host last confirmed it committed.
+    pub fn acknowledged_page(&self) -> Option<&str> {
+        self.acknowledged.as_ref().map(|ack| ack.page_id.as_str())
+    }
     pub fn apply(
         &mut self,
         context: Option<&HarnessRetentionContext>,

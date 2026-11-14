@@ -202,8 +202,34 @@ async fn callbacks_are_concurrent_and_cancelled_ids_cannot_be_answered() {
     ));
     session.close().await;
 }
+/// Codes of the skipped-frame notices among `events`.
+fn skipped_codes(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Message(bcode_claude_code::NativeMessage::Notice(value))
+                if value["type"] == bcode_claude_code::ADAPTER_NOTICE_TYPE =>
+            {
+                value["code"].as_str().map(ToOwned::to_owned)
+            }
+            _ => None,
+        })
+        .collect()
+}
+/// Receive until settlement, returning everything received before it.
+async fn until_settled(session: &mut ClaudeSession) -> Vec<Event> {
+    let mut received = Vec::new();
+    for _ in 0..64 {
+        let event = receive(session).await.expect("the session stays connected");
+        if matches!(event, Event::Settlement(Settlement::Settled)) {
+            return received;
+        }
+        received.push(event);
+    }
+    panic!("no settlement after skipped frames");
+}
 #[tokio::test(flavor = "current_thread")]
-async fn unknown_state_fails_closed() {
+async fn unknown_state_is_skipped_and_the_session_continues() {
     let fake = Fake::new("unknown");
     let mut session = fake.start().await;
     session
@@ -211,19 +237,58 @@ async fn unknown_state_fails_closed() {
         .submit("start", None)
         .await
         .expect("submit");
-    assert!(matches!(receive(&mut session).await, Err(Error::Protocol)));
-    assert_eq!(session.settlement(), Settlement::Uncertain);
+    let mut received = Vec::new();
+    while !skipped_codes(&received).contains(&"unreadable_lifecycle".to_owned()) {
+        received.push(receive(&mut session).await.expect("still connected"));
+    }
+    assert_ne!(session.settlement(), Settlement::Uncertain);
     session.close().await;
 }
 #[tokio::test(flavor = "current_thread")]
-async fn slow_consumer_overflow_is_explicit_not_silent_loss() {
+async fn frames_the_adapter_does_not_know_never_end_the_session() {
+    let mut fake = Fake::new("tolerant");
+    fake.options.limits.frame_bytes = 512;
+    let mut session = fake.start().await;
+    session
+        .client()
+        .submit("start", None)
+        .await
+        .expect("submit");
+    let received = until_settled(&mut session).await;
+    let codes = skipped_codes(&received);
+    for code in [
+        "unreadable_frame",
+        "unreadable_lifecycle",
+        "unsupported_control_request",
+        "oversized_frame",
+    ] {
+        assert!(codes.contains(&code.to_owned()), "{code} in {codes:?}");
+    }
+    // Progress, keep-alive and newer frame kinds are relayed as they are.
+    let relayed = received
+        .iter()
+        .filter_map(|event| match event {
+            Event::Message(bcode_claude_code::NativeMessage::Notice(value)) => {
+                value["type"].as_str().map(ToOwned::to_owned)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for kind in ["tool_progress", "keep_alive", "future_frame_kind"] {
+        assert!(relayed.contains(&kind.to_owned()), "{kind} in {relayed:?}");
+    }
+    session.close().await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_consumer_that_stops_draining_is_an_explicit_capacity_fault() {
     let mut fake = Fake::new("overflow");
-    fake.options.limits.queued_events = 1;
+    fake.options.limits.frame_bytes = 512;
+    fake.options.limits.queued_event_bytes = 1024;
     let mut session = fake.start().await;
     let _ = session.client().submit("start", None).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut capacity = false;
-    for _ in 0..4 {
+    for _ in 0..64 {
         if matches!(receive(&mut session).await, Err(Error::Capacity)) {
             capacity = true;
             break;
@@ -234,12 +299,13 @@ async fn slow_consumer_overflow_is_explicit_not_silent_loss() {
     session.close().await;
 }
 #[tokio::test(flavor = "current_thread")]
-async fn unterminated_oversize_frame_is_bounded() {
+async fn an_oversized_frame_is_skipped_not_fatal() {
     let mut fake = Fake::new("oversized");
     fake.options.limits.frame_bytes = 512;
     let mut session = fake.start().await;
     let _ = session.client().submit("start", None).await;
-    assert!(matches!(receive(&mut session).await, Err(Error::Capacity)));
+    let event = receive(&mut session).await.expect("still connected");
+    assert_eq!(skipped_codes(&[event]), ["oversized_frame"]);
     session.close().await;
 }
 #[tokio::test(flavor = "current_thread")]

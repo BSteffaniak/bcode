@@ -735,7 +735,7 @@ pub async fn next_managed_step(
             if !budget.allow(std::time::Instant::now()) {
                 commands.detach_commands().await;
                 return ManagedJourneyStep::End(ManagedJourneyEnd::Failed(format!(
-                    "The managed conversation could not be recovered after repeated daemon restarts. {}",
+                    "The managed conversation could not be recovered after repeated interruptions. {}",
                     reopen_hint(target)
                 )));
             }
@@ -747,11 +747,11 @@ pub async fn next_managed_step(
                 Ok(next) => ManagedJourneyStep::Continue {
                     generation: next,
                     status: format!(
-                        "Recovered the managed conversation after a daemon restart (generation {next}); no input was replayed"
+                        "Resumed the managed conversation (generation {next}); no input was replayed"
                     ),
                 },
                 Err(error) => ManagedJourneyStep::End(ManagedJourneyEnd::Failed(format!(
-                    "The managed conversation could not be recovered after the daemon restarted ({error}). {}",
+                    "The managed conversation could not be resumed ({error}). {}",
                     reopen_hint(target)
                 ))),
             }

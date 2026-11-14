@@ -356,6 +356,9 @@ pub struct SessionViewSnapshot {
     /// Times the native agent summarized earlier turns, dropping context the host added there.
     #[serde(default)]
     pub native_context_compactions: u64,
+    /// Generation whose native process connection ended, until a later generation resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_connection_ended: Option<u64>,
     /// Session summary metadata, when supplied by the daemon/catalog.
     pub session_summary: Option<SessionSummary>,
 }
@@ -394,6 +397,7 @@ impl SessionViewSnapshot {
             interactions: Vec::new(),
             pending_external_interactions: Vec::new(),
             native_context_compactions: 0,
+            native_connection_ended: None,
             session_summary: None,
         }
     }

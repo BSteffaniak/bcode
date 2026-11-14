@@ -26,8 +26,10 @@ pub struct NativeEnvironment(pub BTreeMap<String, String>);
 /// Memory and concurrency bounds, not completion timers.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    /// Largest native frame read; a longer one is skipped with a notice.
     pub frame_bytes: usize,
-    pub queued_events: usize,
+    /// Bytes of native frames held for a consumer that has fallen behind.
+    pub queued_event_bytes: usize,
     pub queued_writes: usize,
     pub pending_requests: usize,
     pub active_callbacks: usize,
@@ -37,8 +39,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            frame_bytes: 1024 * 1024,
-            queued_events: 128,
+            frame_bytes: 32 * 1024 * 1024,
+            queued_event_bytes: 256 * 1024 * 1024,
             queued_writes: 32,
             pending_requests: 32,
             active_callbacks: 32,
@@ -92,9 +94,9 @@ impl LaunchOptions {
         }
         let l = &self.limits;
         if l.frame_bytes == 0
-            || l.frame_bytes > 16 * 1024 * 1024
-            || l.queued_events == 0
-            || l.queued_events > 4096
+            || l.frame_bytes > 64 * 1024 * 1024
+            || l.queued_event_bytes < l.frame_bytes
+            || l.queued_event_bytes > 1024 * 1024 * 1024
             || l.queued_writes == 0
             || l.queued_writes > 1024
             || l.pending_requests == 0

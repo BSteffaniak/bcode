@@ -52,6 +52,9 @@ pub fn reconcile_interactions(chat: &mut ActiveChat, loop_state: &mut ChatLoopSt
     let Some(owner) = chat.app.managed_execution_session() else {
         return false;
     };
+    if resume_ended_native(chat, loop_state) {
+        return true;
+    }
     let pending = current_pending(chat, loop_state);
     let live = pending
         .iter()
@@ -138,6 +141,24 @@ pub fn reconcile_interactions(chat: &mut ActiveChat, loop_state: &mut ChatLoopSt
         }
     }
     loop_state.managed_interactions.present(key);
+    true
+}
+
+/// When the attached native process has ended, resume it: the conversation is recovered
+/// under a new generation without replaying any input. Returns whether recovery started.
+fn resume_ended_native(chat: &mut ActiveChat, loop_state: &ChatLoopState) -> bool {
+    let ended = chat.app.session_view_snapshot().native_connection_ended;
+    if ended.is_none() || ended != loop_state.managed_generation() {
+        return false;
+    }
+    let label = chat
+        .app
+        .managed_label()
+        .unwrap_or("The native agent")
+        .to_owned();
+    chat.app.request_managed_exit(ManagedExitRequest::Recover);
+    chat.app
+        .set_status(format!("{label} stopped; resuming the conversation…"));
     true
 }
 

@@ -100,6 +100,20 @@ while IFS= read -r frame; do
           i=0
           while [ "$i" -lt 500 ]; do printf '%s\n' '{"type":"assistant","message":{}}'; i=$((i + 1)); done
           ;;
+        tolerant)
+          # Frames newer or stranger than the adapter: each is skipped or relayed, never fatal.
+          printf '%s\n' '{"type":"tool_progress","tool_use_id":"t1","tool_name":"Bash","elapsed_time_seconds":20}'
+          printf '%s\n' '{"type":"keep_alive"}'
+          printf '%s\n' '{"type":"future_frame_kind","payload":{}}'
+          printf '%s\n' 'not json at all'
+          printf '%s\n' '{"type":"system","subtype":"session_state_changed","state":"future_mode"}'
+          printf '%s\n' '{"type":"control_request","request_id":"future-1","request":{"subtype":"future_request"}}'
+          i=0
+          while [ "$i" -lt 200 ]; do printf 'xxxxxxxx'; i=$((i + 1)); done
+          printf '\n'
+          printf '%s\n' '{"type":"result","is_error":false}'
+          printf '%s\n' '{"type":"system","subtype":"session_state_changed","state":"idle"}'
+          ;;
         oversized)
           i=0
           while [ "$i" -lt 500 ]; do printf 'xxxxxxxx'; i=$((i + 1)); done

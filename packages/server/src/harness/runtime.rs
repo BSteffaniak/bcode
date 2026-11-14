@@ -41,6 +41,11 @@ pub struct ManagedHarnessRuntime<S, T = HarnessPluginTransport> {
     transport: T,
     activity: super::activity::NativeActivity,
     approvals: super::native_policy::NativeApprovals,
+    /// Status of the last page committed per session, so an idle poll that changes nothing
+    /// is not written to history.
+    committed_status: std::sync::Mutex<
+        std::collections::BTreeMap<SessionId, bcode_harness_models::HarnessExecutionStatus>,
+    >,
 }
 
 impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S, T> {
@@ -52,6 +57,7 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             transport,
             activity: super::activity::NativeActivity::new(),
             approvals: super::native_policy::NativeApprovals::new(),
+            committed_status: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -485,9 +491,18 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         // the retention digest, so strip it before canonical commit. It is reattached only to
         // the in-memory result, where daemon ingestion publishes it as session live events.
         let live = std::mem::take(&mut page.live);
-        self.store
-            .observation_page(owner, previous_after.as_deref(), &page)
-            .await?;
+        if self.unchanged_idle_page(owner.session_id, &page) {
+            // Nothing to record: the canonical cursor stays where it was, and so does the
+            // caller's.
+            page.next_after.clone_from(&previous_after);
+        } else {
+            self.store
+                .observation_page(owner, previous_after.as_deref(), &page)
+                .await?;
+            if let Ok(mut committed) = self.committed_status.lock() {
+                committed.insert(owner.session_id, page.status.clone());
+            }
+        }
         page.live = live;
         self.activity
             .observed(owner.session_id, &session.capabilities, &page.observations);
@@ -497,6 +512,23 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             self.store.publish_live(owner, &page).await;
         }
         Ok(page)
+    }
+
+    /// Whether `page` carries nothing durable and reports the status last committed: an idle
+    /// poll result, which history does not need.
+    fn unchanged_idle_page(
+        &self,
+        session: SessionId,
+        page: &bcode_harness_models::HarnessObservationPage,
+    ) -> bool {
+        page.observations.is_empty()
+            && page.hydration_requests.is_empty()
+            && page.retention.is_none()
+            && page.inventory_page.is_none()
+            && self
+                .committed_status
+                .lock()
+                .is_ok_and(|committed| committed.get(&session) == Some(&page.status))
     }
 
     /// Durably request native interruption; acknowledgement does not prove settlement/no effects.

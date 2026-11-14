@@ -15,6 +15,9 @@ pub use models::{NativeModel, NativeModelSelection, available_models};
 mod protocol;
 mod transport;
 
+/// Notice type of a native frame the adapter skipped; see the notice's `code`.
+pub const ADAPTER_NOTICE_TYPE: &str = "bcode_adapter_notice";
+
 pub use attribution::{AttributionStage, SubmissionAttribution, SubmissionUuid};
 pub use auth::{
     AuthMethod, AuthStatus, NativeAuthSupport, NativeLoginHandoff, auth_status, login_handoff,

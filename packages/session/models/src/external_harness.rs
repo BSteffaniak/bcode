@@ -763,7 +763,9 @@ impl ExternalHarnessRecovery {
         if self.release_event_sequence == 0
             || self.previous_owner.session_id != owner.session_id
             || self.previous_owner.generation.checked_add(1) != Some(owner.generation)
-            || self.previous_owner.daemon_id == owner.daemon_id
+            // An abandoned transport is proved only by its daemon's end; a recorded release
+            // (acknowledged Close and proven reap) may be recovered by the daemon that made it.
+            || (self.abandoned && self.previous_owner.daemon_id == owner.daemon_id)
             || self.resume_request.instance != self.release.instance
             || self.resume_request.request_id != open.open_id
             || open.open_id == self.release.close_request_id
@@ -1036,6 +1038,27 @@ impl std::io::Write for Counter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Opening of the block announcing the conversation's Bcode agent to a native agent at the
+/// start of a message: `<bcode-agent name="NAME">` … `</bcode-agent>`, then the message.
+pub const AGENT_BLOCK_OPEN: &str = "<bcode-agent name=\"";
+/// Closing of the agent block.
+pub const AGENT_BLOCK_CLOSE: &str = "</bcode-agent>";
+
+/// The announced agent name and the message itself, for display.
+#[must_use]
+pub fn split_agent_block(text: &str) -> (Option<&str>, &str) {
+    let Some(rest) = text.strip_prefix(AGENT_BLOCK_OPEN) else {
+        return (None, text);
+    };
+    let Some((name, _)) = rest.split_once("\">") else {
+        return (None, text);
+    };
+    let Some((_, message)) = rest.split_once(AGENT_BLOCK_CLOSE) else {
+        return (None, text);
+    };
+    (Some(name), message.trim_start_matches('\n'))
 }
 
 #[cfg(test)]

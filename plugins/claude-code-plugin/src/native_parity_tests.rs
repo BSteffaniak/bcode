@@ -446,3 +446,44 @@ fn cumulative_native_cost_becomes_per_result_increments() {
     // A smaller total means the native total restarted; it is all new cost.
     assert_eq!(cost(0.02), Some(20_000));
 }
+
+#[test]
+fn background_tasks_are_described_by_what_they_do_and_how_they_ended() {
+    let mut normalizer = normalizer();
+    let status = |normalizer: &mut Normalizer, frame: serde_json::Value| {
+        normalizer
+            .event(Event::Message(NativeMessage::System(frame)))
+            .into_iter()
+            .find_map(|observation| match observation.kind {
+                HarnessObservationKind::Subagent { status, .. } => Some(status),
+                _ => None,
+            })
+    };
+    assert_eq!(
+        status(
+            &mut normalizer,
+            json!({"type":"system","subtype":"task_started","task_id":"t1",
+                "task_type":"local_agent","description":"Review the diff\nsecond line"}),
+        )
+        .as_deref(),
+        Some("started a subagent: Review the diff")
+    );
+    assert_eq!(
+        status(
+            &mut normalizer,
+            json!({"type":"system","subtype":"task_notification","task_id":"t1",
+                "status":"completed","summary":"3 issues found"}),
+        )
+        .as_deref(),
+        Some("subagent completed: Review the diff — 3 issues found")
+    );
+    assert_eq!(
+        status(
+            &mut normalizer,
+            json!({"type":"system","subtype":"task_notification","task_id":"unknown",
+                "status":"failed"}),
+        )
+        .as_deref(),
+        Some("task failed: background work")
+    );
+}
