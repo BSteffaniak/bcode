@@ -180,7 +180,7 @@ impl HeaderPlan {
 pub const PUBLISH_MENU_CHOOSE: &str = "publish.choose";
 /// Publish menu entry: import an external review.
 pub const PUBLISH_MENU_IMPORT: &str = "publish.import";
-/// Publish menu entry: show the changes since the last review.
+/// Publish menu entry: switch between only what changed and the full change.
 pub const PUBLISH_MENU_SINCE_LAST: &str = "publish.since_last";
 /// Publish menu entry: mark the review pass complete.
 pub const PUBLISH_MENU_COMPLETE: &str = "publish.complete";
@@ -191,7 +191,7 @@ pub fn publish_items() -> Vec<MenuItem> {
     vec![
         MenuItem::new(PUBLISH_MENU_CHOOSE, "Publish…"),
         MenuItem::new(PUBLISH_MENU_IMPORT, "Import external review…"),
-        MenuItem::new(PUBLISH_MENU_SINCE_LAST, "Changes since last review"),
+        MenuItem::new(PUBLISH_MENU_SINCE_LAST, "Only what changed"),
         MenuItem::new(PUBLISH_MENU_COMPLETE, "Mark review pass complete"),
     ]
 }

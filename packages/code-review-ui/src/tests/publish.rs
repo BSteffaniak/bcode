@@ -24,7 +24,7 @@ use bcode_code_review_models::{
 };
 use std::sync::Arc;
 
-fn layer(number: u64) -> ReviewSourceKind {
+pub(super) fn layer(number: u64) -> ReviewSourceKind {
     ReviewSourceKind::StackLayer {
         provider: FAKE_PROVIDER.to_owned(),
         repository: FAKE_REPOSITORY.to_owned(),
@@ -79,7 +79,11 @@ fn save_draft(backend: &TestBackend, workspace: &ReviewWorkspace, anchor: DraftA
     });
 }
 
-fn resume(fixture: &GitFixture, backend: &Arc<TestBackend>, id: &str) -> Scenario<ReviewApp> {
+pub(super) fn resume(
+    fixture: &GitFixture,
+    backend: &Arc<TestBackend>,
+    id: &str,
+) -> Scenario<ReviewApp> {
     let entry = Entry::Resume {
         workspace_id: Some(id.to_owned()),
     };
@@ -922,7 +926,7 @@ fn excluded_threads_stay_out_and_option_fields_take_every_letter() {
 
 /// Add a commit adding `path` to `branch` of `fixture`, dated now (the fixture dates its own
 /// commits in the past), through a temporary worktree.
-fn push_to(fixture: &GitFixture, branch: &str, path: &str) {
+pub(super) fn push_to(fixture: &GitFixture, branch: &str, path: &str) {
     let worktree = tempfile::tempdir().expect("worktree dir");
     let checkout = worktree.path().join("checkout");
     let now = format!(

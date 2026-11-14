@@ -150,7 +150,6 @@ impl ReviewDocument {
             state.attribution = old.attribution;
             state.last_used = old.last_used;
             state.resident_bytes = old.resident_bytes;
-            state.carried_over = old.carried_over;
             state.marks = old.marks;
             state.content_base = old.content_base;
             moved.insert(old_index, new_index);

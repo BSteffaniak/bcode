@@ -424,6 +424,7 @@ impl ReviewSurface {
                 workspace,
                 &identity.with_patch(patch.as_deref()),
             );
+            self.record_look(&file, bcode_code_review_models::LookKind::Viewed);
         }
         // Marking (or unmarking) hands the fold back to the mark: viewed folds, unviewed opens.
         if let Some(review) = self.review.as_mut() {

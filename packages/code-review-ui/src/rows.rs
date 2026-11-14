@@ -498,7 +498,7 @@ enum ContentStamp {
     Gap(Option<u32>, bool, usize),
     /// A file's header or details: what changes them without a new key.
     File {
-        /// Viewed, collapsed, carried over, loaded.
+        /// Viewed, collapsed.
         flags: u8,
         /// Threads in the file.
         threads: usize,
@@ -545,9 +545,7 @@ impl ContentStamp {
                 gap.hidden_threads,
             ),
             ReviewItem::FileHeader(header) => Self::File {
-                flags: u8::from(header.viewed)
-                    | u8::from(header.collapsed) << 1
-                    | u8::from(header.carried_over) << 2,
+                flags: u8::from(header.viewed) | u8::from(header.collapsed) << 1,
                 threads: header.thread_count,
                 counts: (None, None),
                 layers: header.layers.len(),

@@ -62,7 +62,6 @@ pub mod panels;
 pub mod path_completion;
 pub mod picker;
 pub mod publish;
-pub mod rereview;
 pub mod rows;
 mod run;
 pub mod services;

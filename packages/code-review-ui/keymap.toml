@@ -180,7 +180,7 @@ keymap_actions = [
     { id = "bcode.code_review.layer_previous", scope = "code-review", description = "Previous stack layer", defaults = [
         ",",
     ] },
-    { id = "bcode.code_review.since_last_review", scope = "code-review", description = "Show only the changes since your last review (toggle)", defaults = [
+    { id = "bcode.code_review.compare_view", scope = "code-review", description = "Only what changed since you looked / the full change with what is new marked", defaults = [
         "shift+l",
     ] },
     { id = "bcode.code_review.complete_pass", scope = "code-review", description = "Mark the review pass complete", defaults = [

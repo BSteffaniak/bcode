@@ -282,6 +282,16 @@ impl ReviewSurface {
         let thread = composer.thread.clone();
         self.close_composer();
         let now = now_ms();
+        let look = match mode {
+            ComposerMode::Comment | ComposerMode::Reply { .. } => {
+                Some(bcode_code_review_models::LookKind::Commented)
+            }
+            ComposerMode::Ask => Some(bcode_code_review_models::LookKind::Asked),
+            ComposerMode::Edit { .. } | ComposerMode::Conversation { .. } => None,
+        };
+        if let (Some(kind), Some(file)) = (look, anchor.file.as_ref()) {
+            self.record_look(file, kind);
+        }
         let result = match mode {
             ComposerMode::Comment => {
                 self.notes

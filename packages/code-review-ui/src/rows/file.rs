@@ -190,13 +190,6 @@ fn header_facts(item: &FileHeaderItem, theme: &ReviewTheme, counts: bool) -> Vec
         trailing.push(badge);
         trailing.push(Span::raw(" "));
     }
-    if item.carried_over {
-        trailing.push(Span::styled(
-            "unchanged since last review",
-            theme.badge_outdated,
-        ));
-        trailing.push(Span::raw(" "));
-    }
     for (flag, label, style) in [
         (ReviewIndexFlag::Binary, "binary", theme.status_binary),
         (ReviewIndexFlag::ModeChanged, "mode", theme.muted),
@@ -278,7 +271,7 @@ fn pill(item: &FileHeaderItem, theme: &ReviewTheme) -> Span {
 
 /// The path as directory (muted) and name (bold), with a rename's old path before it.
 fn path_spans(item: &FileHeaderItem, theme: &ReviewTheme, with_dir: bool) -> Vec<Span> {
-    let muted = item.viewed || item.carried_over;
+    let muted = item.viewed || item.since == Some(bcode_code_review_models::FileSince::Unchanged);
     let mut spans = Vec::new();
     if with_dir && let Some(old) = &item.old_path {
         spans.push(Span::styled(old.clone(), theme.muted));

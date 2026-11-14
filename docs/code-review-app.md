@@ -323,6 +323,18 @@ viewed state), the review is saved and opened again, and one notice says what ch
 stack changed: #1 closed or merged (removed); #3 added"). If no layer is left to read the stack
 from, one notice names the closed layers. Failures name sources by their labels.
 
+### Changes since you looked
+
+A review that steps through pull requests compares each one, in place, with the version you
+last looked at (see [review-stack-history.md](review-stack-history.md)). Marking a file viewed,
+commenting, asking the AI, and completing the pass (`shift+m`) record that you looked at the
+pull request's current version; earlier completed passes count too. When a review opens after
+a pull request moved, its rebase is taken out: a layer only rebased collapses to one line, files
+unchanged since you looked fold once viewed, lines new since then are tinted with a bar in the
+gutter, and code removed since then is a marker you can expand. `shift+l` switches between that
+full change and only what changed (each changed file from its old version replayed on today's
+base to the current code); viewed marks, comments, and navigation are the same in both.
+
 ### Pull request conversations
 
 A pull request (or stack layer, or whole stack) shows its conversation as its forge has it,
@@ -525,7 +537,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `shift+i` | Import an external review… |
 | `.` | Next stack layer |
 | `,` | Previous stack layer |
-| `shift+l` | Show only the changes since your last review (toggle) |
+| `shift+l` | Only what changed since you looked / the full change with what is new marked |
 | `shift+m` | Mark the review pass complete |
 | `enter` | Actions of the thread or AI answer (reveals a gap) |
 | `z` | Fold or open the thread or AI answer (its More shows a whole answer) |

@@ -205,9 +205,6 @@ pub struct FileHeaderItem {
     pub layers: Vec<LayerNumber>,
     /// Threads anchored in this file (including outdated ones), resident or not.
     pub thread_count: usize,
-    /// Whether the file's patch is unchanged since the last review pass (a re-review after a
-    /// rebase): shown de-emphasized.
-    pub carried_over: bool,
     /// How the file changed since the comparison's baseline, when its source is compared.
     pub since: Option<FileSince>,
     /// Position of the file in its group (1-based).

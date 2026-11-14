@@ -151,6 +151,7 @@ enum Phase {
 
 mod annotate;
 mod assist;
+mod compare;
 mod conversation;
 mod dock;
 mod feed;
@@ -717,15 +718,10 @@ pub struct ReviewSurface {
     /// Commit sides each source of the whole review resolved to (the pass recorded when the
     /// reviewer completes it or publishes).
     pass_revisions: BTreeMap<String, bcode_code_review_models::ReviewedRevision>,
-    /// What changed since the last recorded pass.
-    rereview: Option<super::rereview::RereviewPlan>,
-    rereview_checked: bool,
-    /// The whole review's sources while the changes since the last review are shown.
-    since_last: Option<Vec<ReviewSource>>,
-    /// Files whose patch is unchanged since the last pass.
-    carried: BTreeSet<bcode_code_review::document::FileKey>,
-    /// A re-open that is not a refresh (switching to or from the changes since the last
-    /// review): no "refreshed" toast.
+    /// Comparisons with what the reviewer last looked at.
+    comparing: compare::Comparing,
+    /// A re-open that is not a refresh (the stack's layers were matched again): no
+    /// "refreshed" toast.
     switching: bool,
     /// Folded threads and expanded AI answers (persisted).
     folds: Folds,
@@ -864,10 +860,7 @@ impl ReviewSurface {
             rail_layer: None,
             layer_positions: BTreeMap::new(),
             pass_revisions: BTreeMap::new(),
-            rereview: None,
-            rereview_checked: false,
-            since_last: None,
-            carried: BTreeSet::new(),
+            comparing: compare::Comparing::default(),
             switching: false,
             folds: Folds::default(),
             hide_resolved: false,
@@ -1108,16 +1101,10 @@ impl ReviewSurface {
         self.modal.as_ref()
     }
 
-    /// What changed since the last recorded review pass, once compared.
+    /// The review's comparison with what the reviewer last looked at.
     #[must_use]
-    pub const fn rereview(&self) -> Option<&super::rereview::RereviewPlan> {
-        self.rereview.as_ref()
-    }
-
-    /// Whether the changes since the last review are shown instead of the whole review.
-    #[must_use]
-    pub const fn showing_since_last(&self) -> bool {
-        self.since_last.is_some()
+    pub const fn comparing(&self) -> &compare::Comparing {
+        &self.comparing
     }
 
     /// The sources the review currently shows.
@@ -1563,11 +1550,7 @@ impl ReviewSurface {
                 Vec::new(),
             )
         });
-        // The whole review's sources (not the changes since the last review).
-        workspace.sources = self
-            .since_last
-            .clone()
-            .unwrap_or_else(|| self.sources.clone());
+        workspace.sources.clone_from(&self.sources);
         workspace.presentation = Some(self.current_presentation());
         workspace
     }
@@ -1618,6 +1601,7 @@ impl ReviewSurface {
 
     /// Record the revisions this pass reviewed (durable reviews; saved with the workspace).
     fn record_pass(&mut self) {
+        self.record_layer_looks(None, bcode_code_review_models::LookKind::Pass);
         let revisions = self.pass_revisions.clone();
         if revisions.is_empty() {
             return;
@@ -2029,8 +2013,8 @@ impl ReviewSurface {
             Message::SavedAs(result) => self.finish_save_review(*result),
             Message::Publish(result) => self.apply_publish(result),
             Message::Import(result) => self.apply_import(result),
-            Message::Rereview(plan) => self.apply_rereview(*plan, host),
-            Message::Carried(result) => self.apply_carried(result),
+            Message::Looks(result) => self.apply_looks(result, host),
+            Message::Compared(result) => self.apply_compared(result),
             Message::PathCompletions { generation, result } => {
                 if let Some(composer) = self.composer.as_mut() {
                     composer.answer_completion(generation, result);
@@ -2169,9 +2153,7 @@ impl ReviewSurface {
                     .push(ToastSeverity::Success, "Review refreshed", None);
             }
         }
-        if self.since_last.is_none() {
-            self.pass_revisions.clone_from(&review.revisions);
-        }
+        self.pass_revisions.clone_from(&review.revisions);
         self.note_failed_sources(&review.diagnostics, opened_complete);
         if first_open {
             self.warn_about_stack_size(deepest_stack);
@@ -2181,8 +2163,9 @@ impl ReviewSurface {
         }
         let workspace = self.workspace_mut().clone();
         review.doc.set_viewed_marks(&workspace);
-        review.doc.set_carried_over(&self.carried);
         let _ = review.doc.take_splices();
+        // A new document starts without overlays: every layer is compared again (cached).
+        self.comparing.document_replaced();
         let previous = self.review.replace(review);
         self.phase = Phase::Ready;
         self.opened_at.get_or_insert(arrived);
@@ -2236,7 +2219,7 @@ impl ReviewSurface {
         if let Some((source, answer)) = &arrived.fingerprints {
             review.doc.accept_fingerprints(source, answer);
         }
-        review.doc.set_carried_over(&self.carried);
+        self.comparing.layers_moved();
         review.totals = review.doc.totals();
         review.rebuild_files(&self.theme, self.hide_viewed_files);
         review.note_splices();
@@ -2386,8 +2369,7 @@ impl ReviewSurface {
         }
     }
 
-    /// Open the review's current sources again, keeping position and expansions (refresh, and
-    /// switching to or from the changes since the last review).
+    /// Open the review's current sources again, keeping position and expansions.
     fn reopen(&mut self, host: &UiContext) {
         self.refreshing = true;
         let services = self.services.clone();
@@ -2677,8 +2659,8 @@ impl ReviewSurface {
                 self.step_layer(action == "layer_next");
                 Action::Redraw
             }
-            "since_last_review" => {
-                self.toggle_since_last(host);
+            "compare_view" => {
+                self.toggle_compare_view();
                 Action::Redraw
             }
             "complete_pass" => {
@@ -3254,7 +3236,7 @@ impl ReviewSurface {
         match id {
             chrome::PUBLISH_MENU_IMPORT => self.open_import(host),
             chrome::PUBLISH_MENU_COMPLETE => self.complete_pass(),
-            chrome::PUBLISH_MENU_SINCE_LAST => self.toggle_since_last(host),
+            chrome::PUBLISH_MENU_SINCE_LAST => self.toggle_compare_view(),
             _ => self.open_publish(),
         }
         Action::Redraw
@@ -4954,7 +4936,7 @@ const fn item_hints(cursor: Option<&ItemKey>) -> &'static [(&'static str, &'stat
 
 /// Actions whose first key the footer hints show.
 const HINT_ACTIONS: &[&str] = &[
-    "since_last_review",
+    "compare_view",
     "publish",
     "comment",
     "ask",
@@ -5195,6 +5177,8 @@ impl View for ReviewSurface {
             self.reopen(host);
             changed = true;
         }
+        // Looks are written before anything else, closing included.
+        self.flush_looks(host);
         if let Some(started) = self.closing {
             self.pump_notes(host);
             self.save(host);
@@ -5208,8 +5192,11 @@ impl View for ReviewSurface {
             self.notes_requested = true;
             self.load_notes(host);
         }
-        if self.review.is_some() && !self.rereview_checked {
-            self.start_rereview(host);
+        if self.review.is_some() {
+            self.start_comparison(host);
+            if self.comparing.take_moved() {
+                self.refresh_comparison(host);
+            }
         }
         let notes_before = self.notes.pending();
         self.pump_notes(host);

@@ -6,13 +6,13 @@ mod appearance;
 mod assistant;
 mod benchmark;
 mod chrome;
+mod compare;
 mod conversation;
 mod feed;
 mod files;
 mod interaction;
 mod parity;
 mod publish;
-mod rereview;
 mod screen;
 mod wizard;
 

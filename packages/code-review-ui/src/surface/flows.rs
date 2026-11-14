@@ -8,11 +8,10 @@ use super::super::notes::NoteScope;
 use super::super::publish::{
     self, ChecklistThread, FlowOutcome, FlowRequest, PrepareContext, PublishFlow, Readiness,
 };
-use super::super::rereview::{self, PatchComparison, RereviewPlan};
 use super::ReviewSurface;
 use crate::action::Action;
 use crate::context::UiContext;
-use bcode_code_review::document::{FileKey, ItemKey};
+use bcode_code_review::document::ItemKey;
 use bcode_code_review::publish_plan::PublishThread;
 use bcode_code_review_models::{
     ResolvedReviewStack, ResolvedSource, ReviewFileSummary, ReviewPullRequestTarget,
@@ -630,197 +629,6 @@ impl ReviewSurface {
         }
     }
 
-    // ----------------------------------------------------------------------------------------
-    // Re-review
-    // ----------------------------------------------------------------------------------------
-
-    /// After the first open of a durable review: compare each source's current head with the
-    /// last recorded pass.
-    pub(super) fn start_rereview(&mut self, host: &UiContext) {
-        if self.rereview_checked || self.is_transient() || self.since_last.is_some() {
-            return;
-        }
-        self.rereview_checked = true;
-        let recorded = self.workspace_mut().reviewed_revisions.clone();
-        let changed: Vec<_> = self
-            .pass_revisions
-            .iter()
-            .filter_map(|(source_id, current)| {
-                let reviewed = recorded.get(source_id)?;
-                let new_head = current.reviewed_head_oid.clone()?;
-                (reviewed.reviewed_head_oid.as_deref() != Some(new_head.as_str()))
-                    .then(|| (source_id.clone(), reviewed.clone(), new_head))
-            })
-            .collect();
-        if changed.is_empty() {
-            return;
-        }
-        let services = self.services.clone();
-        let repo = self.repo_path.clone();
-        let inbox = self.inbox.clone();
-        host.spawn(Box::pin(async move {
-            let plan = rereview::analyze(services, repo, changed).await;
-            inbox.push(Message::Rereview(Box::new(plan)));
-        }));
-    }
-
-    /// The comparison finished: offer the delta view and carry unchanged patches of rebased
-    /// sources over as viewed.
-    pub(super) fn apply_rereview(&mut self, plan: RereviewPlan, host: &UiContext) {
-        if plan.is_empty() {
-            return;
-        }
-        let key = self
-            .action_keys
-            .get("since_last_review")
-            .cloned()
-            .unwrap_or_else(|| "L".to_owned());
-        self.toasts.push(
-            ToastSeverity::Info,
-            plan.summary(),
-            Some(format!(
-                "{key}: show only the changes since your last review"
-            )),
-        );
-        self.compare_patches(&plan, host);
-        self.rereview = Some(plan);
-    }
-
-    /// Compare the patches of rebased sources' files with the reviewed ones.
-    fn compare_patches(&self, plan: &RereviewPlan, host: &UiContext) {
-        let Some(review) = &self.review else {
-            return;
-        };
-        let mut comparisons = Vec::new();
-        let mut groups = Vec::new();
-        for changed in plan
-            .changed
-            .iter()
-            .filter(|changed| !changed.fast_forward())
-        {
-            let (Some(old_base), Some(old_head)) = (
-                changed.reviewed.reviewed_base_oid.clone(),
-                changed.reviewed.reviewed_head_oid.clone(),
-            ) else {
-                continue;
-            };
-            if changed.compare.is_some_and(|compare| !compare.old_exists) {
-                continue;
-            }
-            for group in review.doc.groups() {
-                if group.source.source_id != changed.source_id || group.source.part.is_some() {
-                    continue;
-                }
-                comparisons.push(PatchComparison {
-                    group: groups.len(),
-                    old: (old_base.clone(), old_head.clone()),
-                    new: (group.source.base.clone(), group.source.head.clone()),
-                    paths: review
-                        .doc
-                        .group_files(group.index)
-                        .map(|file| file.path.clone())
-                        .collect(),
-                });
-                groups.push(group.source.source_id.clone());
-            }
-        }
-        if comparisons.is_empty() {
-            return;
-        }
-        let services = self.services.clone();
-        let repo = self.repo_path.clone();
-        let inbox = self.inbox.clone();
-        host.spawn(Box::pin(async move {
-            let result = rereview::unchanged_patches(services, repo, comparisons)
-                .await
-                .map(|unchanged| {
-                    unchanged
-                        .into_iter()
-                        .map(|(group, path, patch)| (groups[group].clone(), path, patch))
-                        .collect()
-                });
-            inbox.push(Message::Carried(result));
-        }));
-    }
-
-    /// Unchanged patches arrived: mark those files viewed with their new identity and show
-    /// them de-emphasized.
-    pub(super) fn apply_carried(&mut self, result: Result<Vec<(String, String, String)>, String>) {
-        let unchanged = match result {
-            Ok(unchanged) => unchanged,
-            Err(error) => {
-                self.toasts.push(
-                    ToastSeverity::Warning,
-                    "Could not compare patches with the last review",
-                    Some(error),
-                );
-                return;
-            }
-        };
-        let Some(review) = self.review.as_ref() else {
-            return;
-        };
-        let mut marks = Vec::new();
-        for (source_id, path, patch) in &unchanged {
-            let key = FileKey::new(source_id.clone(), None, path.clone());
-            if let Some((identity, _)) = review.doc.viewed_identity(&key) {
-                marks.push((identity, patch.clone()));
-            }
-            self.carried.insert(key);
-        }
-        let workspace = self.workspace_mut();
-        for (identity, patch) in &marks {
-            bcode_code_review::viewed::mark_viewed(workspace, &identity.with_patch(Some(patch)));
-        }
-        if let Some(review) = self.review.as_mut() {
-            review.doc.set_carried_over(&self.carried);
-            review.note_splices();
-        }
-        self.apply_viewed();
-        if !unchanged.is_empty() {
-            self.toasts.push(
-                ToastSeverity::Info,
-                format!(
-                    "{} file{} unchanged since your last review (marked viewed)",
-                    unchanged.len(),
-                    if unchanged.len() == 1 { "" } else { "s" }
-                ),
-                None,
-            );
-        }
-    }
-
-    /// Switch between the whole review and the changes since the last review.
-    pub(super) fn toggle_since_last(&mut self, host: &UiContext) {
-        if let Some(full) = self.since_last.take() {
-            self.sources = full;
-            self.set_status("showing the whole review", StatusSeverity::Info);
-            self.switching = true;
-            self.reopen(host);
-            return;
-        }
-        let Some(plan) = self.rereview.as_ref() else {
-            self.set_status(
-                if self.is_transient() {
-                    "save the review to track review passes"
-                } else {
-                    "nothing changed since your last review pass"
-                },
-                StatusSeverity::Info,
-            );
-            return;
-        };
-        let delta = plan.delta_sources(&self.sources);
-        let full = std::mem::replace(&mut self.sources, delta);
-        self.since_last = Some(full);
-        self.set_status(
-            "showing the changes since your last review",
-            StatusSeverity::Info,
-        );
-        self.switching = true;
-        self.reopen(host);
-    }
-
     /// Mark the review pass complete: record the reviewed revisions now.
     pub(super) fn complete_pass(&mut self) {
         if self.is_transient() {
@@ -831,7 +639,6 @@ impl ReviewSurface {
             return;
         }
         self.record_pass();
-        self.rereview = None;
         self.toasts
             .push(ToastSeverity::Success, "Review pass recorded", None);
     }

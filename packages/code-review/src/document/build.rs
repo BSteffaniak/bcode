@@ -414,7 +414,6 @@ impl ReviewDocument {
             load: state.load_state(),
             layers: layers.clone(),
             thread_count: self.file_annotations[file].len(),
-            carried_over: state.carried_over,
             since: self.since_of(file),
             position: u32::try_from(file - group.files.start + 1).unwrap_or(u32::MAX),
             count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),

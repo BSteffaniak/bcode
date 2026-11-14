@@ -317,8 +317,6 @@ pub(super) struct FileState {
     pub attribution: AttributionState,
     pub last_used: u64,
     pub resident_bytes: usize,
-    /// Patch unchanged since the last review pass.
-    pub carried_over: bool,
     /// Lines new since the comparison's baseline.
     pub marks: MarksState,
     /// The commit the resident content was diffed from, when it is not the source's base (the
@@ -739,7 +737,6 @@ impl ReviewDocument {
                 attribution,
                 last_used: 0,
                 resident_bytes: 0,
-                carried_over: false,
                 marks: MarksState::Missing,
                 content_base: None,
                 fold: FileFold::Auto,
@@ -2156,26 +2153,6 @@ impl ReviewDocument {
             .filter(|file| file.viewed == ViewedState::ViewedNeedsUpdate)
             .map(|file| file.key.clone())
             .collect()
-    }
-
-    /// Mark the files whose patch is unchanged since the last review pass; every
-    /// other file loses the mark. Rebuilds only the files whose mark changed.
-    pub fn set_carried_over(&mut self, files: &BTreeSet<FileKey>) {
-        for index in 0..self.files.len() {
-            let carried = files.contains(self.files[index].key.as_ref());
-            if self.files[index].carried_over != carried {
-                self.files[index].carried_over = carried;
-                self.rebuild_file(index);
-            }
-        }
-    }
-
-    /// Whether a file is marked unchanged since the last review pass.
-    #[must_use]
-    pub fn carried_over(&self, file: &FileKey) -> bool {
-        self.file_index
-            .get(file)
-            .is_some_and(|index| self.files[*index].carried_over)
     }
 
     /// The file's patch id, once its hunks were loaded (kept after eviction).

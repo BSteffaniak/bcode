@@ -107,10 +107,10 @@ pub enum Message {
     Publish(super::publish::FlowResult),
     /// Work of the import flow finished.
     Import(super::import::ImportResult),
-    /// The re-review comparison finished.
-    Rereview(Box<super::rereview::RereviewPlan>),
-    /// Patches unchanged since the last pass: `(source id, path, patch id)`.
-    Carried(Result<Vec<(String, String, String)>, String>),
+    /// The reviewer's looks at the review's layers were listed.
+    Looks(Result<Vec<bcode_code_review_models::LayerLook>, String>),
+    /// Layers were compared with their baselines.
+    Compared(Result<Vec<bcode_code_review_models::LayerDelta>, String>),
     /// Paths matching the composer's `@word`, for the completion tagged `generation`.
     PathCompletions {
         /// Completion generation the search was made for.

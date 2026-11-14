@@ -60,6 +60,14 @@ pub fn actions_for(scope: &str) -> Vec<KeymapAction> {
         .collect()
 }
 
+/// The current id of an action id that was renamed, so overrides of the old id keep working.
+fn renamed(action: &str) -> Option<&'static str> {
+    match action {
+        "bcode.code_review.since_last_review" => Some("bcode.code_review.compare_view"),
+        _ => None,
+    }
+}
+
 /// Resolve the declared actions with `overrides` (`scope -> key -> action`; an empty action
 /// unbinds the key).
 ///
@@ -77,6 +85,8 @@ pub fn registry(
                 .map(|(key, action)| {
                     let action = if matches!(action.as_str(), "none" | "unbind") {
                         String::new()
+                    } else if let Some(current) = renamed(&action) {
+                        current.to_owned()
                     } else {
                         action
                     };
@@ -136,6 +146,23 @@ mod tests {
             Some("bcode.code_review.home_down")
         );
         assert_eq!(registry.action_for_key(HOME_SCOPE, key("j")), None);
+    }
+
+    #[test]
+    fn overrides_of_a_renamed_action_bind_its_new_id() {
+        let registry = registry(BTreeMap::from([(
+            REVIEW_SCOPE.to_owned(),
+            BTreeMap::from([(
+                "ctrl+l".to_owned(),
+                "bcode.code_review.since_last_review".to_owned(),
+            )]),
+        )]))
+        .expect("overrides resolve");
+        let key = |text: &str| parse_key_stroke(text).expect("key");
+        assert_eq!(
+            registry.action_for_key(REVIEW_SCOPE, key("ctrl+l")),
+            Some("bcode.code_review.compare_view")
+        );
     }
 
     #[test]

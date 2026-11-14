@@ -548,10 +548,32 @@ Built:
   `NavKind::NewSince`, and the renderer's tint (`theme.since.diff`), gutter bar
   (`theme.icons.since_bar`), file badges, summary and marker rows with their click targets.
 
-Not built yet: steps 3 to 5. The review screen does not create comparisons yet (nothing calls
-`set_comparison` outside tests), the matrix still opens each comparison as its own review, and
-`shift+l` still uses the separate "since last review" path. Also not built: moved-code
-detection, checks per version, assistant summaries per push, and the restack summary on home.
+* **Step 3, first part (in place on the review screen).** `surface/compare.rs`: once the
+  stack is known, looks are seeded from the review's completed passes and listed in one call;
+  each step-through layer's baseline is resolved with the engaged rule and pinned for the
+  session (a layer that moves while open is compared with the head it had); every layer is
+  compared in one `review.compare.layers` call and laid over the document, again only for pairs
+  that changed when a source is listed again. Looks are recorded (batched, with their heads kept
+  under `refs/bcode-review/version/`) when a file is marked viewed, a comment, reply or AI
+  question is made, and a pass is completed or published. `shift+l` is the `compare_view`
+  action (overrides of `since_last_review` are read as it) and the publish menu's entry reads
+  *Only what changed*. Removed: `rereview.rs`, the `since_last` source swap,
+  `Message::Rereview`/`Carried`, the one-time toast, and the patch-id carry-over (with the
+  document's `carried_over`).
+
+Not built yet, in order:
+
+* **Rest of step 3:** the header control (`b`, `compare_baseline`) with its summary and
+  progress, the reopen banner, rail and file-panel badges, the *only pull requests with real
+  changes* filter, `opened` looks after `compare.dwell_seconds`, `reviewed` looks from the
+  viewer's forge verdicts (`history::looks::forge_review_looks` exists), the `compare.*`
+  configuration, `]`/`[` preferring `NavKind::NewSince` while comparing, a click/`enter` on
+  rows for the summary's buttons by keyboard, the matrix acting in place, and removing
+  `Action::OpenReview`, the app's `return_to`, `history::sources_of`,
+  `Message::HistoryCompared` and `history::compare`'s source-producing API.
+* Steps 4 and 5.
+* Also not built: moved-code detection, checks per version, assistant summaries per push, and
+  the restack summary on home.
 
 ### Implementation notes (where the build differs from the text above)
 
@@ -573,3 +595,8 @@ detection, checks per version, assistant summaries per push, and the restack sum
 * **`history::compare`** (comparisons as review sources) still serves the matrix until step 3
   removes it; its replay commits now use the same deterministic commit as the deltas.
 * **`FileSteps`** (the cache kind for file header stepping) is added with step 4, which uses it.
+* **Which sources are compared:** step-through layer sources (one group per pull request, its
+  stack's top layer giving the number, head, and fork point). Whole-stack sources, and pull
+  request sources that resolve without a stack, are not compared yet.
+* **No looks, no comparison:** when the reviewer never looked at any layer of the review, no
+  source is compared (no summaries, no "new to you" everywhere on a first visit).
