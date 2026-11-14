@@ -34,6 +34,9 @@ use std::collections::BTreeSet;
 /// Layout id of the rail.
 pub const RAIL_ID: &str = "review.stack_rail";
 
+/// Id of the rail tab standing for the layers hidden while only real changes show.
+const FOLD_ID: &str = "\u{1}hidden";
+
 /// One tab of the rail.
 #[derive(Debug, Clone)]
 pub struct RailEntry {
@@ -131,6 +134,7 @@ impl ReviewSurface {
             StackView::AllLayers => StackView::OneLayer,
         };
         self.apply_stack_view();
+        self.apply_compare_filter();
         let text = match self.stack_view {
             StackView::OneLayer => "one pull request at a time (shift+o: all)",
             StackView::AllLayers => "every pull request of the stack (shift+o: one at a time)",
@@ -182,18 +186,17 @@ impl ReviewSurface {
             return Vec::new();
         }
         let theme = &self.theme;
-        let drafts: Vec<(Option<&str>, &str)> = self
-            .notes
-            .drafts()
-            .iter()
-            .map(|draft| (draft.anchor.source_id.as_deref(), draft.thread_id.as_str()))
-            .collect();
+        let drafts = self.draft_threads();
+        let filtered = self.compare_filtered();
         let mut entries = Vec::new();
         for group in review.doc.groups() {
-            let Some(stack) = group.stack else {
+            let source_id = group.source.source_id.clone();
+            let Some(stack) = group
+                .stack
+                .filter(|_| !self.folded_away(&filtered, &source_id))
+            else {
                 continue;
             };
-            let source_id = group.source.source_id.clone();
             let threads: BTreeSet<&str> = drafts
                 .iter()
                 .filter(|(source, _)| *source == Some(source_id.as_str()))
@@ -261,13 +264,15 @@ impl ReviewSurface {
                 &mut compact,
                 self.conversation_tab_spans(&source_id),
             );
+            let mut minimal = vec![Span::styled(number, theme.badge_open)];
+            self.append_badge(&source_id, [&mut full, &mut compact, &mut minimal]);
             entries.push(RailEntry {
                 source_id,
                 home,
                 labels: [
                     Line::from_spans(full),
                     Line::from_spans(compact),
-                    Line::from_spans(vec![Span::styled(number, theme.badge_open)]),
+                    Line::from_spans(minimal),
                 ],
             });
         }
@@ -473,12 +478,118 @@ impl ReviewSurface {
         cx.paint_component(&TextBlock::new(Text::from_lines(vec![line])), area);
     }
 
-    /// Tab items for the rail at `width`: the most detailed labels that fit.
-    fn rail_items(entries: &[RailEntry], width: u16) -> Vec<TabItem<'_>> {
-        let build = |level: usize| -> Vec<TabItem<'_>> {
+    /// A layer's badge from its comparison: full (`● +40 −12 · 3 files`), compact
+    /// (`●+40−12`), and its glyph alone; `None` when the layer is not compared.
+    pub(super) fn layer_badge(&self, source_id: &str) -> Option<[Vec<Span>; 3]> {
+        use bcode_code_review_models::DeltaKind;
+        let review = self.review.as_ref()?;
+        let comparison = review.doc.comparison(source_id)?;
+        let theme = &self.theme;
+        let icons = &theme.icons;
+        let Some(delta) = comparison.delta.as_ref() else {
+            let busy = vec![Span::styled(icons.ellipsis, theme.muted)];
+            return Some([busy.clone(), busy.clone(), busy]);
+        };
+        let (glyph, text, style) = match delta.kind {
+            DeltaKind::Changed | DeltaKind::WithRebase => {
+                let (added, removed) = delta.totals();
+                let files = delta
+                    .files
+                    .iter()
+                    .filter(|file| file.since.changed())
+                    .count();
+                let glyph = if delta.kind == DeltaKind::WithRebase {
+                    icons.since_with_rebase
+                } else {
+                    icons.since_changed
+                };
+                let full = vec![
+                    Span::styled(
+                        format!("{glyph} +{added} {}{removed}", icons.minus),
+                        theme.since.badge,
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}{files} file{}",
+                            icons.separator,
+                            if files == 1 { "" } else { "s" }
+                        ),
+                        theme.muted,
+                    ),
+                ];
+                let compact = vec![Span::styled(
+                    format!("{glyph}+{added}{}{removed}", icons.minus),
+                    theme.since.badge,
+                )];
+                return Some([full, compact, vec![Span::styled(glyph, theme.since.badge)]]);
+            }
+            DeltaKind::RebasedOnly => (icons.since_rebased, "rebased", theme.muted),
+            DeltaKind::Unchanged => (icons.since_unchanged, "unchanged", theme.viewed),
+            DeltaKind::NewToYou => (icons.since_new_to_you, "new to you", theme.notice),
+            DeltaKind::Unavailable => (icons.since_unavailable, "unavailable", theme.error),
+        };
+        Some([
+            vec![Span::styled(format!("{glyph} {text}"), style)],
+            vec![Span::styled(glyph, style)],
+            vec![Span::styled(glyph, style)],
+        ])
+    }
+
+    /// Each draft's source and thread.
+    fn draft_threads(&self) -> Vec<(Option<&str>, &str)> {
+        self.notes
+            .drafts()
+            .iter()
+            .map(|draft| (draft.anchor.source_id.as_deref(), draft.thread_id.as_str()))
+            .collect()
+    }
+
+    /// Whether layer `source_id` is folded into the tab of hidden layers: without real changes
+    /// while only those show (the current layer stays).
+    fn folded_away(&self, filtered: &BTreeSet<String>, source_id: &str) -> bool {
+        filtered.contains(source_id) && self.rail_layer.as_deref() != Some(source_id)
+    }
+
+    /// Append layer `source_id`'s comparison badge to its full, compact, and minimal labels.
+    fn append_badge(&self, source_id: &str, labels: [&mut Vec<Span>; 3]) {
+        let Some([wide, narrow, glyph]) = self.layer_badge(source_id) else {
+            return;
+        };
+        let [full, compact, minimal] = labels;
+        full.push(Span::raw(" "));
+        full.extend(wide);
+        compact.push(Span::raw(" "));
+        compact.extend(narrow);
+        minimal.extend(glyph);
+    }
+
+    /// The tab standing for the layers hidden while only real changes show, when there are.
+    fn fold_tab(&self) -> Option<Line> {
+        let hidden = self
+            .compare_filtered()
+            .into_iter()
+            .filter(|source| self.rail_layer.as_ref() != Some(source))
+            .count();
+        (hidden > 0).then(|| {
+            Line::from_spans(vec![Span::styled(
+                format!("+{hidden} {}", self.theme.icons.since_rebased),
+                self.theme.muted,
+            )])
+        })
+    }
+
+    /// Tab items for the rail at `width`: the most detailed labels that fit, then the tab of
+    /// hidden layers.
+    fn rail_items<'a>(
+        entries: &'a [RailEntry],
+        fold: Option<&Line>,
+        width: u16,
+    ) -> Vec<TabItem<'a>> {
+        let build = |level: usize| -> Vec<TabItem<'a>> {
             entries
                 .iter()
                 .map(|entry| TabItem::rich(&entry.source_id, entry.labels[level].clone()))
+                .chain(fold.map(|fold| TabItem::rich(FOLD_ID, fold.clone())))
                 .collect()
         };
         for level in 0..3 {
@@ -496,7 +607,8 @@ impl ReviewSurface {
         let entries = self.rail_entries();
         let selected = self.current_layer(&entries);
         self.rail_state.borrow_mut().set_selected(selected);
-        let items = Self::rail_items(&entries, area.width);
+        let fold = self.fold_tab();
+        let items = Self::rail_items(&entries, fold.as_ref(), area.width);
         let component = TabBarComponent::new(RAIL_ID, &items, &self.rail_state)
             .policy(rail_policy())
             .styles(self.theme.component.tab_bar_styles());
@@ -529,8 +641,9 @@ impl ReviewSurface {
         let entries = self.rail_entries();
         let current = self.current_layer(&entries);
         let before = self.rail_state.borrow().selected();
+        let fold = self.fold_tab();
         let outcome = {
-            let items = Self::rail_items(&entries, area.width);
+            let items = Self::rail_items(&entries, fold.as_ref(), area.width);
             let component = TabBarComponent::new(RAIL_ID, &items, &self.rail_state)
                 .policy(rail_policy())
                 .styles(self.theme.component.tab_bar_styles());
@@ -540,6 +653,12 @@ impl ReviewSurface {
         if after != before
             && let Some(next) = after
         {
+            if next >= entries.len() {
+                // The tab of hidden layers: show every pull request again.
+                self.rail_state.borrow_mut().set_selected(before);
+                self.toggle_only_changed();
+                return true;
+            }
             self.enter_layer(&entries, current, next);
             return true;
         }

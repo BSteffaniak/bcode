@@ -41,8 +41,6 @@ pub enum Message {
     History(Result<bcode_code_review_models::StackTimeline, String>),
     /// The stack's history for the history panel, or why it could not be read.
     HistoryPanel(Result<bcode_code_review_models::StackTimeline, String>),
-    /// A comparison from the history panel: its title and comparisons, or the failure.
-    HistoryCompared(Result<(String, Vec<bcode_code_review::history::compare::Comparison>), String>),
     /// Pull request conversation work finished.
     Conversation(Box<super::surface::ConversationMessage>),
     /// Every source arrived: the change token taken after them.
@@ -111,6 +109,11 @@ pub enum Message {
     Looks(Result<Vec<bcode_code_review_models::LayerLook>, String>),
     /// Layers were compared with their baselines.
     Compared(Result<Vec<bcode_code_review_models::LayerDelta>, String>),
+    /// A layer's version steps (each pair of consecutive versions compared), by number.
+    CompareSteps(
+        u64,
+        Result<Vec<bcode_code_review_models::LayerDelta>, String>,
+    ),
     /// Paths matching the composer's `@word`, for the completion tagged `generation`.
     PathCompletions {
         /// Completion generation the search was made for.

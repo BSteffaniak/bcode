@@ -248,6 +248,7 @@ pub struct ReviewServices {
     execution: Execution,
     stack_limit: ReviewStackLimit,
     conversation: Arc<crate::config::conversation::ConversationConfig>,
+    compare: crate::config::compare::CompareConfig,
     /// Providers and contributors: built-in ones, plus plugin-backed ones once found.
     providers: Arc<Mutex<ProviderRegistry>>,
     /// Whether plugin-backed providers were looked for (once, in the background).
@@ -279,6 +280,7 @@ impl ReviewServices {
             execution: Execution::Pool,
             stack_limit: ReviewStackLimit::default(),
             conversation: Arc::default(),
+            compare: crate::config::compare::CompareConfig::default(),
             providers: Arc::default(),
             plugins_sought: Arc::default(),
             #[cfg(test)]
@@ -426,6 +428,19 @@ impl ReviewServices {
     #[must_use]
     pub fn conversation_config(&self) -> Arc<crate::config::conversation::ConversationConfig> {
         Arc::clone(&self.conversation)
+    }
+
+    /// How pull requests are compared with earlier versions.
+    #[must_use]
+    pub const fn compare_config(&self) -> crate::config::compare::CompareConfig {
+        self.compare
+    }
+
+    /// Use `config` for comparisons with earlier versions.
+    #[must_use]
+    pub const fn with_compare(mut self, config: crate::config::compare::CompareConfig) -> Self {
+        self.compare = config;
+        self
     }
 
     /// Use `config` for pull request conversations.

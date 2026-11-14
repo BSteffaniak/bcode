@@ -1,22 +1,20 @@
 //! The stack history panel, and the work behind it.
 //!
 //! Loading a stack's history (the version log, the branch reflogs, and, when asked, the forge's
-//! push history with old commits fetched) and turning two points of it into a review. See
-//! `docs/review-stack-history.md`.
-//!
-//! The panel is a matrix: one row per layer, one column per push (the first column is before
-//! the first push, the last is now). Each cell says how the layer changed in that push.
+//! push history with old commits fetched), and the matrix that shows it: one row per layer, one
+//! column per push (the first column is before the first push, the last is now), each cell
+//! saying how the layer changed in that push. Its keys ask for comparisons that the review
+//! applies in place. See `docs/review-stack-history.md`.
 
 use super::modal;
 use super::services::ReviewServices;
 use super::theme::ReviewTheme;
-use bcode_code_review::history::compare::{self, Comparison};
 use bcode_code_review::history::{self, TimelineOptions, forge, reflog, version_at};
 use bcode_code_review::provider::ProviderCallError;
 use bcode_code_review_models::{
     ChangeKind, LayerTimeline, ListLayerVersionsRequest, ListLayerVersionsResponse,
-    RecordLayerVersionsRequest, RecordLayerVersionsResponse, ReviewSourceKind,
-    ReviewSourcePullsHistoryRequest, ReviewStack, StackTimeline,
+    RecordLayerVersionsRequest, RecordLayerVersionsResponse, ReviewSourcePullsHistoryRequest,
+    ReviewStack, StackTimeline,
 };
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::composition::TextBlock;
@@ -68,6 +66,22 @@ pub fn ago(at_ms: u64, now_ms: u64) -> String {
         3_600..86_400 => format!("{}h ago", seconds / 3_600),
         _ => format!("{}d ago", seconds / 86_400),
     }
+}
+
+/// `text` in exactly `cells` terminal cells: cut with an ellipsis when wider, padded when
+/// narrower.
+fn fit_cells(text: &str, cells: usize) -> String {
+    use bmux_tui::text_width::{display_width, truncate_to_display_width};
+    let mut fitted = truncate_to_display_width(text, cells);
+    let pad = cells.saturating_sub(display_width(&fitted));
+    fitted.push_str(&" ".repeat(pad));
+    fitted
+}
+
+/// `text` padded to at least `cells` terminal cells (never cut).
+fn pad_cells(text: &str, cells: usize) -> String {
+    let pad = cells.saturating_sub(bmux_tui::text_width::display_width(text));
+    format!("{text}{}", " ".repeat(pad))
 }
 
 fn failed(message: impl Into<String>) -> ProviderCallError {
@@ -170,7 +184,7 @@ pub async fn load(
 }
 
 /// A comparison the panel asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryRequest {
     /// One layer between two times.
     Layer {
@@ -181,124 +195,24 @@ pub enum HistoryRequest {
         /// To the version current then.
         to_ms: u64,
     },
-    /// Every layer whose change differs between two times (`None`: now).
+    /// Every layer between two times (`None`: now).
     Between {
         /// From.
         from_ms: u64,
         /// To.
         to_ms: Option<u64>,
-        /// Also layers that were only rebased.
-        include_rebased: bool,
     },
     /// Every layer as it was at a time.
     StackAt {
         /// When.
         at_ms: u64,
     },
-    /// The whole stack's change since a time.
-    WholeSince {
-        /// Since.
-        at_ms: u64,
-    },
-    /// Every layer's change since this reviewer last reviewed it.
-    SinceReview {
-        /// Also layers that were only rebased.
-        include_rebased: bool,
-    },
-}
-
-/// The review `request` asks for: its title and its sources (labelled).
-///
-/// # Errors
-///
-/// Returns a message when git fails.
-pub async fn comparisons(
-    services: ReviewServices,
-    repo_path: PathBuf,
-    timeline: StackTimeline,
-    request: HistoryRequest,
-) -> Result<(String, Vec<Comparison>), String> {
-    let now = now_ms();
-    services
-        .blocking(move || {
-            let root = repo_path.as_path();
-            let fail = |error: bcode_code_review::data::DataError| failed(error.to_string());
-            let when = |at_ms: u64| {
-                if at_ms == u64::MAX {
-                    "now".to_owned()
-                } else {
-                    ago(at_ms, now)
-                }
-            };
-            Ok(match request {
-                HistoryRequest::Layer {
-                    number,
-                    from_ms,
-                    to_ms,
-                } => {
-                    let layer = timeline
-                        .layers
-                        .iter()
-                        .find(|layer| layer.number == number)
-                        .ok_or_else(|| failed(format!("#{number} is not in the stack")))?;
-                    let (Some(from), Some(to)) =
-                        (version_at(layer, from_ms), version_at(layer, to_ms))
-                    else {
-                        return Ok((String::new(), Vec::new()));
-                    };
-                    (
-                        format!("#{number} from {} to {}", when(from_ms), when(to_ms)),
-                        compare::layer_changes(root, layer, from, to)
-                            .map_err(fail)?
-                            .into_iter()
-                            .collect(),
-                    )
-                }
-                HistoryRequest::Between {
-                    from_ms,
-                    to_ms,
-                    include_rebased,
-                } => (
-                    to_ms.map_or_else(
-                        || format!("Stack since {}", when(from_ms)),
-                        |to_ms| format!("Stack from {} to {}", when(from_ms), when(to_ms)),
-                    ),
-                    compare::changes_between(root, &timeline, from_ms, to_ms, include_rebased)
-                        .map_err(fail)?,
-                ),
-                HistoryRequest::StackAt { at_ms } => (
-                    format!("Stack as it was {}", when(at_ms)),
-                    compare::stack_at(&timeline, at_ms),
-                ),
-                HistoryRequest::WholeSince { at_ms } => (
-                    format!("Whole stack since {}", when(at_ms)),
-                    compare::whole_stack_since(root, &timeline, at_ms)
-                        .map_err(fail)?
-                        .into_iter()
-                        .collect(),
-                ),
-                HistoryRequest::SinceReview { include_rebased } => (
-                    "Stack since your last review".to_owned(),
-                    compare::changes_since_review(root, &timeline, include_rebased)
-                        .map_err(fail)?,
-                ),
-            })
-        })
-        .await
-        .map_err(|error| error.message)
-}
-
-/// The sources of `comparisons`, as a review opens them.
-#[must_use]
-pub fn sources_of(comparisons: &[Comparison]) -> Vec<ReviewSourceKind> {
-    comparisons
-        .iter()
-        .map(|comparison| comparison.source.clone())
-        .collect()
+    /// Every layer's change since this reviewer last looked at it.
+    SinceLooked,
 }
 
 /// What a key in the panel led to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOutcome {
     /// Close the panel.
     Close,
@@ -306,8 +220,10 @@ pub enum HistoryOutcome {
     Redraw,
     /// Not the panel's key.
     Ignored,
-    /// Compute a comparison.
+    /// Compare in place (the panel closes).
     Compare(HistoryRequest),
+    /// Show only pull requests with real changes, or every one again.
+    OnlyChanged,
 }
 
 /// The history panel.
@@ -318,7 +234,6 @@ pub struct HistoryPanel {
     column: usize,
     /// The column a comparison starts from, when pinned.
     from: Option<usize>,
-    include_rebased: bool,
     note: Option<String>,
     /// Each layer's reviews (approvals and requests for changes), from its conversation.
     reviews: BTreeMap<u64, Vec<ReviewMark>>,
@@ -344,7 +259,6 @@ impl HistoryPanel {
             layer: 0,
             column: 0,
             from: None,
-            include_rebased: false,
             note: Some("Reading the stack's history…".to_owned()),
             reviews: BTreeMap::new(),
         }
@@ -461,10 +375,7 @@ impl HistoryPanel {
                 self.from = (self.from != Some(self.column)).then_some(self.column);
                 return HistoryOutcome::Redraw;
             }
-            KeyCode::Char('i') => {
-                self.include_rebased = !self.include_rebased;
-                return HistoryOutcome::Redraw;
-            }
+            KeyCode::Char('i') => return HistoryOutcome::OnlyChanged,
             KeyCode::Enter => {
                 let Some(from) = from else {
                     return HistoryOutcome::Ignored;
@@ -479,29 +390,22 @@ impl HistoryPanel {
                 let Some(from) = from else {
                     return HistoryOutcome::Ignored;
                 };
+                let to = from.max(self.column);
                 HistoryRequest::Between {
                     from_ms: at(from.min(self.column)),
-                    to_ms: Some(at(from.max(self.column))),
-                    include_rebased: self.include_rebased,
+                    to_ms: (to + 1 < columns).then(|| at(to)),
                 }
             }
             KeyCode::Char('s') => HistoryRequest::Between {
                 from_ms: at(self.column),
                 to_ms: None,
-                include_rebased: self.include_rebased,
             },
             KeyCode::Char('a') => HistoryRequest::StackAt {
                 at_ms: at(self.column),
             },
-            KeyCode::Char('w') => HistoryRequest::WholeSince {
-                at_ms: at(self.column),
-            },
-            KeyCode::Char('r') => HistoryRequest::SinceReview {
-                include_rebased: self.include_rebased,
-            },
+            KeyCode::Char('r') => HistoryRequest::SinceLooked,
             _ => return HistoryOutcome::Ignored,
         };
-        self.note = Some("Comparing…".to_owned());
         HistoryOutcome::Compare(request)
     }
 
@@ -562,7 +466,7 @@ impl HistoryPanel {
             )
         };
         let mut header = vec![Span::styled(
-            format!("{:<LABEL_WIDTH$}  ", describe(self.column)),
+            format!("{}  ", pad_cells(&describe(self.column), LABEL_WIDTH)),
             theme.title,
         )];
         for column in shown.clone() {
@@ -577,16 +481,13 @@ impl HistoryPanel {
         }
         lines.push(Line::from_spans(header).truncate(width));
         for (index, layer) in timeline.layers.iter().enumerate() {
-            let mut label = format!("#{} {}", layer.number, layer.title);
-            if label.chars().count() > LABEL_WIDTH {
-                label = label.chars().take(LABEL_WIDTH - 1).collect::<String>() + "…";
-            }
+            let label = fit_cells(&format!("#{} {}", layer.number, layer.title), LABEL_WIDTH);
             let style = if index == self.layer {
                 theme.title
             } else {
                 theme.text
             };
-            let mut spans = vec![Span::styled(format!("{label:<LABEL_WIDTH$}  "), style)];
+            let mut spans = vec![Span::styled(format!("{label}  "), style)];
             for column in shown.clone() {
                 let (glyph, reviewed) = Self::cell(timeline, layer, column);
                 let style = if index == self.layer && column == self.column {
@@ -612,12 +513,6 @@ impl HistoryPanel {
              green: reviewed",
             theme.muted,
         )]));
-        if self.include_rebased {
-            lines.push(Line::from_spans(vec![Span::styled(
-                "Rebased-only layers are included in comparisons (i to leave them out).",
-                theme.muted,
-            )]));
-        }
         if let Some(note) = &self.note {
             lines.push(Line::from_spans(vec![Span::styled(
                 note.clone(),
@@ -641,8 +536,8 @@ impl HistoryPanel {
         policy.header = false;
         policy.margin = bmux_tui::geometry::Insets::all(1);
         policy.min_size = Size::new(area.width.min(40), area.height.min(10));
-        let footer = "←→ push · ↑↓ layer · f pin from · enter layer · p push · s since · \
-                      a as it was · w whole stack · r since review · i rebased · esc";
+        let footer = "←→ push · ↑↓ layer · f pin from · enter layer · p pushes · s since · \
+                      a as it was · r since you looked · i only real changes · esc";
         let frame = PickerFrame::new()
             .title(" Stack history ")
             .footer(Line::from_spans(vec![Span::styled(footer, theme.muted)]))
@@ -726,6 +621,22 @@ mod tests {
     }
 
     #[test]
+    fn labels_fit_their_cells_whatever_their_characters() {
+        use bmux_tui::text_width::display_width;
+        for text in [
+            "#1 short",
+            "#2 一个很长的中文标题，超出了列宽很多很多",
+            "#3 🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂",
+        ] {
+            for cells in [1, 5, 12, 34] {
+                let fitted = fit_cells(text, cells);
+                assert!(display_width(&fitted) <= cells, "{fitted:?} in {cells}");
+                assert!(display_width(&fitted) + 1 >= cells, "{fitted:?} in {cells}");
+            }
+        }
+    }
+
+    #[test]
     fn cells_show_how_each_layer_changed_in_each_push() {
         let timeline = timeline();
         let cells = |layer: usize| -> Vec<&str> {
@@ -801,15 +712,16 @@ mod tests {
             panel.key(key(KeyCode::Char('p'))),
             HistoryOutcome::Compare(HistoryRequest::Between {
                 from_ms: 99,
-                to_ms: Some(u64::MAX),
-                include_rebased: false,
+                to_ms: None,
             })
         );
         assert_eq!(
             panel.key(key(KeyCode::Char('r'))),
-            HistoryOutcome::Compare(HistoryRequest::SinceReview {
-                include_rebased: false
-            })
+            HistoryOutcome::Compare(HistoryRequest::SinceLooked)
+        );
+        assert_eq!(
+            panel.key(key(KeyCode::Char('i'))),
+            HistoryOutcome::OnlyChanged
         );
         assert_eq!(panel.key(key(KeyCode::Escape)), HistoryOutcome::Close);
     }

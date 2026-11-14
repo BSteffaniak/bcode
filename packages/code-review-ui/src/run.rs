@@ -169,7 +169,7 @@ impl App {
             }
             Action::None if outcome == EventOutcome::Ignored => Update::none(),
             // The app opens comparisons itself; one reaching here only needs drawing.
-            Action::Redraw | Action::None | Action::OpenReview { .. } => Update::redraw(),
+            Action::Redraw | Action::None => Update::redraw(),
         }
     }
 
@@ -271,6 +271,7 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
     let services = ReviewServices::new(ReviewStore::new(loaded.store), Arc::clone(&host))
         .with_stack_limit(loaded.stack_limit)
         .with_conversation(loaded.conversation.clone())
+        .with_compare(loaded.compare)
         // Disposable: a review opens from what an earlier run computed and learned, then confirms
         // it (`BCODE_CODE_REVIEW_CACHE=off` disables it).
         .with_cache(Arc::new(bcode_code_review::cache::ReviewCache::for_user()))

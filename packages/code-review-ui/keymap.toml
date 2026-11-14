@@ -183,6 +183,25 @@ keymap_actions = [
     { id = "bcode.code_review.compare_view", scope = "code-review", description = "Only what changed since you looked / the full change with what is new marked", defaults = [
         "shift+l",
     ] },
+    { id = "bcode.code_review.compare_baseline", scope = "code-review", description = "Changes since…: choose what pull requests are compared with", defaults = [
+        "b",
+    ] },
+    { id = "bcode.code_review.compare_only_changed", scope = "code-review", description = "Compare: only pull requests with real changes", defaults = [
+    ] },
+    { id = "bcode.code_review.compare_off", scope = "code-review", description = "Compare: full change (no comparison)", defaults = [
+    ] },
+    { id = "bcode.code_review.compare_last_looked", scope = "code-review", description = "Compare: with what you last looked at", defaults = [
+    ] },
+    { id = "bcode.code_review.compare_versions", scope = "code-review", description = "Compare versions of this pull request…", defaults = [
+    ] },
+    { id = "bcode.code_review.compare_push", scope = "code-review", description = "Compare pushes of the stack…", defaults = [
+    ] },
+    { id = "bcode.code_review.file_version_previous", scope = "code-review", description = "This file's previous version (in a comparison)", defaults = [
+        "alt+[",
+    ] },
+    { id = "bcode.code_review.file_version_next", scope = "code-review", description = "This file's next version (in a comparison)", defaults = [
+        "alt+]",
+    ] },
     { id = "bcode.code_review.complete_pass", scope = "code-review", description = "Mark the review pass complete", defaults = [
         "shift+m",
     ] },
@@ -285,7 +304,7 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.refresh_conversation", scope = "code-review", description = "Pull request: read its conversation again", defaults = [
     ] },
-    { id = "bcode.code_review.stack_history", scope = "code-review", description = "Stack history: how each pull request changed in each push", defaults = [
+    { id = "bcode.code_review.stack_history", scope = "code-review", description = "Stack history: how each pull request changed in each push (compares in place)", defaults = [
         "shift+b",
     ] },
     { id = "bcode.code_review.stack_file", scope = "code-review", description = "Stack: this file through the stack (every layer that changes it)", defaults = [

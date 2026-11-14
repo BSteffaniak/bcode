@@ -454,6 +454,21 @@ impl ReviewSurface {
             self.thread_action(action);
             return;
         }
+        // An older version's lines take no comment: a forge cannot anchor to them.
+        let on_line = self
+            .review
+            .as_ref()
+            .and_then(|review| match &review.cursor {
+                Some(key @ (ItemKey::Line { .. } | ItemKey::LinePair { .. })) => {
+                    key.file().cloned()
+                }
+                _ => None,
+            });
+        if let Some(file) = on_line
+            && self.refuse_historical(&file)
+        {
+            return;
+        }
         match self.cursor_anchor() {
             Some(anchor) => {
                 let mode = if ask {

@@ -112,7 +112,9 @@ impl FileTree {
         let focus = doc.focus();
         for file in doc.file_keys() {
             // One layer at a time: only the focused source's files.
-            if focus.is_some_and(|focus| focus != file.source_id) {
+            if focus.is_some_and(|focus| focus != file.source_id)
+                || doc.source_filtered(&file.source_id)
+            {
                 continue;
             }
             let Some(row) = file_row(doc, file) else {
@@ -129,7 +131,7 @@ impl FileTree {
         let mut tree = Self::default();
         for (source, part, rows) in groups {
             let depth = if grouped {
-                let label = group_label(doc, &source, part);
+                let label = group_label(doc, &source, part, theme);
                 tree.push(
                     format!("g{SEP}{source}{SEP}{}", part_text(part)),
                     0,
@@ -627,12 +629,18 @@ fn file_row(doc: &ReviewDocument, file: &FileRef) -> Option<FileRow> {
 }
 
 /// Label of a source group row: its header label, or a stack layer's pull request.
-fn group_label(doc: &ReviewDocument, source: &str, part: Option<u32>) -> String {
+fn group_label(
+    doc: &ReviewDocument,
+    source: &str,
+    part: Option<u32>,
+    theme: &ReviewTheme,
+) -> String {
     let key = ItemKey::SourceHeader {
         source_id: source.to_owned(),
         part,
     };
-    doc.index_of(&key)
+    let label = doc
+        .index_of(&key)
         .and_then(|index| match doc.item(index) {
             // A stack layer is named by its pull request, the way its banner and tab name it.
             Some(ReviewItem::SourceHeader(header)) => Some(match &header.layer {
@@ -641,7 +649,33 @@ fn group_label(doc: &ReviewDocument, source: &str, part: Option<u32>) -> String 
             }),
             _ => None,
         })
-        .unwrap_or_else(|| source.to_owned())
+        .unwrap_or_else(|| source.to_owned());
+    match compare_badge(doc, source, theme) {
+        Some(badge) => format!("{label}  {badge}"),
+        None => label,
+    }
+}
+
+/// How a compared source changed since its baseline, briefly (`● +40 −12`, `○ rebased`).
+fn compare_badge(doc: &ReviewDocument, source: &str, theme: &ReviewTheme) -> Option<String> {
+    use bcode_code_review_models::DeltaKind;
+    let delta = doc.comparison(source)?.delta.as_ref()?;
+    let icons = &theme.icons;
+    Some(match delta.kind {
+        DeltaKind::Changed | DeltaKind::WithRebase => {
+            let (added, removed) = delta.totals();
+            let glyph = if delta.kind == DeltaKind::WithRebase {
+                icons.since_with_rebase
+            } else {
+                icons.since_changed
+            };
+            format!("{glyph} +{added} {}{removed}", icons.minus)
+        }
+        DeltaKind::RebasedOnly => format!("{} rebased", icons.since_rebased),
+        DeltaKind::Unchanged => format!("{} unchanged", icons.since_unchanged),
+        DeltaKind::NewToYou => format!("{} new to you", icons.since_new_to_you),
+        DeltaKind::Unavailable => format!("{} unavailable", icons.since_unavailable),
+    })
 }
 
 fn file_totals(row: &FileRow) -> Totals {

@@ -152,6 +152,7 @@ enum Phase {
 mod annotate;
 mod assist;
 mod compare;
+mod compare_view;
 mod conversation;
 mod dock;
 mod feed;
@@ -1955,9 +1956,12 @@ impl ReviewSurface {
                 self.refresh_conversations(host);
             }
             Message::Conversation(message) => self.apply_conversation(*message, host),
-            Message::History(result) => self.apply_history(result),
+            Message::History(result) => {
+                self.apply_history(result);
+                // Baselines picked by time wait for the history.
+                self.comparing.layers_moved();
+            }
             Message::HistoryPanel(result) => self.apply_history_panel(result),
-            Message::HistoryCompared(result) => self.apply_history_compared(result),
             Message::OpenFailed(error) => {
                 self.switching = false;
                 if self.review.is_some() {
@@ -2015,6 +2019,7 @@ impl ReviewSurface {
             Message::Import(result) => self.apply_import(result),
             Message::Looks(result) => self.apply_looks(result, host),
             Message::Compared(result) => self.apply_compared(result),
+            Message::CompareSteps(number, result) => self.apply_steps(number, result),
             Message::PathCompletions { generation, result } => {
                 if let Some(composer) = self.composer.as_mut() {
                     composer.answer_completion(generation, result);
@@ -2419,6 +2424,9 @@ impl ReviewSurface {
             let outcome = overlay.key(stroke, &self.theme);
             return self.overlay_outcome(outcome, host);
         }
+        if let Some(action) = self.timeline_key(stroke, host) {
+            return action;
+        }
         match self.focus {
             Focus::Composer => return self.composer_key(stroke, host),
             Focus::Search => return self.search_key(stroke),
@@ -2577,6 +2585,9 @@ impl ReviewSurface {
     fn review_action(&mut self, action: &str, host: &UiContext) -> Option<Action> {
         if self.fold_and_view_action(action) {
             return Some(Action::Redraw);
+        }
+        if let Some(result) = self.compare_action(action, host) {
+            return Some(result);
         }
         Some(match action {
             "palette" | "help" => {
@@ -2785,6 +2796,7 @@ impl ReviewSurface {
     }
 
     fn document_motion(&mut self, action: &str, count: Option<u32>) -> Action {
+        let comparing = self.comparing.active();
         let Some(review) = self.review.as_mut() else {
             return Action::None;
         };
@@ -2844,6 +2856,22 @@ impl ReviewSurface {
                     "unviewed_next" => (NavKind::UnviewedFile, Direction::Forward),
                     "unviewed_previous" => (NavKind::UnviewedFile, Direction::Backward),
                     _ => (NavKind::Change, Direction::Backward),
+                };
+                // While comparing, next and previous change stop on lines new since the
+                // baseline first.
+                let kind = if kind == NavKind::Change
+                    && comparing
+                    && review.cursor.as_ref().is_some_and(|origin| {
+                        review.doc.index_of(origin).is_some_and(|from| {
+                            review
+                                .doc
+                                .navigate(from, NavKind::NewSince, direction)
+                                .is_some()
+                        })
+                    }) {
+                    NavKind::NewSince
+                } else {
+                    kind
                 };
                 for _ in 0..repeat.min(1_000) {
                     if review.motion.is_some() {
@@ -3307,7 +3335,8 @@ impl ReviewSurface {
             return self.overlay_outcome(outcome, host);
         }
         if let Some(action) = self
-            .side_mouse(event, *mouse)
+            .compare_mouse(event, host)
+            .or_else(|| self.side_mouse(event, *mouse))
             .or_else(|| self.bar_mouse(event, host))
         {
             return action;
@@ -3411,6 +3440,7 @@ impl ReviewSurface {
     /// A mouse event the stack rail or the assistant dock handles.
     fn side_mouse(&mut self, event: &Event, mouse: bmux_tui::event::MouseEvent) -> Option<Action> {
         if self.rail_mouse(event) {
+            self.apply_compare_filter();
             return Some(Action::Redraw);
         }
         self.assistant_mouse(mouse)
@@ -3604,7 +3634,14 @@ impl ReviewSurface {
             && !self.rail_entries().is_empty();
         // In the every-layer view of a stack, a strip under the rail names the cursor's layer.
         let strip = rail && area.height >= 10 && self.shows_layer_strip();
-        let above = u16::from(header) + u16::from(rail) + u16::from(strip);
+        // The comparison row, and the banner of a changed review, under the rail and strip.
+        let (compare, banner) =
+            self.compare_rows(header && matches!(self.phase, Phase::Ready), area.height);
+        let above = u16::from(header)
+            + u16::from(rail)
+            + u16::from(strip)
+            + u16::from(compare)
+            + u16::from(banner);
         // The pull request bar, under the rail and strip.
         let bar = if header && matches!(self.phase, Phase::Ready) {
             self.bar_height(area.height, area.width)
@@ -3629,6 +3666,13 @@ impl ReviewSurface {
         } else {
             self.rail = None;
         }
+        let compare_row = area.y + 1 + u16::from(rail) + u16::from(strip);
+        self.paint_compare_rows(
+            Rect::new(area.x, compare_row, area.width, 1),
+            compare,
+            banner,
+            cx,
+        );
         if bar > 0 {
             self.paint_bar(Rect::new(area.x, area.y + above, area.width, bar), cx);
         } else {
@@ -3653,6 +3697,11 @@ impl ReviewSurface {
                 self.paint_footer(Rect::new(area.x, area.bottom() - 1, area.width, 1), cx);
             });
         }
+        self.paint_above(area, body, cx);
+    }
+
+    /// Paint what covers the screen: toasts, the overlay, a modal, and the publish menu.
+    fn paint_above(&mut self, area: Rect, body: Rect, cx: &mut PaintCx<'_, '_>) {
         self.toasts.paint(&self.theme, body, cx);
         let theme = self.theme;
         if let Some(overlay) = self.overlay.as_mut() {
@@ -3662,6 +3711,8 @@ impl ReviewSurface {
             Some(Modal::Publish(flow)) => flow.paint(&theme, area, cx),
             Some(Modal::Import(flow)) => flow.paint(&theme, area, cx),
             Some(Modal::History(panel)) => panel.paint(&theme, area, cx),
+            Some(Modal::Compare(menu)) => menu.paint(&theme, area, cx),
+            Some(Modal::Versions(picker)) => picker.paint(&theme, area, cx),
             None => {}
         }
         if self.publish.open
@@ -4937,6 +4988,7 @@ const fn item_hints(cursor: Option<&ItemKey>) -> &'static [(&'static str, &'stat
 /// Actions whose first key the footer hints show.
 const HINT_ACTIONS: &[&str] = &[
     "compare_view",
+    "compare_baseline",
     "publish",
     "comment",
     "ask",
@@ -5197,6 +5249,9 @@ impl View for ReviewSurface {
             if self.comparing.take_moved() {
                 self.refresh_comparison(host);
             }
+            self.track_dwell();
+            self.record_forge_looks();
+            self.request_steps(host);
         }
         let notes_before = self.notes.pending();
         self.pump_notes(host);

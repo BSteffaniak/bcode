@@ -133,6 +133,10 @@ pub enum FileAction {
     Previous,
     /// The next file.
     Next,
+    /// The file's previous version (in a comparison).
+    VersionPrevious,
+    /// The file's next version (in a comparison).
+    VersionNext,
 }
 
 impl FileAction {
@@ -149,6 +153,8 @@ impl FileAction {
             Self::CopyPath => "copy_path",
             Self::Previous => "previous_file",
             Self::Next => "next_file",
+            Self::VersionPrevious => "file_version_previous",
+            Self::VersionNext => "file_version_next",
         }
     }
 }
@@ -178,6 +184,59 @@ fn viewed_span(viewed: bool, label: bool, theme: &ReviewTheme) -> Span {
         },
         style,
     )
+}
+
+/// A file's versions as header spans, with the cells of its two steps from their end.
+type VersionSteps = (Vec<Span>, [(usize, FileAction); 2]);
+
+/// Cells a header's path keeps before its file's versions are left out.
+const PATH_KEEP: usize = 24;
+
+/// A file's versions in its pull request, at the widest variant that leaves the path
+/// [`PATH_KEEP`] cells of `width` beside `others` cells of facts: `changed in 2 of 4 pushes ·
+/// v4 ◂ ▸`, then `v4 ◂ ▸`, else nothing. Returns the spans (each ending with a space) and the
+/// cells of the two steps, counted from the end of the spans.
+fn version_spans(
+    item: &FileHeaderItem,
+    theme: &ReviewTheme,
+    width: usize,
+    others: usize,
+) -> Option<VersionSteps> {
+    let versions = item.versions?;
+    let shown = versions.shown.map_or(versions.steps + 1, |shown| shown + 2);
+    let step = |enabled: bool, glyph: &'static str| {
+        Span::styled(glyph, if enabled { theme.accent } else { theme.muted })
+    };
+    let tail = vec![
+        Span::styled(format!("v{shown} "), theme.badge_open),
+        step(versions.previous, theme.icons.step_back),
+        Span::raw(" "),
+        step(versions.next, theme.icons.step_forward),
+        Span::raw(" "),
+    ];
+    let pushes = format!(
+        "changed in {} of {} push{}{}",
+        versions.changed_in,
+        versions.steps,
+        if versions.steps == 1 { "" } else { "es" },
+        theme.icons.separator
+    );
+    let mut full = vec![Span::styled(pushes, theme.muted)];
+    full.extend(tail.clone());
+    let back = display_width(theme.icons.step_back);
+    let forward = display_width(theme.icons.step_forward);
+    // From the end: `▸` then a space; `◂` then a space, `▸`, a space.
+    let cells = [
+        (forward + 1 + back + 1, FileAction::VersionPrevious),
+        (forward + 1, FileAction::VersionNext),
+    ];
+    for spans in [full, tail] {
+        let needed: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+        if others + needed + PATH_KEEP <= width {
+            return Some((spans, cells));
+        }
+    }
+    None
 }
 
 /// Spans of what a header says on the right: flags, layers, threads, counts, change bar.
@@ -302,7 +361,27 @@ pub fn header_rows(
             let mut content = vec![pill(item, theme), Span::raw(" ")];
             content.extend(path_spans(item, theme, true));
             let mut trailing = header_facts(item, theme, true);
-            trailing.push(viewed_span(item.viewed, false, theme));
+            let viewed = viewed_span(item.viewed, false, theme);
+            // The viewed mark and its space end the row.
+            let mark_cells = display_width(&viewed.content) + 1;
+            let facts: usize = trailing
+                .iter()
+                .map(|span| display_width(&span.content))
+                .sum();
+            let versions = version_spans(item, theme, width, facts + mark_cells);
+            let mut actions = vec![chevron_action(theme)];
+            if let Some((spans, steps)) = versions {
+                for (from_end, action) in steps {
+                    let at = width.saturating_sub(mark_cells + from_end);
+                    actions.push(ActionCells {
+                        row: 0,
+                        cells: cells(at)..cells(at + 1),
+                        action: ItemAction::File(action),
+                    });
+                }
+                trailing.extend(spans);
+            }
+            trailing.push(viewed);
             trailing.push(Span::raw(" "));
             let line = header_line(
                 &Line::from_spans(lead(item, theme, true, content)),
@@ -311,17 +390,12 @@ pub fn header_rows(
                 fill,
             );
             let mark = width.saturating_sub(2);
-            ItemRows::lines(
-                vec![line],
-                vec![
-                    chevron_action(theme),
-                    ActionCells {
-                        row: 0,
-                        cells: cells(mark)..cells(mark + 1),
-                        action: ItemAction::File(FileAction::Viewed),
-                    },
-                ],
-            )
+            actions.push(ActionCells {
+                row: 0,
+                cells: cells(mark)..cells(mark + 1),
+                action: ItemAction::File(FileAction::Viewed),
+            });
+            ItemRows::lines(vec![line], actions)
         }
         Density::Spacious => {
             let mut first = vec![pill(item, theme), Span::raw(" ")];
@@ -349,23 +423,34 @@ pub fn header_rows(
                     theme.status_renamed,
                 ));
             }
+            let mut facts = header_facts(item, theme, true);
+            let facts_width: usize = facts.iter().map(|span| display_width(&span.content)).sum();
+            let mut actions = vec![
+                chevron_action(theme),
+                ActionCells {
+                    row: 0,
+                    cells: cells(start)..cells(start + viewed_width),
+                    action: ItemAction::File(FileAction::Viewed),
+                },
+            ];
+            if let Some((spans, steps)) = version_spans(item, theme, width, facts_width) {
+                for (from_end, action) in steps {
+                    let at = width.saturating_sub(from_end);
+                    actions.push(ActionCells {
+                        row: 1,
+                        cells: cells(at)..cells(at + 1),
+                        action: ItemAction::File(action),
+                    });
+                }
+                facts.extend(spans);
+            }
             let bottom = header_line(
                 &Line::from_spans(lead(item, theme, false, second)),
-                &Line::from_spans(header_facts(item, theme, true)),
+                &Line::from_spans(facts),
                 width,
                 fill,
             );
-            ItemRows::lines(
-                vec![top, bottom],
-                vec![
-                    chevron_action(theme),
-                    ActionCells {
-                        row: 0,
-                        cells: cells(start)..cells(start + viewed_width),
-                        action: ItemAction::File(FileAction::Viewed),
-                    },
-                ],
-            )
+            ItemRows::lines(vec![top, bottom], actions)
         }
     }
 }
@@ -697,6 +782,99 @@ mod tests {
             Density::for_size(89, 30, Density::Compact),
             Density::Compact
         );
+    }
+
+    fn header(
+        path: &str,
+        versions: Option<bcode_code_review::document::FileVersionsItem>,
+    ) -> FileHeaderItem {
+        FileHeaderItem {
+            file: std::sync::Arc::new(bcode_code_review::document::FileKey::new("s", None, path)),
+            status: bcode_code_review_models::ReviewFileStatus::Modified,
+            old_path: None,
+            additions: 12,
+            deletions: 3,
+            flags: std::collections::BTreeSet::new(),
+            viewed: false,
+            load: bcode_code_review::document::FileLoad::Loaded,
+            layers: Vec::new(),
+            thread_count: 0,
+            since: Some(bcode_code_review_models::FileSince::Changed {
+                added: 4,
+                removed: 1,
+            }),
+            versions,
+            position: 1,
+            count: 3,
+            collapsed: false,
+        }
+    }
+
+    /// The text of the cells `cells` of `line`, by display width.
+    fn cells_text(line: &Line, cells: std::ops::Range<u16>) -> String {
+        let mut x = 0_usize;
+        let mut out = String::new();
+        for span in &line.spans {
+            for grapheme in span.content.split_inclusive(|_: char| true) {
+                let width = display_width(grapheme);
+                if x >= usize::from(cells.start) && x + width <= usize::from(cells.end) {
+                    out.push_str(grapheme);
+                }
+                x += width;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_files_versions_show_by_fit_and_their_steps_are_where_they_are_painted() {
+        let theme = ReviewTheme::derive(None, crate::theme::IconStyle::Unicode);
+        let versions = bcode_code_review::document::FileVersionsItem {
+            changed_in: 2,
+            steps: 4,
+            shown: Some(1),
+            previous: true,
+            next: true,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for path in ["src/lib.rs", "文档/很长的中文文件名称_🙂.rs"] {
+            let item = header(path, Some(versions));
+            for density in [Density::Compact, Density::Spacious] {
+                for width in 0..=160 {
+                    let rows = header_rows(&item, density, &theme, width);
+                    for line in &rows.lines {
+                        assert!(line.width() <= width.max(1), "{path} {density:?} {width}");
+                    }
+                    for action in &rows.actions {
+                        let glyph = match action.action {
+                            ItemAction::File(FileAction::VersionPrevious) => theme.icons.step_back,
+                            ItemAction::File(FileAction::VersionNext) => theme.icons.step_forward,
+                            _ => continue,
+                        };
+                        let line = &rows.lines[usize::from(action.row)];
+                        assert_eq!(
+                            cells_text(line, action.cells.clone()),
+                            glyph,
+                            "{path} {density:?} at {width}: {}",
+                            line.plain_text()
+                        );
+                        seen.insert(line.plain_text().contains("changed in 2 of 4 pushes"));
+                    }
+                }
+            }
+        }
+        // Wide headers say in how many pushes the file changed; narrower ones only step.
+        assert_eq!(seen.len(), 2);
+        let wide = header_rows(
+            &header("src/lib.rs", Some(versions)),
+            Density::Compact,
+            &theme,
+            160,
+        );
+        assert!(wide.lines[0].plain_text().contains("v3 ◂ ▸"));
+        // Without versions, nothing of them shows.
+        let plain = header_rows(&header("src/lib.rs", None), Density::Compact, &theme, 160);
+        assert!(!plain.lines[0].plain_text().contains('◂'));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! The stack history on the review screen: the panel (opened with the `stack_history` action),
-//! the summary of the last push on the layer strip, and opening a comparison as its own review.
+//! The stack history on the review screen: the matrix (opened with the `stack_history`
+//! action), whose comparisons apply in place, and the summary of the last push.
 
 use super::super::history::{self, HistoryOutcome, HistoryPanel, HistoryRequest, HistoryScope};
 use super::super::loader::Message;
@@ -7,8 +7,8 @@ use super::ReviewSurface;
 use super::flows::Modal;
 use crate::action::Action;
 use crate::context::UiContext;
-use bcode_code_review::history::compare::Comparison;
-use bcode_code_review_models::StackTimeline;
+use bcode_code_review::history::version_at;
+use bcode_code_review_models::{ReviewCompareBaseline, StackTimeline};
 use bmux_tui_components::status_bar::StatusSeverity;
 
 impl ReviewSurface {
@@ -124,43 +124,6 @@ impl ReviewSurface {
         }
     }
 
-    /// A comparison is ready: open it as its own review (returning here when it closes).
-    pub(super) fn apply_history_compared(
-        &mut self,
-        result: Result<(String, Vec<Comparison>), String>,
-    ) {
-        let Some(Modal::History(panel)) = self.modal.as_mut() else {
-            return;
-        };
-        match result {
-            Ok((_, comparisons)) if comparisons.is_empty() => {
-                panel.set_note("Nothing changed there (rebases are left out; i includes them).");
-            }
-            Ok((title, comparisons)) => {
-                let filtered = comparisons
-                    .iter()
-                    .filter(|comparison| !comparison.rebase_removed)
-                    .count();
-                if filtered > 0 {
-                    self.set_status(
-                        format!(
-                            "{filtered} comparison{} could not take the rebase out and \
-                             include it",
-                            if filtered == 1 { "" } else { "s" }
-                        ),
-                        StatusSeverity::Warning,
-                    );
-                }
-                self.modal = None;
-                self.pending_action = Some(Action::OpenReview {
-                    title,
-                    sources: history::sources_of(&comparisons),
-                });
-            }
-            Err(error) => panel.set_note(format!("Could not compare: {error}")),
-        }
-    }
-
     /// Answer what a key in the panel led to.
     pub(super) fn history_outcome(&mut self, outcome: HistoryOutcome, host: &UiContext) -> Action {
         match outcome {
@@ -171,28 +134,45 @@ impl ReviewSurface {
             HistoryOutcome::Redraw => Action::Redraw,
             HistoryOutcome::Ignored => Action::None,
             HistoryOutcome::Compare(request) => {
+                self.modal = None;
                 self.compare_history(request, host);
+                Action::Redraw
+            }
+            HistoryOutcome::OnlyChanged => {
+                self.toggle_only_changed();
                 Action::Redraw
             }
         }
     }
 
-    fn compare_history(&self, request: HistoryRequest, host: &UiContext) {
-        let Some(Modal::History(panel)) = self.modal.as_ref() else {
-            return;
-        };
-        let Some(timeline) = panel.timeline().cloned() else {
-            return;
-        };
-        let (services, inbox, repo) = (
-            self.services.clone(),
-            self.inbox.clone(),
-            self.repo_path.clone(),
-        );
-        host.spawn(Box::pin(async move {
-            let result = history::comparisons(services, repo, timeline, request).await;
-            inbox.push(Message::HistoryCompared(result));
-        }));
+    /// Apply a comparison the matrix asked for to the open review.
+    fn compare_history(&mut self, request: HistoryRequest, host: &UiContext) {
+        match request {
+            HistoryRequest::Layer {
+                number,
+                from_ms,
+                to_ms,
+            } => {
+                let indices = self.stack_history.as_ref().and_then(|history| {
+                    let layer = history.layers.iter().find(|layer| layer.number == number)?;
+                    Some((version_at(layer, from_ms)?, version_at(layer, to_ms)?))
+                });
+                match indices {
+                    Some((from, to)) if from != to => self.pick_versions(number, from, to, host),
+                    _ => self.set_status(
+                        format!("#{number} did not change between those pushes"),
+                        bmux_tui_components::status_bar::StatusSeverity::Info,
+                    ),
+                }
+            }
+            HistoryRequest::Between { from_ms, to_ms } => {
+                self.set_compare_baseline(ReviewCompareBaseline::Between { from_ms, to_ms }, host);
+            }
+            HistoryRequest::StackAt { at_ms } => self.compare_stack_at(at_ms, host),
+            HistoryRequest::SinceLooked => {
+                self.set_compare_baseline(ReviewCompareBaseline::LastLooked, host);
+            }
+        }
     }
 
     /// The layer strip's note about the last push: when, and what it changed.

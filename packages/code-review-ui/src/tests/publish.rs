@@ -98,7 +98,7 @@ fn cursor(scenario: &Scenario<ReviewApp>) -> Option<ItemKey> {
 fn publish_step(scenario: &Scenario<ReviewApp>) -> Option<Step> {
     match scenario.surface().review()?.modal()? {
         Modal::Publish(flow) => Some(flow.step().clone()),
-        Modal::Import(_) | Modal::History(_) => None,
+        Modal::Import(_) | Modal::History(_) | Modal::Compare(_) | Modal::Versions(_) => None,
     }
 }
 
@@ -981,7 +981,7 @@ pub(super) fn push_to(fixture: &GitFixture, branch: &str, path: &str) {
 }
 
 #[test]
-fn the_stack_history_shows_a_push_and_opens_what_it_changed_returning_after() {
+fn the_stack_history_shows_a_push_and_compares_what_it_changed_in_place() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
     let workspace = create(
@@ -1001,32 +1001,30 @@ fn the_stack_history_shows_a_push_and_opens_what_it_changed_returning_after() {
     // One push since the stack was first seen: it changed the top layer only.
     assert!(screen.contains("#103 changed"), "{}", screen.text());
 
-    // The top layer (the stack's fourth, #100 to #103), from before the push to now.
+    // The top layer (the stack's fourth, #100 to #103), from before the push to now: compared
+    // in this review, which stays open.
     for _ in 0..3 {
         scenario.key("down");
     }
     scenario.key("enter");
     let screen = settled(&mut scenario);
     assert_eq!(scenario.surface().route_name(), RouteName::Review);
-    let review = scenario.surface().review().expect("comparison review");
-    assert!(review.is_transient());
-    assert!(
-        review
-            .workspace()
-            .is_some_and(|workspace| workspace.title.starts_with("#103")),
-        "{}",
-        screen.text()
-    );
-    assert!(screen.contains("pushed-later.txt"), "{}", screen.text());
-
-    // Closing the comparison comes back to the review it came from.
-    scenario.key("q");
-    settled(&mut scenario);
-    let back = scenario.surface().review().expect("back in the review");
+    let review = scenario.surface().review().expect("the same review");
+    assert!(!review.is_transient());
     assert_eq!(
-        back.workspace().map(|workspace| workspace.id.clone()),
+        review.workspace().map(|workspace| workspace.id.clone()),
         Some(workspace.id)
     );
+    assert!(review.comparing().picks().contains_key(&103));
+    // The push added one file to #103: its tab says so.
+    assert!(screen.contains("#103 Layer 103"), "{}", screen.text());
+    assert!(screen.contains("● +1"), "{}", screen.text());
+    assert!(!screen.contains("Stack history"), "{}", screen.text());
+
+    // Closing goes home, not to another review.
+    scenario.key("q");
+    settled(&mut scenario);
+    assert!(scenario.surface().review().is_none());
 }
 
 #[test]

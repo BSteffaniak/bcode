@@ -42,6 +42,8 @@ pub mod app;
 pub mod appearance;
 pub mod chrome;
 pub mod cli;
+pub mod compare_bar;
+pub mod compare_menu;
 pub mod composer;
 pub mod config;
 pub mod context;

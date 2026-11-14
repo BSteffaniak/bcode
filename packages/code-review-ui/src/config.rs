@@ -30,6 +30,7 @@ use bcode_config_layers::user_state::{
 use bcode_config_layers::{ConfigEnvironment, ConfigLoadOverrides, ProcessConfigEnvironment};
 use bcode_tui_theme::appearance::{AppearanceSources, SavedAppearance, ThemePreferences};
 
+pub mod compare;
 pub mod conversation;
 pub mod view;
 
@@ -115,6 +116,8 @@ pub struct LoadedConfig {
     pub stack_limit: ReviewStackLimit,
     /// Pull request conversations, from the plugin table's `conversation` table.
     pub conversation: conversation::ConversationConfig,
+    /// Comparisons with earlier versions, from the plugin table's `compare` table.
+    pub compare: compare::CompareConfig,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
     /// Configured theme selection (`[tui.theme]`).
@@ -225,6 +228,9 @@ fn read_plugin_table(table: &toml::Table, loaded: &mut LoadedConfig) {
     loaded.view = ReviewViewConfig::from_plugin_table(table);
     let (conversation, problem) = conversation::ConversationConfig::from_plugin_table(table);
     loaded.conversation = conversation;
+    loaded.diagnostics.extend(problem);
+    let (compare, problem) = compare::CompareConfig::from_plugin_table(table);
+    loaded.compare = compare;
     loaded.diagnostics.extend(problem);
     if let Some(stack) = table.get("stack") {
         match stack.clone().try_into::<ReviewStackLimit>() {

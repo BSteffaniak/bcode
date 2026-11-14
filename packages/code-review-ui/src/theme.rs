@@ -132,6 +132,26 @@ pub struct Icons {
     pub new: &'static str,
     /// Gutter bar of a line new since a comparison's baseline (one cell wide).
     pub since_bar: &'static str,
+    /// A layer changed since a comparison's baseline.
+    pub since_changed: &'static str,
+    /// A layer only rebased since the baseline.
+    pub since_rebased: &'static str,
+    /// A layer at the same version as the baseline.
+    pub since_unchanged: &'static str,
+    /// A layer the reviewer never looked at.
+    pub since_new_to_you: &'static str,
+    /// A layer whose rebase could not be taken out.
+    pub since_with_rebase: &'static str,
+    /// A layer whose baseline commits are gone.
+    pub since_unavailable: &'static str,
+    /// A push of the stack on the push timeline that only rebased layers.
+    pub tick: &'static str,
+    /// A push of the stack that changed some layer's own change.
+    pub tick_changed: &'static str,
+    /// Steps to an earlier version.
+    pub step_back: &'static str,
+    /// Steps to a later version.
+    pub step_forward: &'static str,
     /// The upper half of a cell: a card's bottom edge.
     pub half_upper: &'static str,
     /// The lower half of a cell: the lip of the next card.
@@ -180,6 +200,16 @@ impl Icons {
         external: "↗",
         new: "•",
         since_bar: "▎",
+        since_changed: "●",
+        since_rebased: "○",
+        since_unchanged: "✓",
+        since_new_to_you: "+",
+        since_with_rebase: "≈",
+        since_unavailable: "?",
+        tick: "│",
+        tick_changed: "┃",
+        step_back: "◂",
+        step_forward: "▸",
         half_upper: "▀",
         half_lower: "▄",
         file_rule: "─",
@@ -223,6 +253,16 @@ impl Icons {
         external: "->",
         new: "*",
         since_bar: "|",
+        since_changed: "*",
+        since_rebased: "o",
+        since_unchanged: "=",
+        since_new_to_you: "+",
+        since_with_rebase: "~",
+        since_unavailable: "?",
+        tick: "|",
+        tick_changed: "#",
+        step_back: "<",
+        step_forward: ">",
         half_upper: "-",
         half_lower: "-",
         file_rule: "-",

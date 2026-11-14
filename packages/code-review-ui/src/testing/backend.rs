@@ -89,6 +89,13 @@ impl TestBackend {
         self
     }
 
+    /// Use `config` for comparisons with earlier versions.
+    #[must_use]
+    pub fn with_compare_config(mut self, config: crate::config::compare::CompareConfig) -> Self {
+        self.services = self.services.with_compare(config);
+        self
+    }
+
     /// Use `limit` for stacks.
     #[must_use]
     pub fn with_stack_limit(mut self, limit: bcode_code_review_models::ReviewStackLimit) -> Self {

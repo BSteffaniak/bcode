@@ -32,6 +32,10 @@ pub enum Modal {
     Import(ImportFlow),
     /// The stack's history.
     History(super::super::history::HistoryPanel),
+    /// Choosing what pull requests are compared with.
+    Compare(crate::compare_menu::CompareMenu),
+    /// Choosing two versions of one pull request.
+    Versions(crate::compare_menu::VersionPicker),
 }
 
 impl ReviewSurface {
@@ -564,6 +568,15 @@ impl ReviewSurface {
                 let outcome = panel.key(stroke);
                 self.history_outcome(outcome, host)
             }
+            Some(Modal::Compare(menu)) => {
+                let outcome = menu.key(stroke);
+                self.compare_menu_outcome(outcome, host)
+            }
+            Some(Modal::Versions(picker)) => {
+                let number = picker.number();
+                let outcome = picker.key(stroke, &theme);
+                self.version_outcome(outcome, number, host)
+            }
             None => Action::None,
         }
     }
@@ -579,7 +592,7 @@ impl ReviewSurface {
                 let outcome = flow.paste(text);
                 self.import_outcome(outcome, host)
             }
-            Some(Modal::History(_)) | None => Action::None,
+            Some(Modal::History(_) | Modal::Compare(_) | Modal::Versions(_)) | None => Action::None,
         }
     }
 
@@ -594,6 +607,15 @@ impl ReviewSurface {
             Some(Modal::Import(flow)) => {
                 let outcome = flow.mouse(event, &theme);
                 self.import_outcome(outcome, host)
+            }
+            Some(Modal::Compare(menu)) => {
+                let outcome = menu.mouse(event, &theme);
+                self.compare_menu_outcome(outcome, host)
+            }
+            Some(Modal::Versions(picker)) => {
+                let number = picker.number();
+                let outcome = picker.mouse(event, &theme);
+                self.version_outcome(outcome, number, host)
             }
             Some(Modal::History(_)) | None => Action::None,
         }
