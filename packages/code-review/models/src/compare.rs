@@ -21,6 +21,11 @@ pub const OP_REVIEW_VERSIONS_KEEP: &str = "review.versions.keep";
 /// force push drops them from their branch.
 pub const VERSION_REF_NAMESPACE: &str = "refs/bcode-review/version";
 
+/// Reference namespace under which the heads of looks are kept (apart from
+/// [`VERSION_REF_NAMESPACE`], which fetched versions use, so releasing a pruned look never drops
+/// a fetched version's ref).
+pub const LOOK_REF_NAMESPACE: &str = "refs/bcode-review/looked";
+
 /// Most distinct heads whose looks are kept per pull request; older heads are pruned.
 pub const MAX_LOOK_HEADS_PER_PULL: usize = 32;
 
@@ -399,7 +404,7 @@ pub struct ReviewCompareMarksResponse {
 pub struct ReviewVersionsKeepRequest {
     /// Absolute repository path.
     pub repo_path: PathBuf,
-    /// Commits to keep under [`VERSION_REF_NAMESPACE`] (those missing locally are skipped).
+    /// Commits to keep under [`LOOK_REF_NAMESPACE`] (those missing locally are skipped).
     pub keep: Vec<String>,
     /// Commits to stop keeping.
     #[serde(default)]

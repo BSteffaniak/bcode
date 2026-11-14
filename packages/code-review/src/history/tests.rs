@@ -538,7 +538,7 @@ mod deltas {
             0,
             &["for-each-ref", "--format=%(refname)", "refs/bcode-review"],
         );
-        assert_eq!(refs, format!("refs/bcode-review/version/{}", heads[0][0]));
+        assert_eq!(refs, format!("refs/bcode-review/looked/{}", heads[0][0]));
         assert_eq!(
             keep_versions(&repo.root, &[], &[heads[0][0].clone()]).expect("release"),
             (0, 1)
@@ -548,5 +548,21 @@ mod deltas {
             &["for-each-ref", "--format=%(refname)", "refs/bcode-review"],
         );
         assert_eq!(refs, "");
+    }
+
+    #[test]
+    fn releasing_a_looked_head_keeps_the_ref_a_fetched_version_has() {
+        let (repo, heads) = restacked();
+        let head = heads[0][0].clone();
+        // A fetched version's ref, as the forge history writes it.
+        let fetched = format!("refs/bcode-review/version/{head}");
+        repo.git(0, &["update-ref", &fetched, &head]);
+        keep_versions(&repo.root, std::slice::from_ref(&head), &[]).expect("keep");
+        keep_versions(&repo.root, &[], &[head]).expect("release");
+        let refs = repo.git(
+            0,
+            &["for-each-ref", "--format=%(refname)", "refs/bcode-review"],
+        );
+        assert_eq!(refs, fetched);
     }
 }

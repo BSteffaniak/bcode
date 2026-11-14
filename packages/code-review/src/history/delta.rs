@@ -14,8 +14,8 @@ use crate::cache::{CacheKind, ReviewCache};
 use crate::data::DataError;
 use crate::data::git;
 use bcode_code_review_models::{
-    DeltaFile, DeltaKind, FileSince, LayerDelta, LayerPair, LineSpan, REVIEW_COMPARE_MAX_LAYERS,
-    RemovedSince, ReviewCompareMarksRequest, ReviewCompareMarksResponse, VERSION_REF_NAMESPACE,
+    DeltaFile, DeltaKind, FileSince, LOOK_REF_NAMESPACE, LayerDelta, LayerPair, LineSpan,
+    REVIEW_COMPARE_MAX_LAYERS, RemovedSince, ReviewCompareMarksRequest, ReviewCompareMarksResponse,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -581,8 +581,10 @@ fn marks_from(since: &[ZeroHunk], before: &[ZeroHunk]) -> ReviewCompareMarksResp
     answer
 }
 
-/// Keep `keep`'s commits (those present) under [`VERSION_REF_NAMESPACE`] and drop the refs of
-/// `release`, in one `git update-ref --stdin`. Returns how many refs were written and removed.
+/// Keep `keep`'s commits (those present) under [`LOOK_REF_NAMESPACE`] and drop the refs of
+/// `release` there, in one `git update-ref --stdin`.
+///
+/// Refs of fetched versions (another namespace) are never touched. Returns how many refs were written and removed.
 ///
 /// # Errors
 ///
@@ -604,10 +606,10 @@ pub fn keep_versions(
         .collect();
     let mut input = String::new();
     for oid in &present {
-        let _ = writeln!(input, "update {VERSION_REF_NAMESPACE}/{oid} {oid}");
+        let _ = writeln!(input, "update {LOOK_REF_NAMESPACE}/{oid} {oid}");
     }
     for oid in &release {
-        let _ = writeln!(input, "delete {VERSION_REF_NAMESPACE}/{oid}");
+        let _ = writeln!(input, "delete {LOOK_REF_NAMESPACE}/{oid}");
     }
     if input.is_empty() {
         return Ok((0, 0));
