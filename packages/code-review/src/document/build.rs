@@ -476,8 +476,11 @@ impl ReviewDocument {
                 }
                 return;
             };
-            // Showing only what changed, old-side lines are the baseline's, not the anchor's.
-            if shows_changes && lines.end_side == ReviewLineSide::Old {
+            // Showing only what changed, old-side lines are the baseline's, not the anchor's;
+            // showing an older version, no line is the anchor's.
+            if (shows_changes && lines.end_side == ReviewLineSide::Old)
+                || state.content_head.is_some()
+            {
                 if let Emit::Annotation(index, _) = emit {
                     slots
                         .file_level

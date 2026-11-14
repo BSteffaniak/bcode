@@ -253,9 +253,14 @@ impl ReviewSurface {
             }
             self.comparing.pairs.insert(source_id.clone(), pair.clone());
             if let Some(review) = self.review.as_mut() {
-                review
-                    .doc
-                    .set_comparison(&source_id, Some(GroupComparison { delta: None, view }));
+                review.doc.set_comparison(
+                    &source_id,
+                    Some(GroupComparison {
+                        delta: None,
+                        view,
+                        ..GroupComparison::default()
+                    }),
+                );
             }
             if !asked.contains(&pair) {
                 asked.push(pair);
@@ -326,6 +331,7 @@ impl ReviewSurface {
                         Some(GroupComparison {
                             delta: Some(delta.clone()),
                             view,
+                            ..GroupComparison::default()
                         }),
                     );
                 }

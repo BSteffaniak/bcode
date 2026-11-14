@@ -14,15 +14,23 @@ use bcode_code_review_models::{
     DeltaKind, FileSince, LayerDelta, LineSpan, RemovedSince, ReviewCompareMarksRequest,
     ReviewCompareMarksResponse,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// One source's comparison.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GroupComparison {
     /// What the layer's comparison found; `None` while it computes.
     pub delta: Option<LayerDelta>,
     /// How the source's files show.
     pub view: CompareView,
+    /// Whether the comparison ends at an older version than the one the source shows: its
+    /// changed files show only what changed (diffed to that version) and take no comments.
+    pub historical: bool,
+    /// Comparisons of single files that replace the source's for those files (a file stepped
+    /// to another pair of versions), by path. One whose version is not the source's head is
+    /// historical for that file.
+    pub files: BTreeMap<String, LayerDelta>,
 }
 
 /// One file's lines new since the baseline.
@@ -69,9 +77,18 @@ impl ReviewDocument {
             return false;
         }
         let replay_of = |comparison: Option<&GroupComparison>| {
-            comparison
-                .and_then(|comparison| comparison.delta.as_ref())
-                .map(|delta| (delta.replay_oid.clone(), delta.pair.to.head_oid.clone()))
+            comparison.map(|comparison| {
+                let of =
+                    |delta: &LayerDelta| (delta.replay_oid.clone(), delta.pair.to.head_oid.clone());
+                (
+                    comparison.delta.as_ref().map(of),
+                    comparison
+                        .files
+                        .iter()
+                        .map(|(path, delta)| (path.clone(), of(delta)))
+                        .collect::<Vec<_>>(),
+                )
+            })
         };
         let marks_stale =
             replay_of(self.comparisons.get(source_id)) != replay_of(comparison.as_ref());
@@ -111,6 +128,44 @@ impl ReviewDocument {
     #[must_use]
     pub fn file_since(&self, file: &FileKey) -> Option<FileSince> {
         self.since_of(*self.file_index.get(file)?)
+    }
+
+    /// Compare file `file` alone with `delta` (`None`: as its source is compared again), as
+    /// when stepping through the file's versions. Returns whether anything changed.
+    pub fn set_file_comparison(&mut self, file: &FileKey, delta: Option<LayerDelta>) -> bool {
+        let Some(&index) = self.file_index.get(file) else {
+            return false;
+        };
+        let source_id = self.groups[self.files[index].group]
+            .source
+            .source_id
+            .clone();
+        let path = self.files[index].entry.path.clone();
+        let Some(comparison) = self.comparisons.get_mut(&source_id) else {
+            return false;
+        };
+        let changed = match delta {
+            Some(delta) => comparison.files.insert(path, delta.clone()) != Some(delta),
+            None => comparison.files.remove(&path).is_some(),
+        };
+        if changed {
+            if let MarksState::Pending(ticket) = self.files[index].marks {
+                self.pending.remove(&ticket);
+            }
+            self.files[index].marks = MarksState::Missing;
+            let resident = !matches!(self.files[index].content, super::review::Content::Unloaded);
+            if resident
+                && (self.files[index].content_base != self.changes_base(index)
+                    || self.files[index].content_head != self.changes_head(index))
+            {
+                self.unload(index);
+            } else {
+                self.rebuild_file(index);
+            }
+            let block = self.groups[self.files[index].group].header_block;
+            self.rebuild_block(block);
+        }
+        changed
     }
 
     /// Show (or hide again) the files a comparison hides in source `source_id`: its unchanged
@@ -194,7 +249,10 @@ impl ReviewDocument {
                 }
                 let resident =
                     !matches!(self.files[file].content, super::review::Content::Unloaded);
-                if resident && self.files[file].content_base != self.changes_base(file) {
+                if resident
+                    && (self.files[file].content_base != self.changes_base(file)
+                        || self.files[file].content_head != self.changes_head(file))
+                {
                     self.unload(file);
                 } else {
                     self.rebuild_file(file);
@@ -208,26 +266,85 @@ impl ReviewDocument {
         self.comparisons.get(&self.groups[group].source.source_id)
     }
 
-    /// The delta of `group`'s comparison when it describes the revisions the group shows.
+    /// The delta of `group`'s comparison when it describes the revisions the group shows (or,
+    /// for a historical comparison, an older version on purpose).
     fn current_delta(&self, group: usize) -> Option<&LayerDelta> {
-        let delta = self.group_comparison(group)?.delta.as_ref()?;
+        let comparison = self.group_comparison(group)?;
+        let delta = comparison.delta.as_ref()?;
         let head = self.groups[group].source.head.commit_oid();
-        (head.is_none_or(|head| head == delta.pair.to.head_oid)).then_some(delta)
+        (comparison.historical || head.is_none_or(|head| head == delta.pair.to.head_oid))
+            .then_some(delta)
+    }
+
+    /// The delta file `file` shows: its own override, else its source's.
+    fn file_delta(&self, file: usize) -> Option<&LayerDelta> {
+        let group = self.files[file].group;
+        let comparison = self.group_comparison(group)?;
+        comparison
+            .files
+            .get(&self.files[file].entry.path)
+            .or_else(|| self.current_delta(group))
+    }
+
+    /// Whether file `file` is compared up to an older version than its source shows.
+    pub(super) fn historical(&self, file: usize) -> bool {
+        let group = self.files[file].group;
+        let Some(comparison) = self.group_comparison(group) else {
+            return false;
+        };
+        let whole = comparison.historical && comparison.delta.is_some();
+        comparison
+            .files
+            .get(&self.files[file].entry.path)
+            .map_or(whole, |delta| {
+                self.groups[group]
+                    .source
+                    .head
+                    .commit_oid()
+                    .is_some_and(|head| head != delta.pair.to.head_oid)
+            })
+    }
+
+    /// How file `file` shows: an older version always shows only what changed.
+    fn file_view(&self, file: usize) -> Option<CompareView> {
+        let comparison = self.group_comparison(self.files[file].group)?;
+        Some(if self.historical(file) {
+            CompareView::Changes
+        } else {
+            comparison.view
+        })
+    }
+
+    /// Whether `file` is compared up to an older version than its source shows (its lines are
+    /// that version's, read-only).
+    #[must_use]
+    pub fn file_is_historical(&self, file: &FileKey) -> bool {
+        self.file_index
+            .get(file)
+            .is_some_and(|index| self.historical(*index))
+    }
+
+    /// The override comparison of `file`, when it was stepped to another pair of versions.
+    #[must_use]
+    pub fn file_override(&self, file: &FileKey) -> Option<&LayerDelta> {
+        let index = *self.file_index.get(file)?;
+        self.group_comparison(self.files[index].group)?
+            .files
+            .get(&self.files[index].entry.path)
     }
 
     /// How file `file` changed since its source's baseline.
     pub(super) fn since_of(&self, file: usize) -> Option<FileSince> {
         let group = self.files[file].group;
         let comparison = self.group_comparison(group)?;
-        if comparison.delta.is_none() {
+        let path = &self.files[file].entry.path;
+        if comparison.delta.is_none() && !comparison.files.contains_key(path) {
             return Some(FileSince::Unknown);
         }
-        let delta = self.current_delta(group)?;
+        let delta = self.file_delta(file)?;
         match delta.kind {
             DeltaKind::Unchanged | DeltaKind::RebasedOnly => Some(FileSince::Unchanged),
-            DeltaKind::Changed | DeltaKind::WithRebase => {
-                Some(delta.file(&self.files[file].entry.path))
-            }
+            DeltaKind::Changed | DeltaKind::WithRebase => Some(delta.file(path)),
             DeltaKind::NewToYou | DeltaKind::Unavailable => None,
         }
     }
@@ -255,29 +372,42 @@ impl ReviewDocument {
     /// Whether the comparison would hide file `file` (before "show files").
     fn hidden_by_comparison(&self, file: usize) -> bool {
         let group = self.files[file].group;
-        let (Some(comparison), Some(delta)) =
-            (self.group_comparison(group), self.current_delta(group))
-        else {
+        let Some(comparison) = self.group_comparison(group) else {
+            return false;
+        };
+        if comparison.files.contains_key(&self.files[file].entry.path) {
+            // A stepped file is shown: it is the one being looked at.
+            return false;
+        }
+        let Some(delta) = self.current_delta(group) else {
             return false;
         };
         delta.kind == DeltaKind::RebasedOnly
-            || (comparison.view == CompareView::Changes && self.unchanged_since(file))
+            || (self.file_view(file) == Some(CompareView::Changes) && self.unchanged_since(file))
     }
 
     /// The commit file `file`'s hunks are diffed from in the changes view, when it is shown
     /// there.
     pub(super) fn changes_base(&self, file: usize) -> Option<String> {
-        let group = self.files[file].group;
-        if self.group_comparison(group)?.view != CompareView::Changes {
+        if self.file_view(file)? != CompareView::Changes {
             return None;
         }
-        let delta = self.current_delta(group)?;
+        let delta = self.file_delta(file)?;
         if !matches!(delta.kind, DeltaKind::Changed | DeltaKind::WithRebase) {
             return None;
         }
         self.since_of(file)
             .filter(|since| since.changed())
             .and_then(|_| delta.replay_oid.clone())
+    }
+
+    /// The commit file `file`'s hunks are diffed to, when it shows an older version.
+    pub(super) fn changes_head(&self, file: usize) -> Option<String> {
+        if !self.historical(file) {
+            return None;
+        }
+        self.changes_base(file)?;
+        Some(self.file_delta(file)?.pair.to.head_oid.clone())
     }
 
     /// Whether file `file`'s resident content shows only what changed (diffed from a replay).
@@ -314,10 +444,10 @@ impl ReviewDocument {
             return None;
         }
         let group = state.group;
-        if self.group_comparison(group)?.view != CompareView::Full {
+        if self.file_view(file)? != CompareView::Full {
             return None;
         }
-        let delta = self.current_delta(group)?;
+        let delta = self.file_delta(file)?;
         if delta.kind != DeltaKind::Changed || !self.since_of(file)?.changed() {
             return None;
         }

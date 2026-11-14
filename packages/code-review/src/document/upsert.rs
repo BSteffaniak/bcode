@@ -152,6 +152,7 @@ impl ReviewDocument {
             state.resident_bytes = old.resident_bytes;
             state.marks = old.marks;
             state.content_base = old.content_base;
+            state.content_head = old.content_head;
             moved.insert(old_index, new_index);
         }
         rebuilt.pending = std::mem::take(&mut self.pending)

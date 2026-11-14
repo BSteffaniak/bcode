@@ -121,6 +121,10 @@ fn layer() -> Layer {
 }
 
 fn open(service: &ReviewData, layer: &Layer) -> ReviewDocument {
+    open_at(service, layer, &layer.second)
+}
+
+fn open_at(service: &ReviewData, layer: &Layer, head: &str) -> ReviewDocument {
     let repo = layer.repo.root.as_path();
     let resolved: Vec<ResolvedSource> = service
         .resolve_sources(&ResolveReviewSourcesRequest {
@@ -130,7 +134,7 @@ fn open(service: &ReviewData, layer: &Layer) -> ReviewDocument {
                 label: "PR".into(),
                 kind: ReviewSourceKind::CommitRange {
                     base: layer.fork.clone(),
-                    head: layer.second.clone(),
+                    head: head.to_owned(),
                     merge_base: false,
                 },
                 included: true,
@@ -161,6 +165,10 @@ fn open(service: &ReviewData, layer: &Layer) -> ReviewDocument {
 }
 
 fn delta(service: &ReviewData, layer: &Layer) -> LayerDelta {
+    delta_between(service, layer, &layer.first, &layer.second)
+}
+
+fn delta_between(service: &ReviewData, layer: &Layer, from: &str, to: &str) -> LayerDelta {
     let point = |head: &str| VersionPoint {
         head_oid: head.to_owned(),
         fork_oid: Some(layer.fork.clone()),
@@ -170,8 +178,8 @@ fn delta(service: &ReviewData, layer: &Layer) -> LayerDelta {
             repo_path: layer.repo.root.clone(),
             pairs: vec![LayerPair {
                 number: 7,
-                from: Some(point(&layer.first)),
-                to: point(&layer.second),
+                from: Some(point(from)),
+                to: point(to),
             }],
         })
         .expect("compare")
@@ -294,6 +302,7 @@ fn the_full_view_marks_what_is_new_and_folds_what_was_viewed_and_is_unchanged() 
         Some(GroupComparison {
             delta: Some(delta),
             view: CompareView::Full,
+            ..GroupComparison::default()
         }),
     ));
     serve(&service, &mut doc);
@@ -399,6 +408,7 @@ fn switching_views_keeps_keys_viewed_progress_threads_and_the_cursor_line() {
         Some(GroupComparison {
             delta: Some(delta),
             view: CompareView::Full,
+            ..GroupComparison::default()
         }),
     );
     serve(&service, &mut doc);
@@ -488,6 +498,7 @@ fn a_layer_only_rebased_collapses_to_its_summary_until_its_files_are_shown() {
         Some(GroupComparison {
             delta: Some(rebased),
             view: CompareView::Full,
+            ..GroupComparison::default()
         }),
     );
     assert_eq!(shown(&doc), []);
@@ -508,4 +519,142 @@ fn a_layer_only_rebased_collapses_to_its_summary_until_its_files_are_shown() {
             .iter()
             .any(|item| matches!(item, ReviewItem::CompareNote(_)))
     );
+}
+
+/// A third version on the same fork point: the second with `a25` rewritten.
+fn third(layer: &Layer) -> String {
+    let a = numbered("a", 30)
+        .replace("a20\n", "a20 again\n")
+        .replace("a25\n", "a25 third\n");
+    layer.repo.commit(&[("a.txt", &a)], "third")
+}
+
+/// Every line text of `path` shown.
+fn texts(doc: &ReviewDocument, path: &str) -> Vec<String> {
+    items(doc)
+        .iter()
+        .filter_map(|item| match item {
+            ReviewItem::Line(line) if line.file.path == path => {
+                line.content.text().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_historical_comparison_shows_an_older_version_read_only_and_restores_exactly() {
+    let layer = layer();
+    let third = third(&layer);
+    let service = ReviewData::default();
+    let mut doc = open_at(&service, &layer, &third);
+    serve(&service, &mut doc);
+    // A draft on a current line of a.txt.
+    let line = ItemKey::Line {
+        file: file("a.txt").into(),
+        side: ReviewLineSide::New,
+        line: 25,
+    };
+    let anchor = doc.anchor_for(&line).expect("anchor");
+    doc.set_annotations(&Annotations {
+        drafts: vec![draft("t1", &anchor)],
+        ..Annotations::default()
+    });
+    let keys: Vec<_> = doc.file_keys().cloned().collect();
+    // From the first version to the second, while the review shows the third.
+    doc.set_comparison(
+        SOURCE,
+        Some(GroupComparison {
+            delta: Some(delta(&service, &layer)),
+            view: CompareView::Full,
+            historical: true,
+            ..GroupComparison::default()
+        }),
+    );
+    serve(&service, &mut doc);
+    assert!(doc.file_is_historical(&file("a.txt")));
+    assert!(doc.file_shows_changes(&file("a.txt")));
+    // The second version's lines, not the third's.
+    let shown_text = texts(&doc, "a.txt");
+    assert!(
+        shown_text.iter().any(|text| text == "a20 again"),
+        "{shown_text:?}"
+    );
+    assert!(
+        !shown_text.iter().any(|text| text == "a25 third"),
+        "{shown_text:?}"
+    );
+    // Unchanged between the two versions: behind the summary.
+    assert_eq!(
+        shown(&doc),
+        [("a.txt".to_owned(), false), ("d.txt".to_owned(), false)]
+    );
+    // The draft is on the current code: it shows at its file, not on an older line.
+    let index = doc
+        .index_of(&ItemKey::Thread {
+            thread_id: "t1".into(),
+        })
+        .expect("thread shown");
+    let ReviewItem::Thread(thread) = doc.item(index).expect("item") else {
+        panic!("not a thread");
+    };
+    assert_eq!(thread.placement, AnchorPlacement::File);
+    // Off again: the third version, every file, the draft on its line.
+    doc.set_comparison(SOURCE, None);
+    serve(&service, &mut doc);
+    assert!(!doc.file_is_historical(&file("a.txt")));
+    assert!(texts(&doc, "a.txt").iter().any(|text| text == "a25 third"));
+    assert_eq!(doc.file_keys().cloned().collect::<Vec<_>>(), keys);
+    let index = doc
+        .index_of(&ItemKey::Thread {
+            thread_id: "t1".into(),
+        })
+        .expect("thread shown");
+    let ReviewItem::Thread(thread) = doc.item(index).expect("item") else {
+        panic!("not a thread");
+    };
+    assert_eq!(thread.placement, AnchorPlacement::Line);
+    crate::testing::document::assert_consistent(&doc, "after a historical comparison");
+}
+
+#[test]
+fn stepping_one_file_to_other_versions_overrides_only_that_file() {
+    let layer = layer();
+    let third = third(&layer);
+    let service = ReviewData::default();
+    let mut doc = open_at(&service, &layer, &third);
+    serve(&service, &mut doc);
+    doc.set_comparison(
+        SOURCE,
+        Some(GroupComparison {
+            delta: Some(delta_between(&service, &layer, &layer.second, &third)),
+            view: CompareView::Changes,
+            ..GroupComparison::default()
+        }),
+    );
+    serve(&service, &mut doc);
+    // Second to third: only a.txt changed, by a25.
+    assert_eq!(shown(&doc), [("a.txt".to_owned(), false)]);
+    assert!(texts(&doc, "a.txt").iter().any(|text| text == "a25 third"));
+    // a.txt stepped back to the first pair: the second version's change, read-only.
+    assert!(doc.set_file_comparison(&file("a.txt"), Some(delta(&service, &layer))));
+    serve(&service, &mut doc);
+    assert!(doc.file_override(&file("a.txt")).is_some());
+    assert!(doc.file_is_historical(&file("a.txt")));
+    let stepped = texts(&doc, "a.txt");
+    assert!(
+        stepped.iter().any(|text| text == "a20 again"),
+        "{stepped:?}"
+    );
+    assert!(
+        !stepped.iter().any(|text| text == "a25 third"),
+        "{stepped:?}"
+    );
+    assert!(!doc.file_is_historical(&file("b.txt")));
+    // Cleared: back to the source's comparison.
+    assert!(doc.set_file_comparison(&file("a.txt"), None));
+    serve(&service, &mut doc);
+    assert!(!doc.file_is_historical(&file("a.txt")));
+    assert!(texts(&doc, "a.txt").iter().any(|text| text == "a25 third"));
+    crate::testing::document::assert_consistent(&doc, "after stepping a file");
 }

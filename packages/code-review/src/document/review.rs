@@ -322,6 +322,9 @@ pub(super) struct FileState {
     /// The commit the resident content was diffed from, when it is not the source's base (the
     /// "only what changed" view of a comparison).
     pub content_base: Option<String>,
+    /// The commit the resident content was diffed to, when it is not the source's head (an
+    /// older version shown by a historical comparison).
+    pub content_head: Option<String>,
     /// Whether only the file's header shows: by hand, or by its viewed mark.
     pub fold: FileFold,
 }
@@ -739,6 +742,7 @@ impl ReviewDocument {
                 resident_bytes: 0,
                 marks: MarksState::Missing,
                 content_base: None,
+                content_head: None,
                 fold: FileFold::Auto,
             });
             self.blocks.push(Block::new(BlockKind::File(index)));
@@ -1175,6 +1179,10 @@ impl ReviewDocument {
             state.marks = MarksState::Missing;
         }
         state.content_base = None;
+        if state.content_head.take().is_some() {
+            // The count was the older version's.
+            state.line_count = None;
+        }
         self.pending.retain(|_, pending| match pending {
             Pending::Blob { file: owner, .. } => *owner != file,
             Pending::Hunks(_) | Pending::Attribution(_) | Pending::Marks(_) => true,
@@ -1241,9 +1249,13 @@ impl ReviewDocument {
                     || self.resident_bytes < self.config.residency_budget_bytes)
             {
                 let changes_base = self.changes_base(file);
+                let changes_head = self.changes_head(file);
                 let mut source = group.source.clone();
                 if let Some(base) = &changes_base {
                     source.base = RevisionRef::commit(base);
+                }
+                if let Some(head) = &changes_head {
+                    source.head = RevisionRef::commit(head);
                 }
                 let request = ReviewFileHunksRequest {
                     repo_path: self.repo_path.clone(),
@@ -1257,6 +1269,7 @@ impl ReviewDocument {
                 let ticket = self.ticket(Pending::Hunks(file));
                 self.files[file].content = Content::Loading(ticket);
                 self.files[file].content_base = changes_base;
+                self.files[file].content_head = changes_head;
                 self.rebuild_file(file);
                 needs.push(DocumentNeed::Hunks {
                     ticket,
@@ -1382,6 +1395,13 @@ impl ReviewDocument {
     fn blob_selector(&self, file: usize) -> Option<ReviewBlobSelector> {
         let state = &self.files[file];
         let source = &self.groups[state.group].source;
+        if let (Some(head), ReviewLineSide::New) = (&state.content_head, state.context_side()) {
+            // An older version's lines: read from that commit, not the entry's blob.
+            return Some(ReviewBlobSelector::Revision {
+                revision: RevisionRef::commit(head),
+                path: state.entry.path.clone(),
+            });
+        }
         let (blob, revision, path) = match state.context_side() {
             ReviewLineSide::New => (&state.entry.new_blob, &source.head, &state.entry.path),
             ReviewLineSide::Old => (
@@ -1441,7 +1461,7 @@ impl ReviewDocument {
         let side = state.context_side();
         // Diffed from a comparison's replay, the old side is not the entry's: a line count is
         // derived only where both sides exist.
-        let replayed = state.content_base.is_some();
+        let replayed = state.content_base.is_some() || state.content_head.is_some();
         let derived = if response.truncated.is_some()
             || response.binary
             || (replayed && !state.other_side_exists())
@@ -1466,7 +1486,8 @@ impl ReviewDocument {
             },
             ReviewBlobRef::Object { .. }
         );
-        if derived.is_some() || !pinned {
+        // An older version's count is not the entry's.
+        if derived.is_some() || !pinned || state.content_head.is_some() {
             state.line_count = derived;
         }
         // The patch id fingerprints the file's own diff for its viewed mark; a comparison's
