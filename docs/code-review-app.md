@@ -325,10 +325,12 @@ from, one notice names the closed layers. Failures name sources by their labels.
 
 ### Changes since you looked
 
-A review that steps through pull requests compares each one, in place, with an earlier version
-(see [review-stack-history.md](review-stack-history.md)). Every comparison happens on the same
-review screen: nothing opens another review, and viewed marks, comments, AI asks, search and
-navigation work the same with or without one.
+A review compares each pull request (a stack layer stepped through, or a single pull request),
+in place, with an earlier version (see [review-stack-history.md](review-stack-history.md)).
+Other sources showing a diff between two commits (a branch, a range, a whole stack) are compared
+with the review's last completed pass the same way. Every comparison happens on the same review
+screen: nothing opens another review, and viewed marks, comments, AI asks, search and navigation
+work the same with or without one.
 
 * **The default is the version you last looked at.** Marking a file viewed, commenting, asking
   the AI, completing the pass (`shift+m`), your own reviews on the forge, and (when nothing
@@ -339,8 +341,9 @@ navigation work the same with or without one.
   some pull request's own change, `│` one that only rebased; `[`/`]` around the pushes compared)
   and when the last push was. While layers are compared it says how far it got ("comparing 6 of
   21…"). It narrows to `Since: last looked ▾` and `Δ▾`; pushes share ticks when cells are few.
-* **A review that moved since you looked** reopens comparing, with a banner: what changed, and
-  **Only what changed** (`shift+l`), **Compare with…** (`b`) and **Dismiss**.
+* **A review that moved since you looked** reopens comparing with what you last looked at (even
+  when another choice was saved), with a banner: what changed, and **Only what changed**
+  (`shift+l`), **Compare with…** (`b`) and **Dismiss**.
 * **`b`** (or a click on the control) chooses what to compare with: *You last looked*, *Previous
   push*, *A push…* (the timeline takes the keys: `←`/`→`, `f` from, `t` to, `enter`, `esc`; a
   click on a tick compares from before it, with `shift` up to after it), *A version of this pull
@@ -362,9 +365,9 @@ navigation work the same with or without one.
   `?` (the baseline's commits are gone), `⋯` (still comparing). *Only pull requests with real
   changes* folds the others into one `+N ○` tab (a click shows them again), and `.`/`,` skip them.
 * **A file's versions.** Once the current pull request's versions are compared with each other,
-  a file header says `changed in 2 of 4 pushes · v4 ◂ ▸`; `alt+[` and `alt+]` (or the arrows) step
-  that file alone to the previous or next push that changed it (read-only), and past the newest
-  back to the pull request's comparison.
+  a file header says `changed in 2 of 4 pushes · v4 ◂ ▸`; `alt+,` and `alt+.` (or the arrows;
+  `alt+[`/`alt+]` where the terminal reports them) step that file alone to the previous or next
+  push that changed it (read-only), and past the newest back to the pull request's comparison.
 * **The history matrix** (`shift+b`) compares in place too: `enter` the cursor's pull request
   with its version before, `p` the pushes between the pin (`f`) and the cursor, `s` everything
   since the cursor's column, `a` the stack as it was then, `r` since you last looked, `i` only
@@ -579,8 +582,8 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | palette only | Compare: with what you last looked at |
 | palette only | Compare versions of this pull request… |
 | palette only | Compare pushes of the stack… |
-| `alt+[` | This file's previous version (in a comparison) |
-| `alt+]` | This file's next version (in a comparison) |
+| `alt+,`, `alt+[` | This file's previous version (in a comparison) |
+| `alt+.`, `alt+]` | This file's next version (in a comparison) |
 | `shift+m` | Mark the review pass complete |
 | `enter` | Actions of the thread or AI answer (reveals a gap) |
 | `z` | Fold or open the thread or AI answer (its More shows a whole answer) |

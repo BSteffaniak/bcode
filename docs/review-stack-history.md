@@ -25,9 +25,10 @@ moved underneath*, at every level: stack, pull request, file, and line.
 * **Bounded work.** Opening a changed stack costs a bounded, batched, cached amount of git work,
   with progress shown, and never recomputes the whole stack on a keystroke.
 
-Comparisons apply to every review whose sources are pull requests: single pull requests, stack
-layers stepped through, and whole-stack sources. Reviews of local branches and commits have no
-version history and show no comparison control.
+Comparisons apply to every review whose sources are pull requests: single pull requests and
+stack layers stepped through. Other sources showing a diff between two commits (local branches,
+ranges, whole-stack sources) have no version history; they are compared with the review's last
+completed pass, in place, by the same engine.
 
 ## The model
 
@@ -84,9 +85,10 @@ A **look** records that the reviewer saw a specific version of a pull request.
     conversation; no extra call).
   * `opened`: the layer was the current layer, with the screen focused, for
     `compare.dwell_seconds` (default 8). Recorded at most once per head per session.
-* **Keeping commits:** recording a look also pins its head under
-  `refs/bcode-review/version/<oid>` (the namespace fetched versions already use), so the baseline
-  survives garbage collection after a force push. Pruned looks drop their refs.
+* **Keeping commits:** recording a look (seeded ones included) also pins its head under
+  `refs/bcode-review/looked/<oid>`, so the baseline survives garbage collection after a force
+  push. Pruned looks drop their refs there; fetched versions keep theirs under
+  `refs/bcode-review/version/<oid>`, which releasing a look never touches.
 * **Migration:** the table is created by an ordinary store migration. Existing data is seeded
   idempotently when a review opens: each source's `reviewed_revisions` entry for a pull request
   or stack layer becomes a `pass` look at `recorded_at_ms`, and forge reviews by the viewer
@@ -264,8 +266,11 @@ Changes since: [you last looked · 2d ago ▾]   3 of 21 PRs changed · 18 rebas
   review with nothing new since the baseline shows no banner and the control reads "Changes
   since: you last looked · nothing new".
 * The choice of baseline (not the computed result) is kept in the workspace's presentation
-  state, so reopening keeps "previous push" or a fixed time; *last looked* re-resolves on each
-  open.
+  state, so reopening keeps "previous push", a fixed time, or *full change* while nothing moved;
+  *last looked* re-resolves on each open. When some layer moved since the reviewer last looked,
+  the reopened review starts with *you last looked* and the banner instead (the saved choice is
+  one key away). Versions picked for single pull requests and *the stack as it was* are for the
+  session and are not saved.
 
 ## Arbitrary comparisons
 
@@ -349,7 +354,7 @@ src/lib.rs   new since you looked: +12 −3   changed in 2 of 4 pushes · v4 ◂
 * "Changed in N of M pushes" counts the layer's version steps whose replayed delta touches the
   file (`git diff-tree --name-only` per consecutive version pair, computed once per layer when
   the layer is first shown with a comparison, cached by commit ids).
-* `◂`/`▸` (click, or `alt+[`/`alt+]`, actions `file_version_previous`/`file_version_next`)
+* `◂`/`▸` (click, or `alt+,`/`alt+.`, actions `file_version_previous`/`file_version_next`)
   step this file's comparison to the previous or next pair of versions in which it changed. The
   step is a per-file override (`file_overrides`); the rest of the layer keeps its comparison, and
   changing the layer's comparison clears the overrides.
@@ -404,13 +409,15 @@ the file, on the layer), and comparisons add where the data allows:
 | `b` | `compare_baseline` | Changes since…: choose what to compare with |
 | `shift+l` | `compare_view` | Only what changed / the full change with what is new marked |
 | `shift+b` | `stack_history` | History matrix (acts in place) |
-| `alt+[`, `alt+]` | `file_version_previous`, `file_version_next` | This file's previous / next version |
+| `alt+,`, `alt+.` | `file_version_previous`, `file_version_next` | This file's previous / next version |
 | palette | `compare_only_changed` | Only pull requests with real changes |
 | palette | `compare_off` | Full change (no comparison) |
 | palette | `compare_versions` | Compare versions of this pull request… |
 | palette | `compare_push` | Compare pushes of the stack… |
 
-`b`, `alt+[` and `alt+]` are unbound in the `code-review` scope. All are ordinary configurable
+`b`, `alt+,` and `alt+.` are unbound in the `code-review` scope. `alt+[`/`alt+]` are bound too,
+for terminals that report them: in legacy terminals Alt+`[` sends `ESC [`, the start of a
+control sequence, and does not arrive as a key. All are ordinary configurable
 actions in `keymap.toml`, listed in keyboard help and the palette. Inside the picker and the
 timeline, keys are local to that surface (`f`, `t`, `g`, arrows, `enter`, `esc`) and do not reach
 the review.
@@ -510,7 +517,7 @@ Each step is independently committable with its tests, and leaves the app workin
    the filter skips rebased layers with `.`, matrix `enter` updates the document without opening
    a review, and header control variants at narrow widths.
 4. **Arbitrary comparisons.** Version picker with looks, range-diff detail, push timeline strip,
-   time presets, per-file version stepping with `alt+[`/`alt+]`, and historical *to* (read-only
+   time presets, per-file version stepping with `alt+,`/`alt+.`, and historical *to* (read-only
    changes view).
    *Tests:* picking from/to in the picker and on the timeline updates only the intended layers;
    bucketed timeline ticks and their hit regions at small widths; file stepping overrides one
@@ -569,7 +576,7 @@ Built:
   shared ticks at small widths), time presets (an hour, yesterday, a week), historical *to*
   (`GroupComparison::historical`: only what changed, diffed to that version, read-only, no looks
   recorded), per-file version stepping (`GroupComparison::steps`, `files`,
-  `ReviewDocument::set_file_comparison`, `FileVersionsItem` on headers, `alt+[`/`alt+]` and the
+  `ReviewDocument::set_file_comparison`, `FileVersionsItem` on headers, `alt+,`/`alt+.` and the
   header's arrows), and *the stack as it was* (`a` in the matrix).
 
 Not built yet:
@@ -606,18 +613,24 @@ Not built yet:
   either view regardless of the line's kind there (a line added in the full change is context in
   the changes view).
 * **Removed-since markers** whose position is inside hidden context are placed before that gap.
-* **Version steps** use `review.compare.layers` on each pair of consecutive versions (cached as
-  `Delta`s) instead of a separate `FileSteps` kind; they are asked for the current layer, once
-  per head.
+* **Version steps** use `review.compare.layers` on each pair of consecutive available versions
+  (cached as `Delta`s) instead of a separate `FileSteps` kind; they are asked for the current
+  layer, once per head, when the history knows that head (else the history is read again once
+  and the steps wait for it). Steps carry their versions' numbers as the version list counts
+  them, so labels stay truthful when a version between others is unavailable.
 * **Files only in the compared versions** (not in the current change) do not show: a comparison
   lays over the review's files.
 * **A version newer than the review shows** (pushed after it opened, before the stack is read
   again) is compared as recorded and is read-only, like an older one.
 * **The matrix** has no `w` (whole stack since): whole-stack sources are not compared yet; `i`
   toggles *only pull requests with real changes*.
-* **Which sources are compared:** step-through layer sources (one group per pull request, its
-  stack's top layer giving the number, head, and fork point). Whole-stack sources, and pull
-  request sources that resolve without a stack, are not compared yet.
+* **Which sources are compared:** pull requests (step-through layer sources, by their stack's
+  top layer; and single pull request sources, by their resolved head and base) by every rule,
+  with looks recorded; other sources showing a diff between two commits (a branch, a range, a
+  whole stack) only by *you last looked*, from the revisions of the review's last completed
+  pass (no looks are recorded for them, and they have no history to compare by time).
+* **Looks that cannot be read** leave those layers uncompared by *you last looked* (with a
+  warning) instead of holding up the review and its banner; a refresh asks again.
 * **No looks, no comparison:** when the reviewer never looked at any layer of the review, no
   source is compared by the last-looked rule (no summaries, no "new to you" everywhere on a
   first visit); picked versions and the other rules still compare.
