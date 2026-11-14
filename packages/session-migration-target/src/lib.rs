@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn epoch_20_requires_migration_even_with_complete_schema_55_ledger() {
-        assert_eq!(CURRENT_EVENT_SCHEMA, 58);
-        assert_eq!(CURRENT_WRITER_EPOCH, 27);
+        assert_eq!(CURRENT_EVENT_SCHEMA, 59);
+        assert_eq!(CURRENT_WRITER_EPOCH, 28);
         let mut facts = StorageCompatibilityFacts {
             current_migration_ids: vec!["current-schema".into()],
             migration_rows: vec![MigrationLedgerRow {
@@ -447,6 +447,11 @@ mod tests {
             StorageCompatibility::MigrationRequired { .. }
         ));
         facts.writer_epoch = Some(27);
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::MigrationRequired { .. }
+        ));
+        facts.writer_epoch = Some(28);
         assert!(matches!(
             classify_storage_facts(&facts).unwrap(),
             StorageCompatibility::Current { .. }

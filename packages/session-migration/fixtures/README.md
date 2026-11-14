@@ -42,6 +42,18 @@ shared then-current schema 55), writer 26 has no separate schema fixture: every 
 fixture declares writer 26 as a source, and the session-domain migration-target test reconstructs
 a writer-26 store with native usage and verifies the caught-up totals after reopen.
 
+
+## Writer-27 account-reference catch-up
+
+Writers 26 and 27 both emitted event schema 58. Schema 59 / writer 28 adds the optional
+`model_changed.account_reference` and the nullable `session_state.account_reference` projection
+column. `stores/epoch-27-schema-58-events.jsonl` reconstructs the released schema-58 event
+representation from the schema-57 family matrix by changing only the outer schema. The explicit
+`session-writer-epoch-27-to-28` edge preserves canonical payloads and rebuilds every current
+projection; released selections carry no explicit account, so the projected reference is empty.
+Historical inputs at schema 58 or earlier that carry an account reference are rejected rather than
+guessed.
+
 ## Confirmed schema-28 incident family
 
 Read-only inspection of the retained epoch-2 backup for incident session

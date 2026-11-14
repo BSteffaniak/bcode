@@ -152,7 +152,8 @@ impl HistoricalEnvelope {
         })
     }
 
-    /// Reject recovery/interaction families and observations newer than their schema.
+    /// Reject recovery/interaction families, observations, and selection fields newer than
+    /// their schema.
     /// This is historical decoding policy, not native protocol interpretation.
     ///
     /// # Errors
@@ -227,6 +228,18 @@ impl HistoricalEnvelope {
                 schema_version: self.schema_version,
                 event_kind: event_kind.to_owned(),
                 reason: "configuration requests require event schema 58".into(),
+            });
+        }
+        if self.schema_version <= 58
+            && event_kind == "model_changed"
+            && payload
+                .get("account_reference")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "explicit account references require event schema 59".into(),
             });
         }
         if self.schema_version <= 55

@@ -526,6 +526,7 @@ async fn assert_historical_harness_receipt(
     steps.push("session-writer-epoch-23-to-25");
     steps.push("session-writer-epoch-25-to-26");
     steps.push("session-writer-epoch-26-to-27");
+    steps.push("session-writer-epoch-27-to-28");
     assert_eq!(receipt["migration_step_ids"], serde_json::json!(steps));
     for field in ["source_event_count", "target_event_count"] {
         assert_eq!(receipt[field], serde_json::json!(expected.len()));

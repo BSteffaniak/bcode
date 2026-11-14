@@ -451,17 +451,17 @@ fn decode_for_migration(
     {
         return envelope.decode_child_session_created();
     }
-    // Schemas 51 through 57 are representation-compatible except for child creation above
+    // Schemas 51 through 58 are representation-compatible except for child creation above
     // (schema 56 is reserved and rejected as unreleased before this point).
     // Schema 53 external observations retain their original evidence class: replay must never
     // promote a result, acceptance or settlement into a newly introduced terminal disposition.
     // Preserve recorded usage and all admission identities rather than applying older policy.
-    if matches!(envelope.schema_version(), 51..=57)
+    if matches!(envelope.schema_version(), 51..=58)
         && crate::is_released_event_kind_schema(source_kind, envelope.schema_version())
         && crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
             variant.kind == source_kind
                 && (variant.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
-                    || (matches!(envelope.schema_version(), 53..=57)
+                    || (matches!(envelope.schema_version(), 53..=58)
                         && variant.treatment == crate::ReleasedEventTreatment::ExplicitConversion))
         })
     {
@@ -772,7 +772,7 @@ mod tests {
     fn schema_52_fixture_migrates_losslessly_without_creating_checkpoints() {
         let plan = crate::plan_writer_epoch_migration(16).expect("known lossless upgrade");
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 10);
+        assert_eq!(plan.steps.len(), 11);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-16-to-17");
         assert_eq!(plan.steps[1].id, "session-writer-epoch-17-to-18");
         assert_eq!(plan.steps[2].id, "session-writer-epoch-18-to-19");
@@ -783,6 +783,7 @@ mod tests {
         assert_eq!(plan.steps[7].id, "session-writer-epoch-23-to-25");
         assert_eq!(plan.steps[8].id, "session-writer-epoch-25-to-26");
         assert_eq!(plan.steps[9].id, "session-writer-epoch-26-to-27");
+        assert_eq!(plan.steps[10].id, "session-writer-epoch-27-to-28");
         let fixture = include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl");
         let mut seen = BTreeSet::new();
         for payload in fixture.lines() {
@@ -1092,8 +1093,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 58);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 57);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 59);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 58);
         // Classification preserves the source envelope; canonical normalization alone
         // advances its schema after historical semantics have been interpreted.
         assert_eq!(event.schema_version, metadata.source_schema);
@@ -1884,6 +1885,57 @@ mod tests {
     }
 
     #[test]
+    fn account_references_require_schema_59_and_schema_58_selections_migrate_without_one() {
+        let model_changed = |schema: u16, account_reference: Option<&str>| {
+            let mut kind = serde_json::json!({
+                "provider": "provider",
+                "model": "model",
+                "selection_source": "user_explicit",
+            });
+            if let Some(account_reference) = account_reference {
+                kind["account_reference"] = serde_json::json!(account_reference);
+            }
+            serde_json::json!({
+                "schema_version": schema,
+                "sequence": 3,
+                "timestamp_ms": 1,
+                "session_id": SESSION_ID,
+                "kind": { "model_changed": kind },
+            })
+            .to_string()
+        };
+        let decode_current = |payload: &str| {
+            serde_json::from_str::<SessionEvent>(payload).map_err(|e| e.to_string())
+        };
+
+        for schema in [57, 58] {
+            assert!(matches!(
+                decode_for_migration(&model_changed(schema, Some("account")), decode_current),
+                Err(HistoricalSessionEventError::InvalidEvent { schema_version, .. })
+                    if schema_version == schema
+            ));
+        }
+
+        let migrated = decode_for_migration(&model_changed(58, None), decode_current)
+            .expect("released schema-58 selection migrates");
+        let HistoricalDecode::Converted { event, metadata } = migrated else {
+            panic!("schema-58 selection is a released historical input");
+        };
+        assert_eq!(metadata.source_schema, 58);
+        let SessionEventKind::ModelChanged {
+            account_reference, ..
+        } = event.kind
+        else {
+            panic!("model change keeps its kind");
+        };
+        assert_eq!(account_reference, None);
+
+        let current = decode_for_migration(&model_changed(59, Some("account")), decode_current)
+            .expect("current account selection");
+        assert!(matches!(current, HistoricalDecode::Current(_)));
+    }
+
+    #[test]
     fn schema_53_observations_preserve_evidence_class_without_inventing_terminals() {
         let base: serde_json::Value = serde_json::from_str(
             include_str!("../fixtures/stores/epoch-16-schema-52-events.jsonl")
@@ -2057,7 +2109,7 @@ mod tests {
         assert!(normalized.metric_counter.is_none());
         let plan = crate::plan_writer_epoch_migration(17).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 9);
+        assert_eq!(plan.steps.len(), 10);
     }
 
     #[test]
@@ -3127,12 +3179,17 @@ mod tests {
                     id: "session-writer-epoch-26-to-27",
                     source_writer_epoch: 26,
                     target_writer_epoch: 27,
+                },
+                crate::MigrationStepDescriptor {
+                    id: "session-writer-epoch-27-to-28",
+                    source_writer_epoch: 27,
+                    target_writer_epoch: 28,
                 }
             ]
         );
         let plan = crate::plan_writer_epoch_migration(19).unwrap();
         assert_eq!(plan.target_writer_epoch, crate::CURRENT_WRITER_EPOCH);
-        assert_eq!(plan.steps.len(), 7);
+        assert_eq!(plan.steps.len(), 8);
         assert_eq!(
             plan.steps[0],
             crate::MigrationStepDescriptor {
@@ -3143,10 +3200,10 @@ mod tests {
         );
         assert_eq!(plan.steps[1..], latest.steps);
         let old = crate::plan_writer_epoch_migration(18).unwrap();
-        assert_eq!(old.steps.len(), 8);
+        assert_eq!(old.steps.len(), 9);
         assert_eq!(old.steps[0].id, "session-writer-epoch-18-to-19");
         assert_eq!(old.steps[1..], plan.steps);
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 58);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 59);
         assert!(matches!(
             crate::plan_writer_epoch_migration_with_registry(21, 20, &crate::MIGRATION_STEPS),
             Err(crate::MigrationPlanError::FutureWriter { .. })

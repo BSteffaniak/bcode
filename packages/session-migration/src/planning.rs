@@ -362,7 +362,10 @@ mod tests {
             source_writer_epoch: 26,
             target_writer_epoch: 27,
         };
-        for source in RELEASED_HISTORICAL_WRITER_EPOCHS {
+        for source in RELEASED_HISTORICAL_WRITER_EPOCHS
+            .iter()
+            .filter(|source| **source < 27)
+        {
             let plan = plan_writer_epoch_migration_with_registry(*source, 27, &MIGRATION_STEPS)
                 .expect("supported source reaches native-usage projection writer");
             assert_eq!(plan.steps.last(), Some(&usage));
@@ -377,6 +380,48 @@ mod tests {
             plan_writer_epoch_migration_with_registry(27, 26, &MIGRATION_STEPS),
             Err(MigrationPlanError::FutureWriter { .. })
         ));
+    }
+
+    #[test]
+    fn account_reference_edge_extends_every_released_source() {
+        let account = MigrationStepDescriptor {
+            id: "session-writer-epoch-27-to-28",
+            source_writer_epoch: 27,
+            target_writer_epoch: 28,
+        };
+        for source in RELEASED_HISTORICAL_WRITER_EPOCHS {
+            let plan = plan_writer_epoch_migration_with_registry(*source, 28, &MIGRATION_STEPS)
+                .expect("supported source reaches account-reference writer");
+            assert_eq!(plan.steps.last(), Some(&account));
+        }
+        assert_eq!(
+            plan_writer_epoch_migration_with_registry(27, 28, &MIGRATION_STEPS)
+                .unwrap()
+                .steps,
+            [account]
+        );
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(28, 27, &MIGRATION_STEPS),
+            Err(MigrationPlanError::FutureWriter { .. })
+        ));
+    }
+
+    #[test]
+    fn every_unreserved_prior_writer_is_released_and_reaches_current() {
+        const RESERVED_WRITER_EPOCHS: &[u32] = &[24];
+        for epoch in 1..CURRENT_WRITER_EPOCH {
+            if RESERVED_WRITER_EPOCHS.contains(&epoch) {
+                assert!(!RELEASED_HISTORICAL_WRITER_EPOCHS.contains(&epoch));
+                continue;
+            }
+            assert!(
+                RELEASED_HISTORICAL_WRITER_EPOCHS.contains(&epoch),
+                "writer epoch {epoch} precedes the current writer but is neither released nor reserved"
+            );
+            let plan = plan_writer_epoch_migration(epoch)
+                .unwrap_or_else(|error| panic!("writer epoch {epoch} cannot migrate: {error}"));
+            assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
+        }
     }
 
     #[test]
@@ -506,7 +551,7 @@ mod tests {
         let plan = plan_writer_epoch_migration(4).expect("epoch 4 corrective plan");
         let expected_edges = (4..23)
             .map(|source| (source, source + 1))
-            .chain([(23, 25), (25, 26), (26, 27)])
+            .chain([(23, 25), (25, 26), (26, 27), (27, 28)])
             .collect::<Vec<_>>();
         assert_eq!(
             plan.steps
@@ -577,6 +622,11 @@ mod tests {
                     id: "session-writer-epoch-26-to-27",
                     source_writer_epoch: 26,
                     target_writer_epoch: 27,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-27-to-28",
+                    source_writer_epoch: 27,
+                    target_writer_epoch: 28,
                 }
             ]
         );
@@ -641,6 +691,11 @@ mod tests {
                     id: "session-writer-epoch-26-to-27",
                     source_writer_epoch: 26,
                     target_writer_epoch: 27,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-27-to-28",
+                    source_writer_epoch: 27,
+                    target_writer_epoch: 28,
                 },
             ]
         );
