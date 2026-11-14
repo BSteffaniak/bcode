@@ -547,36 +547,49 @@ Built:
   the per-source summary item (`CompareNote`), removed-since markers (`RemovedSince`),
   `NavKind::NewSince`, and the renderer's tint (`theme.since.diff`), gutter bar
   (`theme.icons.since_bar`), file badges, summary and marker rows with their click targets.
+* **Step 3 (in place on the review screen).** `surface/compare.rs` and
+  `surface/compare_view.rs`: looks are seeded from completed passes, listed once, and recorded
+  when a file is marked viewed, a comment, reply or AI question is made, a pass is completed or
+  published, the reviewer's own forge reviews are read, or a layer stays current for
+  `compare.dwell_seconds`; the last-looked baseline is resolved per layer and pinned for the
+  session; every layer is compared in one `review.compare.layers` call (the current layer first)
+  and laid over the document, again only for pairs that changed. The comparison row
+  (`compare_bar.rs`: control, summary with progress, push timeline) and the reopen banner;
+  `b` (`compare_baseline`) opens the "Changes since…" menu (`compare_menu.rs`); `shift+l` is
+  `compare_view` (overrides of `since_last_review` are read as it); `]`/`[` stop on new lines
+  first; rail and file-panel badges; *only pull requests with real changes*
+  (`ReviewDocument::set_filtered_sources`, a `+N` rail tab, `.`/`,` skip); the `compare.*`
+  configuration; the choice kept in presentation state (`ReviewPresentationState::compare`);
+  the history matrix acting in place. Removed: `rereview.rs`, the `since_last` source swap, the
+  one-time toast, the patch-id carry-over, `Action::OpenReview`, the app's `return_to`,
+  `history::sources_of`, `Message::HistoryCompared`, and the source-producing comparison API
+  (`history::compare` keeps only the replay helpers).
+* **Step 4 (arbitrary comparisons).** The version picker (from/to, looks marked, unavailable
+  versions not pickable), the push timeline (keyboard focus from the menu, clicks on ticks,
+  shared ticks at small widths), time presets (an hour, yesterday, a week), historical *to*
+  (`GroupComparison::historical`: only what changed, diffed to that version, read-only, no looks
+  recorded), per-file version stepping (`GroupComparison::steps`, `files`,
+  `ReviewDocument::set_file_comparison`, `FileVersionsItem` on headers, `alt+[`/`alt+]` and the
+  header's arrows), and *the stack as it was* (`a` in the matrix).
 
-* **Step 3, first part (in place on the review screen).** `surface/compare.rs`: once the
-  stack is known, looks are seeded from the review's completed passes and listed in one call;
-  each step-through layer's baseline is resolved with the engaged rule and pinned for the
-  session (a layer that moves while open is compared with the head it had); every layer is
-  compared in one `review.compare.layers` call and laid over the document, again only for pairs
-  that changed when a source is listed again. Looks are recorded (batched, with their heads kept
-  under `refs/bcode-review/version/`) when a file is marked viewed, a comment, reply or AI
-  question is made, and a pass is completed or published. `shift+l` is the `compare_view`
-  action (overrides of `since_last_review` are read as it) and the publish menu's entry reads
-  *Only what changed*. Removed: `rereview.rs`, the `since_last` source swap,
-  `Message::Rereview`/`Carried`, the one-time toast, and the patch-id carry-over (with the
-  document's `carried_over`).
+Not built yet:
 
-Not built yet, in order:
-
-* **Rest of step 3:** the header control (`b`, `compare_baseline`) with its summary and
-  progress, the reopen banner, rail and file-panel badges, the *only pull requests with real
-  changes* filter, `opened` looks after `compare.dwell_seconds`, `reviewed` looks from the
-  viewer's forge verdicts (`history::looks::forge_review_looks` exists), the `compare.*`
-  configuration, `]`/`[` preferring `NavKind::NewSince` while comparing, a click/`enter` on
-  rows for the summary's buttons by keyboard, the matrix acting in place, and removing
-  `Action::OpenReview`, the app's `return_to`, `history::sources_of`,
-  `Message::HistoryCompared` and `history::compare`'s source-producing API.
-* Steps 4 and 5.
+* **Step 5 (comments that follow their code).** Older forge threads and drafts are not placed on
+  the before side of the changes view, threads whose lines were removed do not attach to the
+  removed-since marker, and `diff_hunk` text is not matched; such threads keep their current
+  placement (near their code, on their file, or on the layer).
+* The version picker's range-diff detail (`g`), typed durations or dates for *A time…*, and the
+  push summary on hover (the keyboard cursor on the timeline says it in the status line).
 * Also not built: moved-code detection, checks per version, assistant summaries per push, and
   the restack summary on home.
 
 ### Implementation notes (where the build differs from the text above)
 
+* **The comparison row** sits under the rail (and the layer strip) instead of in the header row,
+  and holds the push timeline too, so the control, the summary and the timeline are one row;
+  narrow variants are `Since: last looked ▾` and `Δ▾`.
+* **The banner** is one row: the full text with labelled buttons, else a brief text with key
+  buttons, else the buttons alone, else the brief text.
 * **Dropped files** are not files of the current change, so they have no header rows: the
   source's summary counts them ("· 2 dropped") and `CompareNoteItem::dropped` lists their paths.
 * **Hidden files** use one toggle per source (`set_compare_files_shown`): it shows the unchanged
@@ -587,16 +600,24 @@ Not built yet, in order:
 * **Marks** are requested only when the source's base commit is the delta's fork point (the
   old-side numbers of marks count from it); otherwise lines are not marked.
 * **Old-side anchors in the changes view** show at their file (placement `File`) instead of
-  being mapped onto the before side; mapping is part of step 5.
+  being mapped onto the before side; every anchor of a file shown at an older version shows at
+  its file.
 * **New-side anchors** whose recorded blob is the file's current new blob keep their line in
   either view regardless of the line's kind there (a line added in the full change is context in
   the changes view).
 * **Removed-since markers** whose position is inside hidden context are placed before that gap.
-* **`history::compare`** (comparisons as review sources) still serves the matrix until step 3
-  removes it; its replay commits now use the same deterministic commit as the deltas.
-* **`FileSteps`** (the cache kind for file header stepping) is added with step 4, which uses it.
+* **Version steps** use `review.compare.layers` on each pair of consecutive versions (cached as
+  `Delta`s) instead of a separate `FileSteps` kind; they are asked for the current layer, once
+  per head.
+* **Files only in the compared versions** (not in the current change) do not show: a comparison
+  lays over the review's files.
+* **A version newer than the review shows** (pushed after it opened, before the stack is read
+  again) is compared as recorded and is read-only, like an older one.
+* **The matrix** has no `w` (whole stack since): whole-stack sources are not compared yet; `i`
+  toggles *only pull requests with real changes*.
 * **Which sources are compared:** step-through layer sources (one group per pull request, its
   stack's top layer giving the number, head, and fork point). Whole-stack sources, and pull
   request sources that resolve without a stack, are not compared yet.
 * **No looks, no comparison:** when the reviewer never looked at any layer of the review, no
-  source is compared (no summaries, no "new to you" everywhere on a first visit).
+  source is compared by the last-looked rule (no summaries, no "new to you" everywhere on a
+  first visit); picked versions and the other rules still compare.

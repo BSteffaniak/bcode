@@ -325,15 +325,50 @@ from, one notice names the closed layers. Failures name sources by their labels.
 
 ### Changes since you looked
 
-A review that steps through pull requests compares each one, in place, with the version you
-last looked at (see [review-stack-history.md](review-stack-history.md)). Marking a file viewed,
-commenting, asking the AI, and completing the pass (`shift+m`) record that you looked at the
-pull request's current version; earlier completed passes count too. When a review opens after
-a pull request moved, its rebase is taken out: a layer only rebased collapses to one line, files
-unchanged since you looked fold once viewed, lines new since then are tinted with a bar in the
-gutter, and code removed since then is a marker you can expand. `shift+l` switches between that
-full change and only what changed (each changed file from its old version replayed on today's
-base to the current code); viewed marks, comments, and navigation are the same in both.
+A review that steps through pull requests compares each one, in place, with an earlier version
+(see [review-stack-history.md](review-stack-history.md)). Every comparison happens on the same
+review screen: nothing opens another review, and viewed marks, comments, AI asks, search and
+navigation work the same with or without one.
+
+* **The default is the version you last looked at.** Marking a file viewed, commenting, asking
+  the AI, completing the pass (`shift+m`), your own reviews on the forge, and (when nothing
+  else was recorded) staying on a pull request for a few seconds record that you looked at its
+  current version; earlier completed passes count too.
+* **The comparison row** under the rail reads `Changes since: [you last looked · 2d ago ▾]  1
+  of 3 PRs changed · 2 rebased only`, then the stack's pushes as ticks (`┃` a push that changed
+  some pull request's own change, `│` one that only rebased; `[`/`]` around the pushes compared)
+  and when the last push was. While layers are compared it says how far it got ("comparing 6 of
+  21…"). It narrows to `Since: last looked ▾` and `Δ▾`; pushes share ticks when cells are few.
+* **A review that moved since you looked** reopens comparing, with a banner: what changed, and
+  **Only what changed** (`shift+l`), **Compare with…** (`b`) and **Dismiss**.
+* **`b`** (or a click on the control) chooses what to compare with: *You last looked*, *Previous
+  push*, *A push…* (the timeline takes the keys: `←`/`→`, `f` from, `t` to, `enter`, `esc`; a
+  click on a tick compares from before it, with `shift` up to after it), *A version of this pull
+  request…* (the version picker), *1 hour ago*, *Yesterday*, *A week ago*, or *Full change* (no
+  comparison); and toggles *Only pull requests with real changes* and *Show only what changed*.
+  The choice is kept with the review; *you last looked* is worked out again on every open.
+* **The version picker** lists the current pull request's versions newest first (`v1`..`vN`,
+  when, what kind of change, and which you looked at or reviewed). `f` sets *from*, `t` sets
+  *to* (now by default), `enter` compares; a click sets *from*, a `shift`-click *to*. A
+  comparison that ends at an older version shows only what changed, read-only: its lines take no
+  comment and nothing about it is recorded as looked at.
+* **What shows.** The rebase is taken out: a layer only rebased collapses to one line, files
+  unchanged since the baseline fold once viewed (unviewed ones stay open), lines new since then
+  are tinted with a bar in the gutter, and code removed since then is a marker you can expand.
+  `]`/`[` stop on new lines first. `shift+l` switches between that full change and only what
+  changed (each changed file from its old version replayed on today's base to the current code).
+* **Badges.** Rail tabs and file panel groups say how each pull request changed: `● +40 −12 · 3
+  files`, `○ rebased`, `✓ unchanged`, `+ new to you`, `≈` (the rebase could not be taken out),
+  `?` (the baseline's commits are gone), `⋯` (still comparing). *Only pull requests with real
+  changes* folds the others into one `+N ○` tab (a click shows them again), and `.`/`,` skip them.
+* **A file's versions.** Once the current pull request's versions are compared with each other,
+  a file header says `changed in 2 of 4 pushes · v4 ◂ ▸`; `alt+[` and `alt+]` (or the arrows) step
+  that file alone to the previous or next push that changed it (read-only), and past the newest
+  back to the pull request's comparison.
+* **The history matrix** (`shift+b`) compares in place too: `enter` the cursor's pull request
+  with its version before, `p` the pushes between the pin (`f`) and the cursor, `s` everything
+  since the cursor's column, `a` the stack as it was then, `r` since you last looked, `i` only
+  real changes.
 
 ### Pull request conversations
 
@@ -375,7 +410,7 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
 * **Publishing** offers **Review on {provider}** first: its options are the verdict (only those
   the provider accepts) and a summary, and held replies go with it. Approve and Request changes
   in the bar open it directly at that verdict for that pull request.
-* **The history panel** (`shift+b`) names each layer's reviews and whether they still apply.
+* **The history matrix** (`shift+b`) names each layer's reviews and whether they still apply.
 * Conversations stay current without polling: they are read when the review opens, when it is
   focused again, after your own changes, when the review's heads change, from **↻**, and when
   the provider's watch says they changed (GitHub's checks cheaply on its own schedule). New
@@ -538,6 +573,14 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `.` | Next stack layer |
 | `,` | Previous stack layer |
 | `shift+l` | Only what changed since you looked / the full change with what is new marked |
+| `b` | Changes since…: choose what pull requests are compared with |
+| palette only | Compare: only pull requests with real changes |
+| palette only | Compare: full change (no comparison) |
+| palette only | Compare: with what you last looked at |
+| palette only | Compare versions of this pull request… |
+| palette only | Compare pushes of the stack… |
+| `alt+[` | This file's previous version (in a comparison) |
+| `alt+]` | This file's next version (in a comparison) |
 | `shift+m` | Mark the review pass complete |
 | `enter` | Actions of the thread or AI answer (reveals a gap) |
 | `z` | Fold or open the thread or AI answer (its More shows a whole answer) |
@@ -579,7 +622,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | palette only | Pull request: open its web page |
 | palette only | Pull request: read its conversation again |
 | palette only | Stack: approve every fully viewed layer… |
-| `shift+b` | Stack history: how each pull request changed in each push |
+| `shift+b` | Stack history: how each pull request changed in each push (compares in place) |
 
 ### File panel (focused) (`code-review-files`)
 
@@ -647,6 +690,15 @@ bcode's own (`--print-config-paths` lists them in order):
   lines in the same sections (functions), even when the rest of the file changes, for example
   after a rebase. `"file"` resets it when either side of the file changes at all. Any other
   value is reported and the default is used.
+* `[plugins.config."bcode.code_review".compare]`: comparisons with earlier versions.
+  `default_baseline` is what a review compares with until another is chosen: `"last_looked"`
+  (the default), `"previous_push"`, a duration such as `"24h"`, or `"none"`. `baseline_look`
+  (`"engaged"`, the default, or `"opened"`) says whether staying on a pull request counts as
+  looking at it even when something else was recorded; `dwell_seconds` (default 8) is how long
+  that takes. `start_view` (`"full"` or `"changes"`) is the view a comparison starts in;
+  `rebased_layers` (`"collapse"`, `"hide"`, or `"show"`) how layers that were only rebased show;
+  `timeline` (`"auto"` or `"always"`) when the push timeline shows. Invalid values are reported
+  and the defaults are used.
 * `[plugins.config."bcode.code_review".stack]`: how many layers a stack of pull requests may
   have. `max_layers` (default 64) is the limit; `over_limit` says what happens beyond it.
   `"warn"` (the default) loads every layer and shows a warning that can be dismissed: a row of
