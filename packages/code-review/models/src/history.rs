@@ -232,21 +232,24 @@ pub struct StackPush {
 }
 
 impl StackPush {
-    /// The layers whose content it changed, and how many it only rebased.
+    /// The layers whose content it changed, and how many it only rebased. A layer seen
+    /// several times in one push (versions close together) counts once: changed when any of
+    /// its versions changed its content.
     #[must_use]
     pub fn split(&self) -> (Vec<u64>, usize) {
-        let changed: Vec<u64> = self
+        let mut changed: Vec<u64> = Vec::new();
+        for (number, kind) in &self.layers {
+            if kind.changes_content() && !changed.contains(number) {
+                changed.push(*number);
+            }
+        }
+        let rebased: BTreeSet<u64> = self
             .layers
             .iter()
-            .filter(|(_, kind)| kind.changes_content())
+            .filter(|(number, kind)| *kind == ChangeKind::RebaseOnly && !changed.contains(number))
             .map(|(number, _)| *number)
             .collect();
-        let rebased = self
-            .layers
-            .iter()
-            .filter(|(_, kind)| *kind == ChangeKind::RebaseOnly)
-            .count();
-        (changed, rebased)
+        (changed, rebased.len())
     }
 }
 
@@ -276,6 +279,19 @@ mod tests {
             ],
         };
         assert_eq!(push.split(), (vec![1, 4], 2));
+        // Two versions of each layer in one push: each layer counts once.
+        let push = StackPush {
+            at_ms: 0,
+            layers: vec![
+                (1, ChangeKind::Content),
+                (2, ChangeKind::RebaseOnly),
+                (1, ChangeKind::CommitsAdded),
+                (2, ChangeKind::RebaseOnly),
+                (3, ChangeKind::RebaseOnly),
+                (3, ChangeKind::Content),
+            ],
+        };
+        assert_eq!(push.split(), (vec![1, 3], 1));
         let event: PullHistoryEvent =
             serde_json::from_str(r#"{"kind":"force_pushed","at_ms":5,"after_oid":"abc"}"#)
                 .expect("event");
