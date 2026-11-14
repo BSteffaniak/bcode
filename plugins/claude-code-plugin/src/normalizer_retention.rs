@@ -5,8 +5,7 @@
 mod tests;
 
 use super::{
-    Event, HarnessContractError, HarnessObservation, HarnessObservationKind, NativeMessage,
-    Normalizer, Value, json,
+    Event, HarnessContractError, HarnessObservation, NativeMessage, Normalizer, Value, json,
 };
 use bcode_harness_models::{
     HarnessHydrationReply, HarnessHydrationRequest, HarnessInventoryConsistency,
@@ -146,43 +145,28 @@ impl Normalizer {
             if reply.canonical_revision < self.staging.revision {
                 return Err(HarnessContractError::InvalidShape);
             }
-            if matches!(
+            // A lookup the host cannot answer, or whose absence proves nothing for this record,
+            // leaves background coverage unknown, but never holds the conversation: the staged
+            // record is processed without it.
+            let unresolved = matches!(
                 reply.resolution,
                 bcode_harness_models::HarnessHydrationResolution::Unavailable
-            ) {
-                self.execution.lose_coverage();
-                if self.staging.notices.is_empty() {
-                    let events = self.execution.coverage();
-                    self.staging.notices = events
-                        .into_iter()
-                        .filter_map(|event| {
-                            self.observation(HarnessObservationKind::Execution { event })
-                        })
-                        .collect();
-                }
-                // Keep the exact pending lookup and staged native record for retry.
-                continue;
-            }
-            if matches!(
+            ) || (matches!(
                 reply.resolution,
                 bcode_harness_models::HarnessHydrationResolution::Absent
-            ) && self
-                .staging
-                .events
-                .front()
-                .is_some_and(|event| match event {
+            ) && self.staging.events.front().is_some_and(
+                |event| match event {
                     Event::Message(NativeMessage::System(value)) => {
                         value.get("task_type").and_then(Value::as_str).is_none()
                     }
                     _ => true,
-                })
-            {
-                // Current reference namespaces cannot prove absence for an
-                // untyped task or a run-only wake. Wait for authoritative hydration.
+                },
+            ));
+            if unresolved {
                 self.execution.lose_coverage();
-                continue;
+            } else {
+                self.execution.hydrate(reply)?;
             }
-            self.execution.hydrate(reply)?;
             self.staging.revision = reply.canonical_revision;
             self.staging.last_reply = Some(reply.clone());
             self.staging.request = None;

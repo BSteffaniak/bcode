@@ -1,7 +1,7 @@
 use super::*;
 use bcode_harness_models::{
     HarnessExecutionEvent, HarnessHydrationReply, HarnessHydrationResolution,
-    HarnessNotificationState, HarnessWorkState,
+    HarnessNotificationState, HarnessObservationKind, HarnessWorkState,
 };
 
 fn normalizer() -> Normalizer {
@@ -348,7 +348,7 @@ fn genuine_global_tool_id_hydrates_without_inventing_turn_and_supplied_turn_stay
 }
 
 #[test]
-fn wrong_request_unavailable_and_conflicting_hydration_fail_closed() {
+fn a_foreign_reply_is_rejected_and_an_unanswerable_lookup_never_holds_the_stream() {
     let mut normalizer = normalizer();
     normalizer.event(system(
         json!({"subtype":"task_notification","task_id":"unknown","status":"completed"}),
@@ -365,5 +365,16 @@ fn wrong_request_unavailable_and_conflicting_hydration_fail_closed() {
     reply.request_id = request.request_id;
     reply.resolution = HarnessHydrationResolution::Unavailable;
     normalizer.apply_hydration(&[reply]).unwrap();
-    assert_ne!(normalizer.hydration_requests(), Vec::new());
+    // The lookup is given up, not retried forever: the staged record is processed with
+    // background coverage unknown, and nothing else is requested for it.
+    assert_eq!(normalizer.hydration_requests(), Vec::new());
+    let processed = normalizer.pump();
+    assert!(
+        processed.iter().any(|observation| matches!(
+            &observation.kind,
+            HarnessObservationKind::Subagent { native_agent_id, .. } if native_agent_id == "unknown"
+        )),
+        "the held task notification is processed: {processed:?}"
+    );
+    assert!(normalizer.pump().is_empty() || normalizer.hydration_requests().is_empty());
 }

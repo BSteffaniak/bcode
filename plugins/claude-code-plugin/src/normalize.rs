@@ -317,7 +317,8 @@ impl Normalizer {
         });
         let outcome = text("status").unwrap_or_else(|| "updated".to_owned());
         let ended = format!("{kind} {outcome}: {description}");
-        match text("summary") {
+        // A summary that only repeats the description adds nothing.
+        match text("summary").filter(|summary| *summary != description) {
             Some(summary) => format!("{ended} — {summary}"),
             None => ended,
         }
