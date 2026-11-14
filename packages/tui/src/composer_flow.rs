@@ -151,6 +151,11 @@ pub fn stage_session_message(
     };
     // A native agent learns the conversation's Bcode agent with the next message after it
     // changes, and again after it summarized away the earlier announcement.
+    let native_agent_change = if chat.app.managed_execution_session().is_some() {
+        staged_native_agent_change(chat)
+    } else {
+        None
+    };
     let native_agent = if chat.app.managed_execution_session().is_some() {
         chat.app.take_native_agent_announcement().map(|agent| {
             let name = chat.agents.name_of(&agent).to_owned();
@@ -181,6 +186,7 @@ pub fn stage_session_message(
             model_id: draft_model_id,
             agent_id,
             native_agent,
+            native_agent_change,
             reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
             reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
             reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
@@ -190,6 +196,30 @@ pub fn stage_session_message(
     });
     chat.app.set_status("sending message…".to_owned());
     true
+}
+
+/// The agent staged for a native conversation, when it differs from the session's agent. A
+/// selection that cycled back to the session's agent is simply dropped.
+fn staged_native_agent_change(chat: &mut ActiveChat) -> Option<super::effects::NativeAgentChange> {
+    let agent_id = chat.app.pending_agent_id()?.to_owned();
+    if agent_id == chat.app.current_agent_id() {
+        let _ = chat.app.take_pending_agent();
+        return None;
+    }
+    let read_only = chat
+        .agents
+        .get(&agent_id)
+        .is_some_and(|agent| agent.read_only);
+    let mode = super::managed_controls::permission_mode_for_agent(read_only);
+    let current_mode = chat
+        .app
+        .managed_settings()
+        .permission_mode
+        .unwrap_or(bcode_harness_models::HarnessPermissionMode::Default);
+    Some(super::effects::NativeAgentChange {
+        agent_id,
+        mode: (mode != current_mode).then_some(mode),
+    })
 }
 
 #[cfg(test)]
@@ -255,6 +285,106 @@ mod tests {
         ));
         assert!(chat.pending_effects.drain_runtime().0.is_empty());
         assert_eq!(chat.app.managed_execution_session(), Some(owner));
+        drop(chat);
+    }
+
+    #[test]
+    fn native_message_carries_the_staged_agent_and_only_a_changed_mode() {
+        use super::super::effects::NativeAgentChange;
+        use super::super::session_flow::{ActiveChat, AgentCatalog, ChatSessionAttachment};
+        use bcode_harness_models::{HarnessPermissionMode, HarnessSessionSetting};
+        let agent = |id: &str, read_only: bool| bcode_agent_profile::AgentInfo {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            badge: None,
+            accent: None,
+            aliases: Vec::new(),
+            is_default: !read_only,
+            read_only,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+        let mut chat = ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[]),
+            agents: AgentCatalog::from_agents(vec![agent("build", false), agent("plan", true)]),
+            attachment: ChatSessionAttachment::Attached { session_id },
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_progress: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        };
+        chat.app.set_managed_execution(session_id);
+        chat.agents.apply_agent_to_app(&mut chat.app, "build");
+        let send = |chat: &mut ActiveChat| {
+            chat.app.replace_composer_with("native input");
+            chat.app.stage_submission();
+            assert!(stage_session_message(
+                std::path::Path::new("."),
+                crate::TuiLaunchOptions::default(),
+                chat,
+                bcode_ipc::PromptPlacement::FollowUp
+            ));
+            let (effects, _) = chat.pending_effects.drain_runtime();
+            effects
+                .into_iter()
+                .find_map(|(_, effect)| match effect {
+                    TuiEffect::SubmitMessage { request } => Some(request),
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        // The first message announces the session's agent; nothing changes.
+        let request = send(&mut chat);
+        assert_eq!(request.native_agent_change, None);
+        assert_eq!(
+            request.native_agent.map(|(id, _)| id).as_deref(),
+            Some("build")
+        );
+
+        // A staged read-only agent switches the native agent to plan mode with the message,
+        // and is the agent announced with it.
+        chat.app.set_pending_agent("plan", None);
+        let request = send(&mut chat);
+        assert_eq!(
+            request.native_agent_change,
+            Some(NativeAgentChange {
+                agent_id: "plan".into(),
+                mode: Some(HarnessPermissionMode::Plan),
+            })
+        );
+        assert_eq!(
+            request.native_agent.map(|(id, _)| id).as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            chat.app.current_agent_id(),
+            "build",
+            "committed only once sent"
+        );
+
+        // When the native agent is already in that mode, only the agent changes.
+        chat.app
+            .apply_managed_setting(&HarnessSessionSetting::PermissionMode {
+                mode: HarnessPermissionMode::Plan,
+            });
+        let request = send(&mut chat);
+        assert_eq!(
+            request.native_agent_change,
+            Some(NativeAgentChange {
+                agent_id: "plan".into(),
+                mode: None,
+            })
+        );
+
+        // A selection that cycled back to the session's agent changes nothing.
+        chat.app.commit_submitted_agent("plan");
+        chat.app.set_pending_agent("plan", None);
+        let request = send(&mut chat);
+        assert_eq!(request.native_agent_change, None);
+        assert_eq!(chat.app.pending_agent_id(), None);
         drop(chat);
     }
 

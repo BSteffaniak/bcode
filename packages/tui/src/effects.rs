@@ -406,8 +406,57 @@ async fn native_agent_instructions(
         .system_prompt_suffix
 }
 
+/// Apply a staged Bcode agent before a native message is sent: switch the native permission
+/// mode when it differs, then save the agent with the session. A harness that cannot switch
+/// modes mid-session still gets the agent; any other failure sends nothing.
+async fn apply_native_agent_change(
+    commands: &bcode_client::ManagedSessionCommandHandle,
+    host: Option<&ManagedHostAccess>,
+    generation: Option<u64>,
+    change: &NativeAgentChange,
+) -> Result<Option<bcode_harness_models::HarnessSessionSetting>, ClientError> {
+    use bcode_harness_models::{HarnessFailure, HarnessServiceResponseKind, HarnessSessionSetting};
+    let host = host.ok_or_else(|| {
+        ClientError::Protocol(
+            "Agent selection is unavailable in this managed conversation; nothing was sent".into(),
+        )
+    })?;
+    let mut applied = None;
+    if let Some(mode) = change.mode {
+        let generation = generation
+            .ok_or_else(|| ClientError::Protocol("Managed generation is missing".into()))?;
+        let setting = HarnessSessionSetting::PermissionMode { mode };
+        let label = super::managed_controls::permission_mode_label(mode);
+        match commands
+            .managed_session_configure(
+                generation,
+                uuid::Uuid::new_v4().to_string(),
+                setting.clone(),
+            )
+            .await
+        {
+            Ok(response) => match response.kind {
+                HarnessServiceResponseKind::Acknowledged { .. } => applied = Some(setting),
+                HarnessServiceResponseKind::Failure(HarnessFailure::Unsupported) => {}
+                other => {
+                    return Err(ClientError::Protocol(format!(
+                        "Switching to {label} was not confirmed ({other:?}); nothing was sent"
+                    )));
+                }
+            },
+            Err(ClientError::Server { code, .. }) if code == "managed_session_unsupported" => {}
+            Err(error) => return Err(error),
+        }
+    }
+    host.client()
+        .set_session_agent(commands.session_id(), change.agent_id.clone())
+        .await?;
+    Ok(applied)
+}
+
 async fn managed_submit_message(
     commands: &bcode_client::ManagedSessionCommandHandle,
+    host: Option<&ManagedHostAccess>,
     request: SubmitMessageRequest,
     generation: Option<u64>,
 ) -> TuiEffectResult {
@@ -432,6 +481,11 @@ async fn managed_submit_message(
             }
             result.receipt = Some(ComposerReceipt::Managed(Box::new(commands.submit_managed_composer_request(retained).await?)));
         } else {
+            if let Some(change) = request.native_agent_change.take() {
+                result.applied_native_setting =
+                    apply_native_agent_change(commands, host, generation, &change).await?;
+                result.committed_agent_id = Some(change.agent_id);
+            }
             let text = match request.native_agent.take() {
                 Some((agent_id, name)) => {
                     let instructions = native_agent_instructions(commands, session_id, agent_id).await;
@@ -573,12 +627,42 @@ async fn managed_slash_command(
                     bcode_harness_models::HarnessSessionSetting::Model { model_id: (*model_id).to_owned() },
                 ));
             }
-            ["/plan" | "/build" | "/agent", ..] => {
-                let mode = super::managed_controls::permission_mode_command(&args)
-                    .map_err(ClientError::Protocol)?;
+            ["/agent", "accept-edits" | "accept_edits" | "acceptedits"] => {
+                // Accept-edits is a native mode with no Bcode agent, so it applies directly.
                 return Ok(SlashCommandOutcome::ManagedConfigure(
-                    bcode_harness_models::HarnessSessionSetting::PermissionMode { mode },
+                    bcode_harness_models::HarnessSessionSetting::PermissionMode {
+                        mode: bcode_harness_models::HarnessPermissionMode::AcceptEdits,
+                    },
                 ));
+            }
+            ["/plan" | "/build" | "/agent", ..] => {
+                // Bcode agents are staged for the next message, as in any Bcode conversation.
+                let host = host.ok_or_else(|| {
+                    ClientError::Protocol("Agent selection is unavailable in this managed conversation".into())
+                })?;
+                let message = if args.as_slice() == ["/agent", "default"] {
+                    "/build".to_owned()
+                } else {
+                    message.clone()
+                };
+                let Some(command) = super::slash_registry::slash_command_name(&message)
+                    .and_then(super::slash_registry::builtin_command)
+                else {
+                    return Ok(SlashCommandOutcome::Unknown(message));
+                };
+                return super::slash_commands::execute_resolved(
+                    &host.client(),
+                    Some(commands.session_id()),
+                    super::slash_commands::SlashExecutionContext {
+                        working_directory: &context.working_directory,
+                        current_agent_id: &context.current_agent_id,
+                        reasoning_display_mode: context.reasoning_display_mode,
+                        reasoning_visible: context.reasoning_visible,
+                    },
+                    &message,
+                    super::slash_registry::SlashResolution::Builtin(command),
+                )
+                .await;
             }
             ["/permissions"] => return Ok(SlashCommandOutcome::ReviewPermissions),
             _ => {}
@@ -699,6 +783,8 @@ pub struct SubmitMessageRequest {
     /// Bcode agent (id and name) to announce to a native agent with this message, when it
     /// changed or the native agent dropped the earlier announcement.
     pub native_agent: Option<(String, String)>,
+    /// Bcode agent staged for a native conversation, applied before this message is sent.
+    pub native_agent_change: Option<NativeAgentChange>,
     /// Reasoning effort to apply before sending.
     pub reasoning_effort: Option<String>,
     /// Reasoning summary to apply before sending.
@@ -709,6 +795,15 @@ pub struct SubmitMessageRequest {
     pub execution: bcode_session_models::TurnExecutionOptions,
     /// Event sender for a newly-created session stream.
     pub event_sender: mpsc::Sender<super::history_flow::SessionStreamUpdate>,
+}
+
+/// A staged Bcode agent for a native conversation, applied when the next message is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAgentChange {
+    /// Bcode agent saved with the session; the daemon decides native approvals with it.
+    pub agent_id: String,
+    /// Native permission mode to switch to, when it differs from the current one.
+    pub mode: Option<bcode_harness_models::HarnessPermissionMode>,
 }
 
 /// Skill action kind requested by the TUI.
@@ -1094,11 +1189,6 @@ pub enum TuiEffect {
         response_id: String,
         /// Typed response value.
         value: bcode_harness_models::HarnessResponseValue,
-    },
-    /// Save the conversation's agent, which also decides a native agent's permission requests.
-    SetSessionAgent {
-        session_id: SessionId,
-        agent_id: String,
     },
     /// Read input the daemon holds for this native session until it can be sent.
     LoadManagedQueue,
@@ -1560,8 +1650,6 @@ pub enum TuiEffectResult {
         /// Managed application response.
         result: Result<bcode_harness_models::HarnessServiceResponse, ClientError>,
     },
-    /// The conversation's agent was saved, or could not be.
-    SessionAgentSet { result: Result<(), ClientError> },
     /// Held native input, after a read or a withdrawal.
     ManagedQueueLoaded {
         /// Withdrawal this answers, with whether its text returns to the composer.
@@ -1692,7 +1780,6 @@ impl TuiEffectResult {
             Self::ManagedQueueLoaded { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
-            Self::SessionAgentSet { result } => DaemonObservation::from_client_result(result),
             Self::ManagedSessionDetected { .. } => DaemonObservation::Success,
         }
     }
@@ -1754,6 +1841,8 @@ pub struct SubmitMessageResult {
     pub prepared_request: Option<Box<SubmitMessageRequest>>,
     /// Agent committed during submission.
     pub committed_agent_id: Option<String>,
+    /// Native setting acknowledged while applying a staged agent.
+    pub applied_native_setting: Option<bcode_harness_models::HarnessSessionSetting>,
     /// Pending reasoning effort generation committed during submission.
     pub committed_reasoning_effort_generation: Option<u64>,
     /// Event stream task for a newly-created session.
@@ -1771,6 +1860,7 @@ impl SubmitMessageResult {
             receipt: None,
             prepared_request: None,
             committed_agent_id: None,
+            applied_native_setting: None,
             committed_reasoning_effort_generation: None,
             event_task: None,
             event_stream_release: None,
@@ -1834,7 +1924,6 @@ enum EffectKey {
     ManagedRespond(u64, String),
     ManagedConfigure,
     ManagedQueue,
-    SessionAgent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2161,9 +2250,6 @@ impl TuiEffect {
                 withdrawal: None,
                 result: Err(client_error),
             },
-            Self::SetSessionAgent { .. } => TuiEffectResult::SessionAgentSet {
-                result: Err(client_error),
-            },
             Self::WithdrawManagedQueued {
                 submission_id,
                 edit,
@@ -2210,7 +2296,6 @@ impl TuiEffect {
             | Self::RespondManagedInteraction { .. }
             | Self::LoadManagedQueue
             | Self::WithdrawManagedQueued { .. }
-            | Self::SetSessionAgent { .. }
             | Self::ConfigureManagedSession { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
@@ -2569,7 +2654,6 @@ impl TuiEffect {
                 ..
             } => EffectKey::ManagedRespond(*generation, request_id.clone()),
             Self::LoadManagedQueue | Self::WithdrawManagedQueued { .. } => EffectKey::ManagedQueue,
-            Self::SetSessionAgent { .. } => EffectKey::SessionAgent,
             Self::ConfigureManagedSession { .. } => EffectKey::ManagedConfigure,
         }
     }
@@ -2605,7 +2689,6 @@ impl TuiEffect {
                 | Self::LoadMilestones { .. }
                 | Self::OpenXray { .. }
                 | Self::LoadAgentCatalog
-                | Self::SetSessionAgent { .. }
         )
     }
 
@@ -2716,7 +2799,13 @@ impl TuiEffect {
         }
         match self {
             Self::SubmitMessage { request } => {
-                Box::pin(managed_submit_message(&commands, *request, generation)).await
+                Box::pin(managed_submit_message(
+                    &commands,
+                    host.as_ref(),
+                    *request,
+                    generation,
+                ))
+                .await
             }
             Self::CancelTurn { session_id: owner } if owner == session_id => {
                 let result = async {
@@ -3014,12 +3103,6 @@ impl TuiEffect {
                     error,
                 }
             }
-            Self::SetSessionAgent {
-                session_id,
-                agent_id,
-            } => TuiEffectResult::SessionAgentSet {
-                result: client.set_session_agent(session_id, agent_id).await,
-            },
             Self::LoadAgentCatalog => TuiEffectResult::AgentCatalogLoaded {
                 agents: AgentCatalog::load(&client)
                     .await

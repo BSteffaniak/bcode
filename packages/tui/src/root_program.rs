@@ -1333,7 +1333,7 @@ impl BcodeRuntimeModel {
                 }
                 if action == Some("tui.agent.cycle") {
                     // The agent cycle selects Bcode agents, which the native agent follows.
-                    super::managed_flow::cycle_native_agent(&mut self.chat, &mut self.loop_state);
+                    super::managed_flow::cycle_native_agent(&mut self.chat);
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if action.is_some_and(managed_blocked_chat_action) {
@@ -3755,7 +3755,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                     && self.settings.keymap().action("chat", *stroke) == Some("tui.agent.cycle")
                     && !self.loop_state.modal_foreground()
                 {
-                    super::managed_flow::cycle_native_agent(&mut self.chat, &mut self.loop_state);
+                    super::managed_flow::cycle_native_agent(&mut self.chat);
                     return Ok(bmux_tui_runtime::Update::redraw());
                 }
                 if self.chat.app.managed_execution_session().is_some()

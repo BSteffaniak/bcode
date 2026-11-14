@@ -264,6 +264,12 @@ impl AgentCatalog {
             .map_or(agent_id, |agent| agent.name.as_str())
     }
 
+    /// Metadata for one agent profile.
+    #[must_use]
+    pub fn get(&self, agent_id: &str) -> Option<&AgentInfo> {
+        self.by_id.get(agent_id)
+    }
+
     /// Return true when the catalog has no agent profiles.
     #[must_use]
     pub const fn is_empty(&self) -> bool {

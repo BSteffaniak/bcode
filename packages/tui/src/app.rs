@@ -4108,11 +4108,12 @@ impl BmuxApp {
         self.managed_queue.clone_from(&held.to_vec());
     }
 
-    /// The current agent, when the native agent has not been told about it yet (or dropped
-    /// the announcement when it summarized earlier turns). Records it as announced.
+    /// The agent the next message runs with (a staged selection or the current agent), when
+    /// the native agent has not been told about it yet (or dropped the announcement when it
+    /// summarized earlier turns). Records it as announced.
     pub fn take_native_agent_announcement(&mut self) -> Option<String> {
         let current = (
-            self.current_agent_id().to_owned(),
+            self.display_agent_id().to_owned(),
             self.session_view.snapshot().native_context_compactions,
         );
         if self.native_agent_announced.as_ref() == Some(&current) {

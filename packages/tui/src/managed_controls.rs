@@ -177,21 +177,14 @@ pub const fn permission_mode_label(mode: HarnessPermissionMode) -> &'static str 
     }
 }
 
-/// Parse `/plan`, `/build` and `/agent <mode>` into a native permission mode.
-///
-/// # Errors
-/// Returns a usage message for unknown agent/mode names; no Bcode agent is selected.
-pub fn permission_mode_command(parts: &[&str]) -> Result<HarnessPermissionMode, String> {
-    match parts {
-        ["/plan"] | ["/agent", "plan"] => Ok(HarnessPermissionMode::Plan),
-        ["/build"] | ["/agent", "build" | "default"] => Ok(HarnessPermissionMode::Default),
-        ["/agent", "accept-edits" | "accept_edits" | "acceptedits"] => {
-            Ok(HarnessPermissionMode::AcceptEdits)
-        }
-        _ => Err(
-            "Managed conversations select native permission modes: /plan, /build, or /agent plan|build|accept-edits"
-                .into(),
-        ),
+/// Native permission mode a Bcode agent runs in: plan mode for a read-only agent, the
+/// default mode otherwise.
+#[must_use]
+pub const fn permission_mode_for_agent(read_only: bool) -> HarnessPermissionMode {
+    if read_only {
+        HarnessPermissionMode::Plan
+    } else {
+        HarnessPermissionMode::Default
     }
 }
 
@@ -743,23 +736,6 @@ mod tests {
             let support = command_support(command.trim_end()).unwrap();
             assert_ne!(support, ManagedCommandSupport::Unavailable, "{command}");
         }
-    }
-
-    #[test]
-    fn permission_mode_commands() {
-        assert_eq!(
-            permission_mode_command(&["/plan"]),
-            Ok(HarnessPermissionMode::Plan)
-        );
-        assert_eq!(
-            permission_mode_command(&["/build"]),
-            Ok(HarnessPermissionMode::Default)
-        );
-        assert_eq!(
-            permission_mode_command(&["/agent", "accept-edits"]),
-            Ok(HarnessPermissionMode::AcceptEdits)
-        );
-        assert!(permission_mode_command(&["/agent", "review"]).is_err());
     }
 
     #[test]

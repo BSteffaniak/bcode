@@ -70,6 +70,7 @@ impl ShellEffects {
                     submission: Ok(Some(record)),
                     prepared_request: None,
                     committed_agent_id: None,
+                    applied_native_setting: None,
                     committed_reasoning_effort_generation: None,
                     // The created session's event stream: the scenario delivers its events live.
                     event_task: Some(tokio::spawn(std::future::pending())),

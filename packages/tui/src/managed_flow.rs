@@ -434,51 +434,34 @@ pub fn start_configure(
     });
 }
 
-/// Cycle the native permission mode: Default → `AcceptEdits` → Plan → Default.
-/// Cycle Bcode's agents in a native conversation, as in any Bcode conversation. The native
-/// agent runs a read-only Bcode agent in its plan mode and any other agent in its default mode.
-pub fn cycle_native_agent(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
+/// Cycle Bcode's agents in a native conversation, as in any Bcode conversation: the choice is
+/// staged for the next message, which applies it to the session and the native agent's mode.
+pub fn cycle_native_agent(chat: &mut ActiveChat) {
     if chat.agents.is_empty() {
         chat.replace_effect(TuiEffect::LoadAgentCatalog);
         chat.app.set_status("Agents are still loading".to_owned());
         return;
     }
-    let Some(agent) = chat.agents.next_agent(chat.app.current_agent_id()).cloned() else {
-        chat.app.set_status("No agents available".to_owned());
-        return;
-    };
-    let mode = if agent.read_only {
-        bcode_harness_models::HarnessPermissionMode::Plan
-    } else {
-        bcode_harness_models::HarnessPermissionMode::Default
-    };
-    chat.agents
-        .apply_agent_to_app(&mut chat.app, agent.id.clone());
-    if let Some(session_id) = chat.attached_session_id() {
-        // The daemon decides the native agent's permission requests with this agent.
-        chat.start_effect(TuiEffect::SetSessionAgent {
-            session_id,
-            agent_id: agent.id.clone(),
-        });
-    }
+    super::chat_loop::cycle_session_agent(chat);
+}
+
+/// Note in the transcript that a staged agent now applies to the native agent.
+pub fn note_native_agent_switch(chat: &mut ActiveChat, agent_id: &str) {
+    let read_only = chat
+        .agents
+        .get(agent_id)
+        .is_some_and(|agent| agent.read_only);
+    let name = chat.agents.name_of(agent_id).to_owned();
     let label = chat
         .app
         .managed_label()
         .unwrap_or("The native agent")
         .to_owned();
-    chat.app.push_ephemeral_system_plain(if agent.read_only {
-        format!(
-            "Switched to the {} agent: {label} plans without changing files.",
-            agent.name
-        )
+    chat.app.push_ephemeral_system_plain(if read_only {
+        format!("Switched to the {name} agent: {label} plans without changing files.")
     } else {
-        format!("Switched to the {} agent.", agent.name)
+        format!("Switched to the {name} agent.")
     });
-    start_configure(
-        chat,
-        loop_state,
-        HarnessSessionSetting::PermissionMode { mode },
-    );
 }
 
 /// Apply one managed setting outcome. Ambiguous outcomes are reported, never replayed.
@@ -928,34 +911,44 @@ mod tests {
         assert!(loop_state.has_model_picker());
         assert!(loop_state.execution_picker.is_none());
         loop_state.model_switcher = None;
-        // Tab cycles Bcode's own agents; the read-only one runs as the native plan mode.
+        // Tab stages Bcode's own agents for the next message, as in any Bcode conversation:
+        // nothing is saved, configured or noted while cycling.
         with_agents(&mut chat);
-        cycle_native_agent(&mut chat, &mut loop_state);
+        let notices = chat.app.ephemeral_notices().count();
+        cycle_native_agent(&mut chat);
+        assert_eq!(chat.app.current_agent_id(), "build");
+        assert_eq!(chat.app.display_agent_id(), "plan");
+        cycle_native_agent(&mut chat);
+        assert_eq!(chat.app.display_agent_id(), "build");
+        cycle_native_agent(&mut chat);
+        assert_eq!(chat.app.display_agent_id(), "plan");
+        assert!(drained(&mut chat).is_empty());
+        assert_eq!(chat.app.ephemeral_notices().count(), notices);
+        assert_eq!(chat.app.managed_settings().permission_mode, None);
+        // Once a message applies it, the switch is noted once.
+        chat.app.commit_submitted_agent("plan");
+        note_native_agent_switch(&mut chat, "plan");
+        assert_eq!(chat.app.ephemeral_notices().count(), notices + 1);
         assert_eq!(chat.app.current_agent_id(), "plan");
-        let mut effects = drained(&mut chat);
-        // The agent is saved with the session, so the daemon decides native approvals with it.
-        let saved = effects
-            .iter()
-            .position(|effect| matches!(effect, TuiEffect::SetSessionAgent { agent_id, .. } if agent_id == "plan"))
-            .expect("agent saved");
-        effects.remove(saved);
+        assert_eq!(chat.app.pending_agent_id(), None);
+
+        // Native setting changes are serialized: a second waits for the first outcome.
+        let setting = HarnessSessionSetting::PermissionMode {
+            mode: bcode_harness_models::HarnessPermissionMode::AcceptEdits,
+        };
+        start_configure(&mut chat, &mut loop_state, setting.clone());
+        let effects = drained(&mut chat);
         let [
             TuiEffect::ConfigureManagedSession {
                 generation: 7,
                 mutation_id,
-                setting,
+                setting: sent,
             },
         ] = &effects[..]
         else {
             panic!("expected configure");
         };
-        assert_eq!(
-            setting,
-            &HarnessSessionSetting::PermissionMode {
-                mode: bcode_harness_models::HarnessPermissionMode::Plan
-            }
-        );
-        // A second change waits for the first outcome instead of racing it.
+        assert_eq!(sent, &setting);
         start_configure(
             &mut chat,
             &mut loop_state,
@@ -968,7 +961,7 @@ mod tests {
             &mut chat,
             &mut loop_state,
             mutation_id,
-            setting,
+            &setting,
             &Ok(HarnessServiceResponse {
                 schema_version: bcode_harness_models::HARNESS_SCHEMA_VERSION,
                 request_id: mutation_id.clone(),
@@ -980,22 +973,8 @@ mod tests {
         );
         assert_eq!(
             chat.app.managed_settings().permission_mode,
-            Some(bcode_harness_models::HarnessPermissionMode::Plan)
+            Some(bcode_harness_models::HarnessPermissionMode::AcceptEdits)
         );
-        cycle_native_agent(&mut chat, &mut loop_state);
-        assert_eq!(chat.app.current_agent_id(), "build");
-        assert!(matches!(
-            &drained(&mut chat)
-                .into_iter()
-                .filter(|effect| !matches!(effect, TuiEffect::SetSessionAgent { .. }))
-                .collect::<Vec<_>>()[..],
-            [TuiEffect::ConfigureManagedSession {
-                setting: HarnessSessionSetting::PermissionMode {
-                    mode: bcode_harness_models::HarnessPermissionMode::Default
-                },
-                ..
-            }]
-        ));
         assert!(
             intercept_slash_outcome(
                 &mut chat,

@@ -4197,11 +4197,6 @@ pub fn apply_effect_result(
             &setting,
             &result,
         ),
-        TuiEffectResult::SessionAgentSet { result } => {
-            if let Err(error) = result {
-                report_nonfatal_client_error(chat, "Saving the agent failed", &error);
-            }
-        }
         TuiEffectResult::ManagedQueueLoaded { withdrawal, result } => {
             super::managed_flow::apply_queue_result(chat, withdrawal, result);
         }
@@ -5213,6 +5208,7 @@ fn resend_retained_native(
             model_id: None,
             agent_id: None,
             native_agent: None,
+            native_agent_change: None,
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_effort_generation: None,
@@ -5235,7 +5231,7 @@ fn apply_submit_message_result(
     match result {
         Ok(mut result) => {
             if let Some(request) = result.prepared_request.take() {
-                dispatch_prepared_managed_composer(chat, request);
+                dispatch_prepared_native(chat, &mut result, request);
                 return;
             }
             if let Some(super::effects::ComposerReceipt::Managed(response)) = &result.receipt {
@@ -5323,6 +5319,8 @@ fn apply_submit_message_result(
                 }
                 return;
             }
+            // Native input that was never prepared did not carry its agent announcement.
+            chat.app.forget_native_agent_announcement();
             daemon_issue::report_client_issue(
                 &mut chat.app,
                 &format!(
@@ -5333,6 +5331,22 @@ fn apply_submit_message_result(
             );
         }
     }
+}
+
+/// Commit what the native message applied (its staged agent and native mode), then send it.
+fn dispatch_prepared_native(
+    chat: &mut ActiveChat,
+    result: &mut super::effects::SubmitMessageResult,
+    request: Box<super::effects::SubmitMessageRequest>,
+) {
+    if let Some(setting) = result.applied_native_setting.take() {
+        chat.app.apply_managed_setting(&setting);
+    }
+    if let Some(agent_id) = result.committed_agent_id.take() {
+        chat.app.commit_submitted_agent(&agent_id);
+        super::managed_flow::note_native_agent_switch(chat, &agent_id);
+    }
+    dispatch_prepared_managed_composer(chat, request);
 }
 
 fn ensure_session_stream_after_foreground_wake(chat: &mut ActiveChat) {
@@ -7243,6 +7257,7 @@ mod scheduler_tests {
             model_id: None,
             agent_id: None,
             native_agent: None,
+            native_agent_change: None,
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_effort_generation: None,
@@ -7276,6 +7291,7 @@ mod scheduler_tests {
                 receipt: None,
                 prepared_request: Some(Box::new(conflict)),
                 committed_agent_id: None,
+                applied_native_setting: None,
                 committed_reasoning_effort_generation: None,
                 event_task: None,
                 event_stream_release: None,
@@ -7309,6 +7325,7 @@ mod scheduler_tests {
                 receipt: None,
                 prepared_request: Some(Box::new(overflow)),
                 committed_agent_id: None,
+                applied_native_setting: None,
                 committed_reasoning_effort_generation: None,
                 event_task: None,
                 event_stream_release: None,
@@ -7336,6 +7353,7 @@ mod scheduler_tests {
             receipt: None,
             prepared_request: Some(Box::new(request)),
             committed_agent_id: None,
+            applied_native_setting: None,
             committed_reasoning_effort_generation: None,
             event_task: None,
             event_stream_release: None,
@@ -7378,6 +7396,7 @@ mod scheduler_tests {
                 receipt: Some(ComposerReceipt::Managed(Box::new(response))),
                 prepared_request: None,
                 committed_agent_id: None,
+                applied_native_setting: None,
                 committed_reasoning_effort_generation: None,
                 event_task: None,
                 event_stream_release: None,
@@ -7404,6 +7423,90 @@ mod scheduler_tests {
     }
 
     #[tokio::test]
+    async fn a_staged_native_agent_commits_only_when_its_message_is_prepared() {
+        use super::super::effects::SubmitMessageResult;
+        use bcode_harness_models::{HarnessPermissionMode, HarnessSessionSetting};
+        let mut chat = managed_test_chat();
+        chat.event_task = Some(tokio::spawn(std::future::pending()));
+        chat.agents = super::super::session_flow::AgentCatalog::from_agents(vec![
+            bcode_agent_profile::AgentInfo {
+                id: "build".into(),
+                name: "Build".into(),
+                description: String::new(),
+                badge: None,
+                accent: None,
+                aliases: Vec::new(),
+                is_default: true,
+                read_only: false,
+            },
+            bcode_agent_profile::AgentInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: String::new(),
+                badge: None,
+                accent: None,
+                aliases: Vec::new(),
+                is_default: false,
+                read_only: true,
+            },
+        ]);
+        chat.agents.apply_agent_to_app(&mut chat.app, "build");
+        chat.app.set_pending_agent("plan", None);
+        let switch_notes = |chat: &ActiveChat| {
+            chat.app
+                .ephemeral_notices()
+                .filter(|notice| notice.text().starts_with("Switched to the Plan agent"))
+                .count()
+        };
+
+        // Applying the agent failed: nothing was sent and the selection stays staged.
+        chat.app.replace_composer_with("native input");
+        chat.app.stage_submission();
+        let identity = chat.app.pending_submissions().last().unwrap().id().clone();
+        apply_submit_message_result(
+            &mut chat,
+            &identity,
+            "native input",
+            Err(ClientError::Protocol(
+                "Switching to plan mode was not confirmed; nothing was sent".into(),
+            )),
+        );
+        assert_eq!(chat.app.current_agent_id(), "build");
+        assert_eq!(chat.app.pending_agent_id(), Some("plan"));
+        assert_eq!(chat.app.managed_settings().permission_mode, None);
+        assert_eq!(switch_notes(&chat), 0);
+        assert_eq!(chat.pending_effects.queued_effect_count(), 0);
+
+        // Once applied, the agent and the native mode are committed with the message.
+        let request = managed_test_request(&chat, &identity.0);
+        let setting = HarnessSessionSetting::PermissionMode {
+            mode: HarnessPermissionMode::Plan,
+        };
+        let prepared = SubmitMessageResult {
+            session_id: chat.attached_session_id().unwrap(),
+            created_session: None,
+            submission: Ok(None),
+            receipt: None,
+            prepared_request: Some(Box::new(request)),
+            committed_agent_id: Some("plan".into()),
+            applied_native_setting: Some(setting),
+            committed_reasoning_effort_generation: None,
+            event_task: None,
+            event_stream_release: None,
+        };
+        apply_submit_message_result(&mut chat, &identity, "native input", Ok(prepared));
+        assert_eq!(chat.app.current_agent_id(), "plan");
+        assert_eq!(chat.app.pending_agent_id(), None);
+        assert_eq!(
+            chat.app.managed_settings().permission_mode,
+            Some(HarnessPermissionMode::Plan)
+        );
+        assert_eq!(switch_notes(&chat), 1);
+        assert_eq!(chat.pending_effects.queued_effect_count(), 1);
+        chat.event_task.take().unwrap().abort();
+    }
+
+    #[tokio::test]
     async fn a_failed_native_hand_off_resends_the_exact_attempt_then_gives_the_text_back() {
         use super::super::effects::SubmitMessageResult;
         let mut chat = managed_test_chat();
@@ -7420,6 +7523,7 @@ mod scheduler_tests {
             receipt: None,
             prepared_request: Some(Box::new(request)),
             committed_agent_id: None,
+            applied_native_setting: None,
             committed_reasoning_effort_generation: None,
             event_task: None,
             event_stream_release: None,
@@ -7475,6 +7579,7 @@ mod scheduler_tests {
             ))),
             prepared_request: None,
             committed_agent_id: None,
+            applied_native_setting: None,
             committed_reasoning_effort_generation: None,
             event_task: None,
             event_stream_release: None,
