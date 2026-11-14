@@ -406,7 +406,7 @@ the file, on the layer), and comparisons add where the data allows:
 
 | Keys | Action id | Action |
 |---|---|---|
-| `b` | `compare_baseline` | Changes since…: choose what to compare with |
+| `b` | `compare_baseline` | The comparison menu: baselines and view options, previewed live |
 | `shift+l` | `compare_view` | Only what changed / the full change with what is new marked |
 | `shift+b` | `stack_history` | History matrix (acts in place) |
 | `alt+,`, `alt+.` | `file_version_previous`, `file_version_next` | This file's previous / next version |
@@ -562,7 +562,7 @@ Built:
   session; every layer is compared in one `review.compare.layers` call (the current layer first)
   and laid over the document, again only for pairs that changed. The comparison row
   (`compare_bar.rs`: control, summary with progress, push timeline) and the reopen banner;
-  `b` (`compare_baseline`) opens the "Changes since…" menu (`compare_menu.rs`); `shift+l` is
+  `b` (`compare_baseline`) opens the comparison menu (`compare_menu.rs`); `shift+l` is
   `compare_view` (overrides of `since_last_review` are read as it); `]`/`[` stop on new lines
   first; rail and file-panel badges; *only pull requests with real changes*
   (`ReviewDocument::set_filtered_sources`, a `+N` rail tab, `.`/`,` skip); the `compare.*`
@@ -578,6 +578,15 @@ Built:
   recorded), per-file version stepping (`GroupComparison::steps`, `files`,
   `ReviewDocument::set_file_comparison`, `FileVersionsItem` on headers, `alt+,`/`alt+.` and the
   header's arrows), and *the stack as it was* (`a` in the matrix).
+* **Live comparison control.** The menu previews each pick on the review behind it (`space` or
+  a click), `enter` keeps, `esc` restores the choice it opened on (`Comparing` holds a snapshot;
+  nothing is saved while it is open); deltas computed in the session are kept by pair so a pick
+  made again lays at once. The baseline in effect is a radio mark with what it resolves to, view
+  options are check boxes, and the comparison row shows the options on as chips. The file panel
+  follows the comparison (`files.rs`, `surface/compare_legend.rs`): changed, new, unchanged and
+  dropped files, group badges, files hidden as in the document
+  (`ReviewDocument::file_compare_hidden`), and a legend with the comparison, what it found, and
+  what it hides.
 
 Not built yet:
 

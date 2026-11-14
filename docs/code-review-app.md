@@ -340,16 +340,31 @@ work the same with or without one.
   of 3 PRs changed · 2 rebased only`, then the stack's pushes as ticks (`┃` a push that changed
   some pull request's own change, `│` one that only rebased; `[`/`]` around the pushes compared)
   and when the last push was. While layers are compared it says how far it got ("comparing 6 of
-  21…"). It narrows to `Since: last looked ▾` and `Δ▾`; pushes share ticks when cells are few.
+  21…"). The view options that are on follow the control as chips (`[only what changed]`,
+  `[only PRs with real changes]`); a click on one opens the menu. It narrows to `Since: last
+  looked ▾` and `Δ▾` (brief chips, then none); pushes share ticks when cells are few.
 * **A review that moved since you looked** reopens comparing with what you last looked at (even
   when another choice was saved), with a banner: what changed, and **Only what changed**
   (`shift+l`), **Compare with…** (`b`) and **Dismiss**.
-* **`b`** (or a click on the control) chooses what to compare with: *You last looked*, *Previous
-  push*, *A push…* (the timeline takes the keys: `←`/`→`, `f` from, `t` to, `enter`, `esc`; a
-  click on a tick compares from before it, with `shift` up to after it), *A version of this pull
-  request…* (the version picker), *1 hour ago*, *Yesterday*, *A week ago*, or *Full change* (no
-  comparison); and toggles *Only pull requests with real changes* and *Show only what changed*.
-  The choice is kept with the review; *you last looked* is worked out again on every open.
+* **`b`** (or a click on the control) opens the comparison menu, a live control over the review
+  behind it. Under **Show changes since** it lists the baselines as radio buttons: *you last
+  looked*, *the previous push*, *1 hour ago*, *yesterday*, *a week ago*, *pushes picked on the
+  timeline…* (the timeline takes the keys: `←`/`→`, `f` from, `t` to, `enter`, `esc`; a click on
+  a tick compares from before it, with `shift` up to after it), *two versions of #N…* (the
+  version picker), *the stack as it was* (only while a history choice is in effect) and
+  *nothing: show the full change*. The baseline in effect is marked `◉` with what it resolves to
+  (`◉ you last looked · 4m ago`, `◉ pushes picked on the timeline… · 3h ago → now`), and the
+  menu opens with the cursor on it. Under **View** it lists the check boxes *Only what changed*
+  and *Only pull requests with real changes*.
+  * `space` (or a click) picks the row in place: the review behind the menu compares with that
+    baseline, or flips that option, at once, and the menu stays open; the footer says how far a
+    comparison got while one computes. Comparisons computed before are laid again at once.
+  * `enter` keeps what is set and closes the menu (on a baseline not yet in effect it picks it
+    first); a click outside the menu does the same.
+  * `esc` puts back exactly what the menu opened on.
+  * Rows that open another picker (pushes, versions) close the menu and open it.
+  Nothing is saved while the menu is open; the choice is kept with the review when it closes,
+  and *you last looked* is worked out again on every open.
 * **The version picker** lists the current pull request's versions newest first (`v1`..`vN`,
   when, what kind of change, and which you looked at or reviewed). `f` sets *from*, `t` sets
   *to* (now by default), `enter` compares; a click sets *from*, a `shift`-click *to*. A
@@ -360,18 +375,42 @@ work the same with or without one.
   are tinted with a bar in the gutter, and code removed since then is a marker you can expand.
   `]`/`[` stop on new lines first. `shift+l` switches between that full change and only what
   changed (each changed file from its old version replayed on today's base to the current code).
-* **Badges.** Rail tabs and file panel groups say how each pull request changed: `● +40 −12 · 3
-  files`, `○ rebased`, `✓ unchanged`, `+ new to you`, `≈` (the rebase could not be taken out),
-  `?` (the baseline's commits are gone), `⋯` (still comparing). *Only pull requests with real
-  changes* folds the others into one `+N ○` tab (a click shows them again), and `.`/`,` skip them.
+* **Badges.** Rail tabs say how each pull request changed: `● +40 −12 · 3 files`, `○ rebased`,
+  `✓ unchanged`, `+ new to you`, `≈` (the rebase could not be taken out), `?` (the baseline's
+  commits are gone), `⋯` (still comparing). *Only pull requests with real changes* folds the
+  others into one `+N ○` tab (a click shows them again), and `.`/`,` skip them.
+* **The file panel** follows the comparison, one pull request at a time and with every layer
+  shown (`shift+o`) alike.
+  * A legend over the tree names the comparison and the options on (`Changes since you last
+    looked · 4m ago · only what changed`; a click opens the menu), then what it found: for one
+    pull request `1 of 3 files changed since you last looked (4m ago): +1 −0`, or plainly `No
+    changes since you last looked (4m ago): only rebased`; with every layer `1 of 3 PRs changed ·
+    2 rebased only`. Without a comparison it says *Full change: no comparison*.
+  * Files changed since the baseline are marked `●` (new to the change since then: `+`) before
+    their status, in bold, with their since counts (`Δ+3−1`, `new +12`); files the same as then
+    recede (dimmed); files the baseline's change had and the current one dropped are listed,
+    struck through and inert, as `− path  dropped since` at the end of their group.
+  * Group rows (one per layer with every layer shown) carry the same badge as the rail (`●
+    +40 −12 · 3 files`, `○ rebased only`, `✓ no changes`, `⋯ comparing`, `? baseline gone`)
+    instead of their whole change's counts; layers with nothing to look at again recede.
+  * The panel lists what the document shows: files the comparison hides there (unchanged since
+    then in *only what changed*, every file of a layer only rebased) are left out, counted on
+    their group (`· 2 hidden`), and the legend says `2 files hidden: unchanged since then
+    [show]`. Showing them (that row, the summary row's button in the document, or *Compare: show
+    or hide the files the comparison hides* in the palette) shows them in both, dimmed, with
+    `[hide]` to hide them again. A compared group stays listed even when all its files are
+    hidden.
+  * When *Only pull requests with real changes* leaves pull requests out, the legend says so
+    (`2 pull requests hidden: no real changes [show all]`, or *skipped* one at a time) and the
+    row turns the option off.
 * **A file's versions.** Once the current pull request's versions are compared with each other,
   a file header says `changed in 2 of 4 pushes · v4 ◂ ▸`; `alt+,` and `alt+.` (or the arrows;
   `alt+[`/`alt+]` where the terminal reports them) step that file alone to the previous or next
   push that changed it (read-only), and past the newest back to the pull request's comparison.
 * **The history matrix** (`shift+b`) compares in place too: `enter` the cursor's pull request
   with its version before, `p` the pushes between the pin (`f`) and the cursor, `s` everything
-  since the cursor's column, `a` the stack as it was then, `r` since you last looked, `i` only
-  real changes.
+  since the cursor's column, `a` the whole stack at this push (the menu marks it *the stack as
+  it was*), `r` since you last looked, `i` only real changes.
 
 ### Pull request conversations
 
