@@ -605,7 +605,19 @@ impl ReviewSurface {
             .workspace
             .as_ref()
             .and_then(|workspace| workspace.presentation.as_ref());
-        let saved = presentation.and_then(|state| state.compare.baseline);
+        let ago = presentation.and_then(|state| state.compare.ago_ms);
+        // A time chosen as "this long ago" is that long before this open.
+        let saved = presentation
+            .and_then(|state| state.compare.baseline)
+            .map(|saved| match (saved, ago) {
+                (Baseline::Between { to_ms: None, .. }, Some(ago)) => Baseline::Between {
+                    from_ms: super::super::history::now_ms().saturating_sub(ago),
+                    to_ms: None,
+                },
+                (saved, _) => saved,
+            });
+        self.comparing.ago =
+            ago.filter(|_| matches!(saved, Some(Baseline::Between { to_ms: None, .. })));
         self.comparing.restored = saved.filter(|saved| *saved != Baseline::LastLooked);
         self.comparing.baseline = saved.unwrap_or_else(|| {
             config
@@ -743,6 +755,7 @@ impl ReviewSurface {
         });
         if moved {
             self.comparing.baseline = Baseline::LastLooked;
+            self.comparing.ago = None;
             self.comparing.picks.clear();
             self.comparing.banner = BannerState::Undecided;
         }
@@ -1245,11 +1258,16 @@ impl ReviewSurface {
     /// Compare every layer by `baseline` (clearing single picks), kept for the next open
     /// (while no layer moved since the reviewer last looked).
     pub(super) fn set_compare_baseline(&mut self, baseline: Baseline, host: &UiContext) {
+        self.choose_baseline(baseline, None, host);
+    }
+
+    /// Compare every layer by `baseline`, chosen as the time `ago` before now when given.
+    fn choose_baseline(&mut self, baseline: Baseline, ago: Option<u64>, host: &UiContext) {
         self.comparing.baseline = baseline;
         self.comparing.restored = None;
         self.comparing.picks.clear();
         self.comparing.timeline = None;
-        self.comparing.ago = None;
+        self.comparing.ago = ago;
         self.comparing.stack_at = None;
         if baseline != Baseline::LastLooked {
             self.comparing.banner = BannerState::Hidden;
@@ -1419,15 +1437,25 @@ impl ReviewSurface {
             self.comparing.snapshot = None;
         }
         let (baseline, only_changed) = (self.comparing.baseline, self.comparing.only_changed);
+        let ago = self.comparing.ago;
         let picked = !self.comparing.picks.is_empty();
+        let mut changed = false;
         if let Some(workspace) = self.workspace.as_mut() {
             let state = workspace.presentation.get_or_insert_with(Default::default);
+            let before = state.compare;
             if !picked {
                 state.compare.baseline = Some(baseline);
+                state.compare.ago_ms = ago;
             }
             state.compare.only_changed = only_changed;
+            changed = state.compare != before;
         }
         self.persist_presentation(true);
+        // The choice is written into the workspace's state above, so the presentation check
+        // sees no difference: save it here.
+        if changed {
+            self.request_save();
+        }
     }
 
     /// The baseline in words: in full and briefly.
@@ -1520,14 +1548,14 @@ impl ReviewSurface {
 
     /// Compare every layer with how it was `ms` ago.
     pub(super) fn compare_ago(&mut self, ms: u64, host: &UiContext) {
-        self.set_compare_baseline(
+        self.choose_baseline(
             Baseline::Between {
                 from_ms: super::super::history::now_ms().saturating_sub(ms),
                 to_ms: None,
             },
+            Some(ms),
             host,
         );
-        self.comparing.ago = Some(ms);
     }
 
     /// Record a look of `kind` at the layer `file` belongs to (its current version).

@@ -64,6 +64,10 @@ pub struct ReviewCompareChoice {
     /// Only pull requests with real changes since the baseline are shown.
     #[serde(default)]
     pub only_changed: bool,
+    /// The baseline was chosen as a time this long before now (`1 hour ago`, `yesterday`):
+    /// a reopened review compares with that long before it reopens, and names the choice so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ago_ms: Option<u64>,
 }
 
 impl ReviewCompareChoice {

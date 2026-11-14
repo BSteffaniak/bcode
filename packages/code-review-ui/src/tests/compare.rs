@@ -1203,6 +1203,57 @@ fn the_menu_previews_picks_live_keeps_them_on_enter_and_puts_them_back_on_escape
 }
 
 #[test]
+fn a_time_picked_in_the_menu_reopens_marked_as_that_time() {
+    use crate::compare_menu::{AGO_PRESETS, MenuChoice};
+    use bcode_code_review_models::ReviewCompareBaseline;
+    let (fixture, backend, id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let (day, _) = AGO_PRESETS[1];
+    // Looked at as it is now (a completed pass), so the saved choice is kept on reopen.
+    scenario.key("shift+m");
+    settled(&mut scenario);
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Ago(day));
+    scenario.key("space");
+    settled(&mut scenario);
+    scenario.key("enter");
+    settled(&mut scenario);
+    let saved = scenario
+        .surface()
+        .review()
+        .expect("review")
+        .presentation()
+        .compare;
+    assert_eq!(saved.ago_ms, Some(day));
+    scenario.key("q");
+    settled(&mut scenario);
+
+    let mut scenario = resume(&fixture, &backend, &id);
+    settled(&mut scenario);
+    let comparing = scenario.surface().review().expect("review").comparing();
+    assert_eq!(
+        comparing.ago(),
+        Some(day),
+        "{:?} {:?}",
+        comparing.baseline(),
+        scenario
+            .surface()
+            .review()
+            .expect("review")
+            .presentation()
+            .compare
+    );
+    assert!(matches!(
+        comparing.baseline(),
+        ReviewCompareBaseline::Between { to_ms: None, .. }
+    ));
+    scenario.key("b");
+    let screen = settled(&mut scenario);
+    assert_eq!(menu_focus(&scenario), Some(MenuChoice::Ago(day)));
+    assert!(screen.contains("◉ yesterday"), "{}", screen.text());
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
