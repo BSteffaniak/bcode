@@ -35,6 +35,9 @@ impl ReviewDocument {
         rebuilt.ignore_whitespace = self.ignore_whitespace;
         rebuilt.composer.clone_from(&self.composer);
         rebuilt.marks = std::mem::take(&mut self.marks);
+        rebuilt.comparisons = std::mem::take(&mut self.comparisons);
+        rebuilt.compare_files_shown = std::mem::take(&mut self.compare_files_shown);
+        rebuilt.expanded_removals = std::mem::take(&mut self.expanded_removals);
         rebuilt.tick = self.tick;
         rebuilt.next_ticket = self.next_ticket;
         for (group, hidden) in rebuilt.groups.iter_mut().zip(regrouped.hidden) {
@@ -148,6 +151,8 @@ impl ReviewDocument {
             state.last_used = old.last_used;
             state.resident_bytes = old.resident_bytes;
             state.carried_over = old.carried_over;
+            state.marks = old.marks;
+            state.content_base = old.content_base;
             moved.insert(old_index, new_index);
         }
         rebuilt.pending = std::mem::take(&mut self.pending)
@@ -156,6 +161,7 @@ impl ReviewDocument {
                 let remapped = match pending {
                     Pending::Hunks(file) => Pending::Hunks(*moved.get(&file)?),
                     Pending::Attribution(file) => Pending::Attribution(*moved.get(&file)?),
+                    Pending::Marks(file) => Pending::Marks(*moved.get(&file)?),
                     Pending::Blob { file, start, count } => Pending::Blob {
                         file: *moved.get(&file)?,
                         start,

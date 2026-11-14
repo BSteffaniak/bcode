@@ -5,19 +5,22 @@
 //! same data; only line items differ.
 
 use super::anchors::{AnchorLines, AnchorTarget, AnnotationBody};
+use super::compare::Marks;
 use super::gaps::{self, Region};
 use super::items::{
-    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileEndItem, FileHeaderItem,
-    FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayoutMode, LineContent, LineItem, LineKind,
-    LinePairItem, OutdatedReason, PairSide, PlaceholderItem, ReviewItem, SourceHeaderItem,
-    SourceIntroItem, StackLayerLabel, ThreadItem,
+    AgentThreadItem, AnchorPlacement, CompareNoteItem, ComposerItem, FileDetailsItem, FileEndItem,
+    FileHeaderItem, FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayoutMode, LineContent,
+    LineItem, LineKind, LinePairItem, OutdatedReason, PairSide, PlaceholderItem, RemovedSinceItem,
+    ReviewItem, SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem,
 };
 use super::keys::{FileNoticeKind, FileRef};
 use super::review::{
     AttributionState, Block, BlockKind, Content, DocHunk, DocLine, FileState, Loaded,
     ReviewDocument,
 };
-use bcode_code_review_models::{ReviewIndexFlag, ReviewLineKind, ReviewLineSide};
+use bcode_code_review_models::{
+    FileSince, RemovedSince, ReviewIndexFlag, ReviewLineKind, ReviewLineSide,
+};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -146,8 +149,9 @@ impl ReviewDocument {
                 under_header: group.show_header,
             })
         });
-        // Annotations on the source as a whole follow the introduction.
-        let mut notes: Vec<ReviewItem> = Vec::new();
+        // A comparison's summary follows the introduction, then annotations on the source as a
+        // whole.
+        let mut notes: Vec<ReviewItem> = self.compare_note(index).into_iter().collect();
         for annotation in self.source_annotations.get(&index).into_iter().flatten() {
             self.push_annotation(*annotation, AnchorPlacement::Review, &mut notes);
         }
@@ -200,6 +204,51 @@ impl ReviewDocument {
             hunk_parent: vec![None; items.len()],
             items,
         }
+    }
+
+    /// What group `index`'s comparison found, once per source (on its first part).
+    fn compare_note(&self, index: usize) -> Option<ReviewItem> {
+        let group = &self.groups[index];
+        if group
+            .source
+            .part
+            .as_ref()
+            .is_some_and(|part| part.index != 0)
+        {
+            return None;
+        }
+        let comparison = self.group_comparison(index)?;
+        let delta = comparison.delta.as_ref();
+        let (mut changed_files, mut unchanged_files) = (0, 0);
+        for file in group.files.clone() {
+            match self.since_of(file) {
+                Some(since) if since.changed() => changed_files += 1,
+                Some(FileSince::Unchanged) => unchanged_files += 1,
+                _ => {}
+            }
+        }
+        let (added, removed) = delta.map_or((0, 0), bcode_code_review_models::LayerDelta::totals);
+        Some(ReviewItem::CompareNote(CompareNoteItem {
+            source_id: group.source.source_id.clone(),
+            part: group.source.part.as_ref().map(|part| part.index),
+            kind: delta.map(|delta| delta.kind),
+            view: comparison.view,
+            changed_files,
+            unchanged_files,
+            dropped: delta
+                .map(|delta| {
+                    delta
+                        .files
+                        .iter()
+                        .filter(|file| file.since == FileSince::Dropped)
+                        .map(|file| file.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            added,
+            removed,
+            files_shown: self.compare_files_shown.contains(&group.source.source_id),
+        }))
     }
 
     /// Push the annotation at `index`, and the composer when it shows under it.
@@ -314,6 +363,7 @@ impl ReviewDocument {
                 parents.push(None);
             }
             Content::Loaded(loaded) => {
+                let marks = self.file_marks(file);
                 let mut builder = FileBuilder {
                     doc: self,
                     state,
@@ -322,6 +372,8 @@ impl ReviewDocument {
                     items,
                     parents,
                     slots,
+                    marks,
+                    removals: marks.map_or(&[][..], |marks| &marks.removed_since),
                 };
                 builder.content(&regions);
                 let (mut items, mut parents) = (builder.items, builder.parents);
@@ -363,6 +415,7 @@ impl ReviewDocument {
             layers: layers.clone(),
             thread_count: self.file_annotations[file].len(),
             carried_over: state.carried_over,
+            since: self.since_of(file),
             position: u32::try_from(file - group.files.start + 1).unwrap_or(u32::MAX),
             count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),
             collapsed: self.folded(file),
@@ -411,7 +464,8 @@ impl ReviewDocument {
     fn slots(&self, file: usize, regions: &[Region]) -> Slots {
         let state = &self.files[file];
         let mut slots = Slots::default();
-        let place = |emit: Emit, target: &AnchorTarget, slots: &mut Slots| {
+        let shows_changes = self.shows_changes(file);
+        let place = |emit: Emit, target: &AnchorTarget, exact: bool, slots: &mut Slots| {
             let AnchorTarget::Lines(lines) = target else {
                 slots.file_level.push(emit);
                 return;
@@ -423,7 +477,16 @@ impl ReviewDocument {
                 }
                 return;
             };
-            let (placement, slot) = locate_anchor(state, loaded, regions, lines);
+            // Showing only what changed, old-side lines are the baseline's, not the anchor's.
+            if shows_changes && lines.end_side == ReviewLineSide::Old {
+                if let Emit::Annotation(index, _) = emit {
+                    slots
+                        .file_level
+                        .push(Emit::Annotation(index, AnchorPlacement::File));
+                }
+                return;
+            }
+            let (placement, slot) = locate_anchor(state, loaded, regions, lines, exact);
             let emit = match emit {
                 Emit::Annotation(index, _) => Emit::Annotation(index, placement),
                 Emit::Composer => Emit::Composer,
@@ -465,14 +528,24 @@ impl ReviewDocument {
                     continue;
                 }
             }
+            // A new-side anchor whose blob is the file's current one names exactly these lines,
+            // whichever diff shows them (a line added in one is context in another).
+            let exact = match &annotation.target {
+                AnchorTarget::Lines(lines) => {
+                    lines.end_side == ReviewLineSide::New
+                        && annotation.anchor.blob_oid.is_some()
+                        && annotation.anchor.blob_oid.as_deref() == state.entry.new_blob.oid()
+                }
+                _ => false,
+            };
             let emit = Emit::Annotation(index, AnchorPlacement::File);
-            place(emit, &annotation.target, &mut slots);
+            place(emit, &annotation.target, exact, &mut slots);
         }
         if let Some(anchor) = &self.composer
             && self.composer_after.is_none()
             && anchor.file.as_ref() == Some(&state.key)
         {
-            place(Emit::Composer, &anchor.target, &mut slots);
+            place(Emit::Composer, &anchor.target, false, &mut slots);
         }
         slots
     }
@@ -489,6 +562,7 @@ fn locate_anchor(
     loaded: &Loaded,
     regions: &[Region],
     lines: &AnchorLines,
+    exact: bool,
 ) -> (AnchorPlacement, Slot) {
     let end = (lines.end_side, lines.end_line());
     let start = (lines.end_side, lines.start_line());
@@ -503,6 +577,8 @@ fn locate_anchor(
         }
     } else {
         let kind_matches = match (&end_location, lines.end_kind) {
+            (Location::Hunk(kind), _) if exact => *kind != ReviewLineKind::Removed,
+            (Location::Region { .. }, _) if exact => true,
             (Location::Hunk(kind), expected) => *kind == expected,
             (Location::Region { .. }, kind) => kind == ReviewLineKind::Context,
             (Location::Truncated | Location::Missing, _) => true,
@@ -604,9 +680,44 @@ struct FileBuilder<'a> {
     items: Vec<ReviewItem>,
     parents: Vec<Option<u32>>,
     slots: Slots,
+    /// Lines new since the comparison's baseline, when marked.
+    marks: Option<&'a Marks>,
+    /// Removed-since markers not placed yet, by position.
+    removals: &'a [RemovedSince],
 }
 
 impl FileBuilder<'_> {
+    /// Whether a line is new (or newly removed) since the baseline.
+    fn since(&self, side: ReviewLineSide, line: Option<u32>) -> bool {
+        match (self.marks, line) {
+            (Some(marks), Some(line)) => match side {
+                ReviewLineSide::New => marks.new_line(line),
+                ReviewLineSide::Old => marks.removed(line),
+            },
+            _ => false,
+        }
+    }
+
+    /// Place the removed-since markers that stand before new-side line `before` (every one
+    /// left, with `None`).
+    fn removals_before(&mut self, before: Option<u32>, parent: Option<u32>) {
+        while let Some((removal, rest)) = self.removals.split_first() {
+            if before.is_some_and(|before| removal.before_new_line > before) {
+                break;
+            }
+            self.removals = rest;
+            let item = ReviewItem::RemovedSince(RemovedSinceItem {
+                file: self.key.clone(),
+                before_new_line: removal.before_new_line,
+                lines: removal.lines.clone().into(),
+                expanded: self
+                    .doc
+                    .removal_expanded(&self.key, removal.before_new_line),
+            });
+            self.push(item, parent);
+        }
+    }
+
     fn push(&mut self, item: ReviewItem, parent: Option<u32>) {
         self.items.push(item);
         self.parents.push(parent);
@@ -660,6 +771,7 @@ impl FileBuilder<'_> {
         for region in &regions[next_region..] {
             self.region(region);
         }
+        self.removals_before(None, None);
         if let Some(truncation) = loaded.truncated {
             self.push(
                 ReviewItem::FileNotice(FileNoticeItem {
@@ -714,6 +826,10 @@ impl FileBuilder<'_> {
                 new_count: hunk.range.new_count,
                 heading: hunk.heading.clone(),
                 layers,
+                since: hunk.lines.iter().any(|line| match line.kind {
+                    ReviewLineKind::Removed => self.since(ReviewLineSide::Old, line.old),
+                    _ => self.since(ReviewLineSide::New, line.new),
+                }),
             }),
             header,
         );
@@ -743,6 +859,13 @@ impl FileBuilder<'_> {
             },
             kind,
         );
+        let since = match side {
+            ReviewLineSide::Old => self.since(side, line.old),
+            ReviewLineSide::New => self.since(side, line.new),
+        };
+        if line.new.is_some() {
+            self.removals_before(line.new, parent);
+        }
         self.push(
             ReviewItem::Line(LineItem {
                 file: self.key.clone(),
@@ -751,6 +874,7 @@ impl FileBuilder<'_> {
                 new_line: line.new,
                 content: LineContent::Text(line.text.clone()),
                 layer,
+                since,
             }),
             parent,
         );
@@ -764,11 +888,18 @@ impl FileBuilder<'_> {
             ReviewLineSide::New => line.new,
         }?;
         let kind = line_kind(line.kind);
+        let since = match (side, kind) {
+            (ReviewLineSide::Old, LineKind::Removed) | (ReviewLineSide::New, _) => {
+                self.since(side, Some(number))
+            }
+            (ReviewLineSide::Old, _) => false,
+        };
         Some(PairSide {
             line: number,
             kind,
             content: LineContent::Text(line.text.clone()),
             layer: self.layer(side, Some(number), kind),
+            since,
         })
     }
 
@@ -783,6 +914,9 @@ impl FileBuilder<'_> {
             old.as_ref().map(|side| side.line),
             new.as_ref().map(|side| side.line),
         );
+        if new_line.is_some() {
+            self.removals_before(new_line, parent);
+        }
         self.push(
             ReviewItem::LinePair(LinePairItem {
                 file: self.key.clone(),
@@ -872,6 +1006,13 @@ impl FileBuilder<'_> {
     }
 
     fn gap(&mut self, region: &Region, start: u32, end: u32) {
+        let new_end = match self.state.context_side() {
+            ReviewLineSide::New => Some(end),
+            ReviewLineSide::Old => region.other_line(end),
+        };
+        if let Some(new_end) = new_end {
+            self.removals_before(new_end.checked_add(1), None);
+        }
         let hidden: Vec<u32> = self
             .slots
             .hidden
@@ -927,6 +1068,10 @@ impl FileBuilder<'_> {
             ReviewLineSide::New => (other, Some(line)),
             ReviewLineSide::Old => (Some(line), other),
         };
+        if new.is_some() {
+            self.removals_before(new, None);
+        }
+        let since = self.since(ReviewLineSide::New, new);
         match self.doc.layout {
             LayoutMode::Unified => {
                 self.push(
@@ -937,24 +1082,26 @@ impl FileBuilder<'_> {
                         new_line: new,
                         content,
                         layer: None,
+                        since,
                     }),
                     None,
                 );
             }
             LayoutMode::SideBySide => {
-                let make = |line: Option<u32>| {
+                let make = |line: Option<u32>, since: bool| {
                     line.map(|line| PairSide {
                         line,
                         kind: LineKind::Expanded,
                         content: content.clone(),
                         layer: None,
+                        since,
                     })
                 };
                 self.push(
                     ReviewItem::LinePair(LinePairItem {
                         file: self.key.clone(),
-                        old: make(old),
-                        new: make(new),
+                        old: make(old, false),
+                        new: make(new, since),
                         emphasize: false,
                     }),
                     None,

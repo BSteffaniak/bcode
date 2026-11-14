@@ -234,12 +234,48 @@ impl ReviewSurface {
                 self.file_ui.actions.push(action.action());
                 None
             }
+            ItemAction::Compare(action) => {
+                Self::apply_compare_click(review, &click.key, action);
+                None
+            }
             ItemAction::Comment => {
                 let anchor = review.doc.anchor_for(&click.key)?;
                 review.selection = None;
                 self.open_composer(anchor, ComposerMode::Comment, "");
                 None
             }
+        }
+    }
+}
+
+impl ReviewSurface {
+    /// Run a click on a comparison's rows.
+    fn apply_compare_click(
+        review: &mut Review,
+        key: &ItemKey,
+        action: crate::rows::compare::CompareAction,
+    ) {
+        use crate::rows::compare::CompareAction;
+        use bcode_code_review::document::CompareView;
+        let changed = match (action, key) {
+            (CompareAction::ToggleRemoval, ItemKey::RemovedSince { file, before }) => {
+                review.doc.toggle_removal(file, *before)
+            }
+            (CompareAction::ShowFiles, ItemKey::CompareNote { source_id, .. }) => {
+                let shown = review.doc.compare_files_shown(source_id);
+                review.doc.set_compare_files_shown(source_id, !shown)
+            }
+            (CompareAction::ToggleView, ItemKey::CompareNote { source_id, .. }) => {
+                let view = match review.doc.comparison(source_id).map(|c| c.view) {
+                    Some(CompareView::Changes) => CompareView::Full,
+                    _ => CompareView::Changes,
+                };
+                review.doc.set_compare_view(view)
+            }
+            _ => false,
+        };
+        if changed {
+            review.note_splices();
         }
     }
 }

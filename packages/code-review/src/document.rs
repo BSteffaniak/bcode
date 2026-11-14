@@ -20,6 +20,7 @@
 
 mod anchors;
 mod build;
+mod compare;
 mod fenwick;
 mod gaps;
 mod interval;
@@ -34,12 +35,14 @@ pub(crate) mod tests;
 
 pub use anchors::{AnchorLines, AnchorTarget, Annotations, DocAnchor, target_of};
 pub use build::estimate_rows;
+pub use compare::GroupComparison;
 pub use interval::IntervalSet;
 pub use items::{
-    AgentThreadItem, AnchorPlacement, ComposerItem, FileDetailsItem, FileEndItem, FileHeaderItem,
-    FileLoad, FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayerNumber, LayoutMode,
-    LineContent, LineItem, LineKind, LinePairItem, OutdatedReason, PairSide, PlaceholderItem,
-    ReviewItem, SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem,
+    AgentThreadItem, AnchorPlacement, CompareNoteItem, CompareView, ComposerItem, FileDetailsItem,
+    FileEndItem, FileHeaderItem, FileLoad, FileNoticeItem, GapItem, GapState, HunkHeaderItem,
+    LayerNumber, LayoutMode, LineContent, LineItem, LineKind, LinePairItem, OutdatedReason,
+    PairSide, PlaceholderItem, RemovedSinceItem, ReviewItem, SourceHeaderItem, SourceIntroItem,
+    StackLayerLabel, ThreadItem,
 };
 pub use keys::{FileKey, FileNoticeKind, FileRef, ItemKey};
 pub use navigation::{

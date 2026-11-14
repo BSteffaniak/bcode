@@ -16,6 +16,7 @@ use super::super::{DocumentConfig, DocumentNeed, ReviewDocument, SourceInput};
 use super::support::{Edit, SynthFile};
 use crate::ReviewData;
 use crate::testing::fixture::{FixtureSpec, GitFixture};
+use bcode_code_review_models::ReviewCompareMarksResponse;
 use bcode_code_review_models::{
     REVIEW_INDEX_MAX_PAGE_SIZE, ResolveReviewSourcesRequest, ReviewBlobLinesResponse,
     ReviewFileStatus, ReviewIndexEntry, ReviewIndexRequest, ReviewSource,
@@ -88,6 +89,9 @@ fn answer(doc: &mut ReviewDocument, cache: &mut BTreeMap<String, SynthFile>, nee
                     binary: false,
                 },
             );
+        }
+        DocumentNeed::Marks { ticket, .. } => {
+            doc.accept_marks(*ticket, ReviewCompareMarksResponse::default());
         }
     }
 }

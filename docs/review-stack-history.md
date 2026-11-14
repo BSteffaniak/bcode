@@ -528,11 +528,48 @@ each step that changes behavior it describes.
 
 ## Status
 
-Built: the version log and its sources (forge timeline, observation, reflogs), the timeline and
-change kinds, the replay engine (`history::compare`), the restack summary on the layer strip, the
-history matrix, and *this file through the stack* / *files several layers change*.
+Built:
 
-Not built yet: everything above that differs from that, in the plan's order. Until it is, the
-matrix still opens each comparison as its own review, and `shift+l` still uses the separate
-"since last review" path. Also not built: moved-code detection, checks per version, assistant
-summaries per push, and the restack summary on home.
+* The version log and its sources (forge timeline, observation, reflogs), the timeline and change
+  kinds, the restack summary on the layer strip, the history matrix, and *this file through the
+  stack* / *files several layers change*.
+* **Step 1 (data layer).** The `layer_looks` table (`027_layer_looks_table`) with
+  `review.looks.record` / `review.looks.list` (upsert per pull request, head and kind; at most
+  `MAX_LOOK_HEADS_PER_PULL` heads, pruned heads reported so their refs can be released), seeding
+  helpers for completed passes and forge verdicts (`history::looks::pass_looks`,
+  `forge_review_looks`), baseline selection (`history::looks::last_looked`, `baseline_pair`),
+  deterministic replay commits, layer deltas (`review.compare.layers`,
+  `history::delta::layer_deltas`), line marks (`review.compare.marks`), keeping looked heads
+  (`review.versions.keep`), and the `Replay`, `Delta` and `Marks` cache kinds.
+* **Step 2 (document overlay).** `ReviewDocument::set_comparison` / `set_compare_view` /
+  `set_compare_files_shown` / `toggle_removal` / `accept_marks`, `FileSince` on file headers,
+  `DocumentNeed::Marks`, both views (changes-view hunks are requested from the replay commit),
+  the per-source summary item (`CompareNote`), removed-since markers (`RemovedSince`),
+  `NavKind::NewSince`, and the renderer's tint (`theme.since.diff`), gutter bar
+  (`theme.icons.since_bar`), file badges, summary and marker rows with their click targets.
+
+Not built yet: steps 3 to 5. The review screen does not create comparisons yet (nothing calls
+`set_comparison` outside tests), the matrix still opens each comparison as its own review, and
+`shift+l` still uses the separate "since last review" path. Also not built: moved-code
+detection, checks per version, assistant summaries per push, and the restack summary on home.
+
+### Implementation notes (where the build differs from the text above)
+
+* **Dropped files** are not files of the current change, so they have no header rows: the
+  source's summary counts them ("· 2 dropped") and `CompareNoteItem::dropped` lists their paths.
+* **Hidden files** use one toggle per source (`set_compare_files_shown`): it shows the unchanged
+  files of the changes view and the files of a layer that was only rebased, folded to their
+  headers. The summary row carries the toggle and the view switch as buttons.
+* **Side-by-side tint:** a row is tinted when either side is new since the baseline; the gutter
+  bar is painted per side.
+* **Marks** are requested only when the source's base commit is the delta's fork point (the
+  old-side numbers of marks count from it); otherwise lines are not marked.
+* **Old-side anchors in the changes view** show at their file (placement `File`) instead of
+  being mapped onto the before side; mapping is part of step 5.
+* **New-side anchors** whose recorded blob is the file's current new blob keep their line in
+  either view regardless of the line's kind there (a line added in the full change is context in
+  the changes view).
+* **Removed-since markers** whose position is inside hidden context are placed before that gap.
+* **`history::compare`** (comparisons as review sources) still serves the matrix until step 3
+  removes it; its replay commits now use the same deterministic commit as the deltas.
+* **`FileSteps`** (the cache kind for file header stepping) is added with step 4, which uses it.

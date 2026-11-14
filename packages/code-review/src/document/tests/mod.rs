@@ -3,6 +3,7 @@
 mod annotations;
 mod benchmark;
 mod chrome;
+mod compare;
 mod expansion;
 mod integration;
 mod navigation;

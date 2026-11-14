@@ -142,6 +142,8 @@ pub enum NeedResult {
     BlobLines(Box<ReviewBlobLinesResponse>),
     /// `review.stack.attribution` answer.
     Attribution(Box<ReviewStackAttributionResponse>),
+    /// `review.compare.marks` answer.
+    Marks(Box<bcode_code_review_models::ReviewCompareMarksResponse>),
     /// The call failed.
     Failed(String),
 }
@@ -814,6 +816,10 @@ pub async fn serve_need(services: ReviewServices, need: DocumentNeed) -> (Ticket
             .call(request)
             .await
             .map(|response| NeedResult::Attribution(Box::new(response))),
+        DocumentNeed::Marks { request, .. } => services
+            .call(request)
+            .await
+            .map(|response| NeedResult::Marks(Box::new(response))),
     };
     (
         ticket,

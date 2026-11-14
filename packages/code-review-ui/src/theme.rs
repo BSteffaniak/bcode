@@ -130,6 +130,8 @@ pub struct Icons {
     pub external: &'static str,
     /// Something new since last looked at.
     pub new: &'static str,
+    /// Gutter bar of a line new since a comparison's baseline (one cell wide).
+    pub since_bar: &'static str,
     /// The upper half of a cell: a card's bottom edge.
     pub half_upper: &'static str,
     /// The lower half of a cell: the lip of the next card.
@@ -177,6 +179,7 @@ impl Icons {
         checks: "●",
         external: "↗",
         new: "•",
+        since_bar: "▎",
         half_upper: "▀",
         half_lower: "▄",
         file_rule: "─",
@@ -219,6 +222,7 @@ impl Icons {
         checks: "*",
         external: "->",
         new: "*",
+        since_bar: "|",
         half_upper: "-",
         half_lower: "-",
         file_rule: "-",
@@ -377,8 +381,23 @@ pub struct ReviewTheme {
     pub toasts: ToastStackStyles,
     /// Publish button.
     pub publish: SplitButtonStyles,
+    /// What a comparison marks: lines new since its baseline, its markers and summaries.
+    pub since: SinceStyles,
     /// Glyphs.
     pub icons: Icons,
+}
+
+/// Styles of a comparison's marks (see `docs/review-stack-history.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinceStyles {
+    /// Diff rows of lines new since the baseline: the diff styles with a stronger row tint.
+    pub diff: DiffViewerStyle,
+    /// The gutter bar of such lines.
+    pub bar: Style,
+    /// Badges saying what changed since the baseline.
+    pub badge: Style,
+    /// A comparison's summary line and removed-since markers.
+    pub note: Style,
 }
 
 /// Share of the accent in the background of a selected line range.
@@ -581,6 +600,7 @@ impl ReviewTheme {
             status: components.status,
             toasts: components.toasts,
             publish: components.publish,
+            since: since_styles(&tiers, &component, &diff),
             icons,
         }
     }
@@ -958,6 +978,29 @@ const fn pill(tiers: &Tiers) -> Style {
 }
 
 /// `a` mixed into `b` by `share`, when both are RGB colors.
+/// Share of the comparison hue in the row tint of lines new since a baseline.
+const SINCE_TINT_SHARE: f64 = 0.22;
+
+/// A comparison's styles: its hue (the second accent, else info) tints changed rows more
+/// strongly and colors the gutter bar and badges.
+fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyle) -> SinceStyles {
+    let hue = tiers.accent_alt.fg.or(component.info.fg);
+    let tint = |row: Style| {
+        mixed(hue, row.bg.or(tiers.canvas.bg), SINCE_TINT_SHARE).map_or(row, |bg| row.bg(bg))
+    };
+    let ink = hue.map_or(tiers.accent, |fg| Style::new().fg(fg));
+    SinceStyles {
+        diff: DiffViewerStyle {
+            added_row: tint(diff.added_row),
+            removed_row: tint(diff.removed_row),
+            ..*diff
+        },
+        bar: ink.add_modifier(Modifier::BOLD),
+        badge: ink.add_modifier(Modifier::BOLD),
+        note: tiers.muted,
+    }
+}
+
 fn mixed(a: Option<Color>, b: Option<Color>, share: f64) -> Option<Color> {
     match (a?, b?) {
         (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => Some(Color::from(bmux_color::mix(

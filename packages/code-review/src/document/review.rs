@@ -1,6 +1,7 @@
 //! The review document: one keyed, virtualizable item sequence over every file of every source.
 
 use super::anchors::{self, AnchorTarget, Annotation, Annotations, DocAnchor};
+use super::compare::{GroupComparison, MarksState};
 use super::fenwick::Fenwick;
 use super::gaps::{self, HunkRange, Region, RegionInput};
 use super::interval::IntervalSet;
@@ -10,10 +11,10 @@ use crate::viewed::{EntryIdentity, ViewedReset, ViewedState, best_state};
 use bcode_code_review_models::{
     REVIEW_BLOB_LINES_MAX_COUNT, REVIEW_HUNKS_DEFAULT_CONTEXT, ResolvedReviewStack, ResolvedSource,
     ResolvedSourceMode, ReviewBlobLinesRequest, ReviewBlobLinesResponse, ReviewBlobRef,
-    ReviewBlobSelector, ReviewFileExpansion, ReviewFileHunksRequest, ReviewFileHunksResponse,
-    ReviewHunksTruncation, ReviewIndexEntry, ReviewLineKind, ReviewLineSide,
-    ReviewStackAttributionRequest, ReviewStackAttributionResponse, ReviewStackLineAttribution,
-    ReviewWorkspace, ViewedMark,
+    ReviewBlobSelector, ReviewCompareMarksRequest, ReviewFileExpansion, ReviewFileHunksRequest,
+    ReviewFileHunksResponse, ReviewHunksTruncation, ReviewIndexEntry, ReviewLineKind,
+    ReviewLineSide, ReviewStackAttributionRequest, ReviewStackAttributionResponse,
+    ReviewStackLineAttribution, ReviewWorkspace, RevisionRef, ViewedMark,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -148,6 +149,15 @@ pub enum DocumentNeed {
         /// Request.
         request: ReviewStackAttributionRequest,
     },
+    /// Load which lines are new since a comparison's baseline (`review.compare.marks`).
+    Marks {
+        /// Ticket to pass back with the result.
+        ticket: Ticket,
+        /// File.
+        file: FileRef,
+        /// Request.
+        request: ReviewCompareMarksRequest,
+    },
 }
 
 impl DocumentNeed {
@@ -157,7 +167,8 @@ impl DocumentNeed {
         match self {
             Self::Hunks { ticket, .. }
             | Self::BlobLines { ticket, .. }
-            | Self::Attribution { ticket, .. } => *ticket,
+            | Self::Attribution { ticket, .. }
+            | Self::Marks { ticket, .. } => *ticket,
         }
     }
 
@@ -167,7 +178,8 @@ impl DocumentNeed {
         match self {
             Self::Hunks { file, .. }
             | Self::BlobLines { file, .. }
-            | Self::Attribution { file, .. } => file,
+            | Self::Attribution { file, .. }
+            | Self::Marks { file, .. } => file,
         }
     }
 }
@@ -307,6 +319,11 @@ pub(super) struct FileState {
     pub resident_bytes: usize,
     /// Patch unchanged since the last review pass.
     pub carried_over: bool,
+    /// Lines new since the comparison's baseline.
+    pub marks: MarksState,
+    /// The commit the resident content was diffed from, when it is not the source's base (the
+    /// "only what changed" view of a comparison).
+    pub content_base: Option<String>,
     /// Whether only the file's header shows: by hand, or by its viewed mark.
     pub fold: FileFold,
 }
@@ -539,6 +556,7 @@ pub(super) enum Pending {
     Hunks(usize),
     Blob { file: usize, start: u32, count: u32 },
     Attribution(usize),
+    Marks(usize),
 }
 
 /// Path persisted for review-level anchors (the spelling stored reviews use).
@@ -598,6 +616,12 @@ pub struct ReviewDocument {
     pub(super) viewed_count: usize,
     pub(super) splices: Vec<Splice>,
     pub(super) revision: u64,
+    /// Comparison overlays, by source id.
+    pub(super) comparisons: BTreeMap<String, GroupComparison>,
+    /// Sources whose files a comparison hides are shown anyway.
+    pub(super) compare_files_shown: BTreeSet<String>,
+    /// Removed-since markers whose text shows, by file and new-side line.
+    pub(super) expanded_removals: BTreeSet<(FileKey, u32)>,
 }
 
 /// Viewport, protected, and prefetch block ranges (inclusive).
@@ -657,6 +681,9 @@ impl ReviewDocument {
             viewed_count: 0,
             splices: Vec::new(),
             revision: 0,
+            comparisons: BTreeMap::new(),
+            compare_files_shown: BTreeSet::new(),
+            expanded_removals: BTreeSet::new(),
         };
         for input in sources {
             doc.add_source(input, show_headers);
@@ -713,6 +740,8 @@ impl ReviewDocument {
                 last_used: 0,
                 resident_bytes: 0,
                 carried_over: false,
+                marks: MarksState::Missing,
+                content_base: None,
                 fold: FileFold::Auto,
             });
             self.blocks.push(Block::new(BlockKind::File(index)));
@@ -909,7 +938,11 @@ impl ReviewDocument {
         match state.fold {
             FileFold::Open => false,
             FileFold::Folded => true,
-            FileFold::Auto => self.config.fold_viewed && state.viewed.is_viewed(),
+            FileFold::Auto => {
+                self.compare_folded(file)
+                    || state.viewed.is_viewed()
+                        && (self.config.fold_viewed || self.unchanged_since(file))
+            }
         }
     }
 
@@ -1140,9 +1173,14 @@ impl ReviewDocument {
             self.pending.remove(&ticket);
             state.attribution = AttributionState::Missing;
         }
+        if let MarksState::Pending(ticket) = state.marks {
+            self.pending.remove(&ticket);
+            state.marks = MarksState::Missing;
+        }
+        state.content_base = None;
         self.pending.retain(|_, pending| match pending {
             Pending::Blob { file: owner, .. } => *owner != file,
-            Pending::Hunks(_) | Pending::Attribution(_) => true,
+            Pending::Hunks(_) | Pending::Attribution(_) | Pending::Marks(_) => true,
         });
         self.rebuild_file(file);
     }
@@ -1205,9 +1243,14 @@ impl ReviewDocument {
                 && (self.in_window(file, |window| window.protected)
                     || self.resident_bytes < self.config.residency_budget_bytes)
             {
+                let changes_base = self.changes_base(file);
+                let mut source = group.source.clone();
+                if let Some(base) = &changes_base {
+                    source.base = RevisionRef::commit(base);
+                }
                 let request = ReviewFileHunksRequest {
                     repo_path: self.repo_path.clone(),
-                    source: group.source.clone(),
+                    source,
                     path: self.files[file].entry.path.clone(),
                     old_path: self.files[file].entry.old_path.clone(),
                     context_lines: Some(self.config.context_lines),
@@ -1216,6 +1259,7 @@ impl ReviewDocument {
                 };
                 let ticket = self.ticket(Pending::Hunks(file));
                 self.files[file].content = Content::Loading(ticket);
+                self.files[file].content_base = changes_base;
                 self.rebuild_file(file);
                 needs.push(DocumentNeed::Hunks {
                     ticket,
@@ -1244,6 +1288,17 @@ impl ReviewDocument {
             let ticket = self.ticket(Pending::Attribution(file));
             self.files[file].attribution = AttributionState::Pending(ticket);
             needs.push(DocumentNeed::Attribution {
+                ticket,
+                file: self.files[file].key.clone(),
+                request,
+            });
+        }
+        if self.inflight(false) < self.config.max_inflight_blobs
+            && let Some(request) = self.marks_request(file)
+        {
+            let ticket = self.ticket(Pending::Marks(file));
+            self.files[file].marks = MarksState::Pending(ticket);
+            needs.push(DocumentNeed::Marks {
                 ticket,
                 file: self.files[file].key.clone(),
                 request,
@@ -1387,7 +1442,13 @@ impl ReviewDocument {
             .sum();
         let state = &mut self.files[file];
         let side = state.context_side();
-        let derived = if response.truncated.is_some() || response.binary {
+        // Diffed from a comparison's replay, the old side is not the entry's: a line count is
+        // derived only where both sides exist.
+        let replayed = state.content_base.is_some();
+        let derived = if response.truncated.is_some()
+            || response.binary
+            || (replayed && !state.other_side_exists())
+        {
             None
         } else if state.other_side_exists() {
             gaps::line_count_from_trailing_context(&ranges, side, self.config.context_lines)
@@ -1411,7 +1472,9 @@ impl ReviewDocument {
         if derived.is_some() || !pinned {
             state.line_count = derived;
         }
-        if response.patch_id.is_some() {
+        // The patch id fingerprints the file's own diff for its viewed mark; a comparison's
+        // diff is another one.
+        if response.patch_id.is_some() && !replayed {
             state.patch_id.clone_from(&response.patch_id);
         }
         state.content = Content::Loaded(Box::new(Loaded {
@@ -1529,6 +1592,9 @@ impl ReviewDocument {
             }
             Pending::Attribution(file) => {
                 self.files[file].attribution = AttributionState::Failed;
+            }
+            Pending::Marks(file) => {
+                self.files[file].marks = MarksState::Failed;
             }
         }
         true
@@ -1876,6 +1942,12 @@ impl ReviewDocument {
 
     fn range_anchor_between(&self, first: usize, last: usize, file: FileRef) -> Option<DocAnchor> {
         use super::items::LineKind;
+        // Showing only what changed, the old side is the baseline replayed, which no forge can
+        // anchor to: only current (new-side) lines take comments there.
+        let new_only = self
+            .file_index
+            .get(file.as_ref())
+            .is_some_and(|index| self.shows_changes(*index));
         let mut old: Option<(u32, u32)> = None;
         let mut new: Option<(u32, u32)> = None;
         let mut end: Option<(ReviewLineSide, LineKind)> = None;
@@ -1918,6 +1990,12 @@ impl ReviewDocument {
             lines += 1;
         }
         let (end_side, kind) = end?;
+        if new_only {
+            if end_side == ReviewLineSide::Old {
+                return None;
+            }
+            old = None;
+        }
         let end_kind = match kind {
             LineKind::Added => ReviewLineKind::Added,
             LineKind::Removed => ReviewLineKind::Removed,
@@ -2163,7 +2241,7 @@ impl ReviewDocument {
 
     /// Whether file `file` (an index into the files) is in a hidden group.
     pub(super) fn file_hidden(&self, file: usize) -> bool {
-        self.groups[self.files[file].group].hidden
+        self.groups[self.files[file].group].hidden || self.compare_hidden(file)
     }
 
     /// Files of group `index` (see [`GroupInfo::index`]), in document order.
@@ -2216,7 +2294,8 @@ impl ReviewDocument {
                 .map(|index| self.files[*index].block);
         }
         match key {
-            ItemKey::SourceHeader { source_id, part } => self
+            ItemKey::SourceHeader { source_id, part }
+            | ItemKey::CompareNote { source_id, part } => self
                 .groups
                 .iter()
                 .find(|group| {

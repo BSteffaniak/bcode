@@ -77,6 +77,13 @@ impl fmt::Display for RowKey {
                 file(f, key)
             }
             ItemKey::SourceIntro { source_id } => write!(f, "si{SEP}{source_id}"),
+            ItemKey::CompareNote { source_id, part } => {
+                write!(f, "cn{SEP}{source_id}{SEP}{}", part.map_or(-1, i64::from))
+            }
+            ItemKey::RemovedSince { file: key, before } => {
+                write!(f, "rs{SEP}{before}{SEP}")?;
+                file(f, key)
+            }
             ItemKey::FileDetails(key) => {
                 f.write_str("fd")?;
                 f.write_char(SEP)?;
@@ -135,6 +142,7 @@ use std::fmt::Write as _;
 
 mod agent;
 pub mod card;
+pub mod compare;
 pub mod file;
 pub mod thread_card;
 
@@ -289,6 +297,8 @@ pub enum ItemAction {
     File(file::FileAction),
     /// A part of a pull request's card.
     Card(card::CardAction),
+    /// A part of a comparison's rows.
+    Compare(compare::CompareAction),
 }
 
 /// Clickable cells on one row of an item.
@@ -471,8 +481,19 @@ enum ContentStamp {
     /// Nothing beyond the key and the revisions.
     #[default]
     Fixed,
-    /// One unified line, or the two sides of a side-by-side row.
-    Lines([Option<(TextState, Option<u64>)>; 2]),
+    /// One unified line, or the two sides of a side-by-side row: text state, layer, and
+    /// whether the side is new since a comparison's baseline.
+    Lines([Option<(TextState, Option<u64>, bool)>; 2]),
+    /// A removed-since marker: whether its text shows.
+    Removal(bool),
+    /// A comparison's summary.
+    Note(
+        Option<bcode_code_review_models::DeltaKind>,
+        bool,
+        [usize; 3],
+        [u64; 2],
+        bool,
+    ),
     /// A gap: its last hidden line, whether it is open-ended, and its hidden threads.
     Gap(Option<u32>, bool, usize),
     /// A file's header or details: what changes them without a new key.
@@ -485,6 +506,8 @@ enum ContentStamp {
         counts: (Option<u32>, Option<u32>),
         /// Layers that change the file.
         layers: usize,
+        /// How the file changed since a comparison's baseline.
+        since: Option<bcode_code_review_models::FileSince>,
     },
     /// A file's break: whether the file (and the next) is folded, and the next file's place.
     End {
@@ -499,11 +522,20 @@ enum ContentStamp {
 
 impl ContentStamp {
     fn of(item: &ReviewItem) -> Self {
-        let side = |side: &PairSide| (TextState::of(&side.content), side.layer);
+        let side = |side: &PairSide| (TextState::of(&side.content), side.layer, side.since);
         match item {
-            ReviewItem::Line(line) => {
-                Self::Lines([Some((TextState::of(&line.content), line.layer)), None])
-            }
+            ReviewItem::Line(line) => Self::Lines([
+                Some((TextState::of(&line.content), line.layer, line.since)),
+                None,
+            ]),
+            ReviewItem::RemovedSince(removal) => Self::Removal(removal.expanded),
+            ReviewItem::CompareNote(note) => Self::Note(
+                note.kind,
+                note.view == bcode_code_review::document::CompareView::Changes,
+                [note.changed_files, note.unchanged_files, note.dropped.len()],
+                [note.added, note.removed],
+                note.files_shown,
+            ),
             ReviewItem::LinePair(pair) => {
                 Self::Lines([pair.old.as_ref().map(side), pair.new.as_ref().map(side)])
             }
@@ -519,12 +551,14 @@ impl ContentStamp {
                 threads: header.thread_count,
                 counts: (None, None),
                 layers: header.layers.len(),
+                since: header.since,
             },
             ReviewItem::FileDetails(details) => Self::File {
                 flags: u8::from(details.viewed) | u8::from(details.collapsed) << 1,
                 threads: details.thread_count,
                 counts: (details.line_count, details.hunks),
                 layers: details.layers.len(),
+                since: None,
             },
             ReviewItem::FileEnd(end) => Self::End {
                 folded: end.folded,
@@ -697,7 +731,8 @@ impl RowContext<'_> {
             ReviewItem::Thread(_)
             | ReviewItem::AgentThread(_)
             | ReviewItem::FileDetails(_)
-            | ReviewItem::SourceIntro(_) => self.rows(index, width).height,
+            | ReviewItem::SourceIntro(_)
+            | ReviewItem::RemovedSince(_) => self.rows(index, width).height,
             ReviewItem::Composer(_) => self.composer_layout(width)?.height,
             ReviewItem::SourceHeader(header)
                 if header
@@ -754,6 +789,16 @@ impl RowContext<'_> {
                         cells,
                     )
                 },
+            ),
+            ReviewItem::CompareNote(item) => {
+                compare::note_rows(item, styles, cells, self.gutter_indent(width))
+            }
+            ReviewItem::RemovedSince(item) => compare::removed_rows(
+                item,
+                self.options(),
+                styles,
+                width,
+                self.gutter_indent(width),
             ),
             ReviewItem::FileHeader(item) => {
                 file::header_rows(item, self.params.density, styles, cells)
@@ -854,9 +899,19 @@ impl RowContext<'_> {
             },
             width,
             self.options(),
-            &styles.diff,
+            if line.since {
+                &styles.since.diff
+            } else {
+                &styles.diff
+            },
         );
-        diff_item_rows(layout)
+        let mut rows = diff_item_rows(layout);
+        if line.since
+            && let Some(layout) = &rows.diff
+        {
+            compare::paint_since_bar(&mut rows.lines, layout, |_| true, styles);
+        }
+        rows
     }
 
     fn pair_rows(&self, pair: &LinePairItem, width: u16) -> ItemRows {
@@ -880,6 +935,8 @@ impl RowContext<'_> {
             .new
             .as_ref()
             .map(|side| self.pair_side(&pair.file, ReviewLineSide::New, side));
+        let marked = |side: Option<&PairSide>| side.is_some_and(|side| side.since);
+        let (old_since, new_since) = (marked(pair.old.as_ref()), marked(pair.new.as_ref()));
         let layout = layout_diff_row(
             DiffRowItem::SideBySide {
                 old: old.as_ref().map(|side| pair_cell(side, &emphasis.old)),
@@ -887,9 +944,27 @@ impl RowContext<'_> {
             },
             width,
             self.options(),
-            &styles.diff,
+            if old_since || new_since {
+                &styles.since.diff
+            } else {
+                &styles.diff
+            },
         );
-        diff_item_rows(layout)
+        let mut rows = diff_item_rows(layout);
+        if (old_since || new_since)
+            && let Some(layout) = &rows.diff
+        {
+            compare::paint_since_bar(
+                &mut rows.lines,
+                layout,
+                |side| match side {
+                    DiffSourceSide::Old => old_since,
+                    DiffSourceSide::New => new_since,
+                },
+                styles,
+            );
+        }
+        rows
     }
 
     fn pair_side<'s>(

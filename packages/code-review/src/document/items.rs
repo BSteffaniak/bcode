@@ -3,8 +3,8 @@
 
 use super::keys::{FileNoticeKind, FileRef, ItemKey};
 use bcode_code_review_models::{
-    ReviewFileStatus, ReviewHunksTruncation, ReviewIndexFlag, ReviewLineSide, ReviewThreadKind,
-    ReviewThreadSeverity,
+    DeltaKind, FileSince, ReviewFileStatus, ReviewHunksTruncation, ReviewIndexFlag, ReviewLineSide,
+    ReviewThreadKind, ReviewThreadSeverity,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -17,6 +17,57 @@ pub enum LayoutMode {
     Unified,
     /// One [`ReviewItem::LinePair`] per side-by-side row.
     SideBySide,
+}
+
+/// How a source under comparison shows its files (see `docs/review-stack-history.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompareView {
+    /// The whole change, with what is new since the baseline marked.
+    #[default]
+    Full,
+    /// Only what changed since the baseline: each changed file from the baseline's change
+    /// replayed on today's base to the current code.
+    Changes,
+}
+
+/// What a source's comparison found, shown under its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompareNoteItem {
+    /// Workspace source id.
+    pub source_id: String,
+    /// Part index.
+    pub part: Option<u32>,
+    /// What the comparison found; `None` while it computes.
+    pub kind: Option<DeltaKind>,
+    /// How the source shows its files.
+    pub view: CompareView,
+    /// Files changed (or new) since the baseline.
+    pub changed_files: usize,
+    /// Files unchanged since the baseline.
+    pub unchanged_files: usize,
+    /// Paths the baseline's change had that the current change no longer has.
+    pub dropped: Vec<String>,
+    /// Lines added since the baseline.
+    pub added: u64,
+    /// Lines removed since the baseline.
+    pub removed: u64,
+    /// Whether files the comparison hides (unchanged, or every file of a layer only rebased)
+    /// are shown anyway.
+    pub files_shown: bool,
+}
+
+/// Lines of the baseline's own change that the current change no longer has: a marker between
+/// lines, expandable to the removed text (read-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedSinceItem {
+    /// File.
+    pub file: FileRef,
+    /// The marker stands before this new-side line.
+    pub before_new_line: u32,
+    /// The removed lines' text.
+    pub lines: Arc<[String]>,
+    /// Whether the removed text shows.
+    pub expanded: bool,
 }
 
 /// Kind of one displayed line.
@@ -157,6 +208,8 @@ pub struct FileHeaderItem {
     /// Whether the file's patch is unchanged since the last review pass (a re-review after a
     /// rebase): shown de-emphasized.
     pub carried_over: bool,
+    /// How the file changed since the comparison's baseline, when its source is compared.
+    pub since: Option<FileSince>,
     /// Position of the file in its group (1-based).
     pub position: u32,
     /// Files in its group.
@@ -249,6 +302,8 @@ pub struct HunkHeaderItem {
     pub heading: Option<Arc<str>>,
     /// Stack layers that wrote or removed lines of this hunk.
     pub layers: Vec<LayerNumber>,
+    /// Whether the hunk has lines new since the comparison's baseline.
+    pub since: bool,
 }
 
 /// One unified line.
@@ -266,6 +321,8 @@ pub struct LineItem {
     pub content: LineContent,
     /// Stack layer that wrote (added) or removed this line.
     pub layer: Option<LayerNumber>,
+    /// Whether the line is new (or newly removed) since the comparison's baseline.
+    pub since: bool,
 }
 
 impl LineItem {
@@ -291,6 +348,8 @@ pub struct PairSide {
     pub content: LineContent,
     /// Stack layer that wrote or removed this line.
     pub layer: Option<LayerNumber>,
+    /// Whether the line is new (or newly removed) since the comparison's baseline.
+    pub since: bool,
 }
 
 /// One side-by-side row.
@@ -457,6 +516,10 @@ pub enum ReviewItem {
     SourceHeader(SourceHeaderItem),
     /// A source's introduction, before its files.
     SourceIntro(SourceIntroItem),
+    /// What a source's comparison found.
+    CompareNote(CompareNoteItem),
+    /// Lines removed since the comparison's baseline.
+    RemovedSince(RemovedSinceItem),
     /// File header.
     FileHeader(FileHeaderItem),
     /// Facts and actions under a file header.
@@ -494,6 +557,14 @@ impl ReviewItem {
             },
             Self::SourceIntro(item) => ItemKey::SourceIntro {
                 source_id: item.source_id.clone(),
+            },
+            Self::CompareNote(item) => ItemKey::CompareNote {
+                source_id: item.source_id.clone(),
+                part: item.part,
+            },
+            Self::RemovedSince(item) => ItemKey::RemovedSince {
+                file: item.file.clone(),
+                before: item.before_new_line,
             },
             Self::FileHeader(item) => ItemKey::FileHeader(item.file.clone()),
             Self::FileDetails(item) => ItemKey::FileDetails(item.file.clone()),
@@ -547,9 +618,11 @@ impl ReviewItem {
             | Self::HunkHeader(HunkHeaderItem { file, .. })
             | Self::Line(LineItem { file, .. })
             | Self::LinePair(LinePairItem { file, .. })
-            | Self::Gap(GapItem { file, .. }) => Some(file),
+            | Self::Gap(GapItem { file, .. })
+            | Self::RemovedSince(RemovedSinceItem { file, .. }) => Some(file),
             Self::SourceHeader(_)
             | Self::SourceIntro(_)
+            | Self::CompareNote(_)
             | Self::Thread(_)
             | Self::AgentThread(_)
             | Self::Composer(_) => None,
@@ -566,6 +639,19 @@ impl ReviewItem {
                 item.new.as_ref().map(|side| side.line),
             )),
             _ => None,
+        }
+    }
+
+    /// Whether this is a line (or a row with a side) new since the comparison's baseline.
+    #[must_use]
+    pub fn is_since(&self) -> bool {
+        match self {
+            Self::Line(item) => item.since,
+            Self::LinePair(item) => {
+                item.old.as_ref().is_some_and(|side| side.since)
+                    || item.new.as_ref().is_some_and(|side| side.since)
+            }
+            _ => false,
         }
     }
 

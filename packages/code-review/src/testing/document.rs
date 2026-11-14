@@ -352,6 +352,8 @@ pub fn resolved(source_id: &str) -> ResolvedSource {
 pub struct Fake {
     pub files: BTreeMap<String, SynthFile>,
     pub attribution: BTreeMap<String, ReviewStackAttributionResponse>,
+    /// Comparison marks by path (none marked when absent).
+    pub marks: BTreeMap<String, bcode_code_review_models::ReviewCompareMarksResponse>,
 }
 
 impl Fake {
@@ -364,6 +366,7 @@ impl Fake {
                 .map(|file| (file.path.clone(), file))
                 .collect(),
             attribution: BTreeMap::new(),
+            marks: BTreeMap::new(),
         }
     }
 
@@ -465,6 +468,12 @@ impl Fake {
                         binary: false,
                     });
                 doc.accept_attribution(*ticket, response)
+            }
+            DocumentNeed::Marks {
+                ticket, request, ..
+            } => {
+                let response = self.marks.get(&request.path).cloned().unwrap_or_default();
+                doc.accept_marks(*ticket, response)
             }
         }
     }

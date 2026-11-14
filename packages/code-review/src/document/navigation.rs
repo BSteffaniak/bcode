@@ -38,6 +38,9 @@ pub enum NavKind {
     UnviewedFile,
     /// The first line of each run of changed lines.
     Change,
+    /// The first line of each run of lines new (or newly removed) since a comparison's
+    /// baseline.
+    NewSince,
 }
 
 /// Result of a motion.
@@ -183,6 +186,14 @@ impl ReviewDocument {
             NavKind::Thread => matches!(item, ReviewItem::Thread(_) | ReviewItem::AgentThread(_)),
             NavKind::OpenThread => matches!(item, ReviewItem::Thread(thread) if !thread.resolved),
             NavKind::AiAnswer => matches!(item, ReviewItem::AgentThread(_)),
+            NavKind::NewSince => {
+                item.is_since()
+                    && !items[..local]
+                        .iter()
+                        .rev()
+                        .find(|previous| previous.line_numbers().is_some())
+                        .is_some_and(ReviewItem::is_since)
+            }
             NavKind::Change => {
                 item.is_change()
                     && !items[..local]
@@ -243,6 +254,9 @@ impl ReviewDocument {
         match kind {
             NavKind::File | NavKind::UnviewedFile => false,
             NavKind::Hunk | NavKind::Change => changed,
+            NavKind::NewSince => self
+                .since_of(file)
+                .is_some_and(bcode_code_review_models::FileSince::changed),
             NavKind::Thread | NavKind::OpenThread | NavKind::AiAnswer => {
                 self.file_annotations[file].iter().any(|annotation| {
                     matches!(

@@ -37,6 +37,10 @@ fn serve(service: &ReviewData, doc: &mut ReviewDocument) {
                         Err(error) => doc.fail(ticket, &error.to_string()),
                     }
                 }
+                DocumentNeed::Marks { request, .. } => match service.compare_marks(request) {
+                    Ok(response) => doc.accept_marks(ticket, response),
+                    Err(error) => doc.fail(ticket, &error.to_string()),
+                },
             };
             assert!(applied, "{need:?}");
         }

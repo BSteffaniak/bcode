@@ -2064,6 +2064,9 @@ impl ReviewSurface {
             NeedResult::Attribution(response) => {
                 review.doc.accept_attribution(ticket, *response);
             }
+            NeedResult::Marks(response) => {
+                review.doc.accept_marks(ticket, *response);
+            }
             NeedResult::Failed(error) => {
                 review.doc.fail(ticket, &error);
             }
@@ -3169,9 +3172,11 @@ impl ReviewSurface {
             return Self::run_motion(review, origin, kind, direction, repeats + 1);
         }
         let policy = match kind {
-            NavKind::Change | NavKind::Thread | NavKind::OpenThread | NavKind::AiAnswer => {
-                AnchorPolicy::Center
-            }
+            NavKind::Change
+            | NavKind::NewSince
+            | NavKind::Thread
+            | NavKind::OpenThread
+            | NavKind::AiAnswer => AnchorPolicy::Center,
             NavKind::File | NavKind::Hunk | NavKind::UnviewedFile => AnchorPolicy::ItemTopAtTop,
         };
         review.set_cursor(target.index, policy);

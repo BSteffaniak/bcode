@@ -183,6 +183,13 @@ fn viewed_span(viewed: bool, label: bool, theme: &ReviewTheme) -> Span {
 /// Spans of what a header says on the right: flags, layers, threads, counts, change bar.
 fn header_facts(item: &FileHeaderItem, theme: &ReviewTheme, counts: bool) -> Vec<Span> {
     let mut trailing = Vec::new();
+    if let Some(badge) = item
+        .since
+        .and_then(|since| super::compare::since_badge(since, theme))
+    {
+        trailing.push(badge);
+        trailing.push(Span::raw(" "));
+    }
     if item.carried_over {
         trailing.push(Span::styled(
             "unchanged since last review",

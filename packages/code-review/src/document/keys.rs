@@ -62,6 +62,20 @@ pub enum ItemKey {
         /// Workspace source id.
         source_id: String,
     },
+    /// What a source's comparison found.
+    CompareNote {
+        /// Workspace source id.
+        source_id: String,
+        /// Part index.
+        part: Option<u32>,
+    },
+    /// Lines removed since the comparison's baseline, before a new-side line.
+    RemovedSince {
+        /// File.
+        file: FileRef,
+        /// The new-side line the marker stands before.
+        before: u32,
+    },
     /// Header of one file.
     FileHeader(FileRef),
     /// Facts and actions under a file's header.
@@ -139,9 +153,11 @@ impl ItemKey {
             | Self::HunkHeader { file, .. }
             | Self::Line { file, .. }
             | Self::LinePair { file, .. }
-            | Self::Gap { file, .. } => Some(file),
+            | Self::Gap { file, .. }
+            | Self::RemovedSince { file, .. } => Some(file),
             Self::SourceHeader { .. }
             | Self::SourceIntro { .. }
+            | Self::CompareNote { .. }
             | Self::Thread { .. }
             | Self::AgentThread { .. }
             | Self::Composer => None,
@@ -170,16 +186,17 @@ impl ItemKey {
     #[must_use]
     pub fn to_persisted(&self) -> Option<ReviewItemKey> {
         match self {
-            Self::SourceHeader { source_id, .. } | Self::SourceIntro { source_id } => {
-                Some(ReviewItemKey::SourceHeader {
-                    source_id: source_id.clone(),
-                })
-            }
+            Self::SourceHeader { source_id, .. }
+            | Self::SourceIntro { source_id }
+            | Self::CompareNote { source_id, .. } => Some(ReviewItemKey::SourceHeader {
+                source_id: source_id.clone(),
+            }),
             Self::FileHeader(file)
             | Self::FileDetails(file)
             | Self::FileEnd(file)
             | Self::Placeholder(file)
-            | Self::FileNotice { file, .. } => Some(ReviewItemKey::FileHeader {
+            | Self::FileNotice { file, .. }
+            | Self::RemovedSince { file, .. } => Some(ReviewItemKey::FileHeader {
                 source_id: file.source_id.clone(),
                 path: file.path.clone(),
                 part: file.part,
