@@ -16,7 +16,6 @@ use super::ReviewSurface;
 use super::stack::StackView;
 use bcode_code_review_models::{DeltaKind, ReviewCompareBaseline as Baseline};
 use bmux_tui::geometry::Point;
-use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
 
 /// Layout id prefix of the legend's rows (followed by the row's index).
@@ -80,10 +79,6 @@ impl ReviewSurface {
         }
         let theme = &self.theme;
         let separator = theme.icons.separator;
-        let row = |text: String, style: Style, action: Option<LegendAction>| LegendRow {
-            line: Line::from_spans(vec![Span::styled(text, style)]),
-            action,
-        };
         let off = self.comparing.baseline() == Baseline::Off
             && self.comparing.picks().is_empty()
             && self.comparing.stack_at().is_none();
@@ -93,11 +88,18 @@ impl ReviewSurface {
                 .action_keys
                 .get("compare_baseline")
                 .map_or_else(String::new, |key| format!(" ({key} to compare)"));
-            rows.push(row(
+            let mut spans = vec![Span::styled(
                 format!("Full change: no comparison{key}"),
                 theme.muted,
-                Some(LegendAction::OpenMenu),
-            ));
+            )];
+            // Options set while nothing is compared apply once something is.
+            for [chip, _] in self.compare_chips() {
+                spans.push(Span::styled(format!("{separator}{chip}"), theme.muted));
+            }
+            rows.push(LegendRow {
+                line: Line::from_spans(spans),
+                action: Some(LegendAction::OpenMenu),
+            });
             return rows;
         }
         // What is compared, and the view options on.

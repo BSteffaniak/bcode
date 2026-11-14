@@ -1290,6 +1290,42 @@ fn previewing_away_and_back_keeps_the_banner_and_saves_nothing() {
 }
 
 #[test]
+fn only_what_changed_toggles_in_the_menu_while_nothing_is_compared() {
+    use crate::compare_menu::MenuChoice;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Off);
+    scenario.key("space");
+    settled(&mut scenario);
+    assert!(!scenario.surface().review().unwrap().comparing().active());
+    // The box flips in place while nothing is compared, and the menu stays open.
+    menu_to(&mut scenario, MenuChoice::View);
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_some());
+    assert_eq!(review.comparing().view(), CompareView::Changes);
+    assert!(
+        screen.contains("[x] Only what changed"),
+        "{}",
+        screen.text()
+    );
+    // Back to a baseline: the option applies to the comparison at once.
+    menu_to(&mut scenario, MenuChoice::LastLooked);
+    scenario.key("space");
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    let doc = document(&scenario);
+    assert_eq!(
+        doc.comparison(&source_of(doc, 101)).map(|c| c.view),
+        Some(CompareView::Changes)
+    );
+    // The option shows outside the menu as it does inside.
+    assert!(screen.contains("[only what changed]"), "{}", screen.text());
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());

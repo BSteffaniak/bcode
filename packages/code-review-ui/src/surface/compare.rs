@@ -1240,15 +1240,8 @@ impl ReviewSurface {
     }
 
     /// Switch every compared source between the full change and only what changed.
+    /// With nothing compared, the setting still flips and applies once something is.
     pub(super) fn toggle_compare_view(&mut self) {
-        if !self.comparing.active() {
-            self.set_status(
-                "nothing to compare: no layer changed since you last looked, or you never did \
-                 (b compares with something else)",
-                StatusSeverity::Info,
-            );
-            return;
-        }
         let view = match self.comparing.view {
             CompareView::Full => CompareView::Changes,
             CompareView::Changes => CompareView::Full,
@@ -1259,13 +1252,15 @@ impl ReviewSurface {
             review.note_splices();
         }
         self.rebuild_compared_files();
-        self.set_status(
-            match view {
-                CompareView::Changes => "showing only what changed",
-                CompareView::Full => "showing the full change, what is new marked",
-            },
-            StatusSeverity::Info,
-        );
+        let text = match (view, self.comparing.active()) {
+            (CompareView::Changes, true) => "showing only what changed",
+            (CompareView::Full, true) => "showing the full change, what is new marked",
+            (CompareView::Changes, false) => {
+                "only what changed: applies once something is compared (b chooses what with)"
+            }
+            (CompareView::Full, false) => "the full change, once something is compared",
+        };
+        self.set_status(text, StatusSeverity::Info);
     }
 
     /// Compare every layer by `baseline` (clearing single picks), kept for the next open

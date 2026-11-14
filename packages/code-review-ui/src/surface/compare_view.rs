@@ -118,7 +118,7 @@ impl ReviewSurface {
     /// The view options on, in full and briefly.
     pub(super) fn compare_chips(&self) -> Vec<[String; 2]> {
         let mut chips = Vec::new();
-        if self.comparing.active() && self.comparing.view() == CompareView::Changes {
+        if self.comparing.view() == CompareView::Changes {
             chips.push(["only what changed".to_owned(), "changes".to_owned()]);
         }
         if self.comparing.only_changed() {
