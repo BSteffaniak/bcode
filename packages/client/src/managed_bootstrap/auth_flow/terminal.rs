@@ -443,6 +443,7 @@ mod tests {
             reconnect_name: std::sync::Arc::from(""),
             verified_daemon: None,
             restore_state: crate::ConnectionRestoreState::default(),
+            presence: crate::presence::Presence::default(),
         };
         ManagedSessionAuthFlow {
             connection,

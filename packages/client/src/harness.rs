@@ -1005,6 +1005,7 @@ mod tests {
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
             restore_state: crate::ConnectionRestoreState::default(),
+            presence: crate::presence::Presence::default(),
         };
         let denied = connection
             .managed_session_auth(ManagedSessionRequest {

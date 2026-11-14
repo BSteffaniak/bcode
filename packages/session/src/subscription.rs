@@ -33,6 +33,14 @@ impl SessionManager {
             .subscribe_events_bounded(limits)
             .await
     }
+    /// The persistent store's root directory; `None` for in-memory sessions.
+    #[must_use]
+    pub fn store_root(&self) -> Option<std::path::PathBuf> {
+        self.store
+            .as_ref()
+            .map(crate::store_executor::SessionStoreExecutor::root_path)
+    }
+
     /// Subscribe to committed durable session mutations.
     #[must_use]
     pub fn subscribe_mutations(&self) -> broadcast::Receiver<SessionMutationCommitted> {

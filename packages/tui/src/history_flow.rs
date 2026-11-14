@@ -53,6 +53,22 @@ pub enum SessionStreamUpdate {
         session_id: SessionId,
         attached: Box<bcode_client::AttachedSessionHistory>,
     },
+    /// The daemon is dormant and the session is followed read-only through its published feed.
+    Following {
+        session_id: SessionId,
+        following: Following,
+    },
+}
+
+/// What following a session's published feed found (see `docs/daemon-dormancy.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Following {
+    /// Another Bcode build runs the session; its committed events are shown as they come.
+    OtherBuild,
+    /// A newer Bcode build runs the session in a format this build cannot read.
+    NewerBuild,
+    /// Some events could not be followed; the view is incomplete until it is opened again.
+    Incomplete,
 }
 
 const INITIAL_TRANSCRIPT_OVERSCAN_VIEWPORTS: usize = 2;
@@ -468,7 +484,8 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
         | BcodeEvent::SessionCatalogUpdated { .. }
         | BcodeEvent::ClientToolInvocation(_)
         | BcodeEvent::ClientToolCancelled { .. }
-        | BcodeEvent::ClientToolClaimLost { .. } => None,
+        | BcodeEvent::ClientToolClaimLost { .. }
+        | BcodeEvent::DaemonShutdown { .. } => None,
     }
 }
 
@@ -485,7 +502,8 @@ async fn flush_superseded_progress(
         | BcodeEvent::SessionCatalogUpdated { .. }
         | BcodeEvent::ClientToolInvocation(_)
         | BcodeEvent::ClientToolCancelled { .. }
-        | BcodeEvent::ClientToolClaimLost { .. } => 0,
+        | BcodeEvent::ClientToolClaimLost { .. }
+        | BcodeEvent::DaemonShutdown { .. } => 0,
     });
     for event in events {
         if event_sender
@@ -592,23 +610,22 @@ async fn reconnecting_event_stream<F>(
                     + 'a,
             >,
         > + Send
+        + Sync
         + 'static,
 {
-    let mut reconnect_delay = std::time::Duration::from_millis(100);
     if !send_queue_status(&client, session_id, &event_sender).await {
         return;
     }
     let mut pending_progress = BTreeMap::new();
+    // The view's last committed event, so a followed feed delivers only what is new.
+    let mut last_sequence: Option<u64> = None;
     let progress_flush = tokio::time::sleep(SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
     tokio::pin!(progress_flush);
-    let queue_refresh = tokio::time::sleep(std::time::Duration::from_secs(30));
-    tokio::pin!(queue_refresh);
+    // Queue status follows the events that change it; an idle stream sends the daemon nothing
+    // (see docs/daemon-dormancy.md).
     loop {
-        let Some(received) = receive_with_queue_refresh(
-            &client,
-            session_id,
+        let Some(received) = until_closed(
             &event_sender,
-            queue_refresh.as_mut(),
             receive_with_progress_flush(
                 connection.recv_event_without_reconnect(),
                 &event_sender,
@@ -617,7 +634,7 @@ async fn reconnecting_event_stream<F>(
             ),
         )
         .await
-        else {
+        .flatten() else {
             return;
         };
         let needs_resync = match received {
@@ -631,12 +648,16 @@ async fn reconnecting_event_stream<F>(
                 true
             }
             Ok(event) => {
+                if let BcodeEvent::Session(committed) = &event
+                    && committed.session_id == session_id
+                {
+                    last_sequence = Some(committed.sequence);
+                }
                 if matches!(&event, BcodeEvent::Session(event) if bcode_session_view::submission_queue_needs_refresh(&event.kind))
                     && !send_queue_status(&client, session_id, &event_sender).await
                 {
                     return;
                 }
-                reconnect_delay = std::time::Duration::from_millis(100);
                 let Some(reset_flush) =
                     forward_stream_event(&event_sender, &mut pending_progress, event).await
                 else {
@@ -648,6 +669,30 @@ async fn reconnecting_event_stream<F>(
                         .reset(tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL);
                 }
                 false
+            }
+            Err(error) if error.is_daemon_stopped() => {
+                // Dormant: keep the view as it is, send nothing, start nothing. Resume once
+                // real work starts the daemon again, here or in another process.
+                tracing::info!(target: "bcode_tui::session_stream", %session_id,
+                    "daemon stopped; session stream dormant until the daemon is back");
+                drop(connection);
+                pending_progress.clear();
+                if until_closed(
+                    &event_sender,
+                    follow_while_dormant(&client, session_id, &event_sender, &mut last_sequence),
+                )
+                .await
+                .is_none()
+                {
+                    return;
+                }
+                let Some(resynchronized) =
+                    resynchronize(&client, session_id, &event_sender, &attach).await
+                else {
+                    return;
+                };
+                (connection, last_sequence) = resynchronized;
+                continue;
             }
             Err(error) => {
                 tracing::warn!(target: "bcode_tui::session_stream", %session_id,
@@ -664,35 +709,132 @@ async fn reconnecting_event_stream<F>(
         // Dropping the stale connection detaches its client before replacement attach. This keeps
         // session client accounting and idle database release semantics accurate.
         drop(connection);
-        if event_sender
-            .send(SessionStreamUpdate::ResyncStarted { session_id })
-            .await
-            .is_err()
+        let Some(resynchronized) = resynchronize(&client, session_id, &event_sender, &attach).await
+        else {
+            return;
+        };
+        (connection, last_sequence) = resynchronized;
+    }
+}
+
+/// While the daemon is dormant, follow the session's published feed (written by whichever
+/// daemon runs it, of any build) until this client's daemon is live again. Committed events
+/// past `last_sequence` are shown as they come; nothing is sent to any daemon.
+async fn follow_while_dormant(
+    client: &BcodeClient,
+    session_id: SessionId,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    last_sequence: &mut Option<u64>,
+) {
+    use bcode_client::session_feed::{FeedUnreadable, FeedUpdate, SessionOwner};
+    let mut follower = client.follow_session_feed(session_id, *last_sequence).ok();
+    let live = client.daemon_live();
+    tokio::pin!(live);
+    let notify = |following| SessionStreamUpdate::Following {
+        session_id,
+        following,
+    };
+    loop {
+        let update = tokio::select! {
+            () = &mut live => return,
+            update = async {
+                match follower.as_mut() {
+                    Some(follower) => follower.next().await,
+                    None => std::future::pending().await,
+                }
+            } => update,
+        };
+        let message = match update {
+            None | Some(FeedUpdate::Unreadable(FeedUnreadable::Damaged)) => {
+                follower = None;
+                None
+            }
+            Some(FeedUpdate::Event(event)) => {
+                let new = event.session_id == session_id
+                    && last_sequence.is_none_or(|last| event.sequence > last);
+                if new {
+                    *last_sequence = Some(event.sequence);
+                    Some(SessionStreamUpdate::Event(Box::new(BcodeEvent::Session(
+                        *event,
+                    ))))
+                } else {
+                    None
+                }
+            }
+            Some(FeedUpdate::Marker(_)) => match client.session_owner(session_id) {
+                SessionOwner::OtherBuild(_) => Some(notify(Following::OtherBuild)),
+                SessionOwner::NewerBuild => Some(notify(Following::NewerBuild)),
+                SessionOwner::None | SessionOwner::ThisBuild(_) => None,
+            },
+            Some(FeedUpdate::Gap) => Some(notify(Following::Incomplete)),
+            Some(FeedUpdate::Unreadable(FeedUnreadable::NewerBuild)) => {
+                follower = None;
+                Some(notify(Following::NewerBuild))
+            }
+        };
+        if let Some(message) = message
+            && sender.send(message).await.is_err()
         {
             return;
         }
-        loop {
-            if event_sender.is_closed() {
-                return;
-            }
-            match client.connect("bcode-tui-bmux").await {
-                Ok(mut next_connection) => {
-                    if let Ok(attached) = attach(&mut next_connection, session_id).await {
-                        if !send_resynchronized(&client, session_id, &event_sender, attached).await
-                        {
-                            return;
-                        }
-                        tracing::info!(target: "bcode_tui::session_stream", %session_id,
-                            "session event stream resynchronized");
-                        connection = next_connection;
-                        reconnect_delay = std::time::Duration::from_millis(100);
-                        break;
-                    }
-                }
-                Err(_error) => {}
-            }
-            reconnect_delay = wait_before_reconnect(session_id, reconnect_delay).await;
+    }
+}
+
+/// Attach the session on a fresh connection and send the resynchronized view, retrying with
+/// backoff; the connection and the view's last committed event. `None` once the stream's
+/// receiver is gone.
+async fn resynchronize<F>(
+    client: &BcodeClient,
+    session_id: SessionId,
+    event_sender: &mpsc::Sender<SessionStreamUpdate>,
+    attach: &F,
+) -> Option<(bcode_client::ClientConnection, Option<u64>)>
+where
+    F: for<'a> Fn(
+            &'a mut bcode_client::ClientConnection,
+            SessionId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            bcode_client::AttachedSessionHistory,
+                            bcode_client::ClientError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send
+        + Sync
+        + 'static,
+{
+    event_sender
+        .send(SessionStreamUpdate::ResyncStarted { session_id })
+        .await
+        .ok()?;
+    let mut reconnect_delay = std::time::Duration::from_millis(100);
+    loop {
+        if event_sender.is_closed() {
+            return None;
         }
+        // A daemon that stopped meanwhile is waited for, not started from here.
+        until_closed(event_sender, client.daemon_live()).await?;
+        if let Ok(mut next_connection) = client.connect("bcode-tui-bmux").await
+            && let Ok(attached) = attach(&mut next_connection, session_id).await
+        {
+            let last_sequence = attached
+                .history
+                .iter()
+                .filter(|event| event.session_id == session_id)
+                .map(|event| event.sequence)
+                .max();
+            if !send_resynchronized(client, session_id, event_sender, attached).await {
+                return None;
+            }
+            tracing::info!(target: "bcode_tui::session_stream", %session_id,
+                "session event stream resynchronized");
+            return Some((next_connection, last_sequence));
+        }
+        reconnect_delay = wait_before_reconnect(session_id, reconnect_delay).await;
     }
 }
 
@@ -707,26 +849,14 @@ async fn wait_before_reconnect(
     (delay * 2).min(std::time::Duration::from_secs(2))
 }
 
-async fn receive_with_queue_refresh<F, T>(
-    client: &BcodeClient,
-    session_id: SessionId,
-    sender: &mpsc::Sender<SessionStreamUpdate>,
-    mut deadline: std::pin::Pin<&mut tokio::time::Sleep>,
-    receive: F,
-) -> Option<T>
+/// `future`'s output, or `None` once the stream's receiver is gone.
+async fn until_closed<F, T>(sender: &mpsc::Sender<SessionStreamUpdate>, future: F) -> Option<T>
 where
-    F: std::future::Future<Output = Option<T>>,
+    F: std::future::Future<Output = T>,
 {
-    tokio::pin!(receive);
-    loop {
-        tokio::select! {
-            result = &mut receive => return result,
-            () = sender.closed() => return None,
-            () = deadline.as_mut() => {
-                if !send_queue_status(client, session_id, sender).await { return None; }
-                deadline.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-            }
-        }
+    tokio::select! {
+        result = future => Some(result),
+        () = sender.closed() => None,
     }
 }
 

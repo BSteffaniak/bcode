@@ -135,6 +135,49 @@ pub fn activity_watch_batches(
     batches
 }
 
+/// Keep one batch's activity watch open, delivering its snapshots (or failures) as `index`.
+async fn watch_batch(
+    client: BcodeClient,
+    batch: bcode_session_models::SessionActivityWatchScope,
+    index: usize,
+    sender: mpsc::Sender<(
+        usize,
+        Result<bcode_session_models::SessionActivityWatchSnapshot, String>,
+    )>,
+) {
+    loop {
+        // A daemon that stopped is not started again to watch: wait until real work starts
+        // it (see docs/daemon-dormancy.md).
+        client.daemon_live().await;
+        let result = async {
+            let watch = ActivityWatch::open(client.clone(), batch.clone()).await?;
+            let result = loop {
+                let delivery = match watch.next_delivery().await {
+                    Ok(delivery) => delivery,
+                    Err(error) => break Err(error),
+                };
+                if sender.send((index, Ok(delivery.snapshot))).await.is_err() {
+                    break Ok::<(), String>(());
+                }
+            };
+            drop(watch);
+            result
+        }
+        .await;
+        match result {
+            Ok(()) => return,
+            // Stopped, not failed: what was shown stays, and the watch resumes with the daemon.
+            Err(_) if client.daemon_presence() != bcode_client::DaemonPresence::Live => {}
+            Err(error) => {
+                if sender.send((index, Err(error))).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 /// Own all admitted streams and their bounded aggregation in one cancellable command.
 pub async fn run_activity_watches(
     client: BcodeClient,
@@ -154,36 +197,7 @@ pub async fn run_activity_watches(
     // JoinSet aborts every opening/pulling worker when BMUX drops this command.
     let mut workers = tokio::task::JoinSet::new();
     for (index, batch) in batches.iter().cloned().enumerate() {
-        let client = client.clone();
-        let sender = sender.clone();
-        workers.spawn(async move {
-            loop {
-                let result = async {
-                    let watch = ActivityWatch::open(client.clone(), batch.clone()).await?;
-                    let result = loop {
-                        let delivery = match watch.next_delivery().await {
-                            Ok(delivery) => delivery,
-                            Err(error) => break Err(error),
-                        };
-                        if sender.send((index, Ok(delivery.snapshot))).await.is_err() {
-                            break Ok::<(), String>(());
-                        }
-                    };
-                    drop(watch);
-                    result
-                }
-                .await;
-                match result {
-                    Ok(()) => return,
-                    Err(error) => {
-                        if sender.send((index, Err(error))).await.is_err() {
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        });
+        workers.spawn(watch_batch(client.clone(), batch, index, sender.clone()));
     }
     drop(sender);
     let unknown = || SessionApplicationFailure {

@@ -172,6 +172,7 @@ members = [
     "packages/router/telemetry-util",
     "plugins/worktree-plugin",
     "packages/session/models",
+    "packages/session/feed",
     "packages/xray",
     "packages/xray/inspector",
     "plugins/xray-plugin",
@@ -336,6 +337,7 @@ bcode_session_bridge                    = { version = "0.0.1-alpha.0", default-f
 bcode_session_bridge_models             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/models" }
 bcode_session_bridge_server             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/server" }
 bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }
+bcode_session_feed                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/feed" }
 bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
 bcode_session_migration                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration" }
 bcode_session_migration_target          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-migration-target" }

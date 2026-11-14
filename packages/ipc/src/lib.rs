@@ -2094,6 +2094,34 @@ pub struct ServerStatus {
     /// Why the daemon currently refuses idle-only shutdown, if anything blocks it.
     #[serde(default)]
     pub idle_shutdown_blocker: Option<String>,
+    /// Each connected client, so a daemon that will not stop can be traced to its clients.
+    #[serde(default)]
+    pub connected_clients: Vec<ConnectedClient>,
+}
+
+/// One connected client, as it introduced itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectedClient {
+    /// The name it connected with (`bcode-tui-bmux`, `bcode-cli`, ...).
+    pub name: String,
+    /// Its process id, as it reported it.
+    pub process_id: Option<u32>,
+    /// Seconds since it connected.
+    pub connected_secs: u64,
+    /// Seconds since its last request.
+    pub idle_secs: u64,
+}
+
+/// Split a `Hello` client name into its name and its `;key=value` attributes. Unknown
+/// attributes are ignored, so clients can add some without breaking older daemons.
+#[must_use]
+pub fn hello_client_name_parts(client_name: &str) -> (&str, Vec<(&str, &str)>) {
+    let mut parts = client_name.split(';');
+    let name = parts.next().unwrap_or_default().trim();
+    let attributes = parts
+        .filter_map(|part| part.trim().split_once('='))
+        .collect();
+    (name, attributes)
 }
 
 /// One active runtime work registration together with its owning session.
@@ -3732,6 +3760,22 @@ pub enum Event {
     ClientToolClaimLost {
         session_id: SessionId,
     },
+    /// The daemon is stopping; the connection closes after this event. A client goes dormant
+    /// and starts a daemon of its build again only for real work (see
+    /// `docs/daemon-dormancy.md`).
+    DaemonShutdown {
+        reason: DaemonShutdownReason,
+    },
+}
+
+/// Why a daemon is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonShutdownReason {
+    /// It had no work for its idle period.
+    Idle,
+    /// It was asked to stop (a stop command, an upgrade, or a termination signal).
+    Stopped,
 }
 
 /// Errors returned by Bcode IPC encoding/decoding.
@@ -7625,6 +7669,7 @@ mod tests {
             Response::Ok(ResponsePayload::ServerStatus {
                 status: ServerStatus {
                     connected_client_count: 1,
+                    connected_clients: Vec::new(),
                     sessions: vec![test_session_summary("status")],
                     session_catalog_loaded: true,
                     session_catalog_status: SessionCatalogStatus::Loaded,

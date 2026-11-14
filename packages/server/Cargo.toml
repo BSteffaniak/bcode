@@ -39,6 +39,7 @@ bcode_provider_auth_models = { workspace = true }
 bcode_ralph = { workspace = true }
 bcode_ralph_models = { workspace = true }
 bcode_session = { workspace = true }
+bcode_session_feed = { workspace = true }
 bcode_session_import = { workspace = true }
 bcode_session_migration = { workspace = true }
 bcode_session_migration_target = { workspace = true }

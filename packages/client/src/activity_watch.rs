@@ -292,6 +292,7 @@ async fn exchange(
         timeout: connection.request_timeout,
     })??;
     let envelope = crate::recv_envelope(&mut connection.stream).await?;
+    connection.observe_shutdown(&envelope)?;
     if envelope.kind != crate::EnvelopeKind::Response || envelope.request_id != id {
         return Err(crate::ClientError::UnexpectedResponse);
     }

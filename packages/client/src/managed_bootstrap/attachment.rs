@@ -114,7 +114,8 @@ fn event_matches(session_id: SessionId, event: &Event) -> bool {
         | Event::SessionCatalogUpdated { .. }
         | Event::ClientToolInvocation(_)
         | Event::ClientToolCancelled { .. }
-        | Event::ClientToolClaimLost { .. } => false,
+        | Event::ClientToolClaimLost { .. }
+        | Event::DaemonShutdown { .. } => false,
     }
 }
 

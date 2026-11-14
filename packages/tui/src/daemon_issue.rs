@@ -181,6 +181,9 @@ pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
         ClientError::UnexpectedResponse | ClientError::UnexpectedEnvelope => {
             TuiDaemonIssue::UnexpectedDaemonResponse
         }
+        // Requests are sent again when the daemon stops before answering; one that still
+        // meets a stopped daemon is a daemon that cannot be reached right now.
+        ClientError::DaemonStopped { .. } => TuiDaemonIssue::Unavailable,
         ClientError::Protocol(_)
         | ClientError::WorktreeCreate { .. }
         | ClientError::Transport(_)

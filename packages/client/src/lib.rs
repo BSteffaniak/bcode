@@ -53,7 +53,7 @@ use bcode_session_models::{
 use bcode_session_models::{PendingToolExchangeSummary, PermissionSummary};
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -501,7 +501,16 @@ pub enum ClientError {
     UnexpectedResponse,
     #[error("unexpected IPC envelope kind")]
     UnexpectedEnvelope,
+    /// The daemon stopped (it said so). Nothing was lost: it starts again for real work.
+    #[error("daemon stopped ({reason:?})")]
+    DaemonStopped {
+        reason: bcode_ipc::DaemonShutdownReason,
+    },
 }
+
+/// Application failure code for [`ClientError::DaemonStopped`]: the daemon stopped for
+/// idleness or on request. Not an error to show; wait for [`BcodeClient::daemon_live`].
+pub const DAEMON_STOPPED_CODE: &str = "daemon_stopped";
 
 fn session_application_failure(
     error: ClientError,
@@ -510,6 +519,10 @@ fn session_application_failure(
         ClientError::Server { code, message } => {
             bcode_session_models::SessionApplicationFailure { code, message }
         }
+        ClientError::DaemonStopped { .. } => bcode_session_models::SessionApplicationFailure {
+            code: DAEMON_STOPPED_CODE.into(),
+            message: "The daemon stopped while idle; it starts again for real work.".into(),
+        },
         _ => bcode_session_models::SessionApplicationFailure {
             code: "session_transport_unavailable".into(),
             message: "Session operation could not complete through the application connection"
@@ -2554,8 +2567,16 @@ impl ClientError {
             | Self::IncompatibleDaemon { .. }
             | Self::Protocol(_)
             | Self::UnexpectedResponse
-            | Self::UnexpectedEnvelope => false,
+            | Self::UnexpectedEnvelope
+            | Self::DaemonStopped { .. } => false,
         }
+    }
+
+    /// Whether the daemon said it stopped. A caller watching in the background waits for
+    /// [`BcodeClient::daemon_live`] instead of reconnecting, which would start it again.
+    #[must_use]
+    pub const fn is_daemon_stopped(&self) -> bool {
+        matches!(self, Self::DaemonStopped { .. })
     }
 }
 
@@ -3108,8 +3129,12 @@ mod activity_watch;
 /// Tools that run in this application's process and are offered to daemon sessions.
 pub mod client_tools;
 pub mod lifecycle;
+mod presence;
 mod request_lanes;
+pub mod session_feed;
+
 pub use account_lifecycle::AccountLifecycleClient;
+pub use presence::DaemonPresence;
 
 /// Client configured for a local Bcode server endpoint.
 #[derive(Debug, Clone)]
@@ -3130,6 +3155,7 @@ pub struct BcodeClient {
     command_invocations: command_control::Controls,
     contextual_invocations: contextual::Controls,
     request_timeout: Duration,
+    presence: presence::Presence,
 }
 
 /// Daemon availability policy used by client connections.
@@ -3203,7 +3229,8 @@ impl SessionCatalogWatcher {
                 | Event::SessionViewResyncRequired { .. }
                 | Event::ClientToolInvocation(_)
                 | Event::ClientToolCancelled { .. }
-                | Event::ClientToolClaimLost { .. } => {}
+                | Event::ClientToolClaimLost { .. }
+                | Event::DaemonShutdown { .. } => {}
             }
         }
     }
@@ -3355,7 +3382,8 @@ impl SessionWatcher {
                 | Event::SessionViewResyncRequired { .. }
                 | Event::ClientToolInvocation(_)
                 | Event::ClientToolCancelled { .. }
-                | Event::ClientToolClaimLost { .. } => {}
+                | Event::ClientToolClaimLost { .. }
+                | Event::DaemonShutdown { .. } => {}
             }
         }
     }
@@ -3396,7 +3424,8 @@ impl RuntimeWorkWatcher {
                 | Event::SessionCatalogUpdated { .. }
                 | Event::ClientToolInvocation(_)
                 | Event::ClientToolCancelled { .. }
-                | Event::ClientToolClaimLost { .. } => {}
+                | Event::ClientToolClaimLost { .. }
+                | Event::DaemonShutdown { .. } => {}
             }
         }
     }
@@ -3444,9 +3473,10 @@ impl WorkflowRunWatcher {
             let received = match self.connection.recv_event_without_reconnect().await {
                 Ok(event) => event,
                 Err(error)
-                    if error.is_daemon_unavailable()
+                    if (error.is_daemon_unavailable() || error.is_daemon_stopped())
                         && self.connection.reconnect_client.is_some() =>
                 {
+                    // A stopped daemon is waited for inside the reconnect, not started.
                     self.connection.restore_state.workflow_runs = false;
                     self.connection.reconnect_and_restore().await?;
                     let after_sequence = self.connection.subscribe_workflow_runs().await?;
@@ -3467,7 +3497,8 @@ impl WorkflowRunWatcher {
                 | Event::SessionCatalogUpdated { .. }
                 | Event::ClientToolInvocation(_)
                 | Event::ClientToolCancelled { .. }
-                | Event::ClientToolClaimLost { .. } => continue,
+                | Event::ClientToolClaimLost { .. }
+                | Event::DaemonShutdown { .. } => continue,
             };
             match self.sequence.observe(&event) {
                 bcode_workflow_view_models::WorkflowLiveEventDisposition::Refetch => {
@@ -3686,6 +3717,7 @@ impl BcodeClient {
             command_invocations: command_control::Controls::default(),
             contextual_invocations: contextual::Controls::default(),
             request_timeout: configured_request_timeout(),
+            presence: presence::Presence::default(),
         }
     }
 
@@ -3709,6 +3741,7 @@ impl BcodeClient {
             command_invocations: command_control::Controls::default(),
             contextual_invocations: contextual::Controls::default(),
             request_timeout: DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT,
+            presence: presence::Presence::default(),
         }
     }
 
@@ -3829,6 +3862,36 @@ impl BcodeClient {
     ) -> Self {
         self.daemon_availability = daemon_availability;
         self
+    }
+
+    /// The daemon as this client last saw it: live, or dormant after it said it stopped.
+    #[must_use]
+    pub fn daemon_presence(&self) -> DaemonPresence {
+        self.presence.current()
+    }
+
+    /// Return once the daemon is live. At once unless it said it stopped; then this waits,
+    /// sending nothing and starting nothing, until real work starts it again, through this
+    /// client or another process of this build (noticed from its endpoint appearing). Watchers
+    /// call this instead of reconnecting, which would start a daemon nobody needs.
+    pub async fn daemon_live(&self) {
+        let endpoint = self.endpoint.as_unix_socket().map(Path::to_path_buf);
+        self.presence
+            .live(endpoint.as_deref(), || async {
+                // A daemon that just bound its endpoint may still be starting.
+                for _ in 0..DAEMON_PROBE_ATTEMPTS {
+                    if self
+                        .connect_with_deadline("bcode-daemon-presence")
+                        .await
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(DAEMON_PROBE_DELAY).await;
+                }
+                false
+            })
+            .await;
     }
 
     /// Ensure a compatible local daemon is available when auto-start is enabled.
@@ -10043,10 +10106,14 @@ impl BcodeClient {
                 runtime_context: self.runtime_context.clone(),
                 ..ConnectionRestoreState::default()
             },
+            presence: self.presence.clone(),
         };
         match connection
             .send_request(Request::Hello {
-                client_name: format!("{client_name};cap=message_accepted"),
+                client_name: format!(
+                    "{client_name};cap=message_accepted;pid={}",
+                    std::process::id()
+                ),
                 runtime_context: self.runtime_context.clone(),
                 daemon_namespace: self
                     .explicit_daemon_target
@@ -10088,6 +10155,7 @@ impl BcodeClient {
                 connection.client_id = Some(client_id);
                 connection.verified_daemon = Some(daemon);
                 handshake_phase.finish();
+                self.presence.connected();
                 Ok(connection)
             }
             _ => Err(ClientError::UnexpectedResponse),
@@ -10129,6 +10197,14 @@ struct ConnectionRestoreState {
     runtime_work_sessions: std::collections::BTreeSet<SessionId>,
 }
 
+/// Attempts to confirm a daemon whose endpoint appeared, while it finishes starting.
+const DAEMON_PROBE_ATTEMPTS: u32 = 20;
+const DAEMON_PROBE_DELAY: Duration = Duration::from_millis(250);
+
+/// Attempts to replace a daemon lost during a stream before the loss is reported (about eight
+/// seconds of backoff).
+const RECONNECT_ATTEMPTS: u32 = 8;
+
 /// Long-lived client connection.
 #[derive(Debug)]
 pub struct ClientConnection {
@@ -10141,6 +10217,7 @@ pub struct ClientConnection {
     reconnect_client: Option<std::sync::Arc<BcodeClient>>,
     reconnect_name: std::sync::Arc<str>,
     restore_state: ConnectionRestoreState,
+    presence: presence::Presence,
 }
 
 impl ClientConnection {
@@ -10810,12 +10887,19 @@ impl ClientConnection {
             .reconnect_client
             .clone()
             .ok_or(ClientError::UnexpectedResponse)?;
+        // A daemon that stopped is not replaced from here: this waits, idle, until real work
+        // starts it again.
+        client.daemon_live().await;
         let restore_state = self.restore_state.clone();
         let mut delay = Duration::from_millis(25);
+        let mut attempts = 0_u32;
         let mut replacement = loop {
             match client.connect(&self.reconnect_name).await {
                 Ok(connection) => break connection,
-                Err(error) if error.is_daemon_unavailable() => {
+                // Bounded: a daemon that cannot be reached or started is reported, not retried
+                // forever (each attempt may try to start one).
+                Err(error) if error.is_daemon_unavailable() && attempts < RECONNECT_ATTEMPTS => {
+                    attempts += 1;
                     tokio::time::sleep(delay).await;
                     delay = delay.saturating_mul(2).min(Duration::from_secs(2));
                 }
@@ -11077,50 +11161,76 @@ impl ClientConnection {
     /// cancelling a partial envelope read requires discarding this connection.
     pub async fn recv_event_without_reconnect(&mut self) -> Result<Event, ClientError> {
         loop {
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(event);
+            let event = if let Some(event) = self.pending_events.pop_front() {
+                event
+            } else {
+                let envelope = recv_envelope(&mut self.stream).await?;
+                if envelope.kind != EnvelopeKind::Event {
+                    continue;
+                }
+                decode_event(&envelope.payload)?
+            };
+            return self.observe_event(event);
+        }
+    }
+
+    /// The daemon's shutdown announcement is the connection's end, not an event to deliver:
+    /// it makes the client dormant and surfaces as [`ClientError::DaemonStopped`].
+    fn observe_event(&self, event: Event) -> Result<Event, ClientError> {
+        match event {
+            Event::DaemonShutdown { reason } => {
+                self.presence.stopped(reason);
+                Err(ClientError::DaemonStopped { reason })
             }
-            let envelope = recv_envelope(&mut self.stream).await?;
-            if envelope.kind == EnvelopeKind::Event {
-                return decode_event(&envelope.payload).map_err(ClientError::from);
-            }
+            event => Ok(event),
         }
     }
 
     /// Receive the next server event.
+    ///
+    /// When the daemon stops, this waits, sending nothing and starting nothing, until real work
+    /// starts it again (here or in another process of this build); then it reconnects, restores
+    /// the connection's subscriptions and attachment, and delivers a resync. A daemon lost
+    /// without saying so is replaced, as a crash during work needs.
     ///
     /// # Errors
     ///
     /// Returns an error when replacement/reconnection fails or an event cannot be decoded.
     pub async fn recv_event(&mut self) -> Result<Event, ClientError> {
         loop {
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(event);
+            let received = match self.pending_events.pop_front() {
+                Some(event) => Ok(event),
+                None => match recv_envelope(&mut self.stream).await {
+                    Ok(envelope) if envelope.kind != EnvelopeKind::Event => continue,
+                    Ok(envelope) => decode_event(&envelope.payload).map_err(ClientError::from),
+                    Err(error) => Err(ClientError::from(error)),
+                },
+            };
+            let error = match received.and_then(|event| self.observe_event(event)) {
+                Ok(event) => return Ok(event),
+                Err(error) => error,
+            };
+            let recoverable = error.is_daemon_unavailable() || error.is_daemon_stopped();
+            if !recoverable || self.reconnect_client.is_none() {
+                return Err(error);
             }
-            match recv_envelope(&mut self.stream).await {
-                Ok(envelope) => {
-                    if envelope.kind != EnvelopeKind::Event {
-                        continue;
-                    }
-                    return decode_event(&envelope.payload).map_err(ClientError::from);
-                }
-                Err(error) => {
-                    let error = ClientError::from(error);
-                    if !error.is_daemon_unavailable() || self.reconnect_client.is_none() {
-                        return Err(error);
-                    }
-                    self.reconnect_and_restore().await?;
-                }
-            }
+            self.reconnect_and_restore().await?;
         }
     }
 
     async fn send_request(&mut self, request: Request) -> Result<ResponsePayload, ClientError> {
+        self.send_request_ref(&request).await
+    }
+
+    async fn send_request_ref(
+        &mut self,
+        request: &Request,
+    ) -> Result<ResponsePayload, ClientError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        let hello = matches!(&request, Request::Hello { .. });
+        let hello = matches!(request, Request::Hello { .. });
         let encoding = hello.then(|| bcode_metrics::startup::phase("client.hello.encode"));
-        let envelope = request_envelope(request_id, &request)?;
+        let envelope = request_envelope(request_id, request)?;
         if let Some(phase) = encoding {
             phase.finish();
         }
@@ -11145,8 +11255,11 @@ impl ClientConnection {
                     })??
             };
             if envelope.kind == EnvelopeKind::Event {
-                self.pending_events
-                    .push_back(decode_event(&envelope.payload).map_err(ClientError::from)?);
+                let event = decode_event(&envelope.payload).map_err(ClientError::from)?;
+                if let Event::DaemonShutdown { reason } = &event {
+                    self.presence.stopped(*reason);
+                }
+                self.pending_events.push_back(event);
                 continue;
             }
             if envelope.kind != EnvelopeKind::Response || envelope.request_id != request_id {
@@ -12434,6 +12547,7 @@ mod client_timeout_tests {
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
             restore_state: super::ConnectionRestoreState::default(),
+            presence: super::presence::Presence::default(),
         };
         assert!(matches!(
             connection
@@ -12490,6 +12604,7 @@ mod client_timeout_tests {
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
             restore_state: super::ConnectionRestoreState::default(),
+            presence: super::presence::Presence::default(),
         };
 
         assert!(matches!(
@@ -12690,6 +12805,7 @@ mod client_timeout_tests {
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
             restore_state: super::ConnectionRestoreState::default(),
+            presence: super::presence::Presence::default(),
         };
         let result = connection
             .list_sessions_in_working_directory("relative-workspace".into())
@@ -12829,6 +12945,7 @@ mod client_timeout_tests {
             reconnect_client: None,
             reconnect_name: std::sync::Arc::from(""),
             restore_state: super::ConnectionRestoreState::default(),
+            presence: super::presence::Presence::default(),
         };
         let session_id = SessionId::new();
 

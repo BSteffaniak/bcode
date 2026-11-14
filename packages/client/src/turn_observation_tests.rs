@@ -20,6 +20,7 @@ async fn watcher() -> (SessionWatcher, LocalIpcStream, std::path::PathBuf) {
         reconnect_client: None,
         reconnect_name: std::sync::Arc::from(""),
         restore_state: ConnectionRestoreState::default(),
+        presence: presence::Presence::default(),
     };
     (
         SessionWatcher {

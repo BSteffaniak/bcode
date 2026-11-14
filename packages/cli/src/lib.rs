@@ -16450,6 +16450,23 @@ async fn server_status(verbose: bool) -> Result<(), CliError> {
     let status = client.verified_server_status().await?;
     print_server_identity(&status, verbose)?;
     println!("connected clients: {}", status.connected_client_count);
+    if verbose {
+        for client in &status.connected_clients {
+            println!(
+                "  {} (pid {}): connected {}s, idle {}s",
+                if client.name.is_empty() {
+                    "<unnamed>"
+                } else {
+                    &client.name
+                },
+                client
+                    .process_id
+                    .map_or_else(|| "?".to_owned(), |pid| pid.to_string()),
+                client.connected_secs,
+                client.idle_secs,
+            );
+        }
+    }
     println!(
         "model provider: {}",
         status
@@ -32913,6 +32930,7 @@ mod latency_diagnosis_tests {
     fn status_with_metrics(metrics: MetricsSnapshot) -> ServerStatus {
         ServerStatus {
             connected_client_count: 0,
+            connected_clients: Vec::new(),
             sessions: Vec::new(),
             session_catalog_loaded: false,
             session_catalog_status: bcode_ipc::SessionCatalogStatus::default(),

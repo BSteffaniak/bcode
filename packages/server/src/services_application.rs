@@ -1505,10 +1505,26 @@ mod tests {
         use bcode_daemon_lifecycle::application::{
             RuntimeShutdownMode, RuntimeShutdownPreparationApplication as _,
         };
-        let state = state();
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("session");
+        let state = Arc::new(crate::tests::test_server_state(sessions));
         let app = ServicesApplicationHandle::new(&state, ClientId::new());
-        state.register_client(ClientId::new()).await;
-        state.register_client(ClientId::new()).await;
+        // Work, not connected clients, refuses an idle-only stop.
+        crate::register_runtime_work(
+            &state,
+            session.id,
+            crate::RuntimeWorkSpec::new(
+                bcode_session_models::WorkId::new("shutdown-policy-work"),
+                bcode_session_models::RuntimeWorkKind::Workflow,
+                "shutdown policy".to_owned(),
+                crate::CancellationHandle::Test(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            ),
+        )
+        .await;
         assert!(
             app.prepare_runtime_shutdown(RuntimeShutdownMode::IfIdle)
                 .await

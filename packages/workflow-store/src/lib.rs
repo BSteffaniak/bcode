@@ -4367,6 +4367,30 @@ impl WorkflowStore {
         Ok(page)
     }
 
+    /// Whether a run fenced to `artifact_id` is still `running`, including one waiting on a
+    /// retry schedule. Such a run is work for that artifact's daemon, which must not stop for
+    /// idleness until the run settles. Paused and repair-required runs wait on a person, not on
+    /// the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identity is malformed or the query fails.
+    pub fn has_running_run_for_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_id("run target artifact", artifact_id)?;
+        let rows = database::rows(
+            &self.connection,
+            &select("workflow_runs")
+                .projections(database::projections(&["run_id"]))
+                .where_eq("status", "running")
+                .where_eq("target_artifact_id", artifact_id)
+                .limit(1),
+        )?;
+        Ok(!rows.is_empty())
+    }
+
     /// Return bounded artifact identities that still own resumable workflow runs.
     ///
     /// Deleting a daemon image whose artifact still owns `running`, `paused`, or

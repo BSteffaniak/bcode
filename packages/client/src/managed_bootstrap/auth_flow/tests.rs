@@ -100,17 +100,7 @@ async fn dedicated_auth_flow_preserves_caller_and_redacts_sensitive_surface() {
         }
     });
     let stream = bcode_ipc::LocalIpcStream::connect(&endpoint).await.unwrap();
-    let connection = ClientConnection {
-        stream,
-        next_request_id: 1,
-        client_id: Some(bcode_session_models::ClientId::new()),
-        pending_events: std::collections::VecDeque::default(),
-        request_timeout: std::time::Duration::from_secs(1),
-        reconnect_client: None,
-        reconnect_name: std::sync::Arc::from(""),
-        verified_daemon: None,
-        restore_state: crate::ConnectionRestoreState::default(),
-    };
+    let connection = connection(stream);
     let mut flow = protocol_flow(connection, session_id);
     assert!(flow.status().await.is_err());
     assert_eq!(flow.begin().await.unwrap().handle, handle);
@@ -164,17 +154,7 @@ async fn readiness_preserves_only_typed_host_failure_code_without_sensitive_mess
         assert!(bcode_ipc::recv_envelope(&mut stream).await.is_err());
     });
     let stream = bcode_ipc::LocalIpcStream::connect(&endpoint).await.unwrap();
-    let connection = ClientConnection {
-        stream,
-        next_request_id: 1,
-        client_id: Some(bcode_session_models::ClientId::new()),
-        pending_events: std::collections::VecDeque::default(),
-        request_timeout: std::time::Duration::from_secs(1),
-        reconnect_client: None,
-        reconnect_name: std::sync::Arc::from(""),
-        verified_daemon: None,
-        restore_state: crate::ConnectionRestoreState::default(),
-    };
+    let connection = connection(stream);
     let mut flow = protocol_flow(connection, bcode_session_models::SessionId::new());
     let error = flow.readiness().await.unwrap_err();
     assert!(
@@ -185,4 +165,20 @@ async fn readiness_preserves_only_typed_host_failure_code_without_sensitive_mess
     assert!(flow.readiness().await.is_err());
     drop(flow);
     server.await.unwrap();
+}
+
+/// A verified-looking connection over `stream`, with no reconnection.
+fn connection(stream: bcode_ipc::LocalIpcStream) -> ClientConnection {
+    ClientConnection {
+        stream,
+        next_request_id: 1,
+        client_id: Some(bcode_session_models::ClientId::new()),
+        pending_events: std::collections::VecDeque::default(),
+        request_timeout: std::time::Duration::from_secs(1),
+        reconnect_client: None,
+        reconnect_name: std::sync::Arc::from(""),
+        verified_daemon: None,
+        restore_state: crate::ConnectionRestoreState::default(),
+        presence: crate::presence::Presence::default(),
+    }
 }

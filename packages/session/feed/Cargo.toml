@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Published session feeds: what a session's owning daemon committed, readable by any process and build"
+edition     = { workspace = true }
+keywords    = ["bcode", "session", "feed"]
+license     = { workspace = true }
+name        = "bcode_session_feed"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+hex                  = { workspace = true }
+notify               = { workspace = true, features = ["macos_fsevent"] }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true, features = ["std"] }
+sha2                 = { workspace = true }
+tokio                = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

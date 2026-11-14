@@ -11,42 +11,50 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_profile        = { workspace = true }
-bcode_command              = { workspace = true }
-bcode_config               = { workspace = true }
-bcode_daemon_lifecycle     = { workspace = true }
-bcode_harness_models       = { workspace = true }
-bcode_ipc                  = { workspace = true }
-bcode_metrics              = { workspace = true }
-bcode_model                = { workspace = true }
-bcode_model_catalog        = { workspace = true }
+bcode_agent_profile = { workspace = true }
+bcode_command = { workspace = true }
+bcode_config = { workspace = true }
+bcode_daemon_lifecycle = { workspace = true }
+bcode_harness_models = { workspace = true }
+bcode_ipc = { workspace = true }
+bcode_metrics = { workspace = true }
+bcode_model = { workspace = true }
+bcode_model_catalog = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
-bcode_plugin_sdk           = { workspace = true }
-bcode_provider_auth        = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
-bcode_ralph_models         = { workspace = true }
-bcode_session_import       = { workspace = true }
-bcode_session_models       = { workspace = true }
-bcode_session_search       = { workspace = true }
-bcode_session_view_models  = { workspace = true }
-bcode_skill_models         = { workspace = true }
-bcode_tool                 = { workspace = true }
-bcode_usage_models         = { workspace = true }
-bcode_workflow             = { workspace = true }
-bcode_workflow_store       = { workspace = true }
+bcode_ralph_models = { workspace = true }
+bcode_session_feed = { workspace = true }
+bcode_session_import = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_session_search = { workspace = true }
+bcode_session_view_models = { workspace = true }
+bcode_skill_models = { workspace = true }
+bcode_tool = { workspace = true }
+bcode_usage_models = { workspace = true }
+bcode_workflow = { workspace = true }
+bcode_workflow_store = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
-bcode_worktree_models      = { workspace = true }
-bcode_xray                 = { workspace = true }
-bcode_xray_models          = { workspace = true }
-hex                        = { workspace = true }
-libc                       = { workspace = true }
-reqwest                    = { workspace = true, features = ["json", "stream"] }
-serde                      = { workspace = true, features = ["derive", "std"] }
-serde_json                 = { workspace = true }
-sha2                       = { workspace = true }
-thiserror                  = { workspace = true }
-tokio                      = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
-tracing                    = { workspace = true }
+bcode_worktree_models = { workspace = true }
+bcode_xray = { workspace = true }
+bcode_xray_models = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+notify = { workspace = true, features = ["macos_fsevent"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -169,7 +169,8 @@ async fn follow_attached(
                     | BcodeEvent::SessionCatalogUpdated { .. }
                     | BcodeEvent::ClientToolInvocation(_)
                     | BcodeEvent::ClientToolCancelled { .. }
-                    | BcodeEvent::ClientToolClaimLost { .. } => false,
+                    | BcodeEvent::ClientToolClaimLost { .. }
+                    | BcodeEvent::DaemonShutdown { .. } => false,
                 };
                 if changed && !deliver_snapshot(sink, &view).await {
                     return Ok(());

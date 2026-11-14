@@ -1901,6 +1901,7 @@ dependencies = [
  "bcode_provider_auth",
  "bcode_provider_auth_models",
  "bcode_ralph_models",
+ "bcode_session_feed",
  "bcode_session_import",
  "bcode_session_models",
  "bcode_session_search",
@@ -1916,6 +1917,7 @@ dependencies = [
  "bcode_xray_models",
  "hex",
  "libc",
+ "notify",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3341,6 +3343,7 @@ dependencies = [
  "bcode_sdk_session_import_plugin",
  "bcode_session",
  "bcode_session_derivation_plugin",
+ "bcode_session_feed",
  "bcode_session_import",
  "bcode_session_migration",
  "bcode_session_migration_target",
@@ -3490,6 +3493,20 @@ dependencies = [
  "bmux_tui",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bcode_session_feed"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "hex",
+ "notify",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

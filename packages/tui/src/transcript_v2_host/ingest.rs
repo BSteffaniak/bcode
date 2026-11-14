@@ -113,7 +113,8 @@ impl TranscriptV2Host {
             | SessionStreamUpdate::QueueStatus { .. }
             | SessionStreamUpdate::QueueUnavailable { .. }
             | SessionStreamUpdate::ResyncStarted { .. }
-            | SessionStreamUpdate::ManagedOwnershipLost { .. } => false,
+            | SessionStreamUpdate::ManagedOwnershipLost { .. }
+            | SessionStreamUpdate::Following { .. } => false,
         }
     }
 

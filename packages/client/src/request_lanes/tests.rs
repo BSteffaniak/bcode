@@ -11,6 +11,8 @@ enum Reply {
     WrongIdFirst,
     EventFirst,
     AccountLifecycle,
+    /// The second request is met by an idle-shutdown announcement, and the connection closes.
+    ShutdownSecond,
 }
 
 struct Server {
@@ -64,20 +66,8 @@ impl Server {
                             let contexts = Arc::clone(&contexts);
                             let replies = Arc::clone(&replies);
                             connections.spawn(async move {
-                                let hello = crate::recv_envelope(&mut stream).await.unwrap();
-                                let Request::Hello { runtime_context, .. } = bcode_ipc::decode_request(&hello.payload).unwrap() else {
-                                    panic!("first frame must be a handshake");
-                                };
-                                contexts.lock().unwrap().push(runtime_context);
-                                let response = Response::Ok(ResponsePayload::Hello {
-                                    protocol_version: bcode_ipc::ProtocolVersion::current(),
-                                    client_id: bcode_session_models::ClientId::new(),
-                                    daemon: crate::client_timeout_tests::matching_daemon_status(),
-                                });
-                                crate::send_envelope(
-                                    &mut stream,
-                                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
-                                ).await.unwrap();
+                                let context = handshake(&mut stream).await;
+                                contexts.lock().unwrap().push(context);
                                 handshakes.fetch_add(1, Ordering::SeqCst);
                                 let mut plans = std::collections::BTreeSet::new();
                                 while let Ok(request) = crate::recv_envelope(&mut stream).await {
@@ -94,8 +84,12 @@ impl Server {
                                                     break;
                                                 }
                                             }
-                                            Reply::Pong | Reply::WrongIdFirst | Reply::EventFirst | Reply::AccountLifecycle => {}
+                                            Reply::Pong | Reply::WrongIdFirst | Reply::EventFirst | Reply::AccountLifecycle | Reply::ShutdownSecond => {}
                                         }
+                                    }
+                                    if index == 1 && matches!(reply, Reply::ShutdownSecond) {
+                                        announce_idle_shutdown(&mut stream).await;
+                                        break;
                                     }
                                     let Ok(permit) = replies.acquire().await else { break };
                                     permit.forget();
@@ -146,6 +140,37 @@ impl Server {
         .await
         .unwrap();
     }
+}
+
+/// Answer the client's handshake; its runtime context.
+async fn handshake(stream: &mut bcode_ipc::LocalIpcStream) -> Option<ClientRuntimeContext> {
+    let hello = crate::recv_envelope(stream).await.unwrap();
+    let Request::Hello {
+        runtime_context, ..
+    } = bcode_ipc::decode_request(&hello.payload).unwrap()
+    else {
+        panic!("first frame must be a handshake");
+    };
+    let response = Response::Ok(ResponsePayload::Hello {
+        protocol_version: bcode_ipc::ProtocolVersion::current(),
+        client_id: bcode_session_models::ClientId::new(),
+        daemon: crate::client_timeout_tests::matching_daemon_status(),
+    });
+    crate::send_envelope(
+        stream,
+        &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+    )
+    .await
+    .unwrap();
+    runtime_context
+}
+
+/// What a daemon stopping for idleness sends before closing.
+async fn announce_idle_shutdown(stream: &mut bcode_ipc::LocalIpcStream) {
+    let event = bcode_ipc::Event::DaemonShutdown {
+        reason: bcode_ipc::DaemonShutdownReason::Idle,
+    };
+    let _ = crate::send_envelope(stream, &bcode_ipc::event_envelope(&event).unwrap()).await;
 }
 
 fn lifecycle_reply(request: Request, plans: &mut std::collections::BTreeSet<String>) -> Response {
@@ -793,4 +818,17 @@ async fn verified_status_disconnects_before_idle_only_stop() {
     );
     client.server_stop_if_idle().await.unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pooled_connection_whose_daemon_stopped_sends_once_more_on_a_fresh_one() {
+    let server = Server::new(Reply::ShutdownSecond);
+    server.replies.add_permits(2);
+    server.client.send_request(Request::Ping).await.unwrap();
+    // The pooled connection's daemon announces it stopped instead of answering: the request
+    // was never handled, so it goes once more on a fresh connection.
+    server.client.send_request(Request::Ping).await.unwrap();
+    assert_eq!(server.handshakes.load(Ordering::SeqCst), 2);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 3);
+    assert_eq!(server.client.daemon_presence(), crate::DaemonPresence::Live);
 }

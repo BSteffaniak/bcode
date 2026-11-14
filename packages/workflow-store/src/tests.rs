@@ -1010,6 +1010,17 @@ fn active_target_artifact_ids_reports_artifacts_owning_resumable_runs() {
         store.active_target_artifact_ids(100).expect("artifacts"),
         vec!["bcode-fenced-artifact".to_string()]
     );
+    // It is also work for that artifact's daemon, and only that one.
+    assert!(
+        store
+            .has_running_run_for_artifact("bcode-fenced-artifact")
+            .expect("running")
+    );
+    assert!(
+        !store
+            .has_running_run_for_artifact("bcode-other-artifact")
+            .expect("other")
+    );
 
     // Terminal runs release their artifact, allowing image collection.
     assert!(
@@ -1024,6 +1035,11 @@ fn active_target_artifact_ids_reports_artifacts_owning_resumable_runs() {
             .expect("run")
             .status,
         RunStatus::Cancelled
+    );
+    assert!(
+        !store
+            .has_running_run_for_artifact("bcode-fenced-artifact")
+            .expect("settled")
     );
     assert_eq!(
         store.active_target_artifact_ids(100).expect("artifacts"),

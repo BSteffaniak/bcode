@@ -2242,6 +2242,11 @@ impl ChatLoopState {
         let Some(client) = self.foreground_client.clone() else {
             return;
         };
+        // Viewport inputs go to running tools. A daemon that stopped for idleness has none, and
+        // these are no reason to start it again.
+        if client.daemon_presence() != bcode_client::DaemonPresence::Live {
+            return;
+        }
         let connection = std::sync::Arc::clone(&self.viewport_input_connection);
         self.viewport_input_task = Some(tokio::spawn(async move {
             let mut connection = connection.lock().await;
@@ -2260,6 +2265,9 @@ impl ChatLoopState {
             for input in inputs {
                 if let Err(error) = client.send_invocation_input(session_id, input).await {
                     tracing::debug!(%error, "viewport input deferred");
+                    // The connection may be gone with its daemon: open a fresh one next time.
+                    *connection = None;
+                    break;
                 }
             }
             drop(connection);
@@ -6719,9 +6727,30 @@ fn absorb_session_stream_update(
             );
             true
         }
+        history_flow::SessionStreamUpdate::Following {
+            session_id,
+            following,
+        } if chat.viewing_session_id() == Some(session_id) => {
+            chat.app.set_status(
+                match following {
+                    history_flow::Following::OtherBuild => {
+                        "Running in another Bcode build; showing its progress read-only"
+                    }
+                    history_flow::Following::NewerBuild => {
+                        "Updated by a newer Bcode build; open it with the current build"
+                    }
+                    history_flow::Following::Incomplete => {
+                        "Some progress could not be followed; reopen the session to see all of it"
+                    }
+                }
+                .to_owned(),
+            );
+            true
+        }
         history_flow::SessionStreamUpdate::ResyncStarted { .. }
         | history_flow::SessionStreamUpdate::ManagedOwnershipLost { .. }
-        | history_flow::SessionStreamUpdate::Resynchronized { .. } => false,
+        | history_flow::SessionStreamUpdate::Resynchronized { .. }
+        | history_flow::SessionStreamUpdate::Following { .. } => false,
     }
 }
 
@@ -6898,7 +6927,8 @@ fn absorb_bcode_event(
         | BcodeEvent::SessionCatalogUpdated { .. }
         | BcodeEvent::ClientToolInvocation(_)
         | BcodeEvent::ClientToolCancelled { .. }
-        | BcodeEvent::ClientToolClaimLost { .. } => false,
+        | BcodeEvent::ClientToolClaimLost { .. }
+        | BcodeEvent::DaemonShutdown { .. } => false,
     }
 }
 

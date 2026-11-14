@@ -209,7 +209,8 @@ impl ClientToolProvider {
                 | Event::RuntimeWork(_)
                 | Event::Workflow(_)
                 | Event::SessionViewResyncRequired { .. }
-                | Event::SessionCatalogUpdated { .. } => {}
+                | Event::SessionCatalogUpdated { .. }
+                | Event::DaemonShutdown { .. } => {}
             }
         }
     }
@@ -409,7 +410,8 @@ fn provider_request(event: Event) -> Option<ClientToolRequest> {
         | Event::RuntimeWork(_)
         | Event::Workflow(_)
         | Event::SessionViewResyncRequired { .. }
-        | Event::SessionCatalogUpdated { .. } => None,
+        | Event::SessionCatalogUpdated { .. }
+        | Event::DaemonShutdown { .. } => None,
     }
 }
 

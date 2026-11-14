@@ -173,7 +173,14 @@ impl TuiTelemetry {
             let client = self.client.clone();
             self.delivery = Some(Delivery::new(move |batch| {
                 let client = client.clone();
-                async move { client.ingest_client_metrics(batch).await.is_ok() }
+                async move {
+                    // Telemetry is never a reason to start a daemon that stopped for
+                    // idleness: while it is dormant, batches are dropped.
+                    if client.daemon_presence() != bcode_client::DaemonPresence::Live {
+                        return true;
+                    }
+                    client.ingest_client_metrics(batch).await.is_ok()
+                }
             }));
             self.next_flush_at = Some(Instant::now() + TELEMETRY_FLUSH_INTERVAL);
         } else {

@@ -125,6 +125,11 @@ impl CliDiagnosticError {
     fn from_client(error: &bcode_client::ClientError) -> Self {
         use bcode_client::ClientError;
         match error {
+            ClientError::DaemonStopped { .. } => Self::diagnostic(
+                "daemon_stopped",
+                "request",
+                "The daemon stopped before answering; the request was not handled. Run it again.",
+            ),
             ClientError::ConnectTimeout { .. } => Self::diagnostic(
                 "connection_timeout",
                 "connect",

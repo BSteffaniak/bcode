@@ -63,6 +63,7 @@ pub mod runtime_work_operations;
 mod server_operations;
 mod services_application;
 mod session_activity;
+mod session_feed_publisher;
 use activity_changes::{ActivityChanges, ActivityCounter, ActivityMutex};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -611,6 +612,8 @@ pub struct ServerState {
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
+    /// What each connected client said about itself, and when it was last active.
+    client_info: StdMutex<BTreeMap<ClientId, ClientInfo>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
     active_session_namespaces: Mutex<BTreeMap<SessionId, ActiveSessionNamespace>>,
@@ -647,6 +650,9 @@ pub struct ServerState {
     metrics: MetricsRegistry,
     shutdown_admission: server_operations::shutdown_admission::ShutdownAdmissionGate,
     shutdown_requested: std::sync::atomic::AtomicBool,
+    /// Set when the idle watcher commits its shutdown: clients are told the daemon stopped
+    /// for idleness, not because it was asked to.
+    idle_shutdown_committed: std::sync::atomic::AtomicBool,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -669,6 +675,15 @@ impl CatalogEventSubscription {
             last_sent_revision: None,
         }
     }
+}
+
+/// A connected client as it introduced itself, for status.
+#[derive(Debug, Clone)]
+struct ClientInfo {
+    name: String,
+    process_id: Option<u32>,
+    connected_at: Instant,
+    last_request_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -767,6 +782,7 @@ const fn client_event_kind(event: &Event) -> &'static str {
         Event::ClientToolInvocation(_) => "client_tool_invocation",
         Event::ClientToolCancelled { .. } => "client_tool_cancelled",
         Event::ClientToolClaimLost { .. } => "client_tool_claim_lost",
+        Event::DaemonShutdown { .. } => "daemon_shutdown",
     }
 }
 
@@ -2817,6 +2833,7 @@ impl ServerState {
             next_permission_id: Mutex::new(1),
             next_permission_batch_id: Mutex::new(1),
             clients: Mutex::default(),
+            client_info: StdMutex::default(),
             client_runtime_contexts: Mutex::default(),
             client_session_namespaces: Mutex::default(),
             active_session_namespaces: Mutex::default(),
@@ -2853,6 +2870,7 @@ impl ServerState {
             shutdown_admission:
                 server_operations::shutdown_admission::ShutdownAdmissionGate::default(),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            idle_shutdown_committed: std::sync::atomic::AtomicBool::new(false),
             shutdown,
         }
     }
@@ -2862,11 +2880,59 @@ impl ServerState {
             return;
         };
         self.clients.lock().await.insert(client_id);
+        let now = Instant::now();
+        self.client_info_mut().insert(
+            client_id,
+            ClientInfo {
+                name: String::new(),
+                process_id: None,
+                connected_at: now,
+                last_request_at: now,
+            },
+        );
         self.activity_changes.notify();
+    }
+
+    fn client_info_mut(&self) -> std::sync::MutexGuard<'_, BTreeMap<ClientId, ClientInfo>> {
+        self.client_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record what a client said about itself in its `Hello` (`name;pid=N;...`).
+    fn introduce_client(&self, client_id: ClientId, client_name: &str) {
+        let (name, attributes) = bcode_ipc::hello_client_name_parts(client_name);
+        if let Some(info) = self.client_info_mut().get_mut(&client_id) {
+            name.clone_into(&mut info.name);
+            info.process_id = attributes
+                .iter()
+                .find(|(key, _)| *key == "pid")
+                .and_then(|(_, value)| value.parse().ok());
+        }
+    }
+
+    fn client_requested(&self, client_id: ClientId) {
+        if let Some(info) = self.client_info_mut().get_mut(&client_id) {
+            info.last_request_at = Instant::now();
+        }
+    }
+
+    fn connected_clients(&self) -> Vec<bcode_ipc::ConnectedClient> {
+        let now = Instant::now();
+        self.client_info_mut()
+            .values()
+            .map(|info| bcode_ipc::ConnectedClient {
+                name: info.name.clone(),
+                process_id: info.process_id,
+                connected_secs: now.duration_since(info.connected_at).as_secs(),
+                idle_secs: now.duration_since(info.last_request_at).as_secs(),
+            })
+            .collect()
     }
 
     async fn unregister_client(self: &Arc<Self>, client_id: ClientId) {
         self.clients.lock().await.remove(&client_id);
+        self.client_info_mut().remove(&client_id);
         self.activity_changes.notify();
         self.activity_watches.remove_client(client_id);
         for check in self
@@ -3304,30 +3370,56 @@ impl ServerState {
             .contains(&client_id)
     }
 
+    /// A workflow run fenced to this daemon's artifact that is still running (a retry wait
+    /// included). Like other readiness probes, this never waits for storage work: it runs off
+    /// the async workers, and a store in use by another caller blocks for this check (that use
+    /// is workflow activity). Unreadable run state blocks too: stopping could strand a run that
+    /// nothing else would resume. A store that never initialized has no runs to resume here.
+    async fn running_workflow_blocker(&self) -> Option<String> {
+        let artifact = workflow_operations::current_artifact_id(self);
+        if artifact.trim().is_empty() || self.poll_workflow_initialization(false).is_err() {
+            return None;
+        }
+        let store = Arc::clone(&self.workflow_store);
+        let running = tokio::task::spawn_blocking(move || {
+            let store = match store.try_lock() {
+                Ok(store) => store,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
+            Some(store.has_running_run_for_artifact(&artifact))
+        })
+        .await;
+        match running {
+            Ok(Some(Ok(false))) => None,
+            Ok(Some(Ok(true))) => {
+                Some("daemon has running workflow runs; refusing idle-only stop".into())
+            }
+            Ok(None) => Some("daemon workflow storage is in use; refusing idle-only stop".into()),
+            Ok(Some(Err(error))) => {
+                tracing::warn!(target: "bcode_server::idle_shutdown", %error, "workflow run state unreadable");
+                Some("daemon cannot read workflow run state; refusing idle-only stop".into())
+            }
+            Err(_) => Some("daemon cannot read workflow run state; refusing idle-only stop".into()),
+        }
+    }
+
     async fn active_migration_shutdown_blocker(&self) -> Option<String> {
         active_migration_shutdown_blocker(self.session_migrations.active_count().await)
     }
 
+    /// What work keeps the daemon from stopping for idleness, if any (see
+    /// `docs/daemon-dormancy.md`). Connected clients are not work: a client that is only open
+    /// keeps nothing running, and it is told when the daemon stops so it can go dormant.
     async fn idle_shutdown_blocker(&self) -> Option<String> {
-        // Explicit idle-only stop keeps its one control/status caller exemption.
-        self.idle_shutdown_blocker_with_client_allowance(1).await
-    }
-
-    async fn idle_shutdown_blocker_with_client_allowance(
-        &self,
-        allowed_clients: usize,
-    ) -> Option<String> {
         if self.xray.observation_active().unwrap_or(true) || self.xray_endpoints.active().await {
             return Some("daemon has live X-ray endpoints; refusing idle-only stop".into());
         }
         if let Some(blocker) = self.active_migration_shutdown_blocker().await {
             return Some(blocker);
         }
-        let connected_clients = self.clients.lock().await.len();
-        if connected_clients > allowed_clients {
-            return Some(format!(
-                "daemon has {connected_clients} connected clients; refusing idle-only stop"
-            ));
+        if let Some(blocker) = self.running_workflow_blocker().await {
+            return Some(blocker);
         }
         if !self.recovered_interaction_owners.lock().await.is_empty() {
             return Some("daemon has recovered interactive work; refusing idle-only stop".into());
@@ -3401,6 +3493,7 @@ impl ServerState {
         let idle_shutdown_blocker = self.idle_shutdown_blocker().await;
         ServerStatus {
             connected_client_count,
+            connected_clients: self.connected_clients(),
             sessions,
             session_catalog_loaded: matches!(status, SessionCatalogStatus::Loaded),
             session_catalog_status: status.clone(),
@@ -3894,7 +3987,7 @@ impl ServerState {
                 let blocker = tokio::select! {
                     biased;
                     _ = shutdown.recv() => break,
-                    blocker = state.idle_shutdown_blocker_with_client_allowance(0) => blocker,
+                    blocker = state.idle_shutdown_blocker() => blocker,
                 };
                 if let Some(blocker) = blocker {
                     if idle_since.take().is_some() {
@@ -3920,15 +4013,12 @@ impl ServerState {
                         idle_since = None;
                         continue;
                     };
-                    if state
-                        .idle_shutdown_blocker_with_client_allowance(0)
-                        .await
-                        .is_some()
-                    {
+                    if state.idle_shutdown_blocker().await.is_some() {
                         idle_since = None;
                         continue;
                     }
                     reservation.commit();
+                    state.idle_shutdown_committed.store(true, Ordering::SeqCst);
                     state.request_shutdown();
                     break;
                 }
@@ -4007,6 +4097,15 @@ impl ServerState {
             && let Some(registration) = registration.as_mut()
         {
             registration.fail();
+        }
+    }
+
+    /// Why the daemon is stopping, for the announcement to its clients.
+    fn shutdown_reason(&self) -> bcode_ipc::DaemonShutdownReason {
+        if self.idle_shutdown_committed.load(Ordering::SeqCst) {
+            bcode_ipc::DaemonShutdownReason::Idle
+        } else {
+            bcode_ipc::DaemonShutdownReason::Stopped
         }
     }
 
@@ -5555,6 +5654,9 @@ async fn run_constructed_server_inner(
             .start_idle_shutdown_watcher(Duration::from_secs(daemon.idle_shutdown_after_secs))
             .await;
     }
+    if let Some(sessions_root) = state.sessions.store_root() {
+        session_feed_publisher::start(&state, sessions_root);
+    }
     start_termination_signal_watcher(&state);
     let phase = bcode_metrics::startup::phase("server.agent_registration");
     warn_on_unregistered_agent_ids(&state, configured_agent_ids).await;
@@ -6472,9 +6574,14 @@ async fn run_client_operation(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Option<Result<(), ServerError>> {
-    // Only this pure inspection is cancellable here. Mutating requests retain their
-    // existing completion semantics even after shutdown or peer disconnection.
-    let cancel_on_shutdown = matches!(&request, Request::ServerStatus { .. });
+    // Only pure inspection and long polls are cancellable here. Mutating requests retain their
+    // existing completion semantics even after shutdown or peer disconnection. A long poll may
+    // wait indefinitely for a change, so neither a gone client nor a stopping daemon waits on it.
+    let long_poll = matches!(
+        &request,
+        Request::PullSessionActivityWatch { .. } | Request::WaitSessionOpenProgress { .. }
+    );
+    let cancel_on_shutdown = long_poll || matches!(&request, Request::ServerStatus { .. });
     let mut shutdown = state.subscribe_shutdown();
     let cancel_on_disconnect = matches!(
         &request,
@@ -6486,7 +6593,7 @@ async fn run_client_operation(
             | Request::JudgementSetup
             | Request::InvokePluginServiceContextual { .. }
             | Request::InvokeApplicationCommand { .. }
-    );
+    ) || long_poll;
     let operation = Box::pin(handle_request(
         request,
         request_id,
@@ -6496,17 +6603,47 @@ async fn run_client_operation(
         attached_session,
     ));
     if cancel_on_shutdown {
+        let operation = cancel_judgement_on_disconnect(operation, writer.request_end.subscribe());
         return tokio::select! {
             biased;
             _ = shutdown.recv() => None,
-            result = operation => Some(result),
+            result = operation => result,
         };
     }
     if !cancel_on_disconnect {
-        return Some(operation.await);
+        return Some(
+            finish_after_disconnect(operation, writer.request_end.subscribe(), state, client_id)
+                .await,
+        );
     }
     // Judgement is transient: dropping the operation cancels its provider invocation.
     cancel_judgement_on_disconnect(operation, writer.request_end.subscribe()).await
+}
+
+/// Run a request that completes even when its client goes away. A client that disconnects
+/// meanwhile stops being a connected client at once, not when the request ends, so status shows
+/// only live clients and the client's subscriptions and watches are released.
+async fn finish_after_disconnect<T>(
+    operation: impl std::future::Future<Output = T>,
+    mut request_end: tokio::sync::watch::Receiver<bool>,
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+) -> T {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => return result,
+        () = async {
+            while !*request_end.borrow() {
+                if request_end.changed().await.is_err() {
+                    // The connection handler owns the sender; it outlives this request.
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {}
+    }
+    state.unregister_client(client_id).await;
+    operation.await
 }
 
 async fn cancel_judgement_on_disconnect<T>(
@@ -6588,7 +6725,10 @@ async fn handle_registered_client(
     loop {
         let received = tokio::select! {
             biased;
-            _ = shutdown.recv() => break,
+            _ = shutdown.recv() => {
+                announce_shutdown(state, client_id, &writer).await;
+                break;
+            }
             () = writer.disconnect.notified() => break,
             envelope = incoming.recv() => match envelope {
                 Some(envelope) => envelope,
@@ -6610,6 +6750,7 @@ async fn handle_registered_client(
         let Some(request) = decode_client_operation(&writer, &envelope).await? else {
             continue;
         };
+        state.client_requested(client_id);
         let Some(result) = run_client_operation(
             request,
             envelope.request_id,
@@ -6620,6 +6761,10 @@ async fn handle_registered_client(
         )
         .await
         else {
+            // A request cancelled by shutdown is answered by the announcement.
+            if state.shutdown_requested.load(Ordering::SeqCst) {
+                announce_shutdown(state, client_id, &writer).await;
+            }
             break;
         };
         if let Err(error) = result {
@@ -6644,6 +6789,18 @@ async fn handle_registered_client(
     }
 
     Ok(())
+}
+
+/// Tell a client the daemon is stopping, and why, before its connection closes. A client that
+/// is gone or does not read in time is not waited on.
+async fn announce_shutdown(state: &ServerState, client_id: ClientId, writer: &SharedWriter) {
+    let reason = state.shutdown_reason();
+    let sink = ClientEventSink::new(client_id, Arc::clone(writer), state.metrics.clone());
+    if let Err(error) = sink.send(Event::DaemonShutdown { reason }).await
+        && !is_expected_disconnect(&error)
+    {
+        tracing::debug!(%client_id, %error, "shutdown announcement not delivered");
+    }
 }
 
 fn request_metric_labels(request: &Request) -> MetricLabels {
@@ -12202,6 +12359,7 @@ async fn handle_hello(
             "first verified Hello completed"
         );
     }
+    state.introduce_client(client_id, &hello.client_name);
     if client_name_supports_message_accepted(&hello.client_name) {
         state.register_message_accepted_client(client_id).await;
     }
@@ -54412,7 +54570,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn idle_shutdown_blocker_covers_clients_and_runtime_work_then_clears() {
+    async fn idle_shutdown_blocker_counts_work_not_clients() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("sessions");
         let session = sessions
@@ -54422,22 +54580,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = Arc::new(test_server_state(sessions));
 
         assert_eq!(state.idle_shutdown_blocker().await, None);
-        let control_client = ClientId::new();
-        state.register_client(control_client).await;
-        assert_eq!(
-            state.idle_shutdown_blocker().await,
-            None,
-            "one control/status client must not block its own idle-only stop request"
-        );
-        let second_client = ClientId::new();
-        state.register_client(second_client).await;
-        assert!(
-            state
-                .idle_shutdown_blocker()
-                .await
-                .is_some_and(|blocker| blocker.contains("2 connected clients"))
-        );
-        state.unregister_client(second_client).await;
+        // Open clients are not work: they are told when the daemon stops and go dormant.
+        for _ in 0..3 {
+            state.register_client(ClientId::new()).await;
+        }
+        assert_eq!(state.idle_shutdown_blocker().await, None);
 
         register_runtime_work(
             &state,
@@ -54469,33 +54616,73 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn idle_shutdown_watcher_preserves_one_client_until_disconnect() {
+    async fn idle_shutdown_watcher_stops_with_clients_connected_and_says_idle() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let client = ClientId::new();
-        state.register_client(client).await;
-        // Explicit idle-only stop still exempts its own caller, unlike the watcher.
-        assert!(state.idle_shutdown_blocker().await.is_none());
-        assert!(
-            state
-                .idle_shutdown_blocker_with_client_allowance(0)
-                .await
-                .is_some()
+        state.register_client(ClientId::new()).await;
+        assert_eq!(
+            state.shutdown_reason(),
+            bcode_ipc::DaemonShutdownReason::Stopped
         );
         let mut shutdown = state.subscribe_shutdown();
         state
             .start_idle_shutdown_watcher(Duration::from_millis(10))
             .await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(60), shutdown.recv())
-                .await
-                .is_err()
-        );
-        assert!(!state.shutdown_requested.load(Ordering::SeqCst));
-        state.unregister_client(client).await;
         tokio::time::timeout(Duration::from_secs(1), shutdown.recv())
             .await
-            .expect("disconnected daemon reaches idle shutdown")
+            .expect("an idle daemon stops with a client connected")
             .expect("shutdown channel");
+        assert_eq!(
+            state.shutdown_reason(),
+            bcode_ipc::DaemonShutdownReason::Idle
+        );
+        state
+            .stop_idle_shutdown_watcher()
+            .await
+            .expect("watcher joined");
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_shutdown_tells_a_watching_client_which_waits_dormant() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("idle.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            while let Ok(stream) = listener.accept().await {
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    let _ = handle_client(stream, state).await;
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut watcher = client.watch_session_catalog().await.expect("watch");
+        // A connected, watching client does not keep an idle daemon.
+        state
+            .start_idle_shutdown_watcher(Duration::from_millis(10))
+            .await;
+        let waiting = tokio::spawn(async move { watcher.next_revision().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.daemon_presence() == bcode_client::DaemonPresence::Live {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the client is told the daemon stopped");
+        assert_eq!(
+            client.daemon_presence(),
+            bcode_client::DaemonPresence::Dormant {
+                reason: bcode_ipc::DaemonShutdownReason::Idle
+            }
+        );
+        // Dormant: the watcher waits for the daemon instead of failing or reconnecting.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        server.abort();
         state
             .stop_idle_shutdown_watcher()
             .await
@@ -108517,11 +108704,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn idle_watcher_shutdown_cancels_blocked_client_inspection() {
         let state = Arc::new(test_server_state(SessionManager::default()));
-        let clients = state.clients.lock().await;
+        let owners = state.recovered_interaction_owners.lock().await;
         state
             .start_idle_shutdown_watcher(Duration::from_millis(1))
             .await;
-        // Let the watcher enter inspection while its clients lock is unavailable.
+        // Let the watcher enter inspection while a lock it inspects is unavailable.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             !state
@@ -108538,10 +108725,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("blocked inspection remains shutdown responsive")
             .expect("watcher joins");
         assert!(
-            state.clients.try_lock().is_err(),
+            state.recovered_interaction_owners.try_lock().is_err(),
             "test still owns the blocker"
         );
-        drop(clients);
+        drop(owners);
         drop(state);
     }
 

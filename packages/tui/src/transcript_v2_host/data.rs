@@ -215,7 +215,8 @@ pub fn live_input(session: SessionId, event: &BcodeEvent) -> Option<LiveInput> {
         | BcodeEvent::SessionCatalogUpdated { .. }
         | BcodeEvent::ClientToolInvocation(_)
         | BcodeEvent::ClientToolCancelled { .. }
-        | BcodeEvent::ClientToolClaimLost { .. } => None,
+        | BcodeEvent::ClientToolClaimLost { .. }
+        | BcodeEvent::DaemonShutdown { .. } => None,
     }
 }
 

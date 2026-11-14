@@ -8,6 +8,16 @@ use tokio::sync::Semaphore;
 const INTERACTIVE_CAPACITY: usize = 4;
 const BACKGROUND_CAPACITY: usize = 1;
 const MAX_IDLE: Duration = Duration::from_secs(30);
+const NOT_HANDLED_RETRIES: u32 = 3;
+const NOT_HANDLED_DELAY: Duration = Duration::from_millis(100);
+
+/// A failure that proves the daemon never handled the request: it announced it stopped instead
+/// of answering, or refused admission because it is stopping. Sending again (to the next
+/// daemon, started for this real request) is no replay.
+fn not_handled(error: &ClientError) -> bool {
+    error.is_daemon_stopped()
+        || matches!(error, ClientError::Server { code, .. } if code == "daemon_stopping")
+}
 
 #[derive(Debug)]
 pub struct RequestLanes {
@@ -101,9 +111,20 @@ impl BcodeClient {
         timeout: Duration,
     ) -> Result<ResponsePayload, ClientError> {
         if !reusable(&request) {
-            let mut connection = self.connect("bcode-cli").await?;
-            connection.request_timeout = timeout;
-            return connection.send_request(request).await;
+            let mut attempt = 0;
+            loop {
+                let mut connection = self.connect("bcode-cli").await?;
+                connection.request_timeout = timeout;
+                match connection.send_request_ref(&request).await {
+                    // Sent again only when it was certainly not handled (see `not_handled`).
+                    Err(error) if not_handled(&error) && attempt < NOT_HANDLED_RETRIES => {
+                        attempt += 1;
+                        // A stopping daemon is exiting: let it go before starting another.
+                        tokio::time::sleep(NOT_HANDLED_DELAY).await;
+                    }
+                    result => return result,
+                }
+            }
         }
         // The request deadline includes capacity wait, handshake, writes and reads.
         // Dropping this future at ANY await drops its exclusively owned connection.
@@ -134,6 +155,7 @@ impl BcodeClient {
             idle.retain(|entry| entry.returned.elapsed() < MAX_IDLE);
             idle.pop()
         };
+        let pooled = idle.is_some();
         let mut connection = if let Some(idle) = idle {
             let connection = idle.connection;
             let daemon = connection
@@ -156,7 +178,19 @@ impl BcodeClient {
             connection.reconnect_client = None;
             connection
         };
-        let result = connection.send_lane_request(request).await;
+        let retry = pooled.then(|| request.clone());
+        let mut result = connection.send_lane_request(request).await;
+        // A pooled socket outlives a daemon that stopped for idleness. When the daemon said so
+        // before answering, it never handled this request, so sending it once more on a fresh
+        // connection (which starts the daemon again for this real request) is no replay. Any
+        // other failure stays uncertain and is not retried.
+        if let Some(request) = retry
+            && result.as_ref().is_err_and(ClientError::is_daemon_stopped)
+        {
+            connection = self.connect("bcode-cli").await?;
+            connection.reconnect_client = None;
+            result = connection.send_lane_request(request).await;
+        }
         if result.is_ok() {
             lane.idle
                 .lock()
@@ -177,6 +211,22 @@ impl BcodeClient {
 }
 
 impl ClientConnection {
+    /// A one-request exchange met by the daemon's shutdown announcement instead of an answer:
+    /// the request was not handled. The client goes dormant.
+    pub(super) fn observe_shutdown(
+        &self,
+        envelope: &bcode_ipc::Envelope,
+    ) -> Result<(), ClientError> {
+        if envelope.kind == super::EnvelopeKind::Event
+            && let Ok(super::Event::DaemonShutdown { reason }) =
+                super::decode_event(&envelope.payload)
+        {
+            self.presence.stopped(reason);
+            return Err(ClientError::DaemonStopped { reason });
+        }
+        Ok(())
+    }
+
     /// Strict one-request/one-response framing for connections with no subscriptions.
     /// An unsolicited frame is uncertainty, not something to skip or buffer forever.
     pub(super) async fn send_lane_request(
@@ -190,6 +240,7 @@ impl ClientConnection {
         let envelope = super::request_envelope(request_id, &request)?;
         super::send_envelope(&mut self.stream, &envelope).await?;
         let envelope = super::recv_envelope(&mut self.stream).await?;
+        self.observe_shutdown(&envelope)?;
         if envelope.kind != super::EnvelopeKind::Response || envelope.request_id != request_id {
             return Err(ClientError::UnexpectedResponse);
         }
