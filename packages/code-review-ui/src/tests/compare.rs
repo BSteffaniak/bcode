@@ -913,6 +913,94 @@ fn a_files_versions_step_with_alt_comma_and_alt_period() {
     assert!(document(&scenario).file_override(&second).is_none());
 }
 
+/// The trailing text of the file panel's row for `path`.
+fn tree_row(scenario: &Scenario<ReviewApp>, path: &str) -> (String, Vec<String>) {
+    let tree = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.file_tree())
+        .expect("the file tree");
+    let item = tree
+        .items()
+        .iter()
+        .find(|item| item.label.contains(path))
+        .unwrap_or_else(|| panic!("no row {path}: {:?}", tree.items()));
+    (
+        item.label.clone(),
+        item.trailing
+            .iter()
+            .map(bmux_tui::text::Line::plain_text)
+            .collect(),
+    )
+}
+
+#[test]
+fn stepping_a_files_version_updates_its_row_in_the_file_panel() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(&backend, &fixture, "Step panel", vec![layer(101)]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+m");
+    scenario.key("q");
+    settled(&mut scenario);
+    // `early.txt` is pushed and looked at (a completed pass); `late.txt` is pushed after.
+    for path in ["early.txt", "late.txt"] {
+        push_to(&fixture, STACK_BRANCHES[0], path);
+        let mut scenario = resume(&fixture, &backend, &workspace.id);
+        settled(&mut scenario);
+        if path == "early.txt" {
+            scenario.key("shift+m");
+        }
+        scenario.key("q");
+        settled(&mut scenario);
+    }
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let doc = document(&scenario);
+    let early = FileKey::new(source_of(doc, 101), None, "early.txt");
+    assert_eq!(doc.file_since(&early), Some(FileSince::Unchanged));
+    // Only what changed, with the unchanged files shown again (dimmed, hideable).
+    scenario.key("shift+l");
+    settled(&mut scenario);
+    scenario.key(":");
+    scenario.paste("Compare: show or hide the files the comparison hides");
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    let hideable = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .and_then(|review| review.file_tree())
+            .map(crate::files::FileTree::hideable_shown)
+    };
+    let before = hideable(&scenario).expect("the tree");
+    assert!(before > 0, "{}", screen.text());
+    let (label, _) = tree_row(&scenario, "early.txt");
+    assert!(label.starts_with("A "), "{label}");
+    let row = (0..screen.height())
+        .find(|y| {
+            let text = screen.row_text(*y);
+            text.contains("early.txt") && !text.contains("A early.txt")
+        })
+        .unwrap_or_else(|| panic!("the header shows: {}", screen.text()));
+    let x = screen.column_of(row, "early.txt").expect("column");
+    scenario.click(x, row);
+    settled(&mut scenario);
+    // The push that added it: the panel's row and its counts follow the document at once.
+    scenario.key("alt+,");
+    let doc = document(&scenario);
+    assert!(doc.file_override(&early).is_some());
+    assert!(matches!(
+        doc.file_since(&early),
+        Some(FileSince::New { .. })
+    ));
+    let (label, trailing) = tree_row(&scenario, "early.txt");
+    assert!(label.starts_with("+ "), "{label}");
+    assert!(trailing.contains(&"new +1".to_owned()), "{trailing:?}");
+    assert_eq!(hideable(&scenario), Some(before - 1));
+}
+
 #[test]
 fn the_history_marks_versions_the_reviewer_viewed_without_a_completed_pass() {
     let fixture = fixture();

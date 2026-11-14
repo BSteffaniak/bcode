@@ -1862,10 +1862,13 @@ impl ReviewSurface {
                 file.path, step.from, step.to
             ))
         });
+        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
         if let Some(review) = self.review.as_mut()
             && review.doc.set_file_comparison(&file, delta)
         {
             review.note_splices();
+            // The file's mark, its counts, and whether it is hidden follow the version shown.
+            review.rebuild_files(&theme, hide_viewed);
         }
         self.set_status(
             label.unwrap_or_else(|| format!("{}: as its layer is compared", file.path)),
