@@ -568,3 +568,35 @@ fn staying_on_a_layer_records_an_opened_look() {
         looks(&backend, &fixture)
     );
 }
+
+#[test]
+fn clicking_a_summary_rows_view_button_switches_the_whole_screen() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let screen = settled(&mut scenario);
+    let row = (0..screen.height())
+        .find(|y| screen.row_text(*y).contains("[only what changed]"))
+        .unwrap_or_else(|| panic!("a summary row: {}", screen.text()));
+    let x = screen
+        .column_of(row, "[only what changed]")
+        .expect("column");
+    scenario.click(x + 1, row);
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert_eq!(review.comparing().view(), CompareView::Changes);
+    let doc = document(&scenario);
+    assert_eq!(
+        doc.comparison(&source_of(doc, 101)).map(|c| c.view),
+        Some(CompareView::Changes)
+    );
+    assert!(screen.contains("[full change]"), "{}", screen.text());
+    // One key press goes back.
+    scenario.key("shift+l");
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert_eq!(review.comparing().view(), CompareView::Full);
+    let doc = document(&scenario);
+    assert_eq!(
+        doc.comparison(&source_of(doc, 101)).map(|c| c.view),
+        Some(CompareView::Full)
+    );
+}

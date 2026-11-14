@@ -234,6 +234,11 @@ impl ReviewSurface {
                 self.file_ui.actions.push(action.action());
                 None
             }
+            ItemAction::Compare(crate::rows::compare::CompareAction::ToggleView) => {
+                // The same switch as the key: every compared source, the screen's view kept.
+                self.toggle_compare_view();
+                None
+            }
             ItemAction::Compare(action) => {
                 Self::apply_compare_click(review, &click.key, action);
                 None
@@ -256,7 +261,6 @@ impl ReviewSurface {
         action: crate::rows::compare::CompareAction,
     ) {
         use crate::rows::compare::CompareAction;
-        use bcode_code_review::document::CompareView;
         let changed = match (action, key) {
             (CompareAction::ToggleRemoval, ItemKey::RemovedSince { file, before }) => {
                 review.doc.toggle_removal(file, *before)
@@ -264,13 +268,6 @@ impl ReviewSurface {
             (CompareAction::ShowFiles, ItemKey::CompareNote { source_id, .. }) => {
                 let shown = review.doc.compare_files_shown(source_id);
                 review.doc.set_compare_files_shown(source_id, !shown)
-            }
-            (CompareAction::ToggleView, ItemKey::CompareNote { source_id, .. }) => {
-                let view = match review.doc.comparison(source_id).map(|c| c.view) {
-                    Some(CompareView::Changes) => CompareView::Full,
-                    _ => CompareView::Changes,
-                };
-                review.doc.set_compare_view(view)
             }
             _ => false,
         };
