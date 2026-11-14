@@ -334,6 +334,8 @@ impl ReviewSurface {
             return;
         }
         self.comparing.begin_preview();
+        let shown = self.compare_files_shown_now();
+        self.comparing.hold_files_shown(shown);
         let state = self.compare_menu_state();
         self.modal = Some(Modal::Compare(CompareMenu::new(&state, &self.theme)));
     }
@@ -458,16 +460,7 @@ impl ReviewSurface {
             CompareMenuOutcome::Redraw => Action::Redraw,
             CompareMenuOutcome::Cancel => {
                 self.modal = None;
-                if let Some(snapshot) = self.comparing.take_snapshot()
-                    && snapshot != self.comparing.snapshot()
-                {
-                    self.restore_compare(snapshot, host);
-                    let label = self.baseline_labels()[0].clone();
-                    self.set_status(
-                        format!("comparison put back: changes since {label}"),
-                        StatusSeverity::Info,
-                    );
-                }
+                self.put_back_compare(host);
                 Action::Redraw
             }
             CompareMenuOutcome::Done => {
@@ -489,6 +482,25 @@ impl ReviewSurface {
                 }
                 Action::Redraw
             }
+        }
+    }
+
+    /// Put back the comparison the menu opened on (it was cancelled, or a picker it opened
+    /// was): the choice, and which sources show their hidden files.
+    fn put_back_compare(&mut self, host: &UiContext) {
+        let shown = self.comparing.take_files_shown();
+        if let Some(snapshot) = self.comparing.take_snapshot()
+            && snapshot != self.comparing.snapshot()
+        {
+            self.restore_compare(snapshot, host);
+            let label = self.baseline_labels()[0].clone();
+            self.set_status(
+                format!("comparison put back: changes since {label}"),
+                StatusSeverity::Info,
+            );
+        }
+        if let Some(shown) = shown {
+            self.restore_compare_files_shown(&shown);
         }
     }
 

@@ -120,6 +120,9 @@ pub struct Comparing {
     /// The comparison state the menu opened on, while the menu is open: put back on `esc`,
     /// and nothing is saved until the menu closes.
     snapshot: Option<CompareSnapshot>,
+    /// The sources whose hidden files were shown when the menu opened, while it is open (or
+    /// a picker it opened is): put back with the snapshot.
+    files_shown: Option<BTreeSet<String>>,
     /// The push timeline while it has the keyboard.
     pub(super) timeline: Option<TimelineFocus>,
     /// The comparison row as last painted.
@@ -215,6 +218,7 @@ impl Comparing {
     /// The menu closed keeping what it previewed: returns whether the choice differs from the
     /// one it opened on.
     pub(super) fn end_preview(&mut self) -> bool {
+        self.files_shown = None;
         let before = self.snapshot.take();
         before.is_some_and(|before| before != self.snapshot())
     }
@@ -235,6 +239,16 @@ impl Comparing {
     /// The menu closed putting back what it opened on: returns that choice.
     pub(super) const fn take_snapshot(&mut self) -> Option<CompareSnapshot> {
         self.snapshot.take()
+    }
+
+    /// Hold the sources whose hidden files are shown, to put back with the snapshot.
+    pub(super) fn hold_files_shown(&mut self, shown: BTreeSet<String>) {
+        self.files_shown = Some(shown);
+    }
+
+    /// The sources held by [`Self::hold_files_shown`] (and forget them).
+    pub(super) const fn take_files_shown(&mut self) -> Option<BTreeSet<String>> {
+        self.files_shown.take()
     }
 
     /// A source was listed again (or added): its layer may have moved.
@@ -1436,6 +1450,43 @@ impl ReviewSurface {
         self.refresh_comparison(host);
         self.apply_compare_filter();
         self.rebuild_compared_files();
+    }
+
+    /// The sources whose hidden files are shown now.
+    pub(super) fn compare_files_shown_now(&self) -> BTreeSet<String> {
+        let Some(review) = self.review.as_ref() else {
+            return BTreeSet::new();
+        };
+        review
+            .doc
+            .groups()
+            .map(|group| group.source.source_id.clone())
+            .filter(|source| review.doc.compare_files_shown(source))
+            .collect()
+    }
+
+    /// Show the hidden files of exactly the sources in `shown`.
+    pub(super) fn restore_compare_files_shown(&mut self, shown: &BTreeSet<String>) {
+        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let sources: BTreeSet<String> = review
+            .doc
+            .groups()
+            .map(|group| group.source.source_id.clone())
+            .collect();
+        let mut changed = false;
+        for source in &sources {
+            changed |= review
+                .doc
+                .set_compare_files_shown(source, shown.contains(source));
+        }
+        if changed {
+            review.note_splices();
+            review.rebuild_files(&theme, hide_viewed);
+            self.layout_revision += 1;
+        }
     }
 
     /// Keep the comparison choice for the next open. Versions picked for single pull requests

@@ -1326,6 +1326,46 @@ fn only_what_changed_toggles_in_the_menu_while_nothing_is_compared() {
 }
 
 #[test]
+fn escape_puts_back_which_layers_show_their_hidden_files() {
+    use crate::compare_menu::MenuChoice;
+    use crate::config::compare::{CompareConfig, RebasedLayers};
+    let config = CompareConfig {
+        rebased_layers: RebasedLayers::Show,
+        ..CompareConfig::default()
+    };
+    let (_fixture, _backend, _id, mut scenario) =
+        reopened_after_a_restack(TestBackend::default().with_compare_config(config));
+    let rebased = source_of(document(&scenario), 102);
+    assert!(document(&scenario).compare_files_shown(&rebased));
+    // The reviewer hides the rebased layer's files again.
+    scenario.key(".");
+    settled(&mut scenario);
+    run(
+        &mut scenario,
+        "Compare: show or hide the files the comparison hides",
+    );
+    assert!(!document(&scenario).compare_files_shown(&rebased));
+    // A preview lays the comparison again; esc puts back what the menu opened on.
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Off);
+    scenario.key("space");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::LastLooked);
+    scenario.key("space");
+    settled(&mut scenario);
+    scenario.key("escape");
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_none());
+    assert_eq!(
+        kind_of(document(&scenario), 102),
+        Some(DeltaKind::RebasedOnly)
+    );
+    assert!(!document(&scenario).compare_files_shown(&rebased));
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
