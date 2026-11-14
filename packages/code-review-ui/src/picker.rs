@@ -278,6 +278,15 @@ impl Picker {
         ))
     }
 
+    /// Whether `point` (in screen cells) is on the panel as last painted; `None` before it is
+    /// painted.
+    #[must_use]
+    pub fn panel_contains(&self, point: bmux_tui::geometry::Point) -> Option<bool> {
+        let (area, layout) = self.painted.as_ref()?;
+        let rect = layout.find_rect(&LayoutId::new(format!("{}.panel", self.id)))?;
+        Some(Rect::new(area.x + rect.x, area.y + rect.y, rect.width, rect.height).contains(point))
+    }
+
     fn menu_id(&self) -> String {
         format!("{}.menu", self.id)
     }

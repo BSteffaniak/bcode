@@ -1,13 +1,19 @@
-//! Choosing what a review compares with: the "Changes since…" menu and the version picker of
-//! one pull request. Both are BMUX picker frames over menus ([`Picker`]); see
+//! Choosing what a review compares with: the comparison menu and the version picker of one pull
+//! request. Both are BMUX picker frames over menus ([`Picker`]); see
 //! `docs/review-stack-history.md`.
+//!
+//! The comparison menu is a live control: `space` (or a click) picks a baseline or flips a
+//! view option in place and the review behind the menu follows at once; `enter` keeps the
+//! state and closes; `esc` puts back the state the menu opened on. The baseline in effect is
+//! marked like a radio button (with what it resolves to, such as `4m ago`), view options like
+//! check boxes, and the cursor opens on the baseline in effect.
 
 use super::history::ago;
 use super::picker::{Picker, PickerItem, PickerOutcome};
 use super::theme::ReviewTheme;
 use bcode_code_review_models::{ChangeKind, LayerLook, LayerTimeline, LookKind};
 use bmux_keyboard::{KeyCode, KeyStroke};
-use bmux_tui::event::Event;
+use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::text::{Line, Span};
@@ -15,24 +21,34 @@ use bmux_tui::text::{Line, Span};
 /// One hour, in milliseconds.
 const HOUR_MS: u64 = 3_600_000;
 
-/// What the menu chose.
+/// The points in time the menu offers, with their labels.
+pub const AGO_PRESETS: [(u64, &str); 3] = [
+    (HOUR_MS, "1 hour ago"),
+    (24 * HOUR_MS, "yesterday"),
+    (7 * 24 * HOUR_MS, "a week ago"),
+];
+
+/// A row of the comparison menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuChoice {
-    /// What the reviewer last looked at.
+    /// Compare with what the reviewer last looked at.
     LastLooked,
-    /// Each layer's version before the latest push.
+    /// Compare with each layer's version before the latest push.
     PreviousPush,
-    /// A push, picked on the timeline.
+    /// Compare between pushes picked on the timeline.
     Push,
-    /// A version of the current pull request, picked in the version picker.
+    /// Compare two versions of the current pull request, picked in the version picker.
     Version,
-    /// Each layer as it was this long ago.
+    /// Compare with each layer as it was this long ago.
     Ago(u64),
+    /// The whole stack as it was at a time (chosen in the stack history); only listed while in
+    /// effect.
+    StackAt,
     /// No comparison.
     Off,
-    /// Only pull requests with real changes.
+    /// View option: only pull requests with real changes.
     OnlyChanged,
-    /// Only what changed / the full change.
+    /// View option: only what changed.
     View,
 }
 
@@ -44,6 +60,7 @@ impl MenuChoice {
             Self::Push => "push".to_owned(),
             Self::Version => "version".to_owned(),
             Self::Ago(ms) => format!("ago:{ms}"),
+            Self::StackAt => "stack_at".to_owned(),
             Self::Off => "off".to_owned(),
             Self::OnlyChanged => "only_changed".to_owned(),
             Self::View => "view".to_owned(),
@@ -56,11 +73,25 @@ impl MenuChoice {
             "previous" => Self::PreviousPush,
             "push" => Self::Push,
             "version" => Self::Version,
+            "stack_at" => Self::StackAt,
             "off" => Self::Off,
             "only_changed" => Self::OnlyChanged,
             "view" => Self::View,
             other => Self::Ago(other.strip_prefix("ago:")?.parse().ok()?),
         })
+    }
+
+    /// Whether the row is a view option (a check box) rather than a baseline.
+    #[must_use]
+    pub const fn is_option(self) -> bool {
+        matches!(self, Self::OnlyChanged | Self::View)
+    }
+
+    /// Whether picking the row opens another picker (the push timeline or the version picker)
+    /// instead of comparing at once.
+    #[must_use]
+    pub const fn opens_picker(self) -> bool {
+        matches!(self, Self::Push | Self::Version)
     }
 }
 
@@ -77,19 +108,46 @@ pub enum MenuOutcome<T> {
     Chose(T),
 }
 
-/// What the "Changes since…" menu offers and how things stand.
+/// What a key or click in the comparison menu led to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareMenuOutcome {
+    /// Put back the state the menu opened on, and close it.
+    Cancel,
+    /// Keep the state, and close it.
+    Done,
+    /// Apply the choice and keep the menu open (a preview).
+    Apply(MenuChoice),
+    /// Apply the choice, keep the state, and close the menu.
+    ApplyAndClose(MenuChoice),
+    /// Draw again.
+    Redraw,
+    /// Not its input.
+    Ignored,
+}
+
+/// What the comparison menu offers and how things stand.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MenuState {
-    /// The choice in effect, to focus.
+    /// The baseline in effect: marked, and the row the cursor opens on.
     pub current: Option<MenuChoice>,
+    /// What the baseline in effect resolves to (`4m ago`, `push 3 → now`, `v2 → now`).
+    pub detail: Option<String>,
+    /// When the reviewer last looked, when known (`4m ago`).
+    pub last_looked: Option<String>,
+    /// When the stack was last pushed, when known (`2h ago`).
+    pub last_push: Option<String>,
+    /// The pull request the version picker would open on.
+    pub version_of: Option<u64>,
     /// Only pull requests with real changes are shown.
     pub only_changed: bool,
     /// Only what changed is shown.
     pub changes_view: bool,
     /// What there is to pick from.
     pub offers: MenuOffers,
-    /// The keys of the view switch and of this menu, for the labels.
+    /// The key of the view switch, for its row.
     pub view_key: Option<String>,
+    /// How far the comparison is (`comparing 2 of 3…`), while some source is still computing.
+    pub progress: Option<String>,
 }
 
 /// What the menu can offer to pick from.
@@ -101,30 +159,94 @@ pub struct MenuOffers {
     pub versions: bool,
 }
 
-/// The "Changes since…" menu.
+/// The comparison menu.
 #[derive(Debug)]
 pub struct CompareMenu {
     picker: Picker,
+    state: MenuState,
 }
 
+/// The radio mark of a baseline row.
+const fn radio(on: bool, ascii: bool) -> &'static str {
+    match (on, ascii) {
+        (true, false) => "◉ ",
+        (false, false) => "○ ",
+        (true, true) => "(*) ",
+        (false, true) => "( ) ",
+    }
+}
+
+/// The check box of a view option row.
 const fn check(on: bool) -> &'static str {
     if on { "[x] " } else { "[ ] " }
 }
 
+const FOOTER: &str = "space pick · enter done · esc cancel";
+
 impl CompareMenu {
-    /// The menu for `state`.
+    /// The menu for `state`, the cursor on the baseline in effect.
     #[must_use]
     pub fn new(state: &MenuState, theme: &ReviewTheme) -> Self {
-        let mut picker = Picker::new("review.compare_menu", "Changes since…", None);
-        picker.set_footer("enter choose · esc close");
-        let row = |choice: MenuChoice, label: &str, hint: &str| {
-            PickerItem::new(
-                choice.id(),
-                Line::from_spans(vec![
-                    Span::styled(label.to_owned(), theme.text),
-                    Span::styled(format!("  {hint}"), theme.muted),
-                ]),
-            )
+        let picker = Picker::new("review.compare_menu", "Compare", None);
+        let mut menu = Self {
+            picker,
+            state: MenuState::default(),
+        };
+        menu.update(state, theme);
+        if let Some(current) = state.current {
+            menu.picker.focus_id(&current.id());
+        }
+        menu
+    }
+
+    /// Show `state` (after a pick took effect), keeping the cursor where it is.
+    pub fn update(&mut self, state: &MenuState, theme: &ReviewTheme) {
+        if self.state == *state && !self.picker.items().is_empty() {
+            return;
+        }
+        self.state = state.clone();
+        let footer = state.progress.as_ref().map_or_else(
+            || FOOTER.to_owned(),
+            |progress| format!("{progress} · {FOOTER}"),
+        );
+        self.picker.set_footer(footer);
+        self.picker.set_items(Self::items(state, theme));
+    }
+
+    /// The state shown.
+    #[must_use]
+    pub const fn state(&self) -> &MenuState {
+        &self.state
+    }
+
+    fn items(state: &MenuState, theme: &ReviewTheme) -> Vec<PickerItem> {
+        let ascii = theme.icons.menu.is_ascii();
+        let separator = theme.icons.separator;
+        let ellipsis = theme.icons.ellipsis;
+        let target = |choice: MenuChoice, label: String, known: Option<&str>, hint: &str| {
+            let on = state.current == Some(choice);
+            let mut spans = vec![
+                Span::styled(
+                    radio(on, ascii),
+                    if on { theme.accent } else { theme.muted },
+                ),
+                Span::styled(label, if on { theme.title } else { theme.text }),
+            ];
+            // The baseline in effect says what it resolves to; the others say when they are,
+            // when known, else what they mean.
+            let detail = if on {
+                state.detail.as_deref().or(known)
+            } else {
+                known
+            };
+            match detail {
+                Some(detail) if !detail.is_empty() => spans.push(Span::styled(
+                    format!("{separator}{detail}"),
+                    if on { theme.accent } else { theme.muted },
+                )),
+                _ => spans.push(Span::styled(format!("  {hint}"), theme.muted)),
+            }
+            PickerItem::new(choice.id(), Line::from_spans(spans))
         };
         let section = |id: &str, label: &str| {
             PickerItem::section(
@@ -133,99 +255,173 @@ impl CompareMenu {
             )
         };
         let mut items = vec![
-            section("s.since", "Compare with"),
-            row(
+            section("s.since", "Show changes since"),
+            target(
                 MenuChoice::LastLooked,
-                "You last looked",
+                "you last looked".to_owned(),
+                state.last_looked.as_deref(),
                 "each pull request as you last saw it",
             ),
         ];
         if state.offers.pushes {
-            items.push(row(
+            items.push(target(
                 MenuChoice::PreviousPush,
-                "Previous push",
-                "each pull request before the stack's latest push",
-            ));
-            items.push(row(
-                MenuChoice::Push,
-                "A push…",
-                "pick pushes on the timeline",
+                "the previous push".to_owned(),
+                state.last_push.as_deref(),
+                "each pull request before the latest push",
             ));
         }
-        if state.offers.versions {
-            items.push(row(
-                MenuChoice::Version,
-                "A version of this pull request…",
-                "pick two versions",
-            ));
-        }
-        items.push(section("s.time", "As it was"));
-        for (ms, label) in [
-            (HOUR_MS, "1 hour ago"),
-            (24 * HOUR_MS, "Yesterday"),
-            (7 * 24 * HOUR_MS, "A week ago"),
-        ] {
-            items.push(row(
+        for (ms, label) in AGO_PRESETS {
+            items.push(target(
                 MenuChoice::Ago(ms),
-                label,
-                "every pull request since then",
+                label.to_owned(),
+                None,
+                "each pull request as it was then",
             ));
         }
-        items.push(row(
+        if state.offers.pushes {
+            items.push(target(
+                MenuChoice::Push,
+                format!("pushes picked on the timeline{ellipsis}"),
+                None,
+                "from one push to another",
+            ));
+        }
+        if state.offers.versions || state.current == Some(MenuChoice::Version) {
+            let of = state.version_of.map_or_else(
+                || "this pull request".to_owned(),
+                |number| format!("#{number}"),
+            );
+            items.push(target(
+                MenuChoice::Version,
+                format!("two versions of {of}{ellipsis}"),
+                None,
+                "picked in its version list",
+            ));
+        }
+        if state.current == Some(MenuChoice::StackAt) {
+            items.push(target(
+                MenuChoice::StackAt,
+                "the stack as it was".to_owned(),
+                None,
+                "chosen in the stack history",
+            ));
+        }
+        items.push(target(
             MenuChoice::Off,
-            "Full change",
-            "no comparison: the review as without history",
+            "nothing: show the full change".to_owned(),
+            None,
+            "no comparison",
         ));
-        items.push(section("s.show", "Show"));
-        items.push(row(
-            MenuChoice::OnlyChanged,
-            &format!(
-                "{}Only pull requests with real changes",
-                check(state.only_changed)
-            ),
-            "hide unchanged and rebased-only ones",
-        ));
+        items.push(section("s.view", "View"));
+        items.extend(Self::option_items(state, theme));
+        items
+    }
+
+    /// The view option rows: check boxes.
+    fn option_items(state: &MenuState, theme: &ReviewTheme) -> [PickerItem; 2] {
+        let option = |choice: MenuChoice, on: bool, label: &str, hint: String| {
+            PickerItem::new(
+                choice.id(),
+                Line::from_spans(vec![
+                    Span::styled(check(on), if on { theme.accent } else { theme.muted }),
+                    Span::styled(label.to_owned(), if on { theme.title } else { theme.text }),
+                    Span::styled(format!("  {hint}"), theme.muted),
+                ]),
+            )
+        };
         let key = state
             .view_key
             .as_deref()
-            .map_or_else(String::new, |key| format!("({key})"));
-        items.push(row(
-            MenuChoice::View,
-            &format!("{}Show only what changed", check(state.changes_view)),
-            &key,
-        ));
-        picker.set_items(items);
-        if let Some(current) = state.current {
-            picker.focus_id(&current.id());
-        }
-        Self { picker }
+            .map_or_else(String::new, |key| format!(" ({key})"));
+        [
+            option(
+                MenuChoice::View,
+                state.changes_view,
+                "Only what changed",
+                format!("hide what is the same as then{key}"),
+            ),
+            option(
+                MenuChoice::OnlyChanged,
+                state.only_changed,
+                "Only pull requests with real changes",
+                "hide unchanged and rebased-only ones".to_owned(),
+            ),
+        ]
     }
 
     /// Answer a key.
-    pub fn key(&mut self, stroke: KeyStroke) -> MenuOutcome<MenuChoice> {
-        Self::outcome(self.picker.key(stroke))
-    }
-
-    /// Answer a pointer event.
-    pub fn mouse(&mut self, event: &Event, theme: &ReviewTheme) -> MenuOutcome<MenuChoice> {
-        Self::outcome(self.picker.mouse(event, theme))
-    }
-
-    fn outcome(outcome: PickerOutcome) -> MenuOutcome<MenuChoice> {
-        match outcome {
-            PickerOutcome::Cancel => MenuOutcome::Close,
-            PickerOutcome::Picked(id) => {
-                MenuChoice::from_id(&id).map_or(MenuOutcome::Ignored, MenuOutcome::Chose)
+    pub fn key(&mut self, stroke: KeyStroke) -> CompareMenuOutcome {
+        let plain = stroke.modifiers.is_empty();
+        match stroke.key {
+            KeyCode::Space | KeyCode::Char(' ') if plain => {
+                return self
+                    .focused()
+                    .map_or(CompareMenuOutcome::Ignored, |choice| {
+                        if choice.opens_picker() {
+                            CompareMenuOutcome::ApplyAndClose(choice)
+                        } else {
+                            CompareMenuOutcome::Apply(choice)
+                        }
+                    });
             }
-            PickerOutcome::Ignored => MenuOutcome::Ignored,
-            _ => MenuOutcome::Redraw,
+            KeyCode::Enter if plain => {
+                return match self.focused() {
+                    // A view option is flipped with space or a click; enter keeps what is set.
+                    Some(choice) if choice.is_option() => CompareMenuOutcome::Done,
+                    Some(choice)
+                        if self.state.current == Some(choice) && !choice.opens_picker() =>
+                    {
+                        CompareMenuOutcome::Done
+                    }
+                    Some(choice) => CompareMenuOutcome::ApplyAndClose(choice),
+                    None => CompareMenuOutcome::Done,
+                };
+            }
+            _ => {}
+        }
+        match self.picker.key(stroke) {
+            PickerOutcome::Cancel => CompareMenuOutcome::Cancel,
+            PickerOutcome::Ignored => CompareMenuOutcome::Ignored,
+            _ => CompareMenuOutcome::Redraw,
         }
     }
 
-    /// The focused choice.
+    /// Answer a pointer event: a click on a row picks it in place (a row that opens another
+    /// picker opens it); a click outside the panel keeps the state and closes the menu.
+    pub fn mouse(&mut self, event: &Event, theme: &ReviewTheme) -> CompareMenuOutcome {
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.picker.panel_contains(mouse.position) == Some(false)
+        {
+            return CompareMenuOutcome::Done;
+        }
+        match self.picker.mouse(event, theme) {
+            PickerOutcome::Cancel => CompareMenuOutcome::Cancel,
+            PickerOutcome::Picked(id) => match MenuChoice::from_id(&id) {
+                Some(choice) if choice.opens_picker() => CompareMenuOutcome::ApplyAndClose(choice),
+                Some(choice) => CompareMenuOutcome::Apply(choice),
+                None => CompareMenuOutcome::Ignored,
+            },
+            PickerOutcome::Ignored => CompareMenuOutcome::Ignored,
+            _ => CompareMenuOutcome::Redraw,
+        }
+    }
+
+    /// The focused row.
     #[must_use]
     pub fn focused(&self) -> Option<MenuChoice> {
         self.picker.focused().and_then(MenuChoice::from_id)
+    }
+
+    /// The rows' text, in order (section headings included).
+    #[must_use]
+    pub fn rows(&self) -> Vec<String> {
+        self.picker
+            .items()
+            .iter()
+            .map(|item| item.line.plain_text())
+            .collect()
     }
 
     /// Paint over `area`.
@@ -551,42 +747,170 @@ mod tests {
         assert_eq!(picker.key(key(KeyCode::Escape), &theme), MenuOutcome::Close);
     }
 
-    #[test]
-    fn the_menu_offers_what_the_review_has_and_says_what_is_on() {
-        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
-        let mut menu = CompareMenu::new(
-            &MenuState {
-                current: Some(MenuChoice::Off),
-                only_changed: true,
-                changes_view: false,
-                offers: MenuOffers {
-                    pushes: false,
-                    versions: true,
-                },
-                view_key: Some("shift+l".into()),
+    fn menu_state() -> MenuState {
+        MenuState {
+            current: Some(MenuChoice::LastLooked),
+            detail: Some("4m ago".into()),
+            last_looked: Some("4m ago".into()),
+            last_push: Some("2h ago".into()),
+            version_of: Some(7),
+            only_changed: true,
+            changes_view: false,
+            offers: MenuOffers {
+                pushes: false,
+                versions: true,
             },
-            &theme,
-        );
-        assert_eq!(menu.focused(), Some(MenuChoice::Off));
-        let ids: Vec<String> = menu
-            .picker
-            .items()
-            .iter()
-            .map(|item| item.line.plain_text())
-            .collect();
-        assert!(!ids.iter().any(|text| text.contains("Previous push")));
+            view_key: Some("shift+l".into()),
+            progress: None,
+        }
+    }
+
+    #[test]
+    fn the_menu_marks_what_is_in_effect_and_opens_on_it() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let menu = CompareMenu::new(&menu_state(), &theme);
+        assert_eq!(menu.focused(), Some(MenuChoice::LastLooked));
+        let rows = menu.rows();
+        // Baselines and view options under their own headings.
+        assert_eq!(rows[0], "Show changes since");
+        assert!(rows.iter().any(|row| row == "View"), "{rows:?}");
         assert!(
-            ids.iter()
-                .any(|text| text.contains("[x] Only pull requests"))
+            rows.contains(&"◉ you last looked · 4m ago".to_owned()),
+            "{rows:?}"
         );
-        assert!(ids.iter().any(|text| text.contains("(shift+l)")));
-        assert_eq!(
-            menu.key(key(KeyCode::Enter)),
-            MenuOutcome::Chose(MenuChoice::Off)
+        assert!(rows.iter().any(|row| row.starts_with("○ 1 hour ago")));
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("○ two versions of #7"))
+        );
+        assert!(!rows.iter().any(|row| row.contains("previous push")));
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("[x] Only pull requests with real changes"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("[ ] Only what changed") && row.contains("shift+l"))
         );
         assert_eq!(
             MenuChoice::from_id("ago:3600000"),
             Some(MenuChoice::Ago(3_600_000))
         );
+        // ASCII marks.
+        let ascii = ReviewTheme::derive(None, IconStyle::Ascii);
+        let rows = CompareMenu::new(&menu_state(), &ascii).rows();
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("(*) you last looked"))
+        );
+    }
+
+    #[test]
+    fn space_picks_in_place_enter_keeps_and_esc_cancels() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let mut menu = CompareMenu::new(&menu_state(), &theme);
+        // Space on a baseline previews it; the menu stays.
+        assert_eq!(menu.key(key(KeyCode::Down)), CompareMenuOutcome::Redraw);
+        assert_eq!(menu.focused(), Some(MenuChoice::Ago(HOUR_MS)));
+        assert_eq!(
+            menu.key(key(KeyCode::Space)),
+            CompareMenuOutcome::Apply(MenuChoice::Ago(HOUR_MS))
+        );
+        // The owner shows the new state; the cursor stays where it is and the mark moves.
+        let mut state = menu_state();
+        state.current = Some(MenuChoice::Ago(HOUR_MS));
+        state.detail = Some("1h ago".into());
+        menu.update(&state, &theme);
+        assert_eq!(menu.focused(), Some(MenuChoice::Ago(HOUR_MS)));
+        let rows = menu.rows();
+        assert!(
+            rows.contains(&"◉ 1 hour ago · 1h ago".to_owned()),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("○ you last looked · 4m ago"))
+        );
+        // Space on a view option flips it in place; enter on it keeps what is set.
+        menu.key(key(KeyCode::End));
+        assert_eq!(menu.focused(), Some(MenuChoice::OnlyChanged));
+        assert_eq!(
+            menu.key(key(KeyCode::Space)),
+            CompareMenuOutcome::Apply(MenuChoice::OnlyChanged)
+        );
+        assert_eq!(menu.key(key(KeyCode::Enter)), CompareMenuOutcome::Done);
+        // Enter on another baseline picks it and closes; on the one in effect it just closes.
+        menu.key(key(KeyCode::Home));
+        assert_eq!(
+            menu.key(key(KeyCode::Enter)),
+            CompareMenuOutcome::ApplyAndClose(MenuChoice::LastLooked)
+        );
+        menu.key(key(KeyCode::Down));
+        assert_eq!(menu.key(key(KeyCode::Enter)), CompareMenuOutcome::Done);
+        // A row that opens another picker opens it with space too.
+        while menu.focused() != Some(MenuChoice::Version) {
+            menu.key(key(KeyCode::Down));
+        }
+        assert_eq!(
+            menu.key(key(KeyCode::Space)),
+            CompareMenuOutcome::ApplyAndClose(MenuChoice::Version)
+        );
+        assert_eq!(menu.key(key(KeyCode::Escape)), CompareMenuOutcome::Cancel);
+    }
+
+    #[test]
+    fn clicks_pick_in_place_and_a_click_outside_keeps_and_closes() {
+        use crate::testing::harness::paint;
+        use bmux_tui::event::MouseEvent;
+        use bmux_tui::geometry::Point;
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let mut menu = CompareMenu::new(&menu_state(), &theme);
+        let screen = paint(90, 30, |area, cx| menu.paint(&theme, area, cx));
+        let event = |kind: MouseEventKind, x: u16, y: u16| {
+            Event::Mouse(MouseEvent::new(kind, Point::new(x, y)))
+        };
+        let mut click = |x: u16, y: u16| {
+            let down = menu.mouse(
+                &event(MouseEventKind::Down(MouseButton::Left), x, y),
+                &theme,
+            );
+            if down == CompareMenuOutcome::Done {
+                return down;
+            }
+            menu.mouse(&event(MouseEventKind::Up(MouseButton::Left), x, y), &theme)
+        };
+        let row = (0..screen.height())
+            .find(|y| screen.row_text(*y).contains("[x] Only pull requests"))
+            .expect("the option row");
+        let x = screen.column_of(row, "[x]").expect("its column");
+        assert_eq!(
+            click(x + 1, row),
+            CompareMenuOutcome::Apply(MenuChoice::OnlyChanged)
+        );
+        let row = (0..screen.height())
+            .find(|y| screen.row_text(*y).contains("a week ago"))
+            .expect("a baseline row");
+        let x = screen.column_of(row, "a week ago").expect("its column");
+        assert_eq!(
+            click(x, row),
+            CompareMenuOutcome::Apply(MenuChoice::Ago(7 * 24 * HOUR_MS))
+        );
+        assert_eq!(click(0, screen.height() - 1), CompareMenuOutcome::Done);
+    }
+
+    #[test]
+    fn the_menu_fits_tiny_areas() {
+        use crate::testing::harness::paint;
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let mut menu = CompareMenu::new(&menu_state(), &theme);
+        for (width, height) in [(0_u16, 0_u16), (1, 1), (8, 4), (20, 6), (40, 12)] {
+            let screen = paint(width, height, |area, cx| menu.paint(&theme, area, cx));
+            for hit in screen.hits() {
+                assert!(
+                    hit.area.right() <= width && hit.area.bottom() <= height,
+                    "{width}x{height}: {hit:?}"
+                );
+            }
+        }
     }
 }

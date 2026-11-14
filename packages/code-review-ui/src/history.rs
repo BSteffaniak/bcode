@@ -537,7 +537,7 @@ impl HistoryPanel {
         policy.margin = bmux_tui::geometry::Insets::all(1);
         policy.min_size = Size::new(area.width.min(40), area.height.min(10));
         let footer = "←→ push · ↑↓ layer · f pin from · enter layer · p pushes · s since · \
-                      a as it was · r since you looked · i only real changes · esc";
+                      a whole stack at this push · r since you looked · i only real changes · esc";
         let frame = PickerFrame::new()
             .title(" Stack history ")
             .footer(Line::from_spans(vec![Span::styled(footer, theme.muted)]))

@@ -319,8 +319,8 @@ fn the_baseline_control_compares_with_other_baselines_in_place() {
     // `b` opens the control's menu.
     scenario.key("b");
     let screen = settled(&mut scenario);
-    assert!(screen.contains("Changes since…"), "{}", screen.text());
-    assert!(screen.contains("You last looked"), "{}", screen.text());
+    assert!(screen.contains("Show changes since"), "{}", screen.text());
+    assert!(screen.contains("◉ you last looked"), "{}", screen.text());
     scenario.key("escape");
     settled(&mut scenario);
     // Full change: nothing compared, no banner, the same review.
@@ -346,7 +346,7 @@ fn the_baseline_control_compares_with_other_baselines_in_place() {
     scenario.key("b");
     settled(&mut scenario);
     let menu = settled(&mut scenario);
-    assert!(menu.contains("Previous push"), "{}", menu.text());
+    assert!(menu.contains("○ the previous push"), "{}", menu.text());
     scenario.key("escape");
     {
         let screen = run(&mut scenario, "Compare pushes of the stack");
@@ -957,4 +957,159 @@ fn the_history_marks_versions_the_reviewer_viewed_without_a_completed_pass() {
         .expect("the viewed version");
     assert!(viewed.reviewed, "{versions:?}");
     assert!(!versions.last().expect("newest").reviewed, "{versions:?}");
+}
+
+/// The row the open comparison menu's cursor is on.
+fn menu_focus(scenario: &Scenario<ReviewApp>) -> Option<crate::compare_menu::MenuChoice> {
+    match scenario
+        .surface()
+        .review()
+        .and_then(|review| review.modal())
+    {
+        Some(crate::surface::Modal::Compare(menu)) => menu.focused(),
+        _ => None,
+    }
+}
+
+/// Move the open menu's cursor to `choice`.
+fn menu_to(scenario: &mut Scenario<ReviewApp>, choice: crate::compare_menu::MenuChoice) {
+    scenario.key("home");
+    for _ in 0..20 {
+        if menu_focus(scenario) == Some(choice) {
+            return;
+        }
+        scenario.key("down");
+    }
+    panic!("no menu row {choice:?}");
+}
+
+#[test]
+fn the_menu_previews_picks_live_keeps_them_on_enter_and_puts_them_back_on_escape() {
+    use crate::compare_menu::MenuChoice;
+    use bcode_code_review_models::ReviewCompareBaseline;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let saved = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .expect("review")
+            .presentation()
+            .compare
+    };
+    let before = saved(&scenario);
+    scenario.key("b");
+    let screen = settled(&mut scenario);
+    // The menu opens on the baseline in effect, marked, with what it resolves to.
+    assert_eq!(menu_focus(&scenario), Some(MenuChoice::LastLooked));
+    assert!(
+        screen.contains("◉ you last looked · just now"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        screen.contains("[ ] Only what changed"),
+        "{}",
+        screen.text()
+    );
+
+    // Space flips a view option in place: the review behind switches, the menu stays open.
+    menu_to(&mut scenario, MenuChoice::View);
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_some(), "{}", screen.text());
+    assert_eq!(review.comparing().view(), CompareView::Changes);
+    let doc = document(&scenario);
+    assert_eq!(
+        doc.comparison(&source_of(doc, 101)).map(|c| c.view),
+        Some(CompareView::Changes)
+    );
+    assert!(
+        screen.contains("[x] Only what changed"),
+        "{}",
+        screen.text()
+    );
+    assert_eq!(menu_focus(&scenario), Some(MenuChoice::View));
+
+    // Space on a baseline compares with it at once; the mark moves, the menu stays.
+    menu_to(&mut scenario, MenuChoice::Off);
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_some());
+    assert_eq!(review.comparing().baseline(), ReviewCompareBaseline::Off);
+    assert!(!review.comparing().active());
+    assert!(
+        screen.contains("◉ nothing: show the full change"),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.contains("○ you last looked"), "{}", screen.text());
+    // Nothing is saved while previewing.
+    assert_eq!(saved(&scenario), before);
+
+    // Esc puts back exactly what the menu opened on, at once (the deltas are kept).
+    scenario.key("escape");
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_none());
+    assert_eq!(
+        review.comparing().baseline(),
+        ReviewCompareBaseline::LastLooked
+    );
+    assert_eq!(review.comparing().view(), CompareView::Full);
+    assert_eq!(kind_of(document(&scenario), 101), Some(DeltaKind::Changed));
+    assert_eq!(
+        kind_of(document(&scenario), 102),
+        Some(DeltaKind::RebasedOnly)
+    );
+    assert_eq!(saved(&scenario), before);
+
+    // Enter keeps what was picked, and saves it.
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::OnlyChanged);
+    scenario.key("space");
+    settled(&mut scenario);
+    assert!(scenario.surface().review().unwrap().modal().is_some());
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_none());
+    assert!(review.comparing().only_changed());
+    assert!(saved(&scenario).only_changed);
+    // The option stays visible outside the menu.
+    assert!(
+        screen.contains("[only PRs with real changes]"),
+        "{}",
+        screen.text()
+    );
+}
+
+#[test]
+fn clicking_menu_rows_picks_them_in_place() {
+    use crate::compare_menu::MenuChoice;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    scenario.key("b");
+    let screen = settled(&mut scenario);
+    let row = (0..screen.height())
+        .find(|y| screen.row_text(*y).contains("[ ] Only what changed"))
+        .unwrap_or_else(|| panic!("the option row: {}", screen.text()));
+    let x = screen.column_of(row, "[ ] Only").expect("column");
+    scenario.click(x + 1, row);
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_some(), "{}", screen.text());
+    assert_eq!(review.comparing().view(), CompareView::Changes);
+    assert!(
+        screen.contains("[x] Only what changed"),
+        "{}",
+        screen.text()
+    );
+    assert_eq!(menu_focus(&scenario), Some(MenuChoice::View));
+    // A click outside the menu keeps the state and closes it.
+    scenario.click(0, screen.height() - 1);
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_none());
+    assert_eq!(review.comparing().view(), CompareView::Changes);
 }

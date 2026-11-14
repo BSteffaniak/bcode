@@ -40,6 +40,9 @@ pub struct CompareBar {
     pub timeline: bool,
     /// The last push, said after the timeline when there is room.
     pub note: Option<String>,
+    /// The view options on (`only what changed`), in full and briefly: said after the control
+    /// so what the review shows is plain without opening the menu.
+    pub chips: Vec<[String; 2]>,
 }
 
 /// A clickable part of the row.
@@ -49,6 +52,8 @@ pub enum BarPart {
     Control,
     /// The summary.
     Summary,
+    /// A view option that is on (`[only what changed]`).
+    Chip,
     /// A tick of the timeline: the pushes `first..=last`.
     Tick {
         /// First push of the tick.
@@ -120,6 +125,20 @@ fn control_variants(bar: &CompareBar, theme: &ReviewTheme) -> [String; 4] {
         format!("{delta} {} {menu}", bar.baseline[1]),
         format!("{delta}{menu}"),
     ]
+}
+
+/// The chips said with control variant `control`: in full with the widest control, briefly
+/// with the next two, none with the narrowest.
+fn chip_texts(bar: &CompareBar, control: usize) -> Vec<String> {
+    let index = match control {
+        0 => 0,
+        1 | 2 => 1,
+        _ => return Vec::new(),
+    };
+    bar.chips
+        .iter()
+        .map(|chip| format!("[{}]", chip[index]))
+        .collect()
 }
 
 /// The pushes each tick stands for when the timeline has `cells` cells for ticks.
@@ -212,7 +231,11 @@ pub fn plan(bar: &CompareBar, theme: &ReviewTheme, width: u16) -> BarPlan {
             .map(|index| bar.summary[index].as_str())
             .filter(|text| !text.is_empty());
         let note = note.then_some(bar.note.as_deref()).flatten();
+        let chips = chip_texts(bar, control);
         let mut used = display_width(&controls[control]);
+        for chip in &chips {
+            used += 1 + display_width(chip);
+        }
         if let Some(summary) = summary {
             used += GAP + display_width(summary);
         }
@@ -233,6 +256,11 @@ pub fn plan(bar: &CompareBar, theme: &ReviewTheme, width: u16) -> BarPlan {
         let mut row = Row::default();
         let cells = row.push(controls[control].clone(), theme.accent);
         row.part(BarPart::Control, cells);
+        for chip in chips {
+            row.push(" ", Style::default());
+            let cells = row.push(chip, theme.since.badge);
+            row.part(BarPart::Chip, cells);
+        }
         if let Some(summary) = summary {
             row.gap();
             let cells = row.push(summary, theme.muted);
@@ -391,6 +419,7 @@ mod tests {
             cursor: None,
             timeline: true,
             note: Some("last push 12m ago: #12 changed".into()),
+            chips: vec![["only what changed".into(), "changes".into()]],
         }
     }
 
@@ -430,6 +459,13 @@ mod tests {
                             "{text:?} at {width}"
                         ),
                         BarPart::Summary => assert!(bar.summary.contains(&text), "{text:?}"),
+                        BarPart::Chip => assert!(
+                            bar.chips
+                                .iter()
+                                .flatten()
+                                .any(|chip| text == format!("[{chip}]")),
+                            "{text:?}"
+                        ),
                         BarPart::Tick { .. } => assert!(
                             text == theme.icons.tick || text == theme.icons.tick_changed,
                             "{text:?}"
@@ -455,6 +491,7 @@ mod tests {
         bar.summary = [String::new(), String::new()];
         bar.note = None;
         bar.range = None;
+        bar.chips = Vec::new();
         let control = display_width(&control_variants(&bar, &theme)[0]);
         // Room for 10 ticks: four pushes each, and every push is covered once.
         let plan = plan(&bar, &theme, u16::try_from(control + GAP + 4 + 10).unwrap());

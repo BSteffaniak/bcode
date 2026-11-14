@@ -463,13 +463,25 @@ impl Review {
         review
     }
 
-    /// Rebuild the file panel from the document (after its focus changed), every directory open.
+    /// Rebuild the file panel from the document (after its focus or a comparison changed):
+    /// directories and groups the reviewer closed stay closed, every other one is open.
     fn rebuild_files(&mut self, theme: &ReviewTheme, hide_viewed: bool) {
+        let closed: BTreeSet<String> = {
+            let tree = self.tree.borrow();
+            self.files
+                .expandable_ids()
+                .filter(|id| !tree.is_expanded(id))
+                .map(str::to_owned)
+                .collect()
+        };
         self.files = FileTree::new(&self.doc, theme);
         self.files.set_hide_viewed(hide_viewed, theme);
-        self.tree
-            .borrow_mut()
-            .set_expanded_ids(self.files.expandable_ids().map(str::to_owned));
+        self.tree.borrow_mut().set_expanded_ids(
+            self.files
+                .expandable_ids()
+                .filter(|id| !closed.contains(*id))
+                .map(str::to_owned),
+        );
     }
 
     /// Open the file panel's group of source `source` and close the other groups.

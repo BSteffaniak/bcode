@@ -110,6 +110,16 @@ pub struct Comparing {
     /// Each layer's version steps, by number, once computed (they belong to the layer, not to
     /// what it is compared with), with the head they were computed for.
     steps: BTreeMap<u64, LayerSteps>,
+    /// The point in time of the menu the baseline was chosen as, while it is in effect.
+    ago: Option<u64>,
+    /// The time the whole stack is shown as it was at, while it is.
+    stack_at: Option<u64>,
+    /// Deltas computed in this session, by pair (a pair names its commits, so its delta never
+    /// changes): picking a baseline again in the menu lays them at once.
+    deltas: BTreeMap<LayerPair, LayerDelta>,
+    /// The comparison state the menu opened on, while the menu is open: put back on `esc`,
+    /// and nothing is saved until the menu closes.
+    snapshot: Option<CompareSnapshot>,
     /// The push timeline while it has the keyboard.
     pub(super) timeline: Option<TimelineFocus>,
     /// The comparison row as last painted.
@@ -117,6 +127,22 @@ pub struct Comparing {
     /// The banner as last painted.
     pub(super) banner_plan: Option<(Rect, BannerPlan)>,
 }
+
+/// The comparison choice, as the menu opened on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CompareSnapshot {
+    baseline: Baseline,
+    picks: BTreeMap<u64, LayerPair>,
+    only_changed: bool,
+    view: CompareView,
+    banner: BannerState,
+    restored: Option<Baseline>,
+    ago: Option<u64>,
+    stack_at: Option<u64>,
+}
+
+/// Most deltas kept for picking a baseline again.
+const DELTA_CACHE: usize = 512;
 
 impl Comparing {
     /// How compared sources show their files.
@@ -153,6 +179,49 @@ impl Comparing {
     #[must_use]
     pub const fn picks(&self) -> &BTreeMap<u64, LayerPair> {
         &self.picks
+    }
+
+    /// The point in time of the menu the baseline was chosen as, while it is in effect.
+    #[must_use]
+    pub const fn ago(&self) -> Option<u64> {
+        self.ago
+    }
+
+    /// The time the whole stack is shown as it was at, while it is.
+    #[must_use]
+    pub const fn stack_at(&self) -> Option<u64> {
+        self.stack_at
+    }
+
+    /// The choice as it stands, to put back later.
+    pub(super) fn snapshot(&self) -> CompareSnapshot {
+        CompareSnapshot {
+            baseline: self.baseline,
+            picks: self.picks.clone(),
+            only_changed: self.only_changed,
+            view: self.view,
+            banner: self.banner,
+            restored: self.restored,
+            ago: self.ago,
+            stack_at: self.stack_at,
+        }
+    }
+
+    /// Hold the choice as it stands while the menu previews others.
+    pub(super) fn begin_preview(&mut self) {
+        self.snapshot = Some(self.snapshot());
+    }
+
+    /// The menu closed keeping what it previewed: returns whether the choice differs from the
+    /// one it opened on.
+    pub(super) fn end_preview(&mut self) -> bool {
+        let before = self.snapshot.take();
+        before.is_some_and(|before| before != self.snapshot())
+    }
+
+    /// The menu closed putting back what it opened on: returns that choice.
+    pub(super) const fn take_snapshot(&mut self) -> Option<CompareSnapshot> {
+        self.snapshot.take()
     }
 
     /// A source was listed again (or added): its layer may have moved.
@@ -836,6 +905,7 @@ impl ReviewSurface {
         }
         let view = self.comparing.view;
         let mut asked = Vec::new();
+        let mut ready = Vec::new();
         for (source_id, head, number, rule) in wanted {
             let pair = match rule {
                 Rule::Wait => continue,
@@ -874,14 +944,24 @@ impl ReviewSurface {
                     }),
                 );
             }
-            if !asked.contains(&compared.pair) {
+            if let Some(delta) = self.comparing.deltas.get(&compared.pair) {
+                if !ready.contains(delta) {
+                    ready.push(delta.clone());
+                }
+            } else if !asked.contains(&compared.pair) {
                 asked.push(compared.pair.clone());
             }
             self.comparing.pairs.insert(source_id, compared);
         }
-        self.apply_compare_filter();
-        if let Some(review) = self.review.as_mut() {
-            review.note_splices();
+        if ready.is_empty() {
+            self.apply_compare_filter();
+            self.rebuild_compared_files();
+            if let Some(review) = self.review.as_mut() {
+                review.note_splices();
+            }
+        } else {
+            // Computed before: laid over at once.
+            self.lay_deltas(ready);
         }
         if asked.is_empty() {
             return;
@@ -923,7 +1003,6 @@ impl ReviewSurface {
 
     /// Layer deltas arrived: lay each over the sources still showing its pair.
     pub(super) fn apply_compared(&mut self, result: Result<Vec<LayerDelta>, String>) {
-        let view = self.comparing.view;
         let deltas = match result {
             Ok(deltas) => deltas,
             Err(error) => {
@@ -949,6 +1028,23 @@ impl ReviewSurface {
                 return;
             }
         };
+        if self.comparing.deltas.len() + deltas.len() > DELTA_CACHE {
+            self.comparing.deltas.clear();
+        }
+        for delta in &deltas {
+            // Commits missing now may be fetched later.
+            if delta.kind != DeltaKind::Unavailable {
+                self.comparing
+                    .deltas
+                    .insert(delta.pair.clone(), delta.clone());
+            }
+        }
+        self.lay_deltas(deltas);
+    }
+
+    /// Lay `deltas` over the sources showing their pairs.
+    fn lay_deltas(&mut self, deltas: Vec<LayerDelta>) {
+        let view = self.comparing.view;
         let show_rebased = self.services.compare_config().rebased_layers == RebasedLayers::Show;
         let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
         let Some(review) = self.review.as_mut() else {
@@ -985,6 +1081,15 @@ impl ReviewSurface {
         review.rebuild_files(&theme, hide_viewed);
         self.apply_compare_filter();
         self.decide_banner();
+        self.sync_compare_menu();
+    }
+
+    /// Rebuild the file panel after how compared files show changed.
+    pub(super) fn rebuild_compared_files(&mut self) {
+        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        if let Some(review) = self.review.as_mut() {
+            review.rebuild_files(&theme, hide_viewed);
+        }
     }
 
     /// Once every compared layer's delta is in: show the banner when, compared with what the
@@ -1122,6 +1227,7 @@ impl ReviewSurface {
             review.doc.set_compare_view(view);
             review.note_splices();
         }
+        self.rebuild_compared_files();
         self.set_status(
             match view {
                 CompareView::Changes => "showing only what changed",
@@ -1138,6 +1244,8 @@ impl ReviewSurface {
         self.comparing.restored = None;
         self.comparing.picks.clear();
         self.comparing.timeline = None;
+        self.comparing.ago = None;
+        self.comparing.stack_at = None;
         if baseline != Baseline::LastLooked {
             self.comparing.banner = BannerState::Hidden;
         }
@@ -1178,6 +1286,7 @@ impl ReviewSurface {
         let historical = pair.to.head_oid != layer.head;
         self.comparing.picks.insert(number, pair);
         self.comparing.banner = BannerState::Hidden;
+        self.comparing.stack_at = None;
         self.refresh_comparison(host);
         self.set_status(
             if historical {
@@ -1233,6 +1342,8 @@ impl ReviewSurface {
         self.comparing.restored = None;
         self.comparing.picks = picks;
         self.comparing.banner = BannerState::Hidden;
+        self.comparing.ago = None;
+        self.comparing.stack_at = Some(at_ms);
         self.refresh_comparison(host);
         self.set_status(
             format!(
@@ -1259,9 +1370,49 @@ impl ReviewSurface {
         );
     }
 
+    /// Put back the comparison choice `snapshot` (the menu was cancelled): pairs computed for
+    /// it before are laid over again at once.
+    pub(super) fn restore_compare(&mut self, snapshot: CompareSnapshot, host: &UiContext) {
+        let CompareSnapshot {
+            baseline,
+            picks,
+            only_changed,
+            view,
+            banner,
+            restored,
+            ago,
+            stack_at,
+        } = snapshot;
+        self.comparing.baseline = baseline;
+        self.comparing.picks = picks;
+        self.comparing.only_changed = only_changed;
+        self.comparing.banner = banner;
+        self.comparing.restored = restored;
+        self.comparing.ago = ago;
+        self.comparing.stack_at = stack_at;
+        self.comparing.timeline = None;
+        if self.comparing.view != view {
+            self.comparing.view = view;
+            if let Some(review) = self.review.as_mut() {
+                review.doc.set_compare_view(view);
+                review.note_splices();
+            }
+        }
+        self.refresh_comparison(host);
+        self.apply_compare_filter();
+        self.rebuild_compared_files();
+    }
+
     /// Keep the comparison choice for the next open. Versions picked for single pull requests
     /// (and the stack as it was) are for this session: the baseline under them is not saved.
-    fn persist_compare_choice(&mut self) {
+    pub(super) fn persist_compare_choice(&mut self) {
+        // While the menu previews, nothing is saved: closing it saves or puts back.
+        if self.comparing.snapshot.is_some() {
+            if matches!(self.modal, Some(super::flows::Modal::Compare(_))) {
+                return;
+            }
+            self.comparing.snapshot = None;
+        }
         let (baseline, only_changed) = (self.comparing.baseline, self.comparing.only_changed);
         let picked = !self.comparing.picks.is_empty();
         if let Some(workspace) = self.workspace.as_mut() {
@@ -1278,6 +1429,13 @@ impl ReviewSurface {
     pub(super) fn baseline_labels(&self) -> [String; 2] {
         use super::super::history::{ago, now_ms};
         let now = now_ms();
+        if let Some(at) = self.comparing.stack_at {
+            let when = ago(at, now);
+            return [
+                format!("the stack as it was · {when}"),
+                format!("as of {when}"),
+            ];
+        }
         if !self.comparing.picks.is_empty() {
             return if self.comparing.baseline == Baseline::Off {
                 ["picked versions".to_owned(), "versions".to_owned()]
@@ -1287,40 +1445,16 @@ impl ReviewSurface {
         }
         match self.comparing.baseline {
             Baseline::LastLooked => {
-                let newest = self
-                    .comparing
-                    .baselines
-                    .values()
-                    .filter_map(|(_, baseline)| match baseline {
-                        LastLooked::Since(look) => Some(look.looked_at_ms),
-                        _ => None,
-                    })
-                    // Sources that are not pull requests: their last completed pass.
-                    .chain(self.plain_sources().iter().filter_map(|source| {
-                        let revision = self.reviewed_revision(&source.source_id)?;
-                        (revision.reviewed_head_oid.as_deref() != Some(source.head.as_str()))
-                            .then_some(revision.recorded_at_ms)?
-                    }))
-                    .max();
-                let looked = self
-                    .comparing
-                    .baselines
-                    .values()
-                    .any(|(_, baseline)| baseline.look().is_some());
-                let detail = match newest {
-                    Some(at) if at > 0 => format!(" · {}", ago(at, now)),
-                    None if looked => " · nothing new".to_owned(),
-                    None if self.comparing.looks.is_some() => " · not yet".to_owned(),
-                    _ => String::new(),
-                };
+                let detail = self
+                    .last_looked_detail()
+                    .map(|detail| format!(" · {detail}"))
+                    .unwrap_or_default();
                 [format!("you last looked{detail}"), "last looked".to_owned()]
             }
             Baseline::PreviousPush => {
                 let when = self
-                    .stack_history
-                    .as_ref()
-                    .and_then(|history| history.pushes.last())
-                    .map(|push| format!(" · {}", ago(push.at_ms, now)))
+                    .last_push_detail()
+                    .map(|when| format!(" · {when}"))
                     .unwrap_or_default();
                 [format!("previous push{when}"), "prev push".to_owned()]
             }
@@ -1336,6 +1470,59 @@ impl ReviewSurface {
             }
             Baseline::Off => ["full change".to_owned(), "off".to_owned()],
         }
+    }
+
+    /// When the reviewer last looked, in words (`4m ago`, `nothing new`, `not yet`), once
+    /// known.
+    pub(super) fn last_looked_detail(&self) -> Option<String> {
+        use super::super::history::{ago, now_ms};
+        let newest = self
+            .comparing
+            .baselines
+            .values()
+            .filter_map(|(_, baseline)| match baseline {
+                LastLooked::Since(look) => Some(look.looked_at_ms),
+                _ => None,
+            })
+            // Sources that are not pull requests: their last completed pass.
+            .chain(self.plain_sources().iter().filter_map(|source| {
+                let revision = self.reviewed_revision(&source.source_id)?;
+                (revision.reviewed_head_oid.as_deref() != Some(source.head.as_str()))
+                    .then_some(revision.recorded_at_ms)?
+            }))
+            .max();
+        let looked = self
+            .comparing
+            .baselines
+            .values()
+            .any(|(_, baseline)| baseline.look().is_some());
+        match newest {
+            Some(at) if at > 0 => Some(ago(at, now_ms())),
+            None if looked => Some("nothing new".to_owned()),
+            None if self.comparing.looks.is_some() => Some("not yet".to_owned()),
+            _ => None,
+        }
+    }
+
+    /// When the stack was last pushed, in words, once known.
+    pub(super) fn last_push_detail(&self) -> Option<String> {
+        use super::super::history::{ago, now_ms};
+        self.stack_history
+            .as_ref()
+            .and_then(|history| history.pushes.last())
+            .map(|push| ago(push.at_ms, now_ms()))
+    }
+
+    /// Compare every layer with how it was `ms` ago.
+    pub(super) fn compare_ago(&mut self, ms: u64, host: &UiContext) {
+        self.set_compare_baseline(
+            Baseline::Between {
+                from_ms: super::super::history::now_ms().saturating_sub(ms),
+                to_ms: None,
+            },
+            host,
+        );
+        self.comparing.ago = Some(ms);
     }
 
     /// Record a look of `kind` at the layer `file` belongs to (its current version).

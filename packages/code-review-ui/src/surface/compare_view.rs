@@ -7,7 +7,9 @@ use super::compare::{CompareCounts, TimelineFocus, column_time};
 use super::flows::Modal;
 use crate::action::Action;
 use crate::compare_bar::{self, BannerPart, BarPart, CompareBar};
-use crate::compare_menu::{CompareMenu, MenuChoice, MenuOutcome, MenuState, VersionPicker};
+use crate::compare_menu::{
+    CompareMenu, CompareMenuOutcome, MenuChoice, MenuOutcome, MenuState, VersionPicker,
+};
 use crate::config::compare::TimelineMode;
 use crate::context::UiContext;
 use bcode_code_review::document::CompareView;
@@ -103,7 +105,20 @@ impl ReviewSurface {
             range,
             cursor: focus.map(|focus| focus.cursor),
             note: self.last_push_summary(),
+            chips: self.compare_chips(),
         }
+    }
+
+    /// The view options on, in full and briefly.
+    pub(super) fn compare_chips(&self) -> Vec<[String; 2]> {
+        let mut chips = Vec::new();
+        if self.comparing.active() && self.comparing.view() == CompareView::Changes {
+            chips.push(["only what changed".to_owned(), "changes".to_owned()]);
+        }
+        if self.comparing.only_changed() {
+            chips.push(["only PRs with real changes".to_owned(), "real".to_owned()]);
+        }
+        chips
     }
 
     /// The columns of the pushes compared, when the baseline is a time on the timeline.
@@ -249,7 +264,9 @@ impl ReviewSurface {
         {
             let part = plan.part_at(mouse.position.x.saturating_sub(area.x));
             match part {
-                Some(BarPart::Control | BarPart::Summary) => self.open_compare_menu(),
+                Some(BarPart::Control | BarPart::Chip | BarPart::Summary) => {
+                    self.open_compare_menu();
+                }
                 Some(BarPart::Tick { first, last }) => self.click_tick(first, last, modified, host),
                 None => {}
             }
@@ -301,7 +318,7 @@ impl ReviewSurface {
         self.set_compare_baseline(Baseline::Between { from_ms, to_ms }, host);
     }
 
-    /// Open the "Changes since…" menu.
+    /// Open the comparison menu, holding the choice in effect so `esc` can put it back.
     pub(super) fn open_compare_menu(&mut self) {
         if !self.compares_pulls() {
             self.set_status(
@@ -310,19 +327,51 @@ impl ReviewSurface {
             );
             return;
         }
-        let current = if self.comparing.picks().is_empty() {
-            Some(match self.comparing.baseline() {
-                Baseline::LastLooked => MenuChoice::LastLooked,
-                Baseline::PreviousPush => MenuChoice::PreviousPush,
-                Baseline::Between { .. } => MenuChoice::Push,
-                Baseline::Off => MenuChoice::Off,
-            })
-        } else {
-            Some(MenuChoice::Version)
-        };
+        self.comparing.begin_preview();
+        let state = self.compare_menu_state();
+        self.modal = Some(Modal::Compare(CompareMenu::new(&state, &self.theme)));
+    }
+
+    /// The menu's row for the baseline in effect.
+    fn current_menu_choice(&self) -> MenuChoice {
+        if self.comparing.stack_at().is_some() {
+            return MenuChoice::StackAt;
+        }
+        if !self.comparing.picks().is_empty() {
+            return MenuChoice::Version;
+        }
+        match self.comparing.baseline() {
+            Baseline::LastLooked => MenuChoice::LastLooked,
+            Baseline::PreviousPush => MenuChoice::PreviousPush,
+            Baseline::Between { .. } => self
+                .comparing
+                .ago()
+                .map_or(MenuChoice::Push, MenuChoice::Ago),
+            Baseline::Off => MenuChoice::Off,
+        }
+    }
+
+    /// What the comparison menu shows now.
+    pub(super) fn compare_menu_state(&self) -> MenuState {
         let number = self.current_layer_number();
-        let state = MenuState {
-            current,
+        let current = self.current_menu_choice();
+        let [label, _] = self.baseline_labels();
+        let after_dot = |label: &str| label.split_once(" · ").map(|(_, detail)| detail.to_owned());
+        let detail = match current {
+            MenuChoice::LastLooked | MenuChoice::PreviousPush | MenuChoice::StackAt => {
+                after_dot(&label)
+            }
+            MenuChoice::Push | MenuChoice::Ago(_) => Some(label),
+            MenuChoice::Version => Some(self.picks_label()),
+            _ => None,
+        };
+        let counts = self.compare_counts();
+        MenuState {
+            current: Some(current),
+            detail,
+            last_looked: self.last_looked_detail(),
+            last_push: self.last_push_detail(),
+            version_of: number,
             only_changed: self.comparing.only_changed(),
             changes_view: self.comparing.view() == CompareView::Changes,
             offers: crate::compare_menu::MenuOffers {
@@ -340,43 +389,125 @@ impl ReviewSurface {
                 }),
             },
             view_key: self.action_keys.get("compare_view").cloned(),
-        };
-        self.modal = Some(Modal::Compare(CompareMenu::new(&state, &self.theme)));
+            progress: (counts.pending > 0).then(|| summary(counts, true)[0].clone()),
+        }
     }
 
-    /// What the menu chose.
+    /// The versions picked, in words (`#101 v2 → now`).
+    fn picks_label(&self) -> String {
+        let picks = self.comparing.picks();
+        let name = |number: u64, pair: &bcode_code_review_models::LayerPair| {
+            let versions = self
+                .stack_history
+                .as_ref()
+                .and_then(|history| history.layers.iter().find(|layer| layer.number == number));
+            let index = |head: &str| {
+                versions.and_then(|layer| {
+                    layer
+                        .versions
+                        .iter()
+                        .rposition(|version| version.version.head_oid == head)
+                })
+            };
+            let newest = versions.map(|layer| layer.versions.len().saturating_sub(1));
+            let from = pair
+                .from
+                .as_ref()
+                .and_then(|from| index(&from.head_oid))
+                .map_or_else(|| "?".to_owned(), |index| format!("v{}", index + 1));
+            let to = match index(&pair.to.head_oid) {
+                Some(index) if Some(index) == newest => "now".to_owned(),
+                Some(index) => format!("v{}", index + 1),
+                None => "?".to_owned(),
+            };
+            format!("#{number} {from} → {to}")
+        };
+        match picks.iter().next() {
+            Some((number, pair)) if picks.len() == 1 => name(*number, pair),
+            _ => format!("{} pull requests picked", picks.len()),
+        }
+    }
+
+    /// Show the comparison as it stands in the open menu.
+    pub(super) fn sync_compare_menu(&mut self) {
+        if !matches!(self.modal, Some(Modal::Compare(_))) {
+            return;
+        }
+        let state = self.compare_menu_state();
+        let theme = self.theme;
+        if let Some(Modal::Compare(menu)) = self.modal.as_mut() {
+            menu.update(&state, &theme);
+        }
+    }
+
+    /// What the menu chose: picks preview in place, `enter` keeps them, `esc` puts back the
+    /// choice the menu opened on.
     pub(super) fn compare_menu_outcome(
         &mut self,
-        outcome: MenuOutcome<MenuChoice>,
+        outcome: CompareMenuOutcome,
         host: &UiContext,
     ) -> Action {
-        let choice = match outcome {
-            MenuOutcome::Close => {
+        match outcome {
+            CompareMenuOutcome::Ignored => Action::None,
+            CompareMenuOutcome::Redraw => Action::Redraw,
+            CompareMenuOutcome::Cancel => {
                 self.modal = None;
-                return Action::Redraw;
+                if let Some(snapshot) = self.comparing.take_snapshot()
+                    && snapshot != self.comparing.snapshot()
+                {
+                    self.restore_compare(snapshot, host);
+                    let label = self.baseline_labels()[0].clone();
+                    self.set_status(
+                        format!("comparison put back: changes since {label}"),
+                        StatusSeverity::Info,
+                    );
+                }
+                Action::Redraw
             }
-            MenuOutcome::Redraw => return Action::Redraw,
-            MenuOutcome::Ignored => return Action::None,
-            MenuOutcome::Chose(choice) => choice,
-        };
+            CompareMenuOutcome::Done => {
+                self.close_compare_menu();
+                Action::Redraw
+            }
+            CompareMenuOutcome::Apply(choice) => {
+                if choice != self.current_menu_choice() || choice.is_option() {
+                    self.apply_menu_choice(choice, host);
+                }
+                self.sync_compare_menu();
+                Action::Redraw
+            }
+            CompareMenuOutcome::ApplyAndClose(choice) => {
+                self.close_compare_menu();
+                if choice != self.current_menu_choice() || choice.opens_picker() {
+                    self.apply_menu_choice(choice, host);
+                    self.persist_compare_choice();
+                }
+                Action::Redraw
+            }
+        }
+    }
+
+    /// Close the menu keeping what it previewed (saved when it differs from what it opened
+    /// on).
+    fn close_compare_menu(&mut self) {
         self.modal = None;
+        if self.comparing.end_preview() {
+            self.persist_compare_choice();
+        }
+    }
+
+    /// Apply one row of the menu.
+    fn apply_menu_choice(&mut self, choice: MenuChoice, host: &UiContext) {
         match choice {
             MenuChoice::LastLooked => self.set_compare_baseline(Baseline::LastLooked, host),
             MenuChoice::PreviousPush => self.set_compare_baseline(Baseline::PreviousPush, host),
-            MenuChoice::Ago(ms) => self.set_compare_baseline(
-                Baseline::Between {
-                    from_ms: super::super::history::now_ms().saturating_sub(ms),
-                    to_ms: None,
-                },
-                host,
-            ),
+            MenuChoice::Ago(ms) => self.compare_ago(ms, host),
             MenuChoice::Off => self.set_compare_baseline(Baseline::Off, host),
             MenuChoice::Push => self.focus_timeline(),
             MenuChoice::Version => self.open_version_picker(host),
+            MenuChoice::StackAt => {}
             MenuChoice::OnlyChanged => self.toggle_only_changed(),
             MenuChoice::View => self.toggle_compare_view(),
         }
-        Action::Redraw
     }
 
     /// Give the push timeline the keyboard, on the newest push.
