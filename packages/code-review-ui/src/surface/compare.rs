@@ -1295,6 +1295,12 @@ impl ReviewSurface {
                         LastLooked::Since(look) => Some(look.looked_at_ms),
                         _ => None,
                     })
+                    // Sources that are not pull requests: their last completed pass.
+                    .chain(self.plain_sources().iter().filter_map(|source| {
+                        let revision = self.reviewed_revision(&source.source_id)?;
+                        (revision.reviewed_head_oid.as_deref() != Some(source.head.as_str()))
+                            .then_some(revision.recorded_at_ms)?
+                    }))
                     .max();
                 let looked = self
                     .comparing

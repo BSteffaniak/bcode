@@ -184,11 +184,12 @@ impl ReviewSurface {
             .strip_prefix("you last looked · ")
             .map(|ago| format!(" {ago}"))
             .unwrap_or_default();
-        let mut found = vec![plural(
-            counts.changed,
-            "pull request changed",
-            "pull requests changed",
-        )];
+        let (one, many) = if counts.others == 0 {
+            ("pull request changed", "pull requests changed")
+        } else {
+            ("source changed", "sources changed")
+        };
+        let mut found = vec![plural(counts.changed, one, many)];
         if counts.rebased > 0 {
             found.push(format!("{} only rebased", counts.rebased));
         }

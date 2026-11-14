@@ -862,6 +862,9 @@ fn a_branch_is_compared_with_the_last_completed_pass() {
         "{}",
         screen.text()
     );
+    // The banner names sources, and the control says when the pass was.
+    assert!(screen.contains(": 1 source changed."), "{}", screen.text());
+    assert!(!screen.contains("[you last looked ▾]"), "{}", screen.text());
     // Only what changed, in place.
     scenario.key("shift+l");
     settled(&mut scenario);
