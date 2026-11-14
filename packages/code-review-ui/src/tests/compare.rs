@@ -1437,6 +1437,57 @@ fn cancelling_a_picker_opened_from_the_menu_puts_back_its_previews() {
 }
 
 #[test]
+fn the_stack_as_it_was_stays_in_the_menu_while_other_choices_preview() {
+    use crate::compare_menu::MenuChoice;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    scenario.key("shift+b");
+    settled(&mut scenario);
+    scenario.key("a");
+    settled(&mut scenario);
+    let at = scenario
+        .surface()
+        .review()
+        .unwrap()
+        .comparing()
+        .stack_at()
+        .expect("the stack as it was");
+    scenario.key("b");
+    let screen = settled(&mut scenario);
+    assert_eq!(menu_focus(&scenario), Some(MenuChoice::StackAt));
+    assert!(
+        screen.contains("◉ the whole stack as it was"),
+        "{}",
+        screen.text()
+    );
+    // Another choice previews; the row stays, and picking it again brings it back.
+    menu_to(&mut scenario, MenuChoice::LastLooked);
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    assert!(
+        scenario
+            .surface()
+            .review()
+            .unwrap()
+            .comparing()
+            .stack_at()
+            .is_none()
+    );
+    assert!(
+        screen.contains("○ the whole stack as it was"),
+        "{}",
+        screen.text()
+    );
+    menu_to(&mut scenario, MenuChoice::StackAt);
+    scenario.key("space");
+    settled(&mut scenario);
+    scenario.key("enter");
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.modal().is_none());
+    assert_eq!(review.comparing().stack_at(), Some(at));
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());

@@ -398,6 +398,11 @@ impl ReviewSurface {
             },
             view_key: self.action_keys.get("compare_view").cloned(),
             progress: (counts.pending > 0).then(|| summary(counts, true)[0].clone()),
+            stack_at: self
+                .comparing
+                .stack_at()
+                .or_else(|| self.comparing.preview_stack_at())
+                .map(|at| super::super::history::ago(at, super::super::history::now_ms())),
         }
     }
 
@@ -539,7 +544,11 @@ impl ReviewSurface {
             MenuChoice::Off => self.set_compare_baseline(Baseline::Off, host),
             MenuChoice::Push => self.focus_timeline(),
             MenuChoice::Version => self.open_version_picker(host),
-            MenuChoice::StackAt => {}
+            MenuChoice::StackAt => {
+                if let Some(at) = self.comparing.preview_stack_at() {
+                    self.compare_stack_at(at, host);
+                }
+            }
             MenuChoice::OnlyChanged => self.toggle_only_changed(),
             MenuChoice::View => self.toggle_compare_view(),
         }

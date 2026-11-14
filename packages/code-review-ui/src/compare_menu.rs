@@ -41,8 +41,8 @@ pub enum MenuChoice {
     Version,
     /// Compare with each layer as it was this long ago.
     Ago(u64),
-    /// The whole stack as it was at a time (chosen in the stack history); only listed while in
-    /// effect.
+    /// The whole stack as it was at a time (chosen in the stack history); listed while in
+    /// effect, or while the menu opened on it.
     StackAt,
     /// No comparison.
     Off,
@@ -148,6 +148,9 @@ pub struct MenuState {
     pub view_key: Option<String>,
     /// How far the comparison is (`comparing 2 of 3…`), while some source is still computing.
     pub progress: Option<String>,
+    /// When the whole stack is shown as it was (`3h ago`), while that is in effect or the
+    /// menu opened on it: its row is offered.
+    pub stack_at: Option<String>,
 }
 
 /// What the menu can offer to pick from.
@@ -299,12 +302,12 @@ impl CompareMenu {
                 "picked in its version list",
             ));
         }
-        if state.current == Some(MenuChoice::StackAt) {
+        if let Some(when) = state.stack_at.as_deref() {
             items.push(target(
                 MenuChoice::StackAt,
-                "the stack as it was".to_owned(),
-                None,
-                "chosen in the stack history",
+                "the whole stack as it was".to_owned(),
+                Some(when),
+                "picked in the stack history",
             ));
         }
         items.push(target(
@@ -762,6 +765,7 @@ mod tests {
             },
             view_key: Some("shift+l".into()),
             progress: None,
+            stack_at: None,
         }
     }
 

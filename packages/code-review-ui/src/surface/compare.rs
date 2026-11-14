@@ -241,6 +241,11 @@ impl Comparing {
         self.snapshot.take()
     }
 
+    /// The time the whole stack was shown as it was at when the menu opened, while it is open.
+    pub(super) fn preview_stack_at(&self) -> Option<u64> {
+        self.snapshot.as_ref().and_then(|before| before.stack_at)
+    }
+
     /// Hold the sources whose hidden files are shown, to put back with the snapshot.
     pub(super) fn hold_files_shown(&mut self, shown: BTreeSet<String>) {
         self.files_shown = Some(shown);
