@@ -915,6 +915,13 @@ pub enum CoreRuntimeRequest {
     CompactSession {
         session_id: SessionId,
     },
+    ProviderAccountModels,
+    SetSessionModelWithAccount {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        account_reference: String,
+    },
     SetSessionModel {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
@@ -2007,6 +2014,20 @@ impl RoutedRequest {
             Request::CompactSession { session_id } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::CompactSession { session_id }))
             }
+            Request::ProviderAccountModels => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::ProviderAccountModels))
+            }
+            Request::SetSessionModelWithAccount {
+                session_id,
+                provider_plugin_id,
+                model_id,
+                account_reference,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetSessionModelWithAccount {
+                session_id,
+                provider_plugin_id,
+                model_id,
+                account_reference,
+            })),
             Request::SetSessionModel {
                 session_id,
                 provider_plugin_id,

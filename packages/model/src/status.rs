@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 /// their existing missing-field defaults; moving this contract does not change its wire shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionModelStatus {
+    /// Exact explicitly selected account reference; distinct from a default auth profile.
+    #[serde(default)]
+    pub account_reference: Option<String>,
     /// Selected provider plugin.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,

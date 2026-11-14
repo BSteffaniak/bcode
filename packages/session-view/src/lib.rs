@@ -2892,6 +2892,10 @@ mod text_update_retention_tests {
 
     #[test]
     fn bounded_skill_notes_match_ordinary_with_peak_denial() {
+        let limits = || ObservationRetentionLimits {
+            value_nodes: 129,
+            ..limits()
+        };
         let mut view = SessionView::default();
         let mut ordinary = view.clone();
         let mut retained = view.observation_retention_usage(limits()).unwrap();
@@ -3465,7 +3469,7 @@ mod text_update_retention_tests {
         assert_eq!(execution.value_nodes, 9);
         assert_eq!(execution.scalar_capacity_bytes, 0);
         assert_eq!(execution.collection_entries, 0);
-        assert_eq!(usage.value_nodes, 78 + execution.value_nodes);
+        assert_eq!(usage.value_nodes, 79 + execution.value_nodes);
         let mut ledger = usage;
         let before = ledger;
         assert!(view.try_clone_bounded(&mut ledger, limits()).is_err());
@@ -5308,6 +5312,14 @@ impl SessionView {
     }
 
     /// Replace renderer-selected model identity while retaining unrelated runtime state.
+    /// Replace the exact account selection supplied by canonical events or daemon hydration.
+    pub fn set_account_reference(&mut self, account_reference: Option<String>) {
+        if self.snapshot.runtime.account_reference != account_reference {
+            self.snapshot.runtime.account_reference = account_reference;
+            self.bump_revision();
+        }
+    }
+
     pub fn set_model_selection(
         &mut self,
         provider_plugin_id: Option<String>,
@@ -9850,13 +9862,23 @@ impl SessionView {
         use bcode_session_view_models::retention::ObservationRetentionUsage;
         let provider = (!provider.is_empty() && provider != "<auto>").then_some(provider);
         let model = (!model.is_empty() && model != "<default>").then_some(model);
+        let account = match &event.kind {
+            SessionEventKind::ModelChanged {
+                account_reference, ..
+            } => account_reference.as_deref(),
+            _ => None,
+        };
         let runtime = &self.snapshot.runtime;
-        let changed = runtime.provider_plugin_id.as_deref() != provider
+        let changed = runtime.account_reference.as_deref() != account
+            || runtime.provider_plugin_id.as_deref() != provider
             || runtime.requested_model_id.as_deref() != model
             || runtime.effective_model_id.as_deref() != model
             || runtime.display_name.is_some();
         let mut next = *retained;
         if changed {
+            let staged_account = account
+                .map(|text| next.try_clone_string(text, 4, limits))
+                .transpose()?;
             let staged_provider = provider
                 .map(|text| next.try_clone_string(text, 4, limits))
                 .transpose()?;
@@ -9867,6 +9889,7 @@ impl SessionView {
                 .map(|text| next.try_clone_string(text, 4, limits))
                 .transpose()?;
             for old in [
+                runtime.account_reference.as_ref(),
                 runtime.provider_plugin_id.as_ref(),
                 runtime.requested_model_id.as_ref(),
                 runtime.effective_model_id.as_ref(),
@@ -9877,6 +9900,10 @@ impl SessionView {
             {
                 next.try_release(ObservationRetentionUsage::string(old, 4))?;
             }
+            drop(std::mem::replace(
+                &mut self.snapshot.runtime.account_reference,
+                staged_account,
+            ));
             drop(std::mem::replace(
                 &mut self.snapshot.runtime.provider_plugin_id,
                 staged_provider,
@@ -10954,8 +10981,12 @@ impl SessionView {
                 );
             }
             SessionEventKind::ModelChanged {
-                provider, model, ..
+                provider,
+                model,
+                account_reference,
+                ..
             } => {
+                self.set_account_reference(account_reference.clone());
                 self.set_model_selection(
                     provider_to_display_selection(provider),
                     model_to_display_selection(model),
@@ -23722,6 +23753,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_account_is_canonical_runtime_state_and_clears_with_plain_selection() {
+        let session = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session,
+            1,
+            SessionEventKind::ModelChanged {
+                provider: "provider".into(),
+                model: "model".into(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
+                account_reference: Some("opaque-account-ref".into()),
+            },
+        ));
+        assert_eq!(
+            view.snapshot().runtime.account_reference.as_deref(),
+            Some("opaque-account-ref")
+        );
+        view.apply_event(&event(
+            session,
+            2,
+            SessionEventKind::ModelChanged {
+                provider: "provider".into(),
+                model: "model".into(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
+                account_reference: None,
+            },
+        ));
+        assert!(view.snapshot().runtime.account_reference.is_none());
+        view.set_account_reference(Some("attached-account-ref".into()));
+        assert_eq!(
+            view.snapshot().runtime.account_reference.as_deref(),
+            Some("attached-account-ref")
+        );
+    }
+
+    #[test]
     fn model_change_events_normalize_runtime_selection_for_renderers() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -23734,6 +23803,7 @@ mod tests {
                 model: "<default>".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         ));
 
@@ -23750,6 +23820,7 @@ mod tests {
                 model: "model".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         ));
 

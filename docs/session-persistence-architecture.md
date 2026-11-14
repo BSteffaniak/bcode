@@ -587,6 +587,39 @@ Classification:
   preserved any authoritative draft rows it contains.
 * Lock and lease files are coordination metadata, not session history.
 
+## Explicit model account selection
+
+A user-selected provider account is canonical selection state, not a new default. Event schema 59
+adds optional `ModelChanged.account_reference`; writer epoch 28 fences older writers that would
+ignore that reference. The same append transaction updates the nullable `session_state` account
+reference column (migration `083_session_state_account_reference_column`). Actor loading and resume
+read that projection without replaying history. Older model selections have no explicit account.
+An ordinary model selection, switching back to configured defaults, or selecting an external
+credential connection clears the reference in the same model-change event.
+
+Only the account reference accompanies the provider and model in durable history. Credentials,
+provider endpoint/dialect settings, and transient client profile settings are not persisted with
+it. The server reconstructs the route from the enabled provider's offline startup model choices
+and enriches exact membership through the centralized model catalog. Discovery is caller-config
+and context scoped, includes configured and runtime-enrolled accounts, and bounds accounts, source
+model counts, and elapsed provider work. Metadata-only discovery rejects sources larger than 64
+account records (including pool members)
+with an explicit scope-limit error before cloning candidate names; it does not return a silently
+truncated catalog. Provider work also has an aggregate deadline, reported as incomplete on expiry.
+Discovery does not perform inference or authenticate
+remotely; local credential presence is not proof of remote readiness.
+
+Selection checks exact account ownership, context visibility, the complete required credential set,
+and exact model membership before appending any event. This explicit selection preflight unlocks
+only the owned vault and discards the material; passive discovery checks declared metadata and
+vault-file presence without unlocking. Request-target resolution revalidates metadata and routing;
+execution revalidates and materializes the complete owned credential set, never filling missing
+fields from the daemon environment. Missing, deleted,
+wrong-owner, or wrong-context accounts fail closed without substituting another account or pool.
+Same-plugin transient client defaults cannot overwrite the explicit account or its provider-owned
+route. An unavailable account remains selected on resume so the next dispatch reports failure
+rather than silently using configured credentials.
+
 ## Catalog discovery
 
 Catalog discovery is best-effort, bounded, and non-mutating:

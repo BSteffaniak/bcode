@@ -68,34 +68,59 @@ pub enum ModelRequestTargetError {
 /// Identity, API surface, cache capabilities, and pricing come from the same resolved provider-model
 /// snapshot. When live discovery has not supplied a surface, the application catalog is consulted;
 /// an existing context surface is retained only when neither source knows the model's surface.
-pub async fn resolve_model_request_target(
+pub fn resolve_model_request_target<'a>(
+    state: &'a ServerState,
+    input: ModelRequestTargetInput<'a>,
+) -> impl std::future::Future<Output = Result<ResolvedModelRequestTarget, ModelRequestTargetError>>
++ Send
++ 'a {
+    Box::pin(resolve_model_request_target_inner(state, input))
+}
+
+async fn resolve_model_request_target_inner(
     state: &ServerState,
     input: ModelRequestTargetInput<'_>,
 ) -> Result<ResolvedModelRequestTarget, ModelRequestTargetError> {
-    let mut provider_context = managed_default_routing::refresh(
-        state,
-        input.provider_plugin_id,
-        input.provider_context,
-        input.native_default,
-    )
-    .await?;
-    if let Some(session) = input.session_id {
+    let explicit_account = input.provider_context.account_reference.as_deref();
+    let account_route = resolve_account_route(state, &input).await?;
+    let (mut provider_context, account_models) = if let Some((context, models)) = account_route {
+        (context, Some(models))
+    } else {
+        (
+            managed_default_routing::refresh(
+                state,
+                input.provider_plugin_id,
+                input.provider_context,
+                input.native_default,
+            )
+            .await?,
+            None,
+        )
+    };
+    if explicit_account.is_some() {
+        provider_accounts::preserve_request_context(&mut provider_context, input.provider_context);
+    }
+    if let Some(session) = input.session_id.filter(|_| explicit_account.is_none()) {
         bcode_provider_auth::session_routing::prepare_session_auth_pool(
             &session.to_string(),
             &mut provider_context,
         )
         .map_err(|_| ModelRequestTargetError::SessionAuthentication)?;
     }
-    let models = resolved_provider_models(
-        state,
-        input.provider_plugin_id.map(ToOwned::to_owned),
-        bcode_model::ModelListRequest {
-            provider_context: provider_context.clone(),
-            selected_model_id: input.selected_model_id.map(ToOwned::to_owned),
-        },
-    )
-    .await
-    .map_err(ModelRequestTargetError::ModelList)?;
+    let models = if let Some(models) = account_models {
+        models
+    } else {
+        resolved_provider_models(
+            state,
+            input.provider_plugin_id.map(ToOwned::to_owned),
+            bcode_model::ModelListRequest {
+                provider_context: provider_context.clone(),
+                selected_model_id: input.selected_model_id.map(ToOwned::to_owned),
+            },
+        )
+        .await
+        .map_err(ModelRequestTargetError::ModelList)?
+    };
     let model = models
         .models
         .iter()
@@ -131,19 +156,7 @@ pub async fn resolve_model_request_target(
     } else {
         None
     };
-    let support_hint = match &models.catalog.policy {
-        bcode_model::ModelCatalogPolicy::ExpandSupported { target, .. } => Some(target),
-        bcode_model::ModelCatalogPolicy::EnrichOnly { target, .. } => target.as_ref(),
-        _ => None,
-    };
-    let pricing_target = support_hint
-        .map(|hint| bcode_session_models::SessionPricingTarget {
-            provider: hint.provider.clone(),
-            auth_mode: hint.auth_mode.clone(),
-            api_surface: hint.api_surface.clone(),
-            integration: hint.integration.clone(),
-        })
-        .map(Box::new);
+    let pricing_target = model_pricing_target(&models.catalog.policy);
     Ok(ResolvedModelRequestTarget {
         pricing_target,
         provider_plugin_id: input.provider_plugin_id.map(ToOwned::to_owned),
@@ -190,6 +203,55 @@ async fn resolve_request_api_surface(
         .model_api_surface(&catalog_provider_id, model_id)
         .await
         .or(existing_surface)
+}
+
+async fn resolve_account_route(
+    state: &ServerState,
+    input: &ModelRequestTargetInput<'_>,
+) -> Result<
+    Option<(bcode_model::ProviderRequestContext, bcode_model::ModelList)>,
+    ModelRequestTargetError,
+> {
+    let explicit_account = input.provider_context.account_reference.as_deref();
+    let account_route = if let Some(account) = explicit_account {
+        let provider = input
+            .provider_plugin_id
+            .ok_or(ModelRequestTargetError::SessionAuthentication)?;
+        let model = input
+            .selected_model_id
+            .ok_or(ModelRequestTargetError::SessionAuthentication)?;
+        let config = if let Some(session) = input.session_id {
+            state.session_config(session).await
+        } else {
+            state.startup_config.clone()
+        };
+        Some(
+            provider_accounts::route(state, &config, provider, account, Some(model))
+                .await
+                .map_err(|_| ModelRequestTargetError::SessionAuthentication)?,
+        )
+    } else {
+        None
+    };
+    Ok(account_route)
+}
+
+fn model_pricing_target(
+    policy: &bcode_model::ModelCatalogPolicy,
+) -> Option<Box<bcode_session_models::SessionPricingTarget>> {
+    let support_hint = match policy {
+        bcode_model::ModelCatalogPolicy::ExpandSupported { target, .. } => Some(target),
+        bcode_model::ModelCatalogPolicy::EnrichOnly { target, .. } => target.as_ref(),
+        _ => None,
+    };
+    support_hint
+        .map(|hint| bcode_session_models::SessionPricingTarget {
+            provider: hint.provider.clone(),
+            auth_mode: hint.auth_mode.clone(),
+            api_surface: hint.api_surface.clone(),
+            integration: hint.integration.clone(),
+        })
+        .map(Box::new)
 }
 
 #[cfg(test)]

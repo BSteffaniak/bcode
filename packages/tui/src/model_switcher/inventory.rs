@@ -23,6 +23,11 @@ pub enum SourceKey {
     Connection { binding_id: String },
     /// A Bcode model provider using its own configured access.
     Provider { plugin_id: String },
+    /// A securely enrolled provider account, distinct even when adapters are shared.
+    Account {
+        plugin_id: String,
+        account_reference: String,
+    },
     /// Credentials found on this machine that could be connected.
     Connect,
 }
@@ -56,6 +61,8 @@ pub struct Source {
 pub enum Access {
     /// The route's own configured access.
     Direct,
+    /// An explicitly enrolled account resolved by the application.
+    Account { account_reference: String },
     /// An approved connection to another agent's credentials.
     Connection {
         /// Connection binding, sent with the selection.
@@ -198,7 +205,7 @@ impl Entry {
         match &self.access {
             Access::Connect(_) => return Some("Use its credentials in Bcode".into()),
             Access::Setup { .. } => return Some("Set up to run it here".into()),
-            Access::Direct | Access::Connection { .. } => {}
+            Access::Direct | Access::Account { .. } | Access::Connection { .. } => {}
         }
         let model = &self.model.model;
         if self.model.billing_route == ExecutionBillingRoute::NativeSubscription {
@@ -236,6 +243,7 @@ pub fn choice_key(route: &ExecutionRoute, model_id: &str, access: &Access) -> St
     };
     let access = match access {
         Access::Direct => String::new(),
+        Access::Account { account_reference } => format!("account:{account_reference}"),
         Access::Connection { binding_id, .. } => format!("connection:{binding_id}"),
         Access::Connect(candidate) => format!("connect:{}", candidate.binding_id),
         Access::Setup { tool } => format!("setup:{tool}"),
@@ -259,11 +267,23 @@ pub struct CurrentChoice {
     pub route: Option<ExecutionRoute>,
     /// Requested model identifier.
     pub model_id: Option<String>,
+    /// Current provider account, when reported by the application.
+    pub account_reference: Option<String>,
 }
 
 impl CurrentChoice {
     fn matches(&self, entry: &Entry) -> bool {
         self.model_id.as_deref() == Some(entry.model.model.model_id.as_str())
+            && match &entry.access {
+                Access::Account { account_reference } => {
+                    self.account_reference.as_ref() == Some(account_reference)
+                }
+                Access::Direct => {
+                    self.account_reference.is_none()
+                        || entry.model.account_reference == self.account_reference
+                }
+                _ => true,
+            }
             && self
                 .route
                 .as_ref()

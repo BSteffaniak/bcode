@@ -1241,6 +1241,7 @@ mod tests {
     #[test]
     fn thinking_status_distinguishes_provider_request_from_local_display() {
         let status = bcode_model::SessionModelStatus {
+            account_reference: None,
             provider_plugin_id: Some("provider".to_owned()),
             requested_model_id: Some("model".to_owned()),
             effective_model_id: Some("model".to_owned()),

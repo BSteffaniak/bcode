@@ -151,6 +151,7 @@ pub fn inspect_runtime(
     limits: ObservationRetentionLimits,
 ) -> Result<ObservationRetentionUsage, ObservationRetentionExceeded> {
     let crate::SessionRuntimeViewState {
+        account_reference,
         provider_plugin_id,
         requested_model_id,
         display_name,
@@ -173,6 +174,7 @@ pub fn inspect_runtime(
     let mut walker = Walker::new(limits, 4)?;
     walker.nested(inspect_cost(cost, limits)?, 1)?;
     for text in [
+        account_reference.as_ref(),
         provider_plugin_id.as_ref(),
         requested_model_id.as_ref(),
         display_name.as_ref(),

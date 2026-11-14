@@ -193,6 +193,17 @@ pub fn session_migrations() -> CurrentMigrationSource {
     add_submission_recovery_migrations(&mut source);
     add_external_connection_migrations(&mut source);
     add_native_input_queue_migrations(&mut source);
+    add_migration(
+        &mut source,
+        "083_session_state_account_reference_column",
+        alter_table("session_state").add_column(
+            "account_reference".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("account_reference".into()),
+    );
     if crate::durable_interaction::PUBLICATION_ENABLED {
         add_durable_interaction_migrations(&mut source);
     }

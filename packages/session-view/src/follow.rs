@@ -225,6 +225,7 @@ async fn attach(
         None,
     );
     view.set_agent_id(runtime.agent_id);
+    let account_reference = runtime.account_reference;
     view.set_reasoning_presentation_policy(follow.reasoning_policy);
     if let Some(window) = attached.projection_window.as_ref() {
         view.set_history_window_metadata(
@@ -235,6 +236,8 @@ async fn attach(
         );
     }
     view.apply_history(&attached.history);
+    // The bounded window may end before the latest selection; hydration is authoritative.
+    view.set_account_reference(account_reference);
     for record in &attached.submissions {
         view.apply_submission_record(record);
     }

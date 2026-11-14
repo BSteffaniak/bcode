@@ -765,6 +765,27 @@ pub trait SessionApplication: Sync {
         admission: crate::TurnAdmissionMetadata,
     ) -> impl Future<Output = Result<crate::TurnAdmission, SessionApplicationFailure>> + Send;
 
+    /// Persist an exact provider account and model selection.
+    ///
+    /// # Errors
+    /// Rejects unavailable, wrong-owner or out-of-context accounts, unsupported models,
+    /// skill conflicts and canonical mutation failures before recording the selection.
+    fn set_session_model_with_account(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        account_reference: String,
+    ) -> impl Future<Output = Result<(), SessionApplicationFailure>> + Send {
+        let _ = (session_id, provider_plugin_id, model_id, account_reference);
+        async {
+            Err(SessionApplicationFailure {
+                code: "unsupported".into(),
+                message: "account model selection is unavailable".into(),
+            })
+        }
+    }
+
     /// Persist an explicit model selection using the existing provider/model selection path,
     /// optionally with an approved external credential connection for that provider.
     ///

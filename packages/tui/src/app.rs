@@ -2043,6 +2043,16 @@ impl BmuxApp {
             .as_deref()
     }
 
+    /// Return the account last reported for the selected model.
+    #[must_use]
+    pub fn selected_account_reference(&self) -> Option<&str> {
+        self.session_view
+            .snapshot()
+            .runtime
+            .account_reference
+            .as_deref()
+    }
+
     /// Return the currently selected model id, if explicit.
     #[must_use]
     pub fn selected_model_id(&self) -> Option<&str> {
@@ -2585,6 +2595,8 @@ impl BmuxApp {
         selection: bcode_ipc::SessionRuntimeSelection,
         agent_accent: Option<String>,
     ) {
+        self.session_view
+            .set_account_reference(selection.account_reference);
         let provider_plugin_id = selection
             .provider_plugin_id
             .or_else(|| self.selected_provider_plugin_id().map(ToOwned::to_owned));
@@ -2623,6 +2635,8 @@ impl BmuxApp {
 
     /// Apply hydrated model metadata to the app.
     pub fn apply_model_status(&mut self, status: bcode_model::SessionModelStatus) {
+        self.session_view
+            .set_account_reference(status.account_reference.clone());
         let provider_plugin_id = status
             .provider_plugin_id
             .clone()
@@ -6117,6 +6131,7 @@ mod tests {
                 model: "model-2".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         ));
 
@@ -6150,15 +6165,45 @@ mod tests {
                 model: "<default>".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         ));
         assert_eq!(app.selected_provider_plugin_id(), None);
         assert_eq!(app.selected_model_id(), None);
         assert_eq!(app.status(), "model: <auto>/<default>");
+        app.absorb_session_event(&event(
+            2,
+            bcode_session_models::SessionEventKind::AgentChanged {
+                agent_id: "build".into(),
+            },
+        ));
+        assert_eq!(app.selected_account_reference(), None);
+        app.absorb_session_event(&event(
+            3,
+            bcode_session_models::SessionEventKind::ModelChanged {
+                provider: "bcode.openai-compatible".into(),
+                model: "shared-model".into(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
+                account_reference: Some("enrolled-account".into()),
+            },
+        ));
+        assert_eq!(app.selected_account_reference(), Some("enrolled-account"));
+        app.absorb_session_event(&event(
+            4,
+            bcode_session_models::SessionEventKind::ModelChanged {
+                provider: "bcode.openai-compatible".into(),
+                model: "shared-model".into(),
+                selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                external_auth_binding: None,
+                account_reference: None,
+            },
+        ));
+        assert_eq!(app.selected_account_reference(), None);
 
         app.set_pending_agent("review", Some("#ff00ff".to_owned()));
         app.absorb_session_event(&event(
-            2,
+            5,
             bcode_session_models::SessionEventKind::AgentChanged {
                 agent_id: "build".to_owned(),
             },
@@ -6167,7 +6212,7 @@ mod tests {
         assert_eq!(app.display_agent_accent(), None);
 
         app.absorb_session_event(&event(
-            3,
+            6,
             bcode_session_models::SessionEventKind::ReasoningChanged {
                 effort: Some("high".to_owned()),
                 summary: Some("detailed".to_owned()),

@@ -300,6 +300,7 @@ async fn route_backend_selection(
                     provider_plugin_id,
                 }),
             model_id: config.resolved_model_selection().model_id,
+            account_reference: None,
         };
         match Box::pin(bcode_tui::run_model_switcher_in_shell(shell, current, None)).await? {
             bcode_tui::SwitcherExit::Chose(choice) => {

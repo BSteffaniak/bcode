@@ -684,6 +684,7 @@ fn resolve_request_context_from_registry(
 ) -> bcode_model::ProviderRequestContext {
     let selected_profile = request.selection.auth_profile.clone();
     let mut context = bcode_model::ProviderRequestContext {
+        account_reference: None,
         model_profile: request.selection.model_profile,
         auth_profile: request.selection.auth_profile.clone(),
         auth_pool: request.selection.auth_pool.clone(),
@@ -1044,6 +1045,76 @@ pub fn discover_provider_profiles(
                 .iter()
                 .map(|member| member.auth_profile.clone())
         }));
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let result = resolve_auth_provider_profile(
+                config,
+                provider_id,
+                owner_plugin_id,
+                Some(&name),
+                runtime,
+            );
+            (name, result)
+        })
+        .collect()
+}
+
+/// Discover at most `limit` account candidates using the canonical scoped resolver.
+/// No credentials are read and invalid candidates remain isolated in the result.
+#[must_use]
+pub fn discover_provider_profiles_bounded(
+    config: &bcode_config::BcodeConfig,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    limit: usize,
+) -> BTreeMap<String, Result<ResolvedAuthProfile, AuthProfileResolutionError>> {
+    let mut names = config
+        .auth
+        .profiles
+        .iter()
+        .take(limit)
+        .filter(|(_, profile)| {
+            profile.provider_id.as_deref() == Some(provider_id)
+                && profile.owner_plugin_id.as_deref() == Some(owner_plugin_id)
+        })
+        .map(|(name, _)| name.clone())
+        .take(limit)
+        .collect::<std::collections::BTreeSet<_>>();
+    if config.active_context.is_none() {
+        for name in runtime
+            .profiles
+            .iter()
+            .take(limit)
+            .filter(|(_, profile)| {
+                profile.provider_id == provider_id && profile.owner_plugin_id == owner_plugin_id
+            })
+            .map(|(name, _)| name)
+            .chain(
+                runtime
+                    .pools
+                    .values()
+                    .take(limit)
+                    .filter(|pool| {
+                        pool.provider_id.as_deref() == Some(provider_id)
+                            && pool.owner_plugin_id.as_deref() == Some(owner_plugin_id)
+                    })
+                    .flat_map(|pool| {
+                        pool.profiles
+                            .iter()
+                            .take(limit)
+                            .map(|member| &member.auth_profile)
+                    })
+                    .take(limit),
+            )
+        {
+            if names.len() >= limit {
+                break;
+            }
+            names.insert(name.clone());
+        }
     }
     names
         .into_iter()
@@ -2069,6 +2140,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bounded_discovery_separates_same_plugin_accounts_and_context() {
+        let mut config = bcode_config::BcodeConfig::default();
+        let owner = "bcode.openai-compatible";
+        for (name, provider) in [("sol-account", "openai"), ("go-account", "opencode-go")] {
+            config.auth.profiles.insert(
+                name.into(),
+                bcode_config::AuthProfileConfig {
+                    backend: "sshenv".into(),
+                    provider_id: Some(provider.into()),
+                    owner_plugin_id: Some(owner.into()),
+                    scheme: Some("api_key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut runtime = bcode_config::RuntimeAuthSubscriptions::default();
+        runtime.profiles.insert(
+            "runtime-go".into(),
+            bcode_config::RuntimeAuthProfile {
+                provider_id: "opencode-go".into(),
+                owner_plugin_id: owner.into(),
+                backend: "sshenv".into(),
+                scheme: "api_key".into(),
+                storage_profile: "stored-go".into(),
+                vault: "/fixture/go.vault".into(),
+                ..Default::default()
+            },
+        );
+        let go = discover_provider_profiles_bounded(&config, "opencode-go", owner, &runtime, 64);
+        assert_eq!(go.len(), 2);
+        assert!(go.values().all(Result::is_ok));
+        assert!(!go.contains_key("sol-account"));
+        assert_eq!(
+            discover_provider_profiles_bounded(&config, "opencode-go", owner, &runtime, 1).len(),
+            1
+        );
+        assert!(
+            discover_provider_profiles_bounded(&config, "opencode-go", owner, &runtime, 0)
+                .is_empty()
+        );
+        assert!(
+            discover_provider_profiles_bounded(&config, "opencode-go", "bcode.other", &runtime, 64)
+                .is_empty()
+        );
+        config.active_context = Some("isolated".into());
+        let scoped =
+            discover_provider_profiles_bounded(&config, "opencode-go", owner, &runtime, 64);
+        assert!(!scoped.contains_key("runtime-go"));
+        assert!(scoped.values().all(Result::is_err));
     }
 
     fn legacy_openai_resolved(auth: &bcode_config::AuthProviderConfig) -> ResolvedAuthProfile {

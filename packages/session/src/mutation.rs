@@ -407,6 +407,7 @@ impl SessionManager {
                 model,
                 selection_source,
                 external_auth_binding,
+                account_reference: None,
             },
         )
         .await

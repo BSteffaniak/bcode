@@ -1801,6 +1801,9 @@ impl SessionCostSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeViewState {
+    /// Exact explicit model account reference, independent of default authentication.
+    #[serde(default)]
+    pub account_reference: Option<String>,
     /// Authoritative bounded queue state, independent of the loaded transcript window.
     #[serde(default)]
     pub submission_queue: Option<bcode_session_models::SubmissionQueueStatus>,

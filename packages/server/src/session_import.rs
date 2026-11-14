@@ -613,6 +613,7 @@ fn imported_session_event_kind(
                 model,
                 selection_source: bcode_session_models::ModelSelectionSource::ConfigDefault,
                 external_auth_binding: None,
+                account_reference: None,
             }
         }
         ImportableSessionEventKind::AgentChanged { agent_id } => {

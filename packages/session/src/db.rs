@@ -121,6 +121,16 @@ fn inject_migration_fault(
     Ok(())
 }
 
+fn session_visibility_from_row(row: &switchy::database::Row) -> SessionDbResult<SessionVisibility> {
+    optional_string(row, "visibility")
+        .map(|value| serde_json::from_str::<SessionVisibility>(&value))
+        .transpose()
+        .map_err(|_| SessionDbError::InvalidRow {
+            column: "visibility".to_owned(),
+        })
+        .map(Option::unwrap_or_default)
+}
+
 const MIGRATION_EVENT_PAGE_SIZE: usize = 1_000;
 /// Durable storage writer epoch understood by this session database implementation.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -411,6 +421,8 @@ pub struct SessionDbState {
     pub model_selection_source: bcode_session_models::ModelSelectionSource,
     /// Approved external credential connection selected with the current model, if any.
     pub external_auth_binding: Option<String>,
+    /// Explicit provider account reference, never credential material.
+    pub account_reference: Option<String>,
     /// Current reasoning effort selection, if any.
     pub reasoning_effort: Option<String>,
     /// Current reasoning summary selection, if any.
@@ -2099,6 +2111,7 @@ impl SessionDb {
                 "reasoning_summary",
                 "model_selection_source",
                 "external_auth_binding",
+                "account_reference",
                 "reasoning_by_model",
                 "updated_at_ms",
                 "visibility",
@@ -2129,13 +2142,7 @@ impl SessionDb {
             .map_err(|_| SessionDbError::InvalidRow {
                 column: "execution_provenance".to_string(),
             })?;
-        let visibility = optional_string(&row, "visibility")
-            .map(|value| serde_json::from_str::<SessionVisibility>(&value))
-            .transpose()
-            .map_err(|_| SessionDbError::InvalidRow {
-                column: "visibility".to_string(),
-            })?
-            .unwrap_or_default();
+        let visibility = session_visibility_from_row(&row)?;
         let (reasoning_by_model, reasoning_by_model_order) =
             optional_string(&row, "reasoning_by_model")
                 .as_deref()
@@ -2164,6 +2171,7 @@ impl SessionDb {
                 .and_then(decode_model_selection_source)
                 .unwrap_or_default(),
             external_auth_binding: optional_string(&row, "external_auth_binding"),
+            account_reference: optional_string(&row, "account_reference"),
             reasoning_by_model,
             reasoning_by_model_order,
             updated_at_ms: row
@@ -7345,6 +7353,7 @@ async fn project_event(
             model,
             selection_source,
             external_auth_binding,
+            account_reference,
         } => {
             // Restore the reasoning selection remembered for the incoming provider/model pair so
             // the projection matches in-memory state without replaying history.
@@ -7361,6 +7370,7 @@ async fn project_event(
                     encode_model_selection_source(*selection_source),
                 )
                 .value("external_auth_binding", external_auth_binding.clone())
+                .value("account_reference", account_reference.clone())
                 .value("reasoning_effort", remembered.effort)
                 .value("reasoning_summary", remembered.summary)
                 .where_eq("session_id", event.session_id.to_string())
@@ -12314,6 +12324,11 @@ mod tests {
 
     async fn remove_milestone_projection_fixture(db: &SessionDb) {
         switchy::database::schema::alter_table("session_state")
+            .drop_column("account_reference".into())
+            .execute(db.database())
+            .await
+            .unwrap();
+        switchy::database::schema::alter_table("session_state")
             .drop_column("external_auth_binding".into())
             .execute(db.database())
             .await
@@ -14685,6 +14700,7 @@ mod tests {
                 model: "model".to_string(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         ))
         .await
@@ -14730,6 +14746,7 @@ mod tests {
                 model: "model".to_string(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         ))
         .await

@@ -1734,6 +1734,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         location: None,
     });
     app.apply_model_status(bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: Some("very-long-provider-plugin-id".to_owned()),
         requested_model_id: None,
         effective_model_id: None,
@@ -2021,6 +2022,7 @@ fn header_and_footer_include_model_agent_and_token_context() {
     ];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[]);
     app.apply_model_status(bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: Some("provider.example".to_owned()),
         requested_model_id: None,
         effective_model_id: None,
@@ -2115,6 +2117,7 @@ fn status_line_prioritizes_context_over_spent_tokens() {
     )];
     let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[]);
     app.apply_model_status(bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: Some("provider.example".to_owned()),
         requested_model_id: None,
         effective_model_id: None,
@@ -3758,6 +3761,7 @@ fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
 fn thinking_label_uses_effective_values() {
     let mut app = BmuxApp::new_with_history(None, &[], &[]);
     app.apply_model_status(bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: None,
         requested_model_id: None,
         effective_model_id: None,
@@ -3807,6 +3811,7 @@ fn thinking_label_uses_effective_values() {
 #[test]
 fn thinking_dialog_cycles_supported_values_in_semantic_order() {
     let status = bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: None,
         requested_model_id: None,
         effective_model_id: None,
@@ -3866,6 +3871,7 @@ fn thinking_dialog_cycles_supported_values_in_semantic_order() {
 #[test]
 fn thinking_dialog_can_start_focused_on_effort_or_summary() {
     let status = bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: None,
         requested_model_id: None,
         effective_model_id: None,
@@ -3923,6 +3929,7 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
 #[test]
 fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
     let status = bcode_model::SessionModelStatus {
+        account_reference: None,
         provider_plugin_id: None,
         requested_model_id: None,
         effective_model_id: None,

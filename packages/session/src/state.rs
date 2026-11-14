@@ -72,6 +72,7 @@ pub struct SessionState {
     pub(crate) model_selection_source: bcode_session_models::ModelSelectionSource,
     /// Approved external credential connection selected with the current model.
     pub(crate) external_auth_binding: Option<String>,
+    pub(crate) account_reference: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) reasoning_summary: Option<String>,
     /// Reasoning selections remembered per provider/model pair.
@@ -150,6 +151,7 @@ impl SessionState {
             current_model: None,
             model_selection_source: bcode_session_models::ModelSelectionSource::default(),
             external_auth_binding: None,
+            account_reference: None,
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_by_model: BTreeMap::new(),
@@ -224,6 +226,7 @@ impl SessionState {
             current_model: state.current_model,
             model_selection_source: state.model_selection_source,
             external_auth_binding: state.external_auth_binding,
+            account_reference: state.account_reference,
             reasoning_effort: state.reasoning_effort,
             reasoning_summary: state.reasoning_summary,
             reasoning_by_model: state.reasoning_by_model,
@@ -419,11 +422,13 @@ impl SessionState {
                 model,
                 selection_source,
                 external_auth_binding,
+                account_reference,
             } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
                 self.model_selection_source = *selection_source;
                 self.external_auth_binding.clone_from(external_auth_binding);
+                self.account_reference.clone_from(account_reference);
                 self.context_epoch = event.sequence;
                 self.context_occupancy = None;
                 // Restore the reasoning selection previously remembered for this exact

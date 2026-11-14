@@ -1006,6 +1006,8 @@ pub enum TuiEffect {
         model_id: String,
         /// Approved external credential connection to use with the model, if any.
         external_auth_binding: Option<String>,
+        /// Enrolled provider account to apply atomically with the model.
+        account_reference: Option<String>,
     },
     /// Set session reasoning preferences.
     SetSessionReasoning {
@@ -3379,21 +3381,33 @@ impl TuiEffect {
                 provider_plugin_id,
                 model_id,
                 external_auth_binding,
+                account_reference,
             } => TuiEffectResult::SetSessionModel {
                 session_id,
                 provider_plugin_id: provider_plugin_id.clone(),
                 model_id: model_id.clone(),
-                result: execute_session_view_action(
-                    &client,
-                    SessionViewAction::SetModel {
-                        session_id,
-                        provider_plugin_id,
-                        model_id,
-                        external_auth_binding,
-                    },
-                )
-                .await
-                .map(|_| ()),
+                result: if let Some(account) = account_reference {
+                    client
+                        .set_session_model_with_account(
+                            session_id,
+                            provider_plugin_id,
+                            model_id,
+                            account,
+                        )
+                        .await
+                } else {
+                    execute_session_view_action(
+                        &client,
+                        SessionViewAction::SetModel {
+                            session_id,
+                            provider_plugin_id,
+                            model_id,
+                            external_auth_binding,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                },
             },
             Self::SetSessionReasoning {
                 session_id,

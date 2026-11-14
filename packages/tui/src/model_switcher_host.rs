@@ -64,6 +64,7 @@ pub fn open(chat: &ActiveChat, state: &mut ChatLoopState) {
                 provider_plugin_id: provider.to_owned(),
             }),
         model_id: chat.app.selected_model_id().map(ToOwned::to_owned),
+        account_reference: chat.app.selected_account_reference().map(ToOwned::to_owned),
     };
     let choices =
         bcode_config::model_choices::load_from(&bcode_config::model_choices::default_path())
@@ -125,13 +126,20 @@ fn choose(chat: &mut ActiveChat, state: &mut ChatLoopState, choice: Box<Choice>)
         (ExecutionRoute::ModelProvider { provider_plugin_id }, true, Some(session_id)) => {
             let external_auth_binding = match &choice.entry.access {
                 Access::Connection { binding_id, .. } => Some(binding_id.clone()),
-                Access::Direct | Access::Connect(_) | Access::Setup { .. } => None,
+                Access::Direct
+                | Access::Account { .. }
+                | Access::Connect(_)
+                | Access::Setup { .. } => None,
             };
             chat.start_effect(TuiEffect::SetSessionModel {
                 session_id,
                 provider_plugin_id: Some(provider_plugin_id.clone()),
                 model_id: model.model.model_id.clone(),
                 external_auth_binding,
+                account_reference: match &choice.entry.access {
+                    Access::Account { account_reference } => Some(account_reference.clone()),
+                    _ => None,
+                },
             });
             state.pending_switch_effort = choice
                 .effort
@@ -413,6 +421,39 @@ mod tests {
             state,
             &Event::Key(bmux_keyboard::KeyStroke::simple(code)),
         );
+    }
+
+    #[test]
+    fn enrolled_account_choice_applies_in_place_without_external_binding() {
+        let session_id = SessionId::new();
+        let mut chat = chat(session_id);
+        let mut state = open_with(
+            &mut chat,
+            SourceKey::Account {
+                plugin_id: "bcode.openai-compatible".into(),
+                account_reference: "go".into(),
+            },
+            model(ExecutionRoute::ModelProvider {
+                provider_plugin_id: "bcode.openai-compatible".into(),
+            }),
+            Access::Account {
+                account_reference: "go".into(),
+            },
+        );
+        press(&mut chat, &mut state, bmux_keyboard::KeyCode::Enter);
+        let effects: Vec<_> = chat
+            .pending_effects
+            .drain_runtime()
+            .0
+            .into_iter()
+            .map(|(_, effect)| effect)
+            .collect();
+        drop(chat);
+        assert!(state.execution_picker.is_none());
+        drop(state);
+        assert!(matches!(effects.as_slice(), [TuiEffect::SetSessionModel {
+            account_reference: Some(account), external_auth_binding: None, ..
+        }] if account == "go"));
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub mod harness_dispatch;
 pub mod harness_workflow;
 mod plugin_context;
 mod plugin_operations;
+mod provider_accounts;
 mod provider_retry_recovery;
 mod request_routing;
 mod runtime_work;
@@ -6716,6 +6717,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::CancelSessionTurn { session_id, .. }
         | Request::CancelRuntimeWork { session_id, .. }
         | Request::CompactSession { session_id }
+        | Request::SetSessionModelWithAccount { session_id, .. }
         | Request::SetSessionModel { session_id, .. }
         | Request::SetSessionReasoning { session_id, .. }
         | Request::AppendPresentationNote { session_id, .. }
@@ -7010,6 +7012,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CompactSession { .. } => "compact_session",
         Request::RebuildSessionSummary { .. } => "rebuild_session_summary",
         Request::RestartSessionCompaction { .. } => "restart_session_compaction",
+        Request::ProviderAccountModels => "provider_account_models",
+        Request::SetSessionModelWithAccount { .. } => "set_session_model_with_account",
         Request::SetSessionModel { .. } => "set_session_model",
         Request::SetSessionReasoning { .. } => "set_session_reasoning",
         Request::AccountRouting { .. } => "account_routing",
@@ -10842,6 +10846,49 @@ async fn handle_core_runtime_request(
         }
         CoreRuntimeRequest::CompactSession { session_id } => {
             handle_compact_session(request_id, client_id, state, writer, session_id).await
+        }
+        CoreRuntimeRequest::ProviderAccountModels => {
+            use bcode_model::ProviderAccountModelsApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .provider_account_models()
+                .await;
+            send_response(
+                writer,
+                request_id,
+                result.map_or_else(
+                    |message| {
+                        Response::Err(ErrorResponse::new("provider_accounts_unavailable", message))
+                    },
+                    |accounts| Response::Ok(ResponsePayload::ProviderAccountModels { accounts }),
+                ),
+            )
+            .await
+        }
+        CoreRuntimeRequest::SetSessionModelWithAccount {
+            session_id,
+            provider_plugin_id,
+            model_id,
+            account_reference,
+        } => {
+            use bcode_session_models::SessionApplication as _;
+            let result = Box::pin(
+                SessionApplicationHandle::new(state, client_id).set_session_model_with_account(
+                    session_id,
+                    provider_plugin_id,
+                    model_id,
+                    account_reference,
+                ),
+            )
+            .await;
+            send_response(
+                writer,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |()| Response::Ok(ResponsePayload::SessionModelSet),
+                ),
+            )
+            .await
         }
         CoreRuntimeRequest::SetSessionModel {
             session_id,
@@ -20005,23 +20052,43 @@ fn compaction_provider_error_response() -> ErrorResponse {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn model_status_for_selection(
-    state: &ServerState,
+fn model_status_for_selection<'a>(
+    state: &'a ServerState,
     selection: SessionModelSelection,
     session_id: Option<SessionId>,
+    config: &'a bcode_config::BcodeConfig,
+) -> impl std::future::Future<Output = bcode_model::SessionModelStatus> + Send + 'a {
+    Box::pin(model_status_for_selection_inner(
+        state, selection, session_id, config,
+    ))
+}
+
+async fn status_models(
+    state: &ServerState,
+    selection: &SessionModelSelection,
     config: &bcode_config::BcodeConfig,
-) -> bcode_model::SessionModelStatus {
-    let status_auth = managed_default_routing::status_profile(state, &selection).await;
-    let mut models = resolved_provider_models(
-        state,
-        selection.provider_plugin_id.clone(),
-        bcode_model::ModelListRequest {
-            provider_context: selection.provider_context.clone(),
-            selected_model_id: selection.model_id.clone(),
-        },
-    )
-    .await
-    .ok();
+) -> Option<bcode_model::ModelList> {
+    let mut models = if let (Some(account), Some(provider), Some(model)) = (
+        selection.provider_context.account_reference.as_deref(),
+        selection.provider_plugin_id.as_deref(),
+        selection.model_id.as_deref(),
+    ) {
+        provider_accounts::route(state, config, provider, account, Some(model))
+            .await
+            .ok()
+            .map(|(_, models)| models)
+    } else {
+        resolved_provider_models(
+            state,
+            selection.provider_plugin_id.clone(),
+            bcode_model::ModelListRequest {
+                provider_context: selection.provider_context.clone(),
+                selected_model_id: selection.model_id.clone(),
+            },
+        )
+        .await
+        .ok()
+    };
     if let Some(models) = &mut models {
         let provider_for_ignores = selection
             .provider_plugin_id
@@ -20031,6 +20098,59 @@ async fn model_status_for_selection(
             model_ignores::apply_model_ignores(&mut models.models, &rules);
         }
     }
+    models
+}
+
+fn status_model_metadata(
+    provider_context: &bcode_model::ProviderRequestContext,
+    model_id: Option<&str>,
+    model: Option<&bcode_model::ModelInfo>,
+) -> (
+    Option<u32>,
+    Option<u32>,
+    Option<bcode_model::ModelMetadataSource>,
+) {
+    let override_metadata =
+        model_id.map(|model_id| model_metadata_override(provider_context, model_id));
+    let context_window = override_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.context_window)
+        .or_else(|| model.and_then(|model| model.context_window));
+    let max_output_tokens = override_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.max_output_tokens)
+        .or_else(|| model.and_then(|model| model.max_output_tokens));
+    let metadata_source = if override_metadata.as_ref().is_some_and(|metadata| {
+        metadata.context_window.is_some() || metadata.max_output_tokens.is_some()
+    }) {
+        Some(bcode_model::ModelMetadataSource::ConfigOverride)
+    } else {
+        model.and_then(|model| model.metadata_source)
+    };
+    (context_window, max_output_tokens, metadata_source)
+}
+
+const fn status_compaction_threshold(
+    threshold: bcode_config::ProactiveCompactionThreshold,
+) -> (Option<u8>, Option<u64>, &'static str) {
+    match threshold {
+        bcode_config::ProactiveCompactionThreshold::Percent(percent) => {
+            (Some(percent), None, "percent")
+        }
+        bcode_config::ProactiveCompactionThreshold::Tokens(tokens) => {
+            (None, Some(tokens), "tokens")
+        }
+    }
+}
+
+async fn model_status_for_selection_inner(
+    state: &ServerState,
+    selection: SessionModelSelection,
+    session_id: Option<SessionId>,
+    config: &bcode_config::BcodeConfig,
+) -> bcode_model::SessionModelStatus {
+    let status_auth = managed_default_routing::status_profile(state, &selection).await;
+    let models = status_models(state, &selection, config).await;
     let model = models
         .as_ref()
         .and_then(|models| select_model_info(&models.models, selection.model_id.as_deref()));
@@ -20039,24 +20159,11 @@ async fn model_status_for_selection(
         .model_id
         .clone()
         .or_else(|| model.as_ref().map(|model| model.model_id.clone()));
-    let override_metadata = model_id
-        .as_deref()
-        .map(|model_id| model_metadata_override(&selection.provider_context, model_id));
-    let context_window = override_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.context_window)
-        .or_else(|| model.as_ref().and_then(|model| model.context_window));
-    let max_output_tokens = override_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.max_output_tokens)
-        .or_else(|| model.as_ref().and_then(|model| model.max_output_tokens));
-    let metadata_source = if override_metadata.as_ref().is_some_and(|metadata| {
-        metadata.context_window.is_some() || metadata.max_output_tokens.is_some()
-    }) {
-        Some(bcode_model::ModelMetadataSource::ConfigOverride)
-    } else {
-        model.as_ref().and_then(|model| model.metadata_source)
-    };
+    let (context_window, max_output_tokens, metadata_source) = status_model_metadata(
+        &selection.provider_context,
+        model_id.as_deref(),
+        model.as_ref(),
+    );
     let reasoning_override = model_id
         .as_deref()
         .and_then(|model_id| model_reasoning_override(&selection.provider_context, model_id));
@@ -20085,14 +20192,7 @@ async fn model_status_for_selection(
         .compaction
         .effective_for(selection.provider_plugin_id.as_deref(), model_id.as_deref());
     let (threshold_percent, threshold_tokens, threshold_source) =
-        match effective_compaction.proactive_threshold {
-            bcode_config::ProactiveCompactionThreshold::Percent(percent) => {
-                (Some(percent), None, "percent")
-            }
-            bcode_config::ProactiveCompactionThreshold::Tokens(tokens) => {
-                (None, Some(tokens), "tokens")
-            }
-        };
+        status_compaction_threshold(effective_compaction.proactive_threshold);
     let effective_threshold_tokens = context_window.map(|window| {
         compaction_capacity_tokens(
             window,
@@ -20114,6 +20214,7 @@ async fn model_status_for_selection(
         None
     });
     bcode_model::SessionModelStatus {
+        account_reference: selection.provider_context.account_reference.clone(),
         provider_plugin_id: selection.provider_plugin_id,
         requested_model_id: selection.requested_model_id.clone(),
         effective_model_id: model_id.clone(),
@@ -25265,6 +25366,26 @@ async fn run_model_turn_round(
         config,
     } = round;
     let mut dispatch_request = request.clone();
+    if let Some(account) = request.provider_context.account_reference.as_deref() {
+        let provider = provider_plugin_id.ok_or_else(|| {
+            ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                "an explicit provider is required for an account".to_owned(),
+            )
+        })?;
+        dispatch_request.provider_context =
+            provider_accounts::materialize(state, config, provider, &request.model_id, account)
+                .await
+                .map_err(|message| {
+                    ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
+                })?;
+    }
+    if request.provider_context.account_reference.is_some() {
+        provider_accounts::preserve_request_context(
+            &mut dispatch_request.provider_context,
+            &request.provider_context,
+        );
+    }
     prepare_dispatch_context_lineage(state, session_id, &mut dispatch_request);
     // Capture only after final host dispatch adaptation, never the earlier estimate.
     xray_context::assembled_request(&dispatch_request, "assembled_request");
@@ -28889,6 +29010,22 @@ fn narrow_agent_context(
     }
 }
 
+async fn is_native_default_selection(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_plugin_id: Option<&String>,
+    provider_context: &bcode_model::ProviderRequestContext,
+) -> bool {
+    provider_plugin_id == state.selected_provider_plugin_id.as_ref()
+        && provider_context.account_reference.is_none()
+        && provider_context.external_auth_binding.is_none()
+        && !state
+            .session_external_configs
+            .lock()
+            .await
+            .contains(&session_id)
+}
+
 async fn session_model_selection_with_runtime_context(
     state: &ServerState,
     session_id: SessionId,
@@ -28918,6 +29055,10 @@ async fn session_model_selection_with_runtime_context(
     // for a different provider would shadow that provider's saved credentials with foreign ones.
     // The client's provider-neutral process environment still applies so the selected provider
     // can honor the launching shell (for example `AWS_BEARER_TOKEN_BEDROCK`).
+    if selection.provider_context.account_reference.is_some() {
+        // Exact account routes never inherit a same-plugin client's default profile or endpoint.
+        return selection;
+    }
     if runtime_context_targets_selection(state, &context, &selection) {
         overlay_transient_provider_context(
             &mut selection.provider_context,
@@ -29062,6 +29203,9 @@ fn overlay_transient_provider_context(
     selection: &mut bcode_model::ProviderRequestContext,
     runtime: bcode_model::ProviderRequestContext,
 ) {
+    if selection.account_reference.is_some() {
+        return;
+    }
     // An external connection replaces profile authentication wholesale and never merges.
     if runtime.external_auth_binding.is_some() {
         *selection = bcode_model::ProviderRequestContext {
@@ -29075,7 +29219,7 @@ fn overlay_transient_provider_context(
         };
         return;
     }
-    if selection.external_auth_binding.is_some() {
+    if selection.external_auth_binding.is_some() || selection.account_reference.is_some() {
         return;
     }
     if runtime.auth_profile.is_some() {
@@ -29203,6 +29347,42 @@ async fn restored_provider_context(
 /// model came from a resolved default re-resolve against current configuration, so changing the
 /// configured default model takes effect when an idle session is reopened. Sessions with active
 /// runtime work keep their in-flight selection so a running turn is never retargeted.
+fn default_session_runtime_selection(
+    state: &ServerState,
+) -> bcode_session::SessionRuntimeSelection {
+    bcode_session::SessionRuntimeSelection {
+        agent_id: None,
+        provider_plugin_id: state.selected_provider_plugin_id.clone(),
+        model_id: state.selected_model_id.clone(),
+        model_selection_source: bcode_session_models::ModelSelectionSource::ConfigDefault,
+        external_auth_binding: None,
+        account_reference: None,
+        reasoning_effort: state.selected_reasoning.effort.clone(),
+        reasoning_summary: state.selected_reasoning.summary.clone(),
+    }
+}
+
+async fn cache_session_model_selection(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: SessionModelSelection,
+    source: bcode_session_models::ModelSelectionSource,
+) -> SessionModelSelection {
+    let origin = origin_for_selection_source(source);
+    state
+        .session_model_selections
+        .lock()
+        .await
+        .insert(session_id, selection.clone());
+    state
+        .session_model_selection_origins
+        .lock()
+        .await
+        .entry(session_id)
+        .or_insert(origin);
+    selection
+}
+
 async fn session_model_selection(
     state: &ServerState,
     session_id: SessionId,
@@ -29210,20 +29390,11 @@ async fn session_model_selection(
     if let Some(selection) = state.session_model_selections.lock().await.get(&session_id) {
         return selection.clone();
     }
-    let fallback_runtime_selection = || bcode_session::SessionRuntimeSelection {
-        agent_id: None,
-        provider_plugin_id: state.selected_provider_plugin_id.clone(),
-        model_id: state.selected_model_id.clone(),
-        model_selection_source: bcode_session_models::ModelSelectionSource::ConfigDefault,
-        external_auth_binding: None,
-        reasoning_effort: state.selected_reasoning.effort.clone(),
-        reasoning_summary: state.selected_reasoning.summary.clone(),
-    };
     let runtime_selection = state
         .sessions
         .current_runtime_selection(session_id)
         .await
-        .unwrap_or_else(|_| fallback_runtime_selection());
+        .unwrap_or_else(|_| default_session_runtime_selection(state));
     // A non-explicit persisted model is a stale resolved default. Keep it only while runtime work
     // is in flight; otherwise discard it so current configuration is re-resolved below.
     let honor_persisted_model = runtime_selection.model_selection_source.is_sticky()
@@ -29269,23 +29440,38 @@ async fn session_model_selection(
             state.selected_reasoning.summary.clone(),
         ),
     };
-    let provider_context = restored_provider_context(
+    let provider_context = if let Some(account) = runtime_selection
+        .account_reference
+        .as_deref()
+        .filter(|_| honor_persisted_model)
+    {
+        restored_account_context(
+            state,
+            session_id,
+            provider_plugin_id.as_deref(),
+            model_id.as_deref(),
+            account,
+        )
+        .await
+    } else {
+        restored_provider_context(
+            state,
+            session_id,
+            persisted_provider
+                .as_ref()
+                .and(runtime_selection.external_auth_binding.as_deref()),
+            provider_plugin_id.as_deref(),
+            model_id.as_deref(),
+        )
+        .await
+    };
+    let native_default = is_native_default_selection(
         state,
         session_id,
-        persisted_provider
-            .as_ref()
-            .and(runtime_selection.external_auth_binding.as_deref()),
-        provider_plugin_id.as_deref(),
-        model_id.as_deref(),
+        provider_plugin_id.as_ref(),
+        &provider_context,
     )
     .await;
-    let native_default = provider_plugin_id == state.selected_provider_plugin_id
-        && provider_context.external_auth_binding.is_none()
-        && !state
-            .session_external_configs
-            .lock()
-            .await
-            .contains(&session_id);
     let selection = SessionModelSelection {
         provider_plugin_id,
         requested_model_id: persisted_model.clone(),
@@ -29297,19 +29483,13 @@ async fn session_model_selection(
         provider_context,
         native_default,
     };
-    let origin = origin_for_selection_source(runtime_selection.model_selection_source);
-    state
-        .session_model_selections
-        .lock()
-        .await
-        .insert(session_id, selection.clone());
-    state
-        .session_model_selection_origins
-        .lock()
-        .await
-        .entry(session_id)
-        .or_insert(origin);
-    selection
+    cache_session_model_selection(
+        state,
+        session_id,
+        selection,
+        runtime_selection.model_selection_source,
+    )
+    .await
 }
 
 /// Map a server selection origin back onto persisted provenance.
@@ -29386,6 +29566,7 @@ async fn session_runtime_selection_payload(
     }
     let resolved = session_model_selection(state, session_id).await;
     bcode_session_models::SessionRuntimeSelection {
+        account_reference: resolved.provider_context.account_reference.clone(),
         agent_id: Some(session_agent_selection(state, session_id).await),
         provider_plugin_id: resolved.provider_plugin_id,
         requested_model_id: resolved.requested_model_id,
@@ -29560,6 +29741,20 @@ async fn invoke_model_provider_start_turn_at_home(
             unique_model_provider_route(state)?
         };
     let mut dispatch_request = request.clone();
+    if let Some(account) = request.provider_context.account_reference.as_deref() {
+        dispatch_request.provider_context = provider_accounts::materialize(
+            state,
+            config,
+            &provider_plugin_id,
+            &request.model_id,
+            account,
+        )
+        .await?;
+        provider_accounts::preserve_request_context(
+            &mut dispatch_request.provider_context,
+            &request.provider_context,
+        );
+    }
     if let Some(context) =
         external_context_for_dispatch(state, Some(&provider_plugin_id), request, home).await?
     {
@@ -108741,5 +108936,30 @@ mod external_admission_contract_tests {
             ))
             .is_err()
         );
+    }
+}
+
+async fn restored_account_context(
+    state: &ServerState,
+    session_id: SessionId,
+    provider: Option<&str>,
+    model: Option<&str>,
+    account: &str,
+) -> bcode_model::ProviderRequestContext {
+    let unavailable = || bcode_model::ProviderRequestContext {
+        account_reference: Some(account.to_owned()),
+        ..Default::default()
+    };
+    match (provider, model) {
+        (Some(provider), Some(model)) => provider_accounts::validate(
+            state,
+            &state.session_config(session_id).await,
+            provider,
+            model,
+            account,
+        )
+        .await
+        .unwrap_or_else(|_| unavailable()),
+        _ => unavailable(),
     }
 }

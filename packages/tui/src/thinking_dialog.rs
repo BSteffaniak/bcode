@@ -282,6 +282,7 @@ mod tests {
 
     fn status() -> bcode_model::SessionModelStatus {
         bcode_model::SessionModelStatus {
+            account_reference: None,
             provider_plugin_id: None,
             requested_model_id: None,
             effective_model_id: None,

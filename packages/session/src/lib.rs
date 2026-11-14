@@ -350,6 +350,8 @@ pub struct SessionRuntimeSelection {
     pub model_selection_source: bcode_session_models::ModelSelectionSource,
     /// Approved external credential connection selected with the current model, if any.
     pub external_auth_binding: Option<String>,
+    /// Exact account reference selected with the model, if any.
+    pub account_reference: Option<String>,
     /// Session-specific reasoning effort, when explicitly selected.
     pub reasoning_effort: Option<String>,
     /// Session-specific reasoning summary, when explicitly selected.
@@ -1725,6 +1727,7 @@ impl SessionManager {
             current_model: None,
             model_selection_source: bcode_session_models::ModelSelectionSource::default(),
             external_auth_binding: None,
+            account_reference: None,
             reasoning_effort: None,
             reasoning_summary: None,
             reasoning_by_model: BTreeMap::new(),
@@ -4187,6 +4190,89 @@ mod tests {
         assert_eq!(selection.external_auth_binding, None);
         restored.shutdown_catalog_updates().await;
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn account_selection_resumes_from_projection_and_other_selections_clear_it() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(None, test_working_directory())
+            .await
+            .expect("session");
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::ModelChanged {
+                    provider: "bcode.openai-compatible".into(),
+                    model: "account-model".into(),
+                    selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                    external_auth_binding: None,
+                    account_reference: Some("go-account".into()),
+                },
+            )
+            .await
+            .expect("account selection");
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+        let manager = SessionManager::persistent(&root).expect("restore");
+        let selected = manager
+            .current_runtime_selection(session.id)
+            .await
+            .expect("bounded projection");
+        assert_eq!(selected.account_reference.as_deref(), Some("go-account"));
+        assert_eq!(selected.model_id.as_deref(), Some("account-model"));
+        assert!(selected.external_auth_binding.is_none());
+        manager
+            .append_model_changed_with_connection(
+                session.id,
+                "bcode.openai-compatible".into(),
+                "external-model".into(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+                Some("ab".repeat(32)),
+            )
+            .await
+            .expect("external selection");
+        let selected = manager
+            .current_runtime_selection(session.id)
+            .await
+            .expect("projection");
+        assert!(selected.account_reference.is_none());
+        assert!(selected.external_auth_binding.is_some());
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::ModelChanged {
+                    provider: "bcode.openai-compatible".into(),
+                    model: "account-model".into(),
+                    selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
+                    external_auth_binding: None,
+                    account_reference: Some("go-account".into()),
+                },
+            )
+            .await
+            .expect("account selection again");
+        manager
+            .append_model_changed(
+                session.id,
+                "<auto>".into(),
+                "<auto>".into(),
+                bcode_session_models::ModelSelectionSource::UserExplicit,
+            )
+            .await
+            .expect("default selection");
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+        let manager = SessionManager::persistent(&root).expect("restore default");
+        let selected = manager
+            .current_runtime_selection(session.id)
+            .await
+            .expect("projection");
+        assert!(selected.account_reference.is_none());
+        assert!(selected.external_auth_binding.is_none());
+        manager.shutdown_catalog_updates().await;
+        drop(manager);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
@@ -10584,6 +10670,7 @@ mod tests {
                     model: "model".to_string(),
                     selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                     external_auth_binding: None,
+                    account_reference: None,
                 },
             ),
             (

@@ -1166,6 +1166,15 @@ pub enum Request {
         /// Approved external credential connection to use with this model, if any.
         external_auth_binding: Option<String>,
     },
+    /// Discover bounded, secret-free account-scoped provider catalogs.
+    ProviderAccountModels,
+    /// Select an exact account without changing configured defaults.
+    SetSessionModelWithAccount {
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        account_reference: String,
+    },
     SetSessionReasoning {
         session_id: SessionId,
         effort: Option<String>,
@@ -2731,6 +2740,10 @@ pub enum ResponsePayload {
     },
     TurnAdmission {
         admission: bcode_session_models::TurnAdmission,
+    },
+    /// Bounded account-scoped provider catalogs.
+    ProviderAccountModels {
+        accounts: Vec<bcode_model::ProviderAccountModels>,
     },
     SessionModelList {
         provider_plugin_id: Option<String>,
@@ -7510,6 +7523,7 @@ mod tests {
     #[test]
     fn session_runtime_selection_round_trips_agent_identity() {
         let selection = SessionRuntimeSelection {
+            account_reference: None,
             agent_id: Some("build".to_owned()),
             provider_plugin_id: Some("provider".to_owned()),
             requested_model_id: Some("requested".to_owned()),
@@ -7983,6 +7997,7 @@ mod tests {
                 model: "model".to_string(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
             SessionEventKind::SystemMessage {
                 text: "system".to_string(),

@@ -1163,6 +1163,7 @@ mod tests {
                 model: "next-model".to_owned(),
                 selection_source: bcode_session_models::ModelSelectionSource::UserExplicit,
                 external_auth_binding: None,
+                account_reference: None,
             },
         };
         state.ingest(&reset);

@@ -5,8 +5,8 @@ Use OpenCode Go in Bcode with a personal API key. No browser-login flow, OpenCod
 ## Connect
 
 1. In [OpenCode Console](https://opencode.ai), open **Account → Personal API keys**, choose the workspace, and create a key.
-2. In Bcode's onboarding, select **OpenCode Go** and paste the key into the secure API-key prompt. To reopen setup, run `bcode --onboard`.
-3. Choose an available Go model in Bcode's model picker.
+2. If you have not signed in yet, run `bcode auth login opencode-go` and paste the key into the secure prompt.
+3. Open `/model` in your conversation and choose a model under your **OpenCode Go** account. Connected accounts appear alongside existing provider and native-tool sources; onboarding is not required after login.
 
 Bcode stores the key through its standard authentication system. Do not put it in command arguments, TOML, chat messages, or logs. Existing Sol and OpenAI authentication remains independent; connecting Go does not replace those credentials.
 
@@ -24,7 +24,7 @@ This uses the plugin-registered `api_key` method and prompts for the key without
 bcode auth login opencode-go --method api_key
 ```
 
-Then select OpenCode Go and a Go model in Bcode. `bcode auth providers` lists authentication providers registered by enabled plugins; `bcode auth status opencode-go` checks the provider's authentication status. Enrollment alone is not proof that inference succeeds.
+Then choose a model under the connected account in `/model`. The selection applies to this conversation and is retained when you reopen it; your global Sol/OpenAI defaults are unchanged. `bcode auth providers` lists authentication providers registered by enabled plugins; `bcode auth status opencode-go` checks the provider's authentication status. Enrollment alone is not proof that inference succeeds.
 
 ## Routing and billing
 

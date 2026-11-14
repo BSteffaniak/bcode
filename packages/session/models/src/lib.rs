@@ -92,7 +92,8 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 /// native usage, mid-session configuration requests, and later published recovery records.
 /// Epoch 27 (schema 58) folds native harness usage into the required session usage projection;
 /// an epoch-26 writer would append native usage without maintaining that projection.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 27;
+/// Epoch 28 (schema 59) fences explicit account references and their required state projection.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 28;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -409,6 +410,9 @@ pub struct SessionCatalogSourceStatus {
 /// Runtime selections restored from a session, versioned by the enclosing application protocol.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeSelection {
+    /// Exact account reference accompanying an explicit model selection.
+    #[serde(default)]
+    pub account_reference: Option<String>,
     /// Selected agent profile.
     #[serde(default)]
     pub agent_id: Option<String>,
@@ -1541,9 +1545,8 @@ mod checked_tool_projection_tests {
 
 /// Current persisted session event schema version.
 ///
-/// Schema 58 admits managed native-parity observation variants (reasoning, native tool results,
-/// native usage, segment/input display metadata) and the mid-session configuration request kind.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 58;
+/// Schema 59 persists the exact account reference accompanying an explicit model selection.
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 59;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -5048,6 +5051,9 @@ pub enum SessionEventKind {
         /// Never credential material; dispatch revalidates the approval.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         external_auth_binding: Option<String>,
+        /// Exact selected provider account reference, never credentials or routing settings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_reference: Option<String>,
     },
     SystemMessage {
         text: String,

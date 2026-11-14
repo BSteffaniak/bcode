@@ -64,9 +64,17 @@ pub async fn discover(updates: Sender<SourceUpdate>) {
     if !report_native(&context, &instances, &updates).await {
         return;
     }
-    let Some(provider_models) = report_providers(&context, &updates).await else {
+    let (providers, accounts) = tokio::join!(
+        report_providers(&context, &updates),
+        report_accounts(&context, &updates),
+    );
+    let Some(mut provider_models) = providers else {
         return;
     };
+    let Some(account_models) = accounts else {
+        return;
+    };
+    provider_models.extend(account_models);
     let connections = bounded(context.client.external_auth_status())
         .await
         .unwrap_or_default();
@@ -219,6 +227,39 @@ async fn report_providers(
         }
     }
     Some(provider_models)
+}
+
+/// Enrolled accounts are discovered independently of default provider routes.
+async fn report_accounts(
+    context: &Context,
+    updates: &Sender<SourceUpdate>,
+) -> Option<Vec<ExecutionModel>> {
+    let mut models = Vec::new();
+    if let Some(accounts) = bounded(context.client.provider_account_models()).await {
+        for account in accounts {
+            let update = account_update(account);
+            models.extend(update.entries.iter().map(|entry| entry.model.clone()));
+            if !send(updates, update.source, update.entries).await {
+                return None;
+            }
+        }
+    } else {
+        let source = Source {
+            key: SourceKey::Account {
+                plugin_id: String::new(),
+                account_reference: String::new(),
+            },
+            title: "Connected accounts".to_owned(),
+            detail: String::new(),
+            state: SourceState::Failed(
+                "Could not list connected accounts; try reopening /model".to_owned(),
+            ),
+        };
+        if !send(updates, source, Vec::new()).await {
+            return None;
+        }
+    }
+    Some(models)
 }
 
 /// Credentials that could be connected and native tools that need setup.
@@ -466,6 +507,40 @@ fn connection_update(
                     target: target.clone(),
                 },
                 readiness.clone(),
+            )
+        })
+        .collect();
+    SourceUpdate { source, entries }
+}
+
+/// Project one enrolled account's application-owned listing into a distinct source.
+#[must_use]
+pub fn account_update(account: bcode_model::ProviderAccountModels) -> SourceUpdate {
+    let key = SourceKey::Account {
+        plugin_id: account.provider_plugin_id.clone(),
+        account_reference: account.account_reference.clone(),
+    };
+    let source = Source {
+        key: key.clone(),
+        title: account.display_name,
+        detail: "Connected account".to_owned(),
+        state: SourceState::Ready,
+    };
+    let entries = account
+        .models
+        .models
+        .into_iter()
+        .map(|model| {
+            let mut model = provider_model(&account.provider_plugin_id, model);
+            model.account_reference = Some(account.account_reference.clone());
+            let readiness = Readiness::from_execution(model.readiness, false);
+            Entry::new(
+                key.clone(),
+                model,
+                Access::Account {
+                    account_reference: account.account_reference.clone(),
+                },
+                readiness,
             )
         })
         .collect();

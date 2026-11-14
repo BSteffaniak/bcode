@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod tests;
 
+use crate::model_switcher::inventory::Access;
 use crate::{TerminalShell, TuiError};
 use bcode_harness_models::{HarnessInstance, HarnessOpenRequest};
 use bcode_model::execution::{ExecutionModelSelection, ExecutionRoute};
@@ -114,6 +115,38 @@ pub async fn run_native_setup_in_shell(
     crate::native_setup::run(shell, no_discovery).await
 }
 
+async fn select_provider_choice(
+    client: &bcode_client::BcodeClient,
+    session_id: SessionId,
+    provider: &str,
+    model: &str,
+    access: &Access,
+) -> Result<(), bcode_client::ClientError> {
+    if let Access::Account { account_reference } = access {
+        client
+            .set_session_model_with_account(
+                session_id,
+                Some(provider.to_owned()),
+                model.to_owned(),
+                account_reference.clone(),
+            )
+            .await
+    } else {
+        let connection = match access {
+            Access::Connection { binding_id, .. } => Some(binding_id.clone()),
+            _ => None,
+        };
+        client
+            .set_session_model_with_connection(
+                session_id,
+                Some(provider.to_owned()),
+                model.to_owned(),
+                connection,
+            )
+            .await
+    }
+}
+
 impl TerminalShell {
     pub(crate) async fn run_execution_selection(
         &mut self,
@@ -202,20 +235,14 @@ impl TerminalShell {
                             .id
                     }
                 };
-                let connection = match &choice.entry.access {
-                    crate::model_switcher::inventory::Access::Connection { binding_id, .. } => {
-                        Some(binding_id.clone())
-                    }
-                    _ => None,
-                };
-                client
-                    .set_session_model_with_connection(
-                        session_id,
-                        Some(provider_plugin_id.clone()),
-                        selection.model_id,
-                        connection,
-                    )
-                    .await?;
+                select_provider_choice(
+                    &client,
+                    session_id,
+                    provider_plugin_id,
+                    &selection.model_id,
+                    &choice.entry.access,
+                )
+                .await?;
                 if choice.effort.is_some() {
                     client
                         .set_session_reasoning(session_id, choice.effort.clone(), None)

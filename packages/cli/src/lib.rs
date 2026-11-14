@@ -23178,6 +23178,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             model,
             selection_source,
             external_auth_binding,
+            account_reference,
         } => {
             println!(
                 "#{} model changed: {provider}/{model} (source={}{})",
@@ -23188,6 +23189,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                     .map(|binding| format!(", connection={}", &binding[..binding.len().min(12)]))
                     .unwrap_or_default()
             );
+            if let Some(account) = account_reference {
+                println!("  account: {account}");
+            }
         }
         SessionEventKind::ReasoningChanged {
             effort,

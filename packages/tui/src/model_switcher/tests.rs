@@ -163,6 +163,7 @@ fn switcher(current: Option<&str>, choices: ModelChoices) -> ModelSwitcher {
         CurrentChoice {
             route: current.map(|_| native_route()),
             model_id: current.map(ToOwned::to_owned),
+            account_reference: None,
         },
         choices,
         keymap(),
@@ -437,4 +438,59 @@ fn compare_lists_each_model_once_and_sorts_by_clicked_heading() {
     let (rows, _) = paint(&mut switcher, 140, 40);
     let first = row_of(&rows, "GPT-5.5");
     assert!(first < row_of(&rows, "Opus 5.5"), "{rows:#?}");
+}
+
+#[test]
+fn accounts_sharing_an_adapter_keep_distinct_sources_and_recent_keys() {
+    let listing = |account: &str| {
+        super::discovery::account_update(bcode_model::ProviderAccountModels {
+            account_reference: account.into(),
+            provider_plugin_id: "bcode.openai-compatible".into(),
+            display_name: format!("Provider {account}"),
+            models: bcode_model::ModelList {
+                models: vec![model("same-model", "Same model", provider_route(), false).model],
+                catalog: bcode_model::ModelCatalogHints::default(),
+            },
+        })
+    };
+    let first = listing("first");
+    let second = listing("second");
+    assert_ne!(first.source.key, second.source.key);
+    assert_ne!(first.entries[0].key, second.entries[0].key);
+    assert_eq!(
+        first.entries[0].model.account_reference.as_deref(),
+        Some("first")
+    );
+    assert!(
+        matches!(&second.entries[0].access, Access::Account { account_reference } if account_reference == "second")
+    );
+    assert_eq!(
+        first.entries[0].model.readiness,
+        ExecutionModelReadiness::Unknown
+    );
+    let mut inventory = super::inventory::Inventory::default();
+    let selected_key = second.entries[0].key.clone();
+    inventory.apply(first);
+    inventory.apply(second);
+    let current = CurrentChoice {
+        route: Some(ExecutionRoute::ModelProvider {
+            provider_plugin_id: "bcode.openai-compatible".into(),
+        }),
+        model_id: Some("same-model".into()),
+        account_reference: Some("second".into()),
+    };
+    let rows = inventory.rows("", &current, &std::collections::BTreeSet::new(), &[]);
+    let marked: Vec<_> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Choice {
+                entry,
+                current: true,
+                ..
+            } => Some(inventory.entries()[*entry].key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_ne!(marked, Vec::<String>::new());
+    assert!(marked.iter().all(|key| key == &selected_key));
 }

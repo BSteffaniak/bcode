@@ -391,13 +391,15 @@ fn detail_items(switcher: &ModelSwitcher, entry: &Entry) -> Vec<DetailItem> {
             items.push(DetailItem::new("Tool", tool.clone()));
             return items;
         }
-        Access::Direct | Access::Connection { .. } => {}
+        Access::Direct | Access::Account { .. } | Access::Connection { .. } => {}
     }
     if let Some(source) = source {
         let runs = match &entry.source {
             SourceKey::Native { .. } => format!("{} (runs the tool)", source.title),
             SourceKey::Connection { .. } => format!("{} {}", source.title, source.detail),
-            SourceKey::Provider { .. } | SourceKey::Connect => source.title.clone(),
+            SourceKey::Provider { .. } | SourceKey::Account { .. } | SourceKey::Connect => {
+                source.title.clone()
+            }
         };
         items.push(DetailItem::new("Runs in", runs));
     }

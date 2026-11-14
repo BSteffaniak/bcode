@@ -1759,6 +1759,24 @@ impl bcode_session_models::SessionApplication for BcodeClient {
             .await
             .map_err(session_application_failure)
     }
+    async fn set_session_model_with_account(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        account_reference: String,
+    ) -> Result<(), bcode_session_models::SessionApplicationFailure> {
+        Self::set_session_model_with_account(
+            self,
+            session_id,
+            provider_plugin_id,
+            model_id,
+            account_reference,
+        )
+        .await
+        .map_err(session_application_failure)
+    }
+
     async fn set_session_model(
         &self,
         session_id: SessionId,
@@ -6103,6 +6121,57 @@ impl BcodeClient {
                 provider_plugin_id,
                 model_id,
                 external_auth_binding,
+            })
+            .await?
+        {
+            ResponsePayload::SessionModelSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+}
+
+impl bcode_model::ProviderAccountModelsApplication for BcodeClient {
+    async fn provider_account_models(
+        &self,
+    ) -> Result<Vec<bcode_model::ProviderAccountModels>, String> {
+        Self::provider_account_models(self)
+            .await
+            .map_err(|_| "account model discovery failed".to_owned())
+    }
+}
+
+impl BcodeClient {
+    /// Discover account-scoped models using this caller's configuration.
+    ///
+    /// # Errors
+    /// Returns an error on transport failure or unavailable caller configuration.
+    pub async fn provider_account_models(
+        &self,
+    ) -> Result<Vec<bcode_model::ProviderAccountModels>, ClientError> {
+        match self.send_request(Request::ProviderAccountModels).await? {
+            ResponsePayload::ProviderAccountModels { accounts } => Ok(accounts),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Persist a model and exact account reference, without changing defaults.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable, incompatible or out-of-scope accounts/models,
+    /// session admission failures, or transport failure.
+    pub async fn set_session_model_with_account(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        account_reference: String,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::SetSessionModelWithAccount {
+                session_id,
+                provider_plugin_id,
+                model_id,
+                account_reference,
             })
             .await?
         {

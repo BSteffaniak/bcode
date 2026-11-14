@@ -4734,6 +4734,7 @@ fn apply_root_slash_command_outcome(
             provider_plugin_id,
             model_id,
             external_auth_binding: None,
+            account_reference: None,
         }),
         SlashCommandOutcome::SetSessionReasoning {
             session_id,

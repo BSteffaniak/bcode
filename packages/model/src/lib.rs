@@ -1035,6 +1035,30 @@ pub enum ProviderCapability {
     CodeSearch,
 }
 
+/// Secret-free models available through one exact provider account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAccountModels {
+    /// Opaque account reference; never a credential.
+    pub account_reference: String,
+    /// Owning model-provider plugin.
+    pub provider_plugin_id: String,
+    /// Authentication provider label and account label.
+    pub display_name: String,
+    /// Centrally resolved model catalog for this account.
+    pub models: ModelList,
+}
+
+/// Application boundary for secret-free, caller-scoped account model discovery.
+pub trait ProviderAccountModelsApplication: Sync {
+    /// Discover bounded offline catalogs for locally present accounts.
+    ///
+    /// # Errors
+    /// Returns a normalized message when caller configuration or account metadata is unavailable.
+    fn provider_account_models(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ProviderAccountModels>, String>> + Send;
+}
+
 /// Model listing request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelListRequest {
@@ -2723,6 +2747,9 @@ pub trait ProviderRequestExtension: Serialize + DeserializeOwned {
 /// Provider-neutral request context resolved by the host from model/provider profiles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequestContext {
+    /// Explicit session account; host revalidates and materializes it at dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_reference: Option<String>,
     #[serde(default)]
     pub model_profile: Option<String>,
     #[serde(default)]

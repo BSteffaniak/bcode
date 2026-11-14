@@ -76,6 +76,16 @@ impl<'a> SessionApplicationHandle<'a> {
     }
 }
 
+impl bcode_model::ProviderAccountModelsApplication for SessionApplicationHandle<'_> {
+    async fn provider_account_models(
+        &self,
+    ) -> Result<Vec<bcode_model::ProviderAccountModels>, String> {
+        self.require_running()
+            .map_err(|_| "session application is unavailable".to_owned())?;
+        crate::provider_accounts::discover(self.state, self.client_id).await
+    }
+}
+
 impl bcode_session_models::SessionObservationApplication for SessionApplicationHandle<'_> {
     type Observation = super::SessionObservation;
 
@@ -1271,6 +1281,29 @@ impl SessionApplication for SessionApplicationHandle<'_> {
                 "turn dispatch failed; admission may already be durable; inspect the exact turn before retrying",
             ),
         })
+    }
+
+    async fn set_session_model_with_account(
+        &self,
+        session_id: SessionId,
+        provider_plugin_id: Option<String>,
+        model_id: String,
+        account_reference: String,
+    ) -> Result<(), SessionApplicationFailure> {
+        self.selected_location(session_id).await?;
+        let config = crate::provider_accounts::caller_config(self.state, self.client_id)
+            .await
+            .map_err(|message| failure("provider_account_unavailable", &message))?;
+        crate::provider_accounts::set(
+            self.state,
+            session_id,
+            &config,
+            provider_plugin_id,
+            model_id,
+            account_reference,
+        )
+        .await
+        .map_err(|message| failure("provider_account_unavailable", &message))
     }
 
     async fn set_session_model(
