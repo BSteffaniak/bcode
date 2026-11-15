@@ -625,6 +625,10 @@ pub struct ReviewDocument {
     pub(super) compare_files_shown: BTreeSet<String>,
     /// Removed-since markers whose text shows, by file and new-side line.
     pub(super) expanded_removals: BTreeSet<(FileKey, u32)>,
+    /// Hunks with nothing new since a comparison's baseline fold to their header.
+    pub(super) fold_seen_hunks: bool,
+    /// Folded hunks shown anyway, by file and new-side start.
+    pub(super) revealed_hunks: BTreeSet<(FileKey, u32)>,
     /// Sources left out of the document (pull requests without real changes, when only those
     /// are shown).
     pub(super) filtered: BTreeSet<String>,
@@ -691,6 +695,8 @@ impl ReviewDocument {
             comparison_summaries: BTreeMap::new(),
             compare_files_shown: BTreeSet::new(),
             expanded_removals: BTreeSet::new(),
+            fold_seen_hunks: false,
+            revealed_hunks: BTreeSet::new(),
             filtered: BTreeSet::new(),
         };
         for input in sources {

@@ -320,8 +320,25 @@ pub struct HunkHeaderItem {
     pub heading: Option<Arc<str>>,
     /// Stack layers that wrote or removed lines of this hunk.
     pub layers: Vec<LayerNumber>,
+    /// Lines of the hunk new (or removed) since the comparison's baseline, once its file is
+    /// marked; `None` while it is not.
+    pub since_lines: Option<u32>,
+    /// Whether the hunk, with nothing new since the baseline, is folded to this header.
+    pub folded: bool,
+}
+
+impl HunkHeaderItem {
     /// Whether the hunk has lines new since the comparison's baseline.
-    pub since: bool,
+    #[must_use]
+    pub fn since(&self) -> bool {
+        self.since_lines.is_some_and(|lines| lines > 0)
+    }
+
+    /// Whether the hunk's file is marked and nothing in the hunk is new since the baseline.
+    #[must_use]
+    pub fn seen(&self) -> bool {
+        self.since_lines == Some(0)
+    }
 }
 
 /// One unified line.
@@ -341,6 +358,10 @@ pub struct LineItem {
     pub layer: Option<LayerNumber>,
     /// Whether the line is new (or newly removed) since the comparison's baseline.
     pub since: bool,
+    /// The line it replaced in the baseline, when it is new since then and replaced one.
+    pub was: Option<Arc<str>>,
+    /// Whether the line is in a hunk with nothing new since the comparison's baseline.
+    pub seen: bool,
 }
 
 impl LineItem {
@@ -368,6 +389,8 @@ pub struct PairSide {
     pub layer: Option<LayerNumber>,
     /// Whether the line is new (or newly removed) since the comparison's baseline.
     pub since: bool,
+    /// The line it replaced in the baseline, when it is new since then and replaced one.
+    pub was: Option<Arc<str>>,
 }
 
 /// One side-by-side row.
@@ -382,6 +405,8 @@ pub struct LinePairItem {
     /// Intra-line pairing hint: a removed line paired with an added line, whose changed spans
     /// can be emphasized.
     pub emphasize: bool,
+    /// Whether the row is in a hunk with nothing new since the comparison's baseline.
+    pub seen: bool,
 }
 
 /// State of a gap.

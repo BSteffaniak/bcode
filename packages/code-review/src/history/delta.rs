@@ -24,6 +24,10 @@ use std::path::Path;
 /// Most diff lines one file's marks read; past it the file is reported too large to mark.
 pub const MAX_MARK_LINES: usize = crate::data::MAX_ATTRIBUTION_LINES;
 
+/// Longest baseline line (in bytes) kept to mark the words of the line that replaced it: longer
+/// lines are marked whole.
+pub const MAX_WAS_BYTES: usize = 4_096;
+
 /// The fixed identity and date of replay commits.
 const REPLAY_ENV: [(&str, &str); 6] = [
     ("GIT_AUTHOR_NAME", "bcode-review"),
@@ -500,8 +504,9 @@ pub fn marks(
     if let Some(old) = &request.old_path {
         git::validate_relative_path(old)?;
     }
+    // The leading tag names the shape of the cached answer.
     let key = format!(
-        "{} {} {} {}\u{1}{}",
+        "was {} {} {} {}\u{1}{}",
         request.fork_oid,
         request.replay_oid,
         request.head_oid,
@@ -562,6 +567,13 @@ fn marks_from(since: &[ZeroHunk], before: &[ZeroHunk]) -> ReviewCompareMarksResp
             push_line(&mut answer.new_lines, line);
         }
         let at = hunk.new_before() + 1;
+        // Lines that replaced lines of the baseline pair with them in order, as a line diff
+        // pairs a removed run with the added run after it.
+        for (offset, text) in (0..hunk.new_count).zip(&hunk.removed) {
+            if text.len() <= MAX_WAS_BYTES {
+                answer.was.push((hunk.new_start + offset, text.clone()));
+            }
+        }
         let mut gone: Vec<String> = Vec::new();
         for (offset, text) in (0..hunk.old_count).zip(&hunk.removed) {
             let replay_line = hunk.old_before() + 1 + offset;
@@ -665,6 +677,24 @@ mod tests {
                 lines: vec!["mine".into()],
             }]
         );
+    }
+
+    #[test]
+    fn lines_that_replaced_baseline_lines_carry_the_baseline_text_in_order() {
+        // Two replay lines replaced by three: the first two pair, the third is only new; a
+        // pure insertion pairs with nothing; an overlong baseline line is not kept.
+        let long = "x".repeat(MAX_WAS_BYTES + 1);
+        let since = [
+            hunk((3, 2), (3, 3), &["let a = 1;", "let b = 2;"]),
+            hunk((9, 0), (10, 1), &[]),
+            hunk((12, 1), (13, 1), &[long.as_str()]),
+        ];
+        let marks = marks_from(&since, &[]);
+        assert_eq!(
+            marks.was,
+            [(3, "let a = 1;".to_owned()), (4, "let b = 2;".to_owned())]
+        );
+        assert_eq!(marks.new_lines, [(3, 5), (10, 10), (13, 13)]);
     }
 
     #[test]

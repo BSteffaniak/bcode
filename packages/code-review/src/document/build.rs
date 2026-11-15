@@ -374,6 +374,7 @@ impl ReviewDocument {
                     slots,
                     marks,
                     removals: marks.map_or(&[][..], |marks| &marks.removed_since),
+                    hunk_seen: false,
                 };
                 builder.content(&regions);
                 let (mut items, mut parents) = (builder.items, builder.parents);
@@ -687,6 +688,8 @@ struct FileBuilder<'a> {
     marks: Option<&'a Marks>,
     /// Removed-since markers not placed yet, by position.
     removals: &'a [RemovedSince],
+    /// The hunk being built has nothing new since the baseline (its file is marked).
+    hunk_seen: bool,
 }
 
 impl FileBuilder<'_> {
@@ -699,6 +702,41 @@ impl FileBuilder<'_> {
             },
             _ => false,
         }
+    }
+
+    /// The baseline line new-side line `line` replaced, when it is new since and replaced one.
+    fn was(&self, line: Option<u32>) -> Option<Arc<str>> {
+        self.marks?.was(line?).cloned()
+    }
+
+    /// Lines of `hunk` new (or removed) since the baseline, when the file is marked.
+    fn since_lines(&self, hunk: &DocHunk) -> Option<u32> {
+        let marks = self.marks?;
+        let marked = hunk
+            .lines
+            .iter()
+            .filter(|line| match line.kind {
+                ReviewLineKind::Removed => self.since(ReviewLineSide::Old, line.old),
+                _ => self.since(ReviewLineSide::New, line.new),
+            })
+            .count();
+        let range = hunk.range;
+        let removed = marks.removed_within(
+            range.new_start,
+            range.new_start.saturating_add(range.new_count),
+        );
+        u32::try_from(marked + removed).ok()
+    }
+
+    /// Whether an annotation (or the composer) is anchored on a line of `hunk`.
+    fn anchors_in(&self, hunk: &DocHunk) -> bool {
+        hunk.lines.iter().any(|line| {
+            line.old
+                .is_some_and(|old| self.slots.lines.contains_key(&(ReviewLineSide::Old, old)))
+                || line
+                    .new
+                    .is_some_and(|new| self.slots.lines.contains_key(&(ReviewLineSide::New, new)))
+        })
     }
 
     /// Place the removed-since markers that stand before new-side line `before` (every one
@@ -820,6 +858,14 @@ impl FileBuilder<'_> {
             }
             _ => Vec::new(),
         };
+        let since_lines = self.since_lines(hunk);
+        self.hunk_seen = since_lines == Some(0);
+        // A hunk seen before folds to its header, unless something is anchored in it or it
+        // was shown again.
+        let folded = self.hunk_seen
+            && self.doc.fold_seen_hunks
+            && !self.doc.hunk_revealed(&self.key, hunk.range.new_start)
+            && !self.anchors_in(hunk);
         self.push(
             ReviewItem::HunkHeader(HunkHeaderItem {
                 file: self.key.clone(),
@@ -829,13 +875,15 @@ impl FileBuilder<'_> {
                 new_count: hunk.range.new_count,
                 heading: hunk.heading.clone(),
                 layers,
-                since: hunk.lines.iter().any(|line| match line.kind {
-                    ReviewLineKind::Removed => self.since(ReviewLineSide::Old, line.old),
-                    _ => self.since(ReviewLineSide::New, line.new),
-                }),
+                since_lines,
+                folded,
             }),
             header,
         );
+        if folded {
+            self.hunk_seen = false;
+            return;
+        }
         match self.doc.layout {
             LayoutMode::Unified => {
                 for line in &hunk.lines {
@@ -844,6 +892,7 @@ impl FileBuilder<'_> {
             }
             LayoutMode::SideBySide => self.paired_lines(&hunk.lines, header),
         }
+        self.hunk_seen = false;
     }
 
     fn unified_line(&mut self, line: &DocLine, parent: Option<u32>) {
@@ -878,6 +927,12 @@ impl FileBuilder<'_> {
                 content: LineContent::Text(line.text.clone()),
                 layer,
                 since,
+                was: if since && side == ReviewLineSide::New {
+                    self.was(line.new)
+                } else {
+                    None
+                },
+                seen: self.hunk_seen,
             }),
             parent,
         );
@@ -903,6 +958,11 @@ impl FileBuilder<'_> {
             content: LineContent::Text(line.text.clone()),
             layer: self.layer(side, Some(number), kind),
             since,
+            was: if since && side == ReviewLineSide::New {
+                self.was(Some(number))
+            } else {
+                None
+            },
         })
     }
 
@@ -926,6 +986,7 @@ impl FileBuilder<'_> {
                 old,
                 new,
                 emphasize,
+                seen: self.hunk_seen,
             }),
             parent,
         );
@@ -1075,6 +1136,7 @@ impl FileBuilder<'_> {
             self.removals_before(new, None);
         }
         let since = self.since(ReviewLineSide::New, new);
+        let was = if since { self.was(new) } else { None };
         match self.doc.layout {
             LayoutMode::Unified => {
                 self.push(
@@ -1086,26 +1148,30 @@ impl FileBuilder<'_> {
                         content,
                         layer: None,
                         since,
+                        was,
+                        seen: false,
                     }),
                     None,
                 );
             }
             LayoutMode::SideBySide => {
-                let make = |line: Option<u32>, since: bool| {
+                let make = |line: Option<u32>, since: bool, was: Option<Arc<str>>| {
                     line.map(|line| PairSide {
                         line,
                         kind: LineKind::Expanded,
                         content: content.clone(),
                         layer: None,
                         since,
+                        was,
                     })
                 };
                 self.push(
                     ReviewItem::LinePair(LinePairItem {
                         file: self.key.clone(),
-                        old: make(old, false),
-                        new: make(new, since),
+                        old: make(old, false, None),
+                        new: make(new, since, was),
                         emphasize: false,
+                        seen: false,
                     }),
                     None,
                 );

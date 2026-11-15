@@ -712,3 +712,130 @@ fn version_numbers_stay_truthful_when_a_version_between_others_is_unavailable() 
     doc.set_comparison(SOURCE, None);
     assert_eq!(doc.comparison_summary(SOURCE), None);
 }
+
+/// A layer pushed twice whose `e.txt` changes in two places: the second push rewrites only the
+/// later change.
+fn two_hunk_layer() -> Layer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = Repo {
+        root: dir.path().to_path_buf(),
+        _dir: dir,
+    };
+    repo.git(&["init", "-q", "-b", "main"]);
+    let e = numbered("e", 40);
+    let fork = repo.commit(&[("e.txt", &e)], "fork");
+    let first_text = e
+        .replace("e5\n", "E5\n")
+        .replace("e30\n", "let total = a + b;\n");
+    let first = repo.commit(&[("e.txt", &first_text)], "first");
+    let second_text = e
+        .replace("e5\n", "E5\n")
+        .replace("e30\n", "let total = a + b + c;\n");
+    repo.git(&["reset", "-q", "--hard", &fork]);
+    let second = repo.commit(&[("e.txt", &second_text)], "second");
+    Layer {
+        repo,
+        fork,
+        first,
+        second,
+    }
+}
+
+fn hunk_headers(doc: &ReviewDocument) -> Vec<(u32, Option<u32>, bool)> {
+    items(doc)
+        .iter()
+        .filter_map(|item| match item {
+            ReviewItem::HunkHeader(hunk) => Some((hunk.new_start, hunk.since_lines, hunk.folded)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn hunks_seen_before_count_nothing_new_and_fold_until_shown_again() {
+    let layer = two_hunk_layer();
+    let service = ReviewData::default();
+    let mut doc = open(&service, &layer);
+    serve(&service, &mut doc);
+    // Before a comparison nothing is counted.
+    assert!(
+        hunk_headers(&doc)
+            .iter()
+            .all(|(_, since, folded)| since.is_none() && !folded)
+    );
+    let delta = delta(&service, &layer);
+    doc.set_comparison(
+        SOURCE,
+        Some(GroupComparison {
+            delta: Some(delta),
+            view: CompareView::Full,
+            ..GroupComparison::default()
+        }),
+    );
+    serve(&service, &mut doc);
+    let headers = hunk_headers(&doc);
+    assert_eq!(headers.len(), 2, "{headers:?}");
+    let (seen_start, seen_lines, _) = headers[0];
+    assert_eq!(seen_lines, Some(0), "the first change is as it was");
+    assert_eq!(
+        headers[1].1,
+        Some(2),
+        "the rewritten line, added and removed"
+    );
+    // Lines of the hunk seen before say so; the rewritten line knows what it replaced.
+    for item in items(&doc) {
+        if let ReviewItem::Line(line) = item {
+            let in_seen = line.new_line.or(line.old_line).is_some_and(|at| at < 20);
+            assert_eq!(line.seen, in_seen, "{line:?}");
+            if line.since && line.new_line == Some(30) {
+                assert_eq!(line.was.as_deref(), Some("let total = a + b;"));
+            } else {
+                assert_eq!(line.was, None, "{line:?}");
+            }
+        }
+    }
+    // Folding leaves the seen hunk's header only.
+    assert!(doc.set_fold_seen_hunks(true));
+    assert!(!doc.set_fold_seen_hunks(true));
+    assert!(hunk_headers(&doc)[0].2);
+    assert!(!hunk_headers(&doc)[1].2);
+    let early = |doc: &ReviewDocument| {
+        new_lines(doc, "e.txt")
+            .iter()
+            .filter(|(line, _, _)| *line < 20)
+            .count()
+    };
+    assert_eq!(early(&doc), 0);
+    assert!(
+        new_lines(&doc, "e.txt")
+            .iter()
+            .any(|(line, _, _)| *line == 30)
+    );
+    // One folded hunk can be shown again, and folded again.
+    assert!(doc.toggle_seen_hunk(&file("e.txt"), seen_start));
+    assert!(early(&doc) > 0);
+    assert!(!hunk_headers(&doc)[0].2);
+    assert!(doc.toggle_seen_hunk(&file("e.txt"), seen_start));
+    assert_eq!(early(&doc), 0);
+    assert!(!doc.toggle_seen_hunk(&file("e.txt"), 999));
+    // A thread on a line of the seen hunk keeps it open.
+    assert!(doc.set_fold_seen_hunks(false));
+    let key = ItemKey::Line {
+        file: doc.file_keys().next().expect("a file").clone(),
+        side: ReviewLineSide::New,
+        line: 5,
+    };
+    let anchor = doc.anchor_for(&key).expect("anchor");
+    doc.set_annotations(&Annotations {
+        drafts: vec![draft("t1", &anchor)],
+        ..Annotations::default()
+    });
+    doc.set_fold_seen_hunks(true);
+    assert!(!hunk_headers(&doc)[0].2, "an anchored hunk stays open");
+    assert!(
+        doc.index_of(&ItemKey::Thread {
+            thread_id: "t1".into()
+        })
+        .is_some()
+    );
+}

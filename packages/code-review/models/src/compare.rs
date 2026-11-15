@@ -398,6 +398,10 @@ pub struct ReviewCompareMarksResponse {
     pub newly_removed: Vec<LineSpan>,
     /// Lines of the baseline's own change removed since, by position.
     pub removed_since: Vec<RemovedSince>,
+    /// New-side lines new since the baseline that replaced a line there, with that line's text
+    /// in the baseline, sorted by line: the words that changed can be marked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub was: Vec<(u32, String)>,
     /// The file was too large to mark; nothing is marked.
     #[serde(default)]
     pub too_large: bool,

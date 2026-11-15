@@ -89,6 +89,8 @@ pub(super) struct Marks {
     pub new_lines: Vec<LineSpan>,
     pub newly_removed: Vec<LineSpan>,
     pub removed_since: Vec<RemovedSince>,
+    /// Baseline text of new lines that replaced a line there, sorted by new-side line.
+    pub was: Vec<(u32, Arc<str>)>,
 }
 
 fn in_spans(spans: &[LineSpan], line: u32) -> bool {
@@ -105,6 +107,24 @@ impl Marks {
     /// Whether old-side line `line` is removed since the baseline.
     pub fn removed(&self, line: u32) -> bool {
         in_spans(&self.newly_removed, line)
+    }
+
+    /// The baseline line new-side line `line` replaced, when it replaced one.
+    pub fn was(&self, line: u32) -> Option<&Arc<str>> {
+        self.was
+            .binary_search_by_key(&line, |(at, _)| *at)
+            .ok()
+            .map(|index| &self.was[index].1)
+    }
+
+    /// Lines removed since the baseline whose markers stand within new-side lines
+    /// `start..=end`.
+    pub fn removed_within(&self, start: u32, end: u32) -> usize {
+        self.removed_since
+            .iter()
+            .filter(|removal| (start..=end).contains(&removal.before_new_line))
+            .map(|removal| removal.lines.len())
+            .sum()
     }
 }
 
@@ -296,6 +316,57 @@ impl ReviewDocument {
         true
     }
 
+    /// Fold hunks with nothing new since their source's baseline to their header (or show them
+    /// again). Returns whether anything changed.
+    pub fn set_fold_seen_hunks(&mut self, fold: bool) -> bool {
+        if self.fold_seen_hunks == fold {
+            return false;
+        }
+        self.fold_seen_hunks = fold;
+        let marked: Vec<usize> = (0..self.files.len())
+            .filter(|file| self.file_marks(*file).is_some())
+            .collect();
+        for file in marked {
+            self.rebuild_file(file);
+        }
+        true
+    }
+
+    /// Whether hunks with nothing new since the baseline fold.
+    #[must_use]
+    pub const fn fold_seen_hunks(&self) -> bool {
+        self.fold_seen_hunks
+    }
+
+    /// Show the folded hunk of `file` starting at new-side line `new_start` (or fold it again).
+    /// Returns whether the file has such a hunk.
+    pub fn toggle_seen_hunk(&mut self, file: &FileKey, new_start: u32) -> bool {
+        let Some(&index) = self.file_index.get(file) else {
+            return false;
+        };
+        let has = self.files[index].loaded().is_some_and(|loaded| {
+            loaded
+                .hunks
+                .iter()
+                .any(|hunk| hunk.range.new_start == new_start)
+        });
+        if !has {
+            return false;
+        }
+        let key = (file.clone(), new_start);
+        if !self.revealed_hunks.remove(&key) {
+            self.revealed_hunks.insert(key);
+        }
+        self.rebuild_file(index);
+        true
+    }
+
+    /// Whether the hunk of `file` starting at new-side line `new_start` is shown although it
+    /// would fold.
+    pub(super) fn hunk_revealed(&self, file: &FileKey, new_start: u32) -> bool {
+        self.revealed_hunks.contains(&(file.clone(), new_start))
+    }
+
     /// Accept a file's marks. Returns whether the result was applied.
     pub fn accept_marks(&mut self, ticket: Ticket, response: ReviewCompareMarksResponse) -> bool {
         let Some(Pending::Marks(file)) = self.pending.get(&ticket).copied() else {
@@ -309,6 +380,11 @@ impl ReviewDocument {
                 new_lines: response.new_lines,
                 newly_removed: response.newly_removed,
                 removed_since: response.removed_since,
+                was: response
+                    .was
+                    .into_iter()
+                    .map(|(line, text)| (line, Arc::from(text)))
+                    .collect(),
             }
         };
         self.files[file].marks = MarksState::Loaded(Arc::new(marks));
