@@ -24,8 +24,11 @@
 //!   the panel created the session.
 
 use super::button::Badge;
+use super::chips::{Chip, ChipId, ChipPlan, ChipRow};
 use super::history::Tag;
+use super::models::{ModelState, Target};
 use super::picker::{Picker, RowState};
+use super::profile::Category;
 use super::{ASSISTANT_SCOPE, HISTORY_SCOPE, Place, PlaceKey, Screen};
 use crate::agent::{AgentPhase, AgentStreams, FeedKeys};
 use crate::context::UiContext;
@@ -89,6 +92,12 @@ pub const TITLE_ONLY_WIDTH: u16 = 12;
 const INPUT_MAX_ROWS: u16 = 6;
 /// Rows a wheel step scrolls the conversation.
 const WHEEL_ROWS: usize = 3;
+/// Cells the title keeps when it is cut to leave room for the usage.
+const MIN_TITLE_CELLS: u16 = 12;
+/// Cells of a history row's `✕` (a space and the glyph).
+const DELETE_CELLS: usize = 2;
+/// Two presses on the title row within this time zoom the panel.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 /// Bytes of a message the panel sends at most.
 const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 /// Characters of a new conversation's title.
@@ -107,6 +116,15 @@ enum Shown {
     Closed,
     Open,
     Focused,
+}
+
+/// Whether the focused panel was zoomed over the whole area by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zoom {
+    /// Placed by the area's size.
+    Docked,
+    /// Over the whole area.
+    Zoomed,
 }
 
 /// Where the panel is.
@@ -138,6 +156,8 @@ pub enum Outcome {
     Redraw,
     /// Open a session in Bcode.
     OpenSession(bcode_session_models::SessionId),
+    /// Draft a comment with this body at the review's cursor line.
+    DraftComment(String),
 }
 
 /// Background work of the panel that finished.
@@ -177,12 +197,45 @@ enum Done {
         error: Option<String>,
     },
     Stopped(Option<String>),
+    /// The models Bcode offers were listed.
+    Catalog(Result<crate::host::ModelCatalog, String>),
+    /// The app default was read.
+    Default(Result<bcode_code_review_models::ReviewAssistantSettings, String>),
+    /// A session's model was read.
+    SessionModel {
+        session: String,
+        result: Result<crate::host::SessionModel, String>,
+    },
+    /// A model or effort choice was applied: the notice to show, or why it failed.
+    Chosen {
+        session: Option<String>,
+        default: Option<bcode_code_review_models::ReviewAssistantSettings>,
+        result: Result<String, String>,
+    },
+    /// The app's sessions to delete, listed for the confirmation.
+    ListedAll(Result<Vec<String>, String>),
+    /// Every listed session was deleted, except those Bcode refused.
+    DeletedAll {
+        deleted: Vec<String>,
+        refused: Vec<(String, String)>,
+    },
+}
+
+/// What an open assistant overlay is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverlayPurpose {
+    /// Choosing the model of a target; the options by row id.
+    Models(Target, Vec<crate::host::ModelOption>),
+    /// Turning categories on or off.
+    Permissions,
+    /// The tools list.
+    Tools,
 }
 
 /// The conversation's rows at one width.
 #[derive(Debug)]
 struct Rows {
-    key: (u64, u64, u64, u16),
+    key: (u64, u64, u64, u16, &'static str),
     lines: Vec<Line>,
     actions: Vec<ActionCells<ItemAction>>,
 }
@@ -196,6 +249,8 @@ enum Mode {
     Rename(Box<RefCell<TextInputState>>),
     /// Asking before deleting the active conversation.
     ConfirmDelete,
+    /// Asking before deleting every conversation the review app started (these sessions).
+    ConfirmDeleteAll(Vec<String>),
 }
 
 /// What the last frame painted, for pointer input.
@@ -206,6 +261,12 @@ struct Painted {
     feed: Option<Rect>,
     history: Option<Rect>,
     actions: Vec<(String, Rect)>,
+    /// Each chip's cells.
+    chips: Vec<(ChipId, Rect)>,
+    /// The `✕` of a history row: its cells and session.
+    history_delete: Option<(Rect, String)>,
+    /// The title row.
+    title: Option<Rect>,
 }
 
 /// The app-wide assistant panel.
@@ -259,6 +320,28 @@ pub struct Assistant {
     action_keys: BTreeMap<String, String>,
     feed_wake: Option<Instant>,
     revision: u64,
+    /// The models Bcode offers, the app default and the sessions' models.
+    models: ModelState,
+    /// Categories turned off for the active conversation.
+    off: BTreeSet<Category>,
+    /// The open model, permissions or tools overlay.
+    overlay: Option<(OverlayPurpose, crate::palette::Overlay)>,
+    /// Why the last message was not sent or its conversation not started.
+    failure: Option<String>,
+    /// The chips row as last laid out.
+    chip_plan: RefCell<ChipPlan>,
+    /// The history row under the pointer.
+    hover: Option<usize>,
+    /// The `✕` painted on a history row: its row, column and session.
+    history_delete: Cell<Option<(usize, u16)>>,
+    /// The last press on the title row (for double-click zoom).
+    title_press: Option<Instant>,
+    /// Whether the focused panel covers the whole area.
+    zoom: Zoom,
+    /// Whether the active session's model was asked for.
+    model_asked: Option<String>,
+    /// The theme of the last frame (overlays are built with it).
+    theme: Cell<ReviewTheme>,
 }
 
 impl std::fmt::Debug for Assistant {
@@ -316,6 +399,20 @@ impl Assistant {
             action_keys: BTreeMap::new(),
             feed_wake: None,
             revision: 0,
+            models: ModelState::default(),
+            off: BTreeSet::new(),
+            overlay: None,
+            failure: None,
+            chip_plan: RefCell::default(),
+            hover: None,
+            history_delete: Cell::new(None),
+            title_press: None,
+            zoom: Zoom::Docked,
+            model_asked: None,
+            theme: Cell::new(ReviewTheme::derive(
+                None,
+                crate::theme::IconStyle::default(),
+            )),
         }
     }
 
@@ -375,6 +472,74 @@ impl Assistant {
     #[must_use]
     pub const fn input(&self) -> &RefCell<TextInputState> {
         &self.input
+    }
+
+    /// The models Bcode offers, the app default and the sessions' known models.
+    #[must_use]
+    pub const fn models(&self) -> &ModelState {
+        &self.models
+    }
+
+    /// Categories turned off for the active conversation.
+    #[must_use]
+    pub const fn categories_off(&self) -> &BTreeSet<Category> {
+        &self.off
+    }
+
+    /// Why the last message was not sent, shown in the conversation.
+    #[must_use]
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    /// Labels of the open overlay's rows, when one is open.
+    #[must_use]
+    pub fn overlay_labels(&self) -> Option<Vec<&str>> {
+        self.overlay
+            .as_ref()
+            .map(|(_, overlay)| overlay.shown_labels())
+    }
+
+    /// Whether the focused panel covers the whole area.
+    #[must_use]
+    pub const fn zoomed(&self) -> bool {
+        matches!(self.zoom, Zoom::Zoomed)
+    }
+
+    /// The model and effort label a question or card shows: `model · effort`, for `session`
+    /// (the app default without one).
+    #[must_use]
+    pub fn model_effort_label(&self, session: Option<&str>) -> String {
+        let model = self.models.model_label(session);
+        match self.models.effort_label(session) {
+            Some(effort) => format!("{model} · {effort}"),
+            None => model,
+        }
+    }
+
+    /// Ask for the models of `sessions` not known yet (Ask AI cards on screen).
+    pub fn learn_models(&mut self, sessions: &[String], ui: &UiContext) {
+        for session in sessions.iter().take(8) {
+            if self.models.session(session).is_none()
+                && self.model_asked.as_deref() != Some(session)
+            {
+                self.read_session_model(session.clone(), ui);
+            }
+        }
+    }
+
+    /// The tool allowlist of the next turn: the profile's tools without the categories turned
+    /// off; `None` while none is.
+    #[must_use]
+    pub fn tool_allowlist(&self) -> Option<Vec<String>> {
+        if self.off.is_empty() {
+            return None;
+        }
+        let mut config = (*self.services.assistant_config()).clone();
+        for category in &self.off {
+            config.categories.insert(*category, false);
+        }
+        Some(config.tools())
     }
 
     /// Whether the active session waits on an unanswered permission prompt.
@@ -444,6 +609,12 @@ impl Assistant {
                 panel: None,
             };
         }
+        if self.zoomed() && self.is_focused() {
+            return Split {
+                screen: None,
+                panel: Some((area, Dock::Zoomed)),
+            };
+        }
         if area.width >= RIGHT_DOCK_WIDTH {
             let default = area.width * 2 / 5;
             let width = self
@@ -496,6 +667,18 @@ impl Assistant {
             Shown::Closed | Shown::Open => Shown::Focused,
             Shown::Focused => Shown::Closed,
         };
+        self.touch();
+    }
+
+    /// Open the panel and give it keyboard focus.
+    pub const fn focus(&mut self) {
+        self.visibility = Shown::Focused;
+        self.touch();
+    }
+
+    /// Show `text` on the notice line (as an error when `error`).
+    pub fn set_notice(&mut self, text: String, error: bool) {
+        self.notice = Some((text, error));
         self.touch();
     }
 
@@ -575,6 +758,8 @@ impl Assistant {
         self.scroll.set(0);
         self.mode = Mode::Chat;
         self.notice = None;
+        self.failure = None;
+        self.off.clear();
         self.touch();
     }
 
@@ -687,10 +872,12 @@ impl Assistant {
             text,
             context: self.context_blocks(place),
             agent: Some(super::profile::PROFILE_ID.to_owned()),
+            tool_allowlist: self.tool_allowlist(),
         };
         *self.input.borrow_mut() = empty_input();
         self.scroll.set(0);
         self.notice = None;
+        self.failure = None;
         self.touch();
         let attachment = match self.session.clone() {
             // Rebinding first keeps the session's default review the one on screen.
@@ -791,6 +978,20 @@ impl Assistant {
                         session: session.clone(),
                     },
                 );
+                // The app default applies before the first message; a refused model leaves
+                // Bcode's default and says why.
+                if let Err(error) =
+                    super::models::apply_default(&services, repo.clone(), &session).await
+                {
+                    push(
+                        &inbox,
+                        Done::Chosen {
+                            session: Some(session.clone()),
+                            default: None,
+                            result: Err(error),
+                        },
+                    );
+                }
                 if let Some(mut binding) = template {
                     binding.session_id.clone_from(&session);
                     services
@@ -923,6 +1124,16 @@ impl Assistant {
     /// whether anything changed.
     pub fn poll(&mut self, ui: &UiContext) -> bool {
         self.serve_tools();
+        if self.is_open() {
+            self.load_models(false, ui);
+        }
+        if let Some(session) = self.session.clone()
+            && !self.starting
+            && self.models.session(&session).is_none()
+            && self.model_asked.as_deref() != Some(session.as_str())
+        {
+            self.read_session_model(session, ui);
+        }
         let done: Vec<Done> = self
             .inbox
             .lock()
@@ -979,6 +1190,7 @@ impl Assistant {
             } => {
                 if epoch == self.epoch {
                     self.starting = false;
+                    self.read_session_model(session.clone(), ui);
                     self.session = Some(session);
                     self.flush(ui);
                 } else {
@@ -999,7 +1211,7 @@ impl Assistant {
                     self.session = None;
                 }
                 drop(self.take_queued(epoch));
-                self.notice = Some((format!("could not start the assistant: {error}"), true));
+                self.failure = Some(failure_text("could not start the assistant", None, &error));
             }
             Done::Sent {
                 session,
@@ -1010,7 +1222,11 @@ impl Assistant {
                 if !retried && error.code == crate::host::REQUEST_ONLY_CONTEXT_UNAVAILABLE {
                     self.resend = Some((session, *request));
                 } else {
-                    self.notice = Some((format!("could not send: {}", error.message), true));
+                    self.failure = Some(failure_text(
+                        "could not send",
+                        Some(&error.code),
+                        &error.message,
+                    ));
                     self.release_inactive(session);
                 }
             }
@@ -1043,6 +1259,7 @@ impl Assistant {
                     self.notice = Some((format!("could not stop: {error}"), true));
                 }
             }
+            other => self.finish_models(other, ui),
         }
     }
 
@@ -1276,7 +1493,7 @@ impl Assistant {
         }
         match &self.mode {
             Mode::Rename(_) => return self.rename_key(stroke, ui),
-            Mode::ConfirmDelete => return self.confirm_key(stroke, ui),
+            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(_) => return self.confirm_key(stroke, ui),
             Mode::Chat => {}
         }
         // A pending permission prompt takes the feed keys (the input is hidden meanwhile).
@@ -1298,53 +1515,9 @@ impl Assistant {
         }
         if let Some(action) = ui.keymap_action(ASSISTANT_SCOPE, stroke) {
             let action = action.strip_prefix("bcode.code_review.").unwrap_or(&action);
-            match action {
-                "assistant_close" => {
-                    self.visibility = Shown::Closed;
-                    return Outcome::Redraw;
-                }
-                "assistant_back" => {
-                    self.visibility = Shown::Open;
-                    return Outcome::Redraw;
-                }
-                "assistant_stop" => {
-                    self.stop(ui);
-                    return Outcome::Redraw;
-                }
-                "assistant_context" => {
-                    self.context = !self.context;
-                    return Outcome::Redraw;
-                }
-                "assistant_new" => {
-                    self.new_conversation();
-                    return Outcome::Redraw;
-                }
-                "assistant_open" => return self.open_in_bcode(),
-                "assistant_history" => {
-                    self.open_history(ui);
-                    return Outcome::Redraw;
-                }
-                "assistant_rename" => {
-                    self.start_rename();
-                    return Outcome::Redraw;
-                }
-                "assistant_delete" => {
-                    if self.session.is_some() {
-                        self.mode = Mode::ConfirmDelete;
-                    }
-                    return Outcome::Redraw;
-                }
-                "assistant_scroll_up" | "assistant_scroll_down" => {
-                    let page = self.shown.get().1.max(2) - 1;
-                    let rows = i64::try_from(page).unwrap_or(1);
-                    self.scroll_by(if action == "assistant_scroll_up" {
-                        rows
-                    } else {
-                        -rows
-                    });
-                    return Outcome::Redraw;
-                }
-                _ => {}
+            let outcome = self.run_action(action, place, ui);
+            if outcome != Outcome::Ignored {
+                return outcome;
             }
         }
         if self.prompt_pending() {
@@ -1396,9 +1569,13 @@ impl Assistant {
         use bmux_keyboard::KeyCode;
         match stroke.key {
             KeyCode::Char('y') | KeyCode::Enter => {
-                self.mode = Mode::Chat;
-                if let Some(session) = self.session.clone() {
-                    self.delete(session, ui);
+                match std::mem::replace(&mut self.mode, Mode::Chat) {
+                    Mode::ConfirmDeleteAll(sessions) => self.delete_all(sessions, ui),
+                    _ => {
+                        if let Some(session) = self.session.clone() {
+                            self.delete(session, ui);
+                        }
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Escape => self.mode = Mode::Chat,
@@ -1474,11 +1651,16 @@ impl Assistant {
         Outcome::Redraw
     }
 
-    fn open_in_bcode(&self) -> Outcome {
-        self.session
+    fn open_in_bcode(&mut self) -> Outcome {
+        if let Some(session) = self
+            .session
             .as_deref()
             .and_then(|session| session.parse().ok())
-            .map_or(Outcome::Redraw, Outcome::OpenSession)
+        {
+            return Outcome::OpenSession(session);
+        }
+        self.notice = Some(("start or open a conversation first".to_owned(), false));
+        Outcome::Redraw
     }
 
     /// Paste into the focused input.
@@ -1494,7 +1676,7 @@ impl Assistant {
             Mode::Rename(input) => {
                 TextInputControl::new(&RENAME_POLICY).handle_paste(&mut input.borrow_mut(), text);
             }
-            Mode::ConfirmDelete => {}
+            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(_) => {}
             Mode::Chat if self.prompt_pending() => {}
             Mode::Chat => {
                 TextInputControl::new(&self.policy)
@@ -1620,6 +1802,22 @@ impl Assistant {
             MouseEventKind::Down(MouseButton::Left) => {
                 Some(self.mouse_down(mouse.position, panel, dock, &painted, place, ui))
             }
+            MouseEventKind::Move => {
+                let hover = painted
+                    .history
+                    .filter(|area| area.contains(mouse.position))
+                    .and_then(|area| {
+                        let picker = self.picker.as_ref()?;
+                        let index = picker.first.get() + usize::from(mouse.position.y - area.y);
+                        (index < picker.matching().len()).then_some(index)
+                    });
+                if hover == self.hover {
+                    return Some(Outcome::Ignored);
+                }
+                self.hover = hover;
+                self.touch();
+                Some(Outcome::Redraw)
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 if let Some(picker) = self.picker.as_mut() {
@@ -1647,27 +1845,8 @@ impl Assistant {
         let Point { x, y } = position;
         self.visibility = Shown::Focused;
         self.touch();
-        if let Some((id, _)) = painted
-            .actions
-            .iter()
-            .find(|(_, area)| area.contains(position))
-        {
-            return match id.as_str() {
-                "new" => {
-                    self.new_conversation();
-                    Outcome::Redraw
-                }
-                "history" => {
-                    if self.picker.is_some() {
-                        self.picker = None;
-                    } else {
-                        self.open_history(ui);
-                    }
-                    Outcome::Redraw
-                }
-                "open" => self.open_in_bcode(),
-                _ => Outcome::Redraw,
-            };
+        if let Some(outcome) = self.press_control(position, painted, place, ui) {
+            return outcome;
         }
         let divider = match dock {
             Dock::Right => x == panel.x,
@@ -1711,9 +1890,120 @@ impl Assistant {
         Outcome::Redraw
     }
 
+    /// The active conversation's latest answer, once its turn finished.
+    fn latest_answer(&self) -> Option<String> {
+        let state = self.agents.state(self.session.as_deref()?)?;
+        (!state.working && !state.answer.trim().is_empty()).then(|| state.answer.trim().to_owned())
+    }
+
+    fn chip_clicked(&mut self, chip: ChipId, place: &Place, ui: &UiContext) -> Outcome {
+        match chip {
+            ChipId::Context => {
+                self.context = !self.context;
+                Outcome::Redraw
+            }
+            ChipId::Model => self.run_action("assistant_model", place, ui),
+            ChipId::Effort => self.run_action("assistant_effort", place, ui),
+            ChipId::Tools => self.run_action("assistant_tools", place, ui),
+            ChipId::Category(category) => {
+                self.toggle_category(category);
+                Outcome::Redraw
+            }
+        }
+    }
+
+    /// A press on a control: a history row's `✕` (arms, then deletes), a chip, a title-row
+    /// button, or the title row (a double press zooms). `None` elsewhere.
+    fn press_control(
+        &mut self,
+        position: Point,
+        painted: &Painted,
+        place: &Place,
+        ui: &UiContext,
+    ) -> Option<Outcome> {
+        if let Some((_, session)) = painted
+            .history_delete
+            .as_ref()
+            .filter(|(area, _)| area.contains(position))
+        {
+            let session = session.clone();
+            if let Some(picker) = self.picker.as_mut() {
+                if picker.marked.as_deref() == Some(session.as_str()) {
+                    picker.marked = None;
+                    self.delete(session, ui);
+                } else {
+                    picker.marked = Some(session);
+                }
+            }
+            return Some(Outcome::Redraw);
+        }
+        if let Some((chip, _)) = painted
+            .chips
+            .iter()
+            .find(|(_, area)| area.contains(position))
+        {
+            return Some(self.chip_clicked(*chip, place, ui));
+        }
+        if let Some((id, _)) = painted
+            .actions
+            .iter()
+            .find(|(_, area)| area.contains(position))
+        {
+            return Some(match id.as_str() {
+                "close" => {
+                    self.visibility = Shown::Closed;
+                    self.zoom = Zoom::Docked;
+                    Outcome::Redraw
+                }
+                "new" => {
+                    self.new_conversation();
+                    Outcome::Redraw
+                }
+                "history" => {
+                    if self.picker.is_some() {
+                        self.picker = None;
+                    } else {
+                        self.open_history(ui);
+                    }
+                    Outcome::Redraw
+                }
+                "open" => self.open_in_bcode(),
+                _ => Outcome::Redraw,
+            });
+        }
+        if painted.title.is_some_and(|title| title.contains(position)) {
+            let now = Instant::now();
+            let double = self
+                .title_press
+                .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
+            self.title_press = (!double).then_some(now);
+            if double {
+                self.zoom = match self.zoom {
+                    Zoom::Docked => Zoom::Zoomed,
+                    Zoom::Zoomed => Zoom::Docked,
+                };
+                return Some(Outcome::Redraw);
+            }
+        }
+        None
+    }
+
     fn feed_action(&mut self, action: AgentAction, ui: &UiContext) -> Outcome {
         match action {
             AgentAction::Open => return self.open_in_bcode(),
+            AgentAction::Copy => {
+                if let Some(answer) = self.latest_answer() {
+                    self.notice = Some(match ui.copy_text(&answer) {
+                        Ok(()) => ("copied the answer".to_owned(), false),
+                        Err(error) => (format!("could not copy: {}", error.message), true),
+                    });
+                }
+            }
+            AgentAction::Draft => {
+                if let Some(answer) = self.latest_answer() {
+                    return Outcome::DraftComment(answer);
+                }
+            }
             AgentAction::Stop => self.stop(ui),
             AgentAction::Retry => {
                 if let Some(session) = self.session.clone() {
@@ -1752,13 +2042,709 @@ impl Assistant {
     }
 
     // ----------------------------------------------------------------------------------------
+    // Model, effort and permissions
+    // ----------------------------------------------------------------------------------------
+
+    /// Read the app default and list the models once; again after a failed listing when
+    /// `retry`.
+    fn load_models(&mut self, retry: bool, ui: &UiContext) {
+        if !self.models.default_asked {
+            self.models.default_asked = true;
+            let services = self.services.clone();
+            let repo = self.repo.clone();
+            let inbox = Arc::clone(&self.inbox);
+            ui.spawn(Box::pin(async move {
+                let result = super::models::load_default(&services, repo).await;
+                push(&inbox, Done::Default(result));
+            }));
+        }
+        let failed = matches!(self.models.catalog, Some(Err(_)));
+        if self.models.listing || (self.models.catalog.is_some() && !(retry && failed)) {
+            return;
+        }
+        self.models.listing = true;
+        let host = Arc::clone(ui.host());
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let result = host.model_catalog().await.map_err(|error| error.message);
+            push(&inbox, Done::Catalog(result));
+        }));
+    }
+
+    fn read_session_model(&mut self, session: String, ui: &UiContext) {
+        self.model_asked = Some(session.clone());
+        let host = Arc::clone(ui.host());
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let result = host
+                .session_model(session.clone())
+                .await
+                .map_err(|error| error.message);
+            push(&inbox, Done::SessionModel { session, result });
+        }));
+    }
+
+    /// Finished model work: a listing, the app default, a session's model or a choice.
+    fn finish_models(&mut self, done: Done, ui: &UiContext) {
+        match done {
+            Done::Catalog(result) => {
+                self.models.listing = false;
+                self.models.catalog = Some(result);
+                self.refresh_model_overlay(ui);
+            }
+            Done::Default(result) => match result {
+                Ok(settings) => self.models.default = Some(settings),
+                Err(error) => {
+                    self.notice = Some((
+                        format!("could not read the assistant's model: {error}"),
+                        true,
+                    ));
+                }
+            },
+            Done::SessionModel {
+                session,
+                result: Ok(model),
+            } => self.models.learn(session, model),
+            Done::Chosen {
+                session,
+                default,
+                result,
+            } => {
+                if let Some(default) = default {
+                    self.models.default = Some(default);
+                }
+                match result {
+                    Ok(notice) => self.notice = Some((notice, false)),
+                    Err(error) => self.failure = Some(error),
+                }
+                if let Some(session) = session {
+                    self.read_session_model(session, ui);
+                }
+            }
+            Done::ListedAll(result) => match result {
+                Ok(sessions) if sessions.is_empty() => {
+                    self.notice = Some(("the review app has no conversations".to_owned(), false));
+                }
+                Ok(sessions) => self.mode = Mode::ConfirmDeleteAll(sessions),
+                Err(error) => {
+                    self.notice = Some((format!("could not list conversations: {error}"), true));
+                }
+            },
+            Done::DeletedAll { deleted, refused } => {
+                if let Some(picker) = self.picker.as_mut() {
+                    for session in &deleted {
+                        picker.remove(session);
+                    }
+                }
+                if self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| deleted.contains(session))
+                {
+                    self.new_conversation();
+                }
+                let mut notice = format!(
+                    "deleted {} conversation{}",
+                    deleted.len(),
+                    if deleted.len() == 1 { "" } else { "s" }
+                );
+                if let Some((_, reason)) = refused.first() {
+                    use std::fmt::Write as _;
+                    let _ = write!(notice, "; Bcode kept {} ({reason})", refused.len());
+                }
+                self.notice = Some((notice, !refused.is_empty()));
+            }
+            _ => {}
+        }
+    }
+
+    /// The session a target's choice applies to, when it has one.
+    fn target_session(&self, target: &Target) -> Option<String> {
+        match target {
+            Target::Conversation => self.session.clone(),
+            Target::Session(session) => Some(session.clone()),
+            Target::AppDefault => None,
+        }
+    }
+
+    /// Open the model picker for `target`.
+    pub fn open_model_picker(&mut self, target: Target, ui: &UiContext) {
+        self.load_models(true, ui);
+        let theme = self.theme.get();
+        let (entries, options) = self.model_entries(&target);
+        let overlay =
+            crate::palette::Overlay::new(crate::palette::OverlayKind::Models, entries, &theme);
+        self.overlay = Some((OverlayPurpose::Models(target, options), overlay));
+        self.touch();
+    }
+
+    /// Rebuild an open model picker once the models are listed.
+    fn refresh_model_overlay(&mut self, ui: &UiContext) {
+        let Some((OverlayPurpose::Models(target, _), _)) = &self.overlay else {
+            return;
+        };
+        let target = target.clone();
+        self.open_model_picker(target, ui);
+    }
+
+    /// The picker's rows: Bcode's default, then each provider's models (a provider that failed
+    /// as a row with its reason), the current one marked.
+    fn model_entries(
+        &self,
+        target: &Target,
+    ) -> (
+        Vec<crate::palette::OverlayEntry>,
+        Vec<crate::host::ModelOption>,
+    ) {
+        use crate::palette::OverlayEntry;
+        let session = self.target_session(target);
+        let (current, _) = self.models.effective(session.as_deref());
+        let chosen = session
+            .as_deref()
+            .and_then(|session| self.models.session(session))
+            .is_some()
+            || self.models.default_model().is_some();
+        let mut entries = Vec::new();
+        let mut options = Vec::new();
+        let mark = |active: bool| if active { "● " } else { "  " };
+        match &self.models.catalog {
+            None => entries.push(OverlayEntry {
+                action: None,
+                label: "listing the models Bcode offers…".to_owned(),
+                keys: String::new(),
+            }),
+            Some(Err(error)) => entries.push(OverlayEntry {
+                action: None,
+                label: format!("⚠ models unavailable: {error}"),
+                keys: String::new(),
+            }),
+            Some(Ok(catalog)) => {
+                let default = self.models.bcode_default();
+                entries.push(OverlayEntry {
+                    action: Some("model:default".to_owned()),
+                    label: format!(
+                        "{}Bcode's default{}",
+                        mark(!chosen),
+                        default.map_or_else(String::new, |model| format!(
+                            " ({})",
+                            super::models::label(model)
+                        ))
+                    ),
+                    keys: String::new(),
+                });
+                for provider in &catalog.providers {
+                    match &provider.models {
+                        Err(error) => entries.push(OverlayEntry {
+                            action: None,
+                            label: format!("{} — unavailable: {error}", provider.name),
+                            keys: String::new(),
+                        }),
+                        Ok(models) => {
+                            entries.push(OverlayEntry {
+                                action: None,
+                                label: provider.name.clone(),
+                                keys: String::new(),
+                            });
+                            for model in models {
+                                let active = chosen
+                                    && current.as_ref().is_some_and(|current| {
+                                        current.is(model.provider.as_deref(), &model.model_id)
+                                    });
+                                entries.push(OverlayEntry {
+                                    action: Some(format!("model:{}", options.len())),
+                                    label: format!(
+                                        "{}{} {}",
+                                        mark(active),
+                                        super::models::label(model),
+                                        model.model_id
+                                    ),
+                                    keys: model_details(model),
+                                });
+                                options.push(model.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (entries, options)
+    }
+
+    /// Use `choice` (Bcode's default when `None`) for `target`, and save it as the app default.
+    fn choose_model(
+        &self,
+        target: &Target,
+        choice: Option<&crate::host::ModelOption>,
+        ui: &UiContext,
+    ) {
+        let session = self.target_session(target);
+        let (_, effort) = self.models.effective(session.as_deref());
+        let bcode_default = self.models.bcode_default().cloned();
+        let model = choice.cloned().or_else(|| bcode_default.clone());
+        let effort = model
+            .as_ref()
+            .and_then(|model| super::models::kept_effort(model, effort.as_deref()));
+        let settings = choice.map_or_else(
+            bcode_code_review_models::ReviewAssistantSettings::default,
+            |choice| bcode_code_review_models::ReviewAssistantSettings {
+                provider_plugin_id: choice.provider.clone(),
+                model_id: Some(choice.model_id.clone()),
+                effort: effort.clone(),
+                updated_at_ms: 0,
+            },
+        );
+        let name = model.as_ref().map_or_else(
+            || "Bcode's default".to_owned(),
+            |model| super::models::label(model).to_owned(),
+        );
+        let services = self.services.clone();
+        let repo = self.repo.clone();
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let result = async {
+                if let (Some(session), Some(model)) = (&session, &model) {
+                    let host = services.host();
+                    host.set_session_model(
+                        session.clone(),
+                        model.provider.clone(),
+                        model.model_id.clone(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("could not use the model {name}: {}", error.message)
+                    })?;
+                    host.set_session_reasoning(session.clone(), effort.clone())
+                        .await
+                        .map_err(|error| error.message)?;
+                }
+                let saved = super::models::save_default(&services, &repo, settings)
+                    .await
+                    .map_err(|error| format!("could not remember the model: {error}"))?;
+                let notice = if session.is_some() {
+                    format!("{name} from the next message")
+                } else {
+                    format!("{name} for new conversations")
+                };
+                Ok::<_, String>((notice, saved))
+            }
+            .await;
+            let (result, default) = match result {
+                Ok((notice, saved)) => (Ok(notice), Some(saved)),
+                Err(error) => (Err(error), None),
+            };
+            push(
+                &inbox,
+                Done::Chosen {
+                    session,
+                    default,
+                    result,
+                },
+            );
+        }));
+    }
+
+    /// Cycle `target`'s reasoning effort over its model's values, and save it in the app
+    /// default.
+    pub fn cycle_effort(&mut self, target: &Target, ui: &UiContext) {
+        self.load_models(false, ui);
+        let session = self.target_session(target);
+        let (model, effort) = self.models.effective(session.as_deref());
+        let Some(model) = model else {
+            self.notice = Some(("the models are still being listed".to_owned(), false));
+            return;
+        };
+        let Some(next) = super::models::effort_after(
+            &model.effort_values,
+            effort.as_deref(),
+            model.default_effort.as_deref(),
+        ) else {
+            self.notice = Some((
+                format!(
+                    "{} has no reasoning effort setting",
+                    super::models::label(&model)
+                ),
+                false,
+            ));
+            return;
+        };
+        let mut settings = self.models.default.clone().unwrap_or_default();
+        settings.effort = Some(next.clone());
+        // An optimistic label until the session is read back.
+        if let Some(session) = &session
+            && let Some(known) = self.models.session(session).cloned()
+        {
+            self.models.learn(
+                session.clone(),
+                crate::host::SessionModel {
+                    effort: Some(next.clone()),
+                    ..known
+                },
+            );
+        }
+        self.models.default = Some(settings.clone());
+        let services = self.services.clone();
+        let repo = self.repo.clone();
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let result = async {
+                if let Some(session) = &session {
+                    services
+                        .host()
+                        .set_session_reasoning(session.clone(), Some(next.clone()))
+                        .await
+                        .map_err(|error| {
+                            format!("could not use effort {next}: {}", error.message)
+                        })?;
+                }
+                let saved = super::models::save_default(&services, &repo, settings)
+                    .await
+                    .map_err(|error| format!("could not remember the effort: {error}"))?;
+                Ok::<_, String>((format!("effort {next}"), saved))
+            }
+            .await;
+            let (result, default) = match result {
+                Ok((notice, saved)) => (Ok(notice), Some(saved)),
+                Err(error) => (Err(error), None),
+            };
+            push(
+                &inbox,
+                Done::Chosen {
+                    session,
+                    default,
+                    result,
+                },
+            );
+        }));
+    }
+
+    /// Turn `category` on or off for the active conversation; a category off in configuration
+    /// stays off.
+    fn toggle_category(&mut self, category: Category) {
+        let configured = self
+            .services
+            .assistant_config()
+            .categories
+            .get(&category)
+            .copied()
+            .unwrap_or(true);
+        if !configured {
+            self.notice = Some((
+                format!(
+                    "{} is turned off in configuration ({})",
+                    category_name(category),
+                    category.key()
+                ),
+                false,
+            ));
+            return;
+        }
+        let on = if self.off.remove(&category) {
+            true
+        } else {
+            self.off.insert(category);
+            false
+        };
+        self.notice = Some((
+            format!(
+                "{} {} for this conversation from the next message",
+                category_name(category),
+                if on { "on" } else { "off" }
+            ),
+            false,
+        ));
+        self.touch();
+    }
+
+    /// Whether `category` is on for the active conversation (and in configuration).
+    fn category_on(&self, category: Category) -> bool {
+        !self.off.contains(&category)
+            && self
+                .services
+                .assistant_config()
+                .categories
+                .get(&category)
+                .copied()
+                .unwrap_or(true)
+    }
+
+    fn open_permissions(&mut self) {
+        use crate::palette::OverlayEntry;
+        let configured = self.services.assistant_config();
+        let entries = CHIP_CATEGORIES
+            .iter()
+            .map(|category| {
+                let state = if !configured.categories.get(category).copied().unwrap_or(true) {
+                    "off in configuration"
+                } else if self.off.contains(category) {
+                    "off"
+                } else {
+                    "on"
+                };
+                OverlayEntry {
+                    action: Some(format!("category:{}", category.key())),
+                    label: format!(
+                        "{}  {}",
+                        category_glyph(*category),
+                        category_name(*category)
+                    ),
+                    keys: format!("{state} · {}", category.tools().join(", ")),
+                }
+            })
+            .collect();
+        let overlay = crate::palette::Overlay::new(
+            crate::palette::OverlayKind::Permissions,
+            entries,
+            &self.theme.get(),
+        );
+        self.overlay = Some((OverlayPurpose::Permissions, overlay));
+        self.touch();
+    }
+
+    fn open_tools(&mut self) {
+        use crate::palette::OverlayEntry;
+        let configured = self.services.assistant_config();
+        let mut entries = Vec::new();
+        for category in Category::ALL {
+            let on = self.category_on(category);
+            entries.push(OverlayEntry {
+                action: None,
+                label: format!(
+                    "{} — {}",
+                    category_name(category),
+                    if on { "on" } else { "off" }
+                ),
+                keys: String::new(),
+            });
+            let reads = matches!(category, Category::ReviewReads | Category::FileReads);
+            for tool in category.tools() {
+                entries.push(OverlayEntry {
+                    action: Some(format!("tool:{tool}")),
+                    label: (*tool).to_owned(),
+                    keys: if !on {
+                        "off".to_owned()
+                    } else if reads {
+                        "reads: runs".to_owned()
+                    } else {
+                        "changes: asks".to_owned()
+                    },
+                });
+            }
+        }
+        if !configured.extra.is_empty() {
+            entries.push(OverlayEntry {
+                action: None,
+                label: "extra".to_owned(),
+                keys: String::new(),
+            });
+            for tool in &configured.extra {
+                entries.push(OverlayEntry {
+                    action: Some(format!("tool:{tool}")),
+                    label: tool.clone(),
+                    keys: "Bcode's rule".to_owned(),
+                });
+            }
+        }
+        let overlay = crate::palette::Overlay::new(
+            crate::palette::OverlayKind::Tools,
+            entries,
+            &self.theme.get(),
+        );
+        self.overlay = Some((OverlayPurpose::Tools, overlay));
+        self.touch();
+    }
+
+    /// List the app's conversations, then ask before deleting them all.
+    fn ask_delete_all(&self, ui: &UiContext) {
+        let services = self.services.clone();
+        let repo = self.repo.clone();
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let result = super::picker::load(services, repo).await.map(|load| {
+                load.rows
+                    .into_iter()
+                    .map(|row| row.session_id)
+                    .collect::<Vec<_>>()
+            });
+            push(&inbox, Done::ListedAll(result));
+        }));
+    }
+
+    /// Stop, delete and unbind each of `sessions`; sessions Bcode refuses are kept.
+    fn delete_all(&self, sessions: Vec<String>, ui: &UiContext) {
+        let working: BTreeSet<String> = sessions
+            .iter()
+            .filter(|session| {
+                self.agents
+                    .state(session)
+                    .is_some_and(|state| state.working)
+            })
+            .cloned()
+            .collect();
+        let services = self.services.clone();
+        let repo = self.repo.clone();
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let host = services.host();
+            let (mut deleted, mut refused) = (Vec::new(), Vec::new());
+            for session in sessions {
+                if working.contains(&session) {
+                    let _ = host.cancel_turn(session.clone()).await;
+                }
+                match host.delete_session(session.clone()).await {
+                    Ok(()) => {
+                        let _ = services
+                            .call(UnbindReviewAssistantRequest {
+                                repo_path: repo.clone(),
+                                session_id: session.clone(),
+                            })
+                            .await;
+                        deleted.push(session);
+                    }
+                    Err(error) => refused.push((session, error.message)),
+                }
+            }
+            push(&inbox, Done::DeletedAll { deleted, refused });
+        }));
+    }
+
+    /// Run one of the panel's actions (a key, a chip, or a screen's palette).
+    pub fn run_action(&mut self, action: &str, place: &Place, ui: &UiContext) -> Outcome {
+        self.touch();
+        match action {
+            "assistant_close" => self.visibility = Shown::Closed,
+            "assistant_back" => self.visibility = Shown::Open,
+            "assistant_stop" => self.stop(ui),
+            "assistant_context" => self.context = !self.context,
+            "assistant_new" => self.new_conversation(),
+            "assistant_open" => return self.open_in_bcode(),
+            "assistant_history" => self.open_history(ui),
+            "assistant_rename" => self.start_rename(),
+            "assistant_delete" => {
+                if self.session.is_some() {
+                    self.mode = Mode::ConfirmDelete;
+                } else {
+                    self.notice = Some(("start or open a conversation first".to_owned(), false));
+                }
+            }
+            "assistant_delete_all" => self.ask_delete_all(ui),
+            "assistant_model" => self.open_model_picker(Target::Conversation, ui),
+            "assistant_effort" => self.cycle_effort(&Target::Conversation, ui),
+            "assistant_permissions" => self.open_permissions(),
+            "assistant_tools" => self.open_tools(),
+            "assistant_scroll_up" | "assistant_scroll_down" => {
+                let page = self.shown.get().1.max(2) - 1;
+                let rows = i64::try_from(page).unwrap_or(1);
+                self.scroll_by(if action == "assistant_scroll_up" {
+                    rows
+                } else {
+                    -rows
+                });
+            }
+            _ => return Outcome::Ignored,
+        }
+        let _ = place;
+        Outcome::Redraw
+    }
+
+    /// Whether an overlay is open (it takes every input).
+    #[must_use]
+    pub const fn overlay_open(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Paint the open overlay over the app's `area`.
+    pub fn paint_overlay(&mut self, area: Rect, theme: &ReviewTheme, cx: &mut PaintCx<'_, '_>) {
+        if let Some((_, overlay)) = self.overlay.as_mut() {
+            overlay.paint(theme, area, cx);
+        }
+    }
+
+    /// Route an input to the open overlay; `None` when none is open.
+    pub fn overlay_event(&mut self, event: &Event, ui: &UiContext) -> Option<Outcome> {
+        let theme = self.theme.get();
+        let (_, overlay) = self.overlay.as_mut()?;
+        let outcome = match event {
+            Event::Key(stroke) => overlay.key(*stroke, &theme),
+            Event::Paste(text) => overlay.paste(text, &theme),
+            Event::Mouse(_) => overlay.mouse(event, &theme),
+            _ => crate::palette::OverlayOutcome::Redraw,
+        };
+        self.touch();
+        Some(match outcome {
+            crate::palette::OverlayOutcome::Close => {
+                self.overlay = None;
+                Outcome::Redraw
+            }
+            crate::palette::OverlayOutcome::Run(id) => {
+                let (purpose, _) = self.overlay.take()?;
+                self.overlay_choice(purpose, &id, ui);
+                Outcome::Redraw
+            }
+            crate::palette::OverlayOutcome::Redraw | crate::palette::OverlayOutcome::Ignored => {
+                Outcome::Redraw
+            }
+        })
+    }
+
+    fn overlay_choice(&mut self, purpose: OverlayPurpose, id: &str, ui: &UiContext) {
+        match purpose {
+            OverlayPurpose::Models(target, options) => {
+                if id == "model:default" {
+                    self.choose_model(&target, None, ui);
+                } else if let Some(option) = id
+                    .strip_prefix("model:")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| options.get(index).cloned())
+                {
+                    self.choose_model(&target, Some(&option), ui);
+                }
+            }
+            OverlayPurpose::Permissions => {
+                if let Some(category) = id.strip_prefix("category:").and_then(|key| {
+                    Category::ALL
+                        .into_iter()
+                        .find(|category| category.key() == key)
+                }) {
+                    self.toggle_category(category);
+                }
+            }
+            OverlayPurpose::Tools => {
+                if let Some(tool) = id.strip_prefix("tool:") {
+                    self.notice = Some((
+                        format!(
+                            "change how Bcode decides {tool} in bcode.toml: \
+                             [agent.build.permission.tools] \"{tool}\" = \"allow\", \"ask\" or \"deny\""
+                        ),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------------------------
     // Painting
     // ----------------------------------------------------------------------------------------
 
     /// Footer hints while the panel is focused.
     #[must_use]
     pub fn hints(&self) -> Vec<(String, String)> {
+        let marked = self.picker.as_ref().and_then(|picker| {
+            let marked = picker.marked.as_ref()?;
+            picker
+                .matching()
+                .into_iter()
+                .find(|row| row.session_id == *marked)
+                .map(|row| row.title.clone())
+        });
         let mut hints: Vec<(String, String)> = Vec::new();
+        if let Some(title) = marked {
+            hints.push((
+                self.key_of("history_delete")
+                    .unwrap_or_else(|| "✕".to_owned()),
+                format!("again deletes “{title}”"),
+            ));
+        }
         let mut push = |key: Option<String>, label: &str| {
             if let Some(key) = key.filter(|key| !key.is_empty()) {
                 hints.push((key, label.to_owned()));
@@ -1778,7 +2764,7 @@ impl Assistant {
                 push(Some("esc".to_owned()), "cancel");
                 return hints;
             }
-            Mode::ConfirmDelete => {
+            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(_) => {
                 push(Some("y".to_owned()), "delete");
                 push(Some("n".to_owned()), "keep");
                 return hints;
@@ -1801,11 +2787,16 @@ impl Assistant {
             return hints;
         }
         push(Some("enter".to_owned()), "send");
+        push(self.key_of("assistant_model"), "model");
+        push(self.key_of("assistant_effort"), "effort");
+        push(self.key_of("assistant_permissions"), "permissions");
         push(self.key_of("assistant_history"), "history");
         push(self.key_of("assistant_new"), "new");
         push(self.key_of("assistant_stop"), "stop");
         push(self.key_of("assistant_context"), "context");
-        push(self.key_of("assistant_open"), "open in Bcode");
+        if self.session.is_some() {
+            push(self.key_of("assistant_open"), "open in Bcode");
+        }
         push(self.key_of("assistant_back"), "back");
         push(self.key_of("assistant_close"), "close");
         hints
@@ -1837,7 +2828,7 @@ impl Assistant {
             parts.push("working…".to_owned());
         }
         if state.feed.tokens > 0 {
-            parts.push(crate::agent::feed::tokens_label(state.feed.tokens));
+            parts.push(usage_tokens(state.feed.tokens));
         }
         if let Some(cost) = &state.feed.cost {
             parts.push(cost.clone());
@@ -1855,6 +2846,7 @@ impl Assistant {
         theme: &ReviewTheme,
         cx: &mut PaintCx<'_, '_>,
     ) {
+        self.theme.set(*theme);
         let mut painted = Painted {
             panel: Some((rect, dock)),
             area,
@@ -1887,10 +2879,12 @@ impl Assistant {
             return;
         }
         let compact = rect.width < COMPACT_WIDTH || rect.height < COMPACT_HEIGHT;
-        let chrome = self.chrome(theme, &title, focused, compact);
         let pane_rect = Rect::new(0, 0, rect.width, rect.height);
+        let chrome = self.chrome_with_usage(theme, &title, focused, compact, pane_rect);
+        painted.title = Some(Rect::new(rect.x, rect.y, rect.width, 1));
+        let ids = self.title_actions();
         for (index, action_area) in chrome.title_layout(pane_rect).actions {
-            let id = ["new", "history", "open"].get(index).copied().unwrap_or("");
+            let id = ids.get(index).copied().unwrap_or("");
             painted.actions.push((
                 id.to_owned(),
                 Rect::new(
@@ -1909,7 +2903,11 @@ impl Assistant {
         // Lay out once to learn the conversation's width, prepare its rows, then paint.
         let layout = component.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
         if let Some(node) = layout.find(&LayoutId::new(FEED_ID)) {
-            self.prepare_rows(u16::try_from(node.size.width).unwrap_or(u16::MAX), theme);
+            self.prepare_rows(
+                u16::try_from(node.size.width).unwrap_or(u16::MAX),
+                place,
+                theme,
+            );
         }
         cx.paint_component(&component, rect);
         let absolute = |id: &'static str| {
@@ -1924,7 +2922,83 @@ impl Assistant {
         };
         painted.feed = absolute(FEED_ID);
         painted.history = absolute(HISTORY_ID);
+        painted.chips = absolute(super::chips::CHIPS_ID)
+            .map(|chips| self.chip_regions(chips))
+            .unwrap_or_default();
+        painted.history_delete = painted
+            .history
+            .and_then(|area| self.history_delete_region(area));
         *self.painted.borrow_mut() = painted;
+    }
+
+    /// Each painted chip's cells, from the plan the chips row was laid out with at `chips`.
+    fn chip_regions(&self, chips: Rect) -> Vec<(ChipId, Rect)> {
+        self.chip_plan
+            .borrow()
+            .placed
+            .iter()
+            .filter(|(_, cell, _)| cell.y < chips.height)
+            .map(|(id, cell, _)| {
+                (
+                    *id,
+                    Rect::new(chips.x + cell.x, chips.y + cell.y, cell.width, 1),
+                )
+            })
+            .collect()
+    }
+
+    /// The cells and session of the `✕` painted on a history row of the rows at `area`.
+    fn history_delete_region(&self, area: Rect) -> Option<(Rect, String)> {
+        let (row, column) = self.history_delete.get()?;
+        let picker = self.picker.as_ref()?;
+        let session = picker.matching().get(row)?.session_id.clone();
+        let y = u16::try_from(row.checked_sub(picker.first.get())?).ok()?;
+        (y < area.height && column < area.width).then(|| {
+            (
+                Rect::new(area.x + column, area.y + y, area.width - column, 1),
+                session,
+            )
+        })
+    }
+
+    /// The chrome, with the title cut when it would leave the usage no room on the title row.
+    fn chrome_with_usage(
+        &self,
+        theme: &ReviewTheme,
+        title: &str,
+        focused: bool,
+        compact: bool,
+        pane_rect: Rect,
+    ) -> Pane<'static> {
+        let chrome = self.chrome(theme, title, focused, compact);
+        let status = self.status_text();
+        let layout = chrome.title_layout(pane_rect);
+        if compact || status.is_empty() || layout.right_title.is_some() {
+            return chrome;
+        }
+        let actions_start = layout
+            .actions
+            .first()
+            .map_or_else(|| pane_rect.width.saturating_sub(1), |(_, area)| area.x);
+        let status_width = u16::try_from(theme.pane_status(&status).width()).unwrap_or(u16::MAX);
+        // The corner, the title's own padding, and a cell on each side of the status.
+        let room = actions_start.saturating_sub(status_width.saturating_add(5));
+        if room < MIN_TITLE_CELLS {
+            return chrome;
+        }
+        let cut = Line::from_spans(vec![Span::raw(title.to_owned())]).truncate(usize::from(room));
+        let cut: String = cut.spans.iter().map(|span| span.content.as_str()).collect();
+        self.chrome(theme, &cut, focused, compact)
+    }
+
+    /// The title row's buttons, in order: `+ new`, `⟲`, `↗` (only with a session) and `✕`.
+    fn title_actions(&self) -> Vec<&'static str> {
+        let mut ids = vec!["new", "history"];
+        if self.session.is_some() {
+            ids.push("open");
+        }
+        ids.push("close");
+        ids
     }
 
     fn chrome(
@@ -1956,11 +3030,13 @@ impl Assistant {
         }
         if !compact {
             chrome = chrome.right_title(theme.pane_status(&self.status_text()));
-            for (id, label) in [
-                ("new", "+ new".to_owned()),
-                ("history", "⟲".to_owned()),
-                ("open", theme.icons.external.to_owned()),
-            ] {
+            for id in self.title_actions() {
+                let label = match id {
+                    "new" => "+ new".to_owned(),
+                    "history" => "⟲".to_owned(),
+                    "open" => theme.icons.external.to_owned(),
+                    _ => "✕".to_owned(),
+                };
                 chrome = chrome.action(PaneTitleAction::new(
                     id,
                     Line::from_spans(vec![Span::styled(format!(" {label} "), theme.accent)]),
@@ -1983,7 +3059,7 @@ impl Assistant {
             return self.history_content(content, picker, now_ms, theme, focused);
         }
         if !compact {
-            content = content.child(one_line(self.chips(place, theme)));
+            content = content.child(ChipRow::new(self.chips(place, theme), &self.chip_plan));
             if let Some((text, error)) = &self.notice {
                 let style = if *error { theme.error } else { theme.muted };
                 content = content.child(one_line(Line::from_spans(vec![Span::styled(
@@ -2016,6 +3092,16 @@ impl Assistant {
             Mode::ConfirmDelete => {
                 return content.child(one_line(Line::from_spans(vec![Span::styled(
                     "Delete this conversation from Bcode? y delete · n keep",
+                    theme.pill_warning,
+                )])));
+            }
+            Mode::ConfirmDeleteAll(sessions) => {
+                let count = sessions.len();
+                return content.child(one_line(Line::from_spans(vec![Span::styled(
+                    format!(
+                        "Delete all {count} conversation{} the review app started from Bcode? y delete · n keep",
+                        if count == 1 { "" } else { "s" }
+                    ),
                     theme.pill_warning,
                 )])));
             }
@@ -2112,20 +3198,81 @@ impl Assistant {
         content.flex(Flex::new(1, rows))
     }
 
-    /// The chips row: what a message carries.
-    fn chips(&self, place: &Place, theme: &ReviewTheme) -> Line {
-        if self.context {
-            Line::from_spans(vec![Span::styled(
-                format!(" ⌖ {} ", place.chip()),
-                theme.pill_accent,
-            )])
+    /// The chips row: the context a message carries, the model and effort it runs with, the
+    /// permission categories and the tools list.
+    fn chips(&self, place: &Place, theme: &ReviewTheme) -> Vec<Chip> {
+        let text = |text: String, style| Line::from_spans(vec![Span::styled(text, style)]);
+        let mut chips = Vec::new();
+        let (context, context_style) = if self.context {
+            (format!(" ⌖ {} ", place.chip()), theme.pill_accent)
         } else {
-            Line::from_spans(vec![Span::styled("context detached", theme.tiers.dim)])
+            ("context detached".to_owned(), theme.tiers.dim)
+        };
+        chips.push(Chip {
+            id: ChipId::Context,
+            short: text(
+                if self.context {
+                    " ⌖ ".to_owned()
+                } else {
+                    "⌖ off".to_owned()
+                },
+                context_style,
+            ),
+            full: text(context, context_style),
+            keep: 40,
+        });
+        let session = self.session.as_deref();
+        let model = self.models.model_label(session);
+        let model_style = if matches!(self.models.catalog, Some(Err(_))) {
+            theme.error
+        } else {
+            theme.accent
+        };
+        let glyph = if model.starts_with('⚠') { "" } else { "● " };
+        chips.push(Chip {
+            id: ChipId::Model,
+            full: text(format!("{glyph}{model} ▾"), model_style),
+            short: text(format!("{glyph}{model}"), model_style),
+            keep: 50,
+        });
+        if let Some(effort) = self.models.effort_label(session) {
+            chips.push(Chip {
+                id: ChipId::Effort,
+                full: text(format!("◆ effort {effort}"), theme.muted),
+                short: text(format!("◆ {effort}"), theme.muted),
+                keep: 30,
+            });
         }
+        for (index, category) in CHIP_CATEGORIES.into_iter().enumerate() {
+            let style = if self.category_on(category) {
+                theme.text
+            } else {
+                theme
+                    .tiers
+                    .dim
+                    .add_modifier(bmux_tui::style::Modifier::CROSSED_OUT)
+            };
+            chips.push(Chip {
+                id: ChipId::Category(category),
+                full: text(
+                    format!("{} {}", category_glyph(category), category_name(category)),
+                    style,
+                ),
+                short: text(category_glyph(category).to_owned(), style),
+                keep: 20 - u16::try_from(index).unwrap_or(0),
+            });
+        }
+        chips.push(Chip {
+            id: ChipId::Tools,
+            full: text("⚒ tools".to_owned(), theme.muted),
+            short: text("⚒".to_owned(), theme.muted),
+            keep: 10,
+        });
+        chips
     }
 
     /// Lay out the conversation at `width` columns when it changed.
-    fn prepare_rows(&self, width: u16, theme: &ReviewTheme) {
+    fn prepare_rows(&self, width: u16, place: &Place, theme: &ReviewTheme) {
         let session = self.session.clone();
         let key = (
             session
@@ -2134,6 +3281,7 @@ impl Assistant {
             self.folds.revision,
             self.revision,
             width,
+            place.screen.name(),
         );
         if self
             .rows
@@ -2144,10 +3292,23 @@ impl Assistant {
             return;
         }
         let width = usize::from(width);
-        let (lines, actions) = session.as_deref().map_or_else(
-            || (self.intro(width, theme), Vec::new()),
-            |session| crate::rows::dock_rows(session, &self.agents, &self.folds, theme, width),
+        let draft = place.screen == Screen::Review;
+        let (mut lines, actions) = session.as_deref().map_or_else(
+            || (self.intro(place.screen, width, theme), Vec::new()),
+            |session| {
+                crate::rows::dock_rows(session, &self.agents, &self.folds, theme, width, draft)
+            },
         );
+        if let Some(failure) = &self.failure {
+            lines.push(Line::default());
+            lines.extend(wrapped(
+                &Line::from_spans(vec![
+                    Span::styled("✗ ", theme.error),
+                    Span::styled(failure.clone(), theme.error),
+                ]),
+                width,
+            ));
+        }
         *self.rows.borrow_mut() = Some(Rows {
             key,
             lines,
@@ -2155,32 +3316,174 @@ impl Assistant {
         });
     }
 
-    fn intro(&self, width: usize, theme: &ReviewTheme) -> Vec<Line> {
-        let lines: &[(&str, bmux_tui::style::Style)] = if self.starting {
-            &[("starting the assistant…", theme.muted)]
-        } else {
-            &[
-                (
-                    "Ask about the review on screen, or ask me to",
-                    theme.tiers.strong,
-                ),
-                (
-                    "create or open reviews and mark files viewed.",
-                    theme.tiers.strong,
-                ),
-                ("Changes it makes ask for permission first.", theme.muted),
-            ]
+    /// What an empty conversation shows on `screen`: what the assistant can do there, example
+    /// requests, what the chips control, and why the models are unavailable when they are.
+    fn intro(&self, screen: Screen, width: usize, theme: &ReviewTheme) -> Vec<Line> {
+        if self.starting {
+            return vec![
+                Line::from_spans(vec![Span::styled("starting the assistant…", theme.muted)])
+                    .truncate(width),
+            ];
+        }
+        let (lead, examples): (&str, [&str; 3]) = match screen {
+            Screen::Review => (
+                "Ask about this review, or ask me to mark files viewed, change the comparison, comment or move you around.",
+                [
+                    "“What changed since I last looked?”",
+                    "“Mark the generated files viewed”",
+                    "“Show v2 of #102 against now”",
+                ],
+            ),
+            Screen::Home | Screen::Opening => (
+                "Ask me to create or open a review, find your pull requests, or tidy your reviews.",
+                [
+                    "“Create a review for my most recent PR stack”",
+                    "“Review my uncommitted changes”",
+                    "“Archive reviews I finished last week”",
+                ],
+            ),
+            Screen::Wizard => (
+                "Ask me to fill in the new review: which pull requests, branches or commits.",
+                [
+                    "“Review PR #1234 and its stack”",
+                    "“Compare my branch with main”",
+                    "“Only the last three commits”",
+                ],
+            ),
         };
-        lines
-            .iter()
-            .map(|(text, style)| {
-                Line::from_spans(vec![Span::styled((*text).to_owned(), *style)]).truncate(width)
-            })
-            .collect()
+        let mut lines = vec![Line::from_spans(vec![Span::styled(
+            lead.to_owned(),
+            theme.tiers.strong,
+        )])];
+        lines.extend(examples.iter().map(|example| {
+            Line::from_spans(vec![
+                Span::styled("  ", theme.muted),
+                Span::styled((*example).to_owned(), theme.text),
+            ])
+        }));
+        lines.push(Line::from_spans(vec![Span::styled(
+            "The chips above choose the model (alt+m), its effort (shift+tab) and what the assistant may change (alt+p); changes ask for permission first.",
+            theme.muted,
+        )]));
+        if let Some(Err(error)) = &self.models.catalog {
+            lines.push(Line::from_spans(vec![Span::styled(
+                format!("⚠ models unavailable: {error}"),
+                theme.error,
+            )]));
+        }
+        lines.iter().flat_map(|line| wrapped(line, width)).collect()
     }
 }
 
-/// Editing policy of the rename input.
+/// The categories the chips row and the permissions overlay switch (reads have no chip).
+pub const CHIP_CATEGORIES: [Category; 5] = [
+    Category::ReviewWrites,
+    Category::FileWrites,
+    Category::Shell,
+    Category::Publish,
+    Category::Navigation,
+];
+
+/// A category's glyph on its chip.
+#[must_use]
+pub const fn category_glyph(category: Category) -> &'static str {
+    match category {
+        Category::ReviewWrites => "✎",
+        Category::FileWrites => "▤",
+        Category::Shell => "$",
+        Category::Publish => "⇪",
+        Category::Navigation => "→",
+        Category::ReviewReads | Category::FileReads => "◇",
+    }
+}
+
+/// A category's short name on its chip.
+#[must_use]
+pub const fn category_name(category: Category) -> &'static str {
+    match category {
+        Category::ReviewWrites => "review",
+        Category::FileWrites => "files",
+        Category::Shell => "shell",
+        Category::Publish => "publish",
+        Category::Navigation => "move",
+        Category::ReviewReads => "review reads",
+        Category::FileReads => "file reads",
+    }
+}
+
+/// A model's details in the picker: context window, prices per million tokens and effort
+/// range.
+fn model_details(model: &crate::host::ModelOption) -> String {
+    let mut parts = Vec::new();
+    if let Some(window) = model.context_window {
+        parts.push(if window >= 1_000_000 {
+            format!("{}M ctx", window / 1_000_000)
+        } else {
+            format!("{}k ctx", window / 1_000)
+        });
+    }
+    if let Some((input, output)) = &model.price {
+        parts.push(format!("{input}/{output} per M"));
+    }
+    match (model.effort_values.first(), model.effort_values.last()) {
+        (Some(first), Some(last)) if first != last => parts.push(format!("effort {first}–{last}")),
+        (Some(only), _) => parts.push(format!("effort {only}")),
+        _ => {}
+    }
+    parts.join(" · ")
+}
+
+/// `line` wrapped at word boundaries into rows of at most `width` cells.
+fn wrapped(line: &Line, width: usize) -> Vec<Line> {
+    bmux_tui::text::wrap_line_bounded(
+        line,
+        bmux_tui::text::TextWrapGeometry::uniform(width),
+        TextWrap::Word,
+    )
+}
+
+/// Tokens on the title row, as bdata's panel shows them: `850 tok`, `12.3k tok`, `1.2M tok`.
+#[must_use]
+pub fn usage_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => format!("{tokens} tok"),
+        1_000..1_000_000 => format!("{}.{}k tok", tokens / 1_000, tokens % 1_000 / 100),
+        _ => format!(
+            "{}.{}M tok",
+            tokens / 1_000_000,
+            tokens % 1_000_000 / 100_000
+        ),
+    }
+}
+
+/// What a refused message or start says in the conversation: what failed, why, and what to do
+/// for the reasons the app knows.
+fn failure_text(what: &str, code: Option<&str>, message: &str) -> String {
+    let hint = match code {
+        Some("agent_profile_unavailable") => Some(
+            "the review app's tool connection is not registered with Bcode yet; send again in a moment",
+        ),
+        Some(
+            "model_not_found"
+            | "model_unavailable"
+            | "no_model_configured"
+            | "provider_unavailable",
+        ) => Some("choose another model with the model chip or in bcode tui"),
+        _ => None,
+    };
+    let mut text = format!("{what}: {message}");
+    if let Some(code) = code.filter(|code| *code != crate::host::HOST_ERROR_FAILED) {
+        use std::fmt::Write as _;
+        let _ = write!(text, " ({code})");
+    }
+    if let Some(hint) = hint {
+        text.push_str(" — ");
+        text.push_str(hint);
+    }
+    text
+}
+
+/// Editing policy of the rename input./// Editing policy of the rename input.
 static RENAME_POLICY: std::sync::LazyLock<TextInputPolicy> =
     std::sync::LazyLock::new(single_line_policy);
 
@@ -2379,17 +3682,36 @@ impl Component for HistoryRows<'_> {
             first = picker.selected + 1 - height;
         }
         picker.first.set(first);
+        // The `✕` sits on the hovered row, else the selected one, when the row has room for it.
+        let target = self
+            .panel
+            .hover
+            .filter(|hover| *hover >= first && *hover < first + height && *hover < rows.len())
+            .unwrap_or(picker.selected);
+        let delete_column = width
+            .checked_sub(DELETE_CELLS)
+            .filter(|column| *column >= 4);
+        self.panel.history_delete.set(
+            delete_column
+                .filter(|_| target < rows.len() && target >= first && target < first + height)
+                .and_then(|column| Some((target, u16::try_from(column).ok()?))),
+        );
         let lines: Vec<Line> =
             rows.iter()
                 .enumerate()
                 .skip(first)
                 .take(height)
                 .map(|(index, row)| {
+                    let marked = picker.marked.as_deref() == Some(row.session_id.as_str());
+                    let row_width = match delete_column {
+                        Some(column) if index == target => column,
+                        _ => width,
+                    };
                     let state =
                         self.panel.agents.state(&row.session_id).filter(|_| {
                             self.panel.session.as_deref() == Some(row.session_id.as_str())
                         });
-                    super::picker::row_line(
+                    let line = super::picker::row_line(
                         row,
                         RowState {
                             active: self.panel.session.as_deref() == Some(row.session_id.as_str()),
@@ -2397,13 +3719,32 @@ impl Component for HistoryRows<'_> {
                             needs_you: picker.needs_you(&row.session_id)
                                 || state.is_some_and(crate::agent::AgentState::needs_you),
                             selected: index == picker.selected,
-                            marked: picker.marked.as_deref() == Some(row.session_id.as_str()),
+                            marked,
                         },
                         picker.turns.get(&row.session_id).copied(),
                         self.now_ms,
-                        width,
+                        row_width,
                         self.theme,
-                    )
+                    );
+                    if row_width == width {
+                        return line;
+                    }
+                    let mut spans = line.spans.clone();
+                    let pad = row_width.saturating_sub(line.width());
+                    if pad > 0 {
+                        spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                    spans.push(Span::styled(
+                        " ✕",
+                        if marked {
+                            self.theme
+                                .error
+                                .add_modifier(bmux_tui::style::Modifier::BOLD)
+                        } else {
+                            self.theme.muted
+                        },
+                    ));
+                    Line::from_spans(spans)
                 })
                 .collect();
         let block = TextBlock::new(Text::from_lines(lines)).wrap(TextWrap::None);

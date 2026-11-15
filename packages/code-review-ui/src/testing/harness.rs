@@ -89,6 +89,24 @@ pub struct ScriptedHost {
     gated: Mutex<BTreeMap<String, crate::host::ClientToolCall>>,
     /// The app's registered tools and profiles, and where their calls go.
     client_tools: Mutex<Option<ClientTools>>,
+    /// The models the fake daemon offers; listing fails with the message when `Err`.
+    models: Mutex<Result<crate::host::ModelCatalog, String>>,
+    /// Each session's chosen provider, model and effort.
+    session_models: Mutex<BTreeMap<String, SessionChoice>>,
+    /// Model, effort and submit calls in call order (`model <session> <model>`, `effort
+    /// <session> <effort>`, `submit <session>`).
+    model_log: Mutex<Vec<String>>,
+}
+
+/// A session's model choice in the fake daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionChoice {
+    /// Chosen provider.
+    pub provider: Option<String>,
+    /// Chosen model; Bcode's default when `None`.
+    pub model: Option<String>,
+    /// Chosen effort; the model's default when `None`.
+    pub effort: Option<String>,
 }
 
 /// What the app registered as its tools, and the fake daemon's ends of the link.
@@ -161,7 +179,46 @@ impl ScriptedHost {
             turn_tools: Mutex::default(),
             gated: Mutex::default(),
             client_tools: Mutex::default(),
+            models: Mutex::new(Err("this host offers no models".to_owned())),
+            session_models: Mutex::default(),
+            model_log: Mutex::default(),
         }
+    }
+
+    /// Offer `catalog` as the fake daemon's models (`Err` fails listing with the message).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the models lock is poisoned.
+    pub fn set_model_catalog(&self, catalog: Result<crate::host::ModelCatalog, String>) {
+        *self.models.lock().expect("models lock") = catalog;
+    }
+
+    /// The model choice of `session` in the fake daemon.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the models lock is poisoned.
+    pub fn session_choice(&self, session: &str) -> SessionChoice {
+        self.session_models
+            .lock()
+            .expect("models lock")
+            .get(session)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Model, effort and submit calls in call order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the log lock is poisoned.
+    pub fn model_log(&self) -> Vec<String> {
+        self.model_log.lock().expect("log lock").clone()
+    }
+
+    fn log_model(&self, entry: String) {
+        self.model_log.lock().expect("log lock").push(entry);
     }
 
     /// Names of the tools the app registered.
@@ -720,7 +777,76 @@ impl ReviewHost for ScriptedHost {
             .lock()
             .expect("turns lock")
             .push((session_id.clone(), request.clone()));
+        let choice = self.session_choice(&session_id);
+        self.log_model(format!(
+            "submit {session_id} {} {}",
+            choice.model.as_deref().unwrap_or("default"),
+            choice.effort.as_deref().unwrap_or("default")
+        ));
         self.send_message(session_id, request.text)
+    }
+
+    fn model_catalog(&self) -> HostFuture<crate::host::ModelCatalog> {
+        let catalog = self
+            .models
+            .lock()
+            .expect("models lock")
+            .clone()
+            .map_err(HostError::failed);
+        Box::pin(async move { catalog })
+    }
+
+    fn session_model(&self, session_id: String) -> HostFuture<crate::host::SessionModel> {
+        let choice = self.session_choice(&session_id);
+        let catalog = self.models.lock().expect("models lock").clone();
+        Box::pin(async move {
+            let catalog = catalog.map_err(HostError::failed)?;
+            let model = match &choice.model {
+                Some(model) => catalog
+                    .find(choice.provider.as_deref(), model)
+                    .cloned()
+                    .unwrap_or_else(|| crate::host::ModelOption {
+                        provider: choice.provider.clone(),
+                        model_id: model.clone(),
+                        display_name: model.clone(),
+                        ..crate::host::ModelOption::default()
+                    }),
+                None => catalog.default.and_then(Result::ok).unwrap_or_default(),
+            };
+            Ok(crate::host::SessionModel {
+                model,
+                effort: choice.effort,
+            })
+        })
+    }
+
+    fn set_session_model(
+        &self,
+        session_id: String,
+        provider: Option<String>,
+        model_id: String,
+    ) -> HostFuture<()> {
+        self.log_model(format!("model {session_id} {model_id}"));
+        let mut models = self.session_models.lock().expect("models lock");
+        let choice = models.entry(session_id).or_default();
+        choice.provider = provider;
+        choice.model = Some(model_id);
+        drop(models);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_session_reasoning(&self, session_id: String, effort: Option<String>) -> HostFuture<()> {
+        self.log_model(format!(
+            "effort {session_id} {}",
+            effort.as_deref().unwrap_or("default")
+        ));
+        self.session_models
+            .lock()
+            .expect("models lock")
+            .entry(session_id)
+            .or_default()
+            .effort = effort;
+        Box::pin(async { Ok(()) })
     }
 
     fn list_app_sessions(

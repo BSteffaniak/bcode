@@ -33,6 +33,8 @@ const QUESTION_ROWS: usize = 3;
 const REASONING_ROWS: usize = 40;
 /// Lines of one error.
 const ERROR_ROWS: usize = 3;
+/// Cells continuation rows of an error are indented by (under its text, past the icon).
+const ERROR_INDENT: usize = 2;
 
 /// Separator between a feed item's key and the exchange it belongs to, in [`Folds::feed_open`].
 const OPEN_SEPARATOR: char = '\u{1f}';
@@ -319,20 +321,49 @@ impl Card<'_> {
                         theme.tiers.dim,
                     )]);
                 }
-                FeedItem::Error(text) => {
-                    for line in text
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .take(ERROR_ROWS)
-                    {
-                        self.push(vec![
-                            Span::styled(theme.icons.alert, theme.error),
-                            Span::raw(" "),
-                            Span::styled(line.to_owned(), theme.error),
-                        ]);
-                    }
-                }
+                FeedItem::Error(text) => self.error(text),
             }
+        }
+    }
+
+    /// An error, each of its first lines wrapped under its text so the reason and what to do
+    /// stay readable in a narrow panel.
+    fn error(&mut self, text: &str) {
+        let theme = self.theme;
+        let width = self.width.saturating_sub(self.pad.len());
+        let rows = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(ERROR_ROWS)
+            .flat_map(|line| {
+                bmux_tui::text::wrap_line_bounded(
+                    &Line::from_spans(vec![
+                        Span::styled(theme.icons.alert, theme.error),
+                        Span::raw(" "),
+                        Span::styled(line.to_owned(), theme.error),
+                    ]),
+                    bmux_tui::text::TextWrapGeometry::with_continuation(
+                        width,
+                        width.saturating_sub(ERROR_INDENT),
+                    ),
+                    bmux_tui::text::TextWrap::Word,
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    if index == 0 {
+                        row.spans
+                    } else {
+                        std::iter::once(Span::raw(" ".repeat(ERROR_INDENT)))
+                            .chain(row.spans)
+                            .collect()
+                    }
+                })
+            })
+            .take(ERROR_ROWS * 2)
+            .collect::<Vec<_>>();
+        for row in rows {
+            self.push(row);
         }
     }
 
@@ -518,6 +549,7 @@ pub fn dock_rows(
     folds: &Folds,
     theme: &ReviewTheme,
     width: usize,
+    draft: bool,
 ) -> (Vec<Line>, Vec<ActionCells<ItemAction>>) {
     let mut card = Card {
         theme,
@@ -553,6 +585,14 @@ pub fn dock_rows(
             agents.is_answering(&permission.permission_id),
             agents.keys(),
         );
+    }
+    if !state.working && state.feed.permission.is_none() && !state.answer.trim().is_empty() {
+        let agent = ItemAction::Agent;
+        let mut buttons = vec![("Copy".to_owned(), agent(AgentAction::Copy))];
+        if draft {
+            buttons.push(("Draft comment".to_owned(), agent(AgentAction::Draft)));
+        }
+        card.buttons(&buttons);
     }
     let clock = agents.clock(session);
     if state.working && state.feed.permission.is_none() {
@@ -704,6 +744,7 @@ pub(super) fn agent_rows(
     };
     let owned = card_buttons(&CardButtons {
         keys: agents.keys(),
+        model: session.and_then(|session| agents.model_label(session)),
         linked: session.is_some(),
         exchange: exchange.is_some(),
         mode,
@@ -752,6 +793,8 @@ enum CardMode {
 /// What decides an AI card's buttons.
 struct CardButtons<'a> {
     keys: &'a crate::agent::FeedKeys,
+    /// The session's `model · effort`, once known.
+    model: Option<&'a str>,
     linked: bool,
     exchange: bool,
     mode: CardMode,
@@ -767,6 +810,9 @@ fn card_buttons(card: &CardButtons<'_>) -> Vec<(String, ItemAction)> {
             labelled("Open in Bcode", &card.keys.open),
             agent(AgentAction::Open),
         ));
+        if let Some(model) = card.model {
+            buttons.push((format!("● {model}"), agent(AgentAction::Model)));
+        }
     }
     let (answered, expanded, retry) = match card.mode {
         CardMode::Prompting => return buttons,

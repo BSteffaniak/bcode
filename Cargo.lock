@@ -2028,6 +2028,7 @@ dependencies = [
  "bcode_ipc",
  "bcode_keymap",
  "bcode_markdown_render",
+ "bcode_model",
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",

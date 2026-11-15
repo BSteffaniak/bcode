@@ -44,7 +44,7 @@ pub(super) enum FeedRequest {
 
 impl ReviewSurface {
     /// The cursor card's exchange and linked session.
-    fn card_at_cursor(&self) -> Option<(String, String)> {
+    pub(super) fn card_at_cursor(&self) -> Option<(String, String)> {
         let review = self.review.as_ref()?;
         let ReviewItem::AgentThread(agent) = review.doc.item(review.cursor_index)? else {
             return None;
@@ -125,6 +125,22 @@ impl ReviewSurface {
         let action = host.keymap_action(FEED_SCOPE, stroke)?;
         let action = action.strip_prefix("bcode.code_review.").unwrap_or(&action);
         let (_, session) = self.card_at_cursor()?;
+        let target = || crate::assistant::models::Target::Session(session.clone());
+        match action {
+            "feed_model" => {
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Model(target()));
+                return Some(Action::Redraw);
+            }
+            "feed_effort" => {
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Effort(target()));
+                return Some(Action::Redraw);
+            }
+            _ => {}
+        }
         let state = self.agents.state(&session)?;
         let pending = state
             .feed
@@ -141,6 +157,29 @@ impl ReviewSurface {
         };
         self.feed_action(action);
         Some(Action::Redraw)
+    }
+
+    /// The sessions of the review's AI cards, newest first (at most `limit`).
+    #[must_use]
+    pub fn card_sessions(&self, limit: usize) -> Vec<String> {
+        self.notes
+            .exchanges()
+            .iter()
+            .rev()
+            .filter_map(|exchange| exchange.session_id.clone())
+            .take(limit)
+            .collect()
+    }
+
+    /// Show the assistant's `model · effort` labels: `default` on a question being written
+    /// (the app default its session will get) and each card's session's own.
+    pub fn set_model_labels(&mut self, default: String, sessions: Vec<(String, String)>) {
+        if let Some(composer) = self.composer.as_mut() {
+            composer.set_model_label(Some(default));
+        }
+        for (session, label) in sessions {
+            self.agents.set_model_label(&session, label);
+        }
     }
 
     /// Answer the permission request of the cursor card's session, stop its turn, or open or

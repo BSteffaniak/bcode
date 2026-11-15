@@ -430,7 +430,7 @@ impl ReviewApp {
             // The whole place (binding and view) only for a press in the panel.
             let place = self.place(down && self.assistant.contains(mouse.position));
             if let Some(outcome) = self.assistant.mouse(event, &place, host) {
-                return Some(assistant_action(&outcome));
+                return Some(self.assistant_outcome(outcome));
             }
             // A click on the screen gives it the keyboard back.
             if down && self.assistant.is_focused() {
@@ -444,7 +444,8 @@ impl ReviewApp {
         match event {
             Event::Key(stroke) => {
                 let place = self.place(stroke.key == KeyCode::Enter);
-                Some(assistant_action(&self.assistant.key(*stroke, &place, host)))
+                let outcome = self.assistant.key(*stroke, &place, host);
+                Some(self.assistant_outcome(outcome))
             }
             Event::Paste(text) => {
                 self.assistant.paste(text);
@@ -1371,16 +1372,104 @@ impl ReviewApp {
     }
 }
 
-/// The run loop's action for what the assistant panel did.
-const fn assistant_action(outcome: &crate::assistant::Outcome) -> Action {
-    match outcome {
-        crate::assistant::Outcome::Ignored => Action::None,
-        crate::assistant::Outcome::Redraw => Action::Redraw,
-        crate::assistant::Outcome::OpenSession(session_id) => Action::OpenSession {
-            session_id: *session_id,
-        },
+impl ReviewApp {
+    /// The run loop's action for what the assistant panel did; a Draft comment drafts on the
+    /// review on screen.
+    fn assistant_outcome(&mut self, outcome: crate::assistant::Outcome) -> Action {
+        match outcome {
+            crate::assistant::Outcome::Ignored => Action::None,
+            crate::assistant::Outcome::Redraw => Action::Redraw,
+            crate::assistant::Outcome::OpenSession(session_id) => {
+                Action::OpenSession { session_id }
+            }
+            crate::assistant::Outcome::DraftComment(body) => {
+                let result = match &mut self.route {
+                    Route::Review(review) => review.draft_comment_at_cursor(body),
+                    _ => Err("open a review to draft a comment".to_owned()),
+                };
+                match result {
+                    Ok(done) => self.assistant.set_notice(done, false),
+                    Err(error) => self.assistant.set_notice(error, true),
+                }
+                Action::Redraw
+            }
+        }
+    }
+
+    /// What the route asked of the assistant since the last call.
+    fn take_assistant_requests(&mut self) -> Vec<crate::assistant::LinkRequest> {
+        match &mut self.route {
+            Route::Home => self
+                .home
+                .as_mut()
+                .map(|home| home.take_assistant_requests())
+                .unwrap_or_default(),
+            Route::Wizard(wizard) => wizard.take_assistant_requests(),
+            Route::Review(review) => review.take_assistant_requests(),
+            Route::Opening(_) => Vec::new(),
+        }
+    }
+
+    /// Run what the route asked of the assistant: a panel action from its palette (opening
+    /// the panel for those shown in it), or a model or effort choice for a question or card.
+    fn run_assistant_requests(&mut self, host: &UiContext) -> Option<Action> {
+        let requests = self.take_assistant_requests();
+        if requests.is_empty() {
+            return None;
+        }
+        let mut action = Action::Redraw;
+        for request in requests {
+            match request {
+                crate::assistant::LinkRequest::Action(name) => {
+                    let overlay = matches!(
+                        name.as_str(),
+                        "assistant_model" | "assistant_permissions" | "assistant_tools"
+                    );
+                    if !overlay {
+                        self.assistant.focus();
+                    }
+                    let place = self.place(true);
+                    let outcome = self.assistant.run_action(&name, &place, host);
+                    let result = self.assistant_outcome(outcome);
+                    if result != Action::Redraw && result != Action::None {
+                        action = result;
+                    }
+                }
+                crate::assistant::LinkRequest::Model(target) => {
+                    self.assistant.open_model_picker(target, host);
+                }
+                crate::assistant::LinkRequest::Effort(target) => {
+                    self.assistant.cycle_effort(&target, host);
+                }
+            }
+        }
+        Some(action)
+    }
+
+    /// Give the review the assistant's `model · effort` labels for its question composer and
+    /// cards, asking for the cards' sessions' models not known yet.
+    fn share_model_labels(&mut self, host: &UiContext) {
+        let Route::Review(review) = &mut self.route else {
+            return;
+        };
+        let sessions = review.card_sessions(MAX_CARD_MODELS);
+        self.assistant.learn_models(&sessions, host);
+        let labels = sessions
+            .iter()
+            .filter(|session| self.assistant.models().session(session).is_some())
+            .map(|session| {
+                (
+                    session.clone(),
+                    self.assistant.model_effort_label(Some(session)),
+                )
+            })
+            .collect();
+        review.set_model_labels(self.assistant.model_effort_label(None), labels);
     }
 }
+
+/// Ask AI cards whose session's model the review shows at most.
+const MAX_CARD_MODELS: usize = 16;
 
 /// Create a durable workspace.
 async fn create_workspace(
@@ -1501,6 +1590,7 @@ impl View for ReviewApp {
                     frame,
                 );
             }
+            self.assistant.paint_overlay(area, &self.theme, frame);
             if let Some(overlay) = self.appearance.as_mut() {
                 overlay.paint(&self.theme, area, frame);
             }
@@ -1510,6 +1600,9 @@ impl View for ReviewApp {
     fn handle_event(&mut self, event: &Event, host: &UiContext) -> EventResult {
         if let Some(result) = self.appearance_event(event, host) {
             return result;
+        }
+        if let Some(outcome) = self.assistant.overlay_event(event, host) {
+            return EventResult::from_action(self.assistant_outcome(outcome));
         }
         if let Some(action) = self.assistant_event(event, host) {
             self.refresh_keymap(host);
@@ -1521,6 +1614,11 @@ impl View for ReviewApp {
             if result.action == Action::None {
                 result = EventResult::from_action(Action::Redraw);
             }
+        }
+        if let Some(action) = self.run_assistant_requests(host)
+            && matches!(result.action, Action::None | Action::Redraw)
+        {
+            result = EventResult::from_action(action);
         }
         if self.open_requested_appearance(host) && result.action == Action::None {
             result = EventResult::from_action(Action::Redraw);
@@ -1534,6 +1632,12 @@ impl View for ReviewApp {
         if self.take_assistant_request() {
             self.assistant.toggle();
         }
+        if let Some(requested) = self.run_assistant_requests(host)
+            && matches!(action, Action::None | Action::Redraw)
+        {
+            action = requested;
+        }
+        self.share_model_labels(host);
         if self.poll_assistant(host) && action == Action::None {
             action = Action::Redraw;
         }

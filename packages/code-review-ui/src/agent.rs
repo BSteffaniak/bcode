@@ -627,6 +627,11 @@ pub async fn ask(
             )
             .await
             .map_err(|error| error.message)?;
+        // The app default model and effort apply before the question; a refused model
+        // leaves Bcode's default.
+        let _ =
+            crate::assistant::models::apply_default(&services, scope.repo_path.clone(), &session)
+                .await;
         services
             .call(bcode_code_review_models::BindReviewAssistantRequest {
                 repo_path: scope.repo_path.clone(),
@@ -793,14 +798,11 @@ impl AgentState {
                     bcode_session_models::ModelTurnOutcome::Error
                         | bcode_session_models::ModelTurnOutcome::IdleTimeout
                         | bcode_session_models::ModelTurnOutcome::ProviderUnavailable
+                        | bcode_session_models::ModelTurnOutcome::ToolRoundLimitReached
                 )
             );
         if failed {
-            let message = snapshot
-                .runtime
-                .last_turn_message
-                .clone()
-                .unwrap_or_else(|| "linked Bcode turn failed".to_owned());
+            let message = turn_failure(outcome, snapshot.runtime.last_turn_message.as_deref());
             feed.push(FeedItem::Error(message.clone()));
             return Self {
                 answer,
@@ -858,6 +860,32 @@ impl AgentState {
             status: message,
             ..Self::waiting()
         }
+    }
+}
+
+/// Why a turn ended without an answer, as the conversation says it: Bcode's message, with
+/// what to do for the reasons the app knows.
+#[must_use]
+pub fn turn_failure(
+    outcome: Option<bcode_session_models::ModelTurnOutcome>,
+    message: Option<&str>,
+) -> String {
+    use bcode_session_models::ModelTurnOutcome;
+    let message = message.map(str::trim).filter(|message| !message.is_empty());
+    match outcome {
+        Some(ModelTurnOutcome::ToolRoundLimitReached) => format!(
+            "the assistant stopped at its tool-round limit{}; ask it to continue",
+            message.map_or_else(String::new, |message| format!(" ({message})"))
+        ),
+        Some(ModelTurnOutcome::ProviderUnavailable) => format!(
+            "{} — check the model Bcode uses and its sign-in",
+            message.unwrap_or("the model provider could not be reached")
+        ),
+        Some(ModelTurnOutcome::IdleTimeout) => format!(
+            "{} — the model stopped answering; send again",
+            message.unwrap_or("the turn timed out")
+        ),
+        _ => message.unwrap_or("linked Bcode turn failed").to_owned(),
     }
 }
 
@@ -966,6 +994,8 @@ pub struct AgentStreams {
     keys: FeedKeys,
     keys_revision: u64,
     revision: u64,
+    /// Each session's `model · effort`, as the assistant names it.
+    model_labels: BTreeMap<String, String>,
 }
 
 impl AgentStreams {
@@ -997,6 +1027,20 @@ impl AgentStreams {
     #[must_use]
     pub fn clock(&self, session_id: &str) -> LiveClock {
         self.clocks.get(session_id).copied().unwrap_or_default()
+    }
+
+    /// The `model · effort` of `session_id`, once known.
+    #[must_use]
+    pub fn model_label(&self, session_id: &str) -> Option<&str> {
+        self.model_labels.get(session_id).map(String::as_str)
+    }
+
+    /// Show `label` as the `model · effort` of `session_id` on its card.
+    pub fn set_model_label(&mut self, session_id: &str, label: String) {
+        if self.model_labels.get(session_id) != Some(&label) {
+            self.model_labels.insert(session_id.to_owned(), label);
+            self.bump(session_id);
+        }
     }
 
     /// Keys shown on the feed's buttons.

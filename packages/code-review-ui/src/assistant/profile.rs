@@ -139,6 +139,11 @@ pub struct AssistantConfig {
     pub categories: BTreeMap<Category, bool>,
     /// Exact names of other Bcode tools to expose.
     pub extra: Vec<String>,
+    /// The model new conversations and card sessions get until one is chosen in the app:
+    /// `model` or `provider/model`.
+    pub model: Option<String>,
+    /// The reasoning effort they get until one is chosen in the app.
+    pub effort: Option<String>,
 }
 
 impl Default for AssistantConfig {
@@ -149,6 +154,8 @@ impl Default for AssistantConfig {
                 .map(|category| (category, true))
                 .collect(),
             extra: Vec::new(),
+            model: None,
+            effort: None,
         }
     }
 }
@@ -167,6 +174,15 @@ impl AssistantConfig {
             problems.push(format!("{prefix} must be a table"));
             return (config, problems);
         };
+        for (key, slot) in [("model", &mut config.model), ("effort", &mut config.effort)] {
+            match assistant.get(key) {
+                None => {}
+                Some(toml::Value::String(text)) if !text.trim().is_empty() => {
+                    *slot = Some(text.trim().to_owned());
+                }
+                Some(_) => problems.push(format!("{prefix}.{key} must be a non-empty string")),
+            }
+        }
         let Some(tools) = assistant.get("tools") else {
             return (config, problems);
         };
@@ -204,6 +220,22 @@ impl AssistantConfig {
             }
         }
         (config, problems)
+    }
+
+    /// The configured app default: provider (when `model` names one), model and effort.
+    #[must_use]
+    pub fn default_settings(&self) -> bcode_code_review_models::ReviewAssistantSettings {
+        let (provider, model) = match self.model.as_deref().map(|model| model.split_once('/')) {
+            Some(Some((provider, model))) => (Some(provider.to_owned()), Some(model.to_owned())),
+            Some(None) => (None, self.model.clone()),
+            None => (None, None),
+        };
+        bcode_code_review_models::ReviewAssistantSettings {
+            provider_plugin_id: provider,
+            model_id: model,
+            effort: self.effort.clone(),
+            updated_at_ms: 0,
+        }
     }
 
     /// The tool selection of the profile: the enabled categories' tools and `extra`, sorted.
@@ -351,6 +383,25 @@ mod tests {
         assert_eq!(profile.id, PROFILE_ID);
         assert_eq!(profile.base_agent, BASE_AGENT);
         assert_eq!(profile.tools, tools);
+    }
+
+    #[test]
+    fn model_and_effort_seed_the_app_default() {
+        let (config, problems) =
+            parse("[assistant]\nmodel = \"bcode.fake-provider/fake-echo\"\neffort = \"high\"\n");
+        assert_eq!(problems, Vec::<String>::new());
+        let settings = config.default_settings();
+        assert_eq!(
+            settings.provider_plugin_id.as_deref(),
+            Some("bcode.fake-provider")
+        );
+        assert_eq!(settings.model_id.as_deref(), Some("fake-echo"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        let (config, _) = parse("[assistant]\nmodel = \"fake-echo\"\n");
+        assert_eq!(config.default_settings().provider_plugin_id, None);
+        let (config, problems) = parse("[assistant]\nmodel = 3\n");
+        assert_eq!(config.model, None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     #[test]

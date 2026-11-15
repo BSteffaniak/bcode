@@ -13,8 +13,10 @@
 
 pub mod actions;
 pub mod button;
+pub mod chips;
 pub mod context;
 pub mod history;
+pub mod models;
 pub mod panel;
 pub mod picker;
 pub mod profile;
@@ -22,6 +24,37 @@ pub mod profile;
 pub use panel::{Assistant, Dock, Outcome, Split};
 
 use bcode_code_review_models::{ReviewAssistantBinding, ReviewAssistantTag};
+
+/// The panel's actions a screen's command palette lists (and runs on the panel).
+pub const PALETTE_ACTIONS: &[&str] = &[
+    "assistant_model",
+    "assistant_effort",
+    "assistant_permissions",
+    "assistant_tools",
+    "assistant_new",
+    "assistant_history",
+    "assistant_open",
+    "assistant_delete",
+    "assistant_delete_all",
+];
+
+/// The command palette entries of the panel's actions, with their keys in the panel.
+#[must_use]
+pub fn palette_entries(host: &crate::context::UiContext) -> Vec<crate::palette::OverlayEntry> {
+    let actions: Vec<bcode_keymap::KeymapAction> = crate::keymap::actions_for(ASSISTANT_SCOPE)
+        .into_iter()
+        .filter(|action| {
+            PALETTE_ACTIONS
+                .iter()
+                .any(|name| action.id == format!("bcode.code_review.{name}"))
+        })
+        .map(|mut action| {
+            action.description = format!("Assistant: {}", action.description);
+            action
+        })
+        .collect();
+    crate::palette::entries(&actions, |id| host.keymap_keys(ASSISTANT_SCOPE, id), None)
+}
 
 /// Keymap scope of the focused panel.
 pub const ASSISTANT_SCOPE: &str = crate::keymap::ASSISTANT_SCOPE;
@@ -32,12 +65,25 @@ pub const HISTORY_SCOPE: &str = crate::keymap::ASSISTANT_HISTORY_SCOPE;
 ///
 /// That is whether the user asked it to open, focus or close the panel (a key or the palette),
 /// and the cells left free at the end of its header row for the Ask AI button.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScreenLink {
     /// The user asked to open, focus or close the panel.
     pub requested: bool,
     /// Cells left free at the end of the header row.
     pub header_reserve: u16,
+    /// What the screen asked of the assistant since the last call, oldest first.
+    pub requests: Vec<LinkRequest>,
+}
+
+/// Something a screen asks of the assistant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRequest {
+    /// Run one of the panel's actions (from a screen's palette).
+    Action(String),
+    /// Open the model picker for a target.
+    Model(models::Target),
+    /// Cycle a target's reasoning effort.
+    Effort(models::Target),
 }
 
 impl ScreenLink {
@@ -46,6 +92,11 @@ impl ScreenLink {
         let requested = self.requested;
         self.requested = false;
         requested
+    }
+
+    /// What the screen asked of the assistant since the last call.
+    pub fn take_requests(&mut self) -> Vec<LinkRequest> {
+        std::mem::take(&mut self.requests)
     }
 }
 

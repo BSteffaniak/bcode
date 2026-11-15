@@ -252,6 +252,8 @@ pub enum AgentAction {
     Never,
     /// Stop the session's running turn.
     Stop,
+    /// Choose the model of the session.
+    Model,
     /// Open or close the feed item at this index of the card's turn (reasoning, tool output).
     Toggle(u16),
 }

@@ -87,6 +87,20 @@ pub enum OverlayKind {
     StackFile,
     /// Files several layers of a stack change.
     Overlaps,
+    /// The assistant's model picker (filterable).
+    Models,
+    /// The assistant's permission categories.
+    Permissions,
+    /// The assistant's tools.
+    Tools,
+}
+
+impl OverlayKind {
+    /// Whether the overlay has a filter input.
+    #[must_use]
+    pub const fn filters(self) -> bool {
+        matches!(self, Self::Palette | Self::Models)
+    }
 }
 
 /// Action id prefix of the palette's go-to-line entry (followed by the line number).
@@ -180,7 +194,7 @@ impl Overlay {
             .trim_start_matches(':')
             .parse::<u32>()
             .ok()
-            .filter(|line| *line > 0);
+            .filter(|line| *line > 0 && self.kind == OverlayKind::Palette);
         let query = if line.is_some() { String::new() } else { query };
         let words: Vec<&str> = query.split_whitespace().collect();
         self.shown = self
@@ -285,13 +299,19 @@ impl Overlay {
             OverlayKind::Menu => (" Actions ", "enter run · esc close"),
             OverlayKind::StackFile => (" This file through the stack ", "enter go to · esc close"),
             OverlayKind::Overlaps => (" Files several layers change ", "enter go to · esc close"),
+            OverlayKind::Models => (" Model ", "type to filter · enter choose · esc close"),
+            OverlayKind::Permissions => (
+                " Assistant permissions ",
+                "enter turn on or off for this conversation · esc close",
+            ),
+            OverlayKind::Tools => (" Assistant tools ", "enter how to change · esc close"),
         };
         let max = Size::new(
             area.width.saturating_sub(4).min(84),
             area.height.saturating_sub(2),
         );
         let mut policy = PickerFramePolicy::palette().max_size(max);
-        policy.input = self.kind == OverlayKind::Palette;
+        policy.input = self.kind.filters();
         policy.header = false;
         policy.margin = bmux_tui::geometry::Insets::all(1);
         policy.min_size = Size::new(area.width.min(20), area.height.min(5));
@@ -302,11 +322,16 @@ impl Overlay {
             .styles(theme.component.picker_frame_styles())
             .chrome(theme.component.chrome);
         let component = PickerFrameComponent::new(FRAME_ID, frame, self.menu_component(theme));
-        if self.kind == OverlayKind::Palette {
+        if self.kind.filters() {
+            let placeholder = if self.kind == OverlayKind::Models {
+                "type to filter models"
+            } else {
+                "type to filter commands"
+            };
             component.input(
                 TextInputComponent::new(INPUT_ID, &self.input, &self.policy)
                     .style(theme.input)
-                    .placeholder("type to filter commands", theme.placeholder)
+                    .placeholder(placeholder, theme.placeholder)
                     .focused(true),
             )
         } else {
@@ -353,7 +378,7 @@ impl Overlay {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End => return self.navigate(stroke),
-            KeyCode::Char('j' | 'k') if self.kind != OverlayKind::Palette && plain => {
+            KeyCode::Char('j' | 'k') if !self.kind.filters() && plain => {
                 let key = if stroke.key == KeyCode::Char('j') {
                     KeyCode::Down
                 } else {
@@ -363,7 +388,7 @@ impl Overlay {
             }
             _ => {}
         }
-        if self.kind != OverlayKind::Palette {
+        if !self.kind.filters() {
             return OverlayOutcome::Ignored;
         }
         let outcome =
@@ -380,7 +405,7 @@ impl Overlay {
 
     /// Insert pasted text into the palette filter.
     pub fn paste(&mut self, text: &str, theme: &ReviewTheme) -> OverlayOutcome {
-        if self.kind != OverlayKind::Palette {
+        if !self.kind.filters() {
             return OverlayOutcome::Ignored;
         }
         TextInputControl::new(&self.policy).handle_paste(&mut self.input.borrow_mut(), text);

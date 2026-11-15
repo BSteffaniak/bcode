@@ -365,6 +365,21 @@ impl ReviewSurface {
                 composer.severity = notes::next_severity(composer.severity);
                 composer.touch();
             }
+            // A question's model and effort are the app default its new session gets.
+            Some("composer_model") if composer.mode == ComposerMode::Ask => {
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Model(
+                        crate::assistant::models::Target::AppDefault,
+                    ));
+            }
+            Some("composer_effort") if composer.mode == ComposerMode::Ask => {
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Effort(
+                        crate::assistant::models::Target::AppDefault,
+                    ));
+            }
             _ => match composer.key(stroke) {
                 ComposerInput::Submit => self.submit_composer(),
                 ComposerInput::Edited => self.complete_paths(host),
@@ -416,6 +431,12 @@ impl ReviewSurface {
                 composer.touch();
             }
             ComposerButton::Cancel => self.close_composer(),
+            ComposerButton::Model => self
+                .link
+                .requests
+                .push(crate::assistant::LinkRequest::Model(
+                    crate::assistant::models::Target::AppDefault,
+                )),
             ComposerButton::Suggestion(index) => composer.accept_suggestion(index),
         }
     }
@@ -717,6 +738,15 @@ impl ReviewSurface {
             AgentAction::Suggest => self.suggest_from_answer(),
             AgentAction::Draft => self.draft_from_answer(),
             AgentAction::Copy => self.copy_answer(),
+            AgentAction::Model => {
+                let target = self.card_at_cursor().map_or(
+                    crate::assistant::models::Target::AppDefault,
+                    |(_, session)| crate::assistant::models::Target::Session(session),
+                );
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Model(target));
+            }
             AgentAction::Open | AgentAction::Retry | AgentAction::Delete => {
                 return self.exchange_action(action);
             }

@@ -268,10 +268,10 @@ impl ReviewSurface {
                         "thread {thread} is in another layer ({source}); name its layer with `layer`"
                     ))
                 }
-                Some(_) => match self.hidden_refusal(&format!("thread {thread}"), &key) {
-                    Some(refusal) => Err(refusal),
-                    None => Ok((thread, key)),
-                },
+                Some(_) => {
+                    let refusal = self.hidden_refusal(&format!("thread {thread}"), &key);
+                    refusal.map_or(Ok((thread, key)), Err)
+                }
             }
         });
         let thread = thread.transpose()?;
@@ -281,10 +281,8 @@ impl ReviewSurface {
             .map(|path| {
                 let within = alone.as_deref().filter(|_| target.source.is_none());
                 let file = self.find_file(path, target.source.as_deref(), within)?;
-                match self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone())) {
-                    Some(refusal) => Err(refusal),
-                    None => Ok(file),
-                }
+                let refusal = self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone()));
+                refusal.map_or(Ok(file), Err)
             })
             .transpose()?;
         let mut done = Vec::new();

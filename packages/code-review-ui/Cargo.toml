@@ -21,6 +21,7 @@ bcode_config_layers = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_keymap = { workspace = true }
 bcode_markdown_render = { workspace = true }
+bcode_model = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_view = { workspace = true, features = ["client"] }
 bcode_session_view_models = { workspace = true }

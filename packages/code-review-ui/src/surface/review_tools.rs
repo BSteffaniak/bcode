@@ -86,6 +86,11 @@ struct NavigateArguments {
 }
 
 impl ReviewSurface {
+    /// What the screen asked of the assistant since the last call.
+    pub fn take_assistant_requests(&mut self) -> Vec<crate::assistant::LinkRequest> {
+        self.link.take_requests()
+    }
+
     /// The review's `assistant_toggle` action ran since the last call.
     pub const fn take_assistant_request(&mut self) -> bool {
         self.link.take_request()

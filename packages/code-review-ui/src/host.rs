@@ -168,6 +168,88 @@ pub struct TurnRequest {
     pub context: Vec<ContextBlock>,
     /// Agent profile of the turn; the session's agent when `None`.
     pub agent: Option<String>,
+    /// Exact tool names the turn may be offered (intersected with the profile by Bcode); every
+    /// tool of the profile when `None`.
+    pub tool_allowlist: Option<Vec<String>>,
+}
+
+/// A model Bcode offers, as the review app lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelOption {
+    /// Model-provider plugin serving it; Bcode's default provider when `None`.
+    pub provider: Option<String>,
+    /// Display name of the provider, when known.
+    pub provider_name: Option<String>,
+    /// Model id.
+    pub model_id: String,
+    /// Display name.
+    pub display_name: String,
+    /// Context window in tokens, when known.
+    pub context_window: Option<u32>,
+    /// Input and output prices per million tokens, formatted with their currency, when known.
+    pub price: Option<(String, String)>,
+    /// Reasoning effort values the model accepts, in order.
+    pub effort_values: Vec<String>,
+    /// The model's default effort, when known.
+    pub default_effort: Option<String>,
+}
+
+impl ModelOption {
+    /// Whether this option is `provider`'s `model_id` (a missing provider matches any).
+    #[must_use]
+    pub fn is(&self, provider: Option<&str>, model_id: &str) -> bool {
+        self.model_id == model_id
+            && (provider.is_none()
+                || self.provider.is_none()
+                || self.provider.as_deref() == provider)
+    }
+}
+
+/// One model provider's models, or why they could not be listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModels {
+    /// Model-provider plugin id.
+    pub provider: String,
+    /// Display name.
+    pub name: String,
+    /// Its models, or the reason listing them failed.
+    pub models: Result<Vec<ModelOption>, String>,
+}
+
+/// The models Bcode offers: its default model and each model provider's models.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelCatalog {
+    /// Bcode's default model, or why it is unknown.
+    pub default: Option<Result<ModelOption, String>>,
+    /// Each model provider's models, in Bcode's order.
+    pub providers: Vec<ProviderModels>,
+}
+
+impl ModelCatalog {
+    /// The listed option for `provider`'s `model_id`, when listed.
+    #[must_use]
+    pub fn find(&self, provider: Option<&str>, model_id: &str) -> Option<&ModelOption> {
+        self.providers
+            .iter()
+            .filter_map(|listed| listed.models.as_ref().ok())
+            .flatten()
+            .find(|option| option.is(provider, model_id))
+            .or_else(|| {
+                self.default
+                    .as_ref()
+                    .and_then(|default| default.as_ref().ok())
+                    .filter(|option| option.is(provider, model_id))
+            })
+    }
+}
+
+/// A session's model and reasoning effort, as Bcode reports them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionModel {
+    /// The session's model, as a listed option would describe it (effort values included).
+    pub model: ModelOption,
+    /// The selected effort; the model's default when `None`.
+    pub effort: Option<String>,
 }
 
 /// Error code of a turn whose request-only context the daemon no longer holds.
@@ -379,6 +461,40 @@ pub trait ReviewHost: Send + Sync {
     fn delete_session(&self, session_id: String) -> HostFuture<()> {
         let _ = session_id;
         Box::pin(async { Err(HostError::failed("this host cannot delete sessions")) })
+    }
+
+    /// The models Bcode offers: its default model and each model provider's models, each
+    /// listing bounded in time.
+    fn model_catalog(&self) -> HostFuture<ModelCatalog> {
+        Box::pin(async { Err(HostError::failed("this host cannot list models")) })
+    }
+
+    /// The model and reasoning effort of `session_id`.
+    fn session_model(&self, session_id: String) -> HostFuture<SessionModel> {
+        let _ = session_id;
+        Box::pin(async { Err(HostError::failed("this host cannot read session models")) })
+    }
+
+    /// Run `session_id`'s turns with `provider`'s `model_id` from its next turn on.
+    fn set_session_model(
+        &self,
+        session_id: String,
+        provider: Option<String>,
+        model_id: String,
+    ) -> HostFuture<()> {
+        let _ = (session_id, provider, model_id);
+        Box::pin(async { Err(HostError::failed("this host cannot choose models")) })
+    }
+
+    /// Run `session_id`'s turns with reasoning `effort` (the model's default when `None`) from
+    /// its next turn on.
+    fn set_session_reasoning(&self, session_id: String, effort: Option<String>) -> HostFuture<()> {
+        let _ = (session_id, effort);
+        Box::pin(async {
+            Err(HostError::failed(
+                "this host cannot choose reasoning effort",
+            ))
+        })
     }
 
     /// Permission requests waiting for an answer, in every session.
@@ -683,6 +799,79 @@ impl StandaloneHost {
     }
 }
 
+/// How long one model listing may take before it is reported as not answering.
+const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Input and output prices per million tokens, formatted with their currency.
+fn price_of(pricing: Option<&bcode_model::ModelPricingInfo>) -> Option<(String, String)> {
+    let pricing = pricing?;
+    let format = |price: Option<bcode_model::ModelTokenPrice>| {
+        price.map(|price| {
+            let cents = price.micros.div_ceil(10_000);
+            let amount = format!("{}.{:02}", cents / 100, cents % 100);
+            if pricing.currency == "USD" {
+                format!("${amount}")
+            } else {
+                format!("{amount} {}", pricing.currency)
+            }
+        })
+    };
+    Some((format(pricing.input)?, format(pricing.output)?))
+}
+
+fn model_option_of_info(
+    model: &bcode_model::ModelInfo,
+    provider: &str,
+    provider_name: &str,
+) -> ModelOption {
+    ModelOption {
+        provider: Some(provider.to_owned()),
+        provider_name: Some(provider_name.to_owned()),
+        model_id: model.model_id.clone(),
+        display_name: model.display_name.clone(),
+        context_window: model.context_window,
+        price: price_of(model.pricing.as_ref()),
+        effort_values: model
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort_values.clone())
+            .unwrap_or_default(),
+        default_effort: model
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.default_effort.clone()),
+    }
+}
+
+fn model_option_of_status(status: &bcode_model::SessionModelStatus) -> ModelOption {
+    let model_id = status
+        .requested_model_id
+        .clone()
+        .or_else(|| status.effective_model_id.clone())
+        .or_else(|| status.model_id.clone())
+        .unwrap_or_default();
+    ModelOption {
+        provider: status.provider_plugin_id.clone(),
+        provider_name: None,
+        display_name: status
+            .display_name
+            .clone()
+            .unwrap_or_else(|| model_id.clone()),
+        model_id,
+        context_window: status.context_window,
+        price: price_of(status.pricing.as_ref()),
+        effort_values: status
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort_values.clone())
+            .unwrap_or_default(),
+        default_effort: status
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.default_effort.clone()),
+    }
+}
+
 fn parse_session(session_id: &str) -> Result<SessionId, HostError> {
     session_id
         .parse::<SessionId>()
@@ -764,6 +953,7 @@ impl ReviewHost for StandaloneHost {
             let admission = bcode_session_models::TurnAdmissionMetadata {
                 execution: bcode_session_models::TurnExecutionOptions {
                     agent_profile: request.agent,
+                    tool_allowlist: request.tool_allowlist,
                     ..bcode_session_models::TurnExecutionOptions::default()
                 },
                 context,
@@ -871,6 +1061,112 @@ impl ReviewHost for StandaloneHost {
                 .delete_session(id)
                 .await
                 .map(drop)
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn model_catalog(&self) -> HostFuture<ModelCatalog> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let client = bcode.client().await?;
+            let default =
+                match tokio::time::timeout(MODEL_LIST_TIMEOUT, client.default_model_status()).await
+                {
+                    Ok(Ok(status)) => Some(Ok(model_option_of_status(&status))),
+                    Ok(Err(error)) => Some(Err(bcode.failure(&error).message)),
+                    Err(_) => Some(Err("Bcode did not answer in time".to_owned())),
+                };
+            let services = client
+                .plugin_services()
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            let mut providers: Vec<(String, String)> = Vec::new();
+            for service in services {
+                if service.interface_id != bcode_model::MODEL_PROVIDER_INTERFACE_ID
+                    || providers.iter().any(|(id, _)| *id == service.plugin_id)
+                {
+                    continue;
+                }
+                let name = service
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| service.plugin_id.clone());
+                providers.push((service.plugin_id, name));
+            }
+            let mut listed = Vec::new();
+            for (provider, name) in providers {
+                let models = match tokio::time::timeout(
+                    MODEL_LIST_TIMEOUT,
+                    client.session_model_list(Some(provider.clone())),
+                )
+                .await
+                {
+                    Ok(Ok(list)) => Ok(list
+                        .models
+                        .iter()
+                        .filter(|model| model.visibility == bcode_model::ModelVisibility::Visible)
+                        .map(|model| model_option_of_info(model, &provider, &name))
+                        .collect()),
+                    Ok(Err(error)) => Err(bcode.failure(&error).message),
+                    Err(_) => Err("the provider did not answer in time".to_owned()),
+                };
+                listed.push(ProviderModels {
+                    provider,
+                    name,
+                    models,
+                });
+            }
+            Ok(ModelCatalog {
+                default,
+                providers: listed,
+            })
+        })
+    }
+
+    fn session_model(&self, session_id: String) -> HostFuture<SessionModel> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            let status = bcode
+                .client()
+                .await?
+                .session_model_status(id)
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            Ok(SessionModel {
+                model: model_option_of_status(&status),
+                effort: status.reasoning_effort.clone(),
+            })
+        })
+    }
+
+    fn set_session_model(
+        &self,
+        session_id: String,
+        provider: Option<String>,
+        model_id: String,
+    ) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            bcode
+                .client()
+                .await?
+                .set_session_model(id, provider, model_id)
+                .await
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn set_session_reasoning(&self, session_id: String, effort: Option<String>) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            bcode
+                .client()
+                .await?
+                .set_session_reasoning(id, effort, None)
+                .await
                 .map_err(|error| bcode.failure(&error))
         })
     }

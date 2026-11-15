@@ -6,6 +6,7 @@ mod appearance;
 mod assistant;
 mod assistant_actions;
 mod assistant_context;
+mod assistant_models;
 mod benchmark;
 mod chrome;
 mod compare;

@@ -469,6 +469,20 @@ keymap_actions = [
     { id = "bcode.code_review.assistant_scroll_down", scope = "code-review-assistant", description = "Scroll the conversation down", defaults = [
         "pagedown",
     ] },
+    { id = "bcode.code_review.assistant_model", scope = "code-review-assistant", description = "Choose the assistant's model", defaults = [
+        "alt+m",
+    ] },
+    { id = "bcode.code_review.assistant_effort", scope = "code-review-assistant", description = "Cycle the assistant's reasoning effort", defaults = [
+        "shift+tab",
+    ] },
+    { id = "bcode.code_review.assistant_permissions", scope = "code-review-assistant", description = "Turn the assistant's permission categories on or off for this conversation", defaults = [
+        "alt+p",
+    ] },
+    { id = "bcode.code_review.assistant_tools", scope = "code-review-assistant", description = "List the assistant's tools and how Bcode decides them", defaults = [
+        "alt+t",
+    ] },
+    { id = "bcode.code_review.assistant_delete_all", scope = "code-review-assistant", description = "Delete every conversation the review app started (asks first)", defaults = [
+    ] },
     { id = "bcode.code_review.history_up", scope = "code-review-assistant-history", description = "Previous conversation", defaults = [
         "up",
         "ctrl+p",
@@ -507,6 +521,18 @@ keymap_actions = [
     { id = "bcode.code_review.feed_stop", scope = "code-review-feed", description = "Stop the AI card's running turn", defaults = [
         "esc",
         "ctrl+c",
+    ] },
+    { id = "bcode.code_review.feed_model", scope = "code-review-feed", description = "Choose the model of the AI card's session", defaults = [
+        "alt+m",
+    ] },
+    { id = "bcode.code_review.feed_effort", scope = "code-review-feed", description = "Cycle the reasoning effort of the AI card's session", defaults = [
+        "shift+tab",
+    ] },
+    { id = "bcode.code_review.composer_model", scope = "code-review-composer", description = "Choose the model a question is asked with", defaults = [
+        "alt+m",
+    ] },
+    { id = "bcode.code_review.composer_effort", scope = "code-review-composer", description = "Cycle the reasoning effort a question is asked with", defaults = [
+        "shift+tab",
     ] },
     { id = "bcode.code_review.composer_submit", scope = "code-review-composer", description = "Save the comment", defaults = [
         "ctrl+s",

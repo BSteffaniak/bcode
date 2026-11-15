@@ -1054,12 +1054,18 @@ impl Home {
             "home_exit" => return HomeOutcome::Exit,
             "home_assistant" => self.link.requested = true,
             "home_palette" => {
-                let entries = super::palette::entries(
+                let mut entries = super::palette::entries(
                     &crate::keymap::actions_for(HOME_SCOPE),
                     |id| host.keymap_keys(HOME_SCOPE, id),
                     None,
                 );
+                entries.extend(crate::assistant::palette_entries(host));
                 self.overlay = Some(Overlay::new(OverlayKind::Palette, entries, theme));
+            }
+            assistant if crate::assistant::PALETTE_ACTIONS.contains(&assistant) => {
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Action(assistant.to_owned()));
             }
             _ => return HomeOutcome::Ignored,
         }
@@ -1451,6 +1457,11 @@ impl Home {
     #[must_use]
     pub const fn shows_header(height: u16) -> bool {
         height >= 3
+    }
+
+    /// What the screen asked of the assistant since the last call.
+    pub fn take_assistant_requests(&mut self) -> Vec<crate::assistant::LinkRequest> {
+        self.link.take_requests()
     }
 
     /// The `home_assistant` or palette action ran since the last call.

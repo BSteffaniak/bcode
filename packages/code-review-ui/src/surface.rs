@@ -4164,7 +4164,9 @@ impl ReviewSurface {
             ));
             entries
         } else {
-            super::palette::entries(&review, keys(SCOPE), None)
+            let mut entries = super::palette::entries(&review, keys(SCOPE), None);
+            entries.extend(crate::assistant::palette_entries(host));
+            entries
         };
         let kind = if help {
             super::palette::OverlayKind::Help
@@ -4220,6 +4222,12 @@ impl ReviewSurface {
     fn run_action(&mut self, action: &str, count: Option<u32>, host: &UiContext) -> Action {
         if action == "assistant_toggle" {
             self.link.requested = true;
+            return Action::Redraw;
+        }
+        if crate::assistant::PALETTE_ACTIONS.contains(&action) {
+            self.link
+                .requests
+                .push(crate::assistant::LinkRequest::Action(action.to_owned()));
             return Action::Redraw;
         }
         if let Some(result) = self.surface_action(action, count, host) {

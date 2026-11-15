@@ -251,10 +251,10 @@ fn a_message_whose_request_only_context_was_lost_is_sent_again_once() {
         setup
             .app()
             .assistant()
-            .notice()
-            .is_some_and(|notice| notice.contains("could not send")),
-        "{:?}",
-        setup.app().assistant().notice()
+            .failure()
+            .is_some_and(|failure| failure.contains("could not send")),
+        "the conversation says why: {:?}",
+        setup.app().assistant().failure()
     );
 }
 

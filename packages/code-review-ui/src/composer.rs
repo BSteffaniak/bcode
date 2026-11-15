@@ -71,6 +71,8 @@ pub enum ComposerButton {
     Preview,
     /// Cancel.
     Cancel,
+    /// Choose the model a question is asked with.
+    Model,
     /// Accept the `@path` suggestion at this index.
     Suggestion(u16),
 }
@@ -129,6 +131,8 @@ pub struct Composer {
     pub remote_reply: Option<crate::config::conversation::ReplyMode>,
     /// The thread a question is asked from (its comments go with the question).
     pub thread: Option<String>,
+    /// The model and effort a question is asked with, as the assistant names them.
+    pub model_label: Option<String>,
     policy: TextInputPolicy,
     revision: u64,
     completion_generation: u64,
@@ -154,9 +158,18 @@ impl Composer {
             completion: None,
             remote_reply: None,
             thread: None,
+            model_label: None,
             policy,
             revision: 0,
             completion_generation: 0,
+        }
+    }
+
+    /// Show `label` as the model a question is asked with.
+    pub fn set_model_label(&mut self, label: Option<String>) {
+        if self.model_label != label {
+            self.model_label = label;
+            self.touch();
         }
     }
 
@@ -463,6 +476,9 @@ impl Composer {
         };
         let mut parts: Vec<(String, Option<ComposerButton>)> =
             vec![(submit.to_owned(), Some(ComposerButton::Submit))];
+        if let (ComposerMode::Ask, Some(label)) = (&self.mode, &self.model_label) {
+            parts.push((format!(" ● {label} ▾ "), Some(ComposerButton::Model)));
+        }
         match self.remote_reply {
             Some(ReplyMode::SendNow) => {
                 parts.push((

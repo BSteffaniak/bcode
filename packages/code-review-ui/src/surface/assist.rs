@@ -448,6 +448,27 @@ impl ReviewSurface {
         self.set_status("added a suggested review comment", StatusSeverity::Success);
     }
 
+    /// Draft a comment with `body` at the cursor (its selected range, line or file header), as
+    /// the assistant panel's Draft comment does. Returns what was drafted.
+    ///
+    /// # Errors
+    ///
+    /// * The review is loading, or the cursor is on nothing a comment can be anchored to.
+    pub fn draft_comment_at_cursor(&mut self, body: String) -> Result<String, String> {
+        let anchor = self
+            .cursor_anchor()
+            .ok_or_else(|| "move the cursor to a line to draft a comment there".to_owned())?;
+        let label = anchor
+            .file
+            .as_ref()
+            .map_or_else(|| "the review".to_owned(), |file| file.path.clone());
+        self.notes
+            .add_draft(anchor.to_draft_anchor(), body, None, None, now_ms());
+        self.sync_notes();
+        self.set_status("drafted the assistant's answer", StatusSeverity::Success);
+        Ok(format!("drafted a comment on {label}"))
+    }
+
     /// Turn the cursor's AI answer into a draft comment at its anchor.
     pub(super) fn draft_from_answer(&mut self) {
         let Some((exchange, answer)) = self.answer_at_cursor() else {
