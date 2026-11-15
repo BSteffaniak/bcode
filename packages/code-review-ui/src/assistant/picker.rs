@@ -40,6 +40,8 @@ pub struct HistoryLoad {
     pub degraded: bool,
     /// Sessions waiting on a permission answer.
     pub needs_you: BTreeSet<String>,
+    /// Cursor of Bcode's next catalog page, when the catalog has more sessions than listed.
+    pub next_cursor: Option<String>,
 }
 
 /// Read and merge the history of the repository at `repo`.
@@ -112,7 +114,48 @@ pub async fn load(services: ReviewServices, repo: PathBuf) -> Result<HistoryLoad
         rows,
         degraded: page.degraded,
         needs_you,
+        next_cursor: page.next_cursor,
     })
+}
+
+/// Conversations "delete every conversation" lists at most in one run.
+pub const MAX_DELETE_ALL: usize = 1_000;
+
+/// Every conversation the review app started (the history's rows, then Bcode's further catalog
+/// pages), at most [`MAX_DELETE_ALL`]; and whether more remain unlisted.
+///
+/// # Errors
+///
+/// * Why Bcode or the review store could not be read.
+pub async fn list_all(
+    services: ReviewServices,
+    repo: PathBuf,
+) -> Result<(Vec<String>, bool), String> {
+    let load = load(services.clone(), repo.clone()).await?;
+    let mut sessions: Vec<String> = load.rows.into_iter().map(|row| row.session_id).collect();
+    let mut known: BTreeSet<String> = sessions.iter().cloned().collect();
+    let mut cursor = load.next_cursor;
+    let host = services.host();
+    while let Some(next) = cursor.take() {
+        if sessions.len() >= MAX_DELETE_ALL {
+            return Ok((sessions, true));
+        }
+        let page = host
+            .list_app_sessions(
+                repo.clone(),
+                Some(next),
+                crate::host::MAX_APP_SESSION_PAGE.min(MAX_DELETE_ALL - sessions.len()),
+            )
+            .await
+            .map_err(|error| error.message)?;
+        for session in page.sessions {
+            if known.insert(session.id.clone()) {
+                sessions.push(session.id);
+            }
+        }
+        cursor = page.next_cursor;
+    }
+    Ok((sessions, false))
 }
 
 /// State of the open history picker.

@@ -214,12 +214,15 @@ enum Done {
         default: Option<bcode_code_review_models::ReviewAssistantSettings>,
         result: Result<String, String>,
     },
-    /// The app's sessions to delete, listed for the confirmation.
-    ListedAll(Result<Vec<String>, String>),
-    /// Every listed session was deleted, except those Bcode refused.
+    /// The app's sessions to delete, listed for the confirmation, and whether more remain
+    /// unlisted.
+    ListedAll(Result<(Vec<String>, bool), String>),
+    /// Every listed session was deleted, except those Bcode refused; `more` when sessions
+    /// remained unlisted.
     DeletedAll {
         deleted: Vec<String>,
         refused: Vec<(String, String)>,
+        more: bool,
     },
 }
 
@@ -252,7 +255,7 @@ enum Mode {
     /// Asking before deleting the active conversation.
     ConfirmDelete,
     /// Asking before deleting every conversation the review app started (these sessions).
-    ConfirmDeleteAll(Vec<String>),
+    ConfirmDeleteAll(Vec<String>, bool),
 }
 
 /// What the last frame painted, for pointer input.
@@ -1507,7 +1510,9 @@ impl Assistant {
         }
         match &self.mode {
             Mode::Rename(_) => return self.rename_key(stroke, ui),
-            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(_) => return self.confirm_key(stroke, ui),
+            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(..) => {
+                return self.confirm_key(stroke, ui);
+            }
             Mode::Chat => {}
         }
         // A pending permission prompt takes the feed keys (the input is hidden meanwhile).
@@ -1584,7 +1589,7 @@ impl Assistant {
         match stroke.key {
             KeyCode::Char('y') | KeyCode::Enter => {
                 match std::mem::replace(&mut self.mode, Mode::Chat) {
-                    Mode::ConfirmDeleteAll(sessions) => self.delete_all(sessions, ui),
+                    Mode::ConfirmDeleteAll(sessions, more) => self.delete_all(sessions, more, ui),
                     _ => {
                         if let Some(session) = self.session.clone() {
                             self.delete(session, ui);
@@ -1690,7 +1695,7 @@ impl Assistant {
             Mode::Rename(input) => {
                 TextInputControl::new(&RENAME_POLICY).handle_paste(&mut input.borrow_mut(), text);
             }
-            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(_) => {}
+            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(..) => {}
             Mode::Chat if self.prompt_pending() => {}
             Mode::Chat => {
                 TextInputControl::new(&self.policy)
@@ -2149,15 +2154,19 @@ impl Assistant {
                 }
             }
             Done::ListedAll(result) => match result {
-                Ok(sessions) if sessions.is_empty() => {
+                Ok((sessions, _)) if sessions.is_empty() => {
                     self.notice = Some(("the review app has no conversations".to_owned(), false));
                 }
-                Ok(sessions) => self.mode = Mode::ConfirmDeleteAll(sessions),
+                Ok((sessions, more)) => self.mode = Mode::ConfirmDeleteAll(sessions, more),
                 Err(error) => {
                     self.notice = Some((format!("could not list conversations: {error}"), true));
                 }
             },
-            Done::DeletedAll { deleted, refused } => {
+            Done::DeletedAll {
+                deleted,
+                refused,
+                more,
+            } => {
                 if let Some(picker) = self.picker.as_mut() {
                     for session in &deleted {
                         picker.remove(session);
@@ -2178,6 +2187,9 @@ impl Assistant {
                 if let Some((_, reason)) = refused.first() {
                     use std::fmt::Write as _;
                     let _ = write!(notice, "; Bcode kept {} ({reason})", refused.len());
+                }
+                if more {
+                    notice.push_str("; more remain, delete every conversation again for the rest");
                 }
                 self.notice = Some((notice, !refused.is_empty()));
             }
@@ -2586,18 +2598,13 @@ impl Assistant {
         let repo = self.repo.clone();
         let inbox = Arc::clone(&self.inbox);
         ui.spawn(Box::pin(async move {
-            let result = super::picker::load(services, repo).await.map(|load| {
-                load.rows
-                    .into_iter()
-                    .map(|row| row.session_id)
-                    .collect::<Vec<_>>()
-            });
+            let result = super::picker::list_all(services, repo).await;
             push(&inbox, Done::ListedAll(result));
         }));
     }
 
     /// Stop, delete and unbind each of `sessions`; sessions Bcode refuses are kept.
-    fn delete_all(&self, sessions: Vec<String>, ui: &UiContext) {
+    fn delete_all(&self, sessions: Vec<String>, more: bool, ui: &UiContext) {
         let working: BTreeSet<String> = sessions
             .iter()
             .filter(|session| {
@@ -2630,7 +2637,14 @@ impl Assistant {
                     Err(error) => refused.push((session, error.message)),
                 }
             }
-            push(&inbox, Done::DeletedAll { deleted, refused });
+            push(
+                &inbox,
+                Done::DeletedAll {
+                    deleted,
+                    refused,
+                    more,
+                },
+            );
         }));
     }
 
@@ -2791,7 +2805,7 @@ impl Assistant {
                 push(Some("esc".to_owned()), "cancel");
                 return hints;
             }
-            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(_) => {
+            Mode::ConfirmDelete | Mode::ConfirmDeleteAll(..) => {
                 push(Some("y".to_owned()), "delete");
                 push(Some("n".to_owned()), "keep");
                 return hints;
@@ -3122,13 +3136,20 @@ impl Assistant {
                     theme.pill_warning,
                 )])));
             }
-            Mode::ConfirmDeleteAll(sessions) => {
+            Mode::ConfirmDeleteAll(sessions, more) => {
                 let count = sessions.len();
-                return content.child(one_line(Line::from_spans(vec![Span::styled(
+                let plural = if count == 1 { "" } else { "s" };
+                let question = if *more {
                     format!(
-                        "Delete all {count} conversation{} the review app started from Bcode? y delete · n keep",
-                        if count == 1 { "" } else { "s" }
-                    ),
+                        "Delete the newest {count} conversation{plural} the review app started from Bcode (more remain)? y delete · n keep"
+                    )
+                } else {
+                    format!(
+                        "Delete all {count} conversation{plural} the review app started from Bcode? y delete · n keep"
+                    )
+                };
+                return content.child(one_line(Line::from_spans(vec![Span::styled(
+                    question,
                     theme.pill_warning,
                 )])));
             }
