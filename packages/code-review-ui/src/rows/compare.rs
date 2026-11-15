@@ -566,6 +566,14 @@ pub fn hunk_label(
     let phrase = since.phrase();
     let separator = theme.icons.separator;
     match item.since_lines? {
+        // A comment, a draft, or the composer in the hunk keeps it open: nothing to click.
+        0 if marks.seen == SeenHunks::Fold && item.held_open => Some((
+            vec![
+                format!("nothing new since {phrase}{separator}kept open"),
+                "nothing new".to_owned(),
+            ],
+            None,
+        )),
         0 if marks.seen == SeenHunks::Fold && item.folded => {
             let lines = plural(item.new_count.max(item.old_count) as usize, "line");
             Some((
@@ -1065,6 +1073,7 @@ mod tests {
             layers: vec![3],
             since_lines,
             folded,
+            held_open: false,
         }
     }
 
@@ -1115,14 +1124,28 @@ mod tests {
         let (variants, _) =
             label(&hunk(Some(0), false), Since::Push(2), SeenHunks::Fold).expect("label");
         assert_eq!(variants[0], "[nothing new since push 2 · fold]");
+        // Held open by something anchored in it: said so, with no button that would do nothing.
+        let held = HunkHeaderItem {
+            held_open: true,
+            ..hunk(Some(0), false)
+        };
+        let (variants, action) = label(&held, Since::LastLooked, SeenHunks::Fold).expect("label");
+        assert_eq!(variants[0], "nothing new since you looked · kept open");
+        assert_eq!(action, None);
+        assert_eq!(label(&held, Since::LastLooked, SeenHunks::Show), None);
     }
 
     #[test]
     fn hunk_headers_fit_every_width_and_their_buttons_cover_the_painted_label() {
         let theme = theme();
+        let held = HunkHeaderItem {
+            held_open: true,
+            ..hunk(Some(0), false)
+        };
         for (item, seen) in [
             (hunk(Some(0), true), SeenHunks::Fold),
             (hunk(Some(0), false), SeenHunks::Fold),
+            (held, SeenHunks::Fold),
             (hunk(Some(4), false), SeenHunks::Show),
             (hunk(Some(0), false), SeenHunks::Dim),
         ] {
@@ -1156,7 +1179,9 @@ mod tests {
                 if width >= 80 {
                     let text = painted(&rows);
                     match seen {
-                        SeenHunks::Fold => assert_eq!(rows.actions.len(), 1, "{text:?}"),
+                        SeenHunks::Fold => {
+                            assert_eq!(rows.actions.len(), usize::from(!item.held_open), "{text:?}")
+                        }
                         SeenHunks::Show => {
                             assert!(text.contains("new since the previous push · 4 lines"));
                         }

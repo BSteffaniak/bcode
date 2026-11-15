@@ -369,18 +369,25 @@ impl ReviewDocument {
     }
 
     /// Show the folded hunk of `file` starting at new-side line `new_start` (or fold it again).
-    /// Returns whether the file has such a hunk.
+    /// Returns whether the file has such a hunk: one with nothing new since the baseline,
+    /// while such hunks fold, that nothing anchored in it holds open.
     pub fn toggle_seen_hunk(&mut self, file: &FileKey, new_start: u32) -> bool {
+        if !self.fold_seen_hunks {
+            return false;
+        }
         let Some(&index) = self.file_index.get(file) else {
             return false;
         };
-        let has = self.files[index].loaded().is_some_and(|loaded| {
-            loaded
-                .hunks
-                .iter()
-                .any(|hunk| hunk.range.new_start == new_start)
-        });
-        if !has {
+        let foldable = self.blocks[self.files[index].block]
+            .items
+            .iter()
+            .any(|item| match item {
+                super::items::ReviewItem::HunkHeader(hunk) => {
+                    hunk.new_start == new_start && hunk.seen() && !hunk.held_open
+                }
+                _ => false,
+            });
+        if !foldable {
             return false;
         }
         let key = (file.clone(), new_start);

@@ -325,6 +325,9 @@ pub struct HunkHeaderItem {
     pub since_lines: Option<u32>,
     /// Whether the hunk, with nothing new since the baseline, is folded to this header.
     pub folded: bool,
+    /// Whether the hunk has nothing new since the baseline but cannot fold, because a comment,
+    /// a draft, or the composer is anchored in it.
+    pub held_open: bool,
 }
 
 impl HunkHeaderItem {

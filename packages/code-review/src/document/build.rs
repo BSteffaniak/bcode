@@ -862,10 +862,11 @@ impl FileBuilder<'_> {
         self.hunk_seen = since_lines == Some(0);
         // A hunk seen before folds to its header, unless something is anchored in it or it
         // was shown again.
+        let held_open = self.hunk_seen && self.anchors_in(hunk);
         let folded = self.hunk_seen
+            && !held_open
             && self.doc.fold_seen_hunks
-            && !self.doc.hunk_revealed(&self.key, hunk.range.new_start)
-            && !self.anchors_in(hunk);
+            && !self.doc.hunk_revealed(&self.key, hunk.range.new_start);
         self.push(
             ReviewItem::HunkHeader(HunkHeaderItem {
                 file: self.key.clone(),
@@ -877,6 +878,7 @@ impl FileBuilder<'_> {
                 layers,
                 since_lines,
                 folded,
+                held_open,
             }),
             header,
         );

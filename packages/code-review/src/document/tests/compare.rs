@@ -887,3 +887,51 @@ fn a_document_that_replaces_another_folds_and_shows_hunks_as_it_did() {
     assert!(refreshed.toggle_seen_hunk(&file("e.txt"), seen_start));
     assert!(hunk_headers(&refreshed)[0].2);
 }
+
+#[test]
+fn a_hunk_held_open_by_a_draft_does_not_toggle_and_folds_once_the_draft_is_gone() {
+    let layer = two_hunk_layer();
+    let service = ReviewData::default();
+    let mut doc = open(&service, &layer);
+    serve(&service, &mut doc);
+    doc.set_comparison(
+        SOURCE,
+        Some(GroupComparison {
+            delta: Some(delta(&service, &layer)),
+            view: CompareView::Full,
+            ..GroupComparison::default()
+        }),
+    );
+    serve(&service, &mut doc);
+    let seen_start = hunk_headers(&doc)[0].0;
+    let held = |doc: &ReviewDocument| {
+        items(doc).iter().find_map(|item| match item {
+            ReviewItem::HunkHeader(hunk) if hunk.new_start == seen_start => {
+                Some((hunk.folded, hunk.held_open))
+            }
+            _ => None,
+        })
+    };
+    // Nothing toggles while hunks seen before do not fold.
+    assert!(!doc.toggle_seen_hunk(&file("e.txt"), seen_start));
+    let key = ItemKey::Line {
+        file: doc.file_keys().next().expect("a file").clone(),
+        side: ReviewLineSide::New,
+        line: 5,
+    };
+    let anchor = doc.anchor_for(&key).expect("anchor");
+    doc.set_annotations(&Annotations {
+        drafts: vec![draft("t1", &anchor)],
+        ..Annotations::default()
+    });
+    doc.set_fold_seen_hunks(true);
+    assert_eq!(held(&doc), Some((false, true)));
+    // The hunk cannot fold, so a click on it does nothing and leaves nothing behind.
+    assert!(!doc.toggle_seen_hunk(&file("e.txt"), seen_start));
+    // The draft gone, the hunk folds.
+    doc.set_annotations(&Annotations::default());
+    assert_eq!(held(&doc), Some((true, false)));
+    // The rewritten hunk has something new: nothing to fold there either.
+    let new_start = hunk_headers(&doc)[1].0;
+    assert!(!doc.toggle_seen_hunk(&file("e.txt"), new_start));
+}
