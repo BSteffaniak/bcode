@@ -1427,14 +1427,18 @@ impl<'a> ReviewTools<'a> {
             files.push(self.find_file(review, path, None)?);
         }
         let fingerprints = self.fingerprints_of(review, &files)?;
-        let base = review.viewed_record();
+        let base = self.current_viewed_record(review)?;
         let mut record = base.clone();
+        let mut identities = Vec::new();
         for (index, entry) in &files {
             let (patch, content) = fingerprints
                 .get(&(*index, entry.path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            let identity = EntryIdentity::from_entry(entry).with_content(content.as_deref());
+            identities.push((EntryIdentity::from_entry(entry), patch, content));
+        }
+        for (entry, patch, content) in &identities {
+            let identity = entry.clone().with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
             if viewed {
                 crate::viewed::mark_viewed(&mut record, &identity);
@@ -1442,20 +1446,81 @@ impl<'a> ReviewTools<'a> {
                 crate::viewed::unmark_viewed(&mut record, &identity);
             }
         }
-        self.store.update_workspace(UpdateReviewWorkspaceRequest {
-            repo_path: review.repo_root.clone(),
-            workspace: record,
-            base: Some(base),
-        })?;
-        let names: Vec<&str> = files.iter().map(|(_, entry)| entry.path.as_str()).collect();
+        let written = self
+            .store
+            .update_workspace(UpdateReviewWorkspaceRequest {
+                repo_path: review.repo_root.clone(),
+                workspace: record,
+                base: Some(base),
+            })?
+            .workspace;
+        // Say what the store holds now, which another writer may have changed meanwhile.
+        let (mut done, mut other) = (Vec::new(), Vec::new());
+        for (entry, patch, content) in &identities {
+            let identity = entry.clone().with_content(content.as_deref());
+            let identity = identity.with_patch(patch.as_deref());
+            let is_viewed = crate::viewed::viewed_state(&written, &identity, ViewedReset::Diff)
+                != ViewedState::Unviewed;
+            let path = identity.path.to_string();
+            if is_viewed == viewed {
+                done.push(path);
+            } else {
+                other.push(path);
+            }
+        }
+        let (state, opposite) = if viewed {
+            ("viewed", "not viewed")
+        } else {
+            ("not viewed", "viewed")
+        };
+        let mut message = if done.is_empty() {
+            String::new()
+        } else {
+            format!("marked {} {state}", done.join(", "))
+        };
+        if !other.is_empty() {
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            let _ = write!(
+                message,
+                "{} {} {opposite}: another writer changed {} meanwhile",
+                other.join(", "),
+                if other.len() == 1 { "is" } else { "are" },
+                if other.len() == 1 { "it" } else { "them" },
+            );
+        }
         Ok(Written {
-            message: format!(
-                "marked {} {}",
-                names.join(", "),
-                if viewed { "viewed" } else { "not viewed" }
-            ),
+            message,
             thread_id: None,
             id: None,
+        })
+    }
+
+    /// The viewed record as stored now, read after the slow work so marks compare against what
+    /// the reviewer and other writers left since the review was opened. A saved review deleted
+    /// meanwhile gives its own copy, whose write then reports the deletion.
+    fn current_viewed_record(
+        &self,
+        review: &OpenReview,
+    ) -> Result<ReviewWorkspace, AssistantError> {
+        let own = review.viewed_record();
+        let stored = self.saved(&review.repo_root, &own.id)?;
+        Ok(match stored {
+            Some(stored) if review.is_transient() => ReviewWorkspace {
+                viewed_files: stored.viewed_files,
+                viewed_marks: stored.viewed_marks,
+                viewed_threads: stored.viewed_threads,
+                ..own
+            },
+            Some(stored) => stored,
+            None if review.is_transient() => ReviewWorkspace {
+                viewed_files: std::collections::BTreeSet::new(),
+                viewed_marks: Vec::new(),
+                viewed_threads: Vec::new(),
+                ..own
+            },
+            None => own,
         })
     }
 

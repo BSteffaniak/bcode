@@ -917,6 +917,80 @@ fn viewed_marks_a_tool_wrote_survive_the_open_reviews_own_saves() {
     assert!(shown(&setup).contains(&paths[0]), "{:?}", shown(&setup));
 }
 
+/// A mark the tool asks for after the reviewer changed the same file since the tool opened the
+/// review is written and reported as what the store now holds.
+#[test]
+fn a_tool_mark_after_the_reviewer_unmarked_the_file_is_written_and_reported() {
+    let setup = setup(160, 50, true);
+    let path = setup
+        .app()
+        .review()
+        .and_then(|review| review.document())
+        .and_then(|doc| doc.file_keys().next().map(|file| file.path.clone()))
+        .expect("a file");
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let reference = ReviewRef::Workspace(setup.review.id.clone());
+    let mut reviewer = ReviewTools::new(&data, services.store());
+    let opened = reviewer
+        .open(&setup.review.repo_root, &reference)
+        .expect("saved review");
+    reviewer
+        .mark_viewed(&opened, std::slice::from_ref(&path), true)
+        .expect("marked");
+    // The tool opens the review with the file viewed.
+    let mut tool = ReviewTools::new(&data, services.store());
+    let stale = tool
+        .open(&setup.review.repo_root, &reference)
+        .expect("saved review");
+    let viewed_now = || {
+        stored_review(&setup)
+            .expect("saved")
+            .viewed_files
+            .contains(&path)
+    };
+    // The reviewer unmarks it before the tool marks it again.
+    let unmark = |reviewer: &mut ReviewTools<'_>| {
+        let opened = reviewer
+            .open(&setup.review.repo_root, &reference)
+            .expect("saved review");
+        reviewer
+            .mark_viewed(&opened, std::slice::from_ref(&path), false)
+            .expect("unmarked");
+        assert!(!viewed_now());
+    };
+    unmark(&mut reviewer);
+    let selection = bcode_code_review::assistant::manage::FileSelection {
+        paths: vec![path.clone()],
+        ..Default::default()
+    };
+    let report = tool
+        .mark_viewed_selection(
+            &stale,
+            &selection,
+            true,
+            bcode_code_review::viewed::ViewedReset::Diff,
+        )
+        .expect("marked");
+    assert_eq!(report.changed, [path.clone()], "{report:?}");
+    assert!(
+        viewed_now(),
+        "the tool's mark is stored: {}",
+        report.message
+    );
+    // The same through the single-file write.
+    unmark(&mut reviewer);
+    let written = tool
+        .mark_viewed(&stale, std::slice::from_ref(&path), true)
+        .expect("marked");
+    assert!(
+        viewed_now(),
+        "the tool's mark is stored: {}",
+        written.message
+    );
+    assert_eq!(written.message, format!("marked {path} viewed"));
+}
+
 /// A reload that read the store before the review's own save landed does not undo that save
 /// on screen: it is read again.
 #[test]

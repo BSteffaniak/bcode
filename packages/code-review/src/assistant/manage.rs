@@ -430,7 +430,7 @@ impl ReviewTools<'_> {
         // The same path in several layers is one file to the reviewer's marks.
         selected.dedup_by(|a, b| a.1.path == b.1.path);
         let fingerprints = self.fingerprints_of(review, &selected)?;
-        let base = review.viewed_record();
+        let base = self.current_viewed_record(review)?;
         let mut record = base.clone();
         let mut changed = Vec::new();
         let mut kept = Vec::new();
