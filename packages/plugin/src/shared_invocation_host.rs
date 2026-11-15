@@ -82,22 +82,19 @@ fn dispatch_bound(
     if request.operation != expected {
         return Err(protocol("host operation family mismatch"));
     }
-    let response =
-        binding
-            .context
-            .bridge
-            .request(&product_request)
-            .map_err(|failure| match failure {
-                bcode_plugin_sdk::ServiceBridgeError::Host { status }
-                    if status == crate::NATIVE_BRIDGE_CANCELLED_BEFORE_DISPATCH =>
-                {
-                    bmux_plugin_sdk::PluginError::InvocationCancelled
-                }
-                // Cancelled from arbitrary bridge implementations carries no phase
-                // proof. A real/uncertain error after effects remains transport failure.
-                _ => protocol("authorized product host operation failed"),
-            })?;
-    serde_json::to_vec(&response).map_err(|_| protocol("product host response encoding failed"))
+    let outcome = match binding.context.bridge.request(&product_request) {
+        // Proven rejection before dispatch stays a typed port rejection, so the
+        // author sees cancellation without the host call poisoning its port.
+        Err(bcode_plugin_sdk::ServiceBridgeError::Host { status })
+            if status == crate::NATIVE_BRIDGE_CANCELLED_BEFORE_DISPATCH =>
+        {
+            return Err(bmux_plugin_sdk::PluginError::InvocationCancelled);
+        }
+        // After dispatch, success and failure alike are product outcomes the
+        // author must observe; the port transport itself succeeded.
+        result => bcode_plugin_sdk::definition::ProductHostOutcome::from_result(result),
+    };
+    serde_json::to_vec(&outcome).map_err(|_| protocol("product host response encoding failed"))
 }
 /// Explicit extension-call services bound to one real invocation scope.
 pub struct ExtensionDispatch {

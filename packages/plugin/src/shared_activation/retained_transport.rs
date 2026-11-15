@@ -344,9 +344,15 @@ impl RetainedHostDispatch for ProductHostSession {
             .transport
             .lock()
             .map_err(|_| host_session_error("transport ledger poisoned"))?;
-        let settled = ledger.joined && ledger.records.values().all(|record| record.acknowledged);
+        // A released session is closed and joined at the product level: it
+        // admits no further transport begin (see `begin`), so the owner's
+        // retirement settles the transport even when the author observer never
+        // sent an explicit JOIN. Unacknowledged outcomes still keep it pinned.
+        let released = self.inner.released.load(Ordering::Acquire);
+        let settled = (ledger.joined || released)
+            && ledger.records.values().all(|record| record.acknowledged);
         drop(ledger);
-        Ok(settled && self.inner.released.load(Ordering::Acquire))
+        Ok(settled && released)
     }
 }
 

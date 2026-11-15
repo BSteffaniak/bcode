@@ -1,4 +1,5 @@
 //! Shared native ABI loading. Retained read/ack outcomes never replay plugin work.
+use super::shared_activation::bounded_join;
 use crate::{PluginLoadError, PluginManifest};
 use bmux_plugin_sdk::abi::{NativeOperation, NativeOutcome};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -14,6 +15,18 @@ mod blocking;
 #[path = "runtime_native_lifecycle.rs"]
 mod lifecycle;
 use lifecycle::{Ledger, Phase, StepKind};
+
+/// Wake target for one polled native operation.
+#[derive(Default)]
+struct OperationWake(tokio::sync::Notify);
+impl std::task::Wake for OperationWake {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.notify_one();
+    }
+}
 
 struct LifecycleReservation<'a>(&'a AtomicBool);
 impl Drop for LifecycleReservation<'_> {
@@ -141,9 +154,12 @@ pub struct SharedNative {
     snapshot: Mutex<Option<Snapshot>>,
     lifecycle: Mutex<Ledger>,
     lifecycle_busy: AtomicBool,
-    workers: blocking::NativeWorkers,
-    control_workers: blocking::NativeWorkers,
+    workers: Arc<blocking::NativeWorkers>,
+    control_workers: Arc<blocking::NativeWorkers>,
     selected_host: Arc<Mutex<Option<Arc<NativeSelectedHost>>>>,
+    // The loader's actual activation, observed when it binds the retained host,
+    // with the ledger of host resources charged to it.
+    activation: Arc<Mutex<Option<bcode_plugin_sdk::definition::ActivationResources>>>,
     host_sessions: Arc<
         Mutex<
             std::collections::BTreeMap<
@@ -178,6 +194,8 @@ impl SharedNative {
             .map_err(|_| reject())?;
         // The registered session resource pins the actual native execution/image;
         // author table references are observers, never the final cleanup owner.
+        // Retained work runs on the selected reactor, not the caller's runtime.
+        let _reactor = self.host.driver.runtime_handle().enter();
         let session = super::shared_activation::ProductHostSession::from_scope(
             scope,
             services,
@@ -284,8 +302,17 @@ impl SharedNative {
         let retained_execution = Arc::downgrade(&execution);
         let selected_host = Arc::new(Mutex::new(None));
         let selected_binding = Arc::clone(&selected_host);
+        let selected_activation = Arc::new(Mutex::new(None));
+        let activation_binding = Arc::clone(&selected_activation);
         execution
             .bind_retained_host_factory(Arc::new(move |activation| {
+                *activation_binding.lock().map_err(|_| {
+                    bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "native selected activation poisoned".to_string(),
+                    }
+                })? = Some(bcode_plugin_sdk::definition::ActivationResources::new(
+                    activation.clone(),
+                ));
                 let dispatch = Arc::new(NativeSelectedHost {
                     activation: activation.clone(),
                     context: context.clone(),
@@ -303,19 +330,20 @@ impl SharedNative {
             .map_err(|_| error(&manifest.id, "native_retained_factory_negotiation"))?;
         Ok(Self {
             selected_host,
+            activation: selected_activation,
             host_sessions,
             execution,
             host,
             snapshot: Mutex::new(None),
             lifecycle: Mutex::new(Ledger::new()),
             lifecycle_busy: AtomicBool::new(false),
-            workers: blocking::NativeWorkers::new(
+            workers: Arc::new(blocking::NativeWorkers::new(
                 std::num::NonZeroUsize::new(bmux_plugin_sdk::abi::MAX_OPERATIONS)
                     .expect("native operation capacity is positive"),
-            ),
-            control_workers: blocking::NativeWorkers::new(
+            )),
+            control_workers: Arc::new(blocking::NativeWorkers::new(
                 std::num::NonZeroUsize::new(1).expect("control capacity is positive"),
-            ),
+            )),
             unused_invocations: Mutex::new(Vec::new()),
         })
     }
@@ -333,64 +361,88 @@ impl SharedNative {
         plugin_id: &str,
         cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
     ) -> Result<NativeOutcome, PluginLoadError> {
-        let outcome = self.poll_outcome(id, plugin_id, cancellation)?;
-        self.host
-            .drive(self.execution.acknowledge(id))
-            .map_err(|_| error(plugin_id, "shared_native_ack"))?;
+        let settled = self
+            .host
+            .drive(self.settlement(id, cancellation.cloned(), true));
+        self.settled(plugin_id, settled)
+    }
+
+    /// Settle an operation from an asynchronous caller without blocking its
+    /// thread. The settlement runs to acknowledgement on the selected reactor,
+    /// so dropping this observer never strands an unacknowledged outcome.
+    async fn settle_async(
+        &self,
+        id: u64,
+        plugin_id: &str,
+    ) -> Result<NativeOutcome, PluginLoadError> {
+        let settled = self
+            .host
+            .driver
+            .runtime_handle()
+            .spawn(self.settlement(id, None, true))
+            .await
+            .unwrap_or_else(|_| {
+                Err(SettleFailure::recorded(
+                    "native_settlement_task",
+                    "native settlement task did not complete".to_owned(),
+                ))
+            });
+        self.settled(plugin_id, settled)
+    }
+
+    fn settled(
+        &self,
+        plugin_id: &str,
+        settled: Result<NativeOutcome, SettleFailure>,
+    ) -> Result<NativeOutcome, PluginLoadError> {
+        let outcome = settled.map_err(|failure| self.settle_failure(plugin_id, &failure))?;
         if matches!(outcome, NativeOutcome::Error { .. }) {
             return Err(error(plugin_id, "shared_native_operation"));
         }
         Ok(outcome)
     }
 
-    fn poll_outcome(
+    fn settle_failure(&self, plugin_id: &str, failure: &SettleFailure) -> PluginLoadError {
+        if failure.record {
+            self.record_failure(plugin_id, failure.stage, &failure.details)
+        } else {
+            error(plugin_id, failure.stage)
+        }
+    }
+
+    fn poll_outcome(&self, id: u64, plugin_id: &str) -> Result<NativeOutcome, PluginLoadError> {
+        let settled = self.host.drive(self.settlement(id, None, false));
+        settled.map_err(|failure| self.settle_failure(plugin_id, &failure))
+    }
+
+    /// Observe one operation to its final outcome, then optionally acknowledge
+    /// it. The future owns its execution and workers, so it may run on any
+    /// reactor and outlive the caller that started it.
+    fn settlement(
         &self,
         id: u64,
-        plugin_id: &str,
-        cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
-    ) -> Result<NativeOutcome, PluginLoadError> {
-        self.host.drive(async {
-            loop {
-                let execution = self.execution.clone();
-                let waker = std::future::poll_fn(|context| std::task::Poll::Ready(context.waker().clone())).await;
-                let job = self.workers.submit(move || {
-                    let mut context = std::task::Context::from_waker(&waker);
-                    execution.poll(id, &mut context).map_err(Box::new)
-                });
-                tokio::pin!(job);
-                let mut cancellation_forwarded = false;
-                let polled = loop {
-                    if let Some(cancellation) = cancellation {
-                        if !cancellation_forwarded && cancellation.is_cancelled() {
-                            let execution = self.execution.clone();
-                            // Cancellation has independent bounded control capacity,
-                            // even when every author worker is awaiting a host reply.
-                            self.control_workers.submit(move || execution.cancel(id).map_err(Box::new)).await
-                                .map_err(|details| self.record_failure(plugin_id, "native_cancel_worker", &details))?
-                                .map_err(|failure| self.record_failure(plugin_id, "native_cancel_failed", &failure.to_string()))?;
-                            cancellation_forwarded = true;
-                        }
-                        tokio::select! {
-                            outcome = &mut job => break outcome,
-                            () = tokio::time::sleep(std::time::Duration::from_millis(5)), if !cancellation_forwarded => {},
-                        }
-                    } else {
-                        break job.as_mut().await;
-                    }
-                }.map_err(|details| self.record_failure(plugin_id, "native_poll_worker", &details))?;
-                match polled {
-                    Ok(std::task::Poll::Ready(outcome)) => return Ok(outcome),
-                    Ok(std::task::Poll::Pending) => {
-                        // Native ABI is poll-driven. Timer suspension keeps the
-                        // async driver available for the callback's own future.
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    Err(failure) => {
-                        return Err(self.record_failure(plugin_id, "shared_native_poll", &failure.to_string()));
-                    },
-                }
+        cancellation: Option<bcode_plugin_sdk::ServiceCancellation>,
+        acknowledge: bool,
+    ) -> impl std::future::Future<Output = Result<NativeOutcome, SettleFailure>> + Send + 'static
+    {
+        let execution = Arc::clone(&self.execution);
+        let workers = Arc::clone(&self.workers);
+        let control = Arc::clone(&self.control_workers);
+        async move {
+            let outcome =
+                observe_outcome(&execution, &workers, &control, id, cancellation.as_ref()).await?;
+            if acknowledge {
+                execution
+                    .acknowledge(id)
+                    .await
+                    .map_err(|failure| SettleFailure {
+                        stage: "shared_native_ack",
+                        details: failure.to_string(),
+                        record: false,
+                    })?;
             }
-        })
+            Ok(outcome)
+        }
     }
 
     fn reserve_lifecycle(
@@ -450,7 +502,7 @@ impl SharedNative {
         let outcome = if let Some(outcome) = cached {
             outcome
         } else {
-            let outcome = self.poll_outcome(id, plugin_id, None)?;
+            let outcome = self.poll_outcome(id, plugin_id)?;
             self.lifecycle
                 .lock()
                 .map_err(|_| error(plugin_id, "native_lifecycle_poisoned"))?
@@ -479,6 +531,7 @@ impl SharedNative {
             // to be released first. The observed outcome stays cached in the
             // ledger, so a failed retirement retries here without replaying the hook.
             self.retire_host_sessions(plugin_id)?;
+            self.retire_activation_resources(plugin_id)?;
         }
         let repaired = kind == StepKind::Deactivate
             && (!self
@@ -529,7 +582,7 @@ impl SharedNative {
             if session.is_released() {
                 continue;
             }
-            self.host.drive(session.join()).map_err(|failure| {
+            self.host.drive(bounded_join(&session)).map_err(|failure| {
                 self.record_failure(plugin_id, "native_retained_host_join", &failure.to_string())
             })?;
             session.release().map_err(|failure| {
@@ -541,6 +594,47 @@ impl SharedNative {
             })?;
         }
         Ok(())
+    }
+
+    /// Retire host resources still charged to the activation once the author's
+    /// deactivation hook has settled, before acknowledgement finishes the
+    /// activation. Unreleasable entries stay retained and fail closed.
+    fn retire_activation_resources(&self, plugin_id: &str) -> Result<(), PluginLoadError> {
+        let resources = self
+            .activation
+            .lock()
+            .map_err(|_| error(plugin_id, "native_activation_poisoned"))?
+            .clone();
+        if let Some(resources) = resources {
+            resources.retire_all().map_err(|failure| {
+                self.record_failure(
+                    plugin_id,
+                    "native_activation_resource_release",
+                    &failure.to_string(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn active_resources(
+        &self,
+    ) -> bmux_plugin_sdk::definition::PluginResult<bcode_plugin_sdk::definition::ActivationResources>
+    {
+        bcode_plugin_sdk::definition::ProductExtensionPort::ensure_active(self)?;
+        self.activation
+            .lock()
+            .map_err(|_| {
+                bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "selected native activation poisoned",
+                )
+            })?
+            .clone()
+            .ok_or_else(|| {
+                bmux_plugin_sdk::PluginCommandError::unavailable(
+                    "selected native activation unavailable",
+                )
+            })
     }
 
     pub(super) fn activate(&self, plugin_id: &str) -> Result<(), PluginLoadError> {
@@ -722,7 +816,10 @@ impl SharedNative {
     ) -> Result<(), PluginLoadError> {
         let retired = invocation
             .close()
-            .and_then(|()| self.host.drive(invocation.drain()))
+            .and_then(|()| {
+                self.host
+                    .drive(invocation.drain_until(bmux_plugin_runtime::teardown_deadline()))
+            })
             .and_then(|()| invocation.finish());
         if let Err(failure) = retired {
             self.unused_invocations
@@ -819,7 +916,10 @@ impl SharedNative {
         for invocation in unused {
             if invocation
                 .close()
-                .and_then(|()| self.host.drive(invocation.drain()))
+                .and_then(|()| {
+                    self.host
+                        .drive(invocation.drain_until(bmux_plugin_runtime::teardown_deadline()))
+                })
                 .and_then(|()| invocation.finish())
                 .is_err()
             {
@@ -872,6 +972,27 @@ impl SharedNative {
             .map_err(|details| {
                 self.record_failure(plugin_id, "native_control_shutdown", &details)
             })?;
+        // An author observer that dropped the retained host while its session
+        // was still unresolved left the final transport release pending. The
+        // sessions are retired now, so retry that release (never producer
+        // work); a still-pending release keeps the execution image pinned.
+        let released = self
+            .execution
+            .retry_release_retained_host()
+            .map_err(|failure| {
+                self.record_failure(
+                    plugin_id,
+                    "native_retained_host_release",
+                    &failure.to_string(),
+                )
+            })?;
+        if !released {
+            return Err(self.record_failure(
+                plugin_id,
+                "native_retained_host_release_pending",
+                "retained host transport release still pending",
+            ));
+        }
         self.host
             .drive(self.execution.destroy())
             .map_err(|_| error(plugin_id, "destroy"))?;
@@ -881,6 +1002,12 @@ impl SharedNative {
             .map_err(|_| error(plugin_id, "deactivate"))?
             .take();
         drop(snapshot);
+        let activation = self
+            .activation
+            .lock()
+            .map_err(|_| error(plugin_id, "native_activation_poisoned"))?
+            .take();
+        drop(activation);
         self.lifecycle
             .lock()
             .map_err(|_| error(plugin_id, "native_lifecycle_poisoned"))?
@@ -972,7 +1099,7 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedNative {
                     "selected extension admission failed",
                 ));
             };
-            match self.settle(id, plugin_id).map_err(|_| {
+            match self.settle_async(id, plugin_id).await.map_err(|_| {
                 bmux_plugin_sdk::PluginCommandError::unavailable(
                     "selected extension settlement failed; do not replay",
                 )
@@ -983,6 +1110,17 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedNative {
                 )),
             }
         })
+    }
+    fn activation_scope(
+        &self,
+    ) -> bmux_plugin_sdk::definition::PluginResult<bmux_plugin_runtime::ActivationScope> {
+        Ok(self.active_resources()?.scope().clone())
+    }
+    fn activation_resources(
+        &self,
+    ) -> bmux_plugin_sdk::definition::PluginResult<bcode_plugin_sdk::definition::ActivationResources>
+    {
+        self.active_resources()
     }
     fn ensure_active(&self) -> bmux_plugin_sdk::definition::PluginResult<()> {
         let ledger = self.lifecycle.lock().map_err(|_| {
@@ -1036,11 +1174,14 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedNative {
                     )
                 })?;
             // The retained execution owns library, admission and outcome until ack.
-            match self.settle(id, &self.host.native.plugin_id).map_err(|_| {
-                bmux_plugin_sdk::PluginCommandError::unavailable(
-                    "native extension settlement failed; no replay",
-                )
-            })? {
+            match self
+                .settle_async(id, &self.host.native.plugin_id)
+                .await
+                .map_err(|_| {
+                    bmux_plugin_sdk::PluginCommandError::unavailable(
+                        "native extension settlement failed; no replay",
+                    )
+                })? {
                 NativeOutcome::Bytes(bytes) => Ok(bytes),
                 _ => Err(bmux_plugin_sdk::PluginCommandError::failed(
                     "unexpected native extension outcome",
@@ -1048,6 +1189,99 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedNative {
             }
         })
     }
+}
+
+/// A settlement failure, recorded in the lifecycle ledger by its owner.
+struct SettleFailure {
+    stage: &'static str,
+    details: String,
+    record: bool,
+}
+impl SettleFailure {
+    const fn recorded(stage: &'static str, details: String) -> Self {
+        Self {
+            stage,
+            details,
+            record: true,
+        }
+    }
+}
+
+/// Poll an admitted operation to its final outcome.
+///
+/// The loader arms a wake of the polling waker for every `Pending` (the
+/// operation itself, a host-wake guest, cancellation, or the ABI's legacy
+/// repoll), so the host suspends on that wake, never a timer. The permit
+/// survives a wake that lands before suspension.
+async fn observe_outcome(
+    execution: &Arc<bmux_plugin::LoadedExecution>,
+    workers: &blocking::NativeWorkers,
+    control: &blocking::NativeWorkers,
+    id: u64,
+    cancellation: Option<&bcode_plugin_sdk::ServiceCancellation>,
+) -> Result<NativeOutcome, SettleFailure> {
+    let wake = Arc::new(OperationWake::default());
+    let waker = std::task::Waker::from(Arc::clone(&wake));
+    let mut cancellation = cancellation;
+    loop {
+        let polled_execution = Arc::clone(execution);
+        let job_waker = waker.clone();
+        let job = workers.submit(move || {
+            let mut context = std::task::Context::from_waker(&job_waker);
+            polled_execution.poll(id, &mut context).map_err(Box::new)
+        });
+        tokio::pin!(job);
+        let polled = loop {
+            let Some(pending) = cancellation else {
+                break job.as_mut().await;
+            };
+            tokio::select! {
+                outcome = &mut job => break outcome,
+                () = pending.cancelled() => {
+                    forward_cancellation(execution, control, id).await?;
+                    cancellation = None;
+                }
+            }
+        }
+        .map_err(|details| SettleFailure::recorded("native_poll_worker", details))?;
+        match polled {
+            Ok(std::task::Poll::Ready(outcome)) => return Ok(outcome),
+            Ok(std::task::Poll::Pending) => loop {
+                let Some(pending) = cancellation else {
+                    wake.0.notified().await;
+                    break;
+                };
+                tokio::select! {
+                    () = wake.0.notified() => break,
+                    () = pending.cancelled() => {
+                        forward_cancellation(execution, control, id).await?;
+                        cancellation = None;
+                    }
+                }
+            },
+            Err(failure) => {
+                return Err(SettleFailure::recorded(
+                    "shared_native_poll",
+                    failure.to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Forward caller cancellation once. Cancellation has independent bounded
+/// control capacity, even when every author worker awaits a host reply.
+async fn forward_cancellation(
+    execution: &Arc<bmux_plugin::LoadedExecution>,
+    control: &blocking::NativeWorkers,
+    id: u64,
+) -> Result<(), SettleFailure> {
+    let execution = Arc::clone(execution);
+    control
+        .submit(move || execution.cancel(id).map_err(Box::new))
+        .await
+        .map_err(|details| SettleFailure::recorded("native_cancel_worker", details))?
+        .map_err(|failure| SettleFailure::recorded("native_cancel_failed", failure.to_string()))
 }
 
 fn error(plugin_id: &str, hook: &'static str) -> PluginLoadError {

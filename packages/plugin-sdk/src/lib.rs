@@ -217,6 +217,8 @@ struct ServiceCancellationState {
     cancelled: Arc<AtomicBool>,
     mutex: Mutex<()>,
     wakeup: Condvar,
+    // Async observers woken by `cancel` on this handle or any clone.
+    wakers: Mutex<Vec<std::task::Waker>>,
 }
 
 impl Default for ServiceCancellation {
@@ -234,6 +236,7 @@ impl ServiceCancellation {
                 cancelled,
                 mutex: Mutex::new(()),
                 wakeup: Condvar::new(),
+                wakers: Mutex::new(Vec::new()),
             }),
             wait_callback: None,
             wait_user_data: 0,
@@ -278,6 +281,44 @@ impl ServiceCancellation {
         self.state.cancelled.store(true, Ordering::SeqCst);
         self.state.wakeup.notify_all();
         drop(guard);
+        let wakers = std::mem::take(
+            &mut *self
+                .state
+                .wakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Resolve once cancellation is requested, without a timer.
+    ///
+    /// `cancel` on this handle or any clone wakes the future. Flags shared with
+    /// an external source (a shared runtime token or an ABI wait callback)
+    /// expose no wake, so their state is observed whenever the future is polled.
+    pub fn cancelled(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+        std::future::poll_fn(move |context| {
+            if self.is_cancelled() {
+                return std::task::Poll::Ready(());
+            }
+            let mut wakers = self
+                .state
+                .wakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Re-check under the registration lock: `cancel` stores the flag
+            // before draining wakers, so no wake is lost between the checks.
+            if self.is_cancelled() {
+                return std::task::Poll::Ready(());
+            }
+            if !wakers.iter().any(|waker| waker.will_wake(context.waker())) {
+                wakers.push(context.waker().clone());
+            }
+            drop(wakers);
+            std::task::Poll::Pending
+        })
     }
 
     /// Return whether host cancellation has been requested.
@@ -3358,6 +3399,30 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    #[test]
+    fn async_cancellation_wakes_registered_observer_without_a_timer() {
+        struct CountWake(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(CountWake(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut context = std::task::Context::from_waker(&waker);
+        let cancellation = ServiceCancellation::default();
+        let observer = cancellation.clone();
+        let mut cancelled = std::pin::pin!(observer.cancelled());
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+        assert!(cancelled.as_mut().poll(&mut context).is_pending());
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        cancellation.cancel();
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(cancelled.as_mut().poll(&mut context).is_ready());
+        let mut again = std::pin::pin!(cancellation.cancelled());
+        assert!(again.as_mut().poll(&mut context).is_ready());
+    }
 
     #[test]
     fn cancellation_racing_with_wait_registration_wakes_all_waiters() {

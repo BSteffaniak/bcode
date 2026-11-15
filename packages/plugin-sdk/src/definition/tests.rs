@@ -291,9 +291,11 @@ fn injected_shared_host_resolves_context_and_preserves_live_ports() {
             .unwrap());
         }
         assert_eq!(request.operation, "receive_input");
-        Ok(serde_json::to_vec(&crate::ServiceBridgeResponse::Input(
-            bcode_tool::ToolInvocationInputResolution::Closed,
-        ))
+        Ok(serde_json::to_vec(&ProductHostOutcome::Responded {
+            response: crate::ServiceBridgeResponse::Input(
+                bcode_tool::ToolInvocationInputResolution::Closed,
+            ),
+        })
         .unwrap())
     });
     let call = PluginCallContext {
@@ -590,4 +592,53 @@ fn contribution_collectors_accept_empty_snapshot() {
     assert!(registrar.is_available());
     // Empty collection is a real successful snapshot, not a missing callback.
     assert_eq!(encode_collected(&collected).unwrap(), Vec::<Vec<u8>>::new());
+}
+
+#[test]
+#[allow(clippy::result_large_err)] // Shared SDK host callback fixes its external error type.
+fn dispatched_bridge_failure_reaches_the_author_as_a_bridge_error() {
+    let services = bmux_plugin_sdk::definition::PluginHostServices::new(|request| {
+        if request.operation == "invocation_context" {
+            return Ok(serde_json::to_vec(&ProductInvocationSettings {
+                config: PluginConfigContext::default(),
+                transient_progress_limits: TransientProgressLimits::default(),
+            })
+            .unwrap());
+        }
+        let outcome = match request.operation {
+            "exchange" => ProductHostOutcome::from_result(Err(crate::ServiceBridgeError::Host {
+                status: crate::SERVICE_BRIDGE_STATUS_FAILED,
+            })),
+            "invoke_service" => {
+                ProductHostOutcome::from_result(Err(crate::ServiceBridgeError::Cancelled))
+            }
+            _ => return Err(bmux_plugin_sdk::PluginError::InvocationCancelled),
+        };
+        Ok(serde_json::to_vec(&outcome).unwrap())
+    });
+    let bridge = SharedProductHostBridge(services);
+    let exchange = crate::ServiceBridgeRequest::Exchange(bcode_tool::ToolExchangeRequest {
+        invocation_id: "call".to_owned(),
+        exchange_id: "exchange".to_owned(),
+        producer_id: "producer".to_owned(),
+        schema: "test".to_owned(),
+        schema_version: 1,
+        payload: serde_json::Value::Null,
+        response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+    });
+    assert_eq!(
+        crate::ProductHostBridge::request(&bridge, &exchange),
+        Err(crate::ServiceBridgeError::Host {
+            status: crate::SERVICE_BRIDGE_STATUS_FAILED
+        })
+    );
+    let input = crate::ServiceBridgeRequest::ReceiveInput {
+        invocation_id: "call".to_owned(),
+        timeout_ms: Some(0),
+    };
+    // A typed rejection before dispatch stays an author-visible cancellation.
+    assert_eq!(
+        crate::ProductHostBridge::request(&bridge, &input),
+        Err(crate::ServiceBridgeError::Cancelled)
+    );
 }

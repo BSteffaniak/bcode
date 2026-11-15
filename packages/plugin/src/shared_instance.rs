@@ -36,6 +36,8 @@ struct State {
     operation: bool,
     implementation: Option<Arc<dyn PluginInstance>>,
     activation: Option<ActivationScope>,
+    // Host resources charged to `activation`; released in the teardown window.
+    resources: Option<bcode_plugin_sdk::definition::ActivationResources>,
     publication: Option<Publication>,
     partial_services: Option<bmux_plugin_sdk::TypedServiceRegistry>,
     calls: BTreeMap<RuntimeInvocationId, CallOwner>,
@@ -53,6 +55,9 @@ pub struct SharedInstance {
     host_sessions:
         Mutex<BTreeMap<RuntimeInvocationId, super::shared_activation::ProductHostSession>>,
     retained: Mutex<Option<Arc<Self>>>,
+    // Signalled whenever an invocation retirement ends, so cleanup can await a
+    // concurrent retirement of the same call instead of failing on it.
+    retirements: std::sync::Condvar,
 }
 impl std::fmt::Debug for SharedInstance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,6 +80,8 @@ impl Drop for Retirement<'_> {
         if let Some(call) = state.calls.get_mut(&self.key) {
             call.retiring = false;
         }
+        drop(state);
+        self.owner.retirements.notify_all();
     }
 }
 struct Reservation<'a>(&'a SharedInstance);
@@ -148,6 +155,7 @@ impl SharedInstance {
                 operation: false,
                 implementation: Some(implementation),
                 activation: None,
+                resources: None,
                 publication: None,
                 partial_services: None,
                 calls: BTreeMap::new(),
@@ -158,6 +166,7 @@ impl SharedInstance {
             product_host: Mutex::new(None),
             host_sessions: Mutex::new(BTreeMap::new()),
             retained: Mutex::new(None),
+            retirements: std::sync::Condvar::new(),
         });
         *instance.retained.lock().expect("fresh retention") = Some(instance.clone());
         Ok(instance)
@@ -618,6 +627,9 @@ impl SharedInstance {
             .begin_activation(self.host.concurrency)
             .map_err(|_| error(id, "begin_activation"))?;
         state.activation = Some(activation.clone());
+        state.resources = Some(bcode_plugin_sdk::definition::ActivationResources::new(
+            activation.clone(),
+        ));
         state.phase = Phase::Activating;
         drop(state);
         Ok(activation)
@@ -830,6 +842,32 @@ impl SharedInstance {
         retirement?;
         result.unwrap_or_else(|_| unreachable!())
     }
+    /// Cleanup retires every settled call. A call whose own completion path is
+    /// retiring it concurrently is awaited, bounded by the teardown budget, not
+    /// reported as a cleanup failure.
+    fn retire_call_for_cleanup(
+        &self,
+        id: &str,
+        key: RuntimeInvocationId,
+    ) -> Result<(), PluginLoadError> {
+        let waited = self
+            .retirements
+            .wait_timeout_while(
+                self.state.lock().map_err(|_| error(id, "state_poisoned"))?,
+                bmux_plugin_runtime::teardown_timeout(),
+                |state| state.calls.get(&key).is_some_and(|call| call.retiring),
+            )
+            .map_err(|_| error(id, "state_poisoned"))?
+            .1;
+        if waited.timed_out() {
+            return Err(self.failure(
+                id,
+                "invocation_retirement_in_progress",
+                "concurrent invocation retirement exceeded the teardown budget",
+            ));
+        }
+        self.retire_call(id, key)
+    }
     fn retire_call(&self, id: &str, key: RuntimeInvocationId) -> Result<(), PluginLoadError> {
         let scope = {
             let mut state = self.state.lock().map_err(|_| error(id, "state_poisoned"))?;
@@ -973,7 +1011,10 @@ impl SharedInstance {
             // Runtime drain may fail before proving admission/task settlement.
             // Cleanup errors require explicit checked recovery below, never an
             // assumption that an error means the subtree is already drained.
-            match self.host.drive(activation.drain()) {
+            match self
+                .host
+                .drive(activation.drain_until(bmux_plugin_runtime::teardown_deadline()))
+            {
                 Ok(()) => {}
                 Err(bmux_plugin_runtime::ScopeError::Cleanup(details)) => {
                     self.failure(id, "retained_runtime_cleanup", details);
@@ -986,7 +1027,7 @@ impl SharedInstance {
                         .copied()
                         .collect::<Vec<_>>();
                     for key in calls {
-                        self.retire_call(id, key)?;
+                        self.retire_call_for_cleanup(id, key)?;
                     }
                     // This typed acknowledgement checks zero admissions, settled
                     // tasks, no children/resources. Failure keeps cleanup closed;
@@ -1006,7 +1047,7 @@ impl SharedInstance {
                 .copied()
                 .collect::<Vec<_>>();
             for key in calls {
-                self.retire_call(id, key)?;
+                self.retire_call_for_cleanup(id, key)?;
             }
             let author_cleaned = self
                 .state
@@ -1036,6 +1077,7 @@ impl SharedInstance {
         }
         self.destroy_author(id)?;
         self.retire_host_sessions(id)?;
+        self.retire_activation_resources(id)?;
         self.finish_scopes(id, activation)
     }
 
@@ -1062,11 +1104,29 @@ impl SharedInstance {
                 continue;
             }
             self.host
-                .drive(session.join())
+                .drive(super::shared_activation::bounded_join(&session))
                 .map_err(|failure| self.failure(id, "retained_host_join", failure.to_string()))?;
             session.release().map_err(|failure| {
                 self.failure(id, "retained_host_release", failure.to_string())
             })?;
+        }
+        Ok(())
+    }
+
+    /// Retire host resources still charged to the activation. The activation has
+    /// drained and the author cleanup hook settled, so release can only fail for
+    /// genuinely retained work, which keeps cleanup closed for explicit recovery.
+    fn retire_activation_resources(&self, id: &str) -> Result<(), PluginLoadError> {
+        let resources = self
+            .state
+            .lock()
+            .map_err(|_| error(id, "state_poisoned"))?
+            .resources
+            .clone();
+        if let Some(resources) = resources {
+            resources
+                .retire_all()
+                .map_err(|error| self.scope_error(id, "activation_resource_release", &error))?;
         }
         Ok(())
     }
@@ -1094,7 +1154,10 @@ impl SharedInstance {
             .close()
             .map_err(|error| self.scope_error(id, "instance_close", &error))?;
         self.host
-            .drive(self.scope.drain())
+            .drive(
+                self.scope
+                    .drain_until(bmux_plugin_runtime::teardown_deadline()),
+            )
             .map_err(|error| self.scope_error(id, "instance_drain", &error))?;
         self.scope
             .finish()
@@ -1102,6 +1165,7 @@ impl SharedInstance {
         {
             let mut state = self.state.lock().map_err(|_| error(id, "state_poisoned"))?;
             state.activation = None;
+            state.resources = None;
             state.phase = Phase::Destroyed;
         }
         // Only committed scope retirement permits releasing the instance's
@@ -1139,6 +1203,24 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedInstance {
     }
     fn activation_scope(&self) -> bmux_plugin_sdk::definition::PluginResult<ActivationScope> {
         Self::activation_scope(self)
+    }
+    fn activation_resources(
+        &self,
+    ) -> bmux_plugin_sdk::definition::PluginResult<bcode_plugin_sdk::definition::ActivationResources>
+    {
+        let state = self.state.lock().map_err(|_| {
+            bmux_plugin_sdk::PluginCommandError::unavailable("selected activation state poisoned")
+        })?;
+        if state.phase != Phase::Active {
+            return Err(bmux_plugin_sdk::PluginCommandError::unavailable(
+                "selected activation is not active",
+            ));
+        }
+        let resources = state.resources.clone().ok_or_else(|| {
+            bmux_plugin_sdk::PluginCommandError::unavailable("selected activation unavailable")
+        })?;
+        drop(state);
+        Ok(resources)
     }
     fn ensure_active(&self) -> bmux_plugin_sdk::definition::PluginResult<()> {
         let state = self.state.lock().map_err(|_| {

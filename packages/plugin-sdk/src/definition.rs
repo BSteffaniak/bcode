@@ -4,12 +4,14 @@
 //! scheduler, loader, activation admission or ABI. The shared host must retain
 //! and fence typed service handles exactly as it does generated BPDL providers.
 
+pub mod activation_resources;
 pub mod composer;
 pub mod extensions;
 pub mod host_session;
 pub mod host_session_models;
 mod manifest;
 pub mod resources;
+pub use activation_resources::{ActivationResource, ActivationResources};
 #[cfg(feature = "tui")]
 pub use extensions::{PortableFrontendAdapter, SelectedProductFrontend};
 pub use extensions::{ProductExtensionDescriptor, ProductExtensionPort, ProductExtensions};
@@ -119,6 +121,59 @@ pub trait ProductInvocationHost: Send + Sync {
 /// Product host operation contract transported over BMUX's invocation-bound port.
 pub const PRODUCT_HOST_INTERFACE: &str = "bcode.invocation-host/v1";
 
+/// Outcome of one dispatched product host bridge operation.
+///
+/// A bridge that fails after dispatch reports a product result, carried in the
+/// payload, not a transport failure of the invocation port: the shared port
+/// treats a failed host call as fatal to the whole operation, while the author
+/// must observe a bridge failure (including cancellation during the bridge) as
+/// an ordinary error it can report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProductHostOutcome {
+    /// The host bridge resolved the request.
+    Responded {
+        /// Resolution of the requested operation.
+        response: crate::ServiceBridgeResponse,
+    },
+    /// The bridge observed cancellation of the invocation.
+    Cancelled,
+    /// The host bridge failed with a bridge status after dispatch.
+    Failed {
+        /// Bridge status reported by the host.
+        status: i32,
+    },
+}
+
+impl ProductHostOutcome {
+    /// Classify a host bridge result for transport to the author.
+    #[must_use]
+    pub fn from_result(
+        result: Result<crate::ServiceBridgeResponse, crate::ServiceBridgeError>,
+    ) -> Self {
+        match result {
+            Ok(response) => Self::Responded { response },
+            Err(crate::ServiceBridgeError::Cancelled) => Self::Cancelled,
+            Err(crate::ServiceBridgeError::Host { status }) => Self::Failed { status },
+            Err(_) => Self::Failed {
+                status: crate::SERVICE_BRIDGE_STATUS_FAILED,
+            },
+        }
+    }
+
+    /// The author-visible bridge result.
+    ///
+    /// # Errors
+    /// Returns the host's cancellation or failure.
+    pub fn into_result(self) -> Result<crate::ServiceBridgeResponse, crate::ServiceBridgeError> {
+        match self {
+            Self::Responded { response } => Ok(response),
+            Self::Cancelled => Err(crate::ServiceBridgeError::Cancelled),
+            Self::Failed { status } => Err(crate::ServiceBridgeError::Host { status }),
+        }
+    }
+}
+
 /// Adapter from the shared host port to Bcode's existing product operation sum.
 ///
 /// The shared port supplies provenance/admission; product host dispatch owns the
@@ -206,10 +261,18 @@ impl crate::ProductHostBridge for SharedProductHostBridge {
                 operation,
                 payload: &payload,
             })
-            .map_err(|_| crate::ServiceBridgeError::Unavailable)?;
-        serde_json::from_slice(&response).map_err(|_| {
-            crate::ServiceBridgeError::Decode("invalid product host response".to_owned())
-        })
+            .map_err(|error| match error {
+                // Typed rejection before dispatch: no effects occurred.
+                bmux_plugin_sdk::PluginError::InvocationCancelled => {
+                    crate::ServiceBridgeError::Cancelled
+                }
+                _ => crate::ServiceBridgeError::Unavailable,
+            })?;
+        serde_json::from_slice::<ProductHostOutcome>(&response)
+            .map_err(|_| {
+                crate::ServiceBridgeError::Decode("invalid product host response".to_owned())
+            })?
+            .into_result()
     }
 }
 

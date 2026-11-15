@@ -83,11 +83,11 @@ impl SharedActivationContext {
         if activation.runtime_id() != self.runtime {
             return Err(host_session_error("product host runtime mismatch"));
         }
-        if tokio::runtime::Handle::try_current().is_ok() {
-            ProductHostSession::new(activation, services, owner)
-        } else {
-            self.drive(async { ProductHostSession::new(activation, services, owner) })
-        }
+        // Retained work must run on the selected reactor, which keeps running
+        // between lifecycle calls; never the caller's ambient runtime, which may
+        // be a frontend thread that blocks while awaiting this same work.
+        let _reactor = self.driver.runtime_handle().enter();
+        ProductHostSession::new(activation, services, owner)
     }
 
     /// Create a retained session with explicit admission-time memory limits.
@@ -104,13 +104,9 @@ impl SharedActivationContext {
         if activation.runtime_id() != self.runtime {
             return Err(host_session_error("product host runtime mismatch"));
         }
-        if tokio::runtime::Handle::try_current().is_ok() {
-            ProductHostSession::new_with_limits(activation, services, owner, limits)
-        } else {
-            self.drive(async {
-                ProductHostSession::new_with_limits(activation, services, owner, limits)
-            })
-        }
+        // See `retain_product_host`: retained work runs on the selected reactor.
+        let _reactor = self.driver.runtime_handle().enter();
+        ProductHostSession::new_with_limits(activation, services, owner, limits)
     }
 
     /// Open a session retained by the actual selected plugin's recovery ledger.
@@ -253,6 +249,18 @@ impl SharedActivationContext {
         }));
         result.expect("lifecycle driver must settle work before returning")
     }
+}
+
+/// Join a retained session during owner teardown, bounded by the host's
+/// teardown budget. Expiry leaves the session retained for explicit recovery.
+pub async fn bounded_join(session: &ProductHostSession) -> bmux_plugin_sdk::Result<()> {
+    tokio::time::timeout(bmux_plugin_runtime::teardown_timeout(), session.join())
+        .await
+        .unwrap_or_else(|_| {
+            Err(host_session_error(
+                "product host session join exceeded the teardown budget",
+            ))
+        })
 }
 
 fn host_session_error(details: &str) -> bmux_plugin_sdk::PluginError {

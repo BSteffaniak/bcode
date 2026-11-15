@@ -62,6 +62,17 @@ pub trait ProductExtensionPort: Send + Sync {
             "selected activation scope unavailable",
         ))
     }
+    /// Return the actual selected activation's host resource ledger. The owner
+    /// retires and releases its remaining entries during deactivation, after
+    /// draining and before finishing the activation.
+    ///
+    /// # Errors
+    /// Returns an error when the owner is inactive or exposes no resource ledger.
+    fn activation_resources(&self) -> PluginResult<super::ActivationResources> {
+        Err(PluginCommandError::unavailable(
+            "selected activation resources unavailable",
+        ))
+    }
     /// Invoke with explicit request-local host authority, never an ambient fallback.
     fn invoke_with_host(
         &self,
@@ -124,6 +135,14 @@ impl ProductExtensions {
     pub fn activation_scope(&self) -> PluginResult<bmux_plugin_runtime::ActivationScope> {
         self.port.ensure_active()?;
         self.port.activation_scope()
+    }
+    /// Obtain the host resource ledger of this exact selected activation.
+    ///
+    /// # Errors
+    /// Returns an error for a closed owner or an unsupported activation port.
+    pub fn activation_resources(&self) -> PluginResult<super::ActivationResources> {
+        self.port.ensure_active()?;
+        self.port.activation_resources()
     }
     /// Bind a selected host component, optionally with its actual native provider.
     #[must_use]
