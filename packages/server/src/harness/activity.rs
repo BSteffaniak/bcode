@@ -147,6 +147,14 @@ impl NativeActivity {
 
     /// Number of managed sessions with live foreground or unsettled background work.
     #[must_use]
+    /// Whether `session` has live native work by its committed evidence. A poisoned tracker
+    /// cannot prove idleness.
+    pub fn busy(&self, session: SessionId) -> bool {
+        self.sessions.lock().map_or(true, |sessions| {
+            sessions.get(&session).is_some_and(SessionActivity::busy)
+        })
+    }
+
     pub fn busy_sessions(&self) -> usize {
         // A poisoned tracker cannot prove idleness.
         self.sessions.lock().map_or(1, |sessions| {

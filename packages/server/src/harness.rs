@@ -36,7 +36,7 @@ mod transport;
 pub(crate) use observation_watch::ObservationWatches;
 pub use tool_invocation::{ManagedToolBridge, ManagedToolEndpoint};
 pub(crate) use tool_queue::ToolQueueHost;
-pub(crate) use transport::with_credential_admission;
+pub(crate) use transport::{with_credential_admission, with_owner_configuration};
 
 #[cfg(test)]
 mod auth_status_tests;

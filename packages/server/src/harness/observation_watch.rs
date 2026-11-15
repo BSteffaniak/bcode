@@ -7,7 +7,10 @@
 //! There is one watch per session. The request may arrive on a short-lived connection, so
 //! every page is re-admitted as an interactive client attached to the session, falling back
 //! to the requesting client while it remains connected. The watch ends when no such client
-//! remains or the owner generation changes.
+//! remains or the owner generation changes, except that a session whose native work is still
+//! running when its last client leaves is observed by the daemon itself, with no client and no
+//! credentials, until that work ends (see `docs/daemon-dormancy.md`). Otherwise nothing would
+//! record that it ended, and the session would look busy forever.
 #[cfg(test)]
 #[path = "observation_watch_tests.rs"]
 mod tests;
@@ -133,19 +136,40 @@ fn next_delay(progress: usize, waited: bool, previous: Duration) -> Duration {
     }
 }
 
-/// Whether the client that admitted the last page is no longer the one that would be chosen.
-async fn state_changed_caller(
+/// After a page for an admitted client: let the agent's policy answer the native approvals it
+/// decides, and send input queued while the native agent was busy. Whether either happened.
+async fn act_for_client(
+    backend: &dyn crate::harness_dispatch::ManagedSessionBackend,
+    caller: &crate::harness_dispatch::ManagedCaller,
+    session_id: SessionId,
+) -> bool {
+    let policy = backend
+        .apply_agent_policy(caller, session_id)
+        .await
+        .unwrap_or(false);
+    let input = backend
+        .release_queued_input(caller, session_id)
+        .await
+        .unwrap_or(false);
+    policy || input
+}
+
+/// Whether the client that admitted the last page is no longer the one that would be chosen,
+/// including when none is left (the daemon then observes on its own).
+async fn state_changed_caller_or_left(
     state: &Weak<ServerState>,
     session_id: SessionId,
-    admitted: ClientId,
+    admitted: Option<ClientId>,
 ) -> bool {
-    let Some(state) = state.upgrade() else {
+    let Some(admitted) = admitted else {
         return false;
     };
-    state
-        .managed_ingestion_caller(session_id, admitted)
+    let Some(live) = state.upgrade() else {
+        return false;
+    };
+    live.managed_ingestion_caller(session_id, admitted)
         .await
-        .is_some_and(|next| next != admitted)
+        .is_none_or(|next| next != admitted)
 }
 
 async fn drive(
@@ -179,15 +203,15 @@ async fn drive(
         let Some(backend) = live.managed_sessions.get().cloned() else {
             return "backend_unavailable";
         };
-        let Some(admitted) = live
+        let admitted = live
             .managed_ingestion_caller(query.session_id, client)
-            .await
-        else {
-            return "no_attached_client";
-        };
+            .await;
         drop(live);
-        tracing::trace!(target: "bcode_server::harness", requester = %client, admitted = %admitted, "managed observation watch page");
-        let caller = crate::harness_dispatch::ManagedCaller::Client(admitted);
+        if admitted.is_none() && !backend.native_session_busy(query.session_id) {
+            return "no_attached_client";
+        }
+        tracing::trace!(target: "bcode_server::harness", requester = %client, admitted = ?admitted, "managed observation watch page");
+        let caller = admitted.map(crate::harness_dispatch::ManagedCaller::Client);
         let permit = Arc::clone(long_waits).try_acquire_owned().ok();
         let wait = if permit.is_some() {
             WATCH_WAIT_MILLIS
@@ -197,34 +221,29 @@ async fn drive(
         let started = Instant::now();
         // Never abandon an in-flight page: the adapter may already have offered it, and the
         // canonical commit must complete before the next page acknowledges it.
-        let result = backend.poll_observations(&caller, query, wait).await;
+        let result = match &caller {
+            Some(caller) => backend.poll_observations(caller, query, wait).await,
+            // No client: the daemon observes its own session, and only observes.
+            None => backend.poll_owned_observations(query, wait).await,
+        };
         drop(permit);
         match result {
             Ok(progress) => {
                 let waited =
                     wait > 0 && started.elapsed() >= Duration::from_millis(u64::from(wait / 2));
                 delay = next_delay(progress, waited, delay);
-                // The agent's policy answers the native approvals it decides.
-                if backend
-                    .apply_agent_policy(&caller, query.session_id)
-                    .await
-                    .unwrap_or(false)
-                {
-                    delay = Duration::ZERO;
-                }
-                // Input queued while the native agent was busy goes out once it is idle.
-                if backend
-                    .release_queued_input(&caller, query.session_id)
-                    .await
-                    .unwrap_or(false)
+                // Effects run only for an admitted client; the daemon's own observation has
+                // none to run them for.
+                if let Some(caller) = &caller
+                    && act_for_client(backend.as_ref(), caller, query.session_id).await
                 {
                     delay = Duration::ZERO;
                 }
             }
             // The admitting client may have disconnected during the page; pick another
-            // attached client before concluding the owner changed.
+            // attached client (or observe as the daemon) before concluding the owner changed.
             Err(ManagedHarnessError::StaleOwner)
-                if state_changed_caller(state, query.session_id, admitted).await =>
+                if state_changed_caller_or_left(state, query.session_id, admitted).await =>
             {
                 delay = MIN_IDLE_BACKOFF;
             }

@@ -224,6 +224,23 @@ pub trait ManagedSessionBackend: Send + Sync {
         let _ = (caller, query, wait_millis);
         Box::pin(async { Err(ManagedHarnessError::Unsupported) })
     }
+    /// The daemon's own observation of a session it owns, after its last attached client left
+    /// while native work was still running: one page under the session's canonical owner, with
+    /// its pinned configuration and no credentials. Observation only: no input, approvals or
+    /// other effects (see `docs/daemon-dormancy.md`).
+    fn poll_owned_observations<'a>(
+        &'a self,
+        query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
+        wait_millis: u32,
+    ) -> Task<'a, usize> {
+        let _ = (query, wait_millis);
+        Box::pin(async { Err(ManagedHarnessError::Unsupported) })
+    }
+    /// Whether `session_id` has live native work by its committed evidence.
+    fn native_session_busy(&self, session_id: SessionId) -> bool {
+        let _ = session_id;
+        false
+    }
     /// Admit an interactive attachment, drain once, then keep ingesting native observations in
     /// the daemon for as long as that client stays admitted. Committed pages reach the client
     /// through its ordinary session event subscription.
@@ -1048,6 +1065,50 @@ impl<S: ManagedHarnessStore, A: ManagedSessionAdmission> ManagedSessionBackend
     }
     fn busy_native_sessions(&self) -> usize {
         self.runtime.busy_native_sessions()
+    }
+    fn native_session_busy(&self, session_id: SessionId) -> bool {
+        self.runtime.native_session_busy(session_id)
+    }
+    fn poll_owned_observations<'a>(
+        &'a self,
+        query: &'a bcode_ipc::harness::ManagedSessionPollRequest,
+        wait_millis: u32,
+    ) -> Task<'a, usize> {
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or(ManagedHarnessError::Unavailable)?;
+            query.validate().map_err(|_| ManagedHarnessError::Invalid)?;
+            let snapshot = state
+                .sessions
+                .session_external_harness_state(query.session_id)
+                .await
+                .map_err(|_| ManagedHarnessError::Storage)?
+                .ok_or(ManagedHarnessError::Conflict)?;
+            if snapshot.owner.generation != query.generation
+                || snapshot.instance.instance_id != query.instance_id
+            {
+                return Err(ManagedHarnessError::StaleOwner);
+            }
+            let owner = crate::harness::CanonicalHarnessStore::new(&state)
+                .current_owner(query.session_id)
+                .await?;
+            let application = crate::harness::ManagedHarnessApplication::for_daemon_observation(
+                &state,
+                &self.runtime,
+                owner.clone(),
+            );
+            // Outside credential admission, the plugin's credential resolver refuses.
+            let result = Box::pin(crate::harness::with_owner_configuration(
+                owner,
+                application.poll_observations(query, wait_millis),
+            ))
+            .await;
+            drop(application);
+            drop(state);
+            result
+        })
     }
     fn auth_scope<'a>(
         &'a self,

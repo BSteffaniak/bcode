@@ -68,6 +68,12 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         self.activity.busy_sessions()
     }
 
+    /// Whether `session` has live native work by its committed evidence.
+    #[must_use]
+    pub fn native_session_busy(&self, session: SessionId) -> bool {
+        self.activity.busy(session)
+    }
+
     /// Native approvals committed for `session` and not yet put to its agent's policy.
     pub fn take_native_approvals(
         &self,

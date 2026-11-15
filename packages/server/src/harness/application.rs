@@ -98,7 +98,8 @@ pub async fn drain_delegated_observations<S: ManagedHarnessStore, T: ManagedHarn
 /// registered client ID, never deserialize one from a harness request.
 pub struct ManagedHarnessApplication<'a, S, T = HarnessPluginTransport> {
     state: &'a Arc<crate::ServerState>,
-    client_id: ClientId,
+    /// The admitted client; `None` for the daemon's own observation of a session it owns.
+    client_id: Option<ClientId>,
     runtime: &'a ManagedHarnessRuntime<S, T>,
     admitted_owner: Option<HarnessOwner>,
 }
@@ -113,9 +114,27 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
     ) -> Self {
         Self {
             state,
-            client_id,
+            client_id: Some(client_id),
             runtime,
             admitted_owner: None,
+        }
+    }
+
+    /// The daemon's own access for observing a session it owns after its last attached client
+    /// left while native work was still running. No client is involved, so there is no client
+    /// namespace to compare; the full canonical owner is still revalidated before every page.
+    /// Use only for observation (see `docs/daemon-dormancy.md`).
+    #[must_use]
+    pub const fn for_daemon_observation(
+        state: &'a Arc<crate::ServerState>,
+        runtime: &'a ManagedHarnessRuntime<S, T>,
+        owner: HarnessOwner,
+    ) -> Self {
+        Self {
+            state,
+            client_id: None,
+            runtime,
+            admitted_owner: Some(owner),
         }
     }
 
@@ -130,7 +149,7 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
     ) -> Self {
         Self {
             state,
-            client_id,
+            client_id: Some(client_id),
             runtime,
             admitted_owner: Some(owner),
         }
@@ -143,11 +162,12 @@ impl<'a, S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessAppli
         crate::session_operations::require_selected_location(self.state, session_id)
             .await
             .map_err(|_| ManagedHarnessError::StaleOwner)?;
-        if self
-            .state
-            .active_session_namespace_mismatch(session_id, self.client_id)
-            .await
-            .is_some()
+        if let Some(client_id) = self.client_id
+            && self
+                .state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+                .is_some()
         {
             return Err(ManagedHarnessError::StaleOwner);
         }

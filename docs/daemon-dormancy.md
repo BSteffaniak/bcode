@@ -134,17 +134,27 @@ Writing to a session or owning its runtime stays same-build.
   lock that cleanup respects) and can rebuild it from its retained executable handle, so an old
   tab restarts its own daemon whenever it does real work.
 
-## Open: managed native sessions
+## Managed native sessions
 
-A daemon was seen held for hours by its native-activity tracker ("managed session with live
-native work") after its clients left. The tracker clears only on native terminal or settlement
-evidence, and that evidence is ingested by an observation watch that runs only while a client is
-attached to the session (it is admitted with that client's runtime context, including its
-credentials). When the last attached client leaves mid-work, nothing ingests the evidence that the
-work ended, so the session stays "busy" and pins the daemon, and its history stops following the
-native session until someone attaches again. Fixing this means ingesting without an attached
-client: either keeping the departed client's runtime context for that purpose, or giving the
-daemon its own admission identity. That is a decision about credentials, still to be made.
+A managed native session (Claude Code, Codex) is kept current by an observation watch that asks
+its plugin for progress. The daemon's native-activity tracker learns from those pages when work
+ends, so the watch must keep running while there is work, or the session looks busy forever and
+pins the daemon. Before this, a daemon was seen held for hours that way: the watch ran only while
+a client was attached, and its last client had left mid-work.
+
+So when no client is attached but the tracker says the session's native work is still running,
+the daemon keeps observing on its own until the work ends:
+
+* It checks only that the session's canonical owner (instance and generation) is the one the
+  watch follows, and revalidates that owner before every page.
+* It uses the owner's pinned configuration and **no credentials**. Observation needs none:
+  harness plugins read credentials only to launch a native process or for an auth step. Outside
+  credential admission, the plugin's credential resolver refuses every request, so a plugin that
+  did need one to observe would fail the page and leave the session busy (as before), never
+  observe with someone's secret.
+* It only observes: it answers no native approvals and sends no queued input. Those still need
+  a client. A session waiting on an approval stays busy, which is right: it waits on a person.
+* A client attaching again takes the watch back. Once the work ends, the watch stops.
 
 ## Diagnosability
 

@@ -61,6 +61,12 @@ mod drive {
     struct ScriptedBackend {
         script: Mutex<VecDeque<Result<usize, ManagedHarnessError>>>,
         waits: Mutex<Vec<u32>>,
+        /// Whether the session has live native work.
+        busy: std::sync::atomic::AtomicBool,
+        /// Pages observed by the daemon on its own, without a client.
+        owned_pages: std::sync::atomic::AtomicUsize,
+        /// Effects (agent policy, queued input) run for a client.
+        effects: std::sync::atomic::AtomicUsize,
     }
 
     impl ManagedSessionBackend for ScriptedBackend {
@@ -97,6 +103,30 @@ mod drive {
                 }
             })
         }
+        fn poll_owned_observations<'a>(
+            &'a self,
+            _query: &'a ManagedSessionPollRequest,
+            _wait_millis: u32,
+        ) -> ManagedSessionTask<'a, usize> {
+            self.owned_pages
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                Ok(0)
+            })
+        }
+        fn native_session_busy(&self, _session_id: SessionId) -> bool {
+            self.busy.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn apply_agent_policy<'a>(
+            &'a self,
+            _caller: &'a ManagedCaller,
+            _session_id: SessionId,
+        ) -> ManagedSessionTask<'a, bool> {
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(false) })
+        }
     }
 
     fn fixture(
@@ -111,7 +141,7 @@ mod drive {
         ));
         let backend = Arc::new(ScriptedBackend {
             script: Mutex::new(script.into()),
-            waits: Mutex::default(),
+            ..ScriptedBackend::default()
         });
         let installed: Arc<dyn ManagedSessionBackend> = backend.clone();
         assert!(state.managed_sessions.set(installed).is_ok());
@@ -228,6 +258,43 @@ mod drive {
         assert_eq!(live(&watches), 1);
         // Once no interactive client remains attached, ingestion stops.
         disconnect(&state, attached).await;
+        until(|| live(&watches) == 0).await;
+    }
+
+    #[tokio::test]
+    async fn native_work_running_when_the_last_client_leaves_is_observed_until_it_ends() {
+        let mut script = vec![Ok(1)];
+        script.extend(std::iter::repeat_n(Ok(0), 1000));
+        let (state, backend, query) = fixture(script);
+        backend
+            .busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let watches = ObservationWatches::default();
+        let attached = ClientId::new();
+        connect(&state, attached, Some(query.session_id)).await;
+        watches.start(Arc::downgrade(&state), attached, query);
+        until(|| backend.effects.load(std::sync::atomic::Ordering::SeqCst) >= 1).await;
+        // The client leaves mid-work: the daemon keeps observing on its own.
+        disconnect(&state, attached).await;
+        until(|| {
+            backend
+                .owned_pages
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 3
+        })
+        .await;
+        assert_eq!(live(&watches), 1);
+        // It only observes: no approvals answered, no input sent, for nobody.
+        let effects = backend.effects.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            backend.effects.load(std::sync::atomic::Ordering::SeqCst),
+            effects
+        );
+        // The work ends: nothing is left to observe, and the watch stops.
+        backend
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         until(|| live(&watches) == 0).await;
     }
 }

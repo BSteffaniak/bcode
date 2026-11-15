@@ -6,6 +6,18 @@ use bcode_harness_models::{HarnessRequest, HarnessServiceResponse};
 
 tokio::task_local! {
     static CREDENTIAL_CALLER: (crate::harness_dispatch::ManagedCaller, super::HarnessOwner, Arc<bcode_ipc::harness::ManagedSessionCall>);
+    /// The owner whose pinned configuration a call uses when no caller was admitted for
+    /// credentials (the daemon's own observation). Grants no credentials.
+    static CONFIGURATION_OWNER: super::HarnessOwner;
+}
+
+/// Run `operation` with `owner`'s pinned configuration but no credential admission: the
+/// plugin's credential resolver refuses every request. For the daemon's own observation.
+pub async fn with_owner_configuration<T>(
+    owner: super::HarnessOwner,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    CONFIGURATION_OWNER.scope(owner, operation).await
 }
 
 /// Retain authenticated admission independently of native request bytes.
@@ -544,7 +556,10 @@ impl HarnessPluginTransport {
     async fn configuration_view(
         &self,
     ) -> Result<bcode_plugin::PluginServiceConfigView, ManagedHarnessError> {
-        if let Ok(owner) = CREDENTIAL_CALLER.try_with(|(_, owner, _)| owner.clone()) {
+        if let Ok(owner) = CREDENTIAL_CALLER
+            .try_with(|(_, owner, _)| owner.clone())
+            .or_else(|_| CONFIGURATION_OWNER.try_with(Clone::clone))
+        {
             return super::configuration_views::for_owner(&self.state, &owner).await;
         }
         let view = match &self.view {
@@ -941,5 +956,31 @@ mod auth_tests {
             validate_auth_selection(&admission, &input.request),
             Err(ManagedHarnessError::StaleOwner)
         );
+    }
+}
+
+#[cfg(test)]
+mod daemon_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_daemons_own_observation_carries_its_owner_and_no_credential_admission() {
+        let owner = crate::harness::HarnessOwner {
+            session_id: bcode_session_models::SessionId::new(),
+            generation: 3,
+            artifact_id: "artifact".into(),
+            daemon_id: "daemon".into(),
+        };
+        let (configured, admitted) = with_owner_configuration(owner.clone(), async {
+            (
+                CONFIGURATION_OWNER.try_with(Clone::clone).ok(),
+                CREDENTIAL_CALLER.try_with(|_| ()).is_ok(),
+            )
+        })
+        .await;
+        // The owner's pinned configuration applies; no caller exists to resolve credentials
+        // for, so the plugin's credential resolver refuses every request.
+        assert_eq!(configured, Some(owner));
+        assert!(!admitted);
     }
 }
