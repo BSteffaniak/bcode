@@ -6200,7 +6200,7 @@ mod recovery_pause {
 
     /// Pause the next recovery of `session_id` between its reads: the first receiver fires
     /// when it pauses, and sending on the returned sender resumes it.
-    pub(super) fn arm(session_id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub fn arm(session_id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, reached_rx) = oneshot::channel();
         let (resume, resume_rx) = oneshot::channel();
         hooks()
@@ -6210,7 +6210,7 @@ mod recovery_pause {
         (reached_rx, resume)
     }
 
-    pub(super) async fn between_reads(session_id: SessionId) {
+    pub async fn between_reads(session_id: SessionId) {
         let hook = hooks()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6308,6 +6308,18 @@ async fn recover_abandoned_session_runtime_work_inner(
             child = parent;
         }
     }
+    finish_abandoned_runtime_work(state, session_id, active, &owned_tree, &work_ids).await
+}
+
+/// Finish the saved active work no owner holds: re-admit an abandoned top-level model turn when
+/// it can be, else record it as failed (and its turn as errored).
+async fn finish_abandoned_runtime_work(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    active: Vec<bcode_session::db::RuntimeWorkProjection>,
+    owned_tree: &std::collections::BTreeSet<WorkId>,
+    work_ids: &std::collections::BTreeSet<WorkId>,
+) -> Result<(), ServerError> {
     for work in active {
         if owned_tree.contains(&work.work_id) {
             continue;
