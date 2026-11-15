@@ -1887,3 +1887,56 @@ fn concurrent_writers_from_one_copy_each_keep_their_marks() {
     );
     assert_eq!(now.title, "Renamed");
 }
+
+#[test]
+fn assistant_settings_are_one_record_shared_by_every_repository_of_the_store() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let repo = |name: &str| {
+        let repo = temp.path().join(name);
+        std::fs::create_dir_all(&repo).expect("repo");
+        git_test(&repo, &["init", "--quiet"]);
+        repo
+    };
+    let (first, second) = (repo("first"), repo("second"));
+    let read = |repo: &std::path::Path| {
+        super::assistant_settings::assistant_settings_for_request(
+            &bcode_code_review_models::GetReviewAssistantSettingsRequest {
+                repo_path: repo.to_path_buf(),
+            },
+            &config,
+        )
+        .expect("read")
+        .settings
+    };
+    assert_eq!(read(&first), None, "nothing saved yet");
+    let saved = super::assistant_settings::save_assistant_settings_for_request(
+        bcode_code_review_models::SaveReviewAssistantSettingsRequest {
+            repo_path: first.clone(),
+            settings: bcode_code_review_models::ReviewAssistantSettings {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                effort: Some("high".to_owned()),
+                updated_at_ms: 0,
+            },
+        },
+        &config,
+    )
+    .expect("save")
+    .settings;
+    assert!(saved.updated_at_ms > 0);
+    assert_eq!(read(&second), Some(saved), "the store's one record");
+    // Saving again replaces it; an empty record means Bcode's defaults.
+    super::assistant_settings::save_assistant_settings_for_request(
+        bcode_code_review_models::SaveReviewAssistantSettingsRequest {
+            repo_path: second,
+            settings: bcode_code_review_models::ReviewAssistantSettings::default(),
+        },
+        &config,
+    )
+    .expect("save");
+    assert!(read(&first).is_some_and(|settings| settings.is_empty()));
+}

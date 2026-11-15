@@ -228,6 +228,12 @@ store_operations! {
         models::OP_REVIEW_ASSISTANT_LIST, |store, request| store.list_assistants(&request);
     models::UnbindReviewAssistantRequest => models::UnbindReviewAssistantResponse,
         models::OP_REVIEW_ASSISTANT_UNBIND, |store, request| store.unbind_assistant(&request);
+    models::GetReviewAssistantSettingsRequest => models::GetReviewAssistantSettingsResponse,
+        models::OP_REVIEW_ASSISTANT_SETTINGS_GET,
+        |store, request| store.assistant_settings(&request);
+    models::SaveReviewAssistantSettingsRequest => models::SaveReviewAssistantSettingsResponse,
+        models::OP_REVIEW_ASSISTANT_SETTINGS_SAVE,
+        |store, request| store.save_assistant_settings(request);
     PreviewBundle => models::PublishReviewPreviewResponse,
         models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW,
         |_store, request| bcode_code_review::store::preview_bundle(&request.0);

@@ -8,11 +8,13 @@
 //! the store holds no connection and the daemon plugin and a standalone app can use the same
 //! database concurrently.
 
+mod assistant_settings;
 mod conversation;
 mod db;
 mod history;
 mod looks;
 
+use assistant_settings::{assistant_settings_for_request, save_assistant_settings_for_request};
 use conversation::{conversation_for_request, save_conversation_for_request};
 use history::{list_layer_versions_for_request, record_layer_versions_for_request};
 use looks::{list_layer_looks_for_request, record_layer_looks_for_request};
@@ -273,6 +275,14 @@ store_operations! {
     unbind_assistant(&bcode_code_review_models::UnbindReviewAssistantRequest)
         -> bcode_code_review_models::UnbindReviewAssistantResponse
         => unbind_assistant_for_request;
+    /// The review app's assistant settings.
+    assistant_settings(&bcode_code_review_models::GetReviewAssistantSettingsRequest)
+        -> bcode_code_review_models::GetReviewAssistantSettingsResponse
+        => assistant_settings_for_request;
+    /// Replace the review app's assistant settings.
+    save_assistant_settings(bcode_code_review_models::SaveReviewAssistantSettingsRequest)
+        -> bcode_code_review_models::SaveReviewAssistantSettingsResponse
+        => save_assistant_settings_for_request;
     /// Summary of a review target with its draft counts.
     review_context(ReviewContextRequest) -> ReviewContextResponse => review_context_for_request;
     /// Draft threads of a review target.

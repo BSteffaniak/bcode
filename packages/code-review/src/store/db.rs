@@ -1650,6 +1650,7 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(super::conversation::conversation_snapshots_table_migration());
     source.add_migration(super::looks::layer_looks_table_migration());
     source.add_migration(workspace_revision_column_migration());
+    source.add_migration(super::assistant_settings::assistant_settings_table_migration());
 }
 
 /// The revision of a saved review's row, changed by every write, so concurrent writers replace

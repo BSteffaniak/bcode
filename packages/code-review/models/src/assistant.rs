@@ -170,3 +170,64 @@ pub struct GetReviewAssistantResponse {
     /// The binding, when one exists.
     pub binding: Option<ReviewAssistantBinding>,
 }
+
+/// Operation reading the review app's assistant settings.
+pub const OP_REVIEW_ASSISTANT_SETTINGS_GET: &str = "review.assistant.settings.get";
+/// Operation saving the review app's assistant settings.
+pub const OP_REVIEW_ASSISTANT_SETTINGS_SAVE: &str = "review.assistant.settings.save";
+
+/// The model and reasoning effort the review app gives new assistant conversations and Ask AI
+/// card sessions: the latest choice made anywhere in the app. One record per review store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAssistantSettings {
+    /// Model-provider plugin of the model; Bcode's default provider when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_plugin_id: Option<String>,
+    /// Model id; Bcode's default model when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Reasoning effort; the model's default when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// When the record was last saved, in milliseconds since the Unix epoch (set by the store).
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+impl ReviewAssistantSettings {
+    /// Whether the record chooses nothing (Bcode's default model and its default effort).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.model_id.is_none() && self.effort.is_none()
+    }
+}
+
+/// Request for the review app's assistant settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewAssistantSettingsRequest {
+    /// Repository path whose review store holds the record.
+    pub repo_path: PathBuf,
+}
+
+/// Response to [`GetReviewAssistantSettingsRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewAssistantSettingsResponse {
+    /// The record, once one was saved.
+    pub settings: Option<ReviewAssistantSettings>,
+}
+
+/// Request to replace the review app's assistant settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewAssistantSettingsRequest {
+    /// Repository path whose review store holds the record.
+    pub repo_path: PathBuf,
+    /// The record; its timestamp is set by the store.
+    pub settings: ReviewAssistantSettings,
+}
+
+/// Response to [`SaveReviewAssistantSettingsRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewAssistantSettingsResponse {
+    /// The recorded settings.
+    pub settings: ReviewAssistantSettings,
+}
