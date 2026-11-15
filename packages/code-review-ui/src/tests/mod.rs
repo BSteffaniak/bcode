@@ -4,6 +4,7 @@
 mod app;
 mod appearance;
 mod assistant;
+mod assistant_actions;
 mod assistant_context;
 mod benchmark;
 mod chrome;

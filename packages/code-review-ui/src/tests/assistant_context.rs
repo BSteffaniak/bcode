@@ -352,7 +352,10 @@ fn the_profile_follows_the_tool_categories_and_every_turn_names_it() {
     let host = setup.backend.host();
     assert_eq!(
         host.client_tool_names(),
-        vec![crate::assistant::profile::CURRENT_VIEW.to_owned()]
+        crate::assistant::profile::client_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>()
     );
     let profiles = host.agent_profiles();
     assert_eq!(profiles.len(), 1);

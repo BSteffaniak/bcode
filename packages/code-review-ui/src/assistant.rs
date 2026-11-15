@@ -11,6 +11,7 @@
 //! * [`Place`] is what the app tells the panel about the screen: which screen, and on a review
 //!   its id, title, stack layer, cursor place and the binding that attaches a session to it.
 
+pub mod actions;
 pub mod button;
 pub mod context;
 pub mod history;

@@ -11,6 +11,7 @@
 //! * **Client tools.** The tools the app itself answers, under its provider id, with their policy
 //!   class fixed at registration.
 
+use super::actions;
 use bcode_agent_profile::client_profile::ClientAgentProfile;
 use bcode_tool_models::client_tool::{ClientToolDescriptor, ClientToolPolicy};
 use std::collections::BTreeMap;
@@ -83,6 +84,7 @@ impl Category {
                 "code_review.get_thread",
                 "code_review.pull_request",
                 CURRENT_VIEW,
+                actions::FIND_PULL_REQUESTS,
             ],
             Self::ReviewWrites => &[
                 "code_review.add_comment",
@@ -95,10 +97,20 @@ impl Category {
                 "code_review.create_review",
                 "code_review.update_review",
                 "code_review.delete_review",
+                actions::COMPLETE_PASS,
             ],
-            Self::Publish => &["code_review.publish"],
-            // Navigation tools of the app come with its action tools.
-            Self::Navigation => &[],
+            Self::Publish => &[
+                "code_review.publish",
+                actions::PUBLISH,
+                actions::PULL_REQUEST_REVIEW,
+            ],
+            Self::Navigation => &[
+                actions::GO_TO,
+                actions::SET_COMPARISON,
+                actions::SET_VIEW,
+                actions::REFRESH,
+                actions::OPEN_REVIEW,
+            ],
             Self::FileReads => &[
                 "filesystem.read",
                 "filesystem.list",
@@ -232,16 +244,38 @@ Each user message comes with a `review app view` block describing the screen the
 one, the active comparison, the file, cursor and selection) and, for that turn only, a `review \
 app detail` block with the selected lines, threads and per-layer changes. Earlier view blocks \
 describe where the user was when they wrote earlier messages; the screen may have changed since. \
-Call bcode.code-review.current_view to read the screen as it is now, in full. \
+Call bcode.code-review.current_view to read the screen as it is now, in full.
+
 The code_review tools act on the review on screen when called without `review`; on home or in \
-the wizard pass `review` with an id from code_review.list_reviews. \
+the wizard, or for another review, pass `review` with an id from code_review.list_reviews. \
+The bcode.code-review tools act on the app itself: go_to, set_comparison and set_view change \
+what the review on screen shows; open_review takes the user to another review, home or the \
+wizard; refresh reloads. They answer with what is on screen afterwards.
+
+Recipes:
+* \"Create a review for my most recent PR stack\": bcode.code-review.find_pull_requests with \
+filter mine (limit 1), then code_review.create_review with that stack's create_review_source, \
+then bcode.code-review.open_review with the new id.
+* \"Create a review for my uncommitted changes in <dir>\": code_review.create_review with \
+sources [{kind: working_tree}] and directory <dir>, then open_review. When the result says \
+other_repository, tell the user to run `bcode review` in that repository to see it.
+* \"Review PR #N\" / a URL / a branch / a range / commits: code_review.create_review with that \
+kind (find_pull_requests first when you need the stack of a pull request), then open_review.
+* \"Mark these files viewed\": one code_review.mark_viewed call with paths, a glob, layers, all, \
+or unchanged_since_look; never one call per file.
+* Comparisons (\"what changed since I looked\", \"since the last push\", \"v2 to v3 of #12\"): \
+bcode.code-review.set_comparison.
+* Archive, rename, delete reviews: code_review.update_review / code_review.delete_review \
+(delete only when asked; prefer archiving).
+
 Do only what the user asked; ask before acting on anything else. Changes to reviews, files, \
-publishing and commands may ask the user for permission.";
+publishing, commands and moving the user to another screen may ask the user for permission; \
+publishing and pull request verdicts open a dialog the user confirms.";
 
 /// The tools the app answers itself.
 #[must_use]
 pub fn client_tools() -> Vec<ClientToolDescriptor> {
-    vec![ClientToolDescriptor {
+    let mut tools = vec![ClientToolDescriptor {
         name: CURRENT_VIEW.to_owned(),
         description: "The screen the user is looking at in the code review app, live: which \
                       screen (home, wizard, review), the review (id, title, kind, sources with \
@@ -270,7 +304,9 @@ pub fn client_tools() -> Vec<ClientToolDescriptor> {
         }),
         policy: ClientToolPolicy::ReadOnly,
         max_duration_ms: TOOL_DEADLINE_MS,
-    }]
+    }];
+    tools.extend(actions::descriptors());
+    tools
 }
 
 #[cfg(test)]

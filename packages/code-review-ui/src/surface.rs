@@ -151,6 +151,7 @@ enum Phase {
 
 mod annotate;
 mod assist;
+mod assistant_actions;
 mod compare;
 mod compare_legend;
 mod compare_view;
@@ -171,6 +172,7 @@ mod viewed_sync;
 pub(crate) use viewed_sync::Viewed as ViewedState;
 
 pub use annotate::COMPOSER_SCOPE;
+pub use assistant_actions::{ComparisonChange, GoTo, ReviewCommand, VersionPick, ViewChange};
 pub use conversation::{BarState, ConversationMessage, WatchCancel};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;

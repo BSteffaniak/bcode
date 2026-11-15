@@ -343,30 +343,46 @@ impl ReviewSurface {
         let Some(path) = target.path.filter(|path| !path.trim().is_empty()) else {
             return;
         };
-        let Some(review) = self.review.as_mut() else {
-            return;
-        };
+        if let Ok(label) = self.show_location(
+            &path,
+            target.line,
+            target.side.as_deref(),
+            target.source.as_deref(),
+        ) {
+            self.set_status(
+                format!("the assistant showed {label}"),
+                StatusSeverity::Info,
+            );
+        }
+    }
+
+    /// Move the cursor to `path` (at `line` on `side`, `new` unless `old`), revealing hidden
+    /// lines when needed. Returns the place shown.
+    pub(super) fn show_location(
+        &mut self,
+        path: &str,
+        line: Option<u32>,
+        side: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<String, String> {
+        let review = self.review.as_mut().ok_or("the review is still loading")?;
         let path = path.trim().trim_start_matches("./").to_owned();
         let file: Option<FileRef> = review
             .doc
             .file_keys()
-            .find(|file| {
-                file.path == path
-                    && target
-                        .source
-                        .as_deref()
-                        .is_none_or(|source| file.source_id == source)
-            })
+            .find(|file| file.path == path && source.is_none_or(|source| file.source_id == source))
             .cloned();
         let Some(file) = file else {
-            return;
+            return Err(format!(
+                "{path} is not a file shown in this review (code_review.list_files lists them)"
+            ));
         };
-        let side = if target.side.as_deref() == Some("old") {
+        let side = if side == Some("old") {
             ReviewLineSide::Old
         } else {
             ReviewLineSide::New
         };
-        let key = target.line.map_or_else(
+        let key = line.map_or_else(
             || ItemKey::FileHeader(file.clone()),
             |line| ItemKey::Line {
                 file: file.clone(),
@@ -380,18 +396,12 @@ impl ReviewSurface {
         {
             review.note_splices();
         }
-        let key = if review.doc.index_of(&key).is_some() || target.line.is_none() {
+        let key = if review.doc.index_of(&key).is_some() || line.is_none() {
             key
         } else {
             ItemKey::FileHeader(file.clone())
         };
         super::annotate::jump_to_annotation(review, &key);
-        let label = target
-            .line
-            .map_or_else(|| file.path.clone(), |line| format!("{}:{line}", file.path));
-        self.set_status(
-            format!("the assistant showed {label}"),
-            StatusSeverity::Info,
-        );
+        Ok(line.map_or_else(|| file.path.clone(), |line| format!("{}:{line}", file.path)))
     }
 }

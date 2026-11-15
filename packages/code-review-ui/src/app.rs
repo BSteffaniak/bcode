@@ -118,7 +118,31 @@ pub struct ReviewApp {
     assistant: Assistant,
     /// Where the Ask AI button was painted in the last frame.
     button: Option<Rect>,
+    /// Results of the assistant's app tools that ran on a task.
+    tool_work: Arc<Mutex<Vec<ToolWork>>>,
+    /// An `open_review` waiting for its review to load before moving to a place in it.
+    awaiting: Option<Awaiting>,
 }
+
+/// An assistant tool's work finished on a task.
+enum ToolWork {
+    /// `open_review` read the review to open.
+    Opened {
+        result: Result<ReviewWorkspace, String>,
+        target: crate::surface::GoTo,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+    },
+}
+
+/// A review opened by the assistant, with the place to move to once it loaded.
+struct Awaiting {
+    target: crate::surface::GoTo,
+    reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+    since: Instant,
+}
+
+/// How long `open_review` waits for a review to load before answering without the place.
+const OPEN_WAIT: Duration = Duration::from_secs(20);
 
 impl std::fmt::Debug for ReviewApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -160,6 +184,8 @@ impl ReviewApp {
             appearance: None,
             assistant,
             button: None,
+            tool_work: Arc::default(),
+            awaiting: None,
         };
         match entry {
             Entry::Home => app.show_home(false),
@@ -411,23 +437,10 @@ impl ReviewApp {
             changed = true;
         }
         for call in self.assistant.take_tool_calls() {
-            let reply = if call.tool == crate::assistant::profile::CURRENT_VIEW {
-                match self.view_context().tool_answer(&call.arguments) {
-                    Ok(answer) => ClientToolReply::Completed(answer),
-                    Err(message) => ClientToolReply::Failed {
-                        code: "invalid_arguments".to_owned(),
-                        message,
-                    },
-                }
-            } else {
-                ClientToolReply::Failed {
-                    code: "unknown_tool".to_owned(),
-                    message: format!("the review app has no tool {}", call.tool),
-                }
-            };
-            let _ = call.reply.send(reply);
+            self.answer_tool(call, host);
             changed = true;
         }
+        changed |= self.finish_tool_work(host);
         let tools = self.assistant.take_finished_tools();
         if tools.is_empty() {
             return changed;
@@ -864,6 +877,312 @@ impl ReviewApp {
                 review.render_with_theme(area, cx, self.theme_input.as_ref());
             }
         }
+    }
+}
+
+/// Tool arguments as `T`.
+fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    serde_json::from_str(text).map_err(|error| format!("invalid arguments: {error}"))
+}
+
+impl ReviewApp {
+    /// What is on screen after an app tool did `done`, as its answer.
+    fn screen_answer(&self, done: &str) -> ClientToolReply {
+        let screen = self
+            .view_context()
+            .tool_answer(r#"{"sections":["screen","review","stack","comparison","file","home"]}"#)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .unwrap_or_default();
+        ClientToolReply::Completed(serde_json::json!({"done": done, "screen": screen}).to_string())
+    }
+
+    fn refused(code: &str, message: impl Into<String>) -> ClientToolReply {
+        ClientToolReply::Failed {
+            code: code.to_owned(),
+            message: message.into(),
+        }
+    }
+
+    /// Answer one of the app's tools.
+    fn answer_tool(&mut self, call: crate::host::ClientToolCall, host: &UiContext) {
+        use crate::assistant::actions;
+        let crate::host::ClientToolCall {
+            tool,
+            arguments,
+            reply,
+            ..
+        } = call;
+        let answer = match tool.as_str() {
+            crate::assistant::profile::CURRENT_VIEW => {
+                match self.view_context().tool_answer(&arguments) {
+                    Ok(answer) => ClientToolReply::Completed(answer),
+                    Err(message) => Self::refused("invalid_arguments", message),
+                }
+            }
+            actions::FIND_PULL_REQUESTS => {
+                let (services, repo) = (self.services.clone(), self.repo.clone());
+                host.spawn(Box::pin(async move {
+                    let answer = match actions::find(services, repo, &arguments).await {
+                        Ok(found) => ClientToolReply::Completed(found),
+                        Err(message) => Self::refused("find_failed", message),
+                    };
+                    let _ = reply.send(answer);
+                }));
+                return;
+            }
+            actions::OPEN_REVIEW => {
+                self.open_for_tool(&arguments, reply, host);
+                return;
+            }
+            actions::REFRESH => match &mut self.route {
+                Route::Home => {
+                    if let Some(home) = self.home.as_mut() {
+                        home.refresh();
+                    }
+                    self.screen_answer("reloading the reviews")
+                }
+                Route::Review(review) => {
+                    match review.assistant_command(crate::surface::ReviewCommand::Refresh, host) {
+                        Ok(done) => self.screen_answer(&done),
+                        Err(message) => Self::refused("not_ready", message),
+                    }
+                }
+                _ => Self::refused("not_available", "nothing to refresh on this screen"),
+            },
+            actions::GO_TO
+            | actions::SET_COMPARISON
+            | actions::SET_VIEW
+            | actions::COMPLETE_PASS
+            | actions::PULL_REQUEST_REVIEW
+            | actions::PUBLISH => self.review_tool(&tool, &arguments, host),
+            other => Self::refused(
+                "unknown_tool",
+                format!("the review app has no tool {other}"),
+            ),
+        };
+        let _ = reply.send(answer);
+    }
+
+    /// Answer a tool that acts on the review on screen.
+    fn review_tool(&mut self, tool: &str, arguments: &str, host: &UiContext) -> ClientToolReply {
+        use crate::assistant::actions;
+        let Route::Review(review) = &mut self.route else {
+            return Self::refused(
+                "no_review",
+                "no review is on screen; open one with bcode.code-review.open_review",
+            );
+        };
+        let arguments = if arguments.trim().is_empty() {
+            "{}"
+        } else {
+            arguments
+        };
+        let result = match tool {
+            actions::GO_TO => parse(arguments).and_then(|target| review.assistant_go_to(&target)),
+            actions::SET_COMPARISON => {
+                parse(arguments).and_then(|change| review.assistant_set_comparison(&change, host))
+            }
+            actions::SET_VIEW => {
+                parse(arguments).and_then(|change| review.assistant_set_view(&change, host))
+            }
+            actions::COMPLETE_PASS => {
+                review.assistant_command(crate::surface::ReviewCommand::CompletePass, host)
+            }
+            actions::PUBLISH => {
+                review.assistant_command(crate::surface::ReviewCommand::Publish, host)
+            }
+            _ => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Verdict {
+                    action: String,
+                }
+                parse::<Verdict>(arguments).and_then(|verdict| {
+                    let command = match verdict.action.as_str() {
+                        "approve" => crate::surface::ReviewCommand::Approve,
+                        "request_changes" => crate::surface::ReviewCommand::RequestChanges,
+                        "comment" => crate::surface::ReviewCommand::Comment,
+                        "approve_viewed_layers" => {
+                            crate::surface::ReviewCommand::ApproveViewedLayers
+                        }
+                        other => return Err(format!("unknown action {other:?}")),
+                    };
+                    review.assistant_command(command, host)
+                })
+            }
+        };
+        match result {
+            Ok(done) => self.screen_answer(&done),
+            Err(message) => Self::refused("refused", message),
+        }
+    }
+
+    /// Run `open_review`: answered at once, or once the review was read (and loaded, for a
+    /// place in it).
+    fn open_for_tool(
+        &mut self,
+        arguments: &str,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+        host: &UiContext,
+    ) {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct Open {
+            screen: Option<String>,
+            review: Option<String>,
+            #[serde(flatten)]
+            rest: serde_json::Map<String, serde_json::Value>,
+        }
+        let open: Open = match serde_json::from_str(if arguments.trim().is_empty() {
+            "{}"
+        } else {
+            arguments
+        }) {
+            Ok(open) => open,
+            Err(error) => {
+                let _ = reply.send(Self::refused("invalid_arguments", error.to_string()));
+                return;
+            }
+        };
+        match open.screen.as_deref().unwrap_or("review") {
+            "home" => {
+                self.show_home(true);
+                let _ = reply.send(self.screen_answer("showing the reviews home"));
+            }
+            "new_review" => {
+                let mut wizard = Wizard::new(self.services.clone(), self.repo.clone());
+                wizard.prepare_keymap(host);
+                self.route = Route::Wizard(Box::new(wizard));
+                self.keymap_stale = true;
+                let _ = reply.send(self.screen_answer("showing the new-review wizard"));
+            }
+            "review" => {
+                let Some(id) = open.review.filter(|id| !id.trim().is_empty()) else {
+                    let _ = reply.send(Self::refused(
+                        "invalid_arguments",
+                        "pass `review` with a saved review's id (code_review.list_reviews)",
+                    ));
+                    return;
+                };
+                let mut place = open.rest;
+                place.insert("review".to_owned(), serde_json::Value::String(id.clone()));
+                let target: crate::surface::GoTo =
+                    match serde_json::from_value(serde_json::Value::Object(place)) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            let _ =
+                                reply.send(Self::refused("invalid_arguments", error.to_string()));
+                            return;
+                        }
+                    };
+                let (services, repo) = (self.services.clone(), self.repo.clone());
+                let work = Arc::clone(&self.tool_work);
+                host.spawn(Box::pin(async move {
+                    let response: Result<bcode_code_review_models::GetReviewWorkspaceResponse, _> =
+                        services
+                            .call(bcode_code_review_models::GetReviewWorkspaceRequest {
+                                repo_path: repo.clone(),
+                                workspace_id: id.clone(),
+                            })
+                            .await;
+                    let result = match response {
+                        Ok(response) => response.workspace.ok_or_else(|| {
+                            format!(
+                                "no saved review {id} in {} (code_review.list_reviews lists them; a review of another repository opens with `bcode review` there)",
+                                repo.display()
+                            )
+                        }),
+                        Err(error) => Err(error.message),
+                    };
+                    if let Ok(mut queue) = work.lock() {
+                        queue.push(ToolWork::Opened {
+                            result,
+                            target,
+                            reply,
+                        });
+                    }
+                }));
+            }
+            other => {
+                let _ = reply.send(Self::refused(
+                    "invalid_arguments",
+                    format!("unknown screen {other:?} (review, home or new_review)"),
+                ));
+            }
+        }
+    }
+
+    /// Finish app tool work that ran on a task, and moves waiting for a review to load.
+    fn finish_tool_work(&mut self, host: &UiContext) -> bool {
+        let work: Vec<ToolWork> = self
+            .tool_work
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default();
+        let mut changed = false;
+        for item in work {
+            let ToolWork::Opened {
+                result,
+                target,
+                reply,
+            } = item;
+            changed = true;
+            match result {
+                Err(message) => {
+                    let _ = reply.send(Self::refused("not_found", message));
+                }
+                Ok(workspace) => {
+                    let same = self
+                        .review()
+                        .and_then(ReviewSurface::workspace)
+                        .is_some_and(|open| open.id == workspace.id);
+                    if !same {
+                        self.open_review(workspace, Some(host));
+                    }
+                    if target.names_a_place() {
+                        if let Some(earlier) = self.awaiting.take() {
+                            let _ = earlier
+                                .reply
+                                .send(self.screen_answer("opened; another move replaced this one"));
+                        }
+                        self.awaiting = Some(Awaiting {
+                            target,
+                            reply,
+                            since: Instant::now(),
+                        });
+                    } else {
+                        let _ = reply.send(self.screen_answer("opened the review"));
+                    }
+                }
+            }
+        }
+        let loaded = self
+            .review()
+            .is_some_and(|review| review.document().is_some());
+        if let Some(awaiting) = self.awaiting.take() {
+            if loaded {
+                let result = match &mut self.route {
+                    Route::Review(review) => review.assistant_go_to(&awaiting.target),
+                    _ => Err("the review was left before it loaded".to_owned()),
+                };
+                let answer = match result {
+                    Ok(done) => self.screen_answer(&format!("opened the review; {done}")),
+                    Err(message) => self.screen_answer(&format!("opened the review; {message}")),
+                };
+                let _ = awaiting.reply.send(answer);
+                changed = true;
+            } else if awaiting.since.elapsed() > OPEN_WAIT
+                || !matches!(self.route, Route::Review(_) | Route::Opening(_))
+            {
+                let _ = awaiting
+                    .reply
+                    .send(self.screen_answer("opened the review; it is still loading"));
+            } else {
+                self.awaiting = Some(awaiting);
+            }
+        }
+        changed
     }
 }
 
