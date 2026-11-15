@@ -784,6 +784,19 @@ works with any installed Bcode whose bridge window contains its protocol version
     `bcode session list --origin bdata`, that a denied `bdata.run_query` never reaches the
     handler, and that an older bridge version inside the window still connects.
 
+## Adopted by the code review app
+
+The code review app (`bcode review`) is an in-tree app on the same contracts, through its
+`ReviewHost` connection rather than the bridge: its assistant panel creates sessions with the
+origin `bcode.code-review` (context `workspace` and `layer` where the conversation started),
+lists them by that origin for its history, registers its tools (`bcode.code-review.current_view`
+and the action tools) and the `bcode.code-review.assistant` profile on a provider connection,
+claims the active conversation's session, and sends every turn with a durable view block and a
+request-only detail block. Mutating app tools (opening another screen, completing a pass,
+publishing) go through the `build` agent's permission rules like any mutating tool. See
+[code review assistant](code-review-assistant.md) and
+[code review app](code-review-app.md#review-assistant).
+
 ## Decisions for sign-off
 
 * **D1, bridge.** Out-of-tree apps connect through a versioned `bcode session-bridge --stdio`

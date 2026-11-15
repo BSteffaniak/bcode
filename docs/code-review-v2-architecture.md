@@ -359,6 +359,9 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
   `line_range`).
 * `review.sources.resolve` resolves a workspace's included sources:
   * unstaged: index → working tree; staged: `HEAD` → index; both: `HEAD` → working tree;
+  * `WorkingTreePaths { paths, staged, unstaged }`: the same sides, limited to the named
+    repository-relative directories or files (checked like other repository paths); neither
+    side, or no path, is `unresolved_revision`;
   * last commit and `Commit { rev }`: first parent (or the empty tree) → commit;
   * ranges and branch compares: base (or the merge base with merge-base semantics) → head;
   * `CurrentBranch`: merge base of the base and `HEAD` → `HEAD`; without an explicit base, the
@@ -382,7 +385,9 @@ Every diff source resolves to concrete object IDs when a review is opened or ref
   so re-review can compute what changed since the previous pass (section 7.4).
 * New source kinds (additive): `Commits { revs }` (non-contiguous selection), `PullRequest {
   provider, repository, number }`, `StackLayer { provider, repository, number }`, `Stack {
-  provider, repository, top }`, and `CurrentBranch { base: Option<String> }` (auto-detected base).
+  provider, repository, top }`, `CurrentBranch { base: Option<String> }` (auto-detected base),
+  and `WorkingTreePaths { paths, staged, unstaged }` (a kind of its own so a version without it
+  keeps it as unsupported rather than reviewing every uncommitted change).
 
 ### 4.2 Service operations (additive to `bcode.code_review/v1`)
 

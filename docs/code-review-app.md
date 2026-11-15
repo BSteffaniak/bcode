@@ -199,7 +199,14 @@ come, is in [code review assistant](code-review-assistant.md).
 * **Which review the tools act on.** The session's binding names the review its `code_review.*`
   tools act on when no `review` is passed. It is rewritten before each message and whenever the
   screen changes: the review on screen, or detached on home and in the wizard, where a review
-  tool called without `review` fails with "no review is on screen; pass `review`".
+  tool called without `review` fails with "no review is on screen; pass `review`". Any tool can
+  act on another saved review by passing its id.
+* **What it can do in the app.** Besides the review tools, the assistant has the app's own tools
+  (see [App tools](#app-tools)): it finds your pull requests and stacks, moves you within the
+  review on screen, changes the comparison and the view, and opens another review, home or the
+  wizard. So "create a review for my most recent PR stack", "create a review for my uncommitted
+  changes in `src/`" or "mark all these files viewed" work from the conversation: the review is
+  created, home lists it at once, and the assistant opens it (after asking).
 * **History.** `alt+h` (or `⟲`) opens the picker of every conversation of the repository, newest
   first: title, where it started, how long ago, turns, and `needs you` or `working`; Ask AI card
   sessions are labelled `card`. Typing searches; `enter` switches (and attaches the conversation
@@ -224,11 +231,15 @@ come, is in [code review assistant](code-review-assistant.md).
 
 The code review plugin offers these tools to every Bcode session. A session the app started (the
 assistant's, or an AI card's) is bound to its review, so the tools act on the review on screen
-with the revisions it shows; any other session passes `review` with a saved review's id.
+with the revisions it shows; any session can pass `review` with a saved review's id instead. A
+review named by id has its pull request and stack sources resolved without the network: from the
+stack it last opened with, else the pull requests and stacks the provider last reported (the
+review cache). When their commits are not in the repository yet, the tool says to open the
+review in the app once.
 
 | Tool | Access | What it does |
 |---|---|---|
-| `code_review.list_reviews` | read | Saved reviews of the repository (id, title, sources). |
+| `code_review.list_reviews` | read | Saved reviews of the repository, most recently updated first: id, title, kind (`stack_step_through`, `whole_stack`, `pull_request`, `branch`, `range`, `working_tree`, ...), source labels, pull request numbers, viewed files, archived, created and updated times. `include_archived`, `query` (title, kind, label or pull request number). |
 | `code_review.summary` | read | Title, sources and the revisions they resolve to, stack layers, files and lines, viewed files, threads, suggestions. |
 | `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed. |
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
@@ -240,7 +251,12 @@ with the revisions it shows; any other session passes `review` with a saved revi
 | `code_review.add_comment` | write | Drafts a comment on lines (`path`, `line`, `end_line`, `side`), a file, or the review, with an optional kind and severity. |
 | `code_review.reply` | write | Replies in one of the review's local threads. |
 | `code_review.resolve_thread` | write | Resolves or reopens one of the review's local threads. |
-| `code_review.mark_viewed` | write | Marks files viewed or not viewed at their current content. |
+| `code_review.mark_viewed` | write | Marks many files viewed or not viewed at their current content in one call, selected by `paths`, a `glob`, `layers` (pull request numbers or source ids), `all`, or `unchanged_since_look` (files whose change is the same as when you last looked at their layer, or completed a pass); selectors narrow each other. Answers with the files changed, those already in that state and named paths not in the review. |
+| `code_review.add_comments` | write | Several draft comments in one call, each like `add_comment`, with a result per comment. |
+| `code_review.resolve_threads` | write | Resolves or reopens several local threads in one call. |
+| `code_review.create_review` | write | Creates a saved review from `sources`: `pull_request` (`number` or `url`), `stack_layers` (stepped through, bottom first), `stack` (one diff), `branch`, `current_branch`, `range`, `commits`, `commit`, `last_commit`, and `working_tree`, `staged` or `unstaged` limited to `paths`. With `directory`, the review is created in that directory's repository and uncommitted changes are limited to it. |
+| `code_review.update_review` | write | Renames, archives or restores one review (`review`) or several (`reviews`). |
+| `code_review.delete_review` | write | Deletes reviews for good (their comments stay in the store, unreachable). |
 | `code_review.suggest_change` | write | A suggested comment the reviewer accepts or rejects, optionally replacing the lines (a `suggestion` block). |
 | `code_review.publish` | publish | Previews, or with `submit` publishes, the comments with a built-in publisher (`local_markdown`, `markdown_file`, `json_file`). `output_path` is a path relative to the session's working directory that stays inside it; without it the file goes to `.bcode/reviews/` in the repository. |
 
@@ -252,8 +268,8 @@ shortens its page of pull request threads (down to one; `next_offset` continues 
 out local threads and then pending suggestions from the end (`omitted`, `suggestions_omitted`);
 one thread leaves out its oldest replies (keeping the first comment and the latest ones,
 `comments_omitted`), then shortens its diff hunk and then its longest comments. Writes and publishing return what
-they did. Publishing to a forge such as GitHub stays in the app (`P`), which reaches publisher
-plugins.
+they did. Publishing to a forge such as GitHub goes through the app (`P`, or the assistant's
+`bcode.code-review.publish`, which opens the same dialog), which reaches publisher plugins.
 
 Pull request threads come from the review store, not the forge: whenever the review app places
 its pull requests' threads and they changed, or it read them again a minute or more after the
@@ -268,6 +284,32 @@ request sources (one whose pull request was removed, say) shows none, whatever w
 `<owner>/<name>#<number>:<forge id>`. `reply` and `resolve_thread` change local threads only:
 on a pull request thread they still ask first, then fail with an error that says to reply or
 resolve it in the review app or on the forge (or draft a comment with `add_comment`).
+
+#### App tools
+
+The app registers these tools for its own sessions (and the review assistant's profile offers
+them). They act on the screen, so they work while the app is open; each answers with what it did
+and what is on screen now (`current_view`'s sections `screen`, `review`, `stack`, `comparison`,
+`file`, `home`).
+
+| Tool | Class | What it does |
+|---|---|---|
+| `bcode.code-review.current_view` | read-only | The live screen (see What it knows). |
+| `bcode.code-review.find_pull_requests` | read-only | Open pull requests chained into stacks, newest first, each layer with its branches and update time and each stack with a `create_review_source` for `code_review.create_review`. `filter`: `mine` (a layer's branch is a local branch: your own work), `review_requested`, `current_branch`, `all`; `query`; `limit` (10, at most 50). |
+| `bcode.code-review.go_to` | read-only | Moves within the review on screen to a `layer` (pull request number or source id), a `path` and `line` (`side`), or a `thread`, as the keys do. Another review's place fails, naming `open_review`. |
+| `bcode.code-review.set_comparison` | read-only | Any Compare menu choice: `baseline` (`off`, `last_looked`, `previous_push`, `ago` with `ago_minutes`, `between` with `from_ms`/`to_ms`), `view` (`full`, `changes`), `only_changed`, `show_hidden_files`, `all_layers`, `versions` (`number`, `from`, `to`: vN to vM of one pull request), `mark_style`, `word_marks`, `seen_hunks`, `removed_inline`. |
+| `bcode.code-review.set_view` | read-only | `layout` (`unified`, `side_by_side`), `wrap`, `hide_resolved_threads`, `hide_viewed_files`, `file_list` (`tree`, `flat`), `files_panel`, `threads_panel`, `fold_files`, `fold_threads`. |
+| `bcode.code-review.refresh` | read-only | Reloads home, or checks the review on screen for changes (`r`). |
+| `bcode.code-review.open_review` | mutating | Opens a saved review of the repository (`review`), optionally at a `layer`, `path`, `line` or `thread` once it loaded; or `screen = "home"` or `"new_review"`. |
+| `bcode.code-review.complete_pass` | mutating | Marks the review pass complete (`shift+m`). |
+| `bcode.code-review.pull_request_review` | mutating | Opens the dialog to `approve`, `request_changes`, `comment` or `approve_viewed_layers`; you confirm it. |
+| `bcode.code-review.publish` | mutating | Opens the publish dialog (`shift+p`); you confirm it. |
+
+Read-only app tools run without asking: they change what is shown, not what is stored. Mutating
+ones follow the `build` agent's rules for mutating tools, so moving you to another screen asks
+first unless a rule allows it (`"bcode.code-review.open_review" = "allow"`); a denied call never
+reaches the app. Without the app (a conversation continued in `bcode tui`), these tools are not
+available and the review tools still work.
 
 #### Tool permissions
 
@@ -831,17 +873,21 @@ bcode's own (`--print-config-paths` lists them in order):
   (default false: code removed since shows inline, struck through). Invalid values are reported
   and the defaults are used.
 * `[plugins.config."bcode.code_review".assistant.tools]`: which tools the review assistant may
-  use, by category, every one `true` by default: `review_reads` (the review read tools and the
-  app's `bcode.code-review.current_view`), `review_writes` (comments, replies, resolution,
-  suggestions, viewed marks), `publish`, `navigation`, `file_reads` (`filesystem.read`, `list`,
+  use, by category, every one `true` by default: `review_reads` (the review read tools, the
+  app's `current_view` and `find_pull_requests`), `review_writes` (comments, replies,
+  resolution, suggestions, viewed marks, creating, changing and deleting reviews, and the app's
+  `complete_pass`), `publish` (`code_review.publish` and the app's `publish` and
+  `pull_request_review`), `navigation` (the app's `go_to`, `set_comparison`, `set_view`,
+  `refresh` and `open_review`), `file_reads` (`filesystem.read`, `list`,
   `find`, `grep`, `stat`, `exists`), `file_writes` (`filesystem.write`, `edit`, `multi_edit`)
   and `shell` (`shell.run`); `extra` lists exact names of other Bcode tools to expose, such as
   `"web.fetch"`. The app registers the agent profile `bcode.code-review.assistant` with the
   selected tools when it starts; the profile is based on Bcode's `build` agent and can only
   narrow it, so every call is still allowed, asked or denied by the `build` agent's rules
   (`[agent.build.permission.tools]`, for example `"code_review.mark_viewed" = "allow"`). With
-  the defaults, reads and navigation run, and review writes, file writes and shell commands ask
-  each time. An unknown key or a non-boolean value is reported and the default is used.
+  the defaults, reads and moves within the review run; review writes, opening another screen,
+  file writes and shell commands ask each time; publishing asks every time (the panel never
+  offers Always for it or for deleting reviews). An unknown key or a non-boolean value is reported and the default is used.
 
   ```toml
   [plugins.config."bcode.code_review".assistant.tools]

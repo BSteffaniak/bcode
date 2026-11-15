@@ -16,7 +16,8 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
 
 ## Status
 
-* **Design.** Nothing in this document is built yet unless this section says so.
+* **Built.** Every build step below is built, with the deviations listed under
+  [As built](#as-built).
 * **Built: conversation plumbing and history model (build step 1).** `ReviewHost` submits turns
   with context blocks and an agent, lists the app's sessions, reads summaries, renames, deletes,
   counts turns and lists pending permissions; the origin's `layer` entry; the binding's
@@ -32,6 +33,13 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
   category configuration) on its own provider connection, reconnecting after Bcode restarts,
   claims the active conversation's session, and names the profile on every turn while the
   connection is registered.
+* **Built: plugin data tools (build step 4).** `create_review` (every kind, and the new
+  `working_tree_paths` source kind), `update_review`, `delete_review`, the `mark_viewed`
+  selectors, `add_comments`, `resolve_threads` and the extended `list_reviews`; every review tool
+  works on any saved review by id. The open review's saves merge viewed marks written elsewhere.
+* **Built: app action tools and acceptance (build step 5).** `find_pull_requests`, `go_to`,
+  `set_comparison`, `set_view`, `open_review`, `refresh`, `complete_pass`,
+  `pull_request_review` and `publish`; the profile instructions carry the recipes.
 * **Built and relied on.** Session origin, client tools with claims, contributed agent profiles
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
@@ -593,13 +601,49 @@ Where the built panel differs from the design above:
   quoted value).
 * **Categories.** `shell` holds `shell.run` only: `shell.terminal` is not among the `build`
   agent's tools, which the profile can only narrow (the test that checks every listed name
-  against `build` caught it). `navigation` lists no tool until the app action tools of build step
-  5 exist. Turns name the profile only while the app's tool connection is registered; before
+  against `build` caught it). `navigation` holds `go_to`, `set_comparison`, `set_view`, `refresh`
+  and `open_review`; `review_reads` also holds `find_pull_requests`, `review_writes` the new
+  plugin writes and `complete_pass`, and `publish` the app's `publish` and `pull_request_review`.
+  Turns name the profile only while the app's tool connection is registered; before
   that (or with a host that cannot provide tools) they use the session's agent.
 * **`current_view`** returns the snapshot's JSON; `max_files` is not an argument yet, and lists
   are shortened (20 items, 10 files per layer) only when the answer would exceed 64 KiB.
 * **Resubmission** covers a submit rejected with `request_only_context_unavailable`. A queued turn
   that fails later for that reason shows its failure in the conversation and is not resent.
+* **Saved reviews by id.** Plugin tools resolve a saved review's pull request and stack sources
+  without the network: a stack from the review's `stack_snapshots` (what it last opened with),
+  else the stack or pull request the provider last reported (the on-disk review cache). Heads
+  are the recorded head commits; the bottom layer's base is its recorded base commit, else
+  `origin/<base>` or `<base>`. When those commits are not local the tool says to open the review
+  in the app (`open_review`) once.
+* **`update_review` and `delete_review`** need `review` or `reviews`; they never default to the
+  attached review.
+* **`mark_viewed` selectors** narrow each other (layers, then paths, glob, unchanged since the
+  last look); `all` takes every file of the selected layers. "Unchanged since the last look"
+  compares each file's patch id now with its patch id at the reviewer's latest look at the layer
+  (a pull request's latest look, from its fork point when recorded), or at the revisions a
+  completed pass recorded for other sources. A file without a look is left out.
+* **`create_review`** takes `sources` (each with `kind`) rather than one source; a stack named by
+  `stack_layers` takes optional `titles` for its labels. Pull requests named by number use the
+  `origin` remote's repository on the `github` provider. With `directory`, uncommitted-change
+  sources without `paths` are limited to the directory; the answer says `other_repository` when
+  the review was created in another repository.
+* **`find_pull_requests`** chains the provider's listed pull requests into stacks itself (a pull
+  request whose base is another's head is the layer above it) instead of resolving each stack:
+  one provider call. `mine` means a layer's head is a local branch of the repository (the
+  user's own work, as Graphite stacks are); the provider does not report the viewer's login in
+  its list.
+* **`publish` and `pull_request_review`** open the app's dialog (as `shift+p` and the pull
+  request card's actions do) for the reviewer to confirm; they do not submit by themselves.
+* **`set_comparison versions`** needs the stack history: when it is not loaded yet the call
+  starts loading it and asks to be repeated.
+* **`open_review`** reads the review from the store, opens it, and answers once it loaded when a
+  place was named (or after 20 seconds, saying it is still loading). A review of another
+  repository is not found; the profile instructions say to run `bcode review` there.
+* **The viewed-mark race** in the open questions was real: the open review saved its whole
+  workspace with its older viewed state. Saves and reloads now merge per file and per thread
+  (the reviewer's own changes since the last read or write win; everything else comes from the
+  store).
 
 ## Decisions
 
@@ -625,9 +669,8 @@ Where the built panel differs from the design above:
   and deleting, but `bcode tui` may offer it.
 * A contributed profile must list exact tool names; a Bcode capability to subtract categories
   from the base agent's tools would remove the category table.
-* Under parallel test load, viewed marks written by `code_review.mark_viewed` while a review is
-  open were once read back empty after the review reloaded them, which suggests the open
-  review's own workspace save can overwrite marks a tool wrote. Build step 4's bulk
-  `mark_viewed` should confirm or rule this out before relying on it.
 * Opening a review of another repository in the running app (switching its repository) is not
-  covered; the tool returns the command line instead.
+  covered; `open_review` says the review is not in this repository and the instructions tell
+  the model to point the user at `bcode review` there.
+* `find_pull_requests mine` relies on local branches; a provider that reports the viewer's login
+  with its list would allow matching by author too.
