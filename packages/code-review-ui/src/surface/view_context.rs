@@ -420,55 +420,7 @@ fn baseline_name(comparing: &super::compare::Comparing) -> String {
     name
 }
 
-/// The review's kind, from its sources.
-fn review_kind(sources: &[bcode_code_review_models::ReviewSource]) -> String {
-    let included: Vec<&ReviewSourceKind> = sources
-        .iter()
-        .filter(|source| source.included)
-        .map(|source| &source.kind)
-        .collect();
-    let layers = included
-        .iter()
-        .filter(|kind| matches!(kind, ReviewSourceKind::StackLayer { .. }))
-        .count();
-    if layers >= 2 && layers == included.len() {
-        return "stack_step_through".to_owned();
-    }
-    match included.as_slice() {
-        [] => "empty".to_owned(),
-        [only] => match only {
-            ReviewSourceKind::Stack { .. } => "whole_stack",
-            ReviewSourceKind::PullRequest { .. } | ReviewSourceKind::StackLayer { .. } => {
-                "pull_request"
-            }
-            other => source_kind(other),
-        }
-        .to_owned(),
-        _ => "mixed".to_owned(),
-    }
-}
-
-/// Stable name of a source kind.
-const fn source_kind(kind: &ReviewSourceKind) -> &'static str {
-    match kind {
-        ReviewSourceKind::WorkingTreeUnstaged => "unstaged",
-        ReviewSourceKind::IndexStaged => "staged",
-        ReviewSourceKind::WorkingTreeAndIndex => "working_tree",
-        ReviewSourceKind::LastCommit => "last_commit",
-        ReviewSourceKind::Commit { .. } => "commit",
-        ReviewSourceKind::CommitRange { .. } => "range",
-        ReviewSourceKind::BranchCompare { .. } => "branch",
-        ReviewSourceKind::File { .. } | ReviewSourceKind::FileRange { .. } => "files",
-        ReviewSourceKind::Repository => "repository",
-        ReviewSourceKind::Commits { .. } => "commits",
-        ReviewSourceKind::PullRequest { .. } => "pull_request",
-        ReviewSourceKind::StackLayer { .. } => "stack_layer",
-        ReviewSourceKind::Stack { .. } => "stack",
-        ReviewSourceKind::CurrentBranch { .. } => "current_branch",
-        ReviewSourceKind::WorkingTreePaths { .. } => "working_tree_paths",
-        ReviewSourceKind::Unsupported { .. } => "unsupported",
-    }
-}
+use bcode_code_review::assistant::manage::{review_kind, source_kind_name as source_kind};
 
 const fn status_name(status: ReviewFileStatus) -> &'static str {
     match status {

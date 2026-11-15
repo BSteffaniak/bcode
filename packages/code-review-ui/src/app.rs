@@ -429,13 +429,45 @@ impl ReviewApp {
             changed = true;
         }
         let tools = self.assistant.take_finished_tools();
-        if !tools.is_empty()
-            && let Route::Review(review) = &mut self.route
-        {
-            review.apply_assistant_tools(&tools, host);
-            changed = true;
+        if tools.is_empty() {
+            return changed;
         }
-        changed
+        if tools
+            .iter()
+            .any(|(name, _)| crate::surface::REVIEW_LIST_TOOLS.contains(&name.as_str()))
+        {
+            if let Some(home) = self.home.as_mut() {
+                home.refresh();
+            }
+            if self.deleted_review_on_screen(&tools) {
+                self.show_home(true);
+                return true;
+            }
+        }
+        if let Route::Review(review) = &mut self.route {
+            review.apply_assistant_tools(&tools, host);
+        }
+        true
+    }
+
+    /// Whether a finished `code_review.delete_review` named the review on screen.
+    fn deleted_review_on_screen(&self, tools: &[(String, String)]) -> bool {
+        let Some(id) = self
+            .review()
+            .and_then(ReviewSurface::workspace)
+            .map(|workspace| workspace.id.clone())
+        else {
+            return false;
+        };
+        tools.iter().any(|(name, arguments)| {
+            name == "code_review.delete_review"
+                && serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|arguments| {
+                    arguments["review"] == id.as_str()
+                        || arguments["reviews"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|named| named == id.as_str()))
+                })
+        })
     }
 
     /// Paint the route in `screen` with the Ask AI button at the end of its header row.

@@ -174,7 +174,7 @@ pub use annotate::COMPOSER_SCOPE;
 pub use conversation::{BarState, ConversationMessage, WatchCancel};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
-pub use review_tools::ToolsResult;
+pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
 
 pub use find::{SearchState, ThreadsFilter};
 
@@ -732,16 +732,8 @@ pub struct ReviewSurface {
     notes_requested: bool,
     /// Whether a transient review is being saved as a durable one.
     saving_as: bool,
-    /// Viewed files and marks of an unsaved review as last stored for its target.
-    transient_viewed: Option<(
-        std::collections::BTreeSet<String>,
-        Vec<bcode_code_review_models::ViewedMark>,
-        Vec<bcode_code_review_models::ThreadViewMark>,
-    )>,
-    /// Viewed state as last read from or written to the store (see [`viewed_sync`]).
-    viewed_base: Option<viewed_sync::Viewed>,
-    /// Viewed state being saved, while a save runs.
-    viewed_saving: Option<viewed_sync::Viewed>,
+    /// Viewed state as stored and being saved (see [`viewed_sync`]).
+    viewed_sync: viewed_sync::Tracking,
     /// The open publish or import flow.
     modal: Option<Modal>,
     /// Stack rail tab state, and the rail's area and layout in the last frame.
@@ -895,9 +887,7 @@ impl ReviewSurface {
             next_exchange: 0,
             notes_requested: false,
             saving_as: false,
-            transient_viewed: None,
-            viewed_base: None,
-            viewed_saving: None,
+            viewed_sync: viewed_sync::Tracking::default(),
             modal: None,
             rail_state: RefCell::new(bmux_tui_components::tab_bar::TabBarState::new(None)),
             rail: None,
@@ -990,7 +980,7 @@ impl ReviewSurface {
             };
         }
         if workspace.id != TRANSIENT_WORKSPACE_ID {
-            self.viewed_base = Some(viewed_sync::Viewed::of(&workspace));
+            self.viewed_sync.base = Some(viewed_sync::Viewed::of(&workspace));
         }
         self.workspace = Some(workspace);
         self
@@ -1623,6 +1613,28 @@ impl ReviewSurface {
         self.save == SaveState::Idle && self.notes.pending() == 0
     }
 
+    /// A save finished: save again what changed meanwhile, and take what it merged in.
+    fn finish_save(&mut self, result: Result<viewed_sync::Viewed, String>) {
+        self.save = if self.save == SaveState::RunningThenPending {
+            SaveState::Pending
+        } else {
+            SaveState::Idle
+        };
+        let saving = self.viewed_sync.saving.take();
+        match result {
+            Ok(written) => {
+                if let Some(saving) = saving {
+                    self.adopt_viewed(&saving, &written);
+                }
+            }
+            Err(error) => self.toasts.push(
+                ToastSeverity::Error,
+                "Could not save the review state",
+                Some(error),
+            ),
+        }
+    }
+
     fn save(&mut self, host: &UiContext) {
         if self.save != SaveState::Pending {
             return;
@@ -1637,8 +1649,8 @@ impl ReviewSurface {
         }
         self.save = SaveState::Running;
         let local = viewed_sync::Viewed::of(&workspace);
-        self.viewed_saving = Some(local.clone());
-        let base = self.viewed_base.clone();
+        self.viewed_sync.saving = Some(local.clone());
+        let base = self.viewed_sync.base.clone();
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
@@ -2048,27 +2060,7 @@ impl ReviewSurface {
                 self.apply_syntax(message, host);
             }
             Message::Token { result, manual } => self.apply_token(host, result, manual),
-            Message::Saved(result) => {
-                // Changes made while saving are saved next.
-                self.save = if self.save == SaveState::RunningThenPending {
-                    SaveState::Pending
-                } else {
-                    SaveState::Idle
-                };
-                let saving = self.viewed_saving.take();
-                match result {
-                    Ok(written) => {
-                        if let Some(saving) = saving {
-                            self.adopt_viewed(&saving, &written);
-                        }
-                    }
-                    Err(error) => self.toasts.push(
-                        ToastSeverity::Error,
-                        "Could not save the review state",
-                        Some(error),
-                    ),
-                }
-            }
+            Message::Saved(result) => self.finish_save(result),
             Message::NotesLoaded { generation, result } => {
                 if generation == self.generation {
                     match result {
@@ -2169,8 +2161,8 @@ impl ReviewSurface {
             workspace.viewed_marks.clone(),
             workspace.viewed_threads.clone(),
         );
-        self.transient_viewed = Some(viewed);
-        self.viewed_base = Some(stored_viewed.unwrap_or_default());
+        self.viewed_sync.transient = Some(viewed);
+        self.viewed_sync.base = Some(stored_viewed.unwrap_or_default());
     }
 
     fn apply_opened(&mut self, mut opened: Opened) {

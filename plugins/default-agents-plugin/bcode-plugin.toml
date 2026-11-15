@@ -66,6 +66,11 @@ build_tools = [
     "code_review.mark_viewed",
     "code_review.suggest_change",
     "code_review.publish",
+    "code_review.add_comments",
+    "code_review.resolve_threads",
+    "code_review.create_review",
+    "code_review.update_review",
+    "code_review.delete_review",
 ]
 # These tools mutate only the authenticated active run. Application policy, ownership,
 # exact-candidate publication, execution ceilings and downstream tool permissions still apply.
@@ -99,6 +104,11 @@ plan_disabled_tools = [
     "code_review.mark_viewed",
     "code_review.suggest_change",
     "code_review.publish",
+    "code_review.add_comments",
+    "code_review.resolve_threads",
+    "code_review.create_review",
+    "code_review.update_review",
+    "code_review.delete_review",
 ]
 
 [runtime]

@@ -678,8 +678,8 @@ impl ReviewSurface {
                     workspace.viewed_marks.clone(),
                     workspace.viewed_threads.clone(),
                 );
-                let changed = self.transient_viewed.as_ref() != Some(&viewed);
-                self.transient_viewed = Some(viewed);
+                let changed = self.viewed_sync.transient.as_ref() != Some(&viewed);
+                self.viewed_sync.transient = Some(viewed);
                 changed
             }
             Some(_) => true,

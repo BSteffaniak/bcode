@@ -52,6 +52,8 @@ pub const CATEGORY_WRITE: &str = "code_review.write";
 pub const CATEGORY_PUBLISH: &str = "code_review.publish";
 /// Bytes of tool output returned at most.
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+/// Items one batch tool call takes at most.
+const MAX_BATCH: usize = 100;
 
 /// What a tool does to the review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,21 @@ fn location_properties() -> serde_json::Map<String, Value> {
     map
 }
 
+/// A `review` argument naming a saved review to act on.
+fn review_property_required() -> Value {
+    json!({
+        "type": "string",
+        "description": "Id of a saved review (from code_review.list_reviews)."
+    })
+}
+
+fn json_map(value: Value) -> serde_json::Map<String, Value> {
+    match value {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
 fn object(properties: serde_json::Map<String, Value>, required: &[&str]) -> Value {
     json!({
         "type": "object",
@@ -116,8 +133,16 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.list_reviews",
         access: Access::Read,
-        description: "List the saved code reviews of this repository (id, title, sources).",
-        schema: || object(serde_json::Map::new(), &[]),
+        description: "List the saved code reviews of this repository, most recently updated first: id, title, kind (stack_step_through, whole_stack, pull_request, branch, current_branch, range, commits, working_tree, ...), source labels, pull request numbers, viewed files, archived, created and updated times. Pass `query` to find one by title, label or pull request number.",
+        schema: || {
+            object(
+                json_map(json!({
+                    "include_archived": {"type": "boolean", "description": "Include archived reviews (default false)."},
+                    "query": {"type": "string", "description": "Only reviews whose title, kind, source labels or pull request numbers contain this (case-insensitive)."},
+                })),
+                &[],
+            )
+        },
     },
     Spec {
         name: "code_review.summary",
@@ -249,14 +274,107 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.mark_viewed",
         access: Access::Write,
-        description: "Mark files viewed (or not viewed) at their current content.",
+        description: "Mark many files viewed (or not viewed) at their current content in one call, as the reviewer's `v` does. Select files with any of: `paths` (exact paths), `glob` (e.g. src/**/*.rs), `layers` (stack layers by pull request number, or source ids), `all` (every file of the selected layers, or of the review), `unchanged_since_look` (files whose change is the same as when the reviewer last looked at their layer). Selectors narrow each other. Returns the files changed, those already in that state, and named paths not in the review.",
         schema: || {
             with_review(
                 json!({
-                    "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "File paths."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "File paths as code_review.list_files lists them."},
+                    "glob": {"type": "string", "description": "Glob over file paths; `*` stays within a directory, `**` crosses directories."},
+                    "layers": {"type": "array", "items": {"type": "string"}, "description": "Stack layers (pull request numbers such as \"102\") or source ids to take files from."},
+                    "all": {"type": "boolean", "description": "Every file of the selected layers (or of the whole review)."},
+                    "unchanged_since_look": {"type": "boolean", "description": "Only files unchanged since the reviewer last looked at their layer (or completed a review pass)."},
                     "viewed": {"type": "boolean", "description": "true marks viewed (default), false unmarks."},
                 }),
-                &["paths"],
+                &[],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.add_comments",
+        access: Access::Write,
+        description: "Draft several review comments in one call, each like code_review.add_comment. Drafts stay local until the reviewer publishes. Returns each comment's thread id or why it failed.",
+        schema: || {
+            let mut comment = location_properties();
+            comment.remove("review");
+            comment.insert(
+                "body".to_owned(),
+                json!({"type": "string", "description": "Comment text (markdown)."}),
+            );
+            comment.insert("kind".to_owned(), json!({"type": "string", "enum": ["note", "question", "todo", "finding", "summary"]}));
+            comment.insert(
+                "severity".to_owned(),
+                json!({"type": "string", "enum": ["info", "nit", "warning", "blocker"]}),
+            );
+            with_review(
+                json!({
+                    "comments": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_BATCH,
+                        "items": object(comment, &["body"]),
+                        "description": "The comments."
+                    }
+                }),
+                &["comments"],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.resolve_threads",
+        access: Access::Write,
+        description: "Resolve (or reopen) several of the review's local threads in one call. Pull request threads cannot be resolved with this tool. Returns each thread's result.",
+        schema: || {
+            with_review(
+                json!({
+                    "thread_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_BATCH, "description": "Thread ids from code_review.list_threads."},
+                    "resolved": {"type": "boolean", "description": "true resolves (default), false reopens."},
+                }),
+                &["thread_ids"],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.create_review",
+        access: Access::Write,
+        description: "Create a saved review and return its id, title, kind and sources. Kinds: a pull request (number or url), a stack stepped through one pull request at a time (stack_layers, bottom first) or as one diff (stack), a branch against a base, the current branch, a commit range, commits, one commit, and uncommitted changes (working_tree, staged, unstaged) optionally limited to `paths` or to `directory`. With `directory`, the review is created in that directory's repository and uncommitted changes are limited to it. To find the user's pull requests and stacks, call bcode.code-review.find_pull_requests first; to show the new review, call bcode.code-review.open_review.",
+        schema: || {
+            object(
+                json_map(json!({
+                    "sources": {"type": "array", "minItems": 1, "items": create::source_schema(), "description": "What to review, in order."},
+                    "title": {"type": "string", "description": "Title (defaults from the sources)."},
+                    "directory": {"type": "string", "description": "A directory (absolute, or relative to the session's working directory): the review belongs to its repository, and uncommitted changes are limited to it."},
+                })),
+                &["sources"],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.update_review",
+        access: Access::Write,
+        description: "Rename, archive or restore saved reviews: `review` for one or `reviews` for many.",
+        schema: || {
+            object(
+                json_map(json!({
+                    "review": review_property_required(),
+                    "reviews": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_BATCH, "description": "Review ids, to archive or restore several."},
+                    "title": {"type": "string", "description": "New title (one review only)."},
+                    "archived": {"type": "boolean", "description": "true archives, false restores."},
+                })),
+                &[],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.delete_review",
+        access: Access::Write,
+        description: "Delete saved reviews for good (their comments are no longer reachable). Prefer archiving (code_review.update_review) unless the user asked to delete. `review` for one or `reviews` for many.",
+        schema: || {
+            object(
+                json_map(json!({
+                    "review": review_property_required(),
+                    "reviews": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_BATCH, "description": "Review ids."},
+                })),
+                &[],
             )
         },
     },
@@ -551,6 +669,109 @@ struct Arguments {
     publisher: Option<String>,
     submit: Option<bool>,
     output_path: Option<String>,
+    include_archived: Option<bool>,
+    query: Option<String>,
+    sources: Vec<create::SourceArgument>,
+    title: Option<String>,
+    directory: Option<String>,
+    archived: Option<bool>,
+    reviews: Vec<String>,
+    comments: Vec<CommentArgument>,
+    thread_ids: Vec<String>,
+    glob: Option<String>,
+    layers: Vec<String>,
+    all: Option<bool>,
+    unchanged_since_look: Option<bool>,
+}
+
+/// One comment of `add_comments`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CommentArgument {
+    path: Option<String>,
+    line: Option<u32>,
+    end_line: Option<u32>,
+    side: Option<Side>,
+    source: Option<String>,
+    body: Option<String>,
+    kind: Option<ReviewThreadKind>,
+    severity: Option<ReviewThreadSeverity>,
+}
+
+impl CommentArgument {
+    fn location(&self) -> Location {
+        Location {
+            path: self.path.clone(),
+            line: self.line,
+            end_line: self.end_line,
+            side: self.side.unwrap_or_default(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// One item of a batch call: what it did, or why not.
+#[derive(Debug, Serialize)]
+struct BatchItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl BatchItem {
+    fn of<T: Serialize>(id: Option<String>, result: Result<T, AssistantError>) -> Self {
+        match result {
+            Ok(value) => Self {
+                id,
+                ok: true,
+                result: serde_json::to_value(value).ok(),
+                error: None,
+            },
+            Err(error) => Self {
+                id,
+                ok: false,
+                result: None,
+                error: Some(format!("{error} ({})", error.code())),
+            },
+        }
+    }
+}
+
+/// Results of a batch call, with how many succeeded.
+fn batch(items: &[BatchItem]) -> Result<String, AssistantError> {
+    let succeeded = items.iter().filter(|item| item.ok).count();
+    encode(&json!({
+        "succeeded": succeeded,
+        "failed": items.len() - succeeded,
+        "items": items,
+    }))
+}
+
+/// The review ids `review` and `reviews` name.
+fn review_ids(arguments: &Arguments) -> Result<Vec<String>, AssistantError> {
+    let mut ids: Vec<String> = arguments
+        .review
+        .iter()
+        .chain(&arguments.reviews)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(AssistantError::Invalid(
+            "pass `review` or `reviews` with ids from code_review.list_reviews".to_owned(),
+        ));
+    }
+    if ids.len() > MAX_BATCH {
+        return Err(AssistantError::Invalid(format!(
+            "at most {MAX_BATCH} reviews per call"
+        )));
+    }
+    Ok(ids)
 }
 
 impl Arguments {
@@ -593,7 +814,7 @@ fn invoke(
             Ok(descriptor) => descriptor,
             Err(error) => return failure(&format!("invalid review tool descriptor: {error}")),
         };
-    let arguments = match serde_json::from_value::<Arguments>(invocation.arguments.clone()) {
+    let mut arguments = match serde_json::from_value::<Arguments>(invocation.arguments.clone()) {
         Ok(arguments) => arguments,
         Err(error) => return failure(&format!("invalid arguments: {error}")),
     };
@@ -604,7 +825,7 @@ fn invoke(
         reset,
         &invocation.name,
         &descriptor,
-        &arguments,
+        &mut arguments,
     ) {
         Ok(output) => ToolInvocationResponse {
             output: bounded(output),
@@ -623,22 +844,14 @@ fn run(
     reset: ViewedReset,
     name: &str,
     descriptor: &Descriptor,
-    arguments: &Arguments,
+    arguments: &mut Arguments,
 ) -> Result<String, AssistantError> {
     let repo = descriptor.working_directory.as_path();
-    let mut tools = ReviewTools::new(data, store);
-    if name == "code_review.list_reviews" {
-        return encode(&tools.list_reviews(repo)?);
+    let mut tools = ReviewTools::new(data, store).with_providers(remembered_providers());
+    if let Some(result) = run_reviews(&tools, repo, name, arguments) {
+        return result;
     }
-    let reference = match (&arguments.review, &descriptor.session_id) {
-        (Some(review), _) if !review.trim().is_empty() => ReviewRef::Workspace(review.clone()),
-        (_, Some(session)) => ReviewRef::Session(session.clone()),
-        _ => {
-            return Err(AssistantError::NotBound(
-                "this session is not attached to a review; pass `review`".to_owned(),
-            ));
-        }
-    };
+    let reference = review_ref(arguments, descriptor)?;
     let review = tools.open(repo, &reference)?;
     match name {
         "code_review.summary" => encode(&tools.summary(&review)?),
@@ -689,11 +902,21 @@ fn run(
             Arguments::required(arguments.thread_id.as_ref(), "thread_id")?,
             arguments.resolved.unwrap_or(true),
         )?),
-        "code_review.mark_viewed" => encode(&tools.mark_viewed(
+        "code_review.mark_viewed" => encode(&tools.mark_viewed_selection(
             &review,
-            arguments.paths.as_deref().unwrap_or_default(),
+            &bcode_code_review::assistant::manage::FileSelection {
+                paths: arguments.paths.clone().unwrap_or_default(),
+                glob: arguments.glob.clone(),
+                layers: arguments.layers.clone(),
+                all: arguments.all.unwrap_or(false),
+                unchanged_since_look: arguments.unchanged_since_look.unwrap_or(false),
+            },
             arguments.viewed.unwrap_or(true),
+            reset,
         )?),
+        "code_review.add_comments" | "code_review.resolve_threads" => {
+            run_batch(&mut tools, &review, name, arguments)
+        }
         "code_review.suggest_change" => {
             Arguments::required(arguments.path.as_ref(), "path")?;
             encode(&tools.suggest(
@@ -721,6 +944,177 @@ fn run(
             "unknown review tool {name}"
         ))),
     }
+}
+
+/// The review a tool acts on: the one named by `review`, else the session's.
+fn review_ref(arguments: &Arguments, descriptor: &Descriptor) -> Result<ReviewRef, AssistantError> {
+    Ok(match (&arguments.review, &descriptor.session_id) {
+        (Some(review), _) if !review.trim().is_empty() => ReviewRef::Workspace(review.clone()),
+        (_, Some(session)) => ReviewRef::Session(session.clone()),
+        _ => {
+            return Err(AssistantError::NotBound(
+                "this session is not attached to a review; pass `review`".to_owned(),
+            ));
+        }
+    })
+}
+
+/// Run a batch tool on `review`.
+fn run_batch(
+    tools: &mut ReviewTools<'_>,
+    review: &bcode_code_review::assistant::OpenReview,
+    name: &str,
+    arguments: &Arguments,
+) -> Result<String, AssistantError> {
+    match name {
+        "code_review.add_comments" => {
+            if arguments.comments.len() > MAX_BATCH {
+                return Err(AssistantError::Invalid(format!(
+                    "at most {MAX_BATCH} comments per call"
+                )));
+            }
+            let items: Vec<BatchItem> = arguments
+                .comments
+                .iter()
+                .map(|comment| {
+                    let result =
+                        Arguments::required(comment.body.as_ref(), "body").and_then(|body| {
+                            let classification =
+                                (comment.kind.is_some() || comment.severity.is_some()).then(|| {
+                                    (
+                                        comment.kind.unwrap_or_default(),
+                                        comment.severity.unwrap_or_default(),
+                                    )
+                                });
+                            tools.add_comment(review, &comment.location(), body, classification)
+                        });
+                    BatchItem::of(comment.path.clone(), result)
+                })
+                .collect();
+            batch(&items)
+        }
+        "code_review.resolve_threads" => {
+            if arguments.thread_ids.len() > MAX_BATCH {
+                return Err(AssistantError::Invalid(format!(
+                    "at most {MAX_BATCH} threads per call"
+                )));
+            }
+            let resolved = arguments.resolved.unwrap_or(true);
+            let items: Vec<BatchItem> = arguments
+                .thread_ids
+                .iter()
+                .map(|thread| {
+                    let result = tools.resolve(review, thread, resolved);
+                    BatchItem::of(Some(thread.clone()), result)
+                })
+                .collect();
+            batch(&items)
+        }
+        _ => Err(AssistantError::Invalid(format!(
+            "unknown review tool {name}"
+        ))),
+    }
+}
+
+/// Tools that act on saved reviews as a whole rather than on one open review.
+const REVIEW_LEVEL_TOOLS: &[&str] = &[
+    "code_review.list_reviews",
+    "code_review.create_review",
+    "code_review.update_review",
+    "code_review.delete_review",
+];
+
+/// Run the tools that act on saved reviews as a whole; `None` for any other tool.
+fn run_reviews(
+    tools: &ReviewTools<'_>,
+    repo: &std::path::Path,
+    name: &str,
+    arguments: &mut Arguments,
+) -> Option<Result<String, AssistantError>> {
+    REVIEW_LEVEL_TOOLS
+        .contains(&name)
+        .then(|| review_level(tools, repo, name, arguments))
+}
+
+fn review_level(
+    tools: &ReviewTools<'_>,
+    repo: &std::path::Path,
+    name: &str,
+    arguments: &mut Arguments,
+) -> Result<String, AssistantError> {
+    match name {
+        "code_review.list_reviews" => encode(&tools.review_entries(
+            repo,
+            arguments.include_archived.unwrap_or(false),
+            arguments.query.as_deref(),
+        )?),
+        "code_review.create_review" => {
+            let plan = create::plan(
+                repo,
+                arguments.directory.as_deref(),
+                std::mem::take(&mut arguments.sources),
+            )?;
+            let created =
+                tools.create_review(&plan.repo_root, arguments.title.clone(), plan.sources)?;
+            encode(&json!({
+                "message": format!("created the review {:?} ({})", created.title, created.id),
+                "review": created,
+                "other_repository": !same_repository(repo, &plan.repo_root),
+            }))
+        }
+        "code_review.update_review" => {
+            let ids = review_ids(arguments)?;
+            if arguments.title.is_some() && ids.len() > 1 {
+                return Err(AssistantError::Invalid(
+                    "a title renames one review; pass a single `review`".to_owned(),
+                ));
+            }
+            let change = bcode_code_review::assistant::manage::ReviewChange {
+                title: arguments.title.clone(),
+                archived: arguments.archived,
+            };
+            let items: Vec<BatchItem> = ids
+                .into_iter()
+                .map(|id| {
+                    let result = tools.update_review(repo, &id, &change);
+                    BatchItem::of(Some(id), result)
+                })
+                .collect();
+            batch(&items)
+        }
+        _ => {
+            let items: Vec<BatchItem> = review_ids(arguments)?
+                .into_iter()
+                .map(|id| {
+                    let result = tools.delete_review(repo, &id);
+                    BatchItem::of(Some(id), result)
+                })
+                .collect();
+            batch(&items)
+        }
+    }
+}
+
+/// Providers' remembered pull requests and stacks (the review cache on disk, without any
+/// provider), so tools resolve saved pull request reviews without the network.
+fn remembered_providers() -> &'static bcode_code_review::provider::ProviderRegistry {
+    static REGISTRY: std::sync::OnceLock<bcode_code_review::provider::ProviderRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        bcode_code_review::provider::ProviderRegistry::new().with_cache(std::sync::Arc::new(
+            bcode_code_review::cache::ReviewCache::for_user(),
+        ))
+    })
+}
+
+/// Whether `a` and `b` are in the same repository.
+fn same_repository(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let root = |path: &std::path::Path| {
+        git(path, &["rev-parse", "--show-toplevel"])
+            .map(PathBuf::from)
+            .and_then(|root| root.canonicalize().ok())
+    };
+    root(a) == root(b)
 }
 
 /// The pull request behind `review`: its pull request sources, else its branch.
@@ -844,6 +1238,8 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     ServiceResponse::json(value)
         .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string()))
 }
+
+mod create;
 
 #[cfg(test)]
 mod tests;

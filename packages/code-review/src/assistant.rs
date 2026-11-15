@@ -16,6 +16,8 @@
 //! that change threads change local ones only.
 
 pub mod fit;
+pub mod manage;
+pub mod offline;
 pub mod pull_threads;
 
 pub use fit::MAX_THREADS_OUTPUT_BYTES;
@@ -385,12 +387,28 @@ pub struct Written {
 pub struct ReviewTools<'a> {
     data: &'a ReviewData,
     store: &'a ReviewStore,
+    providers: Option<&'a crate::provider::ProviderRegistry>,
 }
 
 impl<'a> ReviewTools<'a> {
     /// Operations reading with `data` and storing with `store`.
     pub const fn new(data: &'a ReviewData, store: &'a ReviewStore) -> Self {
-        Self { data, store }
+        Self {
+            data,
+            store,
+            providers: None,
+        }
+    }
+
+    /// Resolve saved reviews' pull request and stack sources also from what `providers`
+    /// remember (see [`offline`]), besides the stacks the reviews last opened with.
+    #[must_use]
+    pub const fn with_providers(
+        mut self,
+        providers: &'a crate::provider::ProviderRegistry,
+    ) -> Self {
+        self.providers = Some(providers);
+        self
     }
 
     /// Saved reviews of the repository at `repo_path`, newest first.
@@ -510,20 +528,32 @@ impl<'a> ReviewTools<'a> {
         &self,
         workspace: &ReviewWorkspace,
     ) -> Result<(Vec<ResolvedSource>, Vec<ResolvedReviewStack>), AssistantError> {
-        if workspace.sources.iter().any(|source| {
+        let needs_provider = workspace.sources.iter().any(|source| {
             source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
-        }) {
-            return Err(AssistantError::Invalid(
-                "this review has pull request or stack sources, which only the review app can \
-                 resolve; ask from the review's assistant"
-                    .to_owned(),
-            ));
-        }
+        });
+        let provider_resolutions = if needs_provider {
+            offline::resolutions(workspace, self.providers)
+        } else {
+            Vec::new()
+        };
         let response = self.data.resolve_sources(&ResolveReviewSourcesRequest {
             repo_path: workspace.repo_root.clone(),
             sources: workspace.sources.clone(),
-            provider_resolutions: Vec::new(),
+            provider_resolutions,
         })?;
+        if needs_provider
+            && let Some(diagnostic) = response.diagnostics.iter().find(|diagnostic| {
+                diagnostic.severity
+                    == bcode_code_review_models::ReviewSourceDiagnosticSeverity::Error
+            })
+        {
+            return Err(AssistantError::Invalid(format!(
+                "this review's pull requests cannot be resolved from what is known locally ({}); \
+                 open it in the review app once (bcode.code-review.open_review) so its pull \
+                 requests are fetched",
+                diagnostic.message
+            )));
+        }
         if response.sources.is_empty()
             && let Some(diagnostic) = response.diagnostics.first()
         {

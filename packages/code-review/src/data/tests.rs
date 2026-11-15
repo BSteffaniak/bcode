@@ -664,7 +664,7 @@ fn uncommitted_changes_limited_to_paths_list_only_those_paths() {
     );
     assert_eq!(
         scoped(vec![mixed.clone(), unstaged_only.clone()], false, true),
-        vec![mixed.clone(), unstaged_only.clone()],
+        vec![mixed.clone(), unstaged_only],
         "unstaged only"
     );
     // A directory scopes to the files under it.

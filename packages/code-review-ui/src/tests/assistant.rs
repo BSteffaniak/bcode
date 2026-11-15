@@ -927,3 +927,67 @@ impl ReviewSurfaceExt for crate::ReviewSurface {
             .map(|workspace| workspace.viewed_files.clone())
     }
 }
+
+#[test]
+fn home_lists_a_review_the_assistant_created_and_leaves_one_it_deleted() {
+    let mut setup = setup(160, 50, false);
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Create a review of my last commit.");
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let tools = ReviewTools::new(&data, services.store());
+    let created = tools
+        .create_review(
+            &setup.review.repo_root,
+            Some("Made by the assistant".to_owned()),
+            vec![(bcode_code_review_models::ReviewSourceKind::LastCommit, None)],
+        )
+        .expect("created");
+    let screen = setup.deliver(
+        &session,
+        snapshot(vec![
+            user("Create a review of my last commit."),
+            tool("create-1", "code_review.create_review", "{}"),
+            answer("Created it."),
+        ]),
+    );
+    let listed = |setup: &Setup| {
+        setup.app().home().is_some_and(|home| {
+            home.row_labels()
+                .iter()
+                .any(|label| label.contains("Made by the assistant"))
+        })
+    };
+    for _ in 0..6 {
+        if listed(&setup) {
+            break;
+        }
+        setup.settle();
+    }
+    assert!(listed(&setup), "home reloaded:\n{}", screen.text());
+
+    // In the review, deleting it returns home.
+    setup.scenario.key("esc");
+    setup.settle();
+    setup.open_from_home("Retry backoff");
+    let review_id = setup.review.id.clone();
+    tools
+        .delete_review(&setup.review.repo_root, &review_id)
+        .expect("deleted");
+    setup.deliver(
+        &session,
+        snapshot(vec![
+            user("Create a review of my last commit."),
+            tool("create-1", "code_review.create_review", "{}"),
+            answer("Created it."),
+            user("Delete this review."),
+            tool(
+                "delete-1",
+                "code_review.delete_review",
+                &format!(r#"{{"review":"{review_id}"}}"#),
+            ),
+        ]),
+    );
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+    let _ = created;
+}

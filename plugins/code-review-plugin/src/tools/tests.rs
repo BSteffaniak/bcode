@@ -210,6 +210,11 @@ fn reads_are_read_only_and_changes_ask_for_permission() {
         "code_review.mark_viewed",
         "code_review.suggest_change",
         "code_review.publish",
+        "code_review.add_comments",
+        "code_review.resolve_threads",
+        "code_review.create_review",
+        "code_review.update_review",
+        "code_review.delete_review",
     ] {
         assert!(names.contains(&name), "{name} is listed");
         let read_only = list.discovery.get(name).expect("discovery").read_only;
@@ -220,7 +225,12 @@ fn reads_are_read_only_and_changes_ask_for_permission() {
             | "code_review.reply"
             | "code_review.resolve_thread"
             | "code_review.mark_viewed"
-            | "code_review.suggest_change" => ("mutating", true, "code_review.write"),
+            | "code_review.suggest_change"
+            | "code_review.add_comments"
+            | "code_review.resolve_threads"
+            | "code_review.create_review"
+            | "code_review.update_review"
+            | "code_review.delete_review" => ("mutating", true, "code_review.write"),
             "code_review.publish" => ("mutating", true, "code_review.publish"),
             // It reads GitHub with the user's credentials, so web rules decide it too.
             "code_review.pull_request" => ("compound", false, "code_review.read"),
@@ -928,5 +938,507 @@ fn a_detached_session_must_name_its_review() {
                 .contains(bcode_code_review::assistant::DETACHED_MESSAGE),
         "{}",
         detached.output
+    );
+}
+
+/// Reviews created through the tool, by kind.
+fn created(harness: &mut Harness, arguments: &Value) -> Value {
+    harness.json("code_review.create_review", arguments, SESSION)["review"].clone()
+}
+
+fn stored(harness: &Harness, root: &std::path::Path, id: &str) -> ReviewWorkspace {
+    harness
+        .store()
+        .get_workspace(GetReviewWorkspaceRequest {
+            repo_path: root.to_path_buf(),
+            workspace_id: id.to_owned(),
+        })
+        .expect("get")
+        .workspace
+        .expect("saved")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn reviews_are_created_from_every_kind_of_source_and_listed() {
+    use bcode_code_review_models::ReviewSourceKind as Kind;
+    let mut harness = Harness::new();
+    harness.fixture.run(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/widgets.git",
+    ]);
+    let root = harness.fixture.root().to_path_buf();
+    let kinds = |harness: &mut Harness, arguments: Value| -> (Value, Vec<Kind>) {
+        let review = created(harness, &arguments);
+        let id = review["id"].as_str().expect("id").to_owned();
+        let kinds = stored(harness, &root, &id)
+            .sources
+            .into_iter()
+            .map(|source| source.kind)
+            .collect();
+        (review, kinds)
+    };
+    let (review, stack) = kinds(
+        &mut harness,
+        json!({"sources": [{"kind": "stack_layers", "layers": [101, 102, 103], "titles": ["Base", "Middle", "Top"]}]}),
+    );
+    assert_eq!(review["kind"], "stack_step_through");
+    assert_eq!(review["pull_requests"], json!([101, 102, 103]));
+    assert_eq!(
+        stack[0],
+        Kind::StackLayer {
+            provider: "github".to_owned(),
+            repository: "acme/widgets".to_owned(),
+            number: 101
+        }
+    );
+    assert!(
+        review["sources"][0]
+            .as_str()
+            .is_some_and(|label| label == "#101 Base"),
+        "{review}"
+    );
+    let (review, pull) = kinds(
+        &mut harness,
+        json!({"sources": [{"kind": "pull_request", "url": "https://github.com/o/r/pull/7"}], "title": "Seven"}),
+    );
+    assert_eq!(
+        (review["title"].as_str(), review["kind"].as_str()),
+        (Some("Seven"), Some("pull_request"))
+    );
+    assert_eq!(
+        pull,
+        vec![Kind::PullRequest {
+            provider: "github".to_owned(),
+            repository: "o/r".to_owned(),
+            number: 7
+        }]
+    );
+    let (_, branch) = kinds(
+        &mut harness,
+        json!({"sources": [{"kind": "branch", "base": "fixture/base", "head": "main"}]}),
+    );
+    assert!(matches!(
+        &branch[0],
+        Kind::BranchCompare {
+            merge_base: true,
+            ..
+        }
+    ));
+    let (_, range) = kinds(
+        &mut harness,
+        json!({"sources": [{"kind": "range", "base": "main~1", "head": "main"}, {"kind": "commits", "revs": ["main"]}]}),
+    );
+    assert!(matches!(
+        &range[..],
+        [
+            Kind::CommitRange {
+                merge_base: false,
+                ..
+            },
+            Kind::Commits { .. }
+        ]
+    ));
+    // Uncommitted changes in a directory: limited to it.
+    let (review, scoped) = kinds(
+        &mut harness,
+        json!({"sources": [{"kind": "working_tree"}], "directory": "src/mod_000"}),
+    );
+    assert_eq!(
+        scoped,
+        vec![Kind::WorkingTreePaths {
+            paths: vec!["src/mod_000".to_owned()],
+            staged: true,
+            unstaged: true
+        }]
+    );
+    assert_eq!(review["kind"], "working_tree_paths");
+    let id = review["id"].as_str().expect("id").to_owned();
+    let files = harness.json("code_review.list_files", &json!({"review": id}), SESSION);
+    let paths: Vec<&str> = files["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect();
+    assert!(
+        !paths.is_empty() && paths.iter().all(|path| path.starts_with("src/mod_000/")),
+        "{paths:?}"
+    );
+
+    // A directory in another repository creates the review there.
+    let other = GitFixture::generate(FixtureSpec::small());
+    let elsewhere = harness.json(
+        "code_review.create_review",
+        &json!({"sources": [{"kind": "staged"}], "directory": other.root().join("src")}),
+        SESSION,
+    );
+    assert_eq!(elsewhere["other_repository"], true, "{elsewhere}");
+    let id = elsewhere["review"]["id"].as_str().expect("id").to_owned();
+    let other_root = other.root().canonicalize().expect("root");
+    assert!(matches!(
+        &stored(&harness, &other_root, &id).sources[0].kind,
+        Kind::WorkingTreePaths {
+            staged: true,
+            unstaged: false,
+            ..
+        }
+    ));
+
+    // Listing: newest first, searchable by pull request number.
+    let listed = harness.json("code_review.list_reviews", &json!({}), SESSION);
+    assert_eq!(
+        listed["reviews"].as_array().map(Vec::len),
+        Some(5),
+        "{listed}"
+    );
+    let found = harness.json(
+        "code_review.list_reviews",
+        &json!({"query": "#102"}),
+        SESSION,
+    );
+    assert_eq!(found["reviews"][0]["kind"], "stack_step_through", "{found}");
+    let bad = harness.call(
+        "code_review.create_review",
+        &json!({"sources": [{"kind": "pull_request"}]}),
+        SESSION,
+    );
+    assert!(
+        bad.is_error && bad.output.contains("number"),
+        "{}",
+        bad.output
+    );
+}
+
+#[test]
+fn reviews_are_renamed_archived_restored_and_deleted_in_batches() {
+    let mut harness = Harness::new();
+    let first = created(&mut harness, &json!({"sources": [{"kind": "last_commit"}]}));
+    let second = created(&mut harness, &json!({"sources": [{"kind": "staged"}]}));
+    let (first, second) = (
+        first["id"].as_str().expect("id").to_owned(),
+        second["id"].as_str().expect("id").to_owned(),
+    );
+    let renamed = harness.json(
+        "code_review.update_review",
+        &json!({"review": first, "title": "Renamed"}),
+        SESSION,
+    );
+    assert_eq!(
+        renamed["items"][0]["result"]["title"], "Renamed",
+        "{renamed}"
+    );
+    let archived = harness.json(
+        "code_review.update_review",
+        &json!({"reviews": [first, second, "missing"], "archived": true}),
+        SESSION,
+    );
+    assert_eq!(
+        (archived["succeeded"].as_u64(), archived["failed"].as_u64()),
+        (Some(2), Some(1)),
+        "{archived}"
+    );
+    let listed = harness.json("code_review.list_reviews", &json!({}), SESSION);
+    assert_eq!(listed["reviews"].as_array().map(Vec::len), Some(0));
+    let all = harness.json(
+        "code_review.list_reviews",
+        &json!({"include_archived": true}),
+        SESSION,
+    );
+    assert_eq!(all["reviews"][0]["archived"], true);
+    harness.ok(
+        "code_review.update_review",
+        &json!({"review": second, "archived": false}),
+        SESSION,
+    );
+    let listed = harness.json("code_review.list_reviews", &json!({}), SESSION);
+    assert_eq!(listed["reviews"][0]["id"], second.as_str());
+    let deleted = harness.json(
+        "code_review.delete_review",
+        &json!({"reviews": [first, second]}),
+        SESSION,
+    );
+    assert_eq!(deleted["succeeded"], 2, "{deleted}");
+    let all = harness.json(
+        "code_review.list_reviews",
+        &json!({"include_archived": true}),
+        SESSION,
+    );
+    assert_eq!(all["reviews"].as_array().map(Vec::len), Some(0));
+    let nothing = harness.call("code_review.delete_review", &json!({}), SESSION);
+    assert!(nothing.is_error);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn files_are_marked_viewed_by_list_glob_layer_and_unchanged_since_a_pass() {
+    let mut harness = Harness::new();
+    let review = created(
+        &mut harness,
+        &json!({"sources": [{"kind": "range", "base": "fixture/base", "head": "main"}, {"kind": "last_commit"}]}),
+    );
+    let id = review["id"].as_str().expect("id").to_owned();
+    let files = |harness: &mut Harness| -> Vec<(String, bool)> {
+        let listed = harness.json("code_review.list_files", &json!({"review": id}), SESSION);
+        listed["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|file| {
+                (
+                    file["path"].as_str().expect("path").to_owned(),
+                    file["viewed"] == true,
+                )
+            })
+            .collect()
+    };
+    let all_files = files(&mut harness);
+    let first = GitFixture::modified_path(0);
+    let listed = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "paths": [first, "nope.rs"]}),
+        SESSION,
+    );
+    assert_eq!(listed["changed"], json!([first]), "{listed}");
+    assert_eq!(listed["not_found"], json!(["nope.rs"]));
+    let again = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "paths": [first]}),
+        SESSION,
+    );
+    assert_eq!(
+        (again["changed_count"].as_u64(), again["unchanged"].clone()),
+        (Some(0), json!([first]))
+    );
+    let globbed = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "glob": "src/**/*.rs"}),
+        SESSION,
+    );
+    let expected_glob = all_files
+        .iter()
+        .filter(|(path, _)| {
+            path.starts_with("src/")
+                && std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|ext| ext == "rs")
+                && *path != first
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let changed: std::collections::BTreeSet<String> = globbed["changed"]
+        .as_array()
+        .expect("changed")
+        .iter()
+        .filter_map(|path| path.as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(changed, expected_glob, "{globbed}");
+    // Unmark every file of the second source (a layer named by its source id).
+    let unmarked = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "layers": ["source-2"], "all": true, "viewed": false}),
+        SESSION,
+    );
+    assert!(
+        unmarked["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not viewed")),
+        "{unmarked}"
+    );
+    let bad = harness.call(
+        "code_review.mark_viewed",
+        &json!({"review": id, "layers": ["#999"]}),
+        SESSION,
+    );
+    assert!(
+        bad.is_error && bad.output.contains("#999"),
+        "{}",
+        bad.output
+    );
+    // Everything off, then a pass recorded on the same revisions: every file is unchanged since.
+    harness.ok(
+        "code_review.mark_viewed",
+        &json!({"review": id, "all": true, "viewed": false}),
+        SESSION,
+    );
+    assert!(files(&mut harness).iter().all(|(_, viewed)| !viewed));
+    let none = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "unchanged_since_look": true}),
+        SESSION,
+    );
+    assert_eq!(none["changed_count"], 0, "no look yet: {none}");
+    let mut workspace = stored(&harness, harness.fixture.root(), &id);
+    let resolved = ReviewData::default()
+        .resolve_sources(&ResolveReviewSourcesRequest {
+            repo_path: harness.fixture.root().to_path_buf(),
+            sources: workspace.sources.clone(),
+            provider_resolutions: Vec::new(),
+        })
+        .expect("resolve");
+    for source in &resolved.sources {
+        workspace.reviewed_revisions.insert(
+            source.source_id.clone(),
+            bcode_code_review_models::ReviewedRevision::from_resolved(source, Some(1)),
+        );
+    }
+    harness
+        .store()
+        .update_workspace(bcode_code_review_models::UpdateReviewWorkspaceRequest {
+            repo_path: harness.fixture.root().to_path_buf(),
+            workspace,
+        })
+        .expect("pass");
+    let since = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "unchanged_since_look": true}),
+        SESSION,
+    );
+    assert!(
+        since["changed_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{since}"
+    );
+}
+
+#[test]
+fn comments_and_resolutions_are_written_in_batches() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let path = GitFixture::modified_path(0);
+    let line = harness.added_line(&path);
+    let written = harness.json(
+        "code_review.add_comments",
+        &json!({"comments": [
+            {"path": path, "line": line, "body": "One"},
+            {"body": "Overall fine", "kind": "summary"},
+            {"path": "missing.rs", "body": "Nowhere"},
+        ]}),
+        SESSION,
+    );
+    assert_eq!(
+        (written["succeeded"].as_u64(), written["failed"].as_u64()),
+        (Some(2), Some(1)),
+        "{written}"
+    );
+    let threads: Vec<String> = written["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["result"]["thread_id"].as_str().map(str::to_owned))
+        .collect();
+    let resolved = harness.json(
+        "code_review.resolve_threads",
+        &json!({"thread_ids": threads}),
+        SESSION,
+    );
+    assert_eq!(resolved["succeeded"], 2, "{resolved}");
+    let open = harness.json("code_review.list_threads", &json!({}), SESSION);
+    assert_eq!(open["threads"].as_array().map(Vec::len), Some(0), "{open}");
+}
+
+#[test]
+fn a_stack_review_named_by_id_resolves_from_the_stack_it_last_opened_with() {
+    use bcode_code_review_models::{
+        PullRequestSummary, ReviewStack, ReviewStackLayer, ReviewStackSnapshot,
+    };
+    let mut harness = Harness::new();
+    let fixture = &harness.fixture;
+    let oid = |rev: &str| fixture.git(&["rev-parse", rev]).trim().to_owned();
+    let branches = bcode_code_review::testing::fixture::STACK_BRANCHES;
+    let layers: Vec<ReviewStackLayer> = branches
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| ReviewStackLayer {
+            pull: PullRequestSummary {
+                number: 101 + index as u64,
+                title: format!("Layer {}", index + 1),
+                author: None,
+                base_branch: if index == 0 {
+                    "main".to_owned()
+                } else {
+                    branches[index - 1].to_owned()
+                },
+                head_branch: (*branch).to_owned(),
+                head_oid: oid(branch),
+                base_oid: (index == 0).then(|| oid("main")),
+                review_requested_from_me: false,
+                draft: false,
+                updated: None,
+                url: None,
+            },
+            parent: (index > 0).then(|| 100 + index as u64),
+        })
+        .collect();
+    let review = created(
+        &mut harness,
+        &json!({"sources": [{"kind": "stack_layers", "layers": [101, 102, 103], "repository": "acme/widgets"}]}),
+    );
+    let id = review["id"].as_str().expect("id").to_owned();
+    // Without what it last opened with, the tools say how to get it resolved.
+    let unresolved = harness.call("code_review.list_files", &json!({"review": id}), SESSION);
+    assert!(
+        unresolved.is_error && unresolved.output.contains("open_review"),
+        "{}",
+        unresolved.output
+    );
+    let root = harness.fixture.root().to_path_buf();
+    let mut workspace = stored(&harness, &root, &id);
+    workspace.stack_snapshots = vec![ReviewStackSnapshot {
+        provider: "github".to_owned(),
+        repository: "acme/widgets".to_owned(),
+        stack: ReviewStack {
+            trunk: "main".to_owned(),
+            rooted_at_default_branch: true,
+            layers,
+            requested: 103,
+            siblings: Vec::new(),
+            warnings: Vec::new(),
+        },
+        confirmed_at_ms: 1,
+    }];
+    harness
+        .store()
+        .update_workspace(bcode_code_review_models::UpdateReviewWorkspaceRequest {
+            repo_path: root,
+            workspace,
+        })
+        .expect("snapshot");
+    let files = harness.json("code_review.list_files", &json!({"review": id}), SESSION);
+    let paths: Vec<&str> = files["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect();
+    for layer in 1..=3 {
+        assert!(
+            paths.contains(&GitFixture::stack_layer_path(layer).as_str()),
+            "{paths:?}"
+        );
+    }
+    let marked = harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "layers": ["102"], "all": true}),
+        SESSION,
+    );
+    assert!(
+        marked["changed"]
+            .as_array()
+            .expect("changed")
+            .iter()
+            .any(|path| path == GitFixture::stack_layer_path(2).as_str()),
+        "{marked}"
+    );
+    assert!(
+        !marked["changed"]
+            .as_array()
+            .expect("changed")
+            .iter()
+            .any(|path| path == GitFixture::stack_layer_path(1).as_str()),
+        "only layer 102: {marked}"
     );
 }

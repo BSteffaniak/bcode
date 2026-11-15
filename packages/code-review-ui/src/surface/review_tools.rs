@@ -32,6 +32,14 @@ const WRITE_TOOLS: &[&str] = &[
     "code_review.resolve_thread",
     "code_review.suggest_change",
     "code_review.mark_viewed",
+    "code_review.add_comments",
+    "code_review.resolve_threads",
+];
+/// Tool calls that change the saved reviews home lists.
+pub const REVIEW_LIST_TOOLS: &[&str] = &[
+    "code_review.create_review",
+    "code_review.update_review",
+    "code_review.delete_review",
 ];
 /// The tool call that moves the reviewer's view.
 const NAVIGATE_TOOL: &str = "code_review.navigate";
@@ -284,12 +292,12 @@ impl ReviewSurface {
     fn apply_stored_viewed(&mut self, stored: &ReviewWorkspace) {
         let stored = super::viewed_sync::Viewed::of(stored);
         let local = super::viewed_sync::Viewed::of(self.workspace_mut());
-        let merged = self.viewed_base.as_ref().map_or_else(
+        let merged = self.viewed_sync.base.as_ref().map_or_else(
             || stored.clone(),
             |base| super::viewed_sync::merge(base, &local, &stored),
         );
-        self.viewed_base = Some(stored);
-        self.show_viewed(merged);
+        self.viewed_sync.base = Some(stored);
+        self.show_viewed(&merged);
     }
 
     /// After a save wrote `written` for the local state `saving`: take what the save merged in,
@@ -301,20 +309,20 @@ impl ReviewSurface {
     ) {
         let local = super::viewed_sync::Viewed::of(self.workspace_mut());
         let merged = super::viewed_sync::merge(saving, &local, written);
-        self.viewed_base = Some(written.clone());
-        self.show_viewed(merged);
+        self.viewed_sync.base = Some(written.clone());
+        self.show_viewed(&merged);
     }
 
     /// Show `viewed` as the review's viewed state.
-    fn show_viewed(&mut self, viewed: super::viewed_sync::Viewed) {
+    fn show_viewed(&mut self, viewed: &super::viewed_sync::Viewed) {
         let workspace = self.workspace_mut();
-        if super::viewed_sync::Viewed::of(workspace) == viewed {
+        if super::viewed_sync::Viewed::of(workspace) == *viewed {
             return;
         }
         viewed.apply(workspace);
         let workspace = workspace.clone();
         if workspace.id == super::TRANSIENT_WORKSPACE_ID {
-            self.transient_viewed = Some((
+            self.viewed_sync.transient = Some((
                 workspace.viewed_files.clone(),
                 workspace.viewed_marks.clone(),
                 workspace.viewed_threads.clone(),

@@ -90,6 +90,11 @@ impl Category {
                 "code_review.resolve_thread",
                 "code_review.suggest_change",
                 "code_review.mark_viewed",
+                "code_review.add_comments",
+                "code_review.resolve_threads",
+                "code_review.create_review",
+                "code_review.update_review",
+                "code_review.delete_review",
             ],
             Self::Publish => &["code_review.publish"],
             // Navigation tools of the app come with its action tools.

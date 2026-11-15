@@ -16,6 +16,7 @@ bcode_code_review_provider = { workspace = true }
 bcode_config = { workspace = true }
 bcode_git = { workspace = true }
 bcode_path_display = { workspace = true }
+globset = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true, features = ["std", "unicode"] }
 serde = { workspace = true, features = ["derive", "std"] }

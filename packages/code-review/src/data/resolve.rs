@@ -143,6 +143,31 @@ fn head_or_empty(head: Option<&str>) -> RevisionRef {
     head.map_or(RevisionRef::EmptyTree, RevisionRef::commit)
 }
 
+/// Uncommitted changes limited to `paths`.
+fn working_tree_paths(
+    source: &ReviewSource,
+    head: Option<&str>,
+    paths: &[String],
+    staged: bool,
+    unstaged: bool,
+) -> Result<Resolution, DataError> {
+    if paths.is_empty() {
+        return Ok(unresolved("name at least one directory or file"));
+    }
+    for path in paths {
+        git::validate_relative_path(path)?;
+    }
+    let (base, head) = match (staged, unstaged) {
+        (true, true) => (head_or_empty(head), RevisionRef::WorkingTree),
+        (true, false) => (head_or_empty(head), RevisionRef::Index),
+        (false, true) => (RevisionRef::Index, RevisionRef::WorkingTree),
+        (false, false) => return Ok(unresolved("include staged or unstaged changes")),
+    };
+    let mut resolved = diff_source(source, base, head);
+    resolved.paths = paths.to_vec();
+    Ok(Resolution::Resolved(vec![resolved]))
+}
+
 fn resolve_source(
     root: &Path,
     head: Option<&str>,
@@ -162,25 +187,7 @@ fn resolve_source(
             paths,
             staged,
             unstaged,
-        } => {
-            if paths.is_empty() {
-                return Ok(unresolved("name at least one directory or file"));
-            }
-            for path in paths {
-                git::validate_relative_path(path)?;
-            }
-            let (base, head) = match (staged, unstaged) {
-                (true, true) => (head_or_empty(head), RevisionRef::WorkingTree),
-                (true, false) => (head_or_empty(head), RevisionRef::Index),
-                (false, true) => (RevisionRef::Index, RevisionRef::WorkingTree),
-                (false, false) => {
-                    return Ok(unresolved("include staged or unstaged changes"));
-                }
-            };
-            let mut resolved = diff_source(source, base, head);
-            resolved.paths.clone_from(paths);
-            Resolution::Resolved(vec![resolved])
-        }
+        } => working_tree_paths(source, head, paths, *staged, *unstaged)?,
         ReviewSourceKind::LastCommit => match head {
             Some(head) => single_commit(root, source, head)?,
             None => unresolved("the repository has no commits yet"),

@@ -1937,6 +1937,7 @@ dependencies = [
  "bcode_config",
  "bcode_git",
  "bcode_path_display",
+ "globset",
  "hex",
  "regex",
  "serde",

@@ -16,6 +16,17 @@
 use bcode_code_review_models::{ReviewWorkspace, ThreadViewMark, ViewedMark};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The viewed state as the review last read or wrote it.
+#[derive(Debug, Clone, Default)]
+pub struct Tracking {
+    /// An unsaved review's viewed files, marks and threads as last stored for its target.
+    pub transient: Option<(BTreeSet<String>, Vec<ViewedMark>, Vec<ThreadViewMark>)>,
+    /// The viewed state as last read from or written to the store.
+    pub base: Option<Viewed>,
+    /// The viewed state being saved, while a save runs.
+    pub saving: Option<Viewed>,
+}
+
 /// A workspace's viewed state: viewed paths, viewed marks and viewed threads.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Viewed {
