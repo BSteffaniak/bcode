@@ -750,12 +750,19 @@ applying SQL) have review analogs or are marked not applicable.
 * **Per conversation.** The choice is the session's own Bcode model and reasoning selection
   (Bcode's session model and session reasoning settings), so it survives restarts, shows in
   `bcode tui`, and the chip reads it back from the session's model status when a conversation
-  becomes active. Changing it while a turn runs applies from the next turn.
+  becomes active. Changing it while a turn runs applies from the next turn. A session's model
+  is read once; one that cannot be read (deleted in `bcode tui`, a daemon error) shows
+  `⚠ model unknown`, the picker's first row says why, and choosing a model for it reads it
+  again.
 * **App default.** The latest choice made anywhere in the app is also saved as the app default,
   a single user-wide record in the review store (`review.assistant.settings.get` and
   `review.assistant.settings.save`, a typed table). New conversations and new card sessions get
   it right after their session is created and before their first message; with no default,
-  nothing is set and Bcode's default applies. Choosing `Bcode's default` clears it.
+  nothing is set and Bcode's default applies. Choosing `Bcode's default` clears it; while Bcode
+  cannot name its default model, choosing it changes nothing and the conversation says why (a
+  session goes back to Bcode's default only by naming that model). A default that cannot be read
+  is read again when the picker opens; until it is read, effort changes are refused rather than
+  saved over it.
 * **Configuration** seeds the app default until one is saved:
 
   ```toml
@@ -765,11 +772,17 @@ applying SQL) have review analogs or are marked not applicable.
   ```
 
 * **Effort** cycles the effective model's values from the current one (else the model's default
-  effort), wrapping; a value the newly chosen model does not offer is dropped.
+  effort), wrapping; a value the newly chosen model does not offer is dropped. The app default
+  saved with it names the model it was chosen for (a card on another model saves that model),
+  so new conversations never get an effort their model does not offer; while the default
+  follows Bcode's default model and the target runs it, the default keeps following it.
 * **Ask AI cards** show `<model> · <effort>` on the card's action row; clicking it opens the
   picker for that card's session (and saves the app default). In the composer's question mode
-  the same chip sits beside the question kind, with `alt+m` and `shift+tab`; before a card has
-  a session they change the app default the new session will get.
+  the same chip sits beside the question kind, with `alt+m` and `shift+tab`. A follow-up (a
+  question at a place whose card already has a session) shows and changes that session's model;
+  a new question shows and changes the app default its new session will get. When Bcode refuses
+  the app default for a new card session, the card says why and the question runs on Bcode's
+  default.
 
 ### Policy chips
 
@@ -777,7 +790,9 @@ applying SQL) have review analogs or are marked not applicable.
   `file_writes`, `shell`, `publish` and `navigation`; an off chip is dim and struck through.
   Read categories have no chip.
 * A chip toggles that category for the active conversation only, for the rest of the run;
-  conversations start from the configured categories. A category off in configuration is not
+  switching to another conversation and back keeps it (remembered for the newest 64
+  conversations of the run), while new conversations and a restart start from the configured
+  categories. A category off in configuration is not
   in the profile, so its chip shows `off` and does not toggle.
 * Each panel message carries a per-turn tool allowlist (Bcode's turn execution options) of the
   profile's tools minus the categories turned off, so the next turn is not offered them;
@@ -859,23 +874,30 @@ Built in the four steps above, with these deviations and notes:
 * **Choosing Bcode's default.** Bcode has no operation that clears a session's model selection,
   so choosing `Bcode's default` sets the session to Bcode's current default model (its id and
   provider) and clears the app default; later conversations then follow Bcode's default again.
-* **A model Bcode does not offer.** Bcode accepts any model id for a session and runs its
-  default instead. The app reads the session's model status back after every choice and after
-  a new session gets the app default; when the requested id differs from the model that runs,
-  the conversation says "Bcode does not offer the model X; this conversation runs Y instead".
-  Model statuses that do not report the requested id show only the model that runs.
+* **A model Bcode does not list.** Bcode accepts any model id for a session and runs it as
+  given, so its turns fail at the provider. The app reads the session's model status back after
+  every choice and after a new session gets the app default; when neither the id the session
+  asked for nor the id it resolved to is in the listing of its provider (and that listing
+  succeeded), the conversation says "Bcode does not list the model X". An alias Bcode resolves
+  to a listed model is not reported, and the picker marks the model it resolves to.
 * **Effort across models.** Switching models keeps the effort only when the new model offers
-  it (a status without a selected effort counts as the model's default).
-* **Categories** are per conversation for the run (not stored): a restart, a new conversation or
-  switching conversations starts from the configured categories. The allowlist is sent only
-  while some category is off, so the default turn shape is unchanged.
+  it (a status without a selected effort counts as the model's default). Bcode restores the
+  effort a session last used with a model when it switches back to that model, and the turn
+  runs with it.
+* **Categories** are per conversation for the run (not stored): a restart or a new conversation
+  starts from the configured categories; switching back to a conversation keeps what was turned
+  off in it. The allowlist is sent only while some category is off, so the default turn shape
+  is unchanged.
+* **Delete every conversation** pages Bcode's catalog for up to 1000 conversations per run; with
+  more, the confirmation says it deletes the newest 1000 and the result notice says more remain.
 * **Failures** cover the last turn of a conversation (the session view reports the last turn's
   outcome) and every refused message; earlier turns' failures stay in the session's transcript.
   Error lines wrap under their text in cards and the panel.
 * **Usage** shows `N tok` and the estimated cost when Bcode estimates one (a model with prices);
   the title is cut to keep them on the title row.
-* **Model labels on cards** are read for the newest 16 cards' sessions; the model part of a
-  `model · effort` label is cut at 24 cells.
+* **Model labels on cards** are read for the newest 16 cards' sessions (and the session of a
+  follow-up being written); the model part of a `model · effort` label is cut at 24 cells and the
+  whole label at 40 cells on cards and in the composer.
 * **Draft comment** drafts at the review's cursor (selected range, line or file header), as the
   composer anchors a new comment.
 * **Live check** (debug daemon, isolated state, fake model provider): the picker listed Bcode's
