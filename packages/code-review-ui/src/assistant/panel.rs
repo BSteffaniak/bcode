@@ -1815,6 +1815,12 @@ impl Assistant {
             }
         }
         if !panel.contains(mouse.position) {
+            // The pointer left: the history row's `✕` goes back to the selected row. The move
+            // stays the review's, so the panel asks for its own redraw.
+            if mouse.kind == MouseEventKind::Move && self.hover.take().is_some() {
+                self.touch();
+                ui.request_redraw();
+            }
             return None;
         }
         match mouse.kind {
