@@ -967,6 +967,10 @@ impl Assistant {
                     // messages, so none is skipped as already applied.
                     self.applied.entry(session.clone()).or_default();
                     self.session = Some(session);
+                } else {
+                    // A new conversation started meanwhile: only the active conversation is
+                    // offered the app's tools, and the session was claimed when created.
+                    self.release_inactive(session);
                 }
             }
             Done::Started {
@@ -1007,13 +1011,19 @@ impl Assistant {
                     self.resend = Some((session, *request));
                 } else {
                     self.notice = Some((format!("could not send: {}", error.message), true));
+                    self.release_inactive(session);
                 }
             }
+            Done::Sent {
+                session,
+                result: Ok(()),
+                ..
+            } => self.release_inactive(session),
             Done::Attached(Err(error)) => {
                 self.attached = None;
                 self.notice = Some((format!("could not attach the review: {error}"), true));
             }
-            Done::Sent { result: Ok(()), .. } | Done::Attached(Ok(())) => {}
+            Done::Attached(Ok(())) => {}
             other @ (Done::History(_)
             | Done::Turns(_)
             | Done::Renamed { .. }
@@ -1033,6 +1043,14 @@ impl Assistant {
                     self.notice = Some((format!("could not stop: {error}"), true));
                 }
             }
+        }
+    }
+
+    /// Release `session` from the app's tools unless it is the active conversation (sending to
+    /// a session claims it, and only the active conversation is offered the tools).
+    fn release_inactive(&self, session: String) {
+        if self.tools.is_some() && self.session.as_deref() != Some(session.as_str()) {
+            drop(self.services.host().release_tool_session(session));
         }
     }
 

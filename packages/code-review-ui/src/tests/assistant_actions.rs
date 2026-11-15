@@ -363,6 +363,30 @@ fn the_first_turn_of_a_new_conversation_already_has_the_apps_tools_and_profile()
 }
 
 #[test]
+fn a_new_conversation_started_while_the_first_is_created_releases_the_first() {
+    let mut setup = super::assistant::setup(160, 40, false);
+    setup.scenario.key("ctrl+k");
+    setup.settle();
+    // The first message creates its session; a new conversation starts before it exists.
+    setup.scenario.paste("First question");
+    setup.scenario.key("enter");
+    setup.scenario.key("ctrl+n");
+    setup.settle();
+    let host = setup.backend.host();
+    let (first, _) = host.sessions().first().cloned().expect("the first session");
+    assert!(
+        !host.claimed_sessions().contains(&first),
+        "the earlier conversation is not offered the app's tools: {:?}",
+        host.claimed_sessions()
+    );
+    assert_eq!(host.released_sessions(), vec![first.clone()]);
+    // The new conversation gets its own session, claimed for the app's tools.
+    let second = setup.send("Second question");
+    assert_ne!(second, first);
+    assert_eq!(host.claimed_sessions(), vec![second]);
+}
+
+#[test]
 fn messages_wait_for_the_profile_while_the_tool_connection_is_down() {
     let mut setup = super::assistant::setup(160, 40, false);
     let host = setup.backend.host();
