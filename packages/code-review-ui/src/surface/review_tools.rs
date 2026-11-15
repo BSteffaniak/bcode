@@ -459,18 +459,53 @@ impl ReviewSurface {
         side: Option<&str>,
         source: Option<&str>,
     ) -> Result<String, String> {
-        let review = self.review.as_mut().ok_or("the review is still loading")?;
+        let file = self.find_file(path, source, None)?;
+        Ok(self.show_file_location(&file, line, side))
+    }
+
+    /// The file `path` (of `source` when given) names; with `within`, only one of that source
+    /// (the stack layer that will be shown alone).
+    pub(super) fn find_file(
+        &self,
+        path: &str,
+        source: Option<&str>,
+        within: Option<&str>,
+    ) -> Result<FileRef, String> {
+        let review = self.review.as_ref().ok_or("the review is still loading")?;
         let path = path.trim().trim_start_matches("./").to_owned();
-        let file: Option<FileRef> = review
+        let mut named: Vec<&FileRef> = review
             .doc
             .file_keys()
-            .find(|file| file.path == path && source.is_none_or(|source| file.source_id == source))
-            .cloned();
-        let Some(file) = file else {
+            .filter(|file| {
+                file.path == path && source.is_none_or(|source| file.source_id == source)
+            })
+            .collect();
+        if named.is_empty() {
             return Err(format!(
                 "{path} is not a file shown in this review (code_review.list_files lists them)"
             ));
+        }
+        if let Some(within) = within {
+            named.retain(|file| file.source_id == within);
+        }
+        named
+            .first()
+            .map(|file| (*file).clone())
+            .ok_or_else(|| format!("{path} is not in the layer shown; name its layer with `layer`"))
+    }
+
+    /// Move the cursor to `file` (at `line` on `side` when given, else its header) and say
+    /// where it went.
+    pub(super) fn show_file_location(
+        &mut self,
+        file: &FileRef,
+        line: Option<u32>,
+        side: Option<&str>,
+    ) -> String {
+        let Some(review) = self.review.as_mut() else {
+            return file.path.clone();
         };
+        let file = file.clone();
         let side = if side == Some("old") {
             ReviewLineSide::Old
         } else {
@@ -496,6 +531,6 @@ impl ReviewSurface {
             ItemKey::FileHeader(file.clone())
         };
         super::annotate::jump_to_annotation(review, &key);
-        Ok(line.map_or_else(|| file.path.clone(), |line| format!("{}:{line}", file.path)))
+        line.map_or_else(|| file.path.clone(), |line| format!("{}:{line}", file.path))
     }
 }

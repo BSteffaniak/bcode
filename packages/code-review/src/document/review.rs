@@ -2240,6 +2240,23 @@ impl ReviewDocument {
         !changed.is_empty()
     }
 
+    /// Where the document holds `key`, shown or not: `None` when it does not hold it at all,
+    /// else the source id of the group holding it (`None` inside for review-level items).
+    #[must_use]
+    pub fn source_of_key(&self, key: &ItemKey) -> Option<Option<&str>> {
+        let block = self.block_of_key(key)?;
+        Some(match self.blocks.get(block)?.kind {
+            BlockKind::ReviewNotes => None,
+            BlockKind::SourceHeader(group) => Some(self.groups[group].source.source_id.as_str()),
+            BlockKind::File(file) => Some(
+                self.groups[self.files[file].group]
+                    .source
+                    .source_id
+                    .as_str(),
+            ),
+        })
+    }
+
     /// The source shown alone (see [`Self::set_focus`]), when one is.
     #[must_use]
     pub fn focus(&self) -> Option<&str> {

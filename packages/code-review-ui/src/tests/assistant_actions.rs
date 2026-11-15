@@ -587,6 +587,54 @@ fn a_comparison_or_view_change_with_one_bad_argument_changes_nothing() {
 }
 
 #[test]
+fn a_go_to_with_one_bad_place_does_not_move_the_layer() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let session = active_session(&mut scenario);
+    let current = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .view_context()
+            .review
+            .and_then(|review| review.stack)
+            .and_then(|stack| stack.current)
+    };
+    let before = current(&scenario);
+    let other = if before == Some(101) { 102 } else { 101 };
+    let before_screen = settled(&mut scenario).text();
+    let thread = refused(call_as(
+        &mut scenario,
+        &session,
+        actions::GO_TO,
+        &format!(r#"{{"layer":{other},"thread":"no-such-thread"}}"#),
+    ));
+    assert!(thread.contains("no-such-thread"), "{thread}");
+    let path = refused(call_as(
+        &mut scenario,
+        &session,
+        actions::GO_TO,
+        &format!(r#"{{"layer":{other},"path":"no/such/file.rs"}}"#),
+    ));
+    assert!(path.contains("no/such/file.rs"), "{path}");
+    assert_eq!(current(&scenario), before, "the layer did not change");
+    assert_eq!(
+        settled(&mut scenario).text(),
+        before_screen,
+        "the screen is as it was"
+    );
+    // The same places are fine once they are real.
+    let moved = done(call_as(
+        &mut scenario,
+        &session,
+        actions::GO_TO,
+        &format!(r#"{{"layer":{other}}}"#),
+    ));
+    assert_eq!(
+        moved["screen"]["review"]["stack"]["current"], other,
+        "{moved}"
+    );
+}
+
+#[test]
 fn pushes_stack_at_and_versions_are_reachable_like_the_compare_menu() {
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
     let compared = done(call_until_loaded(

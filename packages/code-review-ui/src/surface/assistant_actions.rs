@@ -237,9 +237,51 @@ impl ReviewSurface {
                 self.check_version(layer.as_ref().map(|(_, number)| number.clone()), version)
             })
             .transpose()?;
+        // Everything is checked before anything moves; a layer shown alone only shows its own
+        // files and threads.
+        let entries = self.rail_entries();
+        let alone = if self.stack_view == super::stack::StackView::OneLayer {
+            match &layer {
+                Some((position, _)) => entries.get(*position).map(|entry| entry.source_id.clone()),
+                None => self
+                    .review
+                    .as_ref()
+                    .and_then(|review| review.doc.focus().map(str::to_owned)),
+            }
+        } else {
+            None
+        };
+        let thread = target.thread.as_deref().map(|thread| {
+            let key = ItemKey::Thread {
+                thread_id: thread.to_owned(),
+            };
+            let place = self
+                .review
+                .as_ref()
+                .and_then(|review| review.doc.source_of_key(&key).map(|source| source.map(str::to_owned)));
+            match place {
+                None => Err(format!(
+                    "thread {thread} is not shown in this review (code_review.list_threads lists them)"
+                )),
+                Some(Some(source)) if alone.as_ref().is_some_and(|alone| *alone != source) => {
+                    Err(format!(
+                        "thread {thread} is in another layer ({source}); name its layer with `layer`"
+                    ))
+                }
+                Some(_) => Ok((thread, key)),
+            }
+        });
+        let thread = thread.transpose()?;
+        let file = target
+            .path
+            .as_deref()
+            .map(|path| {
+                let within = alone.as_deref().filter(|_| target.source.is_none());
+                self.find_file(path, target.source.as_deref(), within)
+            })
+            .transpose()?;
         let mut done = Vec::new();
         if let Some((position, wanted)) = layer {
-            let entries = self.rail_entries();
             let current = self.current_layer(&entries);
             self.enter_layer(&entries, current, position);
             done.push(format!("layer {wanted}"));
@@ -248,26 +290,14 @@ impl ReviewSurface {
             self.show_layer_version(number, index, host);
             done.push(format!("#{number} v{}", index + 1));
         }
-        if let Some(thread) = target.thread.as_deref() {
-            let review = self.review.as_mut().ok_or("the review is not loaded")?;
-            let key = ItemKey::Thread {
-                thread_id: thread.to_owned(),
-            };
-            if review.doc.index_of(&key).is_none() && review.doc.jump_to(&key).is_none() {
-                return Err(format!(
-                    "thread {thread} is not shown in this review (code_review.list_threads lists them)"
-                ));
-            }
+        if let Some((thread, key)) = thread
+            && let Some(review) = self.review.as_mut()
+        {
             super::annotate::jump_to_annotation(review, &key);
             done.push(format!("thread {thread}"));
         }
-        if let Some(path) = target.path.as_deref() {
-            done.push(self.show_location(
-                path,
-                target.line,
-                target.side.as_deref(),
-                target.source.as_deref(),
-            )?);
+        if let Some(file) = file {
+            done.push(self.show_file_location(&file, target.line, target.side.as_deref()));
         }
         Ok(format!("now showing {}", done.join(", ")))
     }
