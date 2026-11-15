@@ -50,6 +50,9 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
   tools and the `review_assistant_sessions` binding table.
+* **Planned: parity with bdata.** Model, effort and policy chips, remembered choices, Ask AI
+  card model selection, and the remaining panel gaps, as listed under
+  [Parity with bdata](#parity-with-bdata).
 * **Superseded by this design.** The per-review dock: one conversation per review, reachable
   only inside a review, with no visible entry point and a context line appended to the message
   text.
@@ -688,6 +691,162 @@ Where the built panel differs from the design above:
   and archives show at once), reloads after any `create_review`, `update_review` or
   `delete_review` call it sees and when the terminal regains focus, and returns home with a
   toast when its review was deleted.
+
+## Parity with bdata
+
+bdata's assistant panel is the measuring stick for the review assistant: everything it offers
+that applies to a review app is offered here too, with the same keys where they do not collide
+with the review app's own. This section lists every feature, how bdata behaves, the review
+app's state, and the design for each gap. Features bdata has for its SQL editor (inline edits,
+applying SQL) have review analogs or are marked not applicable.
+
+### Gaps
+
+| Feature | bdata | Review app | Design |
+| --- | --- | --- | --- |
+| Model chip and picker | `● <model> ▾` chip, `alt+m`; a filterable picker of the models Bcode offers (name, context window, price per million tokens, effort range, `no tools`), `●` on the current one; Bcode's default until chosen | Missing: every turn uses the session's or Bcode's default model | Chips row gains the model chip and the picker (below). The chip names the conversation's model, or `Bcode's model (<name>)` while none was chosen. |
+| Reasoning effort chip | `◆ effort <value>`, `shift+tab` cycles the model's values (wrapping); shown only for a model with effort values | Missing | The effort chip and `shift+tab`, over the effective model's values (the chosen model, else Bcode's default model, so effort works before a model is chosen); a model without effort shows no chip and `shift+tab` says so. |
+| Policy chips | `runs`, `data`, `edits` chips (`alt+r`, `alt+d`, `alt+p`), switchable for the session | Missing: the categories are configuration only | Chips for `review_writes`, `file_writes`, `shell`, `publish` and `navigation`, each on or off per conversation (below). |
+| Tools list | `⚒ tools` chip, `alt+t`: every app tool and how Bcode decides it by default; choosing one says how to change its rule | Missing | `⚒` chip and `alt+t`: the profile's tools by category, `reads: runs` or `changes: asks`, and (for categories turned off) `off`; choosing one says how to set its Bcode rule. |
+| Remembered model and effort | Saved in bdata's UI state as the choice for every later conversation; the configured `effort` seeds it | Missing | Per conversation and as the app default (below). |
+| Ask AI cards | Not applicable (inline edits run in-process with Bcode's configuration) | Card sessions use Bcode's default model, no way to change it | Cards follow the same choice (below). |
+| Usage | Panel title: `<tokens> tok · $<cost>` for the conversation | Present: tokens and estimated cost on the title row's right | Kept; formatted as bdata's and covered by a test. |
+| Failures | A turn that ends without an answer says why in the conversation: provider unreachable or no model ("check the model Bcode uses and its sign-in"), tool-round limit ("ask the assistant to continue"), the model stopped answering, other failures with Bcode's message | Partial: `Error`, `IdleTimeout` and `ProviderUnavailable` show Bcode's message (or a generic line); the tool-round limit shows nothing; a refused submit (`agent_profile_unavailable`, no model configured) shows only in the notice line | Every turn outcome other than completed or cancelled adds an error line to its turn, with Bcode's message or the reason as bdata words it; a refused submit adds an error line to the conversation with Bcode's code and message (profile unavailable says the app's tool connection is not registered; no model says to choose one with the model chip or in `bcode tui`). |
+| Open in Bcode | `↗` (only while a conversation is open) and the palette's "Open this conversation in Bcode's TUI"; bdata asks, then exits and hands the terminal to `bcode tui`; without a conversation a toast says to start one | `↗` always shown and `ctrl+o`; runs `bcode tui <session>` and the app resumes after; without a conversation nothing happens | `↗` only while the conversation has a session; `ctrl+o` and the palette entry without one say "start or open a conversation first". The app keeps suspending and resuming rather than exiting: nothing of the review is lost, so no confirmation is needed. |
+| Delete this conversation | Palette entry, asks first | Present: `alt+d` and the palette ask in the input row | Kept. |
+| Delete every conversation | Palette entry "Delete every conversation bdata started", asks first | Missing | Palette entry "Delete every conversation the review app started": a confirmation with the count (the app's sessions in this repository, as the history lists them, legacy bindings included); running turns are stopped, each session is deleted and unbound; sessions Bcode refuses (open in another client) are counted in the result notice and kept. |
+| History rows | `alt+d` or the row's `✕` marks, a second press deletes; the footer says which row is armed | Partial: `alt+d` twice; no `✕` | `✕` at the right of the hovered (else selected) visible row, painted and registered only there; the armed row's `✕` turns to the danger style and the footer names it. |
+| History features | Open, delete | Present and beyond: search, rename, tags, turns, needs-you, open in Bcode | Kept. |
+| Title-row controls | `✕` closes, `»` collapses to a rail, `⤡` restores a zoomed panel, double-click on the title zooms | `+ new`, `⟲`, `↗` only; zoom only below the dock thresholds | `✕` closes the panel; double-click on the title row zooms the panel over the whole area and again restores it. No rail: the Ask AI button with its badges is the closed panel's indicator. |
+| Empty state | What it can do, four example requests, and what the chips control | One generic paragraph, the same on every screen | Per screen (home, wizard, review) a line of what it can do, three example requests, and one line on the chips; while models fail to load, the reason. |
+| Edit cards | Proposed SQL as diff cards: Apply (`alt+a`), Apply & run (`alt+g`), Copy, dismiss | Not applicable as such: the review app has no editor, and file edits are Bcode tool calls behind its permission prompt; panel answers have no actions | Answers in the panel get Copy and, when the conversation is attached to a review with a cursor line, Draft comment (a draft thread at that line, as an Ask AI card's Draft does). File edits keep Bcode's permission prompt. |
+| Reasoning and tool output | Reasoning folds; a tool's full output opens | Present: reasoning and tool output fold | Kept. |
+| Permission prompts | `y`, `a`, `n`, `d`; Always withheld for unsafe calls | Present; Always withheld for publishing and deleting | Kept. |
+| Context | Always the screen | Present and beyond: the context chip, `ctrl+x` detaches | Kept. |
+| Scrolling | `pageup`/`pagedown`, wheel | Present | Kept. |
+| Composer selection, paste | Text input selection, mouse, paste | Present (the same text input) | Kept. |
+| Notices | Notes in the conversation (stopped, moved conversations) | Present: notice line under the chips, `stopped` in the turn | Kept. |
+| Bridge and version errors | Bcode missing, too old or too new: the panel says which to update | Not applicable (the app is part of Bcode); daemon unreachable shows the not-connected state | Model listing failures show on the model chip (`⚠ models unavailable`) with the reason on click, as bdata's chip does. |
+| Configuration | `effort` (initial effort), `profile`, `context`, policy defaults | Panel size and tool categories | Adds `model` and `effort` (below) as the app default before anything was chosen in the app. |
+| Footer hints | Send, stop, model, effort, runs, apply, new, close | Present without model and effort | Adds model, effort and permissions. |
+| Inline edit | `alt+k` in the editor | Not applicable | The Ask AI card is the review app's inline request. |
+| Earlier conversations | Imported into Bcode once | Present: per-review sessions listed with their tags | Kept. |
+
+### Model and effort
+
+* **Listing.** The models are those Bcode offers: for each model-provider plugin Bcode serves
+  (as the TUI's model switcher finds them), that provider's model list, each request bounded in
+  time; Bcode's default model status names the default. A provider that fails shows as a
+  disabled row with its reason. Rows show name, provider, context window, price per million
+  tokens when known, and the effort range; `●` marks the current model. The first row is
+  `Bcode's default (<name>)`, which clears the choice.
+* **The picker** is a centered overlay with a filter, reachable from the panel, a card and the
+  composer; it uses the palette's matcher and the overlay's layout, so its hit regions come
+  from the painted rows.
+* **Per conversation.** The choice is the session's own Bcode model and reasoning selection
+  (Bcode's session model and session reasoning settings), so it survives restarts, shows in
+  `bcode tui`, and the chip reads it back from the session's model status when a conversation
+  becomes active. Changing it while a turn runs applies from the next turn.
+* **App default.** The latest choice made anywhere in the app is also saved as the app default,
+  a single user-wide record in the review store (`review.assistant.settings.get` and
+  `review.assistant.settings.save`, a typed table). New conversations and new card sessions get
+  it right after their session is created and before their first message; with no default,
+  nothing is set and Bcode's default applies. Choosing `Bcode's default` clears it.
+* **Configuration** seeds the app default until one is saved:
+
+  ```toml
+  [plugins.config."bcode.code_review".assistant]
+  # model = "fake-echo"          # model id; `provider/model` picks the provider too
+  # effort = "high"              # used when the model offers it
+  ```
+
+* **Effort** cycles the effective model's values from the current one (else the model's default
+  effort), wrapping; a value the newly chosen model does not offer is dropped.
+* **Ask AI cards** show `<model> · <effort>` on the card's action row; clicking it opens the
+  picker for that card's session (and saves the app default). In the composer's question mode
+  the same chip sits beside the question kind, with `alt+m` and `shift+tab`; before a card has
+  a session they change the app default the new session will get.
+
+### Policy chips
+
+* Chips `✎ review`, `▤ files`, `$ shell`, `⇪ publish` and `→ move` stand for `review_writes`,
+  `file_writes`, `shell`, `publish` and `navigation`; an off chip is dim and struck through.
+  Read categories have no chip.
+* A chip toggles that category for the active conversation only, for the rest of the run;
+  conversations start from the configured categories. A category off in configuration is not
+  in the profile, so its chip shows `off` and does not toggle.
+* Each panel message carries a per-turn tool allowlist (Bcode's turn execution options) of the
+  profile's tools minus the categories turned off, so the next turn is not offered them;
+  allow, ask and deny stay Bcode's rules.
+* `alt+p` opens the permissions overlay listing the five categories with their state and
+  tools; `enter` or a click toggles one.
+* Narrow panels: the chips row wraps to a second row, then shows short labels (glyphs only),
+  then drops chips from the right; the model chip is kept last. Every chip's hit region is the
+  cells it painted.
+
+### Keys
+
+| Scope | Keys | Action | bdata |
+| --- | --- | --- | --- |
+| `code-review-assistant` | `alt+m` | Choose the model (`assistant_model`) | Same |
+| `code-review-assistant` | `shift+tab` | Cycle reasoning effort (`assistant_effort`) | Same |
+| `code-review-assistant` | `alt+p` | Permissions overlay (`assistant_permissions`) | `alt+r`, `alt+d`, `alt+p` cycle one policy each; here `alt+r` renames and `alt+d` deletes, as before, so one overlay holds the categories |
+| `code-review-assistant` | `alt+t` | List the assistant's tools (`assistant_tools`) | Same |
+| `code-review-assistant` | none (palette) | Delete every conversation the review app started (`assistant_delete_all`) | Same |
+| `code-review-assistant` | `ctrl+o` (and palette) | Open this conversation in `bcode tui` | Palette only |
+| `code-review-composer` | `alt+m`, `shift+tab` | Model and effort for the question (question mode) | Not applicable |
+| `code-review-feed` | `alt+m`, `shift+tab` | Model and effort for the focused card's session | Not applicable |
+
+None of these keys is bound in the scopes resolved with it (`code-review-assistant` with the
+text input; `code-review-composer` with `code-review`; `code-review-feed` with `code-review`);
+a test checks that no stroke resolves to two actions in any scope combination the app resolves
+together.
+
+### Host interface
+
+`ReviewHost` gains, implemented on Bcode's client like the session bridge's model listing:
+
+* `model_catalog()`: the default model status and each model provider's models (the model
+  provider plugins from the plugin services list, each listed with the session model list for
+  that provider).
+* `session_model(session)`: the session's model status (provider, model, display name,
+  reasoning values, selected effort).
+* `set_session_model(session, provider, model)` and `set_session_reasoning(session, effort)`.
+* `TurnRequest.tool_allowlist`, sent as the turn execution options' tool allowlist.
+
+The scripted test host records each of these calls so tests assert the order (selection
+before the first message) and the values.
+
+### Build plan
+
+1. **Model and effort in the panel.** Host interface; the settings record and its store
+   operations; model and effort chips, the picker, `alt+m` and `shift+tab`; the app default
+   applied to new conversations; configuration keys; the model-listing failure chip. Tests: the
+   picker lists the host's models and Bcode's default; choosing sets the active session's
+   model, and a new conversation's session gets the default before its first submit; effort
+   cycles and wraps over the effective model's values, and a model without effort says so; the
+   default survives an app restart over the same store, and each conversation shows its own
+   model after switching; chip and picker hit regions equal their painted cells at 100, 40, 24,
+   12 and 1 columns with CJK and emoji model names; live, with the fake provider, the next
+   turn runs with the chosen model.
+2. **Policy chips, tools list, failures and usage.** Category chips, the permissions overlay and
+   `alt+p`, the tool allowlist on every panel turn, `⚒` and `alt+t`; failure lines for every
+   turn outcome and refused submit; usage formatting; footer hints. Tests: turning `shell` off
+   removes `shell.run` from the next turn's allowlist and back on restores it (live: the fake
+   provider is not offered it); a configuration-disabled category's chip does not toggle; each
+   failure kind renders its reason; usage shows tokens and cost; the key-conflict test.
+3. **Ask AI cards.** Card sessions get the app default at creation; the card's model label and
+   picker; composer question-mode chip with `alt+m` and `shift+tab`; feed-scope keys. Tests: a
+   new card's session is set to the default before its question; changing a card's model
+   changes only that session and the default; the composer chip's hit region at narrow widths.
+4. **Conversation management and panel finish.** History row `✕`, delete every conversation,
+   palette entries (model, effort, permissions, tools, open in Bcode, delete this, delete
+   every), `↗` only with a session, title-row `✕` and double-click zoom, per-screen empty
+   states, Copy and Draft comment on answers. Tests: the `✕` region exists only for the
+   visible hovered or selected row and arms then deletes; delete every conversation confirms
+   with the count, stops running turns, deletes and unbinds only the app's sessions and reports
+   refusals; the palette lists the entries on home and in a review; the empty state per
+   screen; Draft comment creates a draft at the cursor line.
 
 ## Decisions
 
