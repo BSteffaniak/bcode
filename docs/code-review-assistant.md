@@ -667,6 +667,19 @@ Where the built panel differs from the design above:
 * **`go_to version`** shows one layer (`layer`, else the current one) at that version: its whole
   change then, from its fork point then, read-only where it differs from now. It is also a
   place `open_review` can name.
+* **`go_to thread`** takes a thread id exactly as `code_review.list_threads`, `current_view`
+  and the question context give it: a local thread's own id, or a pull request thread's
+  `<repository>#<number>:<forge id>`. The app keys pull request threads internally by provider
+  and pull request; `ReviewNotes::tool_thread_id` and `ReviewNotes::thread_for_tool_id` are the
+  one mapping between the two, used for every id the app reports or accepts. The thread is the
+  place: it is reached wherever the review shows it (an outdated thread near its code, on its
+  file, or on its pull request), entering its layer when one layer is shown at a time. `path`,
+  `line`, `side`, `source` and `version` given with a thread are not used; the answer says so
+  when they name another place. A thread hidden by the comparison, or resolved while resolved
+  threads are hidden, is refused naming the call that shows it.
+* **Blank arguments.** Every app tool (and every `code_review.*` tool) takes a field whose value
+  is an empty or whitespace-only string, or `null`, as not given, in nested objects too; a
+  required field left blank is refused as missing.
 * **`open_review new_review`** takes `title` and `sources` (as `create_review` takes them; the
   source planning lives in the code review crate, shared with the plugin) and shows the wizard at
   its last step with them filled in; nothing is created until the user confirms.
