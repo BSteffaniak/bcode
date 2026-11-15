@@ -175,13 +175,12 @@ impl ReviewSurface {
     /// follow-up session's own (none until that is known) or else `default` (the app default
     /// its new session will get), and on each card its session's own.
     pub fn set_model_labels(&mut self, default: String, sessions: Vec<(String, String)>) {
-        let label = match self.composer_session() {
-            Some(session) => sessions
+        let label = self.composer_session().map_or(Some(default), |session| {
+            sessions
                 .iter()
                 .find(|(known, _)| *known == session)
-                .map(|(_, label)| label.clone()),
-            None => Some(default),
-        };
+                .map(|(_, label)| label.clone())
+        });
         if let Some(composer) = self.composer.as_mut() {
             composer.set_model_label(label);
         }

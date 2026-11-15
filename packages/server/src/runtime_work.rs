@@ -247,7 +247,7 @@ fn lock_retiring(
 /// does once the terminal event is durable. Dropping it early, for example when the finishing
 /// future is cancelled, releases the id as well, so it never stays owned for good.
 #[derive(Debug)]
-pub(super) struct RetiringWork {
+pub struct RetiringWork {
     spec: RuntimeWorkSpec,
     key: (SessionId, WorkId),
     retiring: RetiringSet,

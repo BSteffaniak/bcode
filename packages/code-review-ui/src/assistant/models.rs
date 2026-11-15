@@ -127,13 +127,15 @@ impl ModelState {
         if listed(&known.model.model_id) || known.requested.as_deref().is_some_and(listed) {
             return None;
         }
-        let listing_complete = match provider {
-            Some(provider) => catalog
-                .providers
-                .iter()
-                .any(|listed| listed.provider == provider && listed.models.is_ok()),
-            None => catalog.providers.iter().all(|listed| listed.models.is_ok()),
-        };
+        let listing_complete = provider.map_or_else(
+            || catalog.providers.iter().all(|listed| listed.models.is_ok()),
+            |provider| {
+                catalog
+                    .providers
+                    .iter()
+                    .any(|listed| listed.provider == provider && listed.models.is_ok())
+            },
+        );
         listing_complete.then(|| {
             known
                 .requested
@@ -277,10 +279,11 @@ pub fn effort_after(
     values.get(next).cloned()
 }
 
-/// The app default saved when `effort` is chosen for a target running `model`: the latest
-/// choice names the model the effort was chosen for. The model stays unnamed when the target
-/// runs Bcode's default (`bcode_default`) and `current` names no model either, so the default
-/// keeps following Bcode's.
+/// The app default saved when `effort` is chosen for a target running `model`.
+///
+/// The latest choice names the model the effort was chosen for. The model stays unnamed when
+/// the target runs Bcode's default (`bcode_default`) and `current` names no model either, so
+/// the default keeps following Bcode's.
 #[must_use]
 pub fn default_with_effort(
     current: &ReviewAssistantSettings,

@@ -628,13 +628,8 @@ pub async fn ask(
             )
             .await
             .map_err(|error| error.message)?;
-        // The app default model and effort apply before the question; a refused one leaves
-        // Bcode's default, and the card says why.
-        refused =
-            crate::assistant::models::apply_default(&services, scope.repo_path.clone(), &session)
-                .await
-                .err()
-                .map(|error| format!("{error}; this question runs Bcode's default"));
+        // The app default applies before the question; the card says why Bcode refused one.
+        refused = refused_default(&services, scope.repo_path.clone(), &session).await;
         services
             .call(bcode_code_review_models::BindReviewAssistantRequest {
                 repo_path: scope.repo_path.clone(),
@@ -681,6 +676,18 @@ pub async fn ask(
             Err(Box::new((recorded, error)))
         }
     }
+}
+
+/// Give the new card session `session` the app default; why Bcode refused it, when it did.
+async fn refused_default(
+    services: &ReviewServices,
+    repo: PathBuf,
+    session: &str,
+) -> Option<String> {
+    crate::assistant::models::apply_default(services, repo, session)
+        .await
+        .err()
+        .map(|error| format!("{error}; this question runs Bcode's default"))
 }
 
 /// Phase of a linked session's answer.

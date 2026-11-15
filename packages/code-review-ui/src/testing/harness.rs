@@ -878,12 +878,12 @@ impl ReviewHost for ScriptedHost {
             .expect("reads lock")
             .entry(session_id.clone())
             .or_default() += 1;
-        if let Some(reason) = self
+        let failure = self
             .session_model_failure
             .lock()
             .expect("failure lock")
-            .clone()
-        {
+            .clone();
+        if let Some(reason) = failure {
             return Box::pin(async move { Err(HostError::failed(reason)) });
         }
         let choice = self.session_choice(&session_id);
@@ -925,13 +925,13 @@ impl ReviewHost for ScriptedHost {
         provider: Option<String>,
         model_id: String,
     ) -> HostFuture<()> {
-        if let Some(reason) = self
+        let refused = self
             .refused_models
             .lock()
             .expect("models lock")
             .get(&model_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(reason) = refused {
             return Box::pin(async move { Err(HostError::failed(reason)) });
         }
         self.log_model(format!("model {session_id} {model_id}"));
@@ -1022,13 +1022,13 @@ impl ReviewHost for ScriptedHost {
     }
 
     fn delete_session(&self, session_id: String) -> HostFuture<()> {
-        if let Some(reason) = self
+        let refused = self
             .refused_deletes
             .lock()
             .expect("deletes lock")
             .get(&session_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(reason) = refused {
             return Box::pin(async move { Err(HostError::failed(reason)) });
         }
         self.catalog

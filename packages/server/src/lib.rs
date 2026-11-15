@@ -85772,14 +85772,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
     /// reasoning again is a no-op that keeps it rather than leaving the daemon-wide effort.
     #[tokio::test]
     async fn set_model_runs_with_the_reasoning_remembered_for_the_incoming_model() {
-        let sessions = SessionManager::default();
-        let session_id = sessions
-            .create_session(Some("keep effort".to_owned()), test_working_directory())
-            .await
-            .expect("session")
-            .id;
-        let mut state = test_server_state(sessions);
-        state.selected_reasoning.effort = Some("low".to_owned());
         async fn selected_effort(state: &ServerState, session_id: SessionId) -> Option<String> {
             state
                 .session_model_selections
@@ -85788,6 +85780,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .get(&session_id)
                 .and_then(|selection| selection.reasoning_effort.clone())
         }
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("keep effort".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let mut state = test_server_state(sessions);
+        state.selected_reasoning.effort = Some("low".to_owned());
 
         session_operations::set_model(
             &state,
