@@ -72,6 +72,8 @@ pub struct Icons {
     pub draft: &'static str,
     /// AI answers.
     pub ai: &'static str,
+    /// The review assistant (the Ask AI button and the panel's title).
+    pub assistant: &'static str,
     /// Accent bar at the start of a file header.
     pub accent_bar: &'static str,
     /// Separator between metadata parts.
@@ -171,6 +173,7 @@ impl Icons {
         thread: "💬",
         draft: "✎",
         ai: "✦",
+        assistant: "✦",
         accent_bar: "▍",
         separator: " · ",
         rename: " → ",
@@ -224,6 +227,7 @@ impl Icons {
         thread: "\"",
         draft: "~",
         ai: "AI",
+        assistant: "*",
         accent_bar: "|",
         separator: " | ",
         rename: " -> ",

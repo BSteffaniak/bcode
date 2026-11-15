@@ -121,6 +121,12 @@ impl TestBackend {
         self.host.provider()
     }
 
+    /// The scripted host the services reach Bcode through, to share with a scenario.
+    #[must_use]
+    pub fn host(&self) -> Arc<ScriptedHost> {
+        Arc::clone(&self.host)
+    }
+
     /// Sessions created so far: `(id, title)`.
     #[must_use]
     pub fn sessions(&self) -> Vec<(String, String)> {

@@ -165,35 +165,53 @@ a turn that has left the observed window says so and `o` reads it in Bcode.
 
 ### Review assistant
 
-`ctrl+k` opens the assistant dock and focuses it; when the dock is open elsewhere it focuses it,
-and when it is focused it closes it. The dock is a chat with a Bcode session working on this
-review. It sits to the right of the document when the body is at least 120 columns wide (190
-beside a right threads panel) and under the document otherwise; drag its divider to resize it.
+The review assistant is one docked conversation with a Bcode session for the whole app: it is
+available on the reviews home, in the new-review wizard and in every review, and stays open with
+the same conversation while you move between them. The full design, including what is still to
+come, is in [code review assistant](code-review-assistant.md).
 
-* The header row carries chips: the review and the cursor's place (its line, selected range, or
-  file). While the place chip is attached (`ctrl+x` detaches or attaches it), a message carries a
-  short context block naming it after the text; the conversation shows the text as typed.
-* The first message creates a session in the repository, binds it to the review, and sends the
-  message. Reopening the review continues its newest bound session; `ctrl+n` starts a new one.
-* The conversation shows every observed turn like an AI card: `▍you` and the message, reasoning,
-  tool lines with their output, and the answers, with a spinner while the session works. Its
-  pane title shows `needs you`, `working…`, tokens and cost. `pageup`/`pagedown` and the wheel
-  scroll it; clicks open reasoning and tool output.
-* A permission request of the session replaces the input with its prompt: `y` allow, `a` always,
-  `n` decline, `d` never (Always and Never when the request can be remembered). `ctrl+c` stops
-  the running turn, `ctrl+o` opens the session in Bcode, and `esc` returns to the review with the
-  dock open. A request while the dock is hidden raises a toast.
-* When a `code_review.*` tool that changes the review finishes in the dock's session (or an AI
-  card's), the review reloads its comments and viewed files as it does for the reviewer's own
-  edits: a drafted comment appears at its line, a resolved thread resolves, a viewed file shows
-  as viewed. `code_review.navigate` moves the cursor to the place it names. In a session the app
-  started (the dock's conversation, or a question's own session) every finished call is applied,
-  including calls that finished before the app first observed the session. In a session it
-  found (reopening a review continues its last assistant session), calls that had already
-  finished when the session is first observed are not replayed.
-* `ctrl+n` starts a new conversation at once: a lookup or a session start of the previous
-  conversation that finishes afterwards never replaces it, and messages written in the previous
-  conversation still go to its session.
+* **Opening it.** The `✦ Ask AI` button at the right end of every screen's header, `ctrl+k`, the
+  palette entry "Ask AI" (`:` or `ctrl+p`, on home too) and the footer hint all open and focus
+  it; `ctrl+k` focuses it when it is open and closes it when it is focused. A focused text field
+  of the screen (the home filter, the comment composer, search) keeps `ctrl+k`. The button
+  shortens to `✦ AI` and then `✦` as the header narrows, is a filled pill while the panel is
+  open, and shows a spinner or `?` while the panel is closed and the conversation works or needs
+  you.
+* **Placement.** From 100 columns the panel docks on the right (by default 40% of the width,
+  36 to 100 columns, and the screen keeps 60); narrower, it docks at the bottom (40% of the
+  height, at least 8 rows, and the screen keeps 8); when neither fits, the focused panel takes
+  the whole screen and `esc` returns to it. Drag the panel's inner edge to resize it. Below 24
+  columns or 6 rows it shows its title row and input only, below 12 columns its title row only.
+* **Conversation.** The title row names the active conversation and where it started (`✦
+  Assistant · <title> · <review #layer or home>`) and carries `+ new`, `⟲` (history) and `↗`
+  (open in Bcode). The chips row names what is on screen (`⌖ src/retry.rs:42`, `⌖ home`, `⌖ new
+  review`); `ctrl+x` detaches it. The first message creates a Bcode session with the review app's
+  origin, titled after the message and tagged with the review and stack layer on screen (or with
+  none on home and in the wizard), and sends it. Each message carries a stored context block
+  describing the screen; the conversation shows the text as typed.
+* **Which review the tools act on.** The session's binding names the review its `code_review.*`
+  tools act on when no `review` is passed. It is rewritten before each message and whenever the
+  screen changes: the review on screen, or detached on home and in the wizard, where a review
+  tool called without `review` fails with "no review is on screen; pass `review`".
+* **History.** `alt+h` (or `⟲`) opens the picker of every conversation of the repository, newest
+  first: title, where it started, how long ago, turns, and `needs you` or `working`; Ask AI card
+  sessions are labelled `card`. Typing searches; `enter` switches (and attaches the conversation
+  to the screen); `alt+r` renames; `alt+d` marks a row and a second `alt+d` deletes it from
+  Bcode; `ctrl+o` opens it in `bcode tui`. Earlier per-review conversations are listed from
+  their bindings, tagged with their review. In the conversation, `alt+r` renames it, `alt+d`
+  asks before deleting it, and `ctrl+n` (or `+ new`) starts a new one.
+* **Turns** show like an AI card: `▍you` and the message, reasoning, tool lines with their output
+  and the answers, with a spinner while the session works; the title row shows `needs you`,
+  `working…`, tokens and cost. `pageup`/`pagedown` and the wheel scroll it; clicks open
+  reasoning and tool output.
+* **Permissions.** A permission request replaces the input with its prompt: `y` allow, `a`
+  always, `n` decline, `d` never. Always and Never are offered only when the request can be
+  remembered, and never for publishing or deleting reviews. `ctrl+c` stops the running turn.
+* **Live reflection.** When a `code_review.*` tool that changes the review finishes in the
+  assistant's session (or an AI card's), the review on screen reloads its comments and viewed
+  files as it does for the reviewer's own edits, and `code_review.navigate` moves the cursor to
+  the place it names. In a session the app started every finished call is applied; in one
+  switched to from the history, calls that had already finished are not replayed.
 
 #### Review tools
 
@@ -585,7 +603,10 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `tab` | Switch between suggestions and reviews |
 | `ctrl+r` | Reload reviews and suggestions |
 | `?` | Keyboard help |
+| `ctrl+t` | Appearance: the review's palette and profile… |
 | `q` | Quit |
+| `ctrl+k` | Ask AI: open, focus, or close the review assistant |
+| `:`, `ctrl+p` | Command palette |
 
 ### New-review wizard (`code-review-wizard`)
 
@@ -594,6 +615,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `tab` | Mark or unmark the commit or file (include or exclude a source when editing) |
 | `shift+tab` | Mark every commit or file from the last mark |
 | `esc` | Back one step |
+| `ctrl+k` | Ask AI: open, focus, or close the review assistant |
 
 ### Review (`code-review`)
 
@@ -627,7 +649,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `>` | Widen file panel |
 | `<` | Narrow file panel |
 | `shift+t` | Show / hide threads panel |
-| `ctrl+k` | Open, focus, or close the review assistant |
+| `ctrl+k` | Ask AI: open, focus, or close the review assistant |
 | `c` | Comment on the line, range, or file (reply on a thread) |
 | `a` | Ask Bcode about the line, range, or file |
 | `shift+f` | Comment on the file |
@@ -752,13 +774,28 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | Keys | Action |
 |---|---|
 | `ctrl+k` | Close the assistant |
-| `esc` | Back to the review (the assistant stays open) |
+| `esc` | Back to the screen (the assistant stays open) |
 | `ctrl+c` | Stop the assistant's running turn |
-| `ctrl+x` | Attach or detach the cursor's place as context |
-| `ctrl+n` | Start a new conversation |
+| `ctrl+x` | Attach or detach what is on screen as context |
+| `ctrl+n`, `alt+n` | Start a new conversation |
+| `alt+h` | Conversation history |
+| `alt+r` | Rename this conversation |
+| `alt+d` | Delete this conversation (asks first) |
 | `ctrl+o` | Open the assistant's session in Bcode |
 | `pageup` | Scroll the conversation up |
 | `pagedown` | Scroll the conversation down |
+
+### Conversation history (`code-review-assistant-history`)
+
+| Keys | Action |
+|---|---|
+| `up`, `ctrl+p` | Previous conversation |
+| `down`, `ctrl+n` | Next conversation |
+| `enter` | Switch to the conversation |
+| `alt+r` | Rename the conversation |
+| `alt+d` | Delete the conversation (press twice) |
+| `ctrl+o` | Open the conversation in Bcode |
+| `esc` | Back to the conversation |
 
 ## Configuration
 

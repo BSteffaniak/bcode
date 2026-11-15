@@ -12,6 +12,11 @@
 //!   with a way back.
 //! * **Theme.** Home, the wizard, and the opening route derive the same [`ReviewTheme`] from the
 //!   host theme as the review does.
+//! * **Assistant.** The review assistant panel belongs to the app, not to a route
+//!   ([`crate::assistant`]): it stays open with the same conversation while the user moves
+//!   between home, the wizard and reviews. The app splits its area between the route and the
+//!   panel, gives the route the remaining rectangle, paints the Ask AI button at the end of the
+//!   route's header row, and attaches the conversation's session to the review on screen.
 
 use super::appearance::{AppearanceOutcome, AppearanceOverlay};
 use super::config::ReviewViewConfig;
@@ -22,6 +27,7 @@ use super::wizard::{Wizard, WizardOutcome};
 use super::{ReviewSurface, entry::transient_workspace};
 use crate::action::Action;
 use crate::action::EventResult;
+use crate::assistant::{Assistant, Place, Screen};
 use crate::context::UiContext;
 use crate::services::ReviewServices;
 use crate::view::View;
@@ -106,6 +112,10 @@ pub struct ReviewApp {
     editing: Option<Box<ReviewWorkspace>>,
     /// The appearance picker, over every route while open.
     appearance: Option<AppearanceOverlay>,
+    /// The review assistant panel.
+    assistant: Assistant,
+    /// Where the Ask AI button was painted in the last frame.
+    button: Option<Rect>,
 }
 
 impl std::fmt::Debug for ReviewApp {
@@ -127,6 +137,7 @@ impl ReviewApp {
         entry: Entry,
     ) -> Self {
         let icons = config.icons.unwrap_or_default();
+        let assistant = Assistant::new(services.clone(), repo.clone());
         let mut app = Self {
             services,
             repo,
@@ -145,6 +156,8 @@ impl ReviewApp {
             keymap_stale: true,
             editing: None,
             appearance: None,
+            assistant,
+            button: None,
         };
         match entry {
             Entry::Home => app.show_home(false),
@@ -242,6 +255,163 @@ impl ReviewApp {
     #[must_use]
     pub const fn appearance_picker(&self) -> Option<&AppearanceOverlay> {
         self.appearance.as_ref()
+    }
+
+    /// The review assistant panel.
+    #[must_use]
+    pub const fn assistant(&self) -> &Assistant {
+        &self.assistant
+    }
+
+    /// Where the Ask AI button was painted in the last frame.
+    #[must_use]
+    pub const fn assistant_button(&self) -> Option<Rect> {
+        self.button
+    }
+
+    /// What is on screen, for the assistant; with `binding` the review's binding template.
+    fn place(&mut self, binding: bool) -> Place {
+        match &mut self.route {
+            Route::Home => Place::screen(Screen::Home),
+            Route::Wizard(_) => Place::screen(Screen::Wizard),
+            Route::Opening(_) => Place::screen(Screen::Opening),
+            Route::Review(review) => Place {
+                screen: Screen::Review,
+                review: Some(review.assistant_review_place(binding)),
+            },
+        }
+    }
+
+    /// Whether the route asked to open, focus or close the assistant.
+    fn take_assistant_request(&mut self) -> bool {
+        match &mut self.route {
+            Route::Home => self
+                .home
+                .as_mut()
+                .is_some_and(|home| home.take_assistant_request()),
+            Route::Wizard(wizard) => wizard.take_assistant_request(),
+            Route::Review(review) => review.take_assistant_request(),
+            Route::Opening(_) => false,
+        }
+    }
+
+    /// Whether the route on screen shows its header row in an area `height` rows high.
+    const fn route_shows_header(&self, height: u16) -> bool {
+        match &self.route {
+            Route::Home => Home::shows_header(height),
+            Route::Wizard(_) => Wizard::shows_header(height),
+            Route::Review(_) => ReviewSurface::shows_header(height),
+            Route::Opening(_) => false,
+        }
+    }
+
+    /// Leave `cells` free at the end of the route's header row.
+    fn set_header_reserve(&mut self, cells: u16) {
+        match &mut self.route {
+            Route::Home => {
+                if let Some(home) = self.home.as_mut() {
+                    home.set_header_reserve(cells);
+                }
+            }
+            Route::Wizard(wizard) => wizard.set_header_reserve(cells),
+            Route::Review(review) => review.set_header_reserve(cells),
+            Route::Opening(_) => {}
+        }
+    }
+
+    /// Route an event to the assistant panel when it takes it.
+    fn assistant_event(&mut self, event: &Event, host: &UiContext) -> Option<Action> {
+        if let Event::Mouse(mouse) = event {
+            if matches!(
+                mouse.kind,
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
+            ) && self
+                .button
+                .is_some_and(|area| area.contains(mouse.position))
+            {
+                self.assistant.toggle();
+                return Some(Action::Redraw);
+            }
+            let down = matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_));
+            let place = self.place(down);
+            if let Some(outcome) = self.assistant.mouse(event, &place, host) {
+                return Some(assistant_action(&outcome));
+            }
+            // A click on the screen gives it the keyboard back.
+            if down && self.assistant.is_focused() {
+                self.assistant.unfocus();
+            }
+            return None;
+        }
+        if !self.assistant.is_focused() {
+            return None;
+        }
+        match event {
+            Event::Key(stroke) => {
+                let place = self.place(stroke.key == KeyCode::Enter);
+                Some(assistant_action(&self.assistant.key(*stroke, &place, host)))
+            }
+            Event::Paste(text) => {
+                self.assistant.paste(text);
+                Some(Action::Redraw)
+            }
+            _ => None,
+        }
+    }
+
+    /// Collect the panel's work, attach its session to the place on screen, and let the
+    /// review reflect what the session's review tools changed.
+    fn poll_assistant(&mut self, host: &UiContext) -> bool {
+        let mut changed = self.assistant.poll(host);
+        let key = self.place(false).key();
+        if self.assistant.needs_attach(&key) {
+            let place = self.place(true);
+            self.assistant.attach(&place, host);
+            changed = true;
+        }
+        let tools = self.assistant.take_finished_tools();
+        if !tools.is_empty()
+            && let Route::Review(review) = &mut self.route
+        {
+            review.apply_assistant_tools(&tools, host);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Paint the route in `screen` with the Ask AI button at the end of its header row.
+    fn render_screen(
+        &mut self,
+        screen: Rect,
+        panel_shown: bool,
+        frame: &mut PaintCx<'_, '_>,
+        styles: Option<&ComponentStyles>,
+        host: &UiContext,
+    ) {
+        let plan = self
+            .route_shows_header(screen.height)
+            .then(|| {
+                crate::assistant::button::plan(
+                    screen.width,
+                    self.assistant.is_open(),
+                    &self.assistant.badge(panel_shown),
+                    &self.theme,
+                )
+            })
+            .flatten();
+        self.set_header_reserve(plan.as_ref().map_or(0, |plan| plan.width));
+        if let Route::Review(review) = &mut self.route {
+            review.render(screen, frame, styles, host);
+        } else {
+            self.render_route(screen, frame);
+        }
+        self.button = plan.map(|plan| {
+            plan.paint(
+                Rect::new(screen.x, screen.y, screen.width, 1),
+                &self.theme,
+                frame,
+            )
+        });
     }
 
     /// Open the appearance picker when a route asked for it.
@@ -508,7 +678,7 @@ impl ReviewApp {
                 };
                 let outcome = match event {
                     Event::Key(stroke) => home.key(*stroke, host, &theme),
-                    Event::Paste(text) => home.paste(text),
+                    Event::Paste(text) => home.paste(text, &theme),
                     Event::Mouse(_) => home.mouse(event, &theme),
                     Event::Resize(_) => HomeOutcome::Redraw,
                     Event::Focus(FocusEvent::Gained) => {
@@ -606,6 +776,17 @@ impl ReviewApp {
     }
 }
 
+/// The run loop's action for what the assistant panel did.
+const fn assistant_action(outcome: &crate::assistant::Outcome) -> Action {
+    match outcome {
+        crate::assistant::Outcome::Ignored => Action::None,
+        crate::assistant::Outcome::Redraw => Action::Redraw,
+        crate::assistant::Outcome::OpenSession(session_id) => Action::OpenSession {
+            session_id: *session_id,
+        },
+    }
+}
+
 /// Create a durable workspace.
 async fn create_workspace(
     services: ReviewServices,
@@ -685,6 +866,7 @@ impl ReviewApp {
 impl View for ReviewApp {
     fn prepare_keymap(&mut self, host: &UiContext) {
         self.keymap_stale = false;
+        self.assistant.prepare_keymap(host);
         if let Some(home) = self.home.as_mut() {
             home.prepare_keymap(host);
         }
@@ -706,10 +888,23 @@ impl View for ReviewApp {
         // Every cell inherits the canvas, so text without a background of its own sits on the
         // theme's canvas rather than the terminal's default background.
         frame.with_style(self.theme.canvas, |frame| {
-            if let Route::Review(review) = &mut self.route {
-                review.render(area, frame, styles, host);
-            } else {
-                self.render_route(area, frame);
+            let split = self.assistant.split(area);
+            match split.screen {
+                Some(screen) => {
+                    self.render_screen(screen, split.panel.is_some(), frame, styles, host);
+                }
+                None => self.button = None,
+            }
+            if let Some((rect, dock)) = split.panel {
+                let place = self.place(false);
+                self.assistant.paint(
+                    area,
+                    (rect, dock),
+                    &place,
+                    crate::assistant::panel::now_ms(),
+                    &self.theme,
+                    frame,
+                );
             }
             if let Some(overlay) = self.appearance.as_mut() {
                 overlay.paint(&self.theme, area, frame);
@@ -721,7 +916,17 @@ impl View for ReviewApp {
         if let Some(result) = self.appearance_event(event, host) {
             return result;
         }
+        if let Some(action) = self.assistant_event(event, host) {
+            self.refresh_keymap(host);
+            return EventResult::from_action(action);
+        }
         let mut result = self.route_event(event, host);
+        if self.take_assistant_request() {
+            self.assistant.toggle();
+            if result.action == Action::None {
+                result = EventResult::from_action(Action::Redraw);
+            }
+        }
         if self.open_requested_appearance(host) && result.action == Action::None {
             result = EventResult::from_action(Action::Redraw);
         }
@@ -731,6 +936,12 @@ impl View for ReviewApp {
 
     fn poll(&mut self, host: &UiContext) -> Action {
         let mut action = self.poll_route(host);
+        if self.take_assistant_request() {
+            self.assistant.toggle();
+        }
+        if self.poll_assistant(host) && action == Action::None {
+            action = Action::Redraw;
+        }
         if self.open_requested_appearance(host) && action == Action::None {
             action = Action::Redraw;
         }

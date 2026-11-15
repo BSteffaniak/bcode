@@ -70,6 +70,18 @@ pub struct ScriptedHost {
     delayed_redraws: AtomicUsize,
     provider: OnceLock<std::sync::Arc<FakeProvider>>,
     publisher: OnceLock<FakePublisher>,
+    /// Bcode's sessions as the fake catalog lists them, by id.
+    catalog: Mutex<BTreeMap<String, crate::host::AppSession>>,
+    /// Turns submitted with context and agent, oldest first.
+    turns: Mutex<Vec<(String, crate::host::TurnRequest)>>,
+    /// Pending permission requests the fake daemon reports.
+    pending: Mutex<Vec<crate::host::PendingPermission>>,
+    /// Deleted session ids, oldest first.
+    deleted: Mutex<Vec<String>>,
+    /// Failures of the next submits, by error code, oldest first.
+    submit_failures: Mutex<VecDeque<String>>,
+    /// Fake clock of session activity.
+    clock: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for ScriptedHost {
@@ -121,7 +133,65 @@ impl ScriptedHost {
             delayed_redraws: AtomicUsize::new(0),
             provider: OnceLock::new(),
             publisher: OnceLock::new(),
+            catalog: Mutex::default(),
+            turns: Mutex::default(),
+            pending: Mutex::default(),
+            deleted: Mutex::default(),
+            submit_failures: Mutex::default(),
+            clock: std::sync::atomic::AtomicU64::new(1_000),
         }
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1_000, Ordering::SeqCst)
+    }
+
+    /// Add `session` to the fake Bcode catalog (a session another client created).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the catalog lock is poisoned.
+    pub fn add_catalog_session(&self, session: crate::host::AppSession) {
+        self.catalog
+            .lock()
+            .expect("catalog lock")
+            .insert(session.id.clone(), session);
+    }
+
+    /// The fake catalog's session `id`, when Bcode has it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the catalog lock is poisoned.
+    pub fn catalog_session(&self, id: &str) -> Option<crate::host::AppSession> {
+        self.catalog.lock().expect("catalog lock").get(id).cloned()
+    }
+
+    /// Turns submitted with context blocks and agent, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the turns lock is poisoned.
+    pub fn turns(&self) -> Vec<(String, crate::host::TurnRequest)> {
+        self.turns.lock().expect("turns lock").clone()
+    }
+
+    /// Report `pending` as the daemon's pending permission requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pending lock is poisoned.
+    pub fn set_pending_permissions(&self, pending: Vec<crate::host::PendingPermission>) {
+        *self.pending.lock().expect("pending lock") = pending;
+    }
+
+    /// Sessions deleted, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the deleted lock is poisoned.
+    pub fn deleted_sessions(&self) -> Vec<String> {
+        self.deleted.lock().expect("deleted lock").clone()
     }
 
     /// Fail creating sessions with `message` from now on (`None` succeeds again).
@@ -377,12 +447,24 @@ impl ReviewHost for ScriptedHost {
         self.session_origins
             .lock()
             .expect("origins lock")
-            .push(origin);
+            .push(origin.clone());
         let failure = self.session_failure.lock().expect("failure lock").clone();
         if let Some(message) = failure {
             return Box::pin(async move { Err(HostError::failed(message)) });
         }
         let id = SessionId::new().to_string();
+        let now = self.tick();
+        self.catalog.lock().expect("catalog lock").insert(
+            id.clone(),
+            crate::host::AppSession {
+                id: id.clone(),
+                title: Some(title.clone()),
+                created_at_ms: now,
+                updated_at_ms: now,
+                origin_app: Some(origin.app_id.clone()),
+                origin_context: origin.context,
+            },
+        );
         self.sessions
             .lock()
             .expect("sessions lock")
@@ -391,11 +473,122 @@ impl ReviewHost for ScriptedHost {
     }
 
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()> {
+        let now = self.tick();
+        if let Some(session) = self
+            .catalog
+            .lock()
+            .expect("catalog lock")
+            .get_mut(&session_id)
+        {
+            session.updated_at_ms = now;
+        }
         self.messages
             .lock()
             .expect("messages lock")
             .push((session_id, text));
         Box::pin(async { Ok(()) })
+    }
+
+    fn submit_turn(&self, session_id: String, request: crate::host::TurnRequest) -> HostFuture<()> {
+        let failure = self
+            .submit_failures
+            .lock()
+            .expect("failures lock")
+            .pop_front();
+        if let Some(code) = failure {
+            return Box::pin(async move {
+                Err(HostError {
+                    message: format!("submit failed: {code}"),
+                    code,
+                })
+            });
+        }
+        self.turns
+            .lock()
+            .expect("turns lock")
+            .push((session_id.clone(), request.clone()));
+        self.send_message(session_id, request.text)
+    }
+
+    fn list_app_sessions(
+        &self,
+        _working_directory: PathBuf,
+        _cursor: Option<String>,
+        limit: usize,
+    ) -> HostFuture<crate::host::AppSessionPage> {
+        let mut sessions: Vec<crate::host::AppSession> = self
+            .catalog
+            .lock()
+            .expect("catalog lock")
+            .values()
+            .filter(|session| {
+                session.origin_app.as_deref() == Some(crate::host::REVIEW_SESSION_APP_ID)
+            })
+            .cloned()
+            .collect();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+        sessions.truncate(limit);
+        Box::pin(async move {
+            Ok(crate::host::AppSessionPage {
+                sessions,
+                next_cursor: None,
+                degraded: false,
+            })
+        })
+    }
+
+    fn session_summaries(
+        &self,
+        session_ids: Vec<String>,
+    ) -> HostFuture<Vec<Option<crate::host::AppSession>>> {
+        let catalog = self.catalog.lock().expect("catalog lock");
+        let summaries = session_ids
+            .iter()
+            .map(|id| catalog.get(id).cloned())
+            .collect();
+        Box::pin(async move { Ok(summaries) })
+    }
+
+    fn rename_session(&self, session_id: String, name: String) -> HostFuture<()> {
+        let found = self
+            .catalog
+            .lock()
+            .expect("catalog lock")
+            .get_mut(&session_id)
+            .map(|session| session.title = Some(name))
+            .is_some();
+        Box::pin(async move {
+            if found {
+                Ok(())
+            } else {
+                Err(HostError::failed("no such session"))
+            }
+        })
+    }
+
+    fn delete_session(&self, session_id: String) -> HostFuture<()> {
+        self.catalog
+            .lock()
+            .expect("catalog lock")
+            .remove(&session_id);
+        self.deleted.lock().expect("deleted lock").push(session_id);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn pending_permissions(&self) -> HostFuture<Vec<crate::host::PendingPermission>> {
+        let pending = self.pending.lock().expect("pending lock").clone();
+        Box::pin(async move { Ok(pending) })
+    }
+
+    fn count_turns(&self, session_id: String) -> HostFuture<crate::host::TurnCount> {
+        let turns = self
+            .messages
+            .lock()
+            .expect("messages lock")
+            .iter()
+            .filter(|(session, _)| *session == session_id)
+            .count();
+        Box::pin(async move { Ok(crate::host::TurnCount { turns, more: false }) })
     }
 
     fn resolve_permission(

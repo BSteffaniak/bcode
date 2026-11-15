@@ -115,7 +115,6 @@ impl ReviewSurface {
             .exchanges()
             .iter()
             .filter_map(|exchange| exchange.session_id.clone())
-            .chain(self.assistant_sessions())
             .collect();
         if self
             .agents
@@ -154,7 +153,7 @@ impl ReviewSurface {
                 if self.fresh_asks.remove(&exchange.exchange_id)
                     && let Some(session) = &exchange.session_id
                 {
-                    self.dock.follow_new_session(session);
+                    self.reflection.follow_new_session(session);
                 }
                 self.notes.put_exchange(exchange);
             }

@@ -330,6 +330,8 @@ pub struct Wizard {
     /// The stack being resolved (by its pull request) as discovery sees it: shown, marked as
     /// unconfirmed, until the provider answers.
     provisional: Option<(u64, Vec<ProvisionalLayer>)>,
+    /// The assistant panel request and the header cells left for the Ask AI button.
+    link: crate::assistant::ScreenLink,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -342,7 +344,12 @@ impl std::fmt::Debug for Wizard {
 }
 
 /// Hint actions of the wizard scope.
-const HINT_ACTIONS: &[&str] = &["wizard_mark", "wizard_mark_range", "wizard_back"];
+const HINT_ACTIONS: &[&str] = &[
+    "wizard_mark",
+    "wizard_mark_range",
+    "wizard_back",
+    "wizard_assistant",
+];
 
 fn type_picker() -> Picker {
     let mut picker = Picker::new("wizard.type", "What do you want to review?", None);
@@ -379,7 +386,25 @@ impl Wizard {
             pending_items: true,
             stack_limit_dismissed: None,
             provisional: None,
+            link: crate::assistant::ScreenLink::default(),
         }
+    }
+
+    /// Leave `cells` free at the end of the header row (where the app paints its Ask AI
+    /// button).
+    pub const fn set_header_reserve(&mut self, cells: u16) {
+        self.link.header_reserve = cells;
+    }
+
+    /// Whether the header row shows in an area `height` rows high.
+    #[must_use]
+    pub const fn shows_header(height: u16) -> bool {
+        height >= 6
+    }
+
+    /// The `wizard_assistant` action ran since the last call.
+    pub const fn take_assistant_request(&mut self) -> bool {
+        self.link.take_request()
     }
 
     /// A wizard editing `workspace`'s title and sources (opens at step 3).
@@ -1539,6 +1564,10 @@ impl Wizard {
             .map(|action| action.trim_start_matches("bcode.code_review.").to_owned());
         let outcome = match action.as_deref() {
             Some("wizard_back") => self.back(),
+            Some("wizard_assistant") => {
+                self.link.requested = true;
+                WizardOutcome::Redraw
+            }
             Some("wizard_mark") if self.markable() => self.mark(false),
             Some("wizard_mark_range") if self.markable() => self.mark(true),
             _ if stroke.key == bmux_keyboard::KeyCode::Enter
@@ -1988,6 +2017,9 @@ impl Wizard {
         if let Some(key) = self.action_keys.get("wizard_back") {
             hints.push((key.clone(), "back".to_owned()));
         }
+        if let Some(key) = self.action_keys.get("wizard_assistant") {
+            hints.push((key.clone(), "Ask AI".to_owned()));
+        }
         hints
     }
 
@@ -2005,7 +2037,7 @@ impl Wizard {
             self.pending_items = false;
             self.refresh_items(theme);
         }
-        let header = area.height >= 6;
+        let header = Self::shows_header(area.height);
         let footer = area.height >= 2;
         if header {
             let row = Rect::new(area.x, area.y, area.width, 1);
@@ -2038,7 +2070,9 @@ impl Wizard {
                     theme.muted,
                 ),
             ])
-            .truncate(usize::from(area.width));
+            .truncate(usize::from(
+                area.width.saturating_sub(self.link.header_reserve),
+            ));
             cx.with_style(theme.header_bar, |cx| {
                 cx.write_line(
                     LocalRect::new(row.x.into(), row.y.into(), row.width, 1),

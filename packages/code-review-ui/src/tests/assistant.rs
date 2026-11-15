@@ -1,18 +1,36 @@
-//! The review assistant dock: opening and placing it, a conversation with a session bound to
-//! the review, its permission prompt, and the review following what the session's review tools
-//! change.
+//! The app-wide review assistant: the panel on home and in reviews, staying open with its
+//! conversation while the user moves between them; the Ask AI button and its hit region; the
+//! panel's placement; the history picker (switch, search, rename, delete, needs-you rows) and
+//! the earlier per-review conversations it lists; the permission prompt answered inline; and the
+//! review following what the conversation's review tools change.
 
-use super::interaction::{Setup, added_line, build, cursor, find, fixture, move_to, setup};
-use super::stable;
-use bcode_code_review::assistant::{Location, ReviewRef, ReviewTools, Side};
-use bcode_code_review::document::{ItemKey, ReviewItem};
-use bcode_code_review_models::{GetReviewAssistantRequest, ReviewAssistantLookup, ReviewLineSide};
+use super::app::settled;
+use crate::app::{ReviewApp, RouteName};
+use crate::assistant::button::BUTTON_ID;
+use crate::assistant::history::Tag;
+use crate::config::ReviewViewConfig;
+use crate::entry::Entry;
+use crate::host::AppSession;
+use crate::testing::backend::TestBackend;
+use crate::testing::fixture::{FixtureSpec, GitFixture};
+use crate::testing::fixture_branch_compare;
+use crate::testing::harness::{Scenario, Screen};
+use bcode_code_review::assistant::{ReviewRef, ReviewTools};
+use bcode_code_review::document::ItemKey;
+use bcode_code_review_models::{
+    BindReviewAssistantRequest, GetReviewAssistantRequest, REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+    ReviewAssistantBinding, ReviewAssistantLookup, ReviewAssistantTag, ReviewLineSide,
+    ReviewTarget, ReviewWorkspace, UpdateReviewWorkspaceRequest,
+};
 use bcode_session_view::follow::SessionViewFollowUpdate;
 use bcode_session_view_models::{
     ChatMessageView, PermissionView, SessionConnectionViewStatus, SessionViewSnapshot,
     ToolInvocationView, ToolInvocationViewStatus, ToolTimingView, TranscriptViewItem,
     TranscriptViewItemId, TranscriptViewItemKind,
 };
+use bmux_tui::geometry::Rect;
+use std::sync::Arc;
+use std::time::Duration;
 
 fn item(id: &str, kind: TranscriptViewItemKind) -> TranscriptViewItem {
     TranscriptViewItem {
@@ -74,395 +92,742 @@ fn snapshot(items: Vec<TranscriptViewItem>) -> SessionViewSnapshot {
     snapshot
 }
 
-fn send(
-    setup: &mut Setup,
-    session: &str,
-    snapshot: SessionViewSnapshot,
-) -> crate::testing::harness::Screen {
-    setup
-        .scenario
-        .host()
-        .session_view(session)
-        .expect("the dock follows its session")
-        .try_send(SessionViewFollowUpdate::Snapshot(Box::new(snapshot)))
-        .expect("delivered");
-    stable(&mut setup.scenario)
+/// The app over a fixture repository with two saved reviews.
+pub(super) struct Setup {
+    pub(super) scenario: Scenario<ReviewApp>,
+    pub(super) backend: Arc<TestBackend>,
+    /// The branch comparison review.
+    pub(super) review: ReviewWorkspace,
+    /// The last-commit review.
+    pub(super) other: ReviewWorkspace,
+    _fixture: GitFixture,
 }
 
-/// Put the cursor on the first added line, open the dock, and send `text`; returns the
-/// session and the message it got.
-fn ask_assistant(setup: &mut Setup, text: &str) -> (String, String) {
-    let index = find(&setup.scenario, 0, added_line);
-    move_to(&mut setup.scenario, index);
-    setup.scenario.key("ctrl+k");
-    setup.scenario.paste(text);
-    setup.scenario.key("enter");
-    stable(&mut setup.scenario);
-    setup.backend.messages().last().cloned().expect("sent")
+fn saved(backend: &TestBackend, workspace: ReviewWorkspace) -> ReviewWorkspace {
+    let _ = backend.call_now(UpdateReviewWorkspaceRequest {
+        repo_path: workspace.repo_root.clone(),
+        workspace: workspace.clone(),
+    });
+    workspace
 }
 
-/// File and new-side line of the first added line.
-fn first_added(setup: &Setup) -> (String, u32) {
-    let index = find(&setup.scenario, 0, added_line);
-    let doc = setup.scenario.surface().document().expect("document");
-    match doc.item(index).map(ReviewItem::key) {
-        Some(ItemKey::Line { file, line, .. }) => (file.path.clone(), line),
-        Some(ItemKey::LinePair { file, new, .. }) => (file.path.clone(), new.expect("new side")),
-        other => panic!("not a line: {other:?}"),
+pub(super) fn setup(width: u16, height: u16, start_in_review: bool) -> Setup {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let backend = Arc::new(TestBackend::default());
+    let root = fixture.root().to_path_buf();
+    let review = saved(
+        &backend,
+        ReviewWorkspace {
+            id: "assistant-review".to_owned(),
+            title: "Retry backoff".to_owned(),
+            ..ReviewWorkspace::from_target(root.clone(), fixture_branch_compare())
+        },
+    );
+    let other = saved(
+        &backend,
+        ReviewWorkspace {
+            id: "assistant-other".to_owned(),
+            title: "Last commit".to_owned(),
+            ..ReviewWorkspace::from_target(root.clone(), ReviewTarget::LastCommit)
+        },
+    );
+    let entry = if start_in_review {
+        Entry::Workspace {
+            workspace: Box::new(review.clone()),
+        }
+    } else {
+        Entry::Home
+    };
+    let app = ReviewApp::new(backend.services(), root, ReviewViewConfig::default(), entry)
+        .with_scroll_motion(Duration::ZERO);
+    let mut scenario = Scenario::with_shared_host(app, backend.host(), width, height);
+    settled(&mut scenario);
+    Setup {
+        scenario,
+        backend,
+        review,
+        other,
+        _fixture: fixture,
     }
 }
 
-#[test]
-fn ctrl_k_opens_the_dock_and_asks_a_session_bound_to_the_review() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 160, 40);
-    setup.scenario.key("ctrl+k");
-    let screen = stable(&mut setup.scenario);
-    let text = screen.text();
-    assert!(screen.contains("Assistant"), "{text}");
-    assert!(screen.contains("Ask about this review."), "{text}");
-    // Wide: the dock is to the right of the document.
-    let title = screen.find("Assistant").expect("dock title");
-    assert!(title.x > 80, "{title:?}");
+impl Setup {
+    pub(super) fn app(&self) -> &ReviewApp {
+        self.scenario.surface()
+    }
 
-    // esc returns to the review with the dock open; ctrl+k then focuses it again.
-    setup.scenario.key("esc");
-    let (path, line) = first_added(&setup);
-    let (session, message) = ask_assistant(&mut setup, "Is this safe?");
-    assert!(message.starts_with("Is this safe?"), "{message}");
-    assert!(
-        message.contains(&format!("{path}:{line}")),
-        "the cursor's place is attached: {message}"
-    );
-    assert!(
-        setup
+    pub(super) fn session(&self) -> Option<String> {
+        self.app().assistant().session().map(str::to_owned)
+    }
+
+    pub(super) fn settle(&mut self) -> Screen {
+        settled(&mut self.scenario)
+    }
+
+    /// Type `text` into the focused panel and send it; returns the session it went to.
+    pub(super) fn send(&mut self, text: &str) -> String {
+        self.scenario.paste(text);
+        self.scenario.key("enter");
+        self.settle();
+        let (session, _) = self
             .backend
-            .sessions()
+            .host()
+            .turns()
+            .last()
+            .cloned()
+            .expect("submitted");
+        session
+    }
+
+    pub(super) fn binding(&self, session: &str) -> Option<ReviewAssistantBinding> {
+        self.backend
+            .call_now(GetReviewAssistantRequest {
+                repo_path: self.review.repo_root.clone(),
+                lookup: ReviewAssistantLookup::Session {
+                    session_id: session.to_owned(),
+                },
+            })
+            .binding
+    }
+
+    /// Deliver `snapshot` to the followed `session`.
+    fn deliver(&mut self, session: &str, snapshot: SessionViewSnapshot) -> Screen {
+        self.backend
+            .host()
+            .session_view(session)
+            .expect("the panel follows its session")
+            .try_send(SessionViewFollowUpdate::Snapshot(Box::new(snapshot)))
+            .expect("delivered");
+        self.settle()
+    }
+
+    /// Open `title` from home.
+    pub(super) fn open_from_home(&mut self, title: &str) {
+        assert_eq!(self.app().route_name(), RouteName::Home);
+        let screen = self.settle();
+        let at = screen.find(title).expect("the review is listed");
+        self.scenario.click(at.x, at.y);
+        self.settle();
+        self.scenario.key("enter");
+        self.settle();
+        assert_eq!(self.app().route_name(), RouteName::Review);
+    }
+
+    fn painted_button(&self, screen: &Screen) -> Option<Rect> {
+        let region = screen
+            .hits()
             .iter()
-            .any(|(id, title)| *id == session && title.starts_with("Review assistant:"))
-    );
-    let binding = setup
-        .backend
-        .call_now(GetReviewAssistantRequest {
-            repo_path: setup.workspace.repo_root.clone(),
-            lookup: ReviewAssistantLookup::Session {
-                session_id: session.clone(),
-            },
-        })
-        .binding
-        .expect("the session is bound to the review");
-    assert_eq!(binding.workspace.id, setup.workspace.id);
+            .find(|region| region.id.as_str() == BUTTON_ID)
+            .map(|region| region.area);
+        assert_eq!(
+            region,
+            self.app().assistant_button(),
+            "the hit region is where the button was painted"
+        );
+        region
+    }
+}
+
+/// The last row showing `text` (history rows sit under the panel's title row).
+fn row_of(screen: &Screen, text: &str) -> u16 {
+    (0..screen.height())
+        .rev()
+        .find(|y| screen.row_text(*y).contains(text))
+        .unwrap_or_else(|| panic!("no row shows {text:?}:\n{}", screen.text()))
+}
+
+#[test]
+fn the_panel_opens_on_home_and_keeps_its_conversation_into_a_review_and_back() {
+    let mut setup = setup(160, 40, false);
+    setup.scenario.key("ctrl+k");
+    let screen = setup.settle();
+    assert!(setup.app().assistant().is_focused());
+    let title = screen.find("Assistant").expect("panel title");
+    assert!(title.x >= 60, "docked on the right: {title:?}");
+    assert!(screen.contains("⌖ home"), "{}", screen.text());
+
+    let session = setup.send("Create a review for my stack");
     let origin = setup
         .backend
+        .host()
         .session_origins()
         .last()
         .cloned()
-        .expect("the session records its origin");
-    assert_eq!(origin.app_id, "bcode.code-review");
+        .expect("origin");
     assert_eq!(
         origin.context.get("purpose").map(String::as_str),
         Some("assistant")
     );
-    assert_eq!(origin.context.get("workspace"), Some(&setup.workspace.id));
+    assert!(
+        !origin.context.contains_key("workspace"),
+        "started on home: {origin:?}"
+    );
+    assert_eq!(setup.app().assistant().tag(), Some(&Tag::Home));
+    let (_, request) = setup.backend.host().turns().last().cloned().expect("turn");
+    assert_eq!(
+        request.text, "Create a review for my stack",
+        "sent as typed"
+    );
+    assert!(setup.binding(&session).is_none(), "home attaches no review");
+
+    // The screen takes the keyboard back; the panel stays open into a review.
+    setup.scenario.key("esc");
+    setup.open_from_home("Retry backoff");
+    assert!(setup.app().assistant().is_open());
+    assert_eq!(setup.session().as_deref(), Some(session.as_str()));
+    let screen = setup.settle();
+    assert!(
+        screen.contains("Create a review for my stack"),
+        "{}",
+        screen.text()
+    );
+    let binding = setup
+        .binding(&session)
+        .expect("attached to the review on screen");
+    assert_eq!(binding.workspace.id, setup.review.id);
+    assert!(!binding.is_detached());
+    assert_eq!(
+        binding.started,
+        Some(ReviewAssistantTag::none()),
+        "the tag stays home"
+    );
+
+    // Back home: the conversation stays and the session is detached.
+    setup.scenario.key("q");
+    setup.settle();
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+    assert_eq!(setup.session().as_deref(), Some(session.as_str()));
+    assert!(setup.binding(&session).expect("binding").is_detached());
+
+    // Into the other review: attached there.
+    setup.open_from_home("Last commit");
+    let binding = setup.binding(&session).expect("binding");
+    assert_eq!(binding.workspace.id, setup.other.id);
+    assert!(!binding.is_detached());
+}
+
+#[test]
+fn a_conversation_started_in_a_review_is_tagged_with_it_and_follows_its_tools() {
+    let mut setup = setup(160, 50, true);
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Review this file.");
+    let origin = setup
+        .backend
+        .host()
+        .session_origins()
+        .last()
+        .cloned()
+        .expect("origin");
+    assert_eq!(origin.context.get("workspace"), Some(&setup.review.id));
     assert_eq!(origin.validate(), Ok(()));
+    let binding = setup.binding(&session).expect("bound to the review");
+    assert_eq!(binding.workspace.id, setup.review.id);
     assert_ne!(
         binding.resolved.len(),
         0,
         "the resolved sources are recorded"
     );
 
-    let screen = send(
-        &mut setup,
+    // The tools write through the store the review reads, as the plugin does.
+    let review = setup.app().review().expect("review");
+    let doc = review.document().expect("document");
+    let (path, line) = (0..doc.len())
+        .filter_map(|index| doc.item(index))
+        .find_map(|item| match item.key() {
+            ItemKey::Line {
+                file,
+                line,
+                side: ReviewLineSide::New,
+            } => Some((file.path.clone(), line)),
+            ItemKey::LinePair {
+                file,
+                new: Some(new),
+                ..
+            } => Some((file.path.clone(), new)),
+            _ => None,
+        })
+        .expect("a new-side line");
+    // Another file is marked viewed (a viewed file folds).
+    let viewed_path = doc
+        .file_keys()
+        .map(|file| file.path.clone())
+        .find(|other| *other != path)
+        .expect("a second file");
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let mut tools = ReviewTools::new(&data, services.store());
+    let opened = tools
+        .open(
+            &setup.review.repo_root,
+            &ReviewRef::Session(session.clone()),
+        )
+        .expect("bound review");
+    tools
+        .mark_viewed(&opened, std::slice::from_ref(&viewed_path), true)
+        .expect("viewed");
+    let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
+    let screen = setup.deliver(
         &session,
-        snapshot(vec![user(&message), answer("It is safe: ASSISTANT_ANSWER")]),
+        snapshot(vec![
+            user("Review this file."),
+            tool("view-1", "code_review.mark_viewed", "{}"),
+            tool("nav-1", "code_review.navigate", &navigate),
+            answer("Marked it viewed: ASSISTANT_ANSWER"),
+        ]),
     );
-    let text = screen.text();
-    assert!(screen.contains("▍you"), "{text}");
-    assert!(screen.contains("ASSISTANT_ANSWER"), "{text}");
+    assert!(screen.contains("ASSISTANT_ANSWER"), "{}", screen.text());
+    let review = setup.app().review().expect("review");
+    let doc = review.document().expect("document");
+    let file = doc
+        .file_keys()
+        .find(|file| file.path == viewed_path)
+        .cloned()
+        .expect("file");
     assert!(
-        !screen.contains("[Review context"),
-        "the question shows as typed: {text}"
+        doc.viewed_state(&file)
+            .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed),
+        "the file shows as viewed"
     );
-
-    // ctrl+x detaches the place; the next message is the text alone, in the same session.
-    setup.scenario.key("ctrl+x");
-    setup.scenario.paste("And the tests?");
-    setup.scenario.key("enter");
-    stable(&mut setup.scenario);
-    let (again, message) = setup.backend.messages().last().cloned().expect("sent");
-    assert_eq!(again, session);
-    assert_eq!(message, "And the tests?");
-
-    // esc returns to the review with the dock open; ctrl+k focuses it, and focused, closes it.
-    setup.scenario.key("esc");
-    let screen = stable(&mut setup.scenario);
-    assert!(screen.contains("ASSISTANT_ANSWER"));
-    setup.scenario.keys(&["ctrl+k", "ctrl+k"]);
-    let screen = stable(&mut setup.scenario);
-    assert!(!screen.contains("ASSISTANT_ANSWER"), "{}", screen.text());
+    match review.cursor() {
+        Some(ItemKey::Line { file, line: at, .. }) => {
+            assert_eq!((file.path.as_str(), *at), (path.as_str(), line));
+        }
+        Some(ItemKey::LinePair { file, new, .. }) => {
+            assert_eq!((file.path.as_str(), *new), (path.as_str(), Some(line)));
+        }
+        other => panic!("cursor moved elsewhere: {other:?}"),
+    }
 }
 
 #[test]
-fn the_dock_sits_under_the_review_when_the_body_is_narrow() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 100, 40);
+fn the_permission_prompt_is_answered_in_the_panel_and_never_remembers_publishing() {
+    let mut setup = setup(160, 40, true);
     setup.scenario.key("ctrl+k");
-    let screen = stable(&mut setup.scenario);
-    let title = screen.find("Assistant").expect("dock title");
-    let review = screen.find("Review").expect("review title");
-    assert!(title.y > review.y + 5, "{title:?} under {review:?}");
-    // With no conversation yet there is no status, so the border runs to the corner.
-    let title_row = screen.row_text(title.y);
-    assert!(title_row.trim_end().ends_with("─╮"), "{title_row:?}");
-    // Too short for a bottom panel: no dock, and focus stays usable in the review.
-    setup.scenario.resize(100, 16);
-    let screen = stable(&mut setup.scenario);
-    assert!(
-        !screen.contains("Ask about this review."),
-        "{}",
-        screen.text()
-    );
-    setup.scenario.key("j");
-    stable(&mut setup.scenario);
-}
-
-#[test]
-fn the_dock_answers_its_sessions_permission_prompt_with_the_feed_keys() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 160, 40);
-    let (session, message) = ask_assistant(&mut setup, "Draft a comment here.");
-    let mut asking = snapshot(vec![user(&message)]);
-    asking.runtime.active_turn_id = Some("turn-1".to_owned());
-    asking.permissions.push(PermissionView {
-        permission_id: "permission-1".to_owned(),
+    let session = setup.send("Draft a comment here.");
+    let permission = |id: &str, tool: &str| PermissionView {
+        permission_id: id.to_owned(),
         session_id: None,
-        tool_call_id: "call-1".to_owned(),
-        tool_name: "code_review.add_comment".to_owned(),
+        tool_call_id: format!("call-{id}"),
+        tool_name: tool.to_owned(),
         producer_plugin_id: Some("bcode.code_review".to_owned()),
         arguments_json: r#"{"path":"a.rs","line":3,"body":"Rename this"}"#.to_owned(),
         batch: None,
         agent_id: "build".to_owned(),
         title: None,
         policy_source: None,
-        detail: Some("build agent asks before code_review.add_comment".to_owned()),
+        detail: None,
         resolved: false,
         approved: None,
         can_remember: true,
-    });
-    let screen = send(&mut setup, &session, asking);
-    let text = screen.text();
-    assert!(screen.contains("? Use code_review.add_comment?"), "{text}");
-    assert!(screen.contains("y allow"), "{text}");
-    // The prompt replaces the input, so `y` answers it rather than typing.
+    };
+    let mut asking = snapshot(vec![user("Draft a comment here.")]);
+    asking.runtime.active_turn_id = Some("turn-1".to_owned());
+    asking
+        .permissions
+        .push(permission("p-1", "code_review.add_comment"));
+    let screen = setup.deliver(&session, asking.clone());
+    assert!(screen.contains("y allow"), "{}", screen.text());
+    assert!(screen.contains("a always"), "{}", screen.text());
     setup.scenario.key("y");
-    stable(&mut setup.scenario);
+    setup.settle();
     assert_eq!(
-        setup.scenario.host().permission_answers(),
-        vec![("permission-1".to_owned(), true, false)]
+        setup.backend.host().permission_answers(),
+        vec![("p-1".to_owned(), true, false)]
     );
-    assert!(stable(&mut setup.scenario).contains("answering…"));
+
+    // Publishing is asked every time: Always is not offered, and `a` does not remember.
+    asking.permissions = vec![permission("p-2", "code_review.publish")];
+    let screen = setup.deliver(&session, asking);
+    assert!(screen.contains("y allow"), "{}", screen.text());
+    assert!(!screen.contains("a always"), "{}", screen.text());
+    setup.scenario.key("a");
+    setup.settle();
+    assert_eq!(setup.backend.host().permission_answers().len(), 1);
+
+    // While the panel is closed the button shows that the conversation needs the user.
+    setup.scenario.key("ctrl+k");
+    let screen = setup.settle();
+    let button = setup.painted_button(&screen).expect("button");
+    assert!(
+        screen.text_in(button, button.y).contains('?'),
+        "{}",
+        screen.row_text(button.y)
+    );
 }
 
 #[test]
-fn the_review_follows_what_the_sessions_review_tools_change() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 160, 50);
-    let (path, line) = first_added(&setup);
-    let (session, message) = ask_assistant(&mut setup, "Review this file.");
-    let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
+fn the_ask_ai_button_and_ctrl_k_open_the_panel_on_every_screen() {
+    let mut setup = setup(160, 40, false);
+    // Home: a click on the button opens and focuses the panel; a second click closes it.
+    let screen = setup.settle();
+    let button = setup.painted_button(&screen).expect("button on home");
+    assert!(screen.text_in(button, button.y).contains("✦ Ask AI"));
+    assert_eq!(button.right(), 160, "at the end of the header row");
+    setup.scenario.click(button.x, button.y);
+    setup.settle();
+    assert!(setup.app().assistant().is_focused());
+    let screen = setup.settle();
+    let button = setup.painted_button(&screen).expect("button");
+    setup.scenario.click(button.x, button.y);
+    setup.settle();
+    assert!(!setup.app().assistant().is_open());
 
-    // The tools write through the store the review reads, as the plugin does.
-    let services = setup.backend.services();
-    let data = bcode_code_review::ReviewData::default();
-    let mut tools = ReviewTools::new(&data, services.store());
-    let review = tools
-        .open(
-            &setup.workspace.repo_root,
-            &ReviewRef::Session(session.clone()),
-        )
-        .expect("bound review");
-    tools
-        .add_comment(
-            &review,
-            &Location {
-                path: Some(path.clone()),
-                line: Some(line),
-                end_line: None,
-                side: Side::New,
-                source: None,
-            },
-            "TOOL_DRAFTED_COMMENT",
-            None,
-        )
-        .expect("drafted");
-    tools
-        .mark_viewed(&review, std::slice::from_ref(&path), true)
-        .expect("viewed");
-    let mut items = vec![
-        user(&message),
-        tool("write-1", "code_review.add_comment", "{}"),
-        tool("view-1", "code_review.mark_viewed", "{}"),
-    ];
-    send(&mut setup, &session, snapshot(items.clone()));
-    let viewed = {
-        let doc = setup.scenario.surface().document().expect("document");
-        let file = doc
-            .file_keys()
-            .find(|file| file.path == path)
-            .cloned()
-            .expect("file");
-        doc.viewed_state(&file)
-            .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed)
+    // The palette entry on home.
+    setup.scenario.key(":");
+    setup.scenario.paste("ask ai");
+    setup.scenario.key("enter");
+    setup.settle();
+    assert!(
+        setup.app().assistant().is_focused(),
+        "the palette opens the panel"
+    );
+    setup.scenario.key("ctrl+k");
+    setup.settle();
+    assert!(!setup.app().assistant().is_open());
+
+    // The wizard.
+    setup.scenario.key("n");
+    setup.settle();
+    assert_eq!(setup.app().route_name(), RouteName::NewReview);
+    let screen = setup.settle();
+    assert!(setup.painted_button(&screen).is_some(), "{}", screen.text());
+    setup.scenario.key("ctrl+k");
+    let screen = setup.settle();
+    assert!(setup.app().assistant().is_focused());
+    assert!(screen.contains("⌖ new review"), "{}", screen.text());
+
+    // A review: the button sits after the publish button.
+    let mut setup = self::setup(160, 40, true);
+    let screen = setup.settle();
+    let button = setup.painted_button(&screen).expect("button in a review");
+    let publish = screen.find("Publish").expect("publish button");
+    assert!(publish.x < button.x && publish.y == button.y);
+    setup.scenario.click(button.x, button.y);
+    setup.settle();
+    assert!(setup.app().assistant().is_focused());
+    // esc gives the review the keyboard; ctrl+k focuses the panel again, then closes it.
+    setup.scenario.key("esc");
+    setup.settle();
+    assert!(setup.app().assistant().is_open() && !setup.app().assistant().is_focused());
+    setup.scenario.keys(&["ctrl+k", "ctrl+k"]);
+    setup.settle();
+    assert!(!setup.app().assistant().is_open());
+}
+
+#[test]
+fn the_buttons_hit_region_is_its_painted_cells_at_every_width() {
+    for start_in_review in [false, true] {
+        let mut setup = setup(200, 30, start_in_review);
+        for width in [200, 80, 30, 12, 8, 1] {
+            setup.scenario.resize(width, 30);
+            let screen = setup.settle();
+            match setup.painted_button(&screen) {
+                Some(area) => {
+                    assert!(
+                        area.right() <= width && area.width < width,
+                        "{width}: {area:?}"
+                    );
+                    let label = screen.text_in(area, area.y);
+                    let expected = if width >= crate::assistant::button::FULL_HEADER {
+                        "✦ Ask AI"
+                    } else if width >= crate::assistant::button::SHORT_HEADER {
+                        "✦ AI"
+                    } else {
+                        "✦"
+                    };
+                    assert!(label.contains(expected), "{width}: {label:?}");
+                }
+                None => assert!(
+                    width < crate::assistant::button::MIN_HEADER,
+                    "{width}: no button"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_button_keeps_its_cells_beside_wide_titles() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let backend = Arc::new(TestBackend::default());
+    let workspace = saved(
+        &backend,
+        ReviewWorkspace {
+            id: "wide-title".to_owned(),
+            title: "レビュー 🚀 再試行のバックオフ e\u{301} 漢字".repeat(3),
+            ..ReviewWorkspace::from_target(fixture.root().to_path_buf(), fixture_branch_compare())
+        },
+    );
+    let app = ReviewApp::new(
+        backend.services(),
+        fixture.root().to_path_buf(),
+        ReviewViewConfig::default(),
+        Entry::Workspace {
+            workspace: Box::new(workspace),
+        },
+    )
+    .with_scroll_motion(Duration::ZERO);
+    let mut scenario = Scenario::with_shared_host(app, backend.host(), 120, 30);
+    for width in [120, 61, 47, 33, 23, 15] {
+        scenario.resize(width, 30);
+        let screen = settled(&mut scenario);
+        let region = screen
+            .hits()
+            .iter()
+            .find(|region| region.id.as_str() == BUTTON_ID)
+            .map(|region| region.area);
+        assert_eq!(region, scenario.surface().assistant_button(), "{width}");
+        let area = region.expect("button");
+        let label = screen.text_in(area, area.y);
+        assert!(label.trim_start().starts_with('✦'), "{width}: {label:?}");
+        // The title never runs into the button's cells.
+        let before = screen.text_in(Rect::new(0, 0, area.x, 1), 0);
+        assert!(!before.contains('✦'), "{width}: {before:?}");
+    }
+}
+
+#[test]
+fn the_panel_docks_right_below_or_over_the_screen_by_size() {
+    let mut setup = setup(100, 40, false);
+    setup.scenario.key("ctrl+k");
+    let screen = setup.settle();
+    let title = screen.find("Assistant").expect("panel title");
+    assert!(title.x >= 60, "right dock at 100 columns: {title:?}");
+
+    setup.scenario.resize(99, 40);
+    let screen = setup.settle();
+    let title = screen.find("Assistant").expect("panel title");
+    assert!(title.y >= 8 && title.x < 10, "bottom dock: {title:?}");
+    assert!(screen.contains("Code reviews"), "home keeps its rows above");
+
+    setup.scenario.resize(99, 15);
+    let screen = setup.settle();
+    assert!(
+        !screen.contains("Code reviews"),
+        "zoomed over home: {}",
+        screen.text()
+    );
+    assert!(screen.contains("Assistant"));
+    // Unfocused, the zoomed panel hides but stays open.
+    setup.scenario.key("esc");
+    let screen = setup.settle();
+    assert!(screen.contains("Code reviews"), "{}", screen.text());
+    assert!(setup.app().assistant().is_open());
+
+    // Tiny areas: the title row only, and nothing panics at any size.
+    setup.scenario.key("ctrl+k");
+    for (width, height) in [(11, 15), (23, 5), (1, 1), (0, 0), (40, 2)] {
+        setup.scenario.resize(width, height);
+        setup.settle();
+    }
+}
+
+#[test]
+fn the_history_lists_every_conversation_and_switches_to_the_one_searched() {
+    let mut setup = setup(160, 40, true);
+    let (first, _) = two_conversations(&mut setup);
+    // An earlier per-review conversation, created before origins carried the review: known
+    // from its binding only.
+    setup.backend.host().add_catalog_session(AppSession {
+        id: "legacy-session".to_owned(),
+        title: Some("Review assistant: Last commit".to_owned()),
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        origin_app: None,
+        origin_context: std::collections::BTreeMap::new(),
+    });
+    let legacy = ReviewAssistantBinding {
+        schema_version: REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+        session_id: "legacy-session".to_owned(),
+        workspace: setup.other.clone(),
+        resolved: Vec::new(),
+        stacks: Vec::new(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        started: None,
+        detached_at_ms: None,
     };
-    assert!(viewed, "the file shows as viewed");
-    // Viewed, it folds; the draft shows again once the file is opened.
-    let file = {
-        let doc = setup.scenario.surface().document().expect("document");
-        doc.file_keys()
-            .find(|file| file.path == path)
-            .cloned()
-            .expect("file")
-    };
+    let _ = setup.backend.call_now(BindReviewAssistantRequest {
+        repo_path: setup.other.repo_root.clone(),
+        binding: legacy.clone(),
+    });
+    // A binding whose session Bcode no longer has is left out.
+    let _ = setup.backend.call_now(BindReviewAssistantRequest {
+        repo_path: setup.other.repo_root.clone(),
+        binding: ReviewAssistantBinding {
+            session_id: "vanished-session".to_owned(),
+            ..legacy
+        },
+    });
+    setup
+        .backend
+        .host()
+        .set_pending_permissions(vec![crate::host::PendingPermission {
+            session_id: first.clone(),
+            permission_id: "p-1".to_owned(),
+            tool: "code_review.add_comment".to_owned(),
+        }]);
+
+    setup.scenario.key("alt+h");
+    let screen = setup.settle();
+    let text = screen.text();
+    assert!(screen.contains("Why did the cap move?"), "{text}");
+    assert!(screen.contains("Explain the retry loop"), "{text}");
+    assert!(screen.contains("Review assistant: Last commit"), "{text}");
+    assert!(!screen.contains("vanished"), "{text}");
+    let first_row = row_of(&screen, "Why did the cap move?");
+    assert!(
+        screen.row_text(first_row).contains("needs you"),
+        "{}",
+        screen.row_text(first_row)
+    );
+    let second_row = row_of(&screen, "Explain the retry loop");
+    assert!(second_row < first_row, "newest first");
+    assert!(
+        screen.row_text(second_row).contains('●'),
+        "the active conversation is marked"
+    );
+    let rows = setup.app().assistant().picker().expect("picker").rows();
+    let legacy_row = rows
+        .iter()
+        .find(|row| row.session_id == "legacy-session")
+        .expect("legacy row");
+    assert_eq!(
+        legacy_row.tag.label(),
+        "Last commit",
+        "tagged with its review"
+    );
+
+    // Search, then switch.
+    setup.scenario.paste("cap");
+    setup.settle();
+    let matching: Vec<String> = setup
+        .app()
+        .assistant()
+        .picker()
+        .expect("picker")
+        .matching()
+        .iter()
+        .map(|row| row.title.clone())
+        .collect();
+    assert_eq!(matching, vec!["Why did the cap move?".to_owned()]);
+    setup.scenario.key("enter");
+    let screen = setup.settle();
+    assert_eq!(setup.session().as_deref(), Some(first.as_str()));
+    assert!(
+        screen.contains("Why did the cap move?"),
+        "the header names it"
+    );
+}
+
+/// Two conversations started in the review; the second is active.
+fn two_conversations(setup: &mut Setup) -> (String, String) {
+    setup.scenario.key("ctrl+k");
+    let first = setup.send("Why did the cap move?");
+    setup.scenario.key("ctrl+n");
+    let second = setup.send("Explain the retry loop");
+    assert_ne!(first, second);
+    (first, second)
+}
+
+#[test]
+fn conversations_are_renamed_and_deleted_with_bcode() {
+    let mut setup = setup(160, 40, true);
+    let (first, second) = two_conversations(&mut setup);
+    // Switch to the first.
+    setup.scenario.key("alt+h");
+    setup.settle();
+    setup.scenario.paste("cap");
+    setup.scenario.key("enter");
+    setup.settle();
+    assert_eq!(setup.session().as_deref(), Some(first.as_str()));
+
+    // Rename the active conversation from the panel.
+    setup.scenario.key("alt+r");
+    for _ in 0.."Why did the cap move?".len() {
+        setup.scenario.key("backspace");
+    }
+    setup.scenario.paste("Cap history");
+    setup.scenario.key("enter");
+    let screen = setup.settle();
+    assert_eq!(
+        setup
+            .backend
+            .host()
+            .catalog_session(&first)
+            .and_then(|session| session.title),
+        Some("Cap history".to_owned())
+    );
+    assert!(screen.contains("Cap history"), "{}", screen.text());
+
+    // Delete from the picker: the first press marks, the second deletes.
+    setup.scenario.key("alt+h");
+    setup.settle();
+    setup.scenario.paste("retry loop");
+    setup.settle();
+    setup.scenario.key("alt+d");
+    let screen = setup.settle();
+    assert!(screen.contains("again to delete"), "{}", screen.text());
+    assert_eq!(
+        setup.backend.host().deleted_sessions(),
+        Vec::<String>::new()
+    );
+    setup.scenario.key("alt+d");
+    let screen = setup.settle();
+    assert_eq!(
+        setup.backend.host().deleted_sessions(),
+        vec![second.clone()]
+    );
+    assert!(setup.binding(&second).is_none(), "its binding is removed");
     assert!(
         setup
-            .scenario
-            .surface()
-            .document()
-            .expect("document")
-            .is_collapsed(&file)
+            .app()
+            .assistant()
+            .picker()
+            .expect("picker")
+            .rows()
+            .iter()
+            .all(|row| row.session_id != second),
+        "{}",
+        screen.text()
     );
-    // Its chevron opens it.
-    let at = setup
-        .scenario
-        .frame()
-        .find("▸")
-        .expect("the folded file's chevron");
-    setup.scenario.click(at.x, at.y);
-    let screen = stable(&mut setup.scenario);
-    assert!(screen.contains("TOOL_DRAFTED_COMMENT"), "{}", screen.text());
 
-    // A new navigation moves the cursor to the line.
-    setup.scenario.key("g");
-    stable(&mut setup.scenario);
-    items.push(tool("nav-2", "code_review.navigate", &navigate));
-    send(&mut setup, &session, snapshot(items));
-    match cursor(&setup.scenario) {
-        ItemKey::Line {
-            file,
-            side,
-            line: at,
-        } => {
-            assert_eq!(
-                (file.path.as_str(), side, at),
-                (path.as_str(), ReviewLineSide::New, line)
-            );
-        }
-        ItemKey::LinePair { file, new, .. } => {
-            assert_eq!((file.path.as_str(), new), (path.as_str(), Some(line)));
-        }
-        other => panic!("cursor moved elsewhere: {other:?}"),
-    }
-}
-
-/// Where the cursor of `setup` is, as file, side and line.
-fn cursor_line(setup: &Setup) -> Option<(String, Option<u32>)> {
-    match cursor(&setup.scenario) {
-        ItemKey::Line { file, side, line } => Some((
-            file.path.clone(),
-            (side == ReviewLineSide::New).then_some(line),
-        )),
-        ItemKey::LinePair { file, new, .. } => Some((file.path.clone(), new)),
-        _ => None,
-    }
-}
-
-#[test]
-fn a_session_the_dock_started_applies_its_first_tool_calls() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 160, 50);
-    let (path, line) = first_added(&setup);
-    let (session, message) = ask_assistant(&mut setup, "Show me the change.");
+    // Delete the active conversation after a confirmation: `n` keeps it.
     setup.scenario.key("esc");
-    setup.scenario.key("g");
-    stable(&mut setup.scenario);
-    assert_ne!(cursor_line(&setup), Some((path.clone(), Some(line))));
-    // The navigation finished before the dock first saw the session; it answers the dock's own
-    // message, so it is applied.
-    let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
-    send(
-        &mut setup,
-        &session,
-        snapshot(vec![
-            user(&message),
-            tool("nav-1", "code_review.navigate", &navigate),
-        ]),
+    setup.scenario.key("alt+d");
+    let screen = setup.settle();
+    assert!(
+        screen.contains("Delete this conversation"),
+        "{}",
+        screen.text()
     );
-    assert_eq!(cursor_line(&setup), Some((path, Some(line))));
+    setup.scenario.key("n");
+    setup.settle();
+    assert_eq!(setup.backend.host().deleted_sessions().len(), 1);
+    setup.scenario.keys(&["alt+d", "y"]);
+    setup.settle();
+    assert_eq!(setup.backend.host().deleted_sessions(), vec![second, first]);
+    assert_eq!(setup.session(), None, "an empty conversation is left");
 }
 
 #[test]
-fn a_reopened_review_does_not_replay_its_assistants_earlier_tool_calls() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 160, 50);
-    let (path, line) = first_added(&setup);
-    let (session, message) = ask_assistant(&mut setup, "Show me the change.");
-
-    // The review opens again and finds the session bound to it.
-    let mut reopened = Setup {
-        scenario: crate::testing::harness::Scenario::new(
-            build(&setup.backend, &setup.workspace, std::time::Duration::ZERO),
-            160,
-            50,
-        ),
-        backend: setup.backend.clone(),
-        workspace: setup.workspace.clone(),
-    };
-    stable(&mut reopened.scenario);
-    reopened.scenario.key("ctrl+k");
-    stable(&mut reopened.scenario);
-    reopened.scenario.key("esc");
-    stable(&mut reopened.scenario);
-    let before = cursor_line(&reopened);
-    let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
-    send(
-        &mut reopened,
-        &session,
-        snapshot(vec![
-            user(&message),
-            tool("nav-1", "code_review.navigate", &navigate),
-        ]),
-    );
+fn opening_a_conversation_in_bcode_hands_over_the_terminal() {
+    let mut setup = setup(160, 40, true);
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Hello");
+    let result = setup.scenario.key("ctrl+o");
     assert_eq!(
-        cursor_line(&reopened),
-        before,
-        "an earlier navigation is not replayed"
+        result.action,
+        crate::action::Action::OpenSession {
+            session_id: session.parse().expect("id")
+        }
     );
-}
-
-#[test]
-fn a_new_conversation_is_not_replaced_by_a_lookup_that_finishes_later() {
-    let fixture = fixture();
-    let mut setup = setup(&fixture, 160, 50);
-    let (session, _) = ask_assistant(&mut setup, "First question.");
-
-    let mut reopened = Setup {
-        scenario: crate::testing::harness::Scenario::new(
-            build(&setup.backend, &setup.workspace, std::time::Duration::ZERO),
-            160,
-            50,
-        ),
-        backend: setup.backend.clone(),
-        workspace: setup.workspace.clone(),
-    };
-    stable(&mut reopened.scenario);
-    // ctrl+k looks the bound session up; ctrl+n asks for a new conversation before the
-    // lookup's answer arrives.
-    reopened.scenario.keys(&["ctrl+k", "ctrl+n"]);
-    stable(&mut reopened.scenario);
-    reopened.scenario.paste("A fresh start.");
-    reopened.scenario.key("enter");
-    stable(&mut reopened.scenario);
-    let (sent_to, text) = reopened.backend.messages().last().cloned().expect("sent");
-    assert!(text.starts_with("A fresh start."), "{text}");
-    assert_ne!(sent_to, session, "the new conversation has its own session");
+    // The picker's ctrl+o opens the selected row.
+    setup.scenario.key("alt+h");
+    setup.settle();
+    let result = setup.scenario.key("ctrl+o");
+    assert!(matches!(
+        result.action,
+        crate::action::Action::OpenSession { .. }
+    ));
 }

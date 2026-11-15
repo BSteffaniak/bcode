@@ -239,6 +239,8 @@ pub struct Home {
     status: Option<Status>,
     toasts: Toasts,
     overlay: Option<Overlay>,
+    /// The assistant panel request and the header cells left for the Ask AI button.
+    link: crate::assistant::ScreenLink,
     regions: Regions,
     preview_pane: Cell<PaneState>,
     started: Instant,
@@ -257,6 +259,8 @@ impl std::fmt::Debug for Home {
 
 /// Actions whose first key the footer hints show.
 const HINT_ACTIONS: &[&str] = &[
+    "home_assistant",
+    "home_palette",
     "home_open",
     "home_new",
     "home_continue",
@@ -321,6 +325,7 @@ impl Home {
             status: None,
             toasts: Toasts::default(),
             overlay: None,
+            link: crate::assistant::ScreenLink::default(),
             regions: Regions::default(),
             preview_pane: Cell::new(PaneState::new(Rect::default())),
             started: Instant::now(),
@@ -1038,6 +1043,15 @@ impl Home {
                 }
             }
             "home_exit" => return HomeOutcome::Exit,
+            "home_assistant" => self.link.requested = true,
+            "home_palette" => {
+                let entries = super::palette::entries(
+                    &crate::keymap::actions_for(HOME_SCOPE),
+                    |id| host.keymap_keys(HOME_SCOPE, id),
+                    None,
+                );
+                self.overlay = Some(Overlay::new(OverlayKind::Palette, entries, theme));
+            }
             _ => return HomeOutcome::Ignored,
         }
         HomeOutcome::Redraw
@@ -1328,7 +1342,13 @@ impl Home {
     }
 
     /// Insert pasted text into the focused input.
-    pub fn paste(&mut self, text: &str) -> HomeOutcome {
+    pub fn paste(&mut self, text: &str, theme: &ReviewTheme) -> HomeOutcome {
+        if let Some(overlay) = self.overlay.as_mut() {
+            return match overlay.paste(text, theme) {
+                OverlayOutcome::Ignored => HomeOutcome::Ignored,
+                _ => HomeOutcome::Redraw,
+            };
+        }
         let state = match self.focus {
             HomeFocus::Filter => &self.filter,
             HomeFocus::Rename => &self.rename,
@@ -1410,6 +1430,23 @@ impl Home {
     // Rendering
     // ----------------------------------------------------------------------------------------
 
+    /// Leave `cells` free at the end of the header row (where the app paints its Ask AI
+    /// button).
+    pub const fn set_header_reserve(&mut self, cells: u16) {
+        self.link.header_reserve = cells;
+    }
+
+    /// Whether the header row shows in an area `height` rows high.
+    #[must_use]
+    pub const fn shows_header(height: u16) -> bool {
+        height >= 3
+    }
+
+    /// The `home_assistant` or palette action ran since the last call.
+    pub const fn take_assistant_request(&mut self) -> bool {
+        self.link.take_request()
+    }
+
     /// Paint home over `area`.
     pub fn render(&mut self, area: Rect, cx: &mut PaintCx<'_, '_>, theme: &ReviewTheme) {
         self.regions = Regions::default();
@@ -1421,7 +1458,7 @@ impl Home {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let header = area.height >= 3;
+        let header = Self::shows_header(area.height);
         let footer = area.height >= 2;
         let body = Rect::new(
             area.x,
@@ -1439,7 +1476,8 @@ impl Home {
         self.rebuild_rows(theme, main.width);
         if header {
             cx.with_style(theme.header_bar, |cx| {
-                self.paint_header(Rect::new(area.x, area.y, area.width, 1), cx, theme);
+                let width = area.width.saturating_sub(self.link.header_reserve);
+                self.paint_header(Rect::new(area.x, area.y, width, 1), cx, theme);
             });
         }
         self.paint_main(main, cx, theme);
@@ -1910,6 +1948,7 @@ impl Home {
                     push(key("home_open"), "open");
                 }
                 push(key("home_new"), "new");
+                push(key("home_assistant"), "Ask AI");
                 push(key("home_continue"), "continue");
                 push(key("home_filter"), "filter");
                 if !on_group {
@@ -1920,6 +1959,7 @@ impl Home {
                 }
                 push(key("home_focus_next"), "suggestions");
                 push(key("home_preview"), "preview");
+                push(key("home_palette"), "commands");
                 push(key("home_help"), "help");
                 push(key("home_exit"), "quit");
             }

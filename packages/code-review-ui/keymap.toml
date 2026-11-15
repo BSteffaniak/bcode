@@ -95,7 +95,7 @@ keymap_actions = [
     { id = "bcode.code_review.threads_toggle", scope = "code-review", description = "Show / hide threads panel", defaults = [
         "shift+t",
     ] },
-    { id = "bcode.code_review.assistant_toggle", scope = "code-review", description = "Open, focus, or close the review assistant", defaults = [
+    { id = "bcode.code_review.assistant_toggle", scope = "code-review", description = "Ask AI: open, focus, or close the review assistant", defaults = [
         "ctrl+k",
     ] },
     { id = "bcode.code_review.comment", scope = "code-review", description = "Comment on the line, range, or file (reply on a thread)", defaults = [
@@ -416,6 +416,13 @@ keymap_actions = [
     { id = "bcode.code_review.home_exit", scope = "code-review-home", description = "Quit", defaults = [
         "q",
     ] },
+    { id = "bcode.code_review.home_assistant", scope = "code-review-home", description = "Ask AI: open, focus, or close the review assistant", defaults = [
+        "ctrl+k",
+    ] },
+    { id = "bcode.code_review.home_palette", scope = "code-review-home", description = "Command palette", defaults = [
+        ":",
+        "ctrl+p",
+    ] },
     { id = "bcode.code_review.wizard_mark", scope = "code-review-wizard", description = "Mark or unmark the commit or file (include or exclude a source when editing)", defaults = [
         "tab",
     ] },
@@ -425,20 +432,33 @@ keymap_actions = [
     { id = "bcode.code_review.wizard_back", scope = "code-review-wizard", description = "Back one step", defaults = [
         "esc",
     ] },
+    { id = "bcode.code_review.wizard_assistant", scope = "code-review-wizard", description = "Ask AI: open, focus, or close the review assistant", defaults = [
+        "ctrl+k",
+    ] },
     { id = "bcode.code_review.assistant_close", scope = "code-review-assistant", description = "Close the assistant", defaults = [
         "ctrl+k",
     ] },
-    { id = "bcode.code_review.assistant_back", scope = "code-review-assistant", description = "Back to the review (the assistant stays open)", defaults = [
+    { id = "bcode.code_review.assistant_back", scope = "code-review-assistant", description = "Back to the screen (the assistant stays open)", defaults = [
         "esc",
     ] },
     { id = "bcode.code_review.assistant_stop", scope = "code-review-assistant", description = "Stop the assistant's running turn", defaults = [
         "ctrl+c",
     ] },
-    { id = "bcode.code_review.assistant_context", scope = "code-review-assistant", description = "Attach or detach the cursor's place as context", defaults = [
+    { id = "bcode.code_review.assistant_context", scope = "code-review-assistant", description = "Attach or detach what is on screen as context", defaults = [
         "ctrl+x",
     ] },
     { id = "bcode.code_review.assistant_new", scope = "code-review-assistant", description = "Start a new conversation", defaults = [
         "ctrl+n",
+        "alt+n",
+    ] },
+    { id = "bcode.code_review.assistant_history", scope = "code-review-assistant", description = "Conversation history", defaults = [
+        "alt+h",
+    ] },
+    { id = "bcode.code_review.assistant_rename", scope = "code-review-assistant", description = "Rename this conversation", defaults = [
+        "alt+r",
+    ] },
+    { id = "bcode.code_review.assistant_delete", scope = "code-review-assistant", description = "Delete this conversation (asks first)", defaults = [
+        "alt+d",
     ] },
     { id = "bcode.code_review.assistant_open", scope = "code-review-assistant", description = "Open the assistant's session in Bcode", defaults = [
         "ctrl+o",
@@ -448,6 +468,29 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.assistant_scroll_down", scope = "code-review-assistant", description = "Scroll the conversation down", defaults = [
         "pagedown",
+    ] },
+    { id = "bcode.code_review.history_up", scope = "code-review-assistant-history", description = "Previous conversation", defaults = [
+        "up",
+        "ctrl+p",
+    ] },
+    { id = "bcode.code_review.history_down", scope = "code-review-assistant-history", description = "Next conversation", defaults = [
+        "down",
+        "ctrl+n",
+    ] },
+    { id = "bcode.code_review.history_switch", scope = "code-review-assistant-history", description = "Switch to the conversation", defaults = [
+        "enter",
+    ] },
+    { id = "bcode.code_review.history_rename", scope = "code-review-assistant-history", description = "Rename the conversation", defaults = [
+        "alt+r",
+    ] },
+    { id = "bcode.code_review.history_delete", scope = "code-review-assistant-history", description = "Delete the conversation (press twice)", defaults = [
+        "alt+d",
+    ] },
+    { id = "bcode.code_review.history_open", scope = "code-review-assistant-history", description = "Open the conversation in Bcode", defaults = [
+        "ctrl+o",
+    ] },
+    { id = "bcode.code_review.history_back", scope = "code-review-assistant-history", description = "Back to the conversation", defaults = [
+        "esc",
     ] },
     { id = "bcode.code_review.feed_allow", scope = "code-review-feed", description = "Allow the AI card's permission request once", defaults = [
         "y",

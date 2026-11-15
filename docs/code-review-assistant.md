@@ -17,6 +17,13 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
 ## Status
 
 * **Design.** Nothing in this document is built yet unless this section says so.
+* **Built: conversation plumbing and history model (build step 1).** `ReviewHost` submits turns
+  with context blocks and an agent, lists the app's sessions, reads summaries, renames, deletes,
+  counts turns and lists pending permissions; the origin's `layer` entry; the binding's
+  `started` and `detached_at_ms`; `review.assistant.list` and `review.assistant.unbind`; the
+  history merge.
+* **Built: app-wide panel, Ask AI button and history picker (build step 2).** As specified, with
+  the deviations listed under [As built](#as-built).
 * **Built and relied on.** Session origin, client tools with claims, contributed agent profiles
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
@@ -555,6 +562,23 @@ daemon built from this repository in an isolated state with the fake model provi
    call never changes the screen; tools for another review work by id; with a live debug daemon
    and the fake provider, the three acceptance requests run end to end against the smoke
    fixtures with a fake `gh`, and nothing is posted to a forge.
+
+## As built
+
+Where the built panel differs from the design above:
+
+* **Button degradation.** The button's label is chosen from the header's width (`✦ Ask AI` from
+  48 cells, `✦ AI` from 24, `✦` from 8; none below, and the screen's title keeps 4 cells) rather
+  than being planned as the last part of each screen's header. Each screen leaves the button's
+  cells free at the end of its header row and the app paints the button there, so painting and
+  the hit region still come from one plan.
+* **Deleting from the conversation** asks in the panel's input row (`y` delete, `n` keep), not in
+  a dialog; picker rows have no `✕` (`alt+d` twice deletes).
+* **Turn counts** are read for the first 30 rows after a load, not per visible row.
+* **The wizard** binds `ctrl+k` before its pickers, so `ctrl+k` opens the panel there even while
+  typing a picker filter.
+* **Context** is a single stored `review app view` block (screen, repository, review, layer and
+  cursor) until build step 3 replaces it with the view and detail blocks.
 
 ## Decisions
 

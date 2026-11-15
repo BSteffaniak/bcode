@@ -21,6 +21,8 @@ pub const FILES_SCOPE: &str = "code-review-files";
 pub const THREADS_SCOPE: &str = "code-review-threads";
 /// Review assistant dock scope.
 pub const ASSISTANT_SCOPE: &str = "code-review-assistant";
+/// Review assistant conversation history scope.
+pub const ASSISTANT_HISTORY_SCOPE: &str = "code-review-assistant-history";
 /// Keys of an AI card's live feed (permission answers, stop).
 pub const FEED_SCOPE: &str = "code-review-feed";
 /// New-review wizard scope.
@@ -115,6 +117,7 @@ mod tests {
             FILES_SCOPE,
             THREADS_SCOPE,
             ASSISTANT_SCOPE,
+            ASSISTANT_HISTORY_SCOPE,
             FEED_SCOPE,
             WIZARD_SCOPE,
         ] {
@@ -221,7 +224,8 @@ mod tests {
             crate::surface::THREADS_SCOPE,
             crate::surface::COMPOSER_SCOPE,
             crate::surface::FEED_SCOPE,
-            crate::surface::ASSISTANT_SCOPE,
+            crate::assistant::ASSISTANT_SCOPE,
+            crate::assistant::HISTORY_SCOPE,
         ]
         .into_iter()
         .map(str::to_owned)

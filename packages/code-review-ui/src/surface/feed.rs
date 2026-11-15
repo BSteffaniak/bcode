@@ -299,32 +299,6 @@ impl ReviewSurface {
     /// Toast attention changes of sessions whose cards are all off screen.
     pub(super) fn feed_attention(&mut self) {
         for (session, attention) in self.agents.take_attention() {
-            if self.assistant_sessions().as_deref() == Some(session.as_str()) {
-                let shown = self.panels.current().is_some_and(|plan| {
-                    plan.assistant != super::super::panels::SidePlacement::Hidden
-                });
-                if shown {
-                    continue;
-                }
-                let (severity, title) = match &attention {
-                    Attention::Permission(tool) => (
-                        ToastSeverity::Warning,
-                        format!("The assistant needs your permission to use {tool}"),
-                    ),
-                    Attention::Answered => {
-                        (ToastSeverity::Success, "The assistant answered".to_owned())
-                    }
-                    Attention::Failed(_) => {
-                        (ToastSeverity::Error, "The assistant failed".to_owned())
-                    }
-                };
-                let body = match attention {
-                    Attention::Failed(message) => Some(message),
-                    _ => None,
-                };
-                self.toasts.push(severity, title, body);
-                continue;
-            }
             let cards: Vec<(String, String)> = self
                 .notes
                 .exchanges()
