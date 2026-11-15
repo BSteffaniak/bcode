@@ -94,8 +94,18 @@ pub struct ScriptedHost {
     /// Each session's chosen provider, model and effort.
     session_models: Mutex<BTreeMap<String, SessionChoice>>,
     /// Model, effort and submit calls in call order (`model <session> <model>`, `effort
-    /// <session> <effort>`, `submit <session>`).
+    /// <session> <effort>`, `submit <session> <model> <effort>` for every message sent).
     model_log: Mutex<Vec<String>>,
+    /// Models the fake daemon refuses to select, with why.
+    refused_models: Mutex<BTreeMap<String, String>>,
+    /// Sessions the fake daemon refuses to delete, with why.
+    refused_deletes: Mutex<BTreeMap<String, String>>,
+    /// Model aliases the fake daemon resolves, alias to model id.
+    model_aliases: Mutex<BTreeMap<String, String>>,
+    /// Why reading any session's model fails, when it does.
+    session_model_failure: Mutex<Option<String>>,
+    /// Session model reads, per session.
+    session_model_reads: Mutex<BTreeMap<String, usize>>,
 }
 
 /// A session's model choice in the fake daemon.
@@ -182,7 +192,71 @@ impl ScriptedHost {
             models: Mutex::new(Err("this host offers no models".to_owned())),
             session_models: Mutex::default(),
             model_log: Mutex::default(),
+            refused_models: Mutex::default(),
+            refused_deletes: Mutex::default(),
+            model_aliases: Mutex::default(),
+            session_model_failure: Mutex::default(),
+            session_model_reads: Mutex::default(),
         }
+    }
+
+    /// Fail every session model read with `reason` (`None` reads again).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn fail_session_models(&self, reason: Option<&str>) {
+        *self.session_model_failure.lock().expect("failure lock") = reason.map(str::to_owned);
+    }
+
+    /// How many times the model of `session` was read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn session_model_reads(&self, session: &str) -> usize {
+        self.session_model_reads
+            .lock()
+            .expect("reads lock")
+            .get(session)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Resolve the model id `alias` to `model`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn alias_model(&self, alias: &str, model: &str) {
+        self.model_aliases
+            .lock()
+            .expect("aliases lock")
+            .insert(alias.to_owned(), model.to_owned());
+    }
+
+    /// Refuse deleting `session` with `reason`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn refuse_delete(&self, session: &str, reason: &str) {
+        self.refused_deletes
+            .lock()
+            .expect("deletes lock")
+            .insert(session.to_owned(), reason.to_owned());
+    }
+
+    /// Refuse selecting `model` with `reason`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the models lock is poisoned.
+    pub fn refuse_model(&self, model: &str, reason: &str) {
+        self.refused_models
+            .lock()
+            .expect("models lock")
+            .insert(model.to_owned(), reason.to_owned());
     }
 
     /// Offer `catalog` as the fake daemon's models (`Err` fails listing with the message).
@@ -740,6 +814,13 @@ impl ReviewHost for ScriptedHost {
         {
             session.updated_at_ms = now;
         }
+        // The model and effort the message's turn runs with.
+        let choice = self.session_choice(&session_id);
+        self.log_model(format!(
+            "submit {session_id} {} {}",
+            choice.model.as_deref().unwrap_or("default"),
+            choice.effort.as_deref().unwrap_or("default")
+        ));
         self.messages
             .lock()
             .expect("messages lock")
@@ -777,12 +858,6 @@ impl ReviewHost for ScriptedHost {
             .lock()
             .expect("turns lock")
             .push((session_id.clone(), request.clone()));
-        let choice = self.session_choice(&session_id);
-        self.log_model(format!(
-            "submit {session_id} {} {}",
-            choice.model.as_deref().unwrap_or("default"),
-            choice.effort.as_deref().unwrap_or("default")
-        ));
         self.send_message(session_id, request.text)
     }
 
@@ -797,23 +872,49 @@ impl ReviewHost for ScriptedHost {
     }
 
     fn session_model(&self, session_id: String) -> HostFuture<crate::host::SessionModel> {
+        *self
+            .session_model_reads
+            .lock()
+            .expect("reads lock")
+            .entry(session_id.clone())
+            .or_default() += 1;
+        if let Some(reason) = self
+            .session_model_failure
+            .lock()
+            .expect("failure lock")
+            .clone()
+        {
+            return Box::pin(async move { Err(HostError::failed(reason)) });
+        }
         let choice = self.session_choice(&session_id);
         let catalog = self.models.lock().expect("models lock").clone();
+        let resolved = choice.model.as_ref().map(|model| {
+            self.model_aliases
+                .lock()
+                .expect("aliases lock")
+                .get(model)
+                .cloned()
+                .unwrap_or_else(|| model.clone())
+        });
         Box::pin(async move {
             let catalog = catalog.map_err(HostError::failed)?;
-            // Like Bcode, a model it does not offer falls back to its default.
-            let listed = choice
-                .model
-                .as_deref()
-                .and_then(|model| catalog.find(choice.provider.as_deref(), model).cloned());
-            let unavailable = choice.model.clone().filter(|_| listed.is_none());
-            let model = listed
-                .or_else(|| catalog.default.and_then(Result::ok))
-                .unwrap_or_default();
+            // Like Bcode, the session runs the resolved id it was given, listed or not.
+            let model = match &resolved {
+                Some(model) => catalog
+                    .find(choice.provider.as_deref(), model)
+                    .cloned()
+                    .unwrap_or_else(|| crate::host::ModelOption {
+                        provider: choice.provider.clone(),
+                        model_id: model.clone(),
+                        display_name: model.clone(),
+                        ..crate::host::ModelOption::default()
+                    }),
+                None => catalog.default.and_then(Result::ok).unwrap_or_default(),
+            };
             Ok(crate::host::SessionModel {
                 model,
                 effort: choice.effort,
-                unavailable,
+                requested: choice.model,
             })
         })
     }
@@ -824,6 +925,15 @@ impl ReviewHost for ScriptedHost {
         provider: Option<String>,
         model_id: String,
     ) -> HostFuture<()> {
+        if let Some(reason) = self
+            .refused_models
+            .lock()
+            .expect("models lock")
+            .get(&model_id)
+            .cloned()
+        {
+            return Box::pin(async move { Err(HostError::failed(reason)) });
+        }
         self.log_model(format!("model {session_id} {model_id}"));
         let mut models = self.session_models.lock().expect("models lock");
         let choice = models.entry(session_id).or_default();
@@ -850,7 +960,7 @@ impl ReviewHost for ScriptedHost {
     fn list_app_sessions(
         &self,
         _working_directory: PathBuf,
-        _cursor: Option<String>,
+        cursor: Option<String>,
         limit: usize,
     ) -> HostFuture<crate::host::AppSessionPage> {
         let mut sessions: Vec<crate::host::AppSession> = self
@@ -864,11 +974,19 @@ impl ReviewHost for ScriptedHost {
             .cloned()
             .collect();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
-        sessions.truncate(limit);
+        // Like Bcode, a page holds at most its limit and a cursor (here an offset) continues.
+        let limit = limit.clamp(1, crate::host::MAX_APP_SESSION_PAGE);
+        let start = cursor
+            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(sessions.len());
+        let end = (start + limit).min(sessions.len());
+        let next_cursor = (end < sessions.len()).then(|| end.to_string());
+        let sessions = sessions.drain(start..end).collect();
         Box::pin(async move {
             Ok(crate::host::AppSessionPage {
                 sessions,
-                next_cursor: None,
+                next_cursor,
                 degraded: false,
             })
         })
@@ -904,6 +1022,15 @@ impl ReviewHost for ScriptedHost {
     }
 
     fn delete_session(&self, session_id: String) -> HostFuture<()> {
+        if let Some(reason) = self
+            .refused_deletes
+            .lock()
+            .expect("deletes lock")
+            .get(&session_id)
+            .cloned()
+        {
+            return Box::pin(async move { Err(HostError::failed(reason)) });
+        }
         self.catalog
             .lock()
             .expect("catalog lock")

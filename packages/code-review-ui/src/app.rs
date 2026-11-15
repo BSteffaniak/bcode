@@ -1461,7 +1461,7 @@ impl ReviewApp {
         self.assistant.learn_models(&sessions, host);
         let labels = sessions
             .iter()
-            .filter(|session| self.assistant.models().session(session).is_some())
+            .filter(|session| self.assistant.models().has_label(session))
             .map(|session| {
                 (
                     session.clone(),

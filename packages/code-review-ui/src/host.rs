@@ -250,9 +250,9 @@ pub struct SessionModel {
     pub model: ModelOption,
     /// The selected effort; the model's default when `None`.
     pub effort: Option<String>,
-    /// The model id the session asked for, when Bcode runs another one instead (an id it does
-    /// not offer).
-    pub unavailable: Option<String>,
+    /// The model id the session asked for, before Bcode resolved aliases (it can differ from
+    /// the model's id without anything being wrong).
+    pub requested: Option<String>,
 }
 
 /// Error code of a turn whose request-only context the daemon no longer holds.
@@ -1137,15 +1137,10 @@ impl ReviewHost for StandaloneHost {
                 .session_model_status(id)
                 .await
                 .map_err(|error| bcode.failure(&error))?;
-            let model = model_option_of_status(&status);
-            let unavailable = status
-                .requested_model_id
-                .clone()
-                .filter(|requested| *requested != model.model_id);
             Ok(SessionModel {
-                model,
+                model: model_option_of_status(&status),
                 effort: status.reasoning_effort,
-                unavailable,
+                requested: status.requested_model_id,
             })
         })
     }

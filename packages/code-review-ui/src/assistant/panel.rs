@@ -347,8 +347,6 @@ pub struct Assistant {
     title_press: Option<Instant>,
     /// Whether the focused panel covers the whole area.
     zoom: Zoom,
-    /// Whether the active session's model was asked for.
-    model_asked: Option<String>,
     /// The theme of the last frame (overlays are built with it).
     theme: Cell<ReviewTheme>,
 }
@@ -418,7 +416,6 @@ impl Assistant {
             history_delete: Cell::new(None),
             title_press: None,
             zoom: Zoom::Docked,
-            model_asked: None,
             theme: Cell::new(ReviewTheme::derive(
                 None,
                 crate::theme::IconStyle::default(),
@@ -538,9 +535,7 @@ impl Assistant {
     pub fn learn_models(&mut self, sessions: &[String], ui: &UiContext) {
         self.load_models(false, ui);
         for session in sessions.iter().take(8) {
-            if self.models.session(session).is_none()
-                && self.model_asked.as_deref() != Some(session)
-            {
+            if self.models.needs_read(session) {
                 self.read_session_model(session.clone(), ui);
             }
         }
@@ -1164,8 +1159,7 @@ impl Assistant {
         }
         if let Some(session) = self.session.clone()
             && !self.starting
-            && self.models.session(&session).is_none()
-            && self.model_asked.as_deref() != Some(session.as_str())
+            && self.models.needs_read(&session)
         {
             self.read_session_model(session, ui);
         }
@@ -2116,7 +2110,7 @@ impl Assistant {
     }
 
     fn read_session_model(&mut self, session: String, ui: &UiContext) {
-        self.model_asked = Some(session.clone());
+        self.models.asking(&session);
         let host = Arc::clone(ui.host());
         let inbox = Arc::clone(&self.inbox);
         ui.spawn(Box::pin(async move {
@@ -2134,6 +2128,7 @@ impl Assistant {
             Done::Catalog(result) => {
                 self.models.listing = false;
                 self.models.catalog = Some(result);
+                self.report_unlisted();
                 self.refresh_model_overlay(ui);
             }
             Done::Default(result) => match result {
@@ -2150,19 +2145,14 @@ impl Assistant {
                 session,
                 result: Ok(model),
             } => {
-                if let Some(requested) = model
-                    .unavailable
-                    .as_ref()
-                    .filter(|_| self.session.as_deref() == Some(session.as_str()))
-                {
-                    self.failure = Some(format!(
-                        "Bcode does not offer the model {requested}; this conversation runs {} \
-                         instead — choose a model with the model chip (alt+m)",
-                        super::models::label(&model.model)
-                    ));
-                }
                 self.models.learn(session, model);
+                self.report_unlisted();
             }
+            // The chip says `⚠ model unknown` and the picker says why.
+            Done::SessionModel {
+                session,
+                result: Err(error),
+            } => self.models.failed(session, error),
             Done::Chosen {
                 session,
                 default,
@@ -2223,6 +2213,23 @@ impl Assistant {
         }
     }
 
+    /// Say so when the active conversation's model is one Bcode does not list.
+    fn report_unlisted(&mut self) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Some(model) = self
+            .session
+            .as_deref()
+            .and_then(|session| self.models.unlisted(session))
+        {
+            self.failure = Some(format!(
+                "Bcode does not list the model {model}, so this conversation's turns may fail — \
+                 choose a model with the model chip (alt+m)"
+            ));
+        }
+    }
+
     /// The session a target's choice applies to, when it has one.
     fn target_session(&self, target: &Target) -> Option<String> {
         match target {
@@ -2269,7 +2276,26 @@ impl Assistant {
             .and_then(|session| self.models.session(session))
             .is_some()
             || self.models.default_model().is_some();
+        // A known session runs its resolved model or the alias it asked for.
+        let runs = |model: &crate::host::ModelOption| match session.as_deref() {
+            Some(session) if self.models.session(session).is_some() => {
+                self.models.runs(session, model)
+            }
+            _ => current
+                .as_ref()
+                .is_some_and(|current| current.is(model.provider.as_deref(), &model.model_id)),
+        };
         let mut entries = Vec::new();
+        if let Some(error) = session
+            .as_deref()
+            .and_then(|session| self.models.unreadable(session))
+        {
+            entries.push(OverlayEntry {
+                action: None,
+                label: format!("⚠ could not read this session's model: {error}"),
+                keys: String::new(),
+            });
+        }
         let mut options = Vec::new();
         let mark = |active: bool| if active { "● " } else { "  " };
         match &self.models.catalog {
@@ -2311,10 +2337,7 @@ impl Assistant {
                                 keys: String::new(),
                             });
                             for model in models {
-                                let active = chosen
-                                    && current.as_ref().is_some_and(|current| {
-                                        current.is(model.provider.as_deref(), &model.model_id)
-                                    });
+                                let active = chosen && runs(model);
                                 entries.push(OverlayEntry {
                                     action: Some(format!("model:{}", options.len())),
                                     label: format!(

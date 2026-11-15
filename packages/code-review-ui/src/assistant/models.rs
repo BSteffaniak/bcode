@@ -16,7 +16,7 @@ use crate::services::ReviewServices;
 use bcode_code_review_models::{
     GetReviewAssistantSettingsRequest, ReviewAssistantSettings, SaveReviewAssistantSettingsRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Sessions whose model the app remembers at most.
@@ -52,6 +52,11 @@ pub struct ModelState {
     sessions: BTreeMap<String, SessionModel>,
     /// Order the sessions were learned in, oldest first (to bound the map).
     learned: Vec<String>,
+    /// Sessions whose model is being read.
+    asked: BTreeSet<String>,
+    /// Sessions whose model could not be read, with why; not read again until a choice is made
+    /// for them.
+    unreadable: BTreeMap<String, String>,
 }
 
 impl ModelState {
@@ -61,8 +66,46 @@ impl ModelState {
         self.sessions.get(session)
     }
 
+    /// Whether the model of `session` is still to be read: not known, not being read, and
+    /// not failed to read.
+    #[must_use]
+    pub fn needs_read(&self, session: &str) -> bool {
+        !self.sessions.contains_key(session)
+            && !self.asked.contains(session)
+            && !self.unreadable.contains_key(session)
+    }
+
+    /// The model of `session` is being read.
+    pub fn asking(&mut self, session: &str) {
+        self.unreadable.remove(session);
+        self.asked.insert(session.to_owned());
+    }
+
+    /// Why the model of `session` could not be read, when it could not.
+    #[must_use]
+    pub fn unreadable(&self, session: &str) -> Option<&str> {
+        self.unreadable.get(session).map(String::as_str)
+    }
+
+    /// Whether `session` has a label to show: its model is known or failed to read.
+    #[must_use]
+    pub fn has_label(&self, session: &str) -> bool {
+        self.sessions.contains_key(session) || self.unreadable.contains_key(session)
+    }
+
+    /// The model of `session` could not be read, because of `reason`.
+    pub fn failed(&mut self, session: String, reason: String) {
+        self.asked.remove(&session);
+        self.unreadable.insert(session, reason);
+        while self.unreadable.len() > MAX_SESSION_MODELS {
+            self.unreadable.pop_first();
+        }
+    }
+
     /// Remember `model` as the model of `session`.
     pub fn learn(&mut self, session: String, model: SessionModel) {
+        self.asked.remove(&session);
+        self.unreadable.remove(&session);
         self.learned.retain(|known| *known != session);
         self.learned.push(session.clone());
         self.sessions.insert(session, model);
@@ -70,6 +113,45 @@ impl ModelState {
             let oldest = self.learned.remove(0);
             self.sessions.remove(&oldest);
         }
+    }
+
+    /// The model id `session` asked for when Bcode lists neither it nor the model it resolved
+    /// to (so its turns are likely to fail). `None` while either is unknown, or when the
+    /// listing of the session's provider failed.
+    #[must_use]
+    pub fn unlisted(&self, session: &str) -> Option<String> {
+        let known = self.session(session)?;
+        let catalog = self.listed()?;
+        let provider = known.model.provider.as_deref();
+        let listed = |id: &str| catalog.find(provider, id).is_some();
+        if listed(&known.model.model_id) || known.requested.as_deref().is_some_and(listed) {
+            return None;
+        }
+        let listing_complete = match provider {
+            Some(provider) => catalog
+                .providers
+                .iter()
+                .any(|listed| listed.provider == provider && listed.models.is_ok()),
+            None => catalog.providers.iter().all(|listed| listed.models.is_ok()),
+        };
+        listing_complete.then(|| {
+            known
+                .requested
+                .clone()
+                .unwrap_or_else(|| known.model.model_id.clone())
+        })
+    }
+
+    /// Whether `session` runs the listed `option`: its resolved model or the id it asked for.
+    #[must_use]
+    pub fn runs(&self, session: &str, option: &ModelOption) -> bool {
+        self.session(session).is_some_and(|known| {
+            option.is(known.model.provider.as_deref(), &known.model.model_id)
+                || known
+                    .requested
+                    .as_deref()
+                    .is_some_and(|requested| option.is(known.model.provider.as_deref(), requested))
+        })
     }
 
     /// The listed catalog, when listing succeeded.
@@ -128,6 +210,9 @@ impl ModelState {
         if matches!(self.catalog, Some(Err(_))) {
             return "⚠ models unavailable".to_owned();
         }
+        if session.is_some_and(|session| self.unreadable.contains_key(session)) {
+            return "⚠ model unknown".to_owned();
+        }
         // A session on Bcode's default model, with no app default chosen, says so.
         let chosen = session
             .and_then(|session| self.session(session))
@@ -153,6 +238,9 @@ impl ModelState {
     /// The effort chip's value for `session`, when its model has effort values.
     #[must_use]
     pub fn effort_label(&self, session: Option<&str>) -> Option<String> {
+        if session.is_some_and(|session| self.unreadable.contains_key(session)) {
+            return None;
+        }
         let (model, effort) = self.effective(session);
         let model = model?;
         if model.effort_values.is_empty() {
@@ -402,7 +490,7 @@ mod tests {
                     ..ModelOption::default()
                 },
                 effort: None,
-                unavailable: None,
+                requested: None,
             },
         );
         assert_eq!(state.model_label(Some("s1")), "Mine 模型 🚀");

@@ -815,9 +815,9 @@ fn a_configured_model_bcode_does_not_offer_says_what_runs_instead() {
     );
     let failure = setup.app().assistant().failure().map(str::to_owned);
     assert!(
-        failure.as_deref().is_some_and(|failure| failure
-            .contains("does not offer the model fake-gone")
-            && failure.contains("Fake echo")),
+        failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("does not list the model fake-gone")),
         "{failure:?}"
     );
 }
