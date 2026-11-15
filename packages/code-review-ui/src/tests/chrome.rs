@@ -765,11 +765,11 @@ fn ascii_icons_replace_unicode_glyphs() {
     let rows = tree_rows(&scenario, &screen);
     let row = tree_row(&rows, "A new_000.rs");
     assert!(
-        row.contains("+40 -0") && row.contains("###..") && row.ends_with('o'),
+        row.contains("+40 -0") && row.contains("|||..") && row.ends_with('o'),
         "{row}"
     );
     assert!(
-        screen.row_text(0).contains("viewed 0/15  ----------"),
+        screen.row_text(0).contains("viewed 0/15  .........."),
         "{}",
         screen.row_text(0)
     );
