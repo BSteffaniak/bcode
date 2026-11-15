@@ -42,9 +42,6 @@ bcode_question_plugin         = { workspace = true, features = ["native"] }
 tokio                         = { workspace = true, features = ["macros", "rt", "time"] }
 
 [features]
-# Compatibility feature: the shared BMUX plugin runtime is a required dependency of
-# the unified plugin architecture, so this no longer gates `bmux_plugin`.
-bmux-host        = []
 default          = []
 fail-on-warnings = []
 

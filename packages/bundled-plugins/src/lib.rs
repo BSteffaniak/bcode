@@ -1418,7 +1418,7 @@ mod tests {
             };
             let selection =
                 bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-            let selected = bcode_plugin::filter_selected_static_plugins(&plugins, &selection)
+            let selected = bcode_plugin::filter_selected_static_registrations(&plugins, &selection)
                 .expect("bundle selection succeeds");
             let selected_ids = selected
                 .iter()
