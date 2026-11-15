@@ -625,5 +625,9 @@ Where the built panel differs from the design above:
   and deleting, but `bcode tui` may offer it.
 * A contributed profile must list exact tool names; a Bcode capability to subtract categories
   from the base agent's tools would remove the category table.
+* Under parallel test load, viewed marks written by `code_review.mark_viewed` while a review is
+  open were once read back empty after the review reloaded them, which suggests the open
+  review's own workspace save can overwrite marks a tool wrote. Build step 4's bulk
+  `mark_viewed` should confirm or rule this out before relying on it.
 * Opening a review of another repository in the running app (switching its repository) is not
   covered; the tool returns the command line instead.
