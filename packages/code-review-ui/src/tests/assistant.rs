@@ -972,7 +972,7 @@ fn a_tool_mark_after_the_reviewer_unmarked_the_file_is_written_and_reported() {
             bcode_code_review::viewed::ViewedReset::Diff,
         )
         .expect("marked");
-    assert_eq!(report.changed, [path.clone()], "{report:?}");
+    assert_eq!(report.changed, std::slice::from_ref(&path), "{report:?}");
     assert!(
         viewed_now(),
         "the tool's mark is stored: {}",
