@@ -443,6 +443,7 @@ impl PluginTuiSurfaceFactory for Factory {
                 actions,
                 bindings: wire::Bindings::default(),
                 pending: VecDeque::new(),
+                input_backlog: VecDeque::new(),
                 completion: None,
                 projection_completion: None,
                 edit_completions: VecDeque::new(),
@@ -480,6 +481,7 @@ struct SurfaceProxy {
     actions: Vec<keymap::KeymapAction>,
     bindings: wire::Bindings,
     pending: VecDeque<(PluginTuiAction, Option<FrontendEffectResponsibility>)>,
+    input_backlog: VecDeque<wire::Request>,
     completion: Option<FrontendEffectResponsibility>,
     projection_completion: Option<(u64, PluginTuiAction, FrontendEffectResponsibility)>,
     edit_completions: VecDeque<FrontendEffectResponsibility>,
@@ -1224,31 +1226,38 @@ async fn worker(
             viewport = Some(next.clone());
             bindings = next_bindings.clone();
         }
-        if let wire::Request::Input {
-            expected_revision, ..
+        if matches!(request, wire::Request::Input { .. }) {
+            let display = ViewDisplay { view: &view, local };
+            let mut executor = WorkerExecutor {
+                owner: &owner,
+                correlated: correlated.as_deref(),
+            };
+            let (result, effects) = deliver_input(&display, request, &mut executor).await;
+            let failed = result.is_err();
+            completion.deliver_correlated(result, effects).await;
+            if failed {
+                break;
+            }
+            continue;
         }
-        | wire::Request::Edit {
+        // Fenced operations reference a displayed snapshot; they reject, never replay.
+        if let wire::Request::Edit {
             expected_revision, ..
         } = &request
             && view
                 .validate_displayed(local, 1, *expected_revision)
                 .is_err()
         {
-            let response = if matches!(request, wire::Request::Edit { .. }) {
-                wire::Response::Edit(PluginTuiFocusedTextFieldEditResult::rejected(
-                    bcode_plugin_sdk::composer::ComposerValidationError::Stale,
-                ))
-            } else {
-                wire::Response::Event(PluginTuiEventResult::consumed())
-            };
-            completion.deliver(Ok(response)).await;
+            completion
+                .deliver(Ok(wire::Response::Edit(
+                    PluginTuiFocusedTextFieldEditResult::rejected(
+                        bcode_plugin_sdk::composer::ComposerValidationError::Stale,
+                    ),
+                )))
+                .await;
             continue;
         }
-        let (mut result, effects) = if let Some(session) = &correlated {
-            session.execute(request).await
-        } else {
-            (invoke(&owner, request).await, None)
-        };
+        let (mut result, effects) = execute(&owner, correlated.as_deref(), request).await;
         if let Ok(wire::Response::Projection(projection)) = &result {
             result = view
                 .apply(FrontendPresentationRequest::Publish {
@@ -1268,6 +1277,163 @@ async fn worker(
     stopped.store(true, Ordering::Release);
     let _ = view.apply(FrontendPresentationRequest::Destroy { resource: local });
     close_surface(&owner, correlated, remote).await;
+}
+
+type Execution = (WorkerResult, Option<Arc<CompletionEffectRecord>>);
+
+async fn execute(
+    owner: &ProductExtensions,
+    correlated: Option<&CorrelatedFrontend>,
+    request: wire::Request,
+) -> Execution {
+    if let Some(session) = correlated {
+        session.execute(request).await
+    } else {
+        (invoke(owner, request).await, None)
+    }
+}
+
+/// Re-deliveries of one stale plain input after its original delivery.
+///
+/// Only this surface's worker prepares new revisions, and it is busy re-delivering, so
+/// one re-delivery normally applies the input. The bound stops a peer that keeps
+/// reporting newer revisions from livelocking the worker.
+const MAX_INPUT_REPLAYS: u32 = 3;
+
+/// Bounded host-side input backlog used while the worker queue is full.
+const INPUT_BACKLOG_CAPACITY: usize = 128;
+
+/// The host's displayed lease, as observed for plain input admission.
+trait InputDisplay: Sync {
+    /// Whether `revision` is the displayed revision currently admitting input.
+    fn admits(&self, revision: u64) -> bool;
+    /// The displayed revision currently admitting input, if the surface is displayed.
+    fn displayed(&self) -> Option<u64>;
+}
+
+/// One delivery of a request to the producer, exactly as the worker would dispatch it.
+trait InputExecutor: Send {
+    fn execute(&mut self, request: wire::Request) -> impl Future<Output = Execution> + Send;
+}
+
+struct WorkerExecutor<'a> {
+    owner: &'a ProductExtensions,
+    correlated: Option<&'a CorrelatedFrontend>,
+}
+impl InputExecutor for WorkerExecutor<'_> {
+    fn execute(&mut self, request: wire::Request) -> impl Future<Output = Execution> + Send {
+        execute(self.owner, self.correlated, request)
+    }
+}
+
+struct ViewDisplay<'a> {
+    view: &'a RetainedFrontend,
+    local: FrontendResourceId,
+}
+impl InputDisplay for ViewDisplay<'_> {
+    fn admits(&self, revision: u64) -> bool {
+        self.view
+            .validate_displayed(self.local, 1, revision)
+            .is_ok()
+    }
+    fn displayed(&self) -> Option<u64> {
+        self.view.displayed_revision(self.local, 1)
+    }
+}
+
+/// Deliver one plain key/pointer input exactly once, in worker order.
+///
+/// The input is tagged with the revision the host displayed. When the host has since
+/// displayed a newer revision, or the producer reports [`wire::Response::Stale`], the
+/// same input is re-delivered against the current revision instead of being dropped.
+/// A stale response is a definitive "not applied", so re-delivery cannot duplicate an
+/// effect; ambiguous failures are still never replayed. Hidden or display-suspended
+/// surfaces never receive input. When the bound is exhausted, the final `Stale`
+/// response is returned so the proxy can surface a typed failure.
+async fn deliver_input(
+    display: &impl InputDisplay,
+    request: wire::Request,
+    executor: &mut impl InputExecutor,
+) -> Execution {
+    let wire::Request::Input {
+        resource,
+        mut expected_revision,
+        event,
+        bindings,
+        focused,
+    } = request
+    else {
+        return (
+            Err("frontend input delivery requires input".to_owned()),
+            None,
+        );
+    };
+    if !display.admits(expected_revision) {
+        match display.displayed() {
+            // The host displayed a newer revision after tagging this input.
+            Some(displayed) if displayed > expected_revision => expected_revision = displayed,
+            _ => {
+                return (
+                    Ok(wire::Response::Event(PluginTuiEventResult::consumed())),
+                    None,
+                );
+            }
+        }
+    }
+    let mut replays = 0;
+    loop {
+        let (result, effects) = executor
+            .execute(wire::Request::Input {
+                resource,
+                expected_revision,
+                event: event.clone(),
+                bindings: bindings.clone(),
+                focused,
+            })
+            .await;
+        let Ok(wire::Response::Stale { revision }) = result else {
+            return (result, effects);
+        };
+        if revision <= expected_revision {
+            return (
+                Err("frontend stale input did not name a newer revision".to_owned()),
+                effects,
+            );
+        }
+        if let Err(error) = settle_unapplied(effects) {
+            return (Err(error.to_owned()), None);
+        }
+        if replays == MAX_INPUT_REPLAYS {
+            return (Ok(wire::Response::Stale { revision }), None);
+        }
+        if display.displayed().is_none() {
+            // Hidden while re-delivering: hidden surfaces never receive input.
+            return (
+                Ok(wire::Response::Event(PluginTuiEventResult::consumed())),
+                None,
+            );
+        }
+        replays += 1;
+        expected_revision = revision;
+    }
+}
+
+/// Retire a correlated response whose input was definitively not applied.
+fn settle_unapplied(effects: Option<Arc<CompletionEffectRecord>>) -> Result<(), &'static str> {
+    let Some(record) = effects else {
+        return Ok(());
+    };
+    let mut token = record.take_handoff()?;
+    if let Err(error) = token
+        .retained()
+        .and_then(|()| token.dispatched())
+        .and_then(|()| token.terminal_applied())
+    {
+        token.recovery_required();
+        return Err(error);
+    }
+    monitor_completion(record);
+    Ok(())
 }
 
 async fn close_surface(
@@ -1341,6 +1507,7 @@ impl SurfaceProxy {
     }
 
     fn collect(&mut self) {
+        self.flush_input_backlog();
         for _ in 0..8 {
             if self.pending.len() >= 128
                 || self.edit_result.is_some()
@@ -1401,6 +1568,13 @@ impl SurfaceProxy {
                     }
                 }
                 Ok(wire::Response::Action(action)) => self.queue_completion(action, token),
+                Ok(wire::Response::Stale { revision }) => self.fail_input(
+                    wire::InputDeliveryFailure::FrontendInputReplayExhausted {
+                        attempts: MAX_INPUT_REPLAYS,
+                        revision,
+                    },
+                    token,
+                ),
                 Ok(_) => self.queue_completion(PluginTuiAction::None, token),
                 Err(_) => {
                     self.view.display_failed();
@@ -1412,6 +1586,82 @@ impl SurfaceProxy {
     }
     fn queue_action(&mut self, action: PluginTuiAction) {
         self.queue_completion(action, None);
+    }
+    /// Surface lost input as a typed closing outcome, after every earlier action.
+    /// Later input would apply out of order, so the surface stops accepting input.
+    fn fail_input(
+        &mut self,
+        failure: wire::InputDeliveryFailure,
+        token: Option<FrontendEffectResponsibility>,
+    ) {
+        self.input_backlog.clear();
+        self.queue_completion(
+            PluginTuiAction::Close {
+                outcome: serde_json::to_value(failure).ok(),
+            },
+            token,
+        );
+        self.stopped.store(true, Ordering::Release);
+    }
+    /// Queue plain input behind any backlog, so a full worker queue never drops or
+    /// reorders it. Backlogged input becomes stale and is re-delivered by the worker.
+    fn enqueue_input(&mut self, request: wire::Request) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        self.flush_input_backlog();
+        let request = if self.input_backlog.is_empty() {
+            let sent = self.send.try_send(Work {
+                request,
+                completion: None,
+            });
+            match sent {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(work)) => work.request,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.view.display_failed();
+                    self.stopped.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        } else {
+            request
+        };
+        if self.input_backlog.len() >= INPUT_BACKLOG_CAPACITY {
+            self.fail_input(
+                wire::InputDeliveryFailure::FrontendInputBacklogExceeded {
+                    capacity: INPUT_BACKLOG_CAPACITY,
+                },
+                None,
+            );
+            return;
+        }
+        self.input_backlog.push_back(request);
+    }
+    fn flush_input_backlog(&mut self) {
+        while let Some(request) = self.input_backlog.pop_front() {
+            if self.stopped.load(Ordering::Acquire) {
+                self.input_backlog.clear();
+                return;
+            }
+            let sent = self.send.try_send(Work {
+                request,
+                completion: None,
+            });
+            match sent {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(work)) => {
+                    self.input_backlog.push_front(work.request);
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.input_backlog.clear();
+                    self.view.display_failed();
+                    self.stopped.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
     }
     fn queue_completion(
         &mut self,
@@ -1497,16 +1747,11 @@ impl SurfaceProxy {
     ) -> PluginTuiEventResult {
         self.collect();
         self.bind_product_host(host);
-        let Some(revision) = self.revision else {
+        // Tag input with the revision the user actually saw, not a newer collected
+        // projection the frame loop has not displayed yet. Hidden surfaces get no input.
+        let Some(revision) = self.view.displayed_revision(self.local, 1) else {
             return PluginTuiEventResult::consumed();
         };
-        if self
-            .view
-            .validate_displayed(self.local, 1, revision)
-            .is_err()
-        {
-            return PluginTuiEventResult::consumed();
-        }
         let bindings = capture_bindings(host, &self.actions, Some(event));
         let mut event = event.clone();
         if let Event::Mouse(mouse) = &mut event {
@@ -1516,7 +1761,7 @@ impl SurfaceProxy {
             mouse.position.x = mouse.position.x.saturating_sub(self.destination.x);
             mouse.position.y = mouse.position.y.saturating_sub(self.destination.y);
         }
-        self.enqueue(wire::Request::Input {
+        self.enqueue_input(wire::Request::Input {
             resource: self.remote,
             expected_revision: revision,
             event,
@@ -1644,7 +1889,8 @@ impl PluginTuiSurface for SurfaceProxy {
         host: &dyn PluginTuiHost,
     ) -> PluginTuiFocusedTextFieldEditResult {
         self.collect();
-        if self.edit_pending {
+        // Backlogged keys will change the field the edit's snapshot describes.
+        if self.edit_pending || !self.input_backlog.is_empty() {
             return PluginTuiFocusedTextFieldEditResult::rejected(
                 bcode_plugin_sdk::composer::ComposerValidationError::Stale,
             );
@@ -2637,5 +2883,457 @@ mod retention_tests {
         retain_action(&mut pending, PluginTuiAction::Redraw).unwrap();
         retain_action(&mut pending, PluginTuiAction::Redraw).unwrap();
         assert_eq!(pending.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod input_replay_tests {
+    use super::{
+        Execution, Factory, InputDisplay, InputExecutor, MAX_INPUT_REPLAYS, RetainedFrontend,
+        deliver_input, wire,
+    };
+    use bcode_plugin_sdk::definition::{
+        ComponentRole, PluginCallContext, PluginCreateContext, PluginFuture, PluginResult,
+        ProductComponentExtension, ProductExtensionDescriptor, ProductExtensionPort,
+        ProductExtensions, extensions::PRODUCT_EXTENSIONS_CONTRACT,
+    };
+    use bcode_plugin_sdk::tui::{
+        BoxedPluginTuiSurface, PluginTuiAction, PluginTuiEventResult, PluginTuiHost,
+        PluginTuiRegistry, PluginTuiSurface, PluginTuiSurfaceFactory, PluginTuiSurfaceFuture,
+        PluginTuiSurfaceOpenRequest, TokioPluginTuiHost,
+    };
+    use bmux_keyboard::{KeyCode, KeyStroke};
+    use bmux_tui::hit::HitRegion;
+    use bmux_tui::{
+        buffer::Buffer, event::Event, frame::Frame, geometry::Rect, paint::PaintCx, style::Style,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct Display {
+        displayed: Option<u64>,
+    }
+    impl InputDisplay for Display {
+        fn admits(&self, revision: u64) -> bool {
+            self.displayed == Some(revision)
+        }
+        fn displayed(&self) -> Option<u64> {
+            self.displayed
+        }
+    }
+
+    fn key(character: char) -> Event {
+        Event::Key(KeyStroke::simple(KeyCode::Char(character)))
+    }
+
+    fn input(expected_revision: u64) -> wire::Request {
+        wire::Request::Input {
+            resource: uuid::Uuid::nil(),
+            expected_revision,
+            event: key('a'),
+            bindings: wire::Bindings::default(),
+            focused: false,
+        }
+    }
+
+    fn named(request: &wire::Request) -> u64 {
+        let wire::Request::Input {
+            expected_revision, ..
+        } = request
+        else {
+            panic!("only input is delivered");
+        };
+        *expected_revision
+    }
+
+    /// Scripted producer: reports `stale` revisions in order, then applies the input.
+    struct Script {
+        stale: std::collections::VecDeque<u64>,
+        delivered: Vec<u64>,
+    }
+    impl InputExecutor for Script {
+        fn execute(
+            &mut self,
+            request: wire::Request,
+        ) -> impl std::future::Future<Output = Execution> + Send {
+            self.delivered.push(named(&request));
+            let response = self.stale.pop_front().map_or_else(
+                || wire::Response::Event(PluginTuiEventResult::consumed()),
+                |revision| wire::Response::Stale { revision },
+            );
+            std::future::ready((Ok(response), None))
+        }
+    }
+
+    async fn deliver(displayed: Option<u64>, tagged: u64, stale: &[u64]) -> (Execution, Vec<u64>) {
+        let mut script = Script {
+            stale: stale.iter().copied().collect(),
+            delivered: Vec::new(),
+        };
+        let result = deliver_input(&Display { displayed }, input(tagged), &mut script).await;
+        (result, script.delivered)
+    }
+
+    #[tokio::test]
+    async fn stale_input_is_redelivered_once_against_the_current_revision() {
+        let ((result, _), delivered) = deliver(Some(4), 4, &[5]).await;
+        assert!(matches!(result, Ok(wire::Response::Event(_))));
+        assert_eq!(delivered, vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn input_tagged_before_a_newer_display_names_the_displayed_revision() {
+        let ((result, _), delivered) = deliver(Some(6), 4, &[]).await;
+        assert!(matches!(result, Ok(wire::Response::Event(_))));
+        assert_eq!(delivered, vec![6]);
+    }
+
+    #[tokio::test]
+    async fn hidden_surfaces_never_receive_input() {
+        let ((result, _), delivered) = deliver(None, 4, &[]).await;
+        assert!(matches!(
+            result,
+            Ok(wire::Response::Event(result)) if result == PluginTuiEventResult::consumed()
+        ));
+        assert_eq!(delivered, Vec::<u64>::new());
+    }
+
+    #[tokio::test]
+    async fn replay_bound_returns_the_final_stale_outcome() {
+        let stale = (5..).take(usize::try_from(MAX_INPUT_REPLAYS).unwrap() + 2);
+        let stale = stale.collect::<Vec<_>>();
+        let ((result, _), delivered) = deliver(Some(4), 4, &stale).await;
+        let last = stale[usize::try_from(MAX_INPUT_REPLAYS).unwrap()];
+        assert!(matches!(result, Ok(wire::Response::Stale { revision }) if revision == last));
+        assert_eq!(
+            delivered.len(),
+            usize::try_from(MAX_INPUT_REPLAYS).unwrap() + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_outcome_that_does_not_advance_is_a_protocol_failure() {
+        let ((result, _), delivered) = deliver(Some(4), 4, &[4]).await;
+        assert!(result.is_err());
+        assert_eq!(delivered, vec![4]);
+    }
+
+    /// Records every key it receives; painting a recognizable cell admits display.
+    struct Recording(Arc<Mutex<Vec<char>>>);
+    impl PluginTuiSurface for Recording {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+        fn title(&self) -> &'static str {
+            "Recording"
+        }
+        fn preferred_height(&mut self, _: u16) -> u16 {
+            1
+        }
+        fn render(&mut self, _: Rect, cx: &mut PaintCx<'_, '_>) {
+            cx.set_cell(0, 0, "R", Style::new());
+            cx.push_hit(HitRegion::new("recording", Rect::new(0, 0, 1, 1)));
+        }
+        fn handle_event(&mut self, event: &Event, _: &dyn PluginTuiHost) -> PluginTuiAction {
+            if let Event::Key(KeyStroke {
+                key: KeyCode::Char(character),
+                ..
+            }) = event
+            {
+                self.0.lock().unwrap().push(*character);
+            }
+            PluginTuiAction::Redraw
+        }
+    }
+
+    /// Per-test sinks keyed by the open request's options; the factory is a plain fn.
+    static RECORDED: Mutex<BTreeMap<String, Arc<Mutex<Vec<char>>>>> = Mutex::new(BTreeMap::new());
+
+    struct RecordingFactory;
+    impl PluginTuiSurfaceFactory for RecordingFactory {
+        fn surface_kind(&self) -> &'static str {
+            "recording"
+        }
+        fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
+            let recorded = request
+                .options
+                .as_str()
+                .and_then(|sink| RECORDED.lock().unwrap().get(sink).cloned())
+                .expect("recording sink");
+            Box::pin(async move { Ok(Box::new(Recording(recorded)) as BoxedPluginTuiSurface) })
+        }
+    }
+    fn registry() -> PluginTuiRegistry {
+        let mut registry = PluginTuiRegistry::default();
+        registry.register_factory(Box::new(RecordingFactory));
+        registry
+    }
+
+    /// The real author codec behind a port; `always_stale` makes it report every input
+    /// stale against an ever-advancing revision, as a misbehaving producer would.
+    struct Port {
+        author: Arc<dyn ProductComponentExtension>,
+        always_stale: AtomicBool,
+    }
+    impl ProductExtensionPort for Port {
+        fn ensure_active(&self) -> PluginResult<()> {
+            Ok(())
+        }
+        fn invoke(
+            &self,
+            contract: String,
+            payload: Vec<u8>,
+        ) -> PluginFuture<'_, PluginResult<Vec<u8>>> {
+            Box::pin(async move {
+                if contract == PRODUCT_EXTENSIONS_CONTRACT {
+                    let contract =
+                        |interface: &str, version| bmux_plugin_sdk::RegistrationContract {
+                            kind: bmux_plugin_sdk::RegistrationKind::Extension,
+                            interface: interface.to_owned(),
+                            version,
+                            name: interface.to_owned(),
+                        };
+                    return Ok(serde_json::to_vec(&ProductExtensionDescriptor {
+                        plugin_id: "test.replay".to_owned(),
+                        role: ComponentRole::Frontend,
+                        contracts: vec![
+                            contract(wire::TUI_FRONTEND_CONTRACT, wire::TUI_FRONTEND_VERSION),
+                            contract(
+                                bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID,
+                                bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION,
+                            ),
+                        ],
+                        native_frontend: false,
+                    })
+                    .unwrap());
+                }
+                assert_eq!(contract, wire::TUI_FRONTEND_CONTRACT);
+                if self.always_stale.load(Ordering::Acquire)
+                    && let wire::Request::Input {
+                        expected_revision, ..
+                    } = serde_json::from_slice(&payload).unwrap()
+                {
+                    return Ok(serde_json::to_vec(&wire::Response::Stale {
+                        revision: expected_revision + 1,
+                    })
+                    .unwrap());
+                }
+                self.author
+                    .invoke(
+                        PluginCallContext {
+                            callback_execution: None,
+                            invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),
+                            cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
+                            host_services: None,
+                        },
+                        payload,
+                    )
+                    .await
+            })
+        }
+    }
+
+    struct Harness {
+        surface: BoxedPluginTuiSurface,
+        view: Arc<RetainedFrontend>,
+        host: TokioPluginTuiHost,
+        recorded: Arc<Mutex<Vec<char>>>,
+        port: Arc<Port>,
+        _redraw: tokio::sync::mpsc::Receiver<()>,
+    }
+
+    impl Harness {
+        async fn open() -> Self {
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let sink = uuid::Uuid::new_v4().to_string();
+            RECORDED
+                .lock()
+                .unwrap()
+                .insert(sink.clone(), Arc::clone(&recorded));
+            let port = Arc::new(Port {
+                author: bcode_plugin_sdk::tui::portable::extension(
+                    registry,
+                    PluginCreateContext {
+                        runtime_scope: bmux_plugin_sdk::definition::RuntimeScopeId::from_uuid(
+                            uuid::Uuid::new_v4(),
+                        ),
+                        instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
+                            uuid::Uuid::new_v4(),
+                        ),
+                        role: ComponentRole::Frontend,
+                    },
+                ),
+                always_stale: AtomicBool::new(false),
+            });
+            let owner =
+                ProductExtensions::new(Arc::clone(&port) as Arc<dyn ProductExtensionPort>, None);
+            let view = RetainedFrontend::for_component(
+                owner.clone(),
+                1,
+                bmux_plugin::component_viewport::portable::PortablePresentationLimits::default(),
+            )
+            .await
+            .unwrap();
+            let surface = Factory {
+                correlated: None,
+                binding: None,
+                kind: "recording".to_owned(),
+                owner,
+                runtime: tokio::runtime::Handle::current(),
+                view: Arc::clone(&view),
+                actions: Vec::new(),
+            }
+            .open(PluginTuiSurfaceOpenRequest {
+                instance_id: "replay".to_owned(),
+                repo_path: None,
+                session_id: None,
+                target: None,
+                options: serde_json::Value::String(sink),
+            })
+            .await
+            .unwrap();
+            let (redraw, receiver) = tokio::sync::mpsc::channel(1);
+            Self {
+                surface,
+                view,
+                host: TokioPluginTuiHost::current(redraw),
+                recorded,
+                port,
+                _redraw: receiver,
+            }
+        }
+
+        /// Render until the producer's projection for `width` is painted, then commit it.
+        async fn display(&mut self, width: u16) {
+            let area = Rect::new(0, 0, width, 1);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    self.view.begin_display();
+                    let mut buffer = Buffer::empty(area);
+                    let mut frame = Frame::new(&mut buffer);
+                    self.surface.render_slice_with_host(
+                        1,
+                        0,
+                        area,
+                        &mut PaintCx::new(&mut frame),
+                        &self.host,
+                    );
+                    if !frame.hits().regions().is_empty() {
+                        self.view
+                            .display_succeeded(frame.hits(), frame.selection())
+                            .unwrap();
+                        break;
+                    }
+                    drop(frame);
+                    self.surface.poll(&self.host);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("producer projection must be displayed");
+        }
+
+        /// Make the producer prepare a newer revision that is collected but not displayed.
+        fn supersede(&mut self, width: u16) {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            self.surface.render_slice_with_host(
+                1,
+                0,
+                area,
+                &mut PaintCx::new(&mut frame),
+                &self.host,
+            );
+        }
+
+        /// Wait until every earlier worker request has completed and been collected.
+        async fn settle(&mut self) {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    match self.surface.drain_effects(&self.host).await {
+                        PluginTuiAction::None => break,
+                        PluginTuiAction::Redraw => {}
+                        action => panic!("unexpected action: {action:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("worker must settle");
+        }
+
+        fn press(&mut self, character: char) {
+            self.surface
+                .handle_event_result(&key(character), &self.host);
+        }
+
+        fn recorded(&self) -> Vec<char> {
+            self.recorded.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn key_against_superseded_revision_applies_exactly_once() {
+        let mut harness = Harness::open().await;
+        harness.display(4).await;
+        harness.supersede(5);
+        harness.settle().await;
+        // The producer is now at a newer revision than the one displayed.
+        harness.press('a');
+        harness.settle().await;
+        assert_eq!(harness.recorded(), vec!['a']);
+        harness.display(5).await;
+        harness.press('b');
+        harness.settle().await;
+        assert_eq!(harness.recorded(), vec!['a', 'b']);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn key_burst_across_revision_bump_preserves_order() {
+        let mut harness = Harness::open().await;
+        harness.display(4).await;
+        // Undisplayed revisions stay within the retained host's pending-publication bound.
+        harness.press('a');
+        harness.supersede(5);
+        harness.press('b');
+        harness.settle().await;
+        assert_eq!(harness.recorded(), vec!['a', 'b']);
+        harness.display(5).await;
+        harness.press('c');
+        harness.supersede(6);
+        harness.press('d');
+        harness.settle().await;
+        assert_eq!(harness.recorded(), vec!['a', 'b', 'c', 'd']);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exhausted_replay_surfaces_typed_failure() {
+        let mut harness = Harness::open().await;
+        harness.display(4).await;
+        harness.settle().await;
+        harness.port.always_stale.store(true, Ordering::Release);
+        harness.press('a');
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match harness.surface.poll(&harness.host) {
+                    PluginTuiAction::Close { outcome } => break outcome,
+                    PluginTuiAction::None | PluginTuiAction::Redraw => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    action => panic!("unexpected action: {action:?}"),
+                }
+            }
+        })
+        .await
+        .expect("exhausted replay must be visible");
+        let failure: wire::InputDeliveryFailure =
+            serde_json::from_value(outcome.expect("typed outcome")).unwrap();
+        assert!(matches!(
+            failure,
+            wire::InputDeliveryFailure::FrontendInputReplayExhausted { attempts, .. }
+                if attempts == MAX_INPUT_REPLAYS
+        ));
+        assert_eq!(harness.recorded(), Vec::<char>::new());
     }
 }

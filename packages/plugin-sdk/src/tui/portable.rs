@@ -35,15 +35,20 @@ mod tests;
 
 /// Independently negotiated terminal surface operation contract.
 ///
-/// Version 2 uses an adjacent `response` discriminator and `payload` content for
-/// responses. Version 1's flattened `outcome` discriminator collided with event
-/// outcomes and is not accepted. Producer and consumer share this codec.
+/// Responses use an adjacent `response` discriminator and `payload` content.
+/// Version 1's flattened `outcome` discriminator collided with event outcomes and
+/// is not accepted. Producer and consumer share this codec.
 /// Deferred edits use one in-flight edit per resource and `EditStatus` polling;
 /// peers lacking that operation reject it rather than replaying an admitted edit.
 /// Unknown edit outcomes remain explicitly unsettled and never authorize fallback.
-pub const TUI_FRONTEND_CONTRACT: &str = "bcode.tui.frontend/v2";
+///
+/// Version 3 adds [`Response::Stale`]: input naming a superseded revision is
+/// reported as not applied, distinctly from handled input, so the host can
+/// re-deliver it against the current revision. Version 2 silently consumed such
+/// input and is not accepted.
+pub const TUI_FRONTEND_CONTRACT: &str = "bcode.tui.frontend/v3";
 /// Negotiated schema version for terminal surface operations.
-pub const TUI_FRONTEND_VERSION: u32 = 2;
+pub const TUI_FRONTEND_VERSION: u32 = 3;
 const MAX_SURFACES: usize = 128;
 const MAX_BYTES: usize = crate::SERVICE_BRIDGE_MAX_RESPONSE_BYTES;
 
@@ -200,6 +205,35 @@ pub enum Response {
     Text(Vec<String>),
     EditStatus(Option<PluginTuiFocusedTextFieldEditResult>),
     Applied,
+    /// Plain input named a revision the surface has already superseded. Nothing was
+    /// applied; `revision` is the surface's current revision, which the host may name
+    /// when re-delivering the same input. Fenced operations such as focused text field
+    /// edits never use this outcome: they reject as stale instead.
+    Stale {
+        revision: u64,
+    },
+}
+
+/// Typed host outcome when plain surface input could not be delivered.
+///
+/// Hosts surface it as the `outcome` of a closing [`PluginTuiAction::Close`]: once an
+/// input is lost, later input would apply out of order, so the surface fails closed
+/// visibly instead of silently dropping a keystroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputDeliveryFailure {
+    /// Stale input was re-delivered `attempts` times while the surface kept advancing.
+    FrontendInputReplayExhausted {
+        /// Re-deliveries attempted after the original delivery.
+        attempts: u32,
+        /// The surface revision reported by the final stale response.
+        revision: u64,
+    },
+    /// More input arrived than the host's bounded per-surface backlog admits.
+    FrontendInputBacklogExceeded {
+        /// The backlog bound that was exceeded.
+        capacity: usize,
+    },
 }
 
 struct Surface {
@@ -875,8 +909,15 @@ impl AuthorFrontend {
                 focused,
                 ..
             } => {
-                if surface.revision != expected_revision {
-                    return Ok(Response::Event(PluginTuiEventResult::consumed()));
+                if expected_revision < surface.revision {
+                    // Report rather than consume: the host re-delivers plain input
+                    // against the current revision instead of losing it.
+                    return Ok(Response::Stale {
+                        revision: surface.revision,
+                    });
+                }
+                if expected_revision != surface.revision {
+                    return Err(failure("frontend input names an unprepared revision"));
                 }
                 surface.host.set_text_input_resolver(Arc::new(bindings));
                 let result = if focused {

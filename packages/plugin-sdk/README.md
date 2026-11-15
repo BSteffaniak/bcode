@@ -207,10 +207,18 @@ merely supplying an empty adapter is not rich frontend support.
 `with_frontend(factory)` automatically installs exactly one B3 portable adapter
 per selected frontend instance using that same factory and `PluginCreateContext`.
 Both serial and concurrent definitions take this path; backend components do not
-install or advertise it. The current contract is **`bcode.tui.frontend/v2`, version
-2**. Frontend-v1's flattened response discriminator collided with event outcomes;
-there is no fallback/reinterpretation as v1. Registration and both shared invocation
-paths use B3's `TUI_FRONTEND_CONTRACT` / `TUI_FRONTEND_VERSION` constants.
+install or advertise it. The current contract is **`bcode.tui.frontend/v3`, version
+3**. Frontend-v1's flattened response discriminator collided with event outcomes;
+there is no fallback/reinterpretation as v1 or v2. Registration and both shared
+invocation paths use B3's `TUI_FRONTEND_CONTRACT` / `TUI_FRONTEND_VERSION` constants.
+
+Plain input carries the revision the host displayed. Version 3 answers input that
+names a superseded revision with `Response::Stale { revision }` (nothing applied)
+instead of silently consuming it, and the host re-delivers the same input once
+against the current revision, in order with later input. Re-delivery is bounded;
+exhaustion closes the surface with a typed `InputDeliveryFailure` outcome rather
+than dropping the input. Fenced operations that reference a displayed snapshot,
+such as focused text field edits, still reject as stale and are never re-delivered.
 
 The paired `bmux.presentation.retained.v2` advertisement identifies the scene
 schema embedded in frontend-v2 render responses, not a second product RPC handler.

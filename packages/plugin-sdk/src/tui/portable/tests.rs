@@ -27,6 +27,7 @@ fn response_envelope_roundtrips_nested_outcomes_and_sequence_payloads() {
         Response::Action(PluginTuiAction::None),
         Response::Text(vec!["界".to_owned()]),
         Response::Applied,
+        Response::Stale { revision: 7 },
     ];
     for response in responses {
         let bytes = serde_json::to_vec(&response).unwrap();
@@ -39,6 +40,10 @@ fn response_envelope_roundtrips_nested_outcomes_and_sequence_payloads() {
     let encoded = serde_json::to_value(Response::Event(event.clone())).unwrap();
     assert_eq!(encoded["response"], "event");
     assert_eq!(encoded["payload"], serde_json::to_value(event).unwrap());
+    assert_eq!(
+        serde_json::to_value(Response::Stale { revision: 7 }).unwrap(),
+        serde_json::json!({"response":"stale","payload":{"revision":7}})
+    );
     assert!(serde_json::from_str::<Response>(r#"{"outcome":"applied"}"#).is_err());
     assert!(serde_json::from_str::<Response>(r#"{"response":"future"}"#).is_err());
 }
@@ -292,6 +297,140 @@ async fn deferred_edit_status_delivers_one_terminal_result_without_replaying_mut
     );
 }
 
+/// Records each delivered event; a field edit reaching it would be a fence violation.
+struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+impl PluginTuiSurface for Counting {
+    fn id(&self) -> &'static str {
+        "counting"
+    }
+    fn title(&self) -> &'static str {
+        "Counting"
+    }
+    fn render(&mut self, _: Rect, _: &mut PaintCx<'_, '_>) {}
+    fn handle_event(&mut self, _: &Event, _: &dyn PluginTuiHost) -> PluginTuiAction {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        PluginTuiAction::Redraw
+    }
+    fn apply_focused_text_field_edit_result(
+        &mut self,
+        _: &FocusedTextFieldEdit,
+        _: &dyn PluginTuiHost,
+    ) -> PluginTuiFocusedTextFieldEditResult {
+        panic!("a stale field edit must never reach the surface");
+    }
+}
+
+/// One counting surface at `revision`, executed directly through the author codec.
+fn counting_state(
+    applied: Arc<std::sync::atomic::AtomicUsize>,
+    revision: u64,
+) -> (State, uuid::Uuid) {
+    let resource = uuid::Uuid::new_v4();
+    let (redraw_sender, redraw) = mpsc::channel(1);
+    let (updates, _) = mpsc::channel(1);
+    let state = State {
+        registry: None,
+        surfaces: BTreeMap::from([(
+            resource,
+            Surface {
+                implementation: Box::new(Counting(applied)),
+                host: TokioPluginTuiHost::current(redraw_sender),
+                redraw,
+                updates,
+                scene: PresentationState::new(Rect::new(0, 0, 1, 1)),
+                revision,
+                dirty: false,
+                viewport: None,
+                bindings: None,
+                edit_pending: false,
+            },
+        )]),
+    };
+    (state, resource)
+}
+
+/// A focused field edit fenced to a snapshot taken at a superseded revision.
+fn superseded_field_edit() -> FocusedTextFieldEdit {
+    let snapshot = FocusedTextFieldSnapshot {
+        identity: FocusedTextFieldIdentity {
+            owner_id: "counting".to_owned(),
+            field_id: "counting.field".to_owned(),
+            lifetime: 1,
+        },
+        generation: 1,
+        document: bcode_plugin_models::composer::ComposerDocument {
+            document_id: "document".to_owned(),
+            revision: 1,
+            text: String::new(),
+            cursor: 0,
+            selection: None,
+        },
+        eligible: true,
+        content_rect: Rect::new(0, 0, 1, 1),
+        anchor: Rect::new(0, 0, 1, 1),
+    };
+    FocusedTextFieldEdit {
+        edit: bcode_plugin_models::composer::ComposerEdit {
+            document_id: "document".to_owned(),
+            revision: 1,
+            range: bcode_plugin_models::composer::ComposerTextRange { start: 0, end: 0 },
+            expected_text: String::new(),
+            replacement: "x".to_owned(),
+            cursor: 1,
+        },
+        expected: snapshot,
+    }
+}
+
+#[tokio::test]
+async fn superseded_input_reports_stale_while_fenced_edits_still_reject() {
+    let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut state, resource) = counting_state(Arc::clone(&applied), 5);
+    let input = |expected_revision| Request::Input {
+        resource,
+        expected_revision,
+        event: Event::Tick,
+        bindings: Bindings::default(),
+        focused: false,
+    };
+    assert!(matches!(
+        AuthorFrontend::execute_surface(&mut state, input(4))
+            .await
+            .unwrap(),
+        Response::Stale { revision: 5 }
+    ));
+    assert_eq!(applied.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        AuthorFrontend::execute_surface(&mut state, input(5)).await.unwrap(),
+        Response::Event(result) if result.action == PluginTuiAction::Redraw
+    ));
+    assert_eq!(applied.load(Ordering::Acquire), 1);
+    // A revision the surface never prepared is a protocol violation, not staleness.
+    assert!(
+        AuthorFrontend::execute_surface(&mut state, input(6))
+            .await
+            .is_err()
+    );
+    assert_eq!(applied.load(Ordering::Acquire), 1);
+    let edit = superseded_field_edit();
+    let rejected = AuthorFrontend::execute_surface(
+        &mut state,
+        Request::Edit {
+            resource,
+            expected_revision: 4,
+            edit: Box::new(edit),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        rejected,
+        Response::Edit(result) if result.edit_result == FocusedTextFieldEditResult::Rejected(
+            bcode_plugin_models::composer::ComposerValidationError::Stale
+        )
+    ));
+}
+
 async fn invoke(adapter: &Arc<dyn ProductComponentExtension>, request: Request) -> Response {
     let payload = serde_json::to_vec(&request).unwrap();
     serde_json::from_slice(&adapter.invoke(call(), payload).await.unwrap()).unwrap()
@@ -532,13 +671,14 @@ async fn verify_rich_scene_and_input_revision_fences(
         first.scene.text.values().next().map(String::as_str),
         Some("界")
     );
+    // Superseded input is reported as not applied, never silently consumed.
     assert!(matches!(invoke(adapter, Request::Input {
         resource,
         expected_revision: 0,
         event: Event::Paste("e\u{301}".to_owned()),
         bindings: Bindings::default(),
         focused: false,
-    }).await, Response::Event(result) if result == PluginTuiEventResult::consumed()));
+    }).await, Response::Stale { revision } if revision == first.revision));
     invoke(
         adapter,
         Request::Input {

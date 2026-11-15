@@ -258,6 +258,28 @@ impl RetainedFrontend {
         Ok(())
     }
 
+    /// The revision whose displayed lease currently admits input for `resource`.
+    ///
+    /// Returns `None` for hidden, retired, display-suspended or foreign-generation
+    /// resources. Like [`Self::validate_displayed`], this issues no queued authority.
+    #[must_use]
+    pub fn displayed_revision(&self, resource: FrontendResourceId, generation: u64) -> Option<u64> {
+        self.owner.ensure_active().ok()?;
+        let state = self.state.lock().ok()?;
+        let (displayed_generation, revision, _, _) = *state.displayed.get(&resource)?;
+        if displayed_generation != generation {
+            return None;
+        }
+        let lease = state
+            .resources
+            .as_ref()?
+            .committed_for_input(resource, generation, revision)
+            .ok()?;
+        drop(state);
+        drop(lease);
+        Some(revision)
+    }
+
     fn from_owner(
         owner: ProductExtensions,
         namespace: &str,

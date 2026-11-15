@@ -4561,6 +4561,99 @@ library = "libcomposer_fixture.dylib"
         drop(presentation);
     }
 
+    /// Make the native producer prepare a newer revision without displaying it.
+    fn supersede_native_hello(
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        width: u16,
+    ) {
+        let area = bmux_tui::geometry::Rect::new(0, 0, width, 3);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        surface.render_slice_with_host(
+            3,
+            0,
+            area,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            host,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_native_hello_replays_keys_across_revision_bumps() {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        use bcode_plugin_sdk::tui::{FocusedTextFieldEdit, FocusedTextFieldEditResult};
+        let artifact = hello_dynamic_library_path();
+        let presentation = tokio::task::spawn_blocking(move || {
+            selected_native_hello_presentation(artifact).unwrap()
+        })
+        .await
+        .unwrap();
+        let mut surface = open_native_hello(&presentation).await;
+        let (redraw, _receiver) = tokio::sync::mpsc::channel(1);
+        let host = bcode_plugin_sdk::tui::TokioPluginTuiHost::current(redraw);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 12, 3);
+        wait_for_native_hello_projection(&presentation, surface.as_mut(), &host, area).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        let expected = surface
+            .focused_text_field()
+            .expect("displayed actual editor");
+        // The producer advances to a revision the host has collected but not displayed.
+        wait_for_native_hello_projection(
+            &presentation,
+            surface.as_mut(),
+            &host,
+            bmux_tui::geometry::Rect::new(0, 0, 13, 3),
+        )
+        .await;
+        assert!(matches!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::None | PluginTuiAction::Redraw
+        ));
+        // A field edit fenced to the superseded snapshot still rejects; it is never replayed.
+        let edit = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange { start: 0, end: 4 },
+                expected_text: "@src".to_owned(),
+                replacement: "界".to_owned(),
+                cursor: "界".len(),
+            },
+            expected,
+        };
+        assert!(matches!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &host)
+                .edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        // Plain keys pressed against the displayed, superseded revision are re-delivered
+        // against the current one, each exactly once and in order.
+        surface.handle_event_result(&native_hello_key('e'), &host);
+        assert_eq!(
+            next_native_hello_effect(surface.as_mut(), &host).await,
+            serde_json::json!({"kind":"hello.effect", "sequence":1})
+        );
+        // Display the current projection, then supersede it again with keys in flight on
+        // both sides of the bump. Undisplayed revisions stay within the retained host's
+        // pending-publication bound.
+        refresh_native_hello_editor(&presentation, surface.as_mut(), &host).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        surface.handle_event_result(&native_hello_key('e'), &host);
+        supersede_native_hello(surface.as_mut(), &host, 14);
+        surface.handle_event_result(&native_hello_key('e'), &host);
+        for sequence in 2..=3 {
+            assert_eq!(
+                next_native_hello_effect(surface.as_mut(), &host).await,
+                serde_json::json!({"kind":"hello.effect", "sequence":sequence})
+            );
+        }
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        presentation.fail_retained_display();
+        drop(presentation);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn startup_selected_native_hello_focus_toggle_revokes_field_snapshot() {
         let artifact = hello_dynamic_library_path();
