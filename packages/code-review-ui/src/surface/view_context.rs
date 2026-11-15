@@ -298,6 +298,8 @@ impl ReviewSurface {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    files_omitted: delta
+                        .map_or(0, |delta| delta.files.len().saturating_sub(MAX_DELTA_FILES)),
                     hidden: doc.source_filtered(&layer.source_id),
                     version: comparison
                         .filter(|comparison| !comparison.steps.is_empty())
@@ -369,6 +371,8 @@ impl ReviewSurface {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    files_omitted: delta
+                        .map_or(0, |delta| delta.files.len().saturating_sub(MAX_DELTA_FILES)),
                 })
             })
             .collect()

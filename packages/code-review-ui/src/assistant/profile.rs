@@ -287,8 +287,9 @@ pub fn client_tools() -> Vec<ClientToolDescriptor> {
                       source's result and changed files, the stack's recent pushes), the file, \
                       cursor and selected lines, threads on the file and the focused thread, \
                       and loaded pull request state. Pass `sections` to read only some of it \
-                      and `max_files` to list fewer files per layer. A `truncated` object says \
-                      what was left out to fit."
+                      and `max_files` to list fewer files per layer; a shortened list has a \
+                      count of what it left out beside it (`files_omitted`, `omitted`). A \
+                      `truncated` object says what was left out to fit."
             .to_owned(),
         input_schema: serde_json::json!({
             "type": "object",

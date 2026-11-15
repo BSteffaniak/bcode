@@ -618,7 +618,9 @@ Where the built panel differs from the design above:
   source (100 by default). An answer over 64 KiB shortens lists (files per layer, selection,
   threads, sources, pushes), then drops sections (pull request, threads, selection, comparison,
   sources, home, wizard), then keeps only the screen; it is always valid JSON, and a `truncated`
-  object lists what was shortened or dropped and where to read it in full. The comparison also
+  object lists what was shortened or dropped and where to read it in full. A shortened list
+  carries a count of what it left out: `files_omitted` beside a layer's or source's `files`,
+  `omitted` in a bounded list (`items`, `total`, `omitted`). The comparison also
   lists the stack's newest 20 pushes (numbered as `set_comparison pushes` takes them) and, for
   sources that are not pull request layers but are compared with their last completed pass,
   each source's result (`sources` in JSON; `source_results` in the view block, `source_deltas`

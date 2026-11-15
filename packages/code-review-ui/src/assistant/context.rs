@@ -207,6 +207,9 @@ pub struct LayerView {
     pub to: String,
     /// Files differing from the baseline.
     pub files: Vec<FileDelta>,
+    /// Files differing from the baseline left out of `files`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub files_omitted: usize,
     /// Whether the layer is hidden (only pull requests with real changes show).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
@@ -246,6 +249,14 @@ pub struct SourceResult {
     pub to: String,
     /// Files differing from the baseline.
     pub files: Vec<FileDelta>,
+    /// Files differing from the baseline left out of `files`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub files_omitted: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// One push of the stack, as the comparison can pick it.
@@ -704,25 +715,43 @@ fn shorten(value: &mut serde_json::Value, pointer: &str, keep: usize) -> bool {
         }
         return cut;
     }
-    let cut = match value.pointer_mut(pointer) {
+    let removed = match value.pointer_mut(pointer) {
         Some(serde_json::Value::Array(items)) if items.len() > keep => {
+            let removed = items.len() - keep;
             items.truncate(keep);
-            true
+            removed
         }
-        _ => false,
+        _ => return false,
     };
-    // A bounded list (`items`, `total`, `omitted`) keeps saying how many are left out.
-    if cut
-        && let Some(parent) = pointer.strip_suffix("/items")
-        && let Some(list) = value
-            .pointer_mut(parent)
-            .and_then(|list| list.as_object_mut())
+    let Some((parent, field)) = pointer.rsplit_once('/') else {
+        return true;
+    };
+    let Some(list) = value
+        .pointer_mut(parent)
+        .and_then(|list| list.as_object_mut())
+    else {
+        return true;
+    };
+    if field == "items"
         && let Some(total) = list.get("total").and_then(serde_json::Value::as_u64)
     {
+        // A bounded list (`items`, `total`, `omitted`) keeps saying how many are left out.
         let kept = u64::try_from(keep).unwrap_or(u64::MAX).min(total);
         list.insert("omitted".to_owned(), serde_json::Value::from(total - kept));
+    } else {
+        // A plain list keeps a count of what it left out beside it (`files_omitted`).
+        let counted = format!("{field}_omitted");
+        let before = list
+            .get(&counted)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let removed = u64::try_from(removed).unwrap_or(u64::MAX);
+        list.insert(
+            counted,
+            serde_json::Value::from(before.saturating_add(removed)),
+        );
     }
-    cut
+    true
 }
 
 /// Remove the field at `pointer`. Returns whether it was there.
@@ -1452,6 +1481,7 @@ mod tests {
                             removed: 1,
                         })
                         .collect(),
+                    files_omitted: 0,
                 })
                 .collect(),
             pushes: Some(Listed::of(
@@ -1481,6 +1511,7 @@ mod tests {
                         removed: 1,
                     })
                     .collect(),
+                files_omitted: 0,
                 hidden: false,
                 version: Some((2, 4)),
             })
@@ -1649,6 +1680,43 @@ mod tests {
                 .as_array()
                 .is_some_and(|files| files.len() == 3),
             "{answer}"
+        );
+        // A shortened files list says how many it left out.
+        assert_eq!(
+            value["review"]["comparison"]["sources"][0]["files_omitted"], 197,
+            "{answer}"
+        );
+        assert_eq!(
+            value["review"]["comparison"]["layers"][0]["files_omitted"], 47,
+            "{answer}"
+        );
+        // Files left out before the answer was built count too.
+        let mut capped = small.clone();
+        let layer = &mut capped
+            .review
+            .as_mut()
+            .and_then(|review| review.comparison.as_mut())
+            .expect("comparison")
+            .layers[0];
+        layer.files.truncate(10);
+        layer.files_omitted = 40;
+        let answer = capped.tool_answer(r#"{"max_files":3}"#).expect("answer");
+        let value: serde_json::Value = serde_json::from_str(&answer).expect("valid JSON");
+        assert_eq!(
+            value["review"]["comparison"]["layers"][0]["files_omitted"], 47,
+            "{answer}"
+        );
+        let whole = capped.tool_answer("").expect("answer");
+        let value: serde_json::Value = serde_json::from_str(&whole).expect("valid JSON");
+        assert_eq!(
+            value["review"]["comparison"]["layers"][0]["files_omitted"], 40,
+            "{whole}"
+        );
+        assert!(
+            value["review"]["comparison"]["layers"][1]
+                .get("files_omitted")
+                .is_none(),
+            "a whole list has no count: {whole}"
         );
         assert_eq!(
             value["review"]["comparison"]["pushes"]["items"][0]["number"], 1,
