@@ -287,6 +287,8 @@ impl ReviewSurface {
             stacks,
             created_at_ms: 0,
             updated_at_ms: 0,
+            started: None,
+            detached_at_ms: None,
         }
     }
 
@@ -405,7 +407,8 @@ impl ReviewSurface {
                         repo.clone(),
                         crate::host::review_session_origin(
                             crate::host::ReviewSessionPurpose::Assistant,
-                            &template.workspace.id,
+                            Some(&template.workspace.id),
+                            None,
                         ),
                     )
                     .await

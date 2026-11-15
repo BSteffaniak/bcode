@@ -220,6 +220,10 @@ store_operations! {
         "review.assistant.bind", |store, request| store.bind_assistant(request);
     models::GetReviewAssistantRequest => models::GetReviewAssistantResponse,
         "review.assistant.get", |store, request| store.assistant_binding(&request);
+    models::ListReviewAssistantsRequest => models::ListReviewAssistantsResponse,
+        models::OP_REVIEW_ASSISTANT_LIST, |store, request| store.list_assistants(&request);
+    models::UnbindReviewAssistantRequest => models::UnbindReviewAssistantResponse,
+        models::OP_REVIEW_ASSISTANT_UNBIND, |store, request| store.unbind_assistant(&request);
     PreviewBundle => models::PublishReviewPreviewResponse,
         models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW,
         |_store, request| bcode_code_review::store::preview_bundle(&request.0);

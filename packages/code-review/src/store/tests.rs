@@ -1576,3 +1576,177 @@ fn looks_upsert_by_head_and_kind_seed_idempotently_and_prune_old_heads() {
     assert_eq!(kept.len(), MAX_LOOK_HEADS_PER_PULL);
     assert!(kept.iter().all(|look| look.head_oid != "h00"));
 }
+
+#[test]
+fn assistant_bindings_keep_where_they_started_and_list_and_unbind() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git_test(&repo, &["init", "--quiet"]);
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let workspace = |id: &str, title: &str| {
+        let mut workspace = test_workspace(&repo, Vec::new());
+        workspace.id = id.to_owned();
+        workspace.title = title.to_owned();
+        workspace
+    };
+    let bind = |session: &str, workspace: ReviewWorkspace, detached: bool| {
+        bind_assistant_for_request(
+            BindReviewAssistantRequest {
+                repo_path: repo.clone(),
+                binding: ReviewAssistantBinding {
+                    schema_version:
+                        bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+                    session_id: session.to_owned(),
+                    workspace,
+                    resolved: Vec::new(),
+                    stacks: Vec::new(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    started: None,
+                    detached_at_ms: detached.then_some(1),
+                },
+            },
+            &config,
+        )
+        .expect("bind")
+        .binding
+    };
+
+    // First saved in a review: it started there, and rebinding elsewhere keeps that.
+    let first = bind("s-1", workspace("rv-1", "Retry"), false);
+    let started = first.started.expect("started");
+    assert_eq!(started.workspace_id.as_deref(), Some("rv-1"));
+    assert_eq!(started.title.as_deref(), Some("Retry"));
+    let moved = bind("s-1", workspace("rv-2", "Auth"), false);
+    assert_eq!(moved.started, Some(started.clone()));
+    let detached = bind("s-1", workspace("rv-2", "Auth"), true);
+    assert_eq!(detached.started, Some(started));
+    assert!(detached.is_detached());
+
+    // First saved detached: it started where no review was on screen.
+    let home = bind("s-2", workspace("rv-1", "Retry"), true);
+    assert_eq!(home.started, Some(ReviewAssistantTag::none()));
+    // A detached session is never the newest binding of a review.
+    let newest = assistant_binding_for_request(
+        &GetReviewAssistantRequest {
+            repo_path: repo.clone(),
+            lookup: ReviewAssistantLookup::Review {
+                workspace_id: "rv-2".to_owned(),
+            },
+        },
+        &config,
+    )
+    .expect("lookup")
+    .binding;
+    assert!(newest.is_none(), "{newest:?}");
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    bind("s-3", workspace("rv-1", "Retry"), false);
+    let list = |limit| {
+        list_assistants_for_request(
+            &bcode_code_review_models::ListReviewAssistantsRequest {
+                repo_path: repo.clone(),
+                limit,
+            },
+            &config,
+        )
+        .expect("list")
+    };
+    let listed = list(None);
+    assert_eq!(
+        listed.bindings.first().map(|b| b.session_id.as_str()),
+        Some("s-3")
+    );
+    assert_eq!(listed.bindings.len(), 3);
+    assert!(!listed.truncated);
+    let bounded = list(Some(2));
+    assert_eq!(bounded.bindings.len(), 2);
+    assert!(bounded.truncated);
+
+    let unbind = || {
+        unbind_assistant_for_request(
+            &bcode_code_review_models::UnbindReviewAssistantRequest {
+                repo_path: repo.clone(),
+                session_id: "s-1".to_owned(),
+            },
+            &config,
+        )
+        .expect("unbind")
+        .removed
+    };
+    assert!(unbind());
+    assert!(!unbind(), "unbinding again is a no-op");
+    assert_eq!(list(None).bindings.len(), 2);
+}
+
+#[test]
+fn assistant_rows_written_before_tags_existed_are_tagged_with_their_review_when_moved() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git_test(&repo, &["init", "--quiet"]);
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let mut workspace = test_workspace(&repo, Vec::new());
+    workspace.id = "rv-legacy".to_owned();
+    workspace.title = "Legacy".to_owned();
+    // A row as an earlier version wrote it: no `started`, no `detached_at_ms` fields.
+    let legacy = serde_json::json!({
+        "schema_version": bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+        "session_id": "old",
+        "workspace": workspace,
+        "created_at_ms": 5,
+        "updated_at_ms": 5,
+    });
+    let resolved = resolve_repo_root(&repo).expect("root");
+    let db_root = resolved.clone();
+    with_database(&resolved, &config, move |database| {
+        Box::pin(async move {
+            database
+                .insert("review_assistant_sessions")
+                .value("session_id", "old".to_owned())
+                .value("workspace_id", "rv-legacy".to_owned())
+                .value("repo_root", db_root.display().to_string())
+                .value("binding_json", legacy.to_string())
+                .value("created_at_ms", 5_i64)
+                .value("updated_at_ms", 5_i64)
+                .execute(database)
+                .await?;
+            Ok::<_, StoreError>(())
+        })
+    })
+    .expect("legacy row");
+    let listed = list_assistants_for_request(
+        &bcode_code_review_models::ListReviewAssistantsRequest {
+            repo_path: repo.clone(),
+            limit: None,
+        },
+        &config,
+    )
+    .expect("list");
+    assert_eq!(listed.bindings.len(), 1, "legacy rows are listed");
+    assert_eq!(listed.bindings[0].started, None);
+
+    let mut moved = listed.bindings[0].clone();
+    moved.workspace.id = "rv-new".to_owned();
+    let moved = bind_assistant_for_request(
+        BindReviewAssistantRequest {
+            repo_path: repo,
+            binding: moved,
+        },
+        &config,
+    )
+    .expect("rebind")
+    .binding;
+    assert_eq!(
+        moved.started.and_then(|started| started.workspace_id),
+        Some("rv-legacy".to_owned())
+    );
+    assert_eq!(moved.created_at_ms, 5);
+}

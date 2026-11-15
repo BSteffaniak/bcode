@@ -37,17 +37,17 @@ use bcode_code_review_models::{
     ListReviewWorkspacesResponse, PublishReviewPreviewResponse, PublishReviewRequest,
     PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest,
     ResolveThreadResponse, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
-    ReviewAssistantBinding, ReviewAssistantLookup, ReviewBundle, ReviewBundleLine,
-    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
-    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
-    ReviewPublisherManifest, ReviewScope, ReviewSource, ReviewSourceKind, ReviewSuggestion,
-    ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind,
-    ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem, SaveDraftRequest,
-    SaveDraftResponse, SaveExternalReviewImportRequest, SaveExternalReviewImportResponse,
-    SavePublishRecordRequest, SavePublishRecordResponse, SaveReviewAiExchangeRequest,
-    SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest, SaveReviewSuggestionResponse,
-    UpdateDraftRequest, UpdateDraftResponse, UpdateReviewWorkspaceRequest,
-    UpdateReviewWorkspaceResponse,
+    ReviewAssistantBinding, ReviewAssistantLookup, ReviewAssistantTag, ReviewBundle,
+    ReviewBundleLine, ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus,
+    ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord,
+    ReviewPublisherCapabilities, ReviewPublisherManifest, ReviewScope, ReviewSource,
+    ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind,
+    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem,
+    SaveDraftRequest, SaveDraftResponse, SaveExternalReviewImportRequest,
+    SaveExternalReviewImportResponse, SavePublishRecordRequest, SavePublishRecordResponse,
+    SaveReviewAiExchangeRequest, SaveReviewAiExchangeResponse, SaveReviewSuggestionRequest,
+    SaveReviewSuggestionResponse, UpdateDraftRequest, UpdateDraftResponse,
+    UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
 use bcode_path_display::display_from_current_dir;
 use serde::{Deserialize, Serialize};
@@ -263,6 +263,14 @@ store_operations! {
     /// The binding of a session, or the newest binding of a review.
     assistant_binding(&GetReviewAssistantRequest) -> GetReviewAssistantResponse
         => assistant_binding_for_request;
+    /// Assistant bindings of a repository, most recently refreshed first.
+    list_assistants(&bcode_code_review_models::ListReviewAssistantsRequest)
+        -> bcode_code_review_models::ListReviewAssistantsResponse
+        => list_assistants_for_request;
+    /// Remove one session's assistant binding.
+    unbind_assistant(&bcode_code_review_models::UnbindReviewAssistantRequest)
+        -> bcode_code_review_models::UnbindReviewAssistantResponse
+        => unbind_assistant_for_request;
     /// Summary of a review target with its draft counts.
     review_context(ReviewContextRequest) -> ReviewContextResponse => review_context_for_request;
     /// Draft threads of a review target.
@@ -1730,6 +1738,43 @@ fn assistant_binding_for_request(
         })
     })?;
     Ok(GetReviewAssistantResponse { binding })
+}
+
+fn list_assistants_for_request(
+    request: &bcode_code_review_models::ListReviewAssistantsRequest,
+    config: &CodeReviewConfig,
+) -> Result<bcode_code_review_models::ListReviewAssistantsResponse, StoreError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let max = bcode_code_review_models::MAX_REVIEW_ASSISTANT_LIST;
+    let limit = usize::try_from(request.limit.unwrap_or(max).clamp(1, max)).unwrap_or(usize::MAX);
+    let db_repo_root = repo_root.clone();
+    let (bindings, truncated) = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .list_assistant_bindings(&db_repo_root, limit)
+                .await
+        })
+    })?;
+    Ok(bcode_code_review_models::ListReviewAssistantsResponse {
+        bindings,
+        truncated,
+    })
+}
+
+fn unbind_assistant_for_request(
+    request: &bcode_code_review_models::UnbindReviewAssistantRequest,
+    config: &CodeReviewConfig,
+) -> Result<bcode_code_review_models::UnbindReviewAssistantResponse, StoreError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let session_id = request.session_id.clone();
+    let removed = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .delete_assistant_binding(&session_id)
+                .await
+        })
+    })?;
+    Ok(bcode_code_review_models::UnbindReviewAssistantResponse { removed })
 }
 
 fn list_ai_exchanges_for_request(

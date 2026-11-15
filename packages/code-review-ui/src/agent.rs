@@ -621,7 +621,8 @@ pub async fn ask(
                 scope.repo_path.clone(),
                 crate::host::review_session_origin(
                     crate::host::ReviewSessionPurpose::Question,
-                    &binding.workspace.id,
+                    Some(&binding.workspace.id),
+                    None,
                 ),
             )
             .await

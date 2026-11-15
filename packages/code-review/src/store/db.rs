@@ -483,7 +483,10 @@ impl<'a> CodeReviewDb<'a> {
             .assistant_binding_for_session(&binding.session_id)
             .await?;
         binding.updated_at_ms = now;
-        binding.created_at_ms = existing.map_or(now, |existing| existing.created_at_ms);
+        binding.created_at_ms = existing
+            .as_ref()
+            .map_or(now, |existing| existing.created_at_ms);
+        binding.started = Some(started_tag(existing.as_ref(), &binding, workspace_id));
         let json = serde_json::to_string(&binding)?;
         if self
             .db
@@ -533,7 +536,58 @@ impl<'a> CodeReviewDb<'a> {
         Ok(row.as_ref().and_then(assistant_binding_from_row))
     }
 
-    /// The most recently refreshed readable binding of the review scoped by `workspace_id`.
+    /// Readable bindings of the repository at `repo_root`, most recently refreshed first, at
+    /// most `limit`; also whether more exist.
+    pub async fn list_assistant_bindings(
+        &self,
+        repo_root: &Path,
+        limit: usize,
+    ) -> Result<(Vec<ReviewAssistantBinding>, bool), StoreError> {
+        let rows = self
+            .db
+            .select("review_assistant_sessions")
+            .columns(&["binding_json"])
+            .filter(Box::new(where_eq(
+                "repo_root",
+                repo_root.display().to_string(),
+            )))
+            .execute(self.db)
+            .await?;
+        let mut bindings: Vec<ReviewAssistantBinding> =
+            rows.iter().filter_map(assistant_binding_from_row).collect();
+        bindings.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        let truncated = bindings.len() > limit;
+        bindings.truncate(limit);
+        Ok((bindings, truncated))
+    }
+
+    /// Remove the binding of `session_id`; returns whether one existed.
+    pub async fn delete_assistant_binding(&self, session_id: &str) -> Result<bool, StoreError> {
+        let existing = self
+            .db
+            .select("review_assistant_sessions")
+            .columns(&["session_id"])
+            .filter(Box::new(where_eq("session_id", session_id.to_string())))
+            .execute_first(self.db)
+            .await?;
+        if existing.is_none() {
+            return Ok(false);
+        }
+        self.db
+            .delete("review_assistant_sessions")
+            .filter(Box::new(where_eq("session_id", session_id.to_string())))
+            .execute(self.db)
+            .await?;
+        Ok(true)
+    }
+
+    /// The most recently refreshed readable attached binding of the review scoped by
+    /// `workspace_id`.
     pub async fn assistant_binding_for_review(
         &self,
         workspace_id: &str,
@@ -548,6 +602,7 @@ impl<'a> CodeReviewDb<'a> {
         Ok(rows
             .iter()
             .filter_map(assistant_binding_from_row)
+            .filter(|binding| !binding.is_detached())
             .max_by_key(|binding| (binding.updated_at_ms, binding.session_id.clone())))
     }
 
@@ -1799,6 +1854,47 @@ pub fn ai_exchange_status_from_str(value: &str) -> Result<ReviewAiExchangeStatus
             "unsupported review AI exchange status: {value}"
         ))),
     }
+}
+
+/// Where a session's conversation started, kept from the first binding ever saved for it.
+///
+/// * An existing row's `started` is kept.
+/// * An existing row without one was written before tags were recorded, while it was attached
+///   to its review: that review is where it started.
+/// * A new row keeps the tag it was saved with, else its review (or no review when it is saved
+///   detached).
+fn started_tag(
+    existing: Option<&ReviewAssistantBinding>,
+    binding: &ReviewAssistantBinding,
+    workspace_id: &str,
+) -> ReviewAssistantTag {
+    let tag_of = |binding: &ReviewAssistantBinding, workspace_id: String| {
+        if binding.is_detached() {
+            ReviewAssistantTag::none()
+        } else {
+            ReviewAssistantTag {
+                workspace_id: Some(workspace_id),
+                title: Some(binding.workspace.title.clone()),
+                layer: None,
+            }
+        }
+    };
+    existing.map_or_else(
+        || {
+            binding
+                .started
+                .clone()
+                .unwrap_or_else(|| tag_of(binding, workspace_id.to_owned()))
+        },
+        |existing| {
+            existing.started.clone().unwrap_or_else(|| {
+                tag_of(
+                    existing,
+                    crate::scope::annotation_workspace_id(&existing.workspace),
+                )
+            })
+        },
+    )
 }
 
 /// A stored binding, or `None` when it is unreadable or of a schema version this version does

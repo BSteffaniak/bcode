@@ -111,23 +111,139 @@ impl ReviewSessionPurpose {
     }
 }
 
-/// Origin recorded on a review session: the review app, the session's purpose and the review
-/// workspace it belongs to. The workspace id is left out when it exceeds the origin bounds.
+/// Origin context key of a review session's purpose.
+pub const ORIGIN_PURPOSE: &str = "purpose";
+/// Origin context key of the review workspace a session started in.
+pub const ORIGIN_WORKSPACE: &str = "workspace";
+/// Origin context key of the stack layer (`#<number>`) that was current when a session started.
+pub const ORIGIN_LAYER: &str = "layer";
+
+/// Origin recorded on a review session.
+///
+/// It names the review app, the session's purpose, the review workspace it started in (none on
+/// the reviews home or in the wizard) and the stack layer that was current then. An entry is
+/// left out when it would exceed the origin bounds.
 #[must_use]
 pub fn review_session_origin(
     purpose: ReviewSessionPurpose,
-    workspace_id: &str,
+    workspace_id: Option<&str>,
+    layer: Option<u64>,
 ) -> bcode_session_models::SessionOrigin {
-    let origin = bcode_session_models::SessionOrigin::new(REVIEW_SESSION_APP_ID)
+    let mut origin = bcode_session_models::SessionOrigin::new(REVIEW_SESSION_APP_ID)
         .with_display_name(REVIEW_SESSION_DISPLAY_NAME)
-        .with_context("purpose", purpose.as_str());
-    let with_workspace = origin.clone().with_context("workspace", workspace_id);
-    if !workspace_id.is_empty() && with_workspace.validate().is_ok() {
-        with_workspace
-    } else {
-        origin
+        .with_context(ORIGIN_PURPOSE, purpose.as_str());
+    let entries = [
+        workspace_id
+            .filter(|id| !id.is_empty())
+            .map(|id| (ORIGIN_WORKSPACE, id.to_owned())),
+        layer.map(|number| (ORIGIN_LAYER, format!("#{number}"))),
+    ];
+    for (key, value) in entries.into_iter().flatten() {
+        let with = origin.clone().with_context(key, value);
+        if with.validate().is_ok() {
+            origin = with;
+        }
+    }
+    origin
+}
+
+/// One block of turn context sent with a message ([`ReviewHost::submit_turn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBlock {
+    /// Block label (1-64 bytes).
+    pub label: String,
+    /// Block text (never empty).
+    pub text: String,
+    /// Whether only this turn reads the block (it is not stored with the message).
+    pub request_only: bool,
+}
+
+/// A message to a session: its text, the context blocks it carries, and the agent profile its
+/// turn runs with.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnRequest {
+    /// Exactly what the user typed.
+    pub text: String,
+    /// Context blocks, stored or request-only.
+    pub context: Vec<ContextBlock>,
+    /// Agent profile of the turn; the session's agent when `None`.
+    pub agent: Option<String>,
+}
+
+/// Error code of a turn whose request-only context the daemon no longer holds.
+pub const REQUEST_ONLY_CONTEXT_UNAVAILABLE: &str = "request_only_context_unavailable";
+
+/// A Bcode session as the review app lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppSession {
+    /// Session id.
+    pub id: String,
+    /// Display title, when it has one.
+    pub title: Option<String>,
+    /// Creation time, in milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    /// Last activity, in milliseconds since the Unix epoch.
+    pub updated_at_ms: u64,
+    /// Origin app id, when the session has an origin.
+    pub origin_app: Option<String>,
+    /// Origin context entries.
+    pub origin_context: std::collections::BTreeMap<String, String>,
+}
+
+impl AppSession {
+    /// From a Bcode session summary.
+    #[must_use]
+    pub fn from_summary(summary: &bcode_session_models::SessionSummary) -> Self {
+        Self {
+            id: summary.id.to_string(),
+            title: summary.title().map(str::to_owned),
+            created_at_ms: summary.created_at_ms,
+            updated_at_ms: summary.updated_at_ms,
+            origin_app: summary.origin.as_ref().map(|origin| origin.app_id.clone()),
+            origin_context: summary
+                .origin
+                .as_ref()
+                .map(|origin| origin.context.clone())
+                .unwrap_or_default(),
+        }
     }
 }
+
+/// One bounded page of the review app's sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppSessionPage {
+    /// Sessions of the page, newest activity first.
+    pub sessions: Vec<AppSession>,
+    /// Cursor of the next page, when there is one.
+    pub next_cursor: Option<String>,
+    /// Whether Bcode's catalog was still loading or incomplete.
+    pub degraded: bool,
+}
+
+/// A permission request waiting for an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermission {
+    /// Session that asks.
+    pub session_id: String,
+    /// Request id.
+    pub permission_id: String,
+    /// Tool that asks.
+    pub tool: String,
+}
+
+/// User messages counted in a session's newest history page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnCount {
+    /// Counted user messages.
+    pub turns: usize,
+    /// Whether older history was not read (the count is a lower bound).
+    pub more: bool,
+}
+
+/// Sessions listed per catalog page at most.
+pub const MAX_APP_SESSION_PAGE: usize = 200;
+/// History events read to count a session's turns.
+const TURN_COUNT_EVENTS: usize = 200;
 
 /// Session view updates of a followed session. Dropping it stops following.
 #[derive(Debug)]
@@ -156,6 +272,55 @@ pub trait ReviewHost: Send + Sync {
 
     /// Send `text` to `session_id` as a user message.
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()>;
+
+    /// Submit `request` to `session_id` as a user message with its context blocks and agent
+    /// profile.
+    ///
+    /// The default sends the text alone, for hosts without turn context.
+    fn submit_turn(&self, session_id: String, request: TurnRequest) -> HostFuture<()> {
+        self.send_message(session_id, request.text)
+    }
+
+    /// One bounded page (at most [`MAX_APP_SESSION_PAGE`]) of the sessions the review app
+    /// created in `working_directory`, newest activity first.
+    fn list_app_sessions(
+        &self,
+        working_directory: PathBuf,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> HostFuture<AppSessionPage> {
+        let _ = (working_directory, cursor, limit);
+        Box::pin(async { Err(HostError::failed("this host cannot list sessions")) })
+    }
+
+    /// The summaries of `session_ids`, in order; `None` for a session Bcode does not have.
+    fn session_summaries(&self, session_ids: Vec<String>) -> HostFuture<Vec<Option<AppSession>>> {
+        let _ = session_ids;
+        Box::pin(async { Err(HostError::failed("this host cannot read sessions")) })
+    }
+
+    /// Give `session_id` the explicit name `name`.
+    fn rename_session(&self, session_id: String, name: String) -> HostFuture<()> {
+        let _ = (session_id, name);
+        Box::pin(async { Err(HostError::failed("this host cannot rename sessions")) })
+    }
+
+    /// Delete `session_id` from Bcode.
+    fn delete_session(&self, session_id: String) -> HostFuture<()> {
+        let _ = session_id;
+        Box::pin(async { Err(HostError::failed("this host cannot delete sessions")) })
+    }
+
+    /// Permission requests waiting for an answer, in every session.
+    fn pending_permissions(&self) -> HostFuture<Vec<PendingPermission>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// User messages in the newest history page of `session_id`.
+    fn count_turns(&self, session_id: String) -> HostFuture<TurnCount> {
+        let _ = session_id;
+        Box::pin(async { Err(HostError::failed("this host cannot read history")) })
+    }
 
     /// Answer the pending permission request `permission_id`: allow it (`approved`) or decline
     /// it, once or remembered as a rule (`remember`).
@@ -394,9 +559,20 @@ impl StandaloneHost {
     }
 }
 
+fn parse_session(session_id: &str) -> Result<SessionId, HostError> {
+    session_id
+        .parse::<SessionId>()
+        .map_err(|error| HostError::failed(error.to_string()))
+}
+
 fn client_error(error: &bcode_client::ClientError) -> HostError {
     if error.is_daemon_unavailable() {
         HostError::failed("Bcode is not running; start bcode and try again")
+    } else if let bcode_client::ClientError::Server { code, message } = error {
+        HostError {
+            code: code.clone(),
+            message: message.clone(),
+        }
     } else {
         HostError::failed(error.to_string())
     }
@@ -442,6 +618,189 @@ impl ReviewHost for StandaloneHost {
                 .await
                 .map(|_| ())
                 .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn submit_turn(&self, session_id: String, request: TurnRequest) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            let mut context = bcode_session_models::TurnContext::default();
+            for block in request.context {
+                let target = if block.request_only {
+                    &mut context.request_only
+                } else {
+                    &mut context.blocks
+                };
+                target.push(bcode_session_models::TurnContextBlock::new(
+                    block.label,
+                    block.text,
+                ));
+            }
+            let admission = bcode_session_models::TurnAdmissionMetadata {
+                execution: bcode_session_models::TurnExecutionOptions {
+                    agent_profile: request.agent,
+                    ..bcode_session_models::TurnExecutionOptions::default()
+                },
+                context,
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            };
+            bcode
+                .client()
+                .await?
+                .submit_turn(id, request.text, admission)
+                .await
+                .map(drop)
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn list_app_sessions(
+        &self,
+        working_directory: PathBuf,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> HostFuture<AppSessionPage> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let cursor = cursor
+                .map(|cursor| serde_json::from_str(&cursor))
+                .transpose()
+                .map_err(|error| HostError::failed(format!("invalid session cursor: {error}")))?;
+            let query = bcode_session_models::SessionCatalogQuery {
+                text: None,
+                origin: Some(bcode_session_models::SessionOriginFilter {
+                    app_id: Some(REVIEW_SESSION_APP_ID.to_owned()),
+                    context: std::collections::BTreeMap::new(),
+                }),
+            };
+            let page = bcode
+                .client()
+                .await?
+                .list_sessions_page_with_scope(
+                    bcode_session_models::SessionDiscoveryScope::WorkingDirectory(
+                        working_directory,
+                    ),
+                    query,
+                    cursor,
+                    limit.clamp(1, MAX_APP_SESSION_PAGE),
+                )
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            Ok(AppSessionPage {
+                sessions: page.sessions.iter().map(AppSession::from_summary).collect(),
+                next_cursor: page
+                    .next_cursor
+                    .and_then(|cursor| serde_json::to_string(&cursor).ok()),
+                degraded: !matches!(
+                    page.catalog_status,
+                    bcode_session_models::SessionCatalogStatus::Loaded
+                ),
+            })
+        })
+    }
+
+    fn session_summaries(&self, session_ids: Vec<String>) -> HostFuture<Vec<Option<AppSession>>> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let client = bcode.client().await?;
+            let mut summaries = Vec::with_capacity(session_ids.len());
+            for session_id in session_ids {
+                let Ok(id) = session_id.parse::<SessionId>() else {
+                    summaries.push(None);
+                    continue;
+                };
+                match client.session_summary(id).await {
+                    Ok(summary) => summaries.push(Some(AppSession::from_summary(&summary))),
+                    Err(error) if error.is_daemon_unavailable() => {
+                        return Err(bcode.failure(&error));
+                    }
+                    // Any other failure: Bcode does not have the session (any more).
+                    Err(_) => summaries.push(None),
+                }
+            }
+            Ok(summaries)
+        })
+    }
+
+    fn rename_session(&self, session_id: String, name: String) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            bcode
+                .client()
+                .await?
+                .rename_session(id, Some(name))
+                .await
+                .map(drop)
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn delete_session(&self, session_id: String) -> HostFuture<()> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            bcode
+                .client()
+                .await?
+                .delete_session(id)
+                .await
+                .map(drop)
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn pending_permissions(&self) -> HostFuture<Vec<PendingPermission>> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let permissions = bcode
+                .client()
+                .await?
+                .list_permissions()
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            Ok(permissions
+                .into_iter()
+                .map(|permission| PendingPermission {
+                    session_id: permission.session_id.to_string(),
+                    permission_id: permission.permission_id,
+                    tool: permission.tool_name,
+                })
+                .collect())
+        })
+    }
+
+    fn count_turns(&self, session_id: String) -> HostFuture<TurnCount> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            let page = bcode
+                .client()
+                .await?
+                .session_history_page(
+                    id,
+                    bcode_session_models::SessionHistoryQuery {
+                        cursor: None,
+                        limit: TURN_COUNT_EVENTS,
+                        direction: bcode_session_models::SessionHistoryDirection::Backward,
+                    },
+                )
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            Ok(TurnCount {
+                turns: page
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.kind,
+                            bcode_session_models::SessionEventKind::UserMessage { .. }
+                        )
+                    })
+                    .count(),
+                more: page.has_more,
+            })
         })
     }
 
@@ -694,4 +1053,35 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             });
     }
     Err("no clipboard command found (pbcopy, wl-copy, xclip or xsel)".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origins_record_the_review_and_layer_or_neither() {
+        let review =
+            review_session_origin(ReviewSessionPurpose::Assistant, Some("rv-1"), Some(103));
+        assert_eq!(
+            review.context.get(ORIGIN_PURPOSE).map(String::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            review.context.get(ORIGIN_WORKSPACE).map(String::as_str),
+            Some("rv-1")
+        );
+        assert_eq!(
+            review.context.get(ORIGIN_LAYER).map(String::as_str),
+            Some("#103")
+        );
+        let home = review_session_origin(ReviewSessionPurpose::Assistant, None, None);
+        assert!(!home.context.contains_key(ORIGIN_WORKSPACE));
+        assert!(!home.context.contains_key(ORIGIN_LAYER));
+        // An id beyond the origin bounds is left out rather than failing the session.
+        let long = "x".repeat(1_000);
+        let bounded = review_session_origin(ReviewSessionPurpose::Question, Some(&long), None);
+        assert!(bounded.validate().is_ok());
+        assert!(!bounded.context.contains_key(ORIGIN_WORKSPACE));
+    }
 }

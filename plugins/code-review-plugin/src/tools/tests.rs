@@ -143,6 +143,8 @@ impl Harness {
                     stacks: resolved.stacks,
                     created_at_ms: 0,
                     updated_at_ms: 0,
+                    started: None,
+                    detached_at_ms: None,
                 },
             })
             .expect("bind");
@@ -891,4 +893,40 @@ fn pull_request_threads_are_not_replied_to_or_resolved_by_the_tools() {
             response.output
         );
     }
+}
+
+#[test]
+fn a_detached_session_must_name_its_review() {
+    let mut harness = Harness::new();
+    let workspace = harness.bind(SESSION);
+    let mut binding = harness
+        .store()
+        .assistant_binding(&bcode_code_review_models::GetReviewAssistantRequest {
+            repo_path: harness.fixture.root().to_path_buf(),
+            lookup: bcode_code_review_models::ReviewAssistantLookup::Session {
+                session_id: SESSION.to_owned(),
+            },
+        })
+        .expect("binding")
+        .binding
+        .expect("bound");
+    binding.detached_at_ms = Some(1);
+    harness
+        .store()
+        .bind_assistant(BindReviewAssistantRequest {
+            repo_path: workspace.repo_root,
+            binding,
+        })
+        .expect("detach");
+
+    let detached = harness.call("code_review.summary", &json!({}), SESSION);
+    assert!(detached.is_error, "{}", detached.output);
+    assert!(
+        detached.output.contains("review_not_bound")
+            && detached
+                .output
+                .contains(bcode_code_review::assistant::DETACHED_MESSAGE),
+        "{}",
+        detached.output
+    );
 }

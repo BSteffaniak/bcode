@@ -72,6 +72,10 @@ pub const ERROR_NOT_FOUND: &str = "not_found";
 /// Error code: the arguments cannot be used.
 pub const ERROR_INVALID: &str = "invalid_arguments";
 
+/// Why a review tool called without `review` fails while the session's app shows no review.
+pub const DETACHED_MESSAGE: &str = "no review is on screen; pass `review` with a saved review's \
+id (code_review.list_reviews lists them)";
+
 /// A failed review operation.
 #[derive(Debug, thiserror::Error)]
 pub enum AssistantError {
@@ -420,7 +424,8 @@ impl<'a> ReviewTools<'a> {
     ///
     /// # Errors
     ///
-    /// * [`AssistantError::NotBound`] when a session has no binding.
+    /// * [`AssistantError::NotBound`] when a session has no binding, or its binding is
+    ///   detached (its app shows no review; see [`DETACHED_MESSAGE`]).
     /// * [`AssistantError::NotFound`] when a named review does not exist.
     /// * [`AssistantError::Invalid`] when a review's sources need a review-source provider and
     ///   it was not opened through a binding.
@@ -449,6 +454,9 @@ impl<'a> ReviewTools<'a> {
                                 .to_owned(),
                         )
                     })?;
+                if binding.is_detached() {
+                    return Err(AssistantError::NotBound(DETACHED_MESSAGE.to_owned()));
+                }
                 (
                     binding.workspace,
                     binding.resolved,

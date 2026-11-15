@@ -40,6 +40,7 @@ pub mod action;
 pub mod agent;
 pub mod app;
 pub mod appearance;
+pub mod assistant;
 pub mod chrome;
 pub mod cli;
 pub mod compare_bar;
