@@ -225,14 +225,42 @@ from it, is in [code review assistant](code-review-assistant.md).
 * **History.** `alt+h` (or `⟲`) opens the picker of every conversation of the repository, newest
   first: title, where it started, how long ago, turns, and `needs you` or `working`; Ask AI card
   sessions are labelled `card`. Typing searches; `enter` switches (and attaches the conversation
-  to the screen); `alt+r` renames; `alt+d` marks a row and a second `alt+d` deletes it from
-  Bcode; `ctrl+o` opens it in `bcode tui`. Earlier per-review conversations are listed from
-  their bindings, tagged with their review. In the conversation, `alt+r` renames it, `alt+d`
-  asks before deleting it, and `ctrl+n` (or `+ new`) starts a new one.
+  to the screen); `alt+r` renames; `alt+d`, or the `✕` on the hovered (else selected) row, marks
+  a row and a second press deletes it from Bcode (the footer names the marked row); `ctrl+o`
+  opens it in `bcode tui`. Earlier per-review conversations are listed from their bindings,
+  tagged with their review. In the conversation, `alt+r` renames it, `alt+d` asks before
+  deleting it, and `ctrl+n` (or `+ new`) starts a new one. The palette entry "Delete every
+  conversation the review app started" asks with the count, stops running turns, deletes and
+  unbinds each session, and reports the ones Bcode kept.
+* **Title row.** `↗` (and `ctrl+o`) opens the conversation in `bcode tui` once it has a session
+  (before that, `ctrl+o` says to start or open one); `✕` closes the panel; a double click on the
+  title zooms the focused panel over the whole screen, and another restores it. The screens'
+  palettes list the assistant's actions ("Assistant: …").
 * **Turns** show like an AI card: `▍you` and the message, reasoning, tool lines with their output
   and the answers, with a spinner while the session works; the title row shows `needs you`,
-  `working…`, tokens and cost. `pageup`/`pagedown` and the wheel scroll it; clicks open
-  reasoning and tool output.
+  `working…`, tokens (`12.3k tok`) and cost, cutting the title to keep them. `pageup`/`pagedown`
+  and the wheel scroll it; clicks open reasoning and tool output. A finished answer offers Copy
+  and, in a review, Draft comment (a draft at the cursor's line, range or file). A message Bcode
+  refused, or a turn that ended without an answer, says why in the conversation: the profile not
+  registered yet, a model or provider failure (with "check the model Bcode uses and its
+  sign-in"), the tool-round limit ("ask it to continue"), or Bcode's own message.
+* **Model, effort and permissions.** The chips row also names the model (`● <model> ▾`; `Bcode's
+  model (<name>)` until one is chosen), its reasoning effort (`◆ effort <value>`, only for a
+  model with effort settings), the permission categories (`✎ review`, `▤ files`, `$ shell`,
+  `⇪ publish`, `→ move`) and `⚒ tools`. `alt+m` (or a click on the model chip) opens a filterable
+  picker of the models Bcode offers, Bcode's default first, with each model's context window,
+  prices and effort range (a provider that cannot list says why). `shift+tab` cycles the effort,
+  wrapping. `alt+p` (or a click on a category chip) turns a category off or on for this
+  conversation: the next turn is not offered its tools (a category turned off in configuration
+  stays off). `alt+t` lists the tools by category and how Bcode decides them. The model and
+  effort are the session's own Bcode selection (they survive a restart and show in `bcode tui`)
+  and the latest choice is also the app default every new conversation and Ask AI card session
+  gets before its first message. The chips wrap to a second row, then shorten to their glyphs,
+  then drop from the right; the model chip goes last.
+* **Ask AI cards** name their session's model (`● <model> · <effort>`); a click on it, or
+  `alt+m` and `shift+tab` on the card, changes that session's model and effort (and the app
+  default). A question being written shows the model it will be asked with; `alt+m` and
+  `shift+tab` in the question composer change the app default its new session gets.
 * **Permissions.** A permission request replaces the input with its prompt: `y` allow, `a`
   always, `n` decline, `d` never. Always and Never are offered only when the request can be
   remembered, and never for publishing or deleting reviews. `ctrl+c` stops the running turn.
@@ -829,6 +857,8 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `ctrl+t` | Switch between comment and question |
 | `alt+k` | Change the thread kind |
 | `alt+s` | Change the thread severity |
+| `alt+m` | Choose the model a question is asked with (question mode) |
+| `shift+tab` | Cycle the reasoning effort a question is asked with (question mode) |
 | `esc` | Cancel the comment |
 
 ### AI card with a running turn or a permission request (`code-review-feed`)
@@ -840,6 +870,8 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `n` | Decline the AI card's permission request once |
 | `d` | Never allow the AI card's permission request |
 | `esc`, `ctrl+c` | Stop the AI card's running turn |
+| `alt+m` | Choose the model of the AI card's session |
+| `shift+tab` | Cycle the reasoning effort of the AI card's session |
 
 ### Review assistant (focused) (`code-review-assistant`)
 
@@ -856,6 +888,11 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `ctrl+o` | Open the assistant's session in Bcode |
 | `pageup` | Scroll the conversation up |
 | `pagedown` | Scroll the conversation down |
+| `alt+m` | Choose the assistant's model |
+| `shift+tab` | Cycle the assistant's reasoning effort |
+| `alt+p` | Turn the assistant's permission categories on or off for this conversation |
+| `alt+t` | List the assistant's tools and how Bcode decides them |
+| (palette) | Delete every conversation the review app started (asks first) |
 
 ### Conversation history (`code-review-assistant-history`)
 
@@ -895,6 +932,10 @@ bcode's own (`--print-config-paths` lists them in order):
   (`"show"`, the default, `"dim"`, or `"fold"`: hunks with nothing new), and `removed_inline`
   (default false: code removed since shows inline, struck through). Invalid values are reported
   and the defaults are used.
+* `[plugins.config."bcode.code_review".assistant]` `model` and `effort`: the model (`"<model>"`
+  or `"<provider>/<model>"`) and reasoning effort new assistant conversations and Ask AI card
+  sessions get until one is chosen in the app (the app then remembers its own choice in the
+  review store). Unset, Bcode's default applies.
 * `[plugins.config."bcode.code_review".assistant.tools]`: which tools the review assistant may
   use, by category, every one `true` by default: `review_reads` (the review read tools, the
   app's `current_view` and `find_pull_requests`), `review_writes` (comments, replies,

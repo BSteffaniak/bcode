@@ -50,9 +50,10 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
   tools and the `review_assistant_sessions` binding table.
-* **Planned: parity with bdata.** Model, effort and policy chips, remembered choices, Ask AI
-  card model selection, and the remaining panel gaps, as listed under
-  [Parity with bdata](#parity-with-bdata).
+* **Built: parity with bdata.** Model, effort and permission chips, the tools list, remembered
+  choices, Ask AI card model selection, failures and usage, and conversation management, as
+  designed under [Parity with bdata](#parity-with-bdata), with the deviations listed under
+  [Parity as built](#parity-as-built).
 * **Superseded by this design.** The per-review dock: one conversation per review, reachable
   only inside a review, with no visible entry point and a context line appended to the message
   text.
@@ -190,6 +191,7 @@ collides with an existing default in its scope (`code-review-home` has no `ctrl+
 | `code-review-assistant` | `alt+r` | Rename this conversation (`assistant_rename`) |
 | `code-review-assistant` | `alt+d` | Delete this conversation, after a confirmation (`assistant_delete`) |
 | `code-review-assistant` | `ctrl+k`, `esc`, `ctrl+c`, `ctrl+x`, `ctrl+o`, `pageup`, `pagedown` | As today; `esc` returns to the route, whichever it is |
+| `code-review-assistant` | `alt+m`, `shift+tab`, `alt+p`, `alt+t` | Model, effort, permissions, tools (see [Parity with bdata](#keys-1)) |
 | `code-review-assistant-history` | `up`, `down`, typing | Move, search |
 | `code-review-assistant-history` | `enter` | Switch to the conversation |
 | `code-review-assistant-history` | `alt+r` | Rename |
@@ -491,6 +493,8 @@ which happens on start and on reconnect):
 [plugins.config."bcode.code_review".assistant]
 # width = 60      # default panel width in columns (right dock)
 # height = 14     # default panel height in rows (bottom dock)
+# model = "fake-echo"   # app default model until one is chosen (`provider/model` too)
+# effort = "high"       # app default reasoning effort until one is chosen
 
 [plugins.config."bcode.code_review".assistant.tools]
 review_reads = true
@@ -847,6 +851,40 @@ before the first message) and the values.
    with the count, stops running turns, deletes and unbinds only the app's sessions and reports
    refusals; the palette lists the entries on home and in a review; the empty state per
    screen; Draft comment creates a draft at the cursor line.
+
+### Parity as built
+
+Built in the four steps above, with these deviations and notes:
+
+* **Choosing Bcode's default.** Bcode has no operation that clears a session's model selection,
+  so choosing `Bcode's default` sets the session to Bcode's current default model (its id and
+  provider) and clears the app default; later conversations then follow Bcode's default again.
+* **A model Bcode does not offer.** Bcode accepts any model id for a session and runs its
+  default instead. The app reads the session's model status back after every choice and after
+  a new session gets the app default; when the requested id differs from the model that runs,
+  the conversation says "Bcode does not offer the model X; this conversation runs Y instead".
+  Model statuses that do not report the requested id show only the model that runs.
+* **Effort across models.** Switching models keeps the effort only when the new model offers
+  it (a status without a selected effort counts as the model's default).
+* **Categories** are per conversation for the run (not stored): a restart, a new conversation or
+  switching conversations starts from the configured categories. The allowlist is sent only
+  while some category is off, so the default turn shape is unchanged.
+* **Failures** cover the last turn of a conversation (the session view reports the last turn's
+  outcome) and every refused message; earlier turns' failures stay in the session's transcript.
+  Error lines wrap under their text in cards and the panel.
+* **Usage** shows `N tok` and the estimated cost when Bcode estimates one (a model with prices);
+  the title is cut to keep them on the title row.
+* **Model labels on cards** are read for the newest 16 cards' sessions; the model part of a
+  `model · effort` label is cut at 24 cells.
+* **Draft comment** drafts at the review's cursor (selected range, line or file header), as the
+  composer anchors a new comment.
+* **Live check** (debug daemon, isolated state, fake model provider): the picker listed Bcode's
+  fake models and the next turn's provider request carried the chosen model
+  (`fake-vision-panels`) and effort (`high`); after a restart a new conversation and a new Ask AI
+  card session got the same default before their first message; a card's model changed from its
+  card and its follow-up ran with the new model; turning `shell` off removed `shell.run` from
+  the next request's tools and turning it on restored it; a scripted provider error showed its
+  reason in the conversation; the title showed `12.3k tok`.
 
 ## Decisions
 
