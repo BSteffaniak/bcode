@@ -24,10 +24,14 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
   history merge.
 * **Built: app-wide panel, Ask AI button and history picker (build step 2).** As specified, with
   the deviations listed under [As built](#as-built).
-* **Built: context blocks (first part of build step 3).** Every message carries the stored view
-  block and the request-only detail block rendered from one snapshot of the screen; a message
-  whose request-only context the daemon no longer holds at admission is sent again once with a
-  fresh snapshot.
+* **Built: context blocks, `current_view`, profile and categories (build step 3).** Every
+  message carries the stored view block and the request-only detail block rendered from one
+  snapshot of the screen; a message whose request-only context the daemon no longer holds at
+  admission is sent again once with a fresh snapshot. The app registers
+  `bcode.code-review.current_view` and the profile `bcode.code-review.assistant` (built from the
+  category configuration) on its own provider connection, reconnecting after Bcode restarts,
+  claims the active conversation's session, and names the profile on every turn while the
+  connection is registered.
 * **Built and relied on.** Session origin, client tools with claims, contributed agent profiles
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
@@ -587,6 +591,13 @@ Where the built panel differs from the design above:
   the selected diff lines (`+`/`-`/` ` prefixed) as Ask AI cards send them. Section budgets are
   as specified; within a section, items are kept while they fit, each cut to 400 bytes (240 for a
   quoted value).
+* **Categories.** `shell` holds `shell.run` only: `shell.terminal` is not among the `build`
+  agent's tools, which the profile can only narrow (the test that checks every listed name
+  against `build` caught it). `navigation` lists no tool until the app action tools of build step
+  5 exist. Turns name the profile only while the app's tool connection is registered; before
+  that (or with a host that cannot provide tools) they use the session's agent.
+* **`current_view`** returns the snapshot's JSON; `max_files` is not an argument yet, and lists
+  are shortened (20 items, 10 files per layer) only when the answer would exceed 64 KiB.
 * **Resubmission** covers a submit rejected with `request_only_context_unavailable`. A queued turn
   that fails later for that reason shows its failure in the conversation and is not resent.
 

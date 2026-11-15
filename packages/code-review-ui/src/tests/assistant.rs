@@ -112,8 +112,18 @@ fn saved(backend: &TestBackend, workspace: ReviewWorkspace) -> ReviewWorkspace {
 }
 
 pub(super) fn setup(width: u16, height: u16, start_in_review: bool) -> Setup {
+    setup_with(TestBackend::default(), width, height, start_in_review)
+}
+
+/// [`setup`] over `backend`.
+pub(super) fn setup_with(
+    backend: TestBackend,
+    width: u16,
+    height: u16,
+    start_in_review: bool,
+) -> Setup {
     let fixture = GitFixture::generate(FixtureSpec::small());
-    let backend = Arc::new(TestBackend::default());
+    let backend = Arc::new(backend);
     let root = fixture.root().to_path_buf();
     let review = saved(
         &backend,

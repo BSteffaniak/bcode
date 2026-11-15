@@ -118,6 +118,8 @@ pub struct LoadedConfig {
     pub conversation: conversation::ConversationConfig,
     /// Comparisons with earlier versions, from the plugin table's `compare` table.
     pub compare: compare::CompareConfig,
+    /// The review assistant, from the plugin table's `assistant` table.
+    pub assistant: crate::assistant::profile::AssistantConfig,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
     /// Configured theme selection (`[tui.theme]`).
@@ -232,6 +234,10 @@ fn read_plugin_table(table: &toml::Table, loaded: &mut LoadedConfig) {
     let (compare, problem) = compare::CompareConfig::from_plugin_table(table);
     loaded.compare = compare;
     loaded.diagnostics.extend(problem);
+    let (assistant, problems) =
+        crate::assistant::profile::AssistantConfig::from_plugin_table(table);
+    loaded.assistant = assistant;
+    loaded.diagnostics.extend(problems);
     if let Some(stack) = table.get("stack") {
         match stack.clone().try_into::<ReviewStackLimit>() {
             Ok(limit) => loaded.stack_limit = limit,

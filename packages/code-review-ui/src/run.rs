@@ -272,6 +272,7 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .with_stack_limit(loaded.stack_limit)
         .with_conversation(loaded.conversation.clone())
         .with_compare(loaded.compare)
+        .with_assistant(loaded.assistant.clone())
         // Disposable: a review opens from what an earlier run computed and learned, then confirms
         // it (`BCODE_CODE_REVIEW_CACHE=off` disables it).
         .with_cache(Arc::new(bcode_code_review::cache::ReviewCache::for_user()))

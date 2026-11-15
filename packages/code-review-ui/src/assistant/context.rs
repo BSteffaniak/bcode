@@ -515,6 +515,116 @@ impl ViewContext {
     }
 }
 
+/// Bytes of the context tool's answer at most.
+pub const TOOL_BUDGET: usize = 64 * 1024;
+
+/// Arguments of the context tool.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolArguments {
+    #[serde(default)]
+    sections: Option<Vec<String>>,
+}
+
+impl ViewContext {
+    /// The context tool's answer for JSON `arguments`: this snapshot as JSON, only the
+    /// `sections` asked for, within [`TOOL_BUDGET`] bytes (long lists are shortened first and
+    /// the answer says so).
+    ///
+    /// # Errors
+    ///
+    /// * A message naming the problem when the arguments are not the tool's.
+    pub fn tool_answer(&self, arguments: &str) -> Result<String, String> {
+        let arguments: ToolArguments = if arguments.trim().is_empty() {
+            ToolArguments::default()
+        } else {
+            serde_json::from_str(arguments)
+                .map_err(|error| format!("invalid arguments: {error}"))?
+        };
+        let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        if let Some(sections) = &arguments.sections {
+            keep_sections(&mut value, sections);
+        }
+        let mut text = value.to_string();
+        if text.len() > TOOL_BUDGET {
+            // Shorten the bulky lists, then say so.
+            for pointer in [
+                "/review/selection/items",
+                "/review/threads/on_file/items",
+                "/review/sources/items",
+            ] {
+                if let Some(serde_json::Value::Array(items)) = value.pointer_mut(pointer) {
+                    items.truncate(20);
+                }
+            }
+            if let Some(serde_json::Value::Array(layers)) =
+                value.pointer_mut("/review/comparison/layers")
+            {
+                for layer in layers {
+                    if let Some(serde_json::Value::Array(files)) = layer.get_mut("files") {
+                        files.truncate(10);
+                    }
+                }
+            }
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "truncated".to_owned(),
+                    serde_json::Value::String(
+                        "lists were shortened to fit; code_review.list_files, \
+                         code_review.list_threads and code_review.file_diff read them in full"
+                            .to_owned(),
+                    ),
+                );
+            }
+            text = value.to_string();
+            if text.len() > TOOL_BUDGET {
+                text = cut(&text, TOOL_BUDGET);
+            }
+        }
+        Ok(text)
+    }
+}
+
+/// Keep only `sections` of the snapshot `value` (the screen fields always stay).
+fn keep_sections(value: &mut serde_json::Value, sections: &[String]) {
+    let wants = |name: &str| sections.iter().any(|section| section == name);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if !wants("home") {
+        object.remove("home");
+    }
+    if !wants("wizard") {
+        object.remove("wizard");
+    }
+    let Some(review) = object
+        .get_mut("review")
+        .and_then(|review| review.as_object_mut())
+    else {
+        return;
+    };
+    for (section, fields) in [
+        ("stack", &["stack"][..]),
+        ("comparison", &["comparison"]),
+        ("file", &["file", "cursor"]),
+        ("selection", &["selection"]),
+        ("threads", &["threads"]),
+        ("pull_request", &["pull_request"]),
+        (
+            "review",
+            &[
+                "id", "scope_id", "title", "kind", "sources", "files", "loading",
+            ],
+        ),
+    ] {
+        if !wants(section) {
+            for field in fields {
+                review.remove(*field);
+            }
+        }
+    }
+}
+
 /// `lines` joined within `budget` bytes: lines that do not fit are left out from the end
 /// (keeping a final `more:` line), with a marker naming the tool with the rest.
 fn fit(lines: Vec<String>, budget: usize) -> String {

@@ -82,6 +82,17 @@ pub struct ScriptedHost {
     submit_failures: Mutex<VecDeque<String>>,
     /// Fake clock of session activity.
     clock: std::sync::atomic::AtomicU64,
+    /// The app's registered tools and profiles, and where their calls go.
+    client_tools: Mutex<Option<ClientTools>>,
+}
+
+/// What the app registered as its tools, and the fake daemon's ends of the link.
+struct ClientTools {
+    tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
+    profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    calls: tokio::sync::mpsc::Sender<crate::host::ClientToolCall>,
+    claims: tokio::sync::mpsc::UnboundedReceiver<String>,
+    claimed: Vec<String>,
 }
 
 impl std::fmt::Debug for ScriptedHost {
@@ -139,7 +150,82 @@ impl ScriptedHost {
             deleted: Mutex::default(),
             submit_failures: Mutex::default(),
             clock: std::sync::atomic::AtomicU64::new(1_000),
+            client_tools: Mutex::default(),
         }
+    }
+
+    /// Names of the tools the app registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tools lock is poisoned.
+    pub fn client_tool_names(&self) -> Vec<String> {
+        self.client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .map(|tools| tools.tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The agent profiles the app registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tools lock is poisoned.
+    pub fn agent_profiles(&self) -> Vec<bcode_agent_profile::client_profile::ClientAgentProfile> {
+        self.client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .map(|tools| tools.profiles.clone())
+            .unwrap_or_default()
+    }
+
+    /// Sessions the app claimed for its tools, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tools lock is poisoned.
+    pub fn claimed_sessions(&self) -> Vec<String> {
+        let mut guard = self.client_tools.lock().expect("tools lock");
+        let claimed = guard.as_mut().map_or_else(Vec::new, |tools| {
+            while let Ok(session) = tools.claims.try_recv() {
+                tools.claimed.push(session);
+            }
+            tools.claimed.clone()
+        });
+        drop(guard);
+        claimed
+    }
+
+    /// Call the app's tool `tool` as `session` with JSON `arguments`, as the daemon does after
+    /// the call passed the permission rules; the answer arrives once the app polls.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the app registered no tools or stopped serving them.
+    pub fn call_client_tool(
+        &self,
+        session: &str,
+        tool: &str,
+        arguments: &str,
+    ) -> tokio::sync::oneshot::Receiver<crate::host::ClientToolReply> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .expect("the app registered its tools")
+            .calls
+            .try_send(crate::host::ClientToolCall {
+                session_id: session.to_owned(),
+                tool: tool.to_owned(),
+                arguments: arguments.to_owned(),
+                reply,
+            })
+            .expect("the app serves its tools");
+        answer
     }
 
     fn tick(&self) -> u64 {
@@ -585,6 +671,27 @@ impl ReviewHost for ScriptedHost {
             .remove(&session_id);
         self.deleted.lock().expect("deleted lock").push(session_id);
         Box::pin(async { Ok(()) })
+    }
+
+    fn serve_client_tools(
+        &self,
+        tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    ) -> Result<crate::host::ClientToolLink, HostError> {
+        let (call_sender, calls) = tokio::sync::mpsc::channel(FOLLOW_BUFFER);
+        let (claims, claim_receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.client_tools.lock().expect("tools lock") = Some(ClientTools {
+            tools,
+            profiles,
+            calls: call_sender,
+            claims: claim_receiver,
+            claimed: Vec::new(),
+        });
+        Ok(crate::host::ClientToolLink {
+            calls,
+            claims,
+            state: Arc::new(Mutex::new(crate::host::ToolLinkState::Ready)),
+        })
     }
 
     fn pending_permissions(&self) -> HostFuture<Vec<crate::host::PendingPermission>> {

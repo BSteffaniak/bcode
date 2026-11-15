@@ -182,13 +182,20 @@ come, is in [code review assistant](code-review-assistant.md).
   height, at least 8 rows, and the screen keeps 8); when neither fits, the focused panel takes
   the whole screen and `esc` returns to it. Drag the panel's inner edge to resize it. Below 24
   columns or 6 rows it shows its title row and input only, below 12 columns its title row only.
+* **What it knows.** Each message carries a stored `review app view` block (the screen, the
+  review's id, title, kind and sources, the stack layers and the current one, the comparison
+  with each layer's result, the file, cursor and selection, threads and loaded pull request
+  state) and, for that turn only, a `review app detail` block (the selected lines, threads on the
+  file, the focused thread, per-layer changes, files changed since the baseline, pull request
+  state). Both are bounded, and every cut names the tool with the rest. The app's own tool
+  `bcode.code-review.current_view` returns the live screen in full (`sections` narrows it).
 * **Conversation.** The title row names the active conversation and where it started (`✦
   Assistant · <title> · <review #layer or home>`) and carries `+ new`, `⟲` (history) and `↗`
   (open in Bcode). The chips row names what is on screen (`⌖ src/retry.rs:42`, `⌖ home`, `⌖ new
   review`); `ctrl+x` detaches it. The first message creates a Bcode session with the review app's
   origin, titled after the message and tagged with the review and stack layer on screen (or with
-  none on home and in the wizard), and sends it. Each message carries a stored context block
-  describing the screen; the conversation shows the text as typed.
+  none on home and in the wizard), and sends it with the review assistant agent profile (when
+  the app's tools are registered); the conversation shows the text as typed.
 * **Which review the tools act on.** The session's binding names the review its `code_review.*`
   tools act on when no `review` is passed. It is rewritten before each message and whenever the
   screen changes: the review on screen, or detached on home and in the wizard, where a review
@@ -823,6 +830,27 @@ bcode's own (`--print-config-paths` lists them in order):
   (`"show"`, the default, `"dim"`, or `"fold"`: hunks with nothing new), and `removed_inline`
   (default false: code removed since shows inline, struck through). Invalid values are reported
   and the defaults are used.
+* `[plugins.config."bcode.code_review".assistant.tools]`: which tools the review assistant may
+  use, by category, every one `true` by default: `review_reads` (the review read tools and the
+  app's `bcode.code-review.current_view`), `review_writes` (comments, replies, resolution,
+  suggestions, viewed marks), `publish`, `navigation`, `file_reads` (`filesystem.read`, `list`,
+  `find`, `grep`, `stat`, `exists`), `file_writes` (`filesystem.write`, `edit`, `multi_edit`)
+  and `shell` (`shell.run`); `extra` lists exact names of other Bcode tools to expose, such as
+  `"web.fetch"`. The app registers the agent profile `bcode.code-review.assistant` with the
+  selected tools when it starts; the profile is based on Bcode's `build` agent and can only
+  narrow it, so every call is still allowed, asked or denied by the `build` agent's rules
+  (`[agent.build.permission.tools]`, for example `"code_review.mark_viewed" = "allow"`). With
+  the defaults, reads and navigation run, and review writes, file writes and shell commands ask
+  each time. An unknown key or a non-boolean value is reported and the default is used.
+
+  ```toml
+  [plugins.config."bcode.code_review".assistant.tools]
+  shell = false                  # never offer shell commands to the assistant
+  extra = ["web.fetch"]
+
+  [agent.build.permission.tools]
+  "code_review.mark_viewed" = "allow"
+  ```
 * `[plugins.config."bcode.code_review".stack]`: how many layers a stack of pull requests may
   have. `max_layers` (default 64) is the limit; `over_limit` says what happens beyond it.
   `"warn"` (the default) loads every layer and shows a warning that can be dismissed: a row of

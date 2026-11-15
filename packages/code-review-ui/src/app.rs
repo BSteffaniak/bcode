@@ -30,6 +30,7 @@ use crate::action::EventResult;
 use crate::assistant::context::ViewContext;
 use crate::assistant::{Assistant, Place, Screen};
 use crate::context::UiContext;
+use crate::host::ClientToolReply;
 use crate::services::ReviewServices;
 use crate::view::View;
 use bcode_code_review::document::DocumentConfig;
@@ -407,6 +408,24 @@ impl ReviewApp {
         if self.assistant.wants_resend() {
             let place = self.place(true);
             self.assistant.resend(&place, host);
+            changed = true;
+        }
+        for call in self.assistant.take_tool_calls() {
+            let reply = if call.tool == crate::assistant::profile::CURRENT_VIEW {
+                match self.view_context().tool_answer(&call.arguments) {
+                    Ok(answer) => ClientToolReply::Completed(answer),
+                    Err(message) => ClientToolReply::Failed {
+                        code: "invalid_arguments".to_owned(),
+                        message,
+                    },
+                }
+            } else {
+                ClientToolReply::Failed {
+                    code: "unknown_tool".to_owned(),
+                    message: format!("the review app has no tool {}", call.tool),
+                }
+            };
+            let _ = call.reply.send(reply);
             changed = true;
         }
         let tools = self.assistant.take_finished_tools();

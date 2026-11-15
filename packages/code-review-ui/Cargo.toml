@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bcode_agent_profile = { workspace = true }
 bcode_client = { workspace = true }
 bcode_code_review = { workspace = true }
 bcode_code_review_github = { workspace = true }
@@ -24,6 +25,7 @@ bcode_session_models = { workspace = true }
 bcode_session_view = { workspace = true, features = ["client"] }
 bcode_session_view_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
+bcode_tool_models = { workspace = true }
 bcode_tui_theme = { workspace = true, features = ["components"] }
 bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true }
@@ -70,7 +72,9 @@ tokio = { workspace = true, features = [
 toml = { workspace = true }
 
 [dev-dependencies]
-bcode_code_review = { workspace = true, features = ["testing"] }
+bcode_agent_policy          = { workspace = true }
+bcode_code_review           = { workspace = true, features = ["testing"] }
+bcode_default_agents_plugin = { workspace = true }
 tempfile          = { workspace = true }
 
 [features]

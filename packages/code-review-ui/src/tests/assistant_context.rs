@@ -257,3 +257,130 @@ fn a_message_whose_request_only_context_was_lost_is_sent_again_once() {
         setup.app().assistant().notice()
     );
 }
+
+/// The answer of the app's tool `tool` called by `session` with `arguments`.
+fn call_tool(
+    setup: &mut super::assistant::Setup,
+    session: &str,
+    tool: &str,
+    arguments: &str,
+) -> crate::host::ClientToolReply {
+    let mut answer = setup
+        .backend
+        .host()
+        .call_client_tool(session, tool, arguments);
+    setup.settle();
+    answer.try_recv().expect("answered")
+}
+
+#[test]
+fn current_view_returns_what_the_blocks_describe_live_and_by_section() {
+    let mut setup = super::assistant::setup(160, 40, true);
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Look here");
+    let crate::host::ClientToolReply::Completed(answer) = call_tool(
+        &mut setup,
+        &session,
+        crate::assistant::profile::CURRENT_VIEW,
+        "{}",
+    ) else {
+        panic!("the tool answers");
+    };
+    let answer: serde_json::Value = serde_json::from_str(&answer).expect("json");
+    let context = setup.app().view_context();
+    let review = review_of(&context);
+    assert_eq!(answer["screen"], "review");
+    assert_eq!(answer["review"]["id"], review.id.clone().expect("saved id"));
+    assert_eq!(answer["review"]["kind"], review.kind);
+    assert_eq!(answer["review"]["title"], review.title);
+    assert!(answer["screen_generation"].is_u64());
+    // Only the sections asked for.
+    let crate::host::ClientToolReply::Completed(file_only) = call_tool(
+        &mut setup,
+        &session,
+        crate::assistant::profile::CURRENT_VIEW,
+        r#"{"sections":["file"]}"#,
+    ) else {
+        panic!("the tool answers");
+    };
+    let file_only: serde_json::Value = serde_json::from_str(&file_only).expect("json");
+    assert!(file_only["review"].get("kind").is_none(), "{file_only}");
+    assert!(
+        file_only["review"].get("comparison").is_none(),
+        "{file_only}"
+    );
+    assert_eq!(file_only["screen"], "review");
+    // Live: after going home the tool describes home.
+    setup.scenario.key("esc");
+    setup.scenario.key("q");
+    setup.settle();
+    let crate::host::ClientToolReply::Completed(home) = call_tool(
+        &mut setup,
+        &session,
+        crate::assistant::profile::CURRENT_VIEW,
+        "",
+    ) else {
+        panic!("the tool answers");
+    };
+    let home: serde_json::Value = serde_json::from_str(&home).expect("json");
+    assert_eq!(home["screen"], "home");
+    assert!(home.get("review").is_none(), "{home}");
+    // Arguments it does not know are refused.
+    assert!(matches!(
+        call_tool(
+            &mut setup,
+            &session,
+            crate::assistant::profile::CURRENT_VIEW,
+            r#"{"nope":1}"#
+        ),
+        crate::host::ClientToolReply::Failed { .. }
+    ));
+}
+
+#[test]
+fn the_profile_follows_the_tool_categories_and_every_turn_names_it() {
+    let (config, problems) = crate::assistant::profile::AssistantConfig::from_plugin_table(
+        &toml::from_str("[assistant.tools]\nshell = false\n").expect("toml"),
+    );
+    assert_eq!(problems, Vec::<String>::new());
+    let mut setup = super::assistant::setup_with(
+        TestBackend::default().with_assistant_config(config),
+        160,
+        40,
+        true,
+    );
+    let host = setup.backend.host();
+    assert_eq!(
+        host.client_tool_names(),
+        vec![crate::assistant::profile::CURRENT_VIEW.to_owned()]
+    );
+    let profiles = host.agent_profiles();
+    assert_eq!(profiles.len(), 1);
+    let profile = &profiles[0];
+    assert_eq!(profile.id, crate::assistant::profile::PROFILE_ID);
+    assert_eq!(profile.base_agent, "build");
+    assert!(
+        !profile.tools.iter().any(|tool| tool == "shell.run"),
+        "shell is off"
+    );
+    assert!(profile.tools.iter().any(|tool| tool == "filesystem.write"));
+    assert!(
+        profile
+            .tools
+            .iter()
+            .any(|tool| tool == "code_review.summary")
+    );
+
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Hello");
+    let (_, request) = host.turns().last().cloned().expect("turn");
+    assert_eq!(
+        request.agent.as_deref(),
+        Some(crate::assistant::profile::PROFILE_ID)
+    );
+    assert_eq!(
+        host.claimed_sessions(),
+        vec![session],
+        "claimed for the app's tools"
+    );
+}

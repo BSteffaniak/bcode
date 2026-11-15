@@ -235,6 +235,12 @@ pub struct Assistant {
     finished: Vec<(String, String)>,
     /// A message to send again with a fresh snapshot (its request-only context was lost).
     resend: Option<(String, TurnRequest)>,
+    /// The connection providing the app's tools and agent profile, once asked for.
+    tools: Option<crate::host::ClientToolLink>,
+    /// Whether the connection was asked for (once per run).
+    tools_asked: bool,
+    /// Sessions claimed on the connection.
+    claimed: BTreeSet<String>,
     picker: Option<Picker>,
     mode: Mode,
     notice: Option<(String, bool)>,
@@ -289,6 +295,9 @@ impl Assistant {
             applied: BTreeMap::new(),
             finished: Vec::new(),
             resend: None,
+            tools: None,
+            tools_asked: false,
+            claimed: BTreeSet::new(),
             picker: None,
             mode: Mode::Chat,
             notice: None,
@@ -651,7 +660,10 @@ impl Assistant {
         let request = TurnRequest {
             text,
             context: self.context_blocks(place),
-            agent: None,
+            // The profile exists only while the app's tool connection is registered.
+            agent: self
+                .tools_ready()
+                .then(|| super::profile::PROFILE_ID.to_owned()),
         };
         *self.input.borrow_mut() = empty_input();
         self.scroll.set(0);
@@ -787,9 +799,48 @@ impl Assistant {
     // Polling
     // ----------------------------------------------------------------------------------------
 
+    /// Whether the app's tools and the assistant's profile are registered with Bcode.
+    #[must_use]
+    pub fn tools_ready(&self) -> bool {
+        self.tools.as_ref().is_some_and(|link| {
+            link.state
+                .lock()
+                .is_ok_and(|state| *state == crate::host::ToolLinkState::Ready)
+        })
+    }
+
+    /// Register the app's tools and the assistant's profile once, and claim the active session.
+    fn serve_tools(&mut self, ui: &UiContext) {
+        if !self.tools_asked {
+            self.tools_asked = true;
+            let config = self.services.assistant_config();
+            self.tools = ui
+                .host()
+                .serve_client_tools(super::profile::client_tools(), vec![config.profile()])
+                .ok();
+        }
+        if let (Some(link), Some(session)) = (&self.tools, &self.session)
+            && self.claimed.insert(session.clone())
+        {
+            let _ = link.claims.send(session.clone());
+        }
+    }
+
+    /// Calls of the app's tools waiting for an answer, oldest first.
+    pub fn take_tool_calls(&mut self) -> Vec<crate::host::ClientToolCall> {
+        let mut calls = Vec::new();
+        if let Some(link) = self.tools.as_mut() {
+            while let Ok(call) = link.calls.try_recv() {
+                calls.push(call);
+            }
+        }
+        calls
+    }
+
     /// Collect finished work, follow the active session and advance its spinner. Returns
     /// whether anything changed.
     pub fn poll(&mut self, ui: &UiContext) -> bool {
+        self.serve_tools(ui);
         let done: Vec<Done> = self
             .inbox
             .lock()

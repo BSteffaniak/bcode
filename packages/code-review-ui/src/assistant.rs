@@ -16,6 +16,7 @@ pub mod context;
 pub mod history;
 pub mod panel;
 pub mod picker;
+pub mod profile;
 
 pub use panel::{Assistant, Dock, Outcome, Split};
 

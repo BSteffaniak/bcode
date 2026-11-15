@@ -1,0 +1,344 @@
+//! The review assistant's agent profile and the tools the app provides.
+//!
+//! * **Profile.** `bcode.code-review.assistant` ("Review assistant") is contributed by the app's
+//!   tool provider connection, based on Bcode's `build` agent and restrict-only: its tool
+//!   selection is the union of the enabled [`Category`] tool lists plus `extra`, intersected by
+//!   Bcode with what `build` exposes; every call is still decided by `build`'s permission rules.
+//! * **Categories.** Configured under `[plugins.config."bcode.code_review".assistant.tools]`,
+//!   every one on by default: review reads, review writes, publish, navigation, file reads, file
+//!   writes, shell. A category set to `false` removes its tools; an unknown key or a non-boolean
+//!   value is reported and the default is used.
+//! * **Client tools.** The tools the app itself answers, under its provider id, with their policy
+//!   class fixed at registration.
+
+use bcode_agent_profile::client_profile::ClientAgentProfile;
+use bcode_tool_models::client_tool::{ClientToolDescriptor, ClientToolPolicy};
+use std::collections::BTreeMap;
+
+/// Provider id of the app's tools, and the app id of its sessions' origin.
+pub const PROVIDER_ID: &str = crate::host::REVIEW_SESSION_APP_ID;
+/// Id of the assistant's agent profile.
+pub const PROFILE_ID: &str = "bcode.code-review.assistant";
+/// Agent the profile narrows.
+pub const BASE_AGENT: &str = "build";
+/// How long a client tool call may run, in milliseconds.
+const TOOL_DEADLINE_MS: u32 = 30_000;
+
+/// A group of tools the user can turn off for the assistant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Category {
+    /// Reading reviews: plugin read tools and the app's view of the screen.
+    ReviewReads,
+    /// Changing reviews: comments, replies, resolution, viewed marks, suggestions.
+    ReviewWrites,
+    /// Publishing review comments.
+    Publish,
+    /// Moving the user within the app.
+    Navigation,
+    /// Reading files.
+    FileReads,
+    /// Writing files.
+    FileWrites,
+    /// Running commands.
+    Shell,
+}
+
+impl Category {
+    /// Every category, in configuration order.
+    pub const ALL: [Self; 7] = [
+        Self::ReviewReads,
+        Self::ReviewWrites,
+        Self::Publish,
+        Self::Navigation,
+        Self::FileReads,
+        Self::FileWrites,
+        Self::Shell,
+    ];
+
+    /// Configuration key.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::ReviewReads => "review_reads",
+            Self::ReviewWrites => "review_writes",
+            Self::Publish => "publish",
+            Self::Navigation => "navigation",
+            Self::FileReads => "file_reads",
+            Self::FileWrites => "file_writes",
+            Self::Shell => "shell",
+        }
+    }
+
+    /// The tools of the category.
+    #[must_use]
+    pub const fn tools(self) -> &'static [&'static str] {
+        match self {
+            Self::ReviewReads => &[
+                "code_review.list_reviews",
+                "code_review.summary",
+                "code_review.list_files",
+                "code_review.file_diff",
+                "code_review.file_content",
+                "code_review.list_threads",
+                "code_review.get_thread",
+                "code_review.pull_request",
+                CURRENT_VIEW,
+            ],
+            Self::ReviewWrites => &[
+                "code_review.add_comment",
+                "code_review.reply",
+                "code_review.resolve_thread",
+                "code_review.suggest_change",
+                "code_review.mark_viewed",
+            ],
+            Self::Publish => &["code_review.publish"],
+            // Navigation tools of the app come with its action tools.
+            Self::Navigation => &[],
+            Self::FileReads => &[
+                "filesystem.read",
+                "filesystem.list",
+                "filesystem.find",
+                "filesystem.grep",
+                "filesystem.stat",
+                "filesystem.exists",
+            ],
+            Self::FileWrites => &[
+                "filesystem.write",
+                "filesystem.edit",
+                "filesystem.multi_edit",
+            ],
+            Self::Shell => &["shell.run"],
+        }
+    }
+}
+
+/// Name of the client tool that returns the screen.
+pub const CURRENT_VIEW: &str = "bcode.code-review.current_view";
+
+/// The assistant's configuration (`[plugins.config."bcode.code_review".assistant]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantConfig {
+    /// Whether each category is on.
+    pub categories: BTreeMap<Category, bool>,
+    /// Exact names of other Bcode tools to expose.
+    pub extra: Vec<String>,
+}
+
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        Self {
+            categories: Category::ALL
+                .into_iter()
+                .map(|category| (category, true))
+                .collect(),
+            extra: Vec::new(),
+        }
+    }
+}
+
+impl AssistantConfig {
+    /// Read the plugin table's `assistant` table; problems are reported and defaults used.
+    #[must_use]
+    pub fn from_plugin_table(table: &toml::Table) -> (Self, Vec<String>) {
+        let mut config = Self::default();
+        let mut problems = Vec::new();
+        let prefix = format!("plugins.config.\"{}\".assistant", crate::config::PLUGIN_ID);
+        let Some(assistant) = table.get("assistant") else {
+            return (config, problems);
+        };
+        let Some(assistant) = assistant.as_table() else {
+            problems.push(format!("{prefix} must be a table"));
+            return (config, problems);
+        };
+        let Some(tools) = assistant.get("tools") else {
+            return (config, problems);
+        };
+        let Some(tools) = tools.as_table() else {
+            problems.push(format!("{prefix}.tools must be a table"));
+            return (config, problems);
+        };
+        for (key, value) in tools {
+            if key == "extra" {
+                match value.as_array().map(|names| {
+                    names
+                        .iter()
+                        .map(|name| name.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<String>>>()
+                }) {
+                    Some(Some(names)) => config.extra = names,
+                    _ => {
+                        problems.push(format!("{prefix}.tools.extra must be a list of tool names"));
+                    }
+                }
+                continue;
+            }
+            let Some(category) = Category::ALL
+                .into_iter()
+                .find(|category| category.key() == key)
+            else {
+                problems.push(format!("{prefix}.tools.{key} is not a tool category"));
+                continue;
+            };
+            match value.as_bool() {
+                Some(on) => {
+                    config.categories.insert(category, on);
+                }
+                None => problems.push(format!("{prefix}.tools.{key} must be true or false")),
+            }
+        }
+        (config, problems)
+    }
+
+    /// The tool selection of the profile: the enabled categories' tools and `extra`, sorted.
+    #[must_use]
+    pub fn tools(&self) -> Vec<String> {
+        let mut tools: Vec<String> = Category::ALL
+            .into_iter()
+            .filter(|category| self.categories.get(category).copied().unwrap_or(true))
+            .flat_map(|category| category.tools().iter().map(|tool| (*tool).to_owned()))
+            .chain(self.extra.iter().cloned())
+            .collect();
+        tools.sort();
+        tools.dedup();
+        tools
+    }
+
+    /// The assistant's agent profile.
+    #[must_use]
+    pub fn profile(&self) -> ClientAgentProfile {
+        ClientAgentProfile {
+            id: PROFILE_ID.to_owned(),
+            name: "Review assistant".to_owned(),
+            description: "Reviews code in the code review app: sees the screen, reads and \
+                          changes reviews, and moves the user, under the build agent's \
+                          permission rules."
+                .to_owned(),
+            base_agent: BASE_AGENT.to_owned(),
+            instructions: INSTRUCTIONS.to_owned(),
+            tools: self.tools(),
+        }
+    }
+}
+
+/// The profile's instructions.
+const INSTRUCTIONS: &str = "You are the review assistant of the Bcode code review app. \
+Each user message comes with a `review app view` block describing the screen the user is on \
+(home, the new-review wizard, or a review: its id, kind, sources, stack layers and the current \
+one, the active comparison, the file, cursor and selection) and, for that turn only, a `review \
+app detail` block with the selected lines, threads and per-layer changes. Earlier view blocks \
+describe where the user was when they wrote earlier messages; the screen may have changed since. \
+Call bcode.code-review.current_view to read the screen as it is now, in full. \
+The code_review tools act on the review on screen when called without `review`; on home or in \
+the wizard pass `review` with an id from code_review.list_reviews. \
+Do only what the user asked; ask before acting on anything else. Changes to reviews, files, \
+publishing and commands may ask the user for permission.";
+
+/// The tools the app answers itself.
+#[must_use]
+pub fn client_tools() -> Vec<ClientToolDescriptor> {
+    vec![ClientToolDescriptor {
+        name: CURRENT_VIEW.to_owned(),
+        description: "The screen the user is looking at in the code review app, live: which \
+                      screen (home, wizard, review), the review (id, title, kind, sources with \
+                      pull request numbers and heads), its stack layers and the current one, \
+                      the active comparison (baseline, view, toggles, each layer's result and \
+                      changed files), the file, cursor and selected lines, threads on the file \
+                      and the focused thread, and loaded pull request state. Pass `sections` to \
+                      read only some of it."
+            .to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "screen", "review", "stack", "comparison", "file", "selection",
+                            "threads", "pull_request", "home", "wizard"
+                        ]
+                    },
+                    "description": "Sections to return; all when omitted."
+                }
+            },
+            "additionalProperties": false
+        }),
+        policy: ClientToolPolicy::ReadOnly,
+        max_duration_ms: TOOL_DEADLINE_MS,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> (AssistantConfig, Vec<String>) {
+        AssistantConfig::from_plugin_table(&toml::from_str(text).expect("toml"))
+    }
+
+    #[test]
+    fn every_category_is_on_by_default_and_each_can_be_turned_off() {
+        let (config, problems) = parse("");
+        assert_eq!(problems, Vec::<String>::new());
+        let tools = config.tools();
+        for category in Category::ALL {
+            for tool in category.tools() {
+                assert!(tools.iter().any(|name| name == tool), "{tool} by default");
+            }
+        }
+        let (config, problems) = parse(
+            "[assistant.tools]\nshell = false\nfile_writes = false\nextra = [\"web.fetch\"]\n",
+        );
+        assert_eq!(problems, Vec::<String>::new());
+        let tools = config.tools();
+        assert!(!tools.iter().any(|tool| tool.starts_with("shell.")));
+        assert!(!tools.iter().any(|tool| tool == "filesystem.write"));
+        assert!(tools.iter().any(|tool| tool == "filesystem.read"));
+        assert!(tools.iter().any(|tool| tool == "web.fetch"));
+        let profile = config.profile();
+        assert_eq!(profile.id, PROFILE_ID);
+        assert_eq!(profile.base_agent, BASE_AGENT);
+        assert_eq!(profile.tools, tools);
+    }
+
+    #[test]
+    fn misspelled_or_mistyped_settings_are_reported_and_the_default_kept() {
+        let (config, problems) = parse("[assistant.tools]\nshel = false\npublish = \"no\"\n");
+        assert_eq!(config, AssistantConfig::default());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].contains("publish must be true or false")
+                || problems[1].contains("publish")
+        );
+    }
+
+    #[test]
+    fn the_profile_is_a_valid_contribution_and_its_tools_are_ones_build_exposes() {
+        let config = AssistantConfig::default();
+        let profile = config.profile();
+        assert_eq!(
+            bcode_agent_profile::client_profile::validate_client_agent_profiles(
+                PROVIDER_ID,
+                std::slice::from_ref(&profile),
+            ),
+            Ok(())
+        );
+        // Every plugin tool the categories name is a tool Bcode's build agent is offered, so a
+        // renamed tool fails here instead of silently leaving the assistant.
+        let defaults = bcode_default_agents_plugin::default_config();
+        let build = bcode_agent_policy::active_tools_for(&bcode_agent_policy::agent_config(
+            &defaults, BASE_AGENT,
+        ));
+        let client: Vec<String> = client_tools().into_iter().map(|tool| tool.name).collect();
+        for tool in profile.tools {
+            if tool.starts_with(&format!("{PROVIDER_ID}.")) {
+                assert!(client.contains(&tool), "{tool} is a client tool of the app");
+            } else {
+                assert!(
+                    build.contains(&tool),
+                    "the build agent is offered {tool}: {build:?}"
+                );
+            }
+        }
+    }
+}

@@ -89,6 +89,16 @@ impl TestBackend {
         self
     }
 
+    /// Use `config` for the review assistant.
+    #[must_use]
+    pub fn with_assistant_config(
+        mut self,
+        config: crate::assistant::profile::AssistantConfig,
+    ) -> Self {
+        self.services = self.services.with_assistant(config);
+        self
+    }
+
     /// Use `config` for comparisons with earlier versions.
     #[must_use]
     pub fn with_compare_config(mut self, config: crate::config::compare::CompareConfig) -> Self {

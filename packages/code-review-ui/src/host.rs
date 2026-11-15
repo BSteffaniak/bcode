@@ -240,6 +240,57 @@ pub struct TurnCount {
     pub more: bool,
 }
 
+/// A call of one of the app's own tools, sent by Bcode after the call passed its permission
+/// rules.
+#[derive(Debug)]
+pub struct ClientToolCall {
+    /// Session that called.
+    pub session_id: String,
+    /// Tool name.
+    pub tool: String,
+    /// JSON arguments.
+    pub arguments: String,
+    /// Where the answer goes.
+    pub reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+}
+
+/// The app's answer to a [`ClientToolCall`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientToolReply {
+    /// The tool ran: the model-visible result.
+    Completed(String),
+    /// The tool failed or refused.
+    Failed {
+        /// Stable error code.
+        code: String,
+        /// Model-visible message.
+        message: String,
+    },
+}
+
+/// Whether the app's tools and profile are registered with Bcode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ToolLinkState {
+    /// Connecting (or connecting again after Bcode went away).
+    #[default]
+    Connecting,
+    /// Registered; sessions claimed are offered the tools.
+    Ready,
+    /// Registration failed, with why (retried later).
+    Failed(String),
+}
+
+/// The app's connection that provides its tools and agent profile.
+#[derive(Debug)]
+pub struct ClientToolLink {
+    /// Calls of the app's tools, oldest first.
+    pub calls: mpsc::Receiver<ClientToolCall>,
+    /// Sessions to claim (claimed again after every reconnect).
+    pub claims: mpsc::UnboundedSender<String>,
+    /// Registration state.
+    pub state: Arc<Mutex<ToolLinkState>>,
+}
+
 /// Sessions listed per catalog page at most.
 pub const MAX_APP_SESSION_PAGE: usize = 200;
 /// History events read to count a session's turns.
@@ -314,6 +365,21 @@ pub trait ReviewHost: Send + Sync {
     /// Permission requests waiting for an answer, in every session.
     fn pending_permissions(&self) -> HostFuture<Vec<PendingPermission>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Provide `tools` and agent `profiles` under the review app's provider id, until the
+    /// returned link is dropped; registering again after Bcode restarts.
+    ///
+    /// # Errors
+    ///
+    /// * [`HostError`] when this host cannot provide tools.
+    fn serve_client_tools(
+        &self,
+        tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    ) -> Result<ClientToolLink, HostError> {
+        let _ = (tools, profiles);
+        Err(HostError::failed("this host cannot provide tools"))
     }
 
     /// User messages in the newest history page of `session_id`.
@@ -771,6 +837,31 @@ impl ReviewHost for StandaloneHost {
         })
     }
 
+    fn serve_client_tools(
+        &self,
+        tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
+        profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    ) -> Result<ClientToolLink, HostError> {
+        let (call_sender, calls) = mpsc::channel(TOOL_CALL_BUFFER);
+        let (claims, claim_receiver) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(ToolLinkState::Connecting));
+        let provider = ToolProvider {
+            bcode: Arc::clone(&self.bcode),
+            tools,
+            profiles,
+            calls: call_sender,
+            claims: claim_receiver,
+            state: Arc::clone(&state),
+            redraw: Arc::clone(&self.redraw),
+        };
+        drop(self.runtime.spawn(provider.run()));
+        Ok(ClientToolLink {
+            calls,
+            claims,
+            state,
+        })
+    }
+
     fn count_turns(&self, session_id: String) -> HostFuture<TurnCount> {
         let bcode = Arc::clone(&self.bcode);
         Box::pin(async move {
@@ -987,6 +1078,123 @@ impl ReviewHost for StandaloneHost {
     /// Only the first call takes effect.
     fn connect_redraw(&self, redraw: Redraw) {
         let _ = self.redraw.set(redraw);
+    }
+}
+
+/// Calls of the app's tools buffered before the provider waits for the UI.
+const TOOL_CALL_BUFFER: usize = 32;
+/// Pause before connecting the tool provider again.
+const TOOL_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// The task that keeps the app's tools registered and forwards their calls to the UI.
+struct ToolProvider {
+    bcode: Arc<BcodeConnection>,
+    tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
+    profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
+    calls: mpsc::Sender<ClientToolCall>,
+    claims: mpsc::UnboundedReceiver<String>,
+    state: Arc<Mutex<ToolLinkState>>,
+    redraw: Arc<OnceLock<Redraw>>,
+}
+
+impl ToolProvider {
+    fn set_state(&self, state: ToolLinkState) {
+        if let Ok(mut current) = self.state.lock() {
+            *current = state;
+        }
+        if let Some(redraw) = self.redraw.get() {
+            redraw();
+        }
+    }
+
+    /// Connect, register, serve until the connection closes, and connect again, until the
+    /// app drops its link.
+    async fn run(mut self) {
+        let mut claimed: Vec<SessionId> = Vec::new();
+        loop {
+            match self.serve(&mut claimed).await {
+                Ok(()) => return,
+                Err(error) => self.set_state(ToolLinkState::Failed(error)),
+            }
+            if self.calls.is_closed() {
+                return;
+            }
+            tokio::time::sleep(TOOL_RECONNECT_DELAY).await;
+        }
+    }
+
+    /// One connection; `Ok` when the app dropped its link.
+    async fn serve(&mut self, claimed: &mut Vec<SessionId>) -> Result<(), String> {
+        use bcode_client::client_tools::ClientToolRequest;
+        use bcode_tool_models::client_tool::ClientToolOutcome;
+        let client = self.bcode.client().await.map_err(|error| error.message)?;
+        let mut provider = client
+            .client_tool_provider(REVIEW_SESSION_APP_ID, self.tools.clone())
+            .await
+            .map_err(|error| client_error(&error).message)?;
+        provider
+            .register_agent_profiles(self.profiles.clone())
+            .await
+            .map_err(|error| client_error(&error).message)?;
+        let (handle, mut requests) = provider.into_concurrent();
+        for session in claimed.iter() {
+            let _ = handle.claim_session(*session).await;
+        }
+        self.set_state(ToolLinkState::Ready);
+        loop {
+            tokio::select! {
+                request = requests.recv() => {
+                    let Some(request) = request else {
+                        return Err("Bcode closed the tool connection".to_owned());
+                    };
+                    let ClientToolRequest::Invoke(invocation) = request else {
+                        continue;
+                    };
+                    let (reply, answer) = tokio::sync::oneshot::channel();
+                    let call = ClientToolCall {
+                        session_id: invocation.session_id.clone(),
+                        tool: invocation.tool_name.clone(),
+                        arguments: invocation.arguments_json.clone(),
+                        reply,
+                    };
+                    if self.calls.send(call).await.is_err() {
+                        return Ok(());
+                    }
+                    if let Some(redraw) = self.redraw.get() {
+                        redraw();
+                    }
+                    let handle = handle.clone();
+                    let invocation_id = invocation.invocation_id;
+                    tokio::spawn(async move {
+                        let outcome = match answer.await {
+                            Ok(ClientToolReply::Completed(content)) => {
+                                ClientToolOutcome::Completed { content }
+                            }
+                            Ok(ClientToolReply::Failed { code, message }) => {
+                                ClientToolOutcome::Failed { code, message }
+                            }
+                            Err(_) => ClientToolOutcome::Failed {
+                                code: "client_tool_unavailable".to_owned(),
+                                message: "the review app closed".to_owned(),
+                            },
+                        };
+                        let _ = handle.respond(invocation_id, outcome).await;
+                    });
+                }
+                claim = self.claims.recv() => {
+                    let Some(session) = claim else {
+                        return Ok(());
+                    };
+                    let Ok(session) = session.parse::<SessionId>() else {
+                        continue;
+                    };
+                    if !claimed.contains(&session) {
+                        claimed.push(session);
+                    }
+                    let _ = handle.claim_session(session).await;
+                }
+            }
+        }
     }
 }
 

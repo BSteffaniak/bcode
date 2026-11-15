@@ -252,6 +252,7 @@ pub struct ReviewServices {
     execution: Execution,
     stack_limit: ReviewStackLimit,
     conversation: Arc<crate::config::conversation::ConversationConfig>,
+    assistant: Arc<crate::assistant::profile::AssistantConfig>,
     compare: crate::config::compare::CompareConfig,
     /// Providers and contributors: built-in ones, plus plugin-backed ones once found.
     providers: Arc<Mutex<ProviderRegistry>>,
@@ -284,6 +285,7 @@ impl ReviewServices {
             execution: Execution::Pool,
             stack_limit: ReviewStackLimit::default(),
             conversation: Arc::default(),
+            assistant: Arc::default(),
             compare: crate::config::compare::CompareConfig::default(),
             providers: Arc::default(),
             plugins_sought: Arc::default(),
@@ -432,6 +434,19 @@ impl ReviewServices {
     #[must_use]
     pub fn conversation_config(&self) -> Arc<crate::config::conversation::ConversationConfig> {
         Arc::clone(&self.conversation)
+    }
+
+    /// The review assistant's tool categories.
+    #[must_use]
+    pub fn assistant_config(&self) -> Arc<crate::assistant::profile::AssistantConfig> {
+        Arc::clone(&self.assistant)
+    }
+
+    /// Use `config` for the review assistant.
+    #[must_use]
+    pub fn with_assistant(mut self, config: crate::assistant::profile::AssistantConfig) -> Self {
+        self.assistant = Arc::new(config);
+        self
     }
 
     /// How pull requests are compared with earlier versions.
