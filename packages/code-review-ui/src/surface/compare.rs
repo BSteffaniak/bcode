@@ -1582,14 +1582,52 @@ impl ReviewSurface {
     /// What the comparison's rows say the changes are since.
     pub(super) fn compare_since(&self) -> crate::rows::compare::Since {
         use crate::rows::compare::Since;
-        if self.comparing.stack_at.is_some() || !self.comparing.picks.is_empty() {
+        if self.comparing.stack_at.is_some() {
             return Since::Then;
+        }
+        if !self.comparing.picks.is_empty() {
+            return self
+                .picked_from_version()
+                .map_or(Since::Then, Since::Version);
         }
         match self.comparing.baseline {
             Baseline::LastLooked => Since::LastLooked,
             Baseline::PreviousPush => Since::PreviousPush,
-            Baseline::Between { .. } | Baseline::Off => Since::Then,
+            Baseline::Between { from_ms, .. } => {
+                if let Some(ms) = self.comparing.ago {
+                    return Since::Ago(ms);
+                }
+                // Pushes picked on the timeline start just before a push: the stack after
+                // the push before it.
+                self.stack_history
+                    .as_ref()
+                    .and_then(|history| {
+                        (0..history.pushes.len())
+                            .find(|column| column_time(history, *column) == Some(from_ms))
+                    })
+                    .and_then(|column| u32::try_from(column).ok())
+                    .map_or(Since::Then, Since::Push)
+            }
+            Baseline::Off => Since::Then,
         }
+    }
+
+    /// The version (1-based) the one pull request whose versions were picked is compared from.
+    fn picked_from_version(&self) -> Option<u32> {
+        let picks = &self.comparing.picks;
+        let (number, pair) = picks.iter().next().filter(|_| picks.len() == 1)?;
+        let from = pair.from.as_ref()?;
+        let layer = self
+            .stack_history
+            .as_ref()?
+            .layers
+            .iter()
+            .find(|layer| layer.number == *number)?;
+        let index = layer
+            .versions
+            .iter()
+            .rposition(|version| version.version.head_oid == from.head_oid)?;
+        u32::try_from(index + 1).ok()
     }
 
     /// When the reviewer last looked, in words (`4m ago`, `nothing new`, `not yet`), once

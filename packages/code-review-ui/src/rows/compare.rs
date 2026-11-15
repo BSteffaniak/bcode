@@ -36,28 +36,45 @@ pub enum Since {
     LastLooked,
     /// The version before the stack's latest push.
     PreviousPush,
-    /// A time, pushes, or versions picked.
+    /// A point in time the comparison menu offers, by how long ago it is in milliseconds.
+    Ago(u64),
+    /// The stack after this push (`0`: before the first push), picked on the timeline.
+    Push(u32),
+    /// This version of the one pull request whose versions were picked.
+    Version(u32),
+    /// Another time, pushes, or versions picked.
     Then,
 }
 
 impl Since {
-    /// The words after "since" (`you looked`, `the previous push`, `then`).
+    /// The words after "since" (`you looked`, `the previous push`, `yesterday`, `push 3`,
+    /// `v2`, `then`).
     #[must_use]
-    pub const fn phrase(self) -> &'static str {
+    pub fn phrase(self) -> String {
         match self {
-            Self::LastLooked => "you looked",
-            Self::PreviousPush => "the previous push",
-            Self::Then => "then",
+            Self::LastLooked => "you looked".to_owned(),
+            Self::PreviousPush => "the previous push".to_owned(),
+            Self::Ago(ms) => crate::compare_menu::AGO_PRESETS
+                .iter()
+                .find(|(preset, _)| *preset == ms)
+                .map_or_else(|| "then".to_owned(), |(_, label)| (*label).to_owned()),
+            Self::Push(0) => "before push 1".to_owned(),
+            Self::Push(push) => format!("push {push}"),
+            Self::Version(version) => format!("v{version}"),
+            Self::Then => "then".to_owned(),
         }
     }
 
-    /// A small number distinguishing the variants, for cache keys.
+    /// A number distinguishing the variants and what they name, for cache keys.
     #[must_use]
     pub const fn index(self) -> u64 {
         match self {
             Self::LastLooked => 0,
             Self::PreviousPush => 1,
             Self::Then => 2,
+            Self::Ago(ms) => 3 | ms << 3,
+            Self::Push(push) => 4 | (push as u64) << 3,
+            Self::Version(version) => 5 | (version as u64) << 3,
         }
     }
 }
@@ -112,9 +129,10 @@ fn note_variants(note: &CompareNoteItem, since: Since, theme: &ReviewTheme) -> V
                 "{} Comparing with {}",
                 theme.icons.ellipsis,
                 match since {
-                    Since::LastLooked => "what you last looked at",
-                    Since::PreviousPush => "the previous push",
-                    Since::Then => "the versions picked",
+                    Since::LastLooked => "what you last looked at".to_owned(),
+                    Since::PreviousPush => "the previous push".to_owned(),
+                    Since::Ago(_) | Since::Push(_) | Since::Version(_) => since.phrase(),
+                    Since::Then => "the versions picked".to_owned(),
                 }
             ))],
             vec![text(format!("{} Comparing", theme.icons.ellipsis))],
@@ -146,9 +164,7 @@ fn note_variants(note: &CompareNoteItem, since: Since, theme: &ReviewTheme) -> V
         Some(DeltaKind::Unavailable) => vec![
             vec![text(match since {
                 Since::LastLooked => "The version you looked at is gone: showing the full change",
-                Since::PreviousPush | Since::Then => {
-                    "The version compared with is gone: showing the full change"
-                }
+                _ => "The version compared with is gone: showing the full change",
             })],
             vec![text("Baseline unavailable")],
         ],
