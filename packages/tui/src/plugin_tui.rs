@@ -4533,6 +4533,12 @@ library = "libcomposer_fixture.dylib"
             wait_for_native_hello_edit(surface.as_mut()).await,
             FocusedTextFieldEditResult::Rejected(_),
         ));
+        // Input is fenced to the revision actually displayed: the author rejects
+        // input naming a revision it has already superseded. Present the current
+        // projection before the next key, as the host's frame loop does, rather
+        // than racing the worker's periodic Prepare.
+        refresh_native_hello_editor(&presentation, surface.as_mut(), &host).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
         surface.handle_event_result(&native_hello_key('e'), &host);
         assert_eq!(
             next_native_hello_effect(surface.as_mut(), &host).await,
