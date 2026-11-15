@@ -1935,6 +1935,8 @@ dependencies = [
  "bcode_code_review_models",
  "bcode_code_review_provider",
  "bcode_config",
+ "bcode_forge",
+ "bcode_forge_models",
  "bcode_git",
  "bcode_path_display",
  "globset",

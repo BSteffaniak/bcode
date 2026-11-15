@@ -1,7 +1,9 @@
-//! What `code_review.create_review` reviews: its `sources` (and `directory`) turned into review
-//! source kinds and the repository the review belongs to.
+//! What a new review reviews, as the assistant names it.
+//!
+//! `code_review.create_review` and the app's prefilled wizard take `sources` (and `directory`);
+//! [`plan`] turns them into review source kinds and the repository the review belongs to.
 
-use bcode_code_review::assistant::AssistantError;
+use super::AssistantError;
 use bcode_code_review_models::ReviewSourceKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,6 +15,7 @@ const GITHUB_PROVIDER: &str = "github";
 const MAX_SOURCES: usize = 50;
 
 /// The schema of one source of `create_review`.
+#[must_use]
 pub fn source_schema() -> Value {
     json!({
         "type": "object",
@@ -74,8 +77,10 @@ pub struct Plan {
     pub sources: Vec<(ReviewSourceKind, Option<String>)>,
 }
 
-/// Turn `sources` into a plan, in the repository of `directory` (relative to `working_directory`
-/// when relative) or of the working directory. With `directory` below the repository root,
+/// Turn `sources` into a plan.
+///
+/// The plan is in the repository of `directory` (relative to `working_directory` when
+/// relative) or of the working directory. With `directory` below the repository root,
 /// uncommitted-change sources are limited to it unless they name `paths`.
 ///
 /// # Errors
@@ -108,7 +113,7 @@ pub fn plan(
                     "{directory} is not a directory"
                 )));
             }
-            let root = super::git(&path, &["rev-parse", "--show-toplevel"])
+            let root = git(&path, &["rev-parse", "--show-toplevel"])
                 .map(PathBuf::from)
                 .ok_or_else(|| {
                     AssistantError::Invalid(format!("{directory} is not inside a git repository"))
@@ -122,7 +127,7 @@ pub fn plan(
             (root, scope)
         }
         None => (
-            super::git(working_directory, &["rev-parse", "--show-toplevel"])
+            git(working_directory, &["rev-parse", "--show-toplevel"])
                 .map_or_else(|| working_directory.to_path_buf(), PathBuf::from),
             None,
         ),
@@ -135,6 +140,21 @@ pub fn plan(
         repo_root,
         sources: planned,
     })
+}
+
+/// Run git in `repo`; its trimmed output when it succeeded with some.
+fn git(repo: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|text| !text.is_empty())
 }
 
 fn required<T>(value: Option<T>, kind: &str, field: &str) -> Result<T, AssistantError> {
@@ -270,7 +290,7 @@ fn repository(repo: &Path, explicit: Option<&str>) -> Result<String, AssistantEr
     if let Some(explicit) = explicit.map(str::trim).filter(|name| !name.is_empty()) {
         return Ok(explicit.to_owned());
     }
-    super::git(repo, &["remote", "get-url", "origin"])
+    git(repo, &["remote", "get-url", "origin"])
         .and_then(|url| bcode_forge_models::RepositoryRef::from_remote_url(&url))
         .map(|repository| {
             if repository.host == bcode_forge::GITHUB_HOST {

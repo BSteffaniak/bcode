@@ -1239,7 +1239,7 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
         .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string()))
 }
 
-mod create;
+use bcode_code_review::assistant::create;
 
 #[cfg(test)]
 mod tests;

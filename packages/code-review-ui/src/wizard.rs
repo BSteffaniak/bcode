@@ -431,6 +431,30 @@ impl Wizard {
         wizard
     }
 
+    /// A wizard for a new review with `sources` (each with its label, the kind's own when
+    /// `None`) and `title` filled in, at its last step for the user to confirm or change.
+    #[must_use]
+    pub fn prefilled(
+        services: ReviewServices,
+        repo: PathBuf,
+        title: Option<String>,
+        sources: Vec<(ReviewSourceKind, Option<String>)>,
+    ) -> Self {
+        let mut wizard = Self::new(services, repo);
+        wizard.sources = sources
+            .into_iter()
+            .map(|(kind, label)| Chosen {
+                label: label.unwrap_or_else(|| kind.label()),
+                kind,
+                id: None,
+                included: true,
+            })
+            .collect();
+        wizard.typed_title = title.filter(|title| !title.trim().is_empty());
+        wizard.enter_confirm();
+        wizard
+    }
+
     /// Whether the wizard edits an existing review's sources.
     #[must_use]
     pub const fn is_editing(&self) -> bool {

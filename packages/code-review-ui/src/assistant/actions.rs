@@ -86,6 +86,18 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
         json!({"type": "string", "description": "Id of the saved review to open (code_review.list_reviews)."}),
     );
     open.insert(
+        "title".to_owned(),
+        json!({"type": "string", "description": "new_review: the title to fill in."}),
+    );
+    open.insert(
+        "sources".to_owned(),
+        json!({
+            "type": "array",
+            "items": bcode_code_review::assistant::create::source_schema(),
+            "description": "new_review: the sources to fill in (as code_review.create_review takes them); the user confirms or changes them in the wizard."
+        }),
+    );
+    open.insert(
         "screen".to_owned(),
         json!({"type": "string", "enum": ["review", "home", "new_review"], "description": "review (default, needs `review`), home (the reviews list) or new_review (the wizard)."}),
     );
@@ -157,7 +169,7 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
         descriptor(
             OPEN_REVIEW,
             ClientToolPolicy::Mutating,
-            "Take the user to another screen: open a saved review of this repository (optionally at a layer, file, line or thread), the reviews home, or the new-review wizard. The user may be asked first. Returns what is on screen once it opened.",
+            "Take the user to another screen: open a saved review of this repository (optionally at a layer, file, line or thread), the reviews home, or the new-review wizard (filled in with `title` and `sources` for the user to confirm). The user may be asked first. Returns what is on screen once it opened.",
             &Value::Object(open),
         ),
         descriptor(

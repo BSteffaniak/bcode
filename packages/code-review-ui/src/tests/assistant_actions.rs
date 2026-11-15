@@ -739,3 +739,41 @@ fn verdicts_need_pull_requests_and_refresh_reloads_home() {
         "{reloaded}"
     );
 }
+
+#[test]
+fn open_review_shows_the_wizard_filled_in_for_the_user_to_confirm() {
+    let mut setup = super::assistant::setup(160, 40, false);
+    let shown = done(call(
+        &mut setup.scenario,
+        actions::OPEN_REVIEW,
+        r#"{"screen":"new_review","title":"Uncommitted docs","sources":[{"kind":"working_tree","paths":["docs"]},{"kind":"last_commit"}]}"#,
+    ));
+    assert!(
+        shown["done"]
+            .as_str()
+            .is_some_and(|done| done.contains("filled in")),
+        "{shown}"
+    );
+    assert_eq!(setup.app().route_name(), RouteName::NewReview);
+    let wizard = setup.app().wizard().expect("wizard");
+    assert_eq!(wizard.step_number(), 3, "at the last step to confirm");
+    assert_eq!(
+        wizard.source_labels().len(),
+        2,
+        "{:?}",
+        wizard.source_labels()
+    );
+    let screen = setup.settle();
+    assert!(screen.contains("Uncommitted docs"), "{}", screen.text());
+    // Nothing is created until the user confirms.
+    assert!(
+        !screen.contains("Creating"),
+        "the review is not created by the tool"
+    );
+    let bad = refused(call(
+        &mut setup.scenario,
+        actions::OPEN_REVIEW,
+        r#"{"screen":"new_review","sources":[{"kind":"teleport"}]}"#,
+    ));
+    assert!(bad.contains("teleport"), "{bad}");
+}

@@ -128,9 +128,14 @@ pub struct ReviewApp {
 
 /// An assistant tool's work finished on a task.
 enum ToolWork {
+    /// `open_review new_review` turned its sources into review sources.
+    Prefilled {
+        result: Result<Next, String>,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+    },
     /// `open_review` read the review to open.
     Opened {
-        result: Result<ReviewWorkspace, String>,
+        result: Result<Box<ReviewWorkspace>, String>,
         target: crate::surface::GoTo,
         reply: tokio::sync::oneshot::Sender<ClientToolReply>,
     },
@@ -140,8 +145,11 @@ enum ToolWork {
 enum Next {
     /// The reviews home.
     Home,
-    /// The new-review wizard.
-    Wizard,
+    /// The new-review wizard, filled in with a title and sources when given.
+    Wizard {
+        title: Option<String>,
+        sources: Vec<(ReviewSourceKind, Option<String>)>,
+    },
     /// Another review, at a place in it.
     Review {
         workspace: Box<ReviewWorkspace>,
@@ -1079,7 +1087,7 @@ impl ReviewApp {
         };
         match open.screen.as_deref().unwrap_or("review") {
             "home" => self.leave_then(Next::Home, reply, host),
-            "new_review" => self.leave_then(Next::Wizard, reply, host),
+            "new_review" => self.prefill_for_tool(open.rest, reply, host),
             "review" => {
                 let Some(id) = open.review.filter(|id| !id.trim().is_empty()) else {
                     let _ = reply.send(Self::refused(
@@ -1110,7 +1118,7 @@ impl ReviewApp {
                             })
                             .await;
                     let result = match response {
-                        Ok(response) => response.workspace.ok_or_else(|| {
+                        Ok(response) => response.workspace.map(Box::new).ok_or_else(|| {
                             format!(
                                 "no saved review {id} in {} (code_review.list_reviews lists them; a review of another repository opens with `bcode review` there)",
                                 repo.display()
@@ -1134,6 +1142,73 @@ impl ReviewApp {
                 ));
             }
         }
+    }
+
+    /// Run `open_review new_review`: the wizard, filled in with `title` and `sources` (as
+    /// `code_review.create_review` takes them) when given.
+    fn prefill_for_tool(
+        &mut self,
+        rest: serde_json::Map<String, serde_json::Value>,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+        host: &UiContext,
+    ) {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Prefill {
+            title: Option<String>,
+            sources: Vec<bcode_code_review::assistant::create::SourceArgument>,
+        }
+        let prefill: Prefill = match serde_json::from_value(serde_json::Value::Object(rest)) {
+            Ok(prefill) => prefill,
+            Err(error) => {
+                let _ = reply.send(Self::refused(
+                    "invalid_arguments",
+                    format!("new_review takes `title` and `sources`: {error}"),
+                ));
+                return;
+            }
+        };
+        if prefill.sources.is_empty() {
+            self.leave_then(
+                Next::Wizard {
+                    title: prefill.title,
+                    sources: Vec::new(),
+                },
+                reply,
+                host,
+            );
+            return;
+        }
+        let repo = self.repo.clone();
+        let work = Arc::clone(&self.tool_work);
+        host.spawn(Box::pin(async move {
+            // Naming sources reads git (the origin remote, the repository root).
+            let planned = tokio::task::spawn_blocking(move || {
+                bcode_code_review::assistant::create::plan(&repo, None, prefill.sources)
+                    .map_err(|error| error.to_string())
+                    .and_then(|plan| {
+                        let same = plan.repo_root.canonicalize().ok() == repo.canonicalize().ok();
+                        if same {
+                            Ok(plan.sources)
+                        } else {
+                            Err(format!(
+                                "those sources are in {}, not this app's repository",
+                                plan.repo_root.display()
+                            ))
+                        }
+                    })
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|planned| planned);
+            let result = planned.map(|sources| Next::Wizard {
+                title: prefill.title,
+                sources,
+            });
+            if let Ok(mut queue) = work.lock() {
+                queue.push(ToolWork::Prefilled { result, reply });
+            }
+        }));
     }
 
     /// Move the user to `next` for an assistant tool, leaving the review on screen through its
@@ -1178,12 +1253,21 @@ impl ReviewApp {
                 self.show_home(true);
                 let _ = reply.send(self.screen_answer("showing the reviews home"));
             }
-            Next::Wizard => {
-                let mut wizard = Wizard::new(self.services.clone(), self.repo.clone());
+            Next::Wizard { title, sources } => {
+                let filled = !sources.is_empty();
+                let mut wizard = if filled {
+                    Wizard::prefilled(self.services.clone(), self.repo.clone(), title, sources)
+                } else {
+                    Wizard::new(self.services.clone(), self.repo.clone())
+                };
                 wizard.prepare_keymap(host);
                 self.route = Route::Wizard(Box::new(wizard));
                 self.keymap_stale = true;
-                let _ = reply.send(self.screen_answer("showing the new-review wizard"));
+                let _ = reply.send(self.screen_answer(if filled {
+                    "showing the new-review wizard filled in, for the user to confirm"
+                } else {
+                    "showing the new-review wizard"
+                }));
             }
             Next::Review { workspace, target } => {
                 self.open_review(*workspace, Some(host));
@@ -1224,12 +1308,23 @@ impl ReviewApp {
             .unwrap_or_default();
         let mut changed = false;
         for item in work {
-            let ToolWork::Opened {
-                result,
-                target,
-                reply,
-            } = item;
             changed = true;
+            let (result, target, reply) = match item {
+                ToolWork::Prefilled { result, reply } => {
+                    match result {
+                        Ok(next) => self.leave_then(next, reply, host),
+                        Err(message) => {
+                            let _ = reply.send(Self::refused("invalid_arguments", message));
+                        }
+                    }
+                    continue;
+                }
+                ToolWork::Opened {
+                    result,
+                    target,
+                    reply,
+                } => (result, target, reply),
+            };
             match result {
                 Err(message) => {
                     let _ = reply.send(Self::refused("not_found", message));
@@ -1242,14 +1337,7 @@ impl ReviewApp {
                     if same {
                         self.await_place(target, reply);
                     } else {
-                        self.leave_then(
-                            Next::Review {
-                                workspace: Box::new(workspace),
-                                target,
-                            },
-                            reply,
-                            host,
-                        );
+                        self.leave_then(Next::Review { workspace, target }, reply, host);
                     }
                 }
             }
