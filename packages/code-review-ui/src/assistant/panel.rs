@@ -2091,8 +2091,9 @@ impl Assistant {
     /// Read the app default and list the models once; again after a failed listing when
     /// `retry`.
     fn load_models(&mut self, retry: bool, ui: &UiContext) {
-        if !self.models.default_asked {
+        if !self.models.default_asked || (retry && self.models.default_error.is_some()) {
             self.models.default_asked = true;
+            self.models.default_error = None;
             let services = self.services.clone();
             let repo = self.repo.clone();
             let inbox = Arc::clone(&self.inbox);
@@ -2142,6 +2143,7 @@ impl Assistant {
                         format!("could not read the assistant's model: {error}"),
                         true,
                     ));
+                    self.models.default_error = Some(error);
                 }
             },
             Done::SessionModel {
@@ -2335,7 +2337,7 @@ impl Assistant {
 
     /// Use `choice` (Bcode's default when `None`) for `target`, and save it as the app default.
     fn choose_model(
-        &self,
+        &mut self,
         target: &Target,
         choice: Option<&crate::host::ModelOption>,
         ui: &UiContext,
@@ -2343,6 +2345,20 @@ impl Assistant {
         let session = self.target_session(target);
         let (_, effort) = self.models.effective(session.as_deref());
         let bcode_default = self.models.bcode_default().cloned();
+        if choice.is_none() && session.is_some() && bcode_default.is_none() {
+            // The session can only be put back on Bcode's default by naming that model.
+            let notice = format!(
+                "Bcode's default model is not known{}; this conversation keeps {}",
+                self.models
+                    .listed()
+                    .and_then(|catalog| catalog.default.as_ref())
+                    .and_then(|default| default.as_ref().err())
+                    .map_or_else(String::new, |error| format!(" ({error})")),
+                self.models.model_label(session.as_deref())
+            );
+            self.failure = Some(notice);
+            return;
+        }
         let model = choice.cloned().or_else(|| bcode_default.clone());
         let effort = model
             .as_ref()
@@ -2430,8 +2446,23 @@ impl Assistant {
             ));
             return;
         };
-        let mut settings = self.models.default.clone().unwrap_or_default();
-        settings.effort = Some(next.clone());
+        let Some(current) = self.models.default.as_ref() else {
+            // Saving without the current default would overwrite the model it names.
+            self.notice = Some((
+                self.models.default_error.as_ref().map_or_else(
+                    || "the assistant's model is still being read".to_owned(),
+                    |error| format!("could not read the assistant's model: {error}"),
+                ),
+                true,
+            ));
+            return;
+        };
+        let settings = super::models::default_with_effort(
+            current,
+            &model,
+            self.models.bcode_default(),
+            next.clone(),
+        );
         // An optimistic label until the session is read back.
         if let Some(session) = &session
             && let Some(known) = self.models.session(session).cloned()

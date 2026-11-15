@@ -44,6 +44,8 @@ pub struct ModelState {
     pub default: Option<ReviewAssistantSettings>,
     /// Whether the app default was asked for.
     pub default_asked: bool,
+    /// Why reading the app default failed; it is read again when the picker opens.
+    pub default_error: Option<String>,
     /// Whether a failed listing is tried again on the next poll (the panel was opened).
     pub relist: bool,
     /// Known session models, by session id.
@@ -187,6 +189,33 @@ pub fn effort_after(
     values.get(next).cloned()
 }
 
+/// The app default saved when `effort` is chosen for a target running `model`: the latest
+/// choice names the model the effort was chosen for. The model stays unnamed when the target
+/// runs Bcode's default (`bcode_default`) and `current` names no model either, so the default
+/// keeps following Bcode's.
+#[must_use]
+pub fn default_with_effort(
+    current: &ReviewAssistantSettings,
+    model: &ModelOption,
+    bcode_default: Option<&ModelOption>,
+    effort: String,
+) -> ReviewAssistantSettings {
+    let follows_bcode = current.model_id.is_none()
+        && bcode_default
+            .is_some_and(|default| default.is(model.provider.as_deref(), &model.model_id));
+    let (provider_plugin_id, model_id) = if follows_bcode {
+        (None, None)
+    } else {
+        (model.provider.clone(), Some(model.model_id.clone()))
+    };
+    ReviewAssistantSettings {
+        provider_plugin_id,
+        model_id,
+        effort: Some(effort),
+        ..current.clone()
+    }
+}
+
 /// The effort kept when switching to `model`: `effort` when the model offers it.
 #[must_use]
 pub fn kept_effort(model: &ModelOption, effort: Option<&str>) -> Option<String> {
@@ -308,6 +337,34 @@ mod tests {
         assert_eq!(kept_effort(&model, Some("high")).as_deref(), Some("high"));
         assert_eq!(kept_effort(&model, Some("medium")), None);
         assert_eq!(kept_effort(&ModelOption::default(), Some("high")), None);
+    }
+
+    #[test]
+    fn an_effort_chosen_for_a_model_saves_that_model_as_the_default() {
+        let a = ModelOption {
+            model_id: "a".to_owned(),
+            effort_values: values(&["low", "high"]),
+            ..ModelOption::default()
+        };
+        let b = ModelOption {
+            model_id: "b".to_owned(),
+            effort_values: values(&["minimal", "max"]),
+            ..ModelOption::default()
+        };
+        let default_a = ReviewAssistantSettings {
+            model_id: Some("a".to_owned()),
+            effort: Some("low".to_owned()),
+            ..ReviewAssistantSettings::default()
+        };
+        let saved = default_with_effort(&default_a, &b, Some(&a), "max".to_owned());
+        assert_eq!(saved.model_id.as_deref(), Some("b"));
+        assert_eq!(saved.effort.as_deref(), Some("max"));
+        let unnamed = ReviewAssistantSettings::default();
+        let follows = default_with_effort(&unnamed, &a, Some(&a), "high".to_owned());
+        assert_eq!(follows.model_id, None, "keeps following Bcode's default");
+        assert_eq!(follows.effort.as_deref(), Some("high"));
+        let named = default_with_effort(&unnamed, &b, Some(&a), "max".to_owned());
+        assert_eq!(named.model_id.as_deref(), Some("b"));
     }
 
     #[test]
