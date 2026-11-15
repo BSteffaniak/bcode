@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 /// Review-source provider of pull requests named by number or URL.
 const GITHUB_PROVIDER: &str = "github";
+/// The host of github.com repositories, written as `owner/name` without it.
+const GITHUB_HOST: &str = "github.com";
 /// Sources one review may have at most.
 const MAX_SOURCES: usize = 50;
 
@@ -293,7 +295,7 @@ fn repository(repo: &Path, explicit: Option<&str>) -> Result<String, AssistantEr
     git(repo, &["remote", "get-url", "origin"])
         .and_then(|url| bcode_forge_models::RepositoryRef::from_remote_url(&url))
         .map(|repository| {
-            if repository.host == bcode_forge::GITHUB_HOST {
+            if repository.host == GITHUB_HOST {
                 repository.full_name()
             } else {
                 format!("{}/{}", repository.host, repository.full_name())
@@ -332,7 +334,7 @@ fn parse_pull_url(url: &str) -> Result<(String, u64), AssistantError> {
         .next()
         .and_then(|number| number.parse::<u64>().ok())
         .ok_or_else(invalid)?;
-    let repository = if *host == bcode_forge::GITHUB_HOST {
+    let repository = if *host == GITHUB_HOST {
         format!("{owner}/{name}")
     } else {
         format!("{host}/{owner}/{name}")
