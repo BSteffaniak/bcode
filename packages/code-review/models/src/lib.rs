@@ -643,6 +643,21 @@ pub enum ReviewSourceKind {
         #[serde(default)]
         base: Option<String>,
     },
+    /// Uncommitted changes limited to some directories or files.
+    ///
+    /// A kind of its own rather than paths on the working-tree kinds, so a version that does not
+    /// know it preserves it as [`ReviewSourceKind::Unsupported`] instead of reviewing every
+    /// uncommitted change.
+    WorkingTreePaths {
+        /// Repository-relative directories or files (at least one).
+        paths: Vec<String>,
+        /// Whether staged changes are included.
+        #[serde(default = "default_true")]
+        staged: bool,
+        /// Whether unstaged changes are included.
+        #[serde(default = "default_true")]
+        unstaged: bool,
+    },
     /// A kind this version does not recognize, preserved verbatim.
     #[serde(skip)]
     Unsupported {
@@ -723,6 +738,22 @@ impl ReviewSourceKind {
             } => format!("Stack {repository}#{top}"),
             Self::CurrentBranch { base: Some(base) } => format!("Current branch vs {base}"),
             Self::CurrentBranch { base: None } => "Current branch".to_string(),
+            Self::WorkingTreePaths {
+                paths,
+                staged,
+                unstaged,
+            } => {
+                let what = match (staged, unstaged) {
+                    (true, false) => "Staged changes",
+                    (false, true) => "Unstaged changes",
+                    _ => "Uncommitted changes",
+                };
+                match paths.as_slice() {
+                    [] => what.to_string(),
+                    [path] => format!("{what} in {path}"),
+                    [first, rest @ ..] => format!("{what} in {first} +{}", rest.len()),
+                }
+            }
             Self::Unsupported { kind, .. } => format!("Unsupported source ({kind})"),
         }
     }

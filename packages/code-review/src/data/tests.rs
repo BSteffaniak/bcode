@@ -632,6 +632,77 @@ fn staged_unstaged_and_combined_indexes_use_index_and_working_tree_blobs() {
 }
 
 #[test]
+fn uncommitted_changes_limited_to_paths_list_only_those_paths() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let repo = fixture.root();
+    let service = ReviewData::default();
+    let mixed = GitFixture::modified_path(0);
+    let unstaged_only = GitFixture::modified_path(1);
+    let scoped = |paths: Vec<String>, staged: bool, unstaged: bool| {
+        let source = resolve_one(
+            &service,
+            repo,
+            ReviewSourceKind::WorkingTreePaths {
+                paths,
+                staged,
+                unstaged,
+            },
+        );
+        full_index(&service, repo, &source)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        scoped(vec![unstaged_only.clone()], true, true),
+        vec![unstaged_only.clone()]
+    );
+    assert_eq!(
+        scoped(vec![mixed.clone(), unstaged_only.clone()], true, false),
+        vec![mixed.clone()],
+        "staged only"
+    );
+    assert_eq!(
+        scoped(vec![mixed.clone(), unstaged_only.clone()], false, true),
+        vec![mixed.clone(), unstaged_only.clone()],
+        "unstaged only"
+    );
+    // A directory scopes to the files under it.
+    let directory = std::path::Path::new(&mixed)
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_owned);
+    if let Some(directory) = directory {
+        assert!(scoped(vec![directory], true, true).contains(&mixed));
+    }
+    // An unsafe path is refused rather than widened.
+    let response = service.resolve_sources(&ResolveReviewSourcesRequest {
+        repo_path: repo.to_path_buf(),
+        sources: vec![source(
+            "s",
+            ReviewSourceKind::WorkingTreePaths {
+                paths: vec!["../outside".to_owned()],
+                staged: true,
+                unstaged: true,
+            },
+        )],
+        provider_resolutions: Vec::new(),
+    });
+    assert!(
+        response.map_or(true, |response| response.sources.is_empty()),
+        "never resolved to the whole repository"
+    );
+    // A build that does not know the kind keeps it as unsupported.
+    let raw = serde_json::json!({"kind": "working_tree_paths", "paths": ["src"]});
+    let kind: ReviewSourceKind = serde_json::from_value(raw.clone()).expect("kind");
+    assert_eq!(
+        serde_json::to_value(&kind).expect("encode")["paths"],
+        raw["paths"]
+    );
+}
+
+#[test]
 fn many_indexes_list_in_parallel_with_each_sources_own_answer() {
     use bcode_code_review_models::ReviewIndexManyRequest;
     let fixture = GitFixture::generate(FixtureSpec::small());

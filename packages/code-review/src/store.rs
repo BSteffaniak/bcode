@@ -1424,6 +1424,30 @@ fn archive_review_workspace_for_request(
     Ok(ArchiveReviewWorkspaceResponse { archived })
 }
 
+impl ReviewStore {
+    /// Delete the saved review `workspace_id` of the repository at `repo_path`. Returns whether
+    /// it existed. Its comments and AI answers stay in the store, unreachable.
+    ///
+    /// # Errors
+    ///
+    /// * See [`ReviewStore`].
+    pub fn delete_workspace(
+        &self,
+        repo_path: &Path,
+        workspace_id: &str,
+    ) -> Result<bool, StoreError> {
+        let repo_root = resolve_repo_root(repo_path)?;
+        let workspace_id = workspace_id.to_owned();
+        with_database(&repo_root, &self.config, move |database| {
+            Box::pin(async move {
+                CodeReviewDb::new(database)
+                    .delete_workspace(&workspace_id)
+                    .await
+            })
+        })
+    }
+}
+
 /// A workspace's included sources materialized into reviewable surfaces (for review bundles).
 #[derive(Debug)]
 struct WorkspaceMaterialization {
@@ -1546,6 +1570,7 @@ fn materialize_context_source(
         | ReviewSourceKind::StackLayer { .. }
         | ReviewSourceKind::Stack { .. }
         | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::WorkingTreePaths { .. }
         | ReviewSourceKind::Unsupported { .. } => {
             return Err(StoreError::InvalidRequest(format!(
                 "source kind '{}' is not supported by this review view",
@@ -1661,6 +1686,7 @@ fn review_target_from_source_kind(kind: &ReviewSourceKind) -> Option<ReviewTarge
         | ReviewSourceKind::StackLayer { .. }
         | ReviewSourceKind::Stack { .. }
         | ReviewSourceKind::CurrentBranch { .. }
+        | ReviewSourceKind::WorkingTreePaths { .. }
         | ReviewSourceKind::Unsupported { .. } => None,
     }
 }

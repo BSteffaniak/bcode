@@ -326,6 +326,19 @@ impl<'a> CodeReviewDb<'a> {
         Ok(true)
     }
 
+    /// Delete a workspace's row. Returns whether it existed.
+    pub async fn delete_workspace(&self, workspace_id: &str) -> Result<bool, StoreError> {
+        if self.get_workspace(workspace_id).await?.is_none() {
+            return Ok(false);
+        }
+        self.db
+            .delete("review_workspaces")
+            .filter(Box::new(where_eq("workspace_id", workspace_id.to_string())))
+            .execute(self.db)
+            .await?;
+        Ok(true)
+    }
+
     pub async fn list_ai_exchanges(
         &self,
         review_key: &str,

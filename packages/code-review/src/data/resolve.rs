@@ -158,6 +158,29 @@ fn resolve_source(
         ReviewSourceKind::WorkingTreeAndIndex => {
             diff(source, head_or_empty(head), RevisionRef::WorkingTree)
         }
+        ReviewSourceKind::WorkingTreePaths {
+            paths,
+            staged,
+            unstaged,
+        } => {
+            if paths.is_empty() {
+                return Ok(unresolved("name at least one directory or file"));
+            }
+            for path in paths {
+                git::validate_relative_path(path)?;
+            }
+            let (base, head) = match (staged, unstaged) {
+                (true, true) => (head_or_empty(head), RevisionRef::WorkingTree),
+                (true, false) => (head_or_empty(head), RevisionRef::Index),
+                (false, true) => (RevisionRef::Index, RevisionRef::WorkingTree),
+                (false, false) => {
+                    return Ok(unresolved("include staged or unstaged changes"));
+                }
+            };
+            let mut resolved = diff_source(source, base, head);
+            resolved.paths.clone_from(paths);
+            Resolution::Resolved(vec![resolved])
+        }
         ReviewSourceKind::LastCommit => match head {
             Some(head) => single_commit(root, source, head)?,
             None => unresolved("the repository has no commits yet"),

@@ -465,6 +465,7 @@ const fn source_kind(kind: &ReviewSourceKind) -> &'static str {
         ReviewSourceKind::StackLayer { .. } => "stack_layer",
         ReviewSourceKind::Stack { .. } => "stack",
         ReviewSourceKind::CurrentBranch { .. } => "current_branch",
+        ReviewSourceKind::WorkingTreePaths { .. } => "working_tree_paths",
         ReviewSourceKind::Unsupported { .. } => "unsupported",
     }
 }
