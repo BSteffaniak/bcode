@@ -223,7 +223,8 @@ The default (`compare.start_view = "full"`) is the **full view**; `shift+l` swit
 * Code removed since the baseline shows as a one-row marker between lines,
   "▾ 3 lines removed since you looked", which expands (click) to the removed text, read-only.
   With `compare.removed_inline` (or **Show removed code inline**) the removed lines show in
-  place instead, as removed rows with their content struck through and faint.
+  place instead, as removed rows with their text struck through and faint (the strike covers
+  the text, not the row's padding).
 * **Hunk labels.** A hunk with marked lines carries a label against the right of its header
   that names the baseline in effect and counts its lines new or removed since then: `new since
   you looked · 2 lines`, `new since push 3 · 3 lines`, `new since yesterday · 1 line`,
@@ -231,9 +232,13 @@ The default (`compare.start_view = "full"`) is the **full view**; `shift+l` swit
   a comparison is active, then on changes.
 * **Hunks with nothing new** (in a marked file) show like the others by default; with
   `compare.seen_hunks = "dim"` they are dimmed, with `"fold"` they fold to their header, which
-  reads `[nothing new since you looked · show 7 lines]` (a click shows that hunk, and
-  `[… · fold]` folds it again). A hunk with a comment, an AI answer, or the composer anchored in
-  it never folds. Showing them is the default because the full change is the view for reading
+  reads `[nothing new since you looked · show 8 lines]`, counting the rows the hunk takes in
+  the layout shown (a click shows that hunk, and `[… · fold]` folds it again). A hunk with a
+  comment, a draft, an AI answer, or the composer anchored in it never folds; its header reads
+  `nothing new since you looked · kept open`, with nothing to click. The fold choice and the
+  hunks shown anyway last across a refresh. While one pull request's versions are picked and a
+  baseline still compares the other layers, labels say `new since then` rather than naming a
+  version that only one layer is compared from. Showing them is the default because the full change is the view for reading
   the whole change: the labels already point at what is new, and folding is one choice away.
 * Files are folded by state:
   * unchanged since the baseline and viewed: folded to their header, badge

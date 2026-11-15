@@ -402,8 +402,9 @@ work the same with or without one.
   **Show removed code inline** shows code removed since in place, struck through and faint,
   instead of behind its marker. A hunk with new lines is labelled with the baseline and a
   count (`new since push 3 · 3 lines`). Under **Hunks with nothing new**, *show* (the default),
-  *dim*, or *fold* them to their header (`[nothing new since you looked · show 7 lines]`; a
-  click shows one, `[… · fold]` folds it again; a hunk with a comment in it stays open). These
+  *dim*, or *fold* them to their header (`[nothing new since you looked · show 8 lines]`; a
+  click shows one, `[… · fold]` folds it again; a hunk with a comment or draft in it stays
+  open and says `kept open`; the choice lasts across a refresh). These
   preview with `space` and are put back by `esc` like the rest of the menu, and last for the
   session; `compare.*` settings set the defaults.
   `]`/`[` stop on new lines first. `shift+l` switches between that full change and only what
