@@ -672,6 +672,9 @@ pub struct ReviewSurface {
     review_pane: Cell<PaneState>,
     threads_pane: Cell<PaneState>,
     tree_scroll: Cell<ScrollViewState>,
+    /// How many rows the comparison legend may take over the file tree: `None` lets every
+    /// row wrap; `Some(rows)` keeps that many rows, one line each (the panel is too short).
+    legend_rows: Cell<Option<u64>>,
     tree_reveal: bool,
     synced_file: Option<FileRef>,
     filter: RefCell<TextInputState>,
@@ -839,6 +842,7 @@ impl ReviewSurface {
             review_pane: Cell::new(PaneState::new(Rect::default())),
             threads_pane: Cell::new(PaneState::new(Rect::default())),
             tree_scroll: Cell::new(ScrollViewState::new()),
+            legend_rows: Cell::new(None),
             tree_reveal: true,
             synced_file: None,
             filter: RefCell::new(TextInputState::new(bmux_text_edit::TextEditBuffer::new())),
@@ -4136,9 +4140,17 @@ impl ReviewSurface {
             let Some(review) = self.review.as_ref() else {
                 return;
             };
-            let layout = self
+            // The legend wraps unless that leaves the file tree too few rows.
+            self.legend_rows.set(None);
+            let mut layout = self
                 .body(review, ListSlot::Probe(&probe))
                 .layout(constraints, &mut LayoutCx::new());
+            if let Some(rows) = legend_rows_fitting(&layout) {
+                self.legend_rows.set(Some(rows));
+                layout = self
+                    .body(review, ListSlot::Probe(&probe))
+                    .layout(constraints, &mut LayoutCx::new());
+            }
             let tree_rows = layout
                 .find(&LayoutId::new(TREE_VIEWPORT_ID))
                 .map(|node| node.size.height);
@@ -4486,13 +4498,22 @@ impl ReviewSurface {
                 .child(prompt)
                 .flex(Flex::new(1, filter)),
         );
-        // The comparison legend: each row its own block, wrapping within the panel, so its
-        // click target is the rect it is laid out in.
-        for (index, row) in self.compare_legend().into_iter().enumerate() {
+        // The comparison legend: each row its own block, so its click target is the rect it
+        // is laid out in. Rows wrap within the panel; in a panel too short for that, they
+        // keep one line each and the later ones are left out, so the tree keeps its rows.
+        let mut legend = self.compare_legend();
+        let wrap = match self.legend_rows.get() {
+            None => bmux_tui::text::TextWrap::Word,
+            Some(rows) => {
+                legend.truncate(usize::try_from(rows).unwrap_or(usize::MAX));
+                bmux_tui::text::TextWrap::None
+            }
+        };
+        for (index, row) in legend.into_iter().enumerate() {
             content = content.child(
                 TextBlock::new(Text::from_lines(vec![row.line]))
                     .id(format!("{}{index}", compare_legend::LEGEND_ROW_ID))
-                    .wrap(bmux_tui::text::TextWrap::Word),
+                    .wrap(wrap),
             );
         }
         let content = content.flex(Flex::new(1, viewport));
@@ -4607,6 +4628,28 @@ impl ReviewSurface {
         );
         Self::pane(THREADS_PANE_ID, chrome, focused, &self.threads_pane, list)
     }
+}
+
+/// Rows of the file tree kept visible under the comparison legend, when the panel has them.
+const MIN_TREE_ROWS: u64 = 3;
+
+/// How many one-line legend rows fit over the file tree in `layout` (the file panel laid out
+/// with every legend row wrapped), or `None` when the wrapped legend leaves the tree at least
+/// [`MIN_TREE_ROWS`] rows (or the panel is not shown).
+fn legend_rows_fitting(layout: &LayoutNode) -> Option<u64> {
+    let height = |id: &str| {
+        layout
+            .find(&LayoutId::new(id.to_owned()))
+            .map(|node| node.size.height)
+    };
+    let content = height("review.files.content")?;
+    let filter = height("review.files.filter_row").unwrap_or(0);
+    let legend: u64 = (0..)
+        .map_while(|index| height(&format!("{}{index}", compare_legend::LEGEND_ROW_ID)))
+        .sum();
+    let room = content.saturating_sub(filter);
+    let tree = MIN_TREE_ROWS.min(room);
+    (legend > room - tree).then_some(room - tree)
 }
 
 /// The threads list: a flat BMUX tree over the cached thread rows.

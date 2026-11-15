@@ -1706,6 +1706,100 @@ fn the_file_panel_says_what_changed_with_every_layer_shown() {
     }
 }
 
+/// The file panel's laid-out parts: the content, the filter row, the legend rows, the tree.
+struct PanelParts {
+    content: bmux_tui::geometry::Rect,
+    filter: bmux_tui::geometry::Rect,
+    legend: Vec<bmux_tui::geometry::Rect>,
+    tree: bmux_tui::geometry::Rect,
+}
+
+fn panel_parts(scenario: &Scenario<ReviewApp>) -> Option<PanelParts> {
+    let review = scenario.surface().review()?;
+    Some(PanelParts {
+        content: review.body_area("review.files.content")?,
+        filter: review.body_area("review.files.filter_row")?,
+        legend: (0..)
+            .map_while(|index| review.body_area(&format!("review.files.legend.{index}")))
+            .collect(),
+        tree: review.body_area("review.files.viewport")?,
+    })
+}
+
+#[test]
+fn a_short_file_panel_keeps_rows_of_the_tree_under_the_legend() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    settled(&mut scenario);
+    scenario.key("shift+o");
+    settled(&mut scenario);
+    run(
+        &mut scenario,
+        "Compare: only pull requests with real changes",
+    );
+    scenario.key("shift+l");
+    let screen = settled(&mut scenario);
+    let full = panel_parts(&scenario).expect("the file panel").legend.len();
+    assert!(full >= 3, "{}", screen.text());
+    let mut capped = false;
+    for (width, height) in [
+        (160_u16, 40_u16),
+        (120, 14),
+        (110, 12),
+        (100, 11),
+        (96, 10),
+        (90, 9),
+        (88, 8),
+        (200, 8),
+        (70, 40),
+        (40, 12),
+    ] {
+        scenario.resize(width, height);
+        let screen = settled(&mut scenario);
+        let Some(parts) = panel_parts(&scenario) else {
+            continue;
+        };
+        let room = parts.content.height.saturating_sub(parts.filter.height);
+        // The tree keeps rows under the legend, inside the panel.
+        assert!(
+            parts.tree.height >= room.min(3),
+            "{width}x{height}: {:?} room {room}\n{}",
+            parts.tree,
+            screen.text()
+        );
+        assert!(parts.tree.bottom() <= parts.content.bottom());
+        for row in &parts.legend {
+            assert!(
+                row.x >= parts.content.x
+                    && row.right() <= parts.content.right()
+                    && row.y >= parts.filter.bottom()
+                    && row.bottom() <= parts.tree.y,
+                "{width}x{height}: {row:?} {:?}\n{}",
+                parts.tree,
+                screen.text()
+            );
+        }
+        capped |= parts.legend.len() < full;
+    }
+    assert!(capped, "no size left the legend short of rows");
+    // Back to a roomy panel: every row shows again, and its clicks land on its action.
+    scenario.resize(160, 40);
+    let screen = settled(&mut scenario);
+    assert_eq!(
+        panel_parts(&scenario).expect("the panel").legend.len(),
+        full
+    );
+    click_in_panel(&mut scenario, &screen, "[show all]");
+    settled(&mut scenario);
+    assert!(
+        !scenario
+            .surface()
+            .review()
+            .unwrap()
+            .comparing()
+            .only_changed()
+    );
+}
+
 #[test]
 fn the_summary_rows_show_button_shows_hidden_files_in_the_document_and_the_panel() {
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
