@@ -1452,7 +1452,12 @@ impl ReviewApp {
         let Route::Review(review) = &mut self.route else {
             return;
         };
-        let sessions = review.card_sessions(MAX_CARD_MODELS);
+        let mut sessions = review.card_sessions(MAX_CARD_MODELS);
+        if let Some(session) = review.composer_session()
+            && !sessions.contains(&session)
+        {
+            sessions.insert(0, session);
+        }
         self.assistant.learn_models(&sessions, host);
         let labels = sessions
             .iter()

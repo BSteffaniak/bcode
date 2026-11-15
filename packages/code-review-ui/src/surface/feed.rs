@@ -171,11 +171,19 @@ impl ReviewSurface {
             .collect()
     }
 
-    /// Show the assistant's `model · effort` labels: `default` on a question being written
-    /// (the app default its session will get) and each card's session's own.
+    /// Show the assistant's `model · effort` labels: on a question being written, its
+    /// follow-up session's own (none until that is known) or else `default` (the app default
+    /// its new session will get), and on each card its session's own.
     pub fn set_model_labels(&mut self, default: String, sessions: Vec<(String, String)>) {
+        let label = match self.composer_session() {
+            Some(session) => sessions
+                .iter()
+                .find(|(known, _)| *known == session)
+                .map(|(_, label)| label.clone()),
+            None => Some(default),
+        };
         if let Some(composer) = self.composer.as_mut() {
-            composer.set_model_label(Some(default));
+            composer.set_model_label(label);
         }
         for (session, label) in sessions {
             self.agents.set_model_label(&session, label);

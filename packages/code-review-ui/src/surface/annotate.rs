@@ -365,20 +365,18 @@ impl ReviewSurface {
                 composer.severity = notes::next_severity(composer.severity);
                 composer.touch();
             }
-            // A question's model and effort are the app default its new session gets.
+            // A question's model and effort are those of the session it goes to.
             Some("composer_model") if composer.mode == ComposerMode::Ask => {
+                let target = self.composer_target();
                 self.link
                     .requests
-                    .push(crate::assistant::LinkRequest::Model(
-                        crate::assistant::models::Target::AppDefault,
-                    ));
+                    .push(crate::assistant::LinkRequest::Model(target));
             }
             Some("composer_effort") if composer.mode == ComposerMode::Ask => {
+                let target = self.composer_target();
                 self.link
                     .requests
-                    .push(crate::assistant::LinkRequest::Effort(
-                        crate::assistant::models::Target::AppDefault,
-                    ));
+                    .push(crate::assistant::LinkRequest::Effort(target));
             }
             _ => match composer.key(stroke) {
                 ComposerInput::Submit => self.submit_composer(),
@@ -431,12 +429,12 @@ impl ReviewSurface {
                 composer.touch();
             }
             ComposerButton::Cancel => self.close_composer(),
-            ComposerButton::Model => self
-                .link
-                .requests
-                .push(crate::assistant::LinkRequest::Model(
-                    crate::assistant::models::Target::AppDefault,
-                )),
+            ComposerButton::Model => {
+                let target = self.composer_target();
+                self.link
+                    .requests
+                    .push(crate::assistant::LinkRequest::Model(target));
+            }
             ComposerButton::Suggestion(index) => composer.accept_suggestion(index),
         }
     }
@@ -804,20 +802,11 @@ impl ReviewSurface {
         self.ask_about(anchor, question, now, None);
     }
 
-    /// [`Self::ask_question`], asked from the thread `thread_id` (local or a pull request's):
-    /// the thread's comments, state, and where it was written go with the question.
-    pub(super) fn ask_about(
-        &mut self,
-        anchor: &DocAnchor,
-        question: String,
-        now: u64,
-        thread_id: Option<&str>,
-    ) {
-        self.next_exchange += 1;
-        let draft_anchor = anchor.to_draft_anchor();
-        let identity = notes::anchor_identity(&draft_anchor);
-        let session = self
-            .notes
+    /// The session a question about `anchor` goes to: the anchor's latest question's, else a
+    /// linked thread's; `None` when the question starts a new session.
+    fn anchor_session(&self, anchor: &DocAnchor) -> Option<String> {
+        let identity = notes::anchor_identity(&anchor.to_draft_anchor());
+        self.notes
             .exchanges()
             .iter()
             .rev()
@@ -829,7 +818,39 @@ impl ReviewSurface {
                     .iter()
                     .filter(|draft| notes::anchor_identity(&draft.anchor) == identity)
                     .find_map(|draft| draft.session_id.clone())
-            });
+            })
+    }
+
+    /// The session the question being written goes to, when it is a follow-up.
+    #[must_use]
+    pub fn composer_session(&self) -> Option<String> {
+        self.composer
+            .as_ref()
+            .filter(|composer| composer.mode == ComposerMode::Ask)
+            .and_then(|composer| self.anchor_session(&composer.anchor))
+    }
+
+    /// What the question composer's model and effort choices apply to: the follow-up's
+    /// session, else the app default its new session gets.
+    fn composer_target(&self) -> crate::assistant::models::Target {
+        self.composer_session().map_or(
+            crate::assistant::models::Target::AppDefault,
+            crate::assistant::models::Target::Session,
+        )
+    }
+
+    /// [`Self::ask_question`], asked from the thread `thread_id` (local or a pull request's):
+    /// the thread's comments, state, and where it was written go with the question.
+    pub(super) fn ask_about(
+        &mut self,
+        anchor: &DocAnchor,
+        question: String,
+        now: u64,
+        thread_id: Option<&str>,
+    ) {
+        self.next_exchange += 1;
+        let draft_anchor = anchor.to_draft_anchor();
+        let session = self.anchor_session(anchor);
         let exchange_id = format!("exchange-{now}-{}", self.next_exchange);
         let exchange = ReviewAiExchange {
             schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
