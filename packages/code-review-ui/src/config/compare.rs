@@ -9,6 +9,10 @@
 //! start_view = "full"                # or "changes": only what changed
 //! rebased_layers = "collapse"        # or "hide", or "show"
 //! timeline = "auto"                  # or "always"
+//! mark_style = "both"                # or "bar", "tint", "strong": how lines new since show
+//! word_marks = true                  # mark the changed words of lines modified since
+//! seen_hunks = "show"                # or "dim", "fold": hunks with nothing new since
+//! removed_inline = false             # show code removed since inline, struck through
 //! ```
 
 use bcode_code_review_models::ReviewCompareBaseline;
@@ -120,6 +124,112 @@ pub enum TimelineMode {
     Always,
 }
 
+/// How lines new since the baseline are marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkStyle {
+    /// A bar in the gutter only.
+    Bar,
+    /// A tint behind the row only.
+    Tint,
+    /// The bar and the tint.
+    #[default]
+    Both,
+    /// An accent bar, a stronger tint, and a `new` label in the gutter where it has room.
+    Strong,
+}
+
+impl MarkStyle {
+    /// Every style, in the order the comparison menu lists them.
+    pub const ALL: [Self; 4] = [Self::Both, Self::Bar, Self::Tint, Self::Strong];
+
+    /// Whether marked rows paint the gutter bar.
+    #[must_use]
+    pub const fn bar(self) -> bool {
+        matches!(self, Self::Bar | Self::Both | Self::Strong)
+    }
+
+    /// Whether marked rows are tinted.
+    #[must_use]
+    pub const fn tint(self) -> bool {
+        matches!(self, Self::Tint | Self::Both | Self::Strong)
+    }
+
+    /// A small number distinguishing the styles, for cache keys.
+    #[must_use]
+    pub const fn index(self) -> u64 {
+        match self {
+            Self::Both => 0,
+            Self::Bar => 1,
+            Self::Tint => 2,
+            Self::Strong => 3,
+        }
+    }
+}
+
+/// How hunks with nothing new since the baseline show while their file is marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeenHunks {
+    /// Like every other hunk.
+    #[default]
+    Show,
+    /// Dimmed.
+    Dim,
+    /// Folded to their header.
+    Fold,
+}
+
+impl SeenHunks {
+    /// Every choice, in the order the comparison menu lists them.
+    pub const ALL: [Self; 3] = [Self::Show, Self::Dim, Self::Fold];
+
+    /// A small number distinguishing the choices, for cache keys.
+    #[must_use]
+    pub const fn index(self) -> u64 {
+        match self {
+            Self::Show => 0,
+            Self::Dim => 1,
+            Self::Fold => 2,
+        }
+    }
+}
+
+/// How what is new since the baseline is marked in the full change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkOptions {
+    /// How marked lines show.
+    pub style: MarkStyle,
+    /// Whether the changed words of a line modified since the baseline are marked.
+    pub words: bool,
+    /// How hunks with nothing new show.
+    pub seen: SeenHunks,
+    /// Whether code removed since the baseline shows inline instead of behind its marker.
+    pub removed_inline: bool,
+}
+
+impl Default for MarkOptions {
+    fn default() -> Self {
+        Self {
+            style: MarkStyle::default(),
+            words: true,
+            seen: SeenHunks::default(),
+            removed_inline: false,
+        }
+    }
+}
+
+impl MarkOptions {
+    /// A number that differs whenever the options do, for cache keys and revisions.
+    #[must_use]
+    pub const fn stamp(self) -> u64 {
+        self.style.index()
+            | (self.words as u64) << 2
+            | self.seen.index() << 3
+            | (self.removed_inline as u64) << 5
+    }
+}
+
 /// The `compare` table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompareConfig {
@@ -135,6 +245,8 @@ pub struct CompareConfig {
     pub rebased_layers: RebasedLayers,
     /// When the push timeline shows.
     pub timeline: TimelineMode,
+    /// How what is new since the baseline is marked.
+    pub marks: MarkOptions,
 }
 
 impl Default for CompareConfig {
@@ -146,6 +258,7 @@ impl Default for CompareConfig {
             start_view: StartView::default(),
             rebased_layers: RebasedLayers::default(),
             timeline: TimelineMode::default(),
+            marks: MarkOptions::default(),
         }
     }
 }
@@ -159,6 +272,10 @@ struct RawCompare {
     start_view: Option<StartView>,
     rebased_layers: Option<RebasedLayers>,
     timeline: Option<TimelineMode>,
+    mark_style: Option<MarkStyle>,
+    word_marks: Option<bool>,
+    seen_hunks: Option<SeenHunks>,
+    removed_inline: Option<bool>,
 }
 
 impl CompareConfig {
@@ -199,6 +316,12 @@ impl CompareConfig {
             start_view: raw.start_view.unwrap_or(defaults.start_view),
             rebased_layers: raw.rebased_layers.unwrap_or(defaults.rebased_layers),
             timeline: raw.timeline.unwrap_or(defaults.timeline),
+            marks: MarkOptions {
+                style: raw.mark_style.unwrap_or(defaults.marks.style),
+                words: raw.word_marks.unwrap_or(defaults.marks.words),
+                seen: raw.seen_hunks.unwrap_or(defaults.marks.seen),
+                removed_inline: raw.removed_inline.unwrap_or(defaults.marks.removed_inline),
+            },
         };
         let mut diagnostic = None;
         if let Some(text) = raw.default_baseline {
@@ -245,6 +368,56 @@ mod tests {
         assert!(problem.is_some_and(|problem| problem.contains("default_baseline")));
         let (_, problem) = read("[compare]\nunknown = 1");
         assert!(problem.is_some());
+    }
+
+    #[test]
+    fn mark_options_read_from_the_compare_table() {
+        let (config, problem) = read("[compare]\ndwell_seconds = 3");
+        assert_eq!(problem, None);
+        assert_eq!(config.marks, MarkOptions::default());
+        assert_eq!(config.marks.style, MarkStyle::Both);
+        assert!(config.marks.words);
+        assert_eq!(config.marks.seen, SeenHunks::Show);
+        assert!(!config.marks.removed_inline);
+        let (config, problem) = read(
+            "[compare]\nmark_style = \"strong\"\nword_marks = false\nseen_hunks = \"fold\"\n\
+             removed_inline = true",
+        );
+        assert_eq!(problem, None);
+        assert_eq!(
+            config.marks,
+            MarkOptions {
+                style: MarkStyle::Strong,
+                words: false,
+                seen: SeenHunks::Fold,
+                removed_inline: true,
+            }
+        );
+        let (config, problem) = read("[compare]\nmark_style = \"loud\"");
+        assert_eq!(config.marks, MarkOptions::default());
+        assert!(problem.is_some());
+        let mut stamps: Vec<u64> = Vec::new();
+        for style in MarkStyle::ALL {
+            for seen in SeenHunks::ALL {
+                for words in [false, true] {
+                    for removed_inline in [false, true] {
+                        stamps.push(
+                            MarkOptions {
+                                style,
+                                words,
+                                seen,
+                                removed_inline,
+                            }
+                            .stamp(),
+                        );
+                    }
+                }
+            }
+        }
+        let count = stamps.len();
+        stamps.sort_unstable();
+        stamps.dedup();
+        assert_eq!(stamps.len(), count, "every option set has its own stamp");
     }
 
     #[test]

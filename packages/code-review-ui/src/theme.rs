@@ -439,6 +439,18 @@ pub struct SinceStyles {
     pub badge: Style,
     /// A comparison's summary line and removed-since markers.
     pub note: Style,
+    /// Diff rows of lines new since the baseline in the strong mark style: a stronger tint.
+    pub strong_diff: DiffViewerStyle,
+    /// The gutter bar and `new` label in the strong mark style.
+    pub strong_bar: Style,
+    /// The words of a line that changed since the baseline line it replaced.
+    pub word: Style,
+    /// Patched over the content of code removed since the baseline shown inline.
+    pub removed_inline: Style,
+    /// Patched over hunks with nothing new since the baseline, when they are dimmed.
+    pub seen: Style,
+    /// A hunk header's label of what in it is new since the baseline.
+    pub label: Style,
 }
 
 /// Share of the accent in the background of a selected line range.
@@ -1022,6 +1034,12 @@ const fn pill(tiers: &Tiers) -> Style {
 /// Share of the comparison hue in the row tint of lines new since a baseline.
 const SINCE_TINT_SHARE: f64 = 0.22;
 
+/// Share of the comparison hue in the row tint of the strong mark style.
+const SINCE_STRONG_TINT_SHARE: f64 = 0.40;
+
+/// Share of the comparison hue behind words changed since the baseline line.
+const SINCE_WORD_SHARE: f64 = 0.55;
+
 /// A comparison's styles: its hue (the second accent, else info) tints changed rows more
 /// strongly and colors the gutter bar and badges.
 fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyle) -> SinceStyles {
@@ -1030,6 +1048,13 @@ fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyl
         mixed(hue, row.bg.or(tiers.canvas.bg), SINCE_TINT_SHARE).map_or(row, |bg| row.bg(bg))
     };
     let ink = hue.map_or(tiers.accent, |fg| Style::new().fg(fg));
+    let strong = |row: Style| {
+        mixed(hue, row.bg.or(tiers.canvas.bg), SINCE_STRONG_TINT_SHARE).map_or(row, |bg| row.bg(bg))
+    };
+    let accent = tiers.accent.fg.map_or(ink, |fg| Style::new().fg(fg));
+    let word = mixed(hue, tiers.canvas.bg, SINCE_WORD_SHARE)
+        .map_or(Style::new(), |bg| Style::new().bg(bg))
+        .add_modifier(Modifier::UNDERLINE);
     SinceStyles {
         diff: DiffViewerStyle {
             added_row: tint(diff.added_row),
@@ -1039,6 +1064,16 @@ fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyl
         bar: ink.add_modifier(Modifier::BOLD),
         badge: ink.add_modifier(Modifier::BOLD),
         note: tiers.muted,
+        strong_diff: DiffViewerStyle {
+            added_row: strong(diff.added_row),
+            removed_row: strong(diff.removed_row),
+            ..*diff
+        },
+        strong_bar: accent.add_modifier(Modifier::BOLD),
+        word,
+        removed_inline: Style::new().add_modifier(Modifier::CROSSED_OUT | Modifier::DIM),
+        seen: Style::new().add_modifier(Modifier::DIM),
+        label: ink.add_modifier(Modifier::BOLD),
     }
 }
 

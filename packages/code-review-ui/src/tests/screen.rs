@@ -651,6 +651,7 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
                 separation: crate::rows::file::Separation::default(),
                 threads: crate::rows::thread_card::Params::default(),
                 since: crate::rows::compare::Since::default(),
+                marks: crate::config::compare::MarkOptions::default(),
             };
             let cache = RefCell::new(RowCache::default());
             let notes = crate::notes::ReviewNotes::default();

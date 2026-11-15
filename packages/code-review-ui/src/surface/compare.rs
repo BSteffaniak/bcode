@@ -14,7 +14,7 @@
 use super::super::loader::{Message, StepsArrived};
 use super::ReviewSurface;
 use crate::compare_bar::{BannerPlan, BarPlan};
-use crate::config::compare::{BaselineLook, RebasedLayers, StartView};
+use crate::config::compare::{BaselineLook, MarkOptions, RebasedLayers, SeenHunks, StartView};
 use crate::context::UiContext;
 use bcode_code_review::document::{CompareView, FileKey, GroupComparison, VersionStep};
 use bcode_code_review::history::looks::{self, BaselineRule, LastLooked};
@@ -114,6 +114,9 @@ pub struct Comparing {
     ago: Option<u64>,
     /// The time the whole stack is shown as it was at, while it is.
     stack_at: Option<u64>,
+    /// How what is new since the baseline is marked, once changed in the menu (else as
+    /// configured).
+    marks: Option<MarkOptions>,
     /// Deltas computed in this session, by pair (a pair names its commits, so its delta never
     /// changes): picking a baseline again in the menu lays them at once.
     deltas: BTreeMap<LayerPair, LayerDelta>,
@@ -142,6 +145,7 @@ pub(super) struct CompareSnapshot {
     restored: Option<Baseline>,
     ago: Option<u64>,
     stack_at: Option<u64>,
+    marks: Option<MarkOptions>,
 }
 
 /// Most deltas kept for picking a baseline again.
@@ -196,6 +200,13 @@ impl Comparing {
         self.stack_at
     }
 
+    /// How what is new since the baseline is marked, when changed in the menu (else as
+    /// configured).
+    #[must_use]
+    pub const fn marks(&self) -> Option<MarkOptions> {
+        self.marks
+    }
+
     /// The choice as it stands, to put back later.
     pub(super) fn snapshot(&self) -> CompareSnapshot {
         CompareSnapshot {
@@ -207,6 +218,7 @@ impl Comparing {
             restored: self.restored,
             ago: self.ago,
             stack_at: self.stack_at,
+            marks: self.marks,
         }
     }
 
@@ -662,6 +674,12 @@ impl ReviewSurface {
             StartView::Full => CompareView::Full,
             StartView::Changes => CompareView::Changes,
         };
+        let fold = self.mark_options().seen == SeenHunks::Fold;
+        if let Some(review) = self.review.as_mut()
+            && review.doc.set_fold_seen_hunks(fold)
+        {
+            review.note_splices();
+        }
         self.list_looks(host);
     }
 
@@ -1414,6 +1432,36 @@ impl ReviewSurface {
         );
     }
 
+    /// How what is new since the baseline is marked now.
+    pub(super) fn mark_options(&self) -> MarkOptions {
+        self.comparing
+            .marks
+            .unwrap_or_else(|| self.services.compare_config().marks)
+    }
+
+    /// Mark what is new since the baseline as `marks` (`None`: as configured): rows are laid
+    /// out again, and hunks seen before fold or show.
+    pub(super) fn set_mark_options(&mut self, marks: Option<MarkOptions>) {
+        if self.comparing.marks == marks {
+            return;
+        }
+        self.comparing.marks = marks;
+        let fold = self.mark_options().seen == SeenHunks::Fold;
+        if let Some(review) = self.review.as_mut()
+            && review.doc.set_fold_seen_hunks(fold)
+        {
+            review.note_splices();
+        }
+        self.layout_revision += 1;
+    }
+
+    /// Change one of the mark options in place.
+    pub(super) fn change_marks(&mut self, change: impl FnOnce(&mut MarkOptions)) {
+        let mut marks = self.mark_options();
+        change(&mut marks);
+        self.set_mark_options(Some(marks));
+    }
+
     /// Show only pull requests with real changes, or every one again.
     pub(super) fn toggle_only_changed(&mut self) {
         self.comparing.only_changed = !self.comparing.only_changed;
@@ -1442,7 +1490,9 @@ impl ReviewSurface {
             restored,
             ago,
             stack_at,
+            marks,
         } = snapshot;
+        self.set_mark_options(marks);
         self.comparing.baseline = baseline;
         self.comparing.picks = picks;
         self.comparing.only_changed = only_changed;

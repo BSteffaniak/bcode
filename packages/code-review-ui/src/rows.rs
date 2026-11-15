@@ -175,6 +175,8 @@ pub struct ViewParams {
     pub threads: thread_card::Params,
     /// What a comparison's rows say the changes are since.
     pub since: compare::Since,
+    /// How what is new since a comparison's baseline is marked.
+    pub marks: super::config::compare::MarkOptions,
 }
 
 /// What a gap segment does when clicked.
@@ -483,9 +485,12 @@ enum ContentStamp {
     /// Nothing beyond the key and the revisions.
     #[default]
     Fixed,
-    /// One unified line, or the two sides of a side-by-side row: text state, layer, and
-    /// whether the side is new since a comparison's baseline.
-    Lines([Option<(TextState, Option<u64>, bool)>; 2]),
+    /// One unified line, or the two sides of a side-by-side row: text state, layer, whether
+    /// the side is new since a comparison's baseline and the line it replaced there; and
+    /// whether the row's hunk has nothing new.
+    Lines([Option<SideStamp>; 2], bool),
+    /// A hunk's header: its lines new since the baseline, and whether it is folded.
+    Hunk(Option<u32>, bool),
     /// A removed-since marker: whether its text shows.
     Removal(bool),
     /// A comparison's summary.
@@ -525,14 +530,33 @@ enum ContentStamp {
     },
 }
 
+/// What changes one side of a diff row without a new key.
+type SideStamp = (TextState, Option<u64>, bool, Option<Arc<str>>);
+
 impl ContentStamp {
     fn of(item: &ReviewItem) -> Self {
-        let side = |side: &PairSide| (TextState::of(&side.content), side.layer, side.since);
+        let side = |side: &PairSide| {
+            (
+                TextState::of(&side.content),
+                side.layer,
+                side.since,
+                side.was.clone(),
+            )
+        };
         match item {
-            ReviewItem::Line(line) => Self::Lines([
-                Some((TextState::of(&line.content), line.layer, line.since)),
-                None,
-            ]),
+            ReviewItem::Line(line) => Self::Lines(
+                [
+                    Some((
+                        TextState::of(&line.content),
+                        line.layer,
+                        line.since,
+                        line.was.clone(),
+                    )),
+                    None,
+                ],
+                line.seen,
+            ),
+            ReviewItem::HunkHeader(hunk) => Self::Hunk(hunk.since_lines, hunk.folded),
             ReviewItem::RemovedSince(removal) => Self::Removal(removal.expanded),
             ReviewItem::CompareNote(note) => Self::Note(
                 note.kind,
@@ -541,9 +565,10 @@ impl ContentStamp {
                 [note.added, note.removed],
                 note.files_shown,
             ),
-            ReviewItem::LinePair(pair) => {
-                Self::Lines([pair.old.as_ref().map(side), pair.new.as_ref().map(side)])
-            }
+            ReviewItem::LinePair(pair) => Self::Lines(
+                [pair.old.as_ref().map(side), pair.new.as_ref().map(side)],
+                pair.seen,
+            ),
             ReviewItem::Gap(gap) => Self::Gap(
                 gap.end,
                 gap.state == GapState::OpenEnded,
@@ -814,6 +839,7 @@ impl RowContext<'_> {
             ReviewItem::RemovedSince(item) => compare::removed_rows(
                 item,
                 self.params.since,
+                self.params.marks,
                 self.options(),
                 styles,
                 width,
@@ -834,9 +860,13 @@ impl RowContext<'_> {
             ),
             ReviewItem::Placeholder(item) => placeholder(item, styles, cells),
             ReviewItem::FileNotice(item) => ItemRows::single(file_notice(item, styles, cells)),
-            ReviewItem::HunkHeader(item) => {
-                ItemRows::single(hunk_header(item, styles, cells, self.gutter_indent(width)))
-            }
+            ReviewItem::HunkHeader(item) => hunk_header(
+                item,
+                (self.params.since, self.params.marks),
+                styles,
+                cells,
+                self.gutter_indent(width),
+            ),
             ReviewItem::Line(line) => self.unified_rows(index, line, width),
             ReviewItem::LinePair(pair) => self.pair_rows(pair, width),
             ReviewItem::Gap(gap) => gap_rows(gap, self.params, cells, self.gutter_indent(width)),
@@ -907,6 +937,14 @@ impl RowContext<'_> {
             });
         }
         let changed = self.unified_emphasis(index, line);
+        let marks = self.params.marks;
+        if line.since
+            && marks.words
+            && let Some(was) = &line.was
+        {
+            let words = compare::word_ranges(was, text);
+            syntax = compare::with_word_marks(&syntax, &words, styles.since.word);
+        }
         let layout = layout_diff_row(
             DiffRowItem::Unified {
                 kind,
@@ -918,19 +956,27 @@ impl RowContext<'_> {
             },
             width,
             self.options(),
-            if line.since {
-                &styles.since.diff
-            } else {
-                &styles.diff
-            },
+            compare::mark_styles(marks, line.since, styles),
         );
         let mut rows = diff_item_rows(layout);
         if line.since
             && let Some(layout) = &rows.diff
         {
-            compare::paint_since_bar(&mut rows.lines, layout, |_| true, styles);
+            compare::paint_marks(&mut rows.lines, layout, |_| true, marks, styles);
+        }
+        if line.seen {
+            self.dim_seen(&mut rows.lines);
         }
         rows
+    }
+
+    /// Dim `lines` of a hunk with nothing new since the baseline, when such hunks dim.
+    fn dim_seen(&self, lines: &mut [Line]) {
+        if self.params.marks.seen == super::config::compare::SeenHunks::Dim {
+            for line in lines {
+                *line = line.patch_style(self.params.theme.since.seen);
+            }
+        }
     }
 
     fn pair_rows(&self, pair: &LinePairItem, width: u16) -> ItemRows {
@@ -946,14 +992,22 @@ impl RowContext<'_> {
         } else {
             bmux_tui_components::diff_viewer::IntralineChanges::default()
         };
+        let marks = self.params.marks;
         let old = pair
             .old
             .as_ref()
             .map(|side| self.pair_side(&pair.file, ReviewLineSide::Old, side));
-        let new = pair
-            .new
-            .as_ref()
-            .map(|side| self.pair_side(&pair.file, ReviewLineSide::New, side));
+        let new = pair.new.as_ref().map(|side| {
+            let mut cell = self.pair_side(&pair.file, ReviewLineSide::New, side);
+            if side.since
+                && marks.words
+                && let Some(was) = &side.was
+            {
+                let words = compare::word_ranges(was, cell.2);
+                cell.3 = compare::with_word_marks(&cell.3, &words, styles.since.word);
+            }
+            cell
+        });
         let marked = |side: Option<&PairSide>| side.is_some_and(|side| side.since);
         let (old_since, new_since) = (marked(pair.old.as_ref()), marked(pair.new.as_ref()));
         let layout = layout_diff_row(
@@ -963,25 +1017,25 @@ impl RowContext<'_> {
             },
             width,
             self.options(),
-            if old_since || new_since {
-                &styles.since.diff
-            } else {
-                &styles.diff
-            },
+            compare::mark_styles(marks, old_since || new_since, styles),
         );
         let mut rows = diff_item_rows(layout);
         if (old_since || new_since)
             && let Some(layout) = &rows.diff
         {
-            compare::paint_since_bar(
+            compare::paint_marks(
                 &mut rows.lines,
                 layout,
                 |side| match side {
                     DiffSourceSide::Old => old_since,
                     DiffSourceSide::New => new_since,
                 },
+                marks,
                 styles,
             );
+        }
+        if pair.seen {
+            self.dim_seen(&mut rows.lines);
         }
         rows
     }
@@ -1398,40 +1452,103 @@ fn file_notice(item: &FileNoticeItem, theme: &ReviewTheme, width: usize) -> Line
     Line::from_spans(vec![Span::styled(text, style)]).truncate(width)
 }
 
-fn hunk_header(item: &HunkHeaderItem, theme: &ReviewTheme, width: usize, indent: usize) -> Line {
+/// A hunk's header row: its range and heading, then against the right edge the label of what
+/// in it is new since a comparison's baseline (or the button showing a hunk folded as seen
+/// before) and the layers that wrote it. The button's cells are found in the painted row.
+fn hunk_header(
+    item: &HunkHeaderItem,
+    (since, marks): (compare::Since, super::config::compare::MarkOptions),
+    theme: &ReviewTheme,
+    width: usize,
+    indent: usize,
+) -> ItemRows {
+    let range = format!(
+        "@@ -{},{} +{},{} @@",
+        item.old_start, item.old_count, item.new_start, item.new_count
+    );
+    let layers: Vec<String> = item
+        .layers
+        .iter()
+        .map(|layer| format!("#{layer}"))
+        .collect();
+    let layers = layers.join(" ");
+    let label = compare::hunk_label(item, since, marks, theme).map(|(variants, action)| {
+        // The widest label leaving the range and the layers in view.
+        let room =
+            width.saturating_sub(indent + display_width(&range) + display_width(&layers) + 3);
+        let text = variants
+            .iter()
+            .find(|variant| display_width(variant) <= room)
+            .or_else(|| variants.last())
+            .cloned()
+            .unwrap_or_default();
+        (text, action)
+    });
+    let (mut line, trailing) =
+        hunk_header_line(item, &range, &layers, label.as_ref(), theme, width, indent);
+    if item.seen() && marks.seen == super::config::compare::SeenHunks::Dim {
+        line = line.patch_style(theme.since.seen);
+    }
+    let mut actions = Vec::new();
+    if let Some((text, Some(action))) = &label {
+        // The label leads the trailing part, which stands against the right edge whole when
+        // it fits; the button is registered only where the painted row shows it.
+        let cells = display_width(text);
+        if let Some(start) = width.checked_sub(trailing)
+            && line.viewport(start, cells).plain_text() == *text
+        {
+            actions.push(ActionCells {
+                row: 0,
+                cells: u16::try_from(start).unwrap_or(u16::MAX)
+                    ..u16::try_from(start + cells).unwrap_or(u16::MAX),
+                action: ItemAction::Compare(*action),
+            });
+        }
+    }
+    ItemRows::lines(vec![line], actions)
+}
+
+fn hunk_header_line(
+    item: &HunkHeaderItem,
+    range: &str,
+    layers: &str,
+    label: Option<&(String, Option<compare::CompareAction>)>,
+    theme: &ReviewTheme,
+    width: usize,
+    indent: usize,
+) -> (Line, usize) {
     let mut content = vec![
         Span::raw(" ".repeat(indent)),
-        Span::styled(
-            format!(
-                "@@ -{},{} +{},{} @@",
-                item.old_start, item.old_count, item.new_start, item.new_count
-            ),
-            theme.hunk,
-        ),
+        Span::styled(range.to_owned(), theme.hunk),
     ];
     if let Some(heading) = &item.heading {
         content.push(Span::raw(" "));
         content.push(Span::styled(heading.to_string(), theme.text));
     }
-    let trailing = if item.layers.is_empty() {
-        Line::default()
-    } else {
-        let layers: Vec<String> = item
-            .layers
-            .iter()
-            .map(|layer| format!("#{layer}"))
-            .collect();
-        Line::from_spans(vec![
-            Span::styled(layers.join(" "), theme.badge_open),
-            Span::raw(" "),
-        ])
-    };
-    header_line(
+    let mut trailing = Vec::new();
+    if let Some((text, action)) = label {
+        trailing.push(Span::styled(
+            text.clone(),
+            if action.is_some() {
+                theme.gap_action
+            } else {
+                theme.since.label
+            },
+        ));
+        trailing.push(Span::raw(" "));
+    }
+    if !layers.is_empty() {
+        trailing.push(Span::styled(layers.to_owned(), theme.badge_open));
+        trailing.push(Span::raw(" "));
+    }
+    let trailing = Line::from_spans(trailing);
+    let line = header_line(
         &Line::from_spans(content),
         &trailing,
         width,
         theme.hunk_fill,
-    )
+    );
+    (line, trailing.width())
 }
 
 /// One labelled part of a gap row.

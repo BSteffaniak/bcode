@@ -1091,7 +1091,7 @@ fn menu_focus(scenario: &Scenario<ReviewApp>) -> Option<crate::compare_menu::Men
 /// Move the open menu's cursor to `choice`.
 fn menu_to(scenario: &mut Scenario<ReviewApp>, choice: crate::compare_menu::MenuChoice) {
     scenario.key("home");
-    for _ in 0..20 {
+    for _ in 0..40 {
         if menu_focus(scenario) == Some(choice) {
             return;
         }
@@ -1858,5 +1858,102 @@ fn the_summary_rows_show_button_shows_hidden_files_in_the_document_and_the_panel
         tree.items()
             .iter()
             .any(|item| item.label.contains("layer_1.rs"))
+    );
+}
+
+#[test]
+fn mark_options_preview_live_in_the_menu_and_escape_puts_them_back() {
+    use crate::compare_menu::MenuChoice;
+    use crate::config::compare::{MarkOptions, MarkStyle, SeenHunks};
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let screen = settled(&mut scenario);
+    // A hunk with lines new since the baseline says so, naming the baseline.
+    assert!(screen.contains("new since you looked"), "{}", screen.text());
+    scenario.key("b");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("Mark new lines"), "{}", screen.text());
+    assert!(screen.contains("◉ bar and tint"), "{}", screen.text());
+    let marks = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .expect("review")
+            .comparing()
+            .marks()
+    };
+    assert_eq!(marks(&scenario), None, "as configured");
+    for (choice, expected) in [
+        (
+            MenuChoice::MarkStyle(MarkStyle::Strong),
+            MarkOptions {
+                style: MarkStyle::Strong,
+                ..MarkOptions::default()
+            },
+        ),
+        (
+            MenuChoice::Words,
+            MarkOptions {
+                style: MarkStyle::Strong,
+                words: false,
+                ..MarkOptions::default()
+            },
+        ),
+        (
+            MenuChoice::RemovedInline,
+            MarkOptions {
+                style: MarkStyle::Strong,
+                words: false,
+                removed_inline: true,
+                ..MarkOptions::default()
+            },
+        ),
+        (
+            MenuChoice::Seen(SeenHunks::Fold),
+            MarkOptions {
+                style: MarkStyle::Strong,
+                words: false,
+                removed_inline: true,
+                seen: SeenHunks::Fold,
+            },
+        ),
+    ] {
+        menu_to(&mut scenario, choice);
+        scenario.key("space");
+        settled(&mut scenario);
+        assert!(scenario.surface().review().unwrap().modal().is_some());
+        assert_eq!(marks(&scenario), Some(expected), "{choice:?}");
+    }
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("◉ strong"), "{}", screen.text());
+    assert!(
+        screen.contains("[ ] Mark changed words"),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.contains("◉ fold"), "{}", screen.text());
+    assert!(document(&scenario).fold_seen_hunks());
+    // Esc puts back the marks the menu opened on, and hunks seen before show again.
+    scenario.key("escape");
+    settled(&mut scenario);
+    assert!(scenario.surface().review().unwrap().modal().is_none());
+    assert_eq!(marks(&scenario), None);
+    assert!(!document(&scenario).fold_seen_hunks());
+    // Enter keeps a mark picked; the baseline the labels name follows the choice.
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Seen(SeenHunks::Dim));
+    scenario.key("space");
+    menu_to(&mut scenario, MenuChoice::PreviousPush);
+    scenario.key("space");
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert_eq!(
+        marks(&scenario).map(|marks| marks.seen),
+        Some(SeenHunks::Dim)
+    );
+    assert!(
+        screen.contains("new since the previous push"),
+        "{}",
+        screen.text()
     );
 }

@@ -1247,8 +1247,10 @@ impl ReviewSurface {
                 .layout_revision
                 .wrapping_mul(64)
                 .wrapping_add(u64::from(review.gutter_digits))
-                .wrapping_mul(4)
-                .wrapping_add(self.compare_since().index()),
+                .wrapping_mul(1_000_003)
+                .wrapping_add(self.compare_since().index())
+                .wrapping_mul(64)
+                .wrapping_add(self.mark_options().stamp()),
             paint_revision: self.paint_revision,
             annotation_revision: self.notes.revision().wrapping_mul(1_000_003)
                 ^ self.folds.revision.wrapping_mul(0x5851_f42d),
@@ -1262,6 +1264,7 @@ impl ReviewSurface {
                 }
             },
             since: self.compare_since(),
+            marks: self.mark_options(),
         }
     }
 

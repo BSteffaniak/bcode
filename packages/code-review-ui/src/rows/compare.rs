@@ -6,15 +6,17 @@
 //! `layout_diff_row`, like every other diff line.
 
 use super::{ActionCells, ItemAction, ItemRows};
+use crate::config::compare::{MarkOptions, MarkStyle, SeenHunks};
 use crate::theme::ReviewTheme;
-use bcode_code_review::document::{CompareNoteItem, CompareView, RemovedSinceItem};
+use bcode_code_review::document::{CompareNoteItem, CompareView, HunkHeaderItem, RemovedSinceItem};
 use bcode_code_review_models::{DeltaKind, FileSince};
 use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span};
 use bmux_tui::text_width::display_width;
 use bmux_tui_components::diff_viewer::{
-    DiffGutterMode, DiffLineKind, DiffRowItem, DiffRowLayout, DiffRowOptions, DiffRowText,
-    DiffSourceSide, layout_diff_row,
+    ChangedRange, DiffGutterMode, DiffLineKind, DiffRowItem, DiffRowLayout, DiffRowOptions,
+    DiffRowText, DiffSourceSide, DiffSyntaxRange, DiffViewerStyle, intraline_changed_ranges,
+    layout_diff_row,
 };
 
 /// An action on a comparison's rows.
@@ -26,6 +28,8 @@ pub enum CompareAction {
     ToggleView,
     /// Show or hide a removed-since marker's text.
     ToggleRemoval,
+    /// Show a hunk folded because nothing in it is new since the baseline, or fold it again.
+    ToggleHunk,
 }
 
 /// What a comparison's rows say the changes are since, as the baseline in effect names it.
@@ -276,15 +280,22 @@ pub fn note_rows(
 }
 
 /// A removed-since marker: its label, then, expanded, the removed lines as removed diff rows.
+///
+/// Shown inline (`marks.removed_inline`), the removed lines stand alone, struck through and
+/// faint, with the marks of lines changed since.
 #[must_use]
 pub fn removed_rows(
     item: &RemovedSinceItem,
     since: Since,
+    marks: MarkOptions,
     options: DiffRowOptions,
     theme: &ReviewTheme,
     width: u16,
     indent: usize,
 ) -> ItemRows {
+    if marks.removed_inline {
+        return inline_removed_rows(item, marks, options, theme, width);
+    }
     let chevron = if item.expanded {
         theme.icons.menu
     } else {
@@ -327,14 +338,276 @@ pub fn removed_rows(
     rows
 }
 
+/// The removed lines of `item` as removed diff rows, their content struck through and faint.
+fn inline_removed_rows(
+    item: &RemovedSinceItem,
+    marks: MarkOptions,
+    options: DiffRowOptions,
+    theme: &ReviewTheme,
+    width: u16,
+) -> ItemRows {
+    let mut rows = ItemRows::lines(Vec::new(), Vec::new());
+    for line in item.lines.iter() {
+        let layout = layout_diff_row(
+            DiffRowItem::Unified {
+                kind: DiffLineKind::Removed,
+                old_line: None,
+                new_line: None,
+                text: DiffRowText::plain(line),
+            },
+            width,
+            options,
+            mark_styles(marks, true, theme),
+        );
+        let mut lines = layout.rows().to_vec();
+        for column in layout.columns().iter().filter(|column| column.present) {
+            for painted in &mut lines {
+                *painted = patch_cells(painted, column.content.clone(), theme.since.removed_inline);
+            }
+        }
+        paint_marks(&mut lines, &layout, |_| true, marks, theme);
+        rows.lines.extend(lines);
+    }
+    rows.height = rows.lines.len().max(1) as u64;
+    rows
+}
+
+/// `line` with `style` patched over the cells in `cells`.
+///
+/// Composed from BMUX viewports: the row keeps its width, and a wide grapheme cut by an edge is blanked rather than split (the
+/// callers' ranges are column boundaries of a BMUX row layout, which no grapheme straddles).
+#[must_use]
+pub fn patch_cells(line: &Line, cells: std::ops::Range<usize>, style: Style) -> Line {
+    let width = line.width();
+    let (start, end) = (cells.start.min(width), cells.end.min(width));
+    if start >= end {
+        return line.clone();
+    }
+    let mut spans = cells_of(line, 0, start).spans;
+    spans.extend(cells_of(line, start, end - start).patch_style(style).spans);
+    spans.extend(cells_of(line, end, width - end).spans);
+    Line::from_spans(spans)
+}
+
+/// Exactly `cells` cells of `line` from `start`: its BMUX viewport, with the cells of a wide
+/// grapheme cut by an edge left blank.
+fn cells_of(line: &Line, start: usize, cells: usize) -> Line {
+    let mut part = line.viewport(start, cells);
+    let short = cells.saturating_sub(part.width());
+    if short > 0 {
+        let style = part.spans.last().map_or_else(Style::new, |span| span.style);
+        part.spans.push(Span::styled(" ".repeat(short), style));
+    }
+    part
+}
+
+/// The diff styles of a row with a side `marked` new since the baseline: tinted when the mark
+/// style tints, more strongly in the strong style.
+#[must_use]
+pub const fn mark_styles(
+    marks: MarkOptions,
+    marked: bool,
+    theme: &ReviewTheme,
+) -> &DiffViewerStyle {
+    if !marked || !marks.style.tint() {
+        return &theme.diff;
+    }
+    match marks.style {
+        MarkStyle::Strong => &theme.since.strong_diff,
+        _ => &theme.since.diff,
+    }
+}
+
+/// The label the strong mark style paints in the gutter of a line new since the baseline.
+pub const NEW_LABEL: &str = "new";
+
+/// Paint the marks of `marks.style` on `lines` (the rows of `layout`) where a side is new since
+/// the baseline.
+///
+/// That is the gutter bar, and in the strong style the accent bar and a `new` label on
+/// the first row where the gutter has a blank run for it.
+pub fn paint_marks(
+    lines: &mut [Line],
+    layout: &DiffRowLayout,
+    marked: impl Fn(DiffSourceSide) -> bool + Copy,
+    marks: MarkOptions,
+    theme: &ReviewTheme,
+) {
+    if !marks.style.bar() {
+        return;
+    }
+    let strong = marks.style == MarkStyle::Strong;
+    let bar = if strong {
+        theme.since.strong_bar
+    } else {
+        theme.since.bar
+    };
+    paint_bar(lines, layout, marked, bar, theme);
+    if strong && let Some(first) = lines.first_mut() {
+        for column in layout.columns() {
+            if column.present
+                && column.gutter == DiffGutterMode::Full
+                && marked(column.side)
+                && let Some(painted) =
+                    label_in_gutter(first, column.cells.start + 1..column.content.start, theme)
+            {
+                *first = painted;
+            }
+        }
+    }
+}
+
+/// `line` with [`NEW_LABEL`] in the first blank run of `gutter` cells that holds it and one
+/// blank after it (so it never touches a line number); `None` when no run does.
+fn label_in_gutter(
+    line: &Line,
+    gutter: std::ops::Range<usize>,
+    theme: &ReviewTheme,
+) -> Option<Line> {
+    let label = NEW_LABEL;
+    let cells = display_width(label);
+    let blank = |at: usize| line.viewport(at, 1).plain_text() == " ";
+    let mut run_start = None;
+    let mut found = None;
+    for at in gutter.start..=gutter.end {
+        if at < gutter.end && blank(at) {
+            run_start.get_or_insert(at);
+            continue;
+        }
+        if let Some(start) = run_start.take()
+            && at - start > cells
+        {
+            found = Some(at - 1 - cells);
+            break;
+        }
+    }
+    let at = found?;
+    let width = line.width();
+    let under = line
+        .viewport(at, cells)
+        .spans
+        .first()
+        .map_or_else(Style::new, |span| span.style);
+    let mut spans = line.viewport(0, at).spans;
+    spans.push(Span::styled(label, under.patch(theme.since.strong_bar)));
+    spans.extend(line.viewport(at + cells, width - at - cells).spans);
+    Some(Line::from_spans(spans))
+}
+
+/// The ranges of `text` that changed since `was`, the baseline line it replaced.
+///
+/// None when the lines share nothing (the line mark says it all) or are too long to compare (BMUX bounds
+/// intraline work per line).
+#[must_use]
+pub fn word_ranges(was: &str, text: &str) -> Vec<ChangedRange> {
+    let Some(changes) = intraline_changed_ranges(was, text) else {
+        return Vec::new();
+    };
+    let start = text.len() - text.trim_start().len();
+    let end = text.trim_end().len();
+    match changes.new.as_slice() {
+        [whole] if whole.start <= start && whole.end >= end => Vec::new(),
+        _ => changes.new,
+    }
+}
+
+/// `syntax` with `style` patched over the bytes of `words`, as sorted, disjoint ranges.
+#[must_use]
+pub fn with_word_marks(
+    syntax: &[DiffSyntaxRange],
+    words: &[ChangedRange],
+    style: Style,
+) -> Vec<DiffSyntaxRange> {
+    if words.is_empty() {
+        return syntax.to_vec();
+    }
+    let mut cuts: Vec<usize> = syntax
+        .iter()
+        .flat_map(|range| [range.start, range.end])
+        .chain(words.iter().flat_map(|range| [range.start, range.end]))
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut ranges: Vec<DiffSyntaxRange> = Vec::with_capacity(cuts.len());
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        let syntax_style = syntax
+            .get(syntax.partition_point(|range| range.end <= start))
+            .filter(|range| range.start <= start)
+            .map(|range| range.style);
+        let word = words
+            .get(words.partition_point(|range| range.end <= start))
+            .is_some_and(|range| range.start <= start);
+        let style = match (syntax_style, word) {
+            (Some(base), true) => base.patch(style),
+            (None, true) => style,
+            (Some(base), false) => base,
+            (None, false) => continue,
+        };
+        match ranges.last_mut() {
+            Some(last) if last.end == start && last.style == style => last.end = end,
+            _ => ranges.push(DiffSyntaxRange::new(start, end, style)),
+        }
+    }
+    ranges
+}
+
+/// The label a hunk header carries for what in the hunk is new since the baseline.
+///
+/// Its variants come widest first, with the action a click on it takes: the count of lines new since,
+/// or, where hunks seen before fold, a button to show or fold one.
+#[must_use]
+pub fn hunk_label(
+    item: &HunkHeaderItem,
+    since: Since,
+    marks: MarkOptions,
+    theme: &ReviewTheme,
+) -> Option<(Vec<String>, Option<CompareAction>)> {
+    let phrase = since.phrase();
+    let separator = theme.icons.separator;
+    match item.since_lines? {
+        0 if marks.seen == SeenHunks::Fold && item.folded => {
+            let lines = plural(item.new_count.max(item.old_count) as usize, "line");
+            Some((
+                vec![
+                    format!("[nothing new since {phrase}{separator}show {lines}]"),
+                    format!("[show {lines}]"),
+                    format!("[{}]", theme.icons.ellipsis),
+                ],
+                Some(CompareAction::ToggleHunk),
+            ))
+        }
+        0 if marks.seen == SeenHunks::Fold => Some((
+            vec![
+                format!("[nothing new since {phrase}{separator}fold]"),
+                "[fold]".to_owned(),
+            ],
+            Some(CompareAction::ToggleHunk),
+        )),
+        0 => None,
+        count => {
+            let lines = plural(count as usize, "line");
+            Some((
+                vec![
+                    format!("new since {phrase}{separator}{lines}"),
+                    format!("new{separator}{count}"),
+                    format!("+{count}"),
+                ],
+                None,
+            ))
+        }
+    }
+}
+
 /// Paint the gutter bar on `lines` (the rows of `layout`) where a side is new since the baseline.
 ///
 /// The bar takes the leading blank cell of each marked column's gutter, which only the full
 /// gutter has: narrower gutters drop the bar first and keep the row tint.
-pub fn paint_since_bar(
+fn paint_bar(
     lines: &mut [Line],
     layout: &DiffRowLayout,
     marked: impl Fn(DiffSourceSide) -> bool,
+    style: Style,
     theme: &ReviewTheme,
 ) {
     let bar = theme.icons.since_bar;
@@ -346,7 +619,7 @@ pub fn paint_since_bar(
             continue;
         }
         for line in lines.iter_mut() {
-            if let Some(painted) = overlay_blank(line, column.cells.start, bar, theme.since.bar) {
+            if let Some(painted) = overlay_blank(line, column.cells.start, bar, style) {
                 *line = painted;
             }
         }
@@ -490,7 +763,15 @@ mod tests {
             expanded: true,
         };
         for width in [0_u16, 1, 2, 5, 12, 40] {
-            let rows = removed_rows(&item, Since::LastLooked, options, &theme, width, 2);
+            let rows = removed_rows(
+                &item,
+                Since::LastLooked,
+                MarkOptions::default(),
+                options,
+                &theme,
+                width,
+                2,
+            );
             assert!(rows.height >= 3, "label and two lines at {width}");
             assert_eq!(rows.height, rows.lines.len() as u64);
             for line in &rows.lines {
@@ -501,7 +782,15 @@ mod tests {
             expanded: false,
             ..item
         };
-        let rows = removed_rows(&collapsed, Since::PreviousPush, options, &theme, 60, 2);
+        let rows = removed_rows(
+            &collapsed,
+            Since::PreviousPush,
+            MarkOptions::default(),
+            options,
+            &theme,
+            60,
+            2,
+        );
         assert_eq!(rows.height, 1);
         assert!(painted(&rows).contains("2 lines removed since the previous push"));
         assert_eq!(rows.actions[0].cells.start, 2);
@@ -523,7 +812,13 @@ mod tests {
         for width in [0_u16, 1, 2, 4, 9, 10, 30] {
             let layout = layout_diff_row(item, width, options, &theme.since.diff);
             let mut lines = layout.rows().to_vec();
-            paint_since_bar(&mut lines, &layout, |_| true, &theme);
+            paint_marks(
+                &mut lines,
+                &layout,
+                |_| true,
+                MarkOptions::default(),
+                &theme,
+            );
             for (painted, original) in lines.iter().zip(layout.rows()) {
                 assert_eq!(
                     painted.width(),
@@ -541,5 +836,427 @@ mod tests {
                 "bar only with the full gutter at {width}"
             );
         }
+    }
+
+    /// Text with wide, combined, and emoji graphemes.
+    const MIXED: &str = "漢字 e\u{301} 👩\u{200d}👩\u{200d}👧 text";
+
+    fn added(text: &str, line: u32) -> DiffRowItem<'_> {
+        DiffRowItem::Unified {
+            kind: DiffLineKind::Added,
+            old_line: None,
+            new_line: Some(line),
+            text: DiffRowText::plain(text),
+        }
+    }
+
+    fn marks(style: MarkStyle) -> MarkOptions {
+        MarkOptions {
+            style,
+            ..MarkOptions::default()
+        }
+    }
+
+    #[test]
+    fn each_mark_style_paints_as_named_and_keeps_every_rows_geometry() {
+        let theme = theme();
+        for digits in [1_usize, 2, 3, 5] {
+            let options = DiffRowOptions::new(DiffRowGutter::new(
+                digits,
+                DiffGutterShape::LineNumbersThenMarker,
+            ));
+            for style in MarkStyle::ALL {
+                for width in [0_u16, 1, 2, 3, 6, 12, 20, 40, 90] {
+                    let item = added(MIXED, 7);
+                    let styles = mark_styles(marks(style), true, &theme);
+                    let layout = layout_diff_row(item, width, options, styles);
+                    let mut lines = layout.rows().to_vec();
+                    paint_marks(&mut lines, &layout, |_| true, marks(style), &theme);
+                    for (painted, original) in lines.iter().zip(layout.rows()) {
+                        assert_eq!(painted.width(), original.width(), "{style:?} at {width}");
+                        assert!(painted.width() <= usize::from(width));
+                    }
+                    let full = layout
+                        .columns()
+                        .iter()
+                        .any(|column| column.gutter == DiffGutterMode::Full);
+                    let first = lines.first().map(Line::plain_text).unwrap_or_default();
+                    assert_eq!(
+                        first.starts_with(theme.icons.since_bar),
+                        full && style.bar(),
+                        "{style:?} bar at {width}: {first:?}"
+                    );
+                    // The tint is the row's: the strong style's deeper than the default.
+                    let tinted = *styles != theme.diff;
+                    assert_eq!(tinted, style.tint(), "{style:?}");
+                    // The label shows only where the gutter has a blank run for it, and the
+                    // line number is never covered.
+                    let label = first.contains(NEW_LABEL);
+                    if label {
+                        assert_eq!(style, MarkStyle::Strong);
+                        assert!(first.contains(&format!("{NEW_LABEL} ")), "{first:?}");
+                        assert!(first.contains('7'), "the number stays: {first:?}");
+                    }
+                    if style == MarkStyle::Strong && full && digits >= 3 {
+                        assert!(label, "{digits} digits at {width}: {first:?}");
+                    }
+                }
+            }
+        }
+        assert_ne!(theme.since.strong_diff, theme.since.diff);
+        assert_ne!(theme.since.strong_bar, theme.since.bar);
+    }
+
+    #[test]
+    fn side_by_side_rows_mark_only_the_new_side() {
+        let theme = theme();
+        let options = DiffRowOptions::new(DiffRowGutter::new(
+            3,
+            DiffGutterShape::LineNumbersThenMarker,
+        ));
+        let item = DiffRowItem::SideBySide {
+            old: Some(bmux_tui_components::diff_viewer::DiffRowCell::new(
+                DiffLineKind::Removed,
+                Some(4),
+                DiffRowText::plain(MIXED),
+            )),
+            new: Some(bmux_tui_components::diff_viewer::DiffRowCell::new(
+                DiffLineKind::Added,
+                Some(4),
+                DiffRowText::plain(MIXED),
+            )),
+        };
+        for width in [0_u16, 3, 9, 30, 80] {
+            let layout = layout_diff_row(item, width, options, &theme.since.diff);
+            let mut lines = layout.rows().to_vec();
+            paint_marks(
+                &mut lines,
+                &layout,
+                |side| side == DiffSourceSide::New,
+                marks(MarkStyle::Strong),
+                &theme,
+            );
+            for (painted, original) in lines.iter().zip(layout.rows()) {
+                assert_eq!(painted.width(), original.width());
+            }
+            for column in layout.columns() {
+                if column.gutter != DiffGutterMode::Full {
+                    continue;
+                }
+                let cell = lines[0].viewport(column.cells.start, 1).plain_text();
+                assert_eq!(
+                    cell == theme.icons.since_bar,
+                    column.side == DiffSourceSide::New,
+                    "{column:?} at {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_words_are_only_what_differs_from_the_baseline_line() {
+        let was = "let total = a + b;";
+        let text = "let total = a + b + c;";
+        let words = word_ranges(was, text);
+        assert_ne!(words.len(), 0);
+        let marked: String = words
+            .iter()
+            .map(|range| &text[range.start..range.end])
+            .collect();
+        assert!(marked.contains('c'), "{marked:?}");
+        assert!(!marked.contains("total"), "{marked:?}");
+        // A wide grapheme changed alone is marked whole.
+        let words = word_ranges("名前 = 1", "名称 = 1");
+        assert!(
+            words
+                .iter()
+                .all(|range| "名称 = 1".is_char_boundary(range.start))
+        );
+        assert_ne!(words.len(), 0);
+        // A line rewritten whole has no words in common: the line mark says it all.
+        assert_eq!(word_ranges("alpha beta", "gamma delta"), []);
+        assert_eq!(word_ranges("same", "same"), []);
+        // Huge or minified lines are left to the line mark: bounded work per line.
+        let huge = "x ".repeat(5_000);
+        let started = std::time::Instant::now();
+        assert_eq!(word_ranges(&huge, &format!("{huge}y")), []);
+        let minified = "a,".repeat(20_000);
+        assert_eq!(
+            word_ranges(&minified, &minified.replacen("a,", "b,", 1)),
+            []
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn word_marks_compose_with_syntax_and_intraline_emphasis_inside_the_row() {
+        let theme = theme();
+        let keyword = Style::new().fg(bmux_tui::style::Color::Red);
+        let text = "fn 名前(x: e\u{301}) -> 👩\u{200d}👩\u{200d}👧 {}";
+        let was = "fn 名前(y: e\u{301}) -> 👩\u{200d}👩\u{200d}👧 {}";
+        let syntax = [DiffSyntaxRange::new(0, 2, keyword)];
+        let words = word_ranges(was, text);
+        let composed = with_word_marks(&syntax, &words, theme.since.word);
+        // Sorted, disjoint, and the keyword keeps its color outside the changed words.
+        for pair in composed.windows(2) {
+            assert!(pair[0].end <= pair[1].start, "{composed:?}");
+        }
+        assert_eq!(composed[0], DiffSyntaxRange::new(0, 2, keyword));
+        let x = text.find('x').expect("x");
+        assert!(
+            composed
+                .iter()
+                .any(|range| range.start <= x && x < range.end && range.style == theme.since.word)
+        );
+        let emphasis = intraline_changed_ranges(was, text).expect("short").new;
+        let options = DiffRowOptions::new(DiffRowGutter::new(
+            3,
+            DiffGutterShape::LineNumbersThenMarker,
+        ));
+        for width in [0_u16, 1, 4, 11, 16, 24, 60] {
+            let layout = layout_diff_row(
+                DiffRowItem::Unified {
+                    kind: DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(12),
+                    text: DiffRowText::plain(text)
+                        .with_changed_ranges(&emphasis)
+                        .with_syntax(&composed),
+                },
+                width,
+                options,
+                &theme.since.diff,
+            );
+            let plain = layout_diff_row(added(text, 12), width, options, &theme.since.diff);
+            assert_eq!(
+                layout.rows().len(),
+                plain.rows().len(),
+                "same rows at {width}"
+            );
+            for (styled, unstyled) in layout.rows().iter().zip(plain.rows()) {
+                assert_eq!(
+                    styled.plain_text(),
+                    unstyled.plain_text(),
+                    "same text at {width}"
+                );
+                assert!(styled.width() <= usize::from(width));
+            }
+        }
+        // The word style survives the emphasis patched over it: its underline stays.
+        assert!(
+            theme
+                .since
+                .word
+                .patch(theme.since.diff.added_emphasis)
+                .modifiers
+                .contains(bmux_tui::style::Modifier::UNDERLINE)
+        );
+        assert_eq!(with_word_marks(&syntax, &[], theme.since.word), syntax);
+    }
+
+    fn hunk(since_lines: Option<u32>, folded: bool) -> HunkHeaderItem {
+        HunkHeaderItem {
+            file: std::sync::Arc::new(bcode_code_review::document::FileKey::new("s", None, "a")),
+            old_start: 10,
+            old_count: 6,
+            new_start: 10,
+            new_count: 7,
+            heading: Some("fn main() 漢字".into()),
+            layers: vec![3],
+            since_lines,
+            folded,
+        }
+    }
+
+    #[test]
+    fn hunk_labels_name_the_baseline_in_effect_and_count_what_is_new() {
+        let theme = theme();
+        let label = |item: &HunkHeaderItem, since: Since, seen: SeenHunks| {
+            let options = MarkOptions {
+                seen,
+                ..MarkOptions::default()
+            };
+            hunk_label(item, since, options, &theme)
+        };
+        for (since, words) in [
+            (Since::LastLooked, "new since you looked · 3 lines"),
+            (Since::PreviousPush, "new since the previous push · 3 lines"),
+            (Since::Push(3), "new since push 3 · 3 lines"),
+            (Since::Version(2), "new since v2 · 3 lines"),
+            (Since::Ago(24 * 3_600_000), "new since yesterday · 3 lines"),
+            (Since::Then, "new since then · 3 lines"),
+        ] {
+            let (variants, action) =
+                label(&hunk(Some(3), false), since, SeenHunks::Show).expect("a label");
+            assert_eq!(variants[0], words);
+            assert_eq!(action, None);
+        }
+        let (variants, _) =
+            label(&hunk(Some(1), false), Since::LastLooked, SeenHunks::Show).expect("label");
+        assert_eq!(variants[0], "new since you looked · 1 line");
+        // Nothing marked, or nothing new without folding: no label.
+        assert_eq!(
+            label(&hunk(None, false), Since::LastLooked, SeenHunks::Fold),
+            None
+        );
+        assert_eq!(
+            label(&hunk(Some(0), false), Since::LastLooked, SeenHunks::Show),
+            None
+        );
+        assert_eq!(
+            label(&hunk(Some(0), false), Since::LastLooked, SeenHunks::Dim),
+            None
+        );
+        // Folded hunks are a button to show them; shown again, a button to fold.
+        let (variants, action) =
+            label(&hunk(Some(0), true), Since::Push(2), SeenHunks::Fold).expect("label");
+        assert_eq!(variants[0], "[nothing new since push 2 · show 7 lines]");
+        assert_eq!(action, Some(CompareAction::ToggleHunk));
+        let (variants, _) =
+            label(&hunk(Some(0), false), Since::Push(2), SeenHunks::Fold).expect("label");
+        assert_eq!(variants[0], "[nothing new since push 2 · fold]");
+    }
+
+    #[test]
+    fn hunk_headers_fit_every_width_and_their_buttons_cover_the_painted_label() {
+        let theme = theme();
+        for (item, seen) in [
+            (hunk(Some(0), true), SeenHunks::Fold),
+            (hunk(Some(0), false), SeenHunks::Fold),
+            (hunk(Some(4), false), SeenHunks::Show),
+            (hunk(Some(0), false), SeenHunks::Dim),
+        ] {
+            let options = MarkOptions {
+                seen,
+                ..MarkOptions::default()
+            };
+            for width in [0_usize, 1, 5, 12, 20, 33, 50, 80, 140] {
+                let rows = super::super::hunk_header(
+                    &item,
+                    (Since::PreviousPush, options),
+                    &theme,
+                    width,
+                    4,
+                );
+                assert_eq!(rows.lines.len(), 1);
+                assert!(rows.lines[0].width() <= width, "{seen:?} at {width}");
+                for action in &rows.actions {
+                    let (start, end) = (
+                        usize::from(action.cells.start),
+                        usize::from(action.cells.end),
+                    );
+                    assert!(end <= width);
+                    let label = rows.lines[0].viewport(start, end - start).plain_text();
+                    assert!(label.starts_with('[') && label.ends_with(']'), "{label:?}");
+                    assert_eq!(
+                        action.action,
+                        ItemAction::Compare(CompareAction::ToggleHunk)
+                    );
+                }
+                if width >= 80 {
+                    let text = painted(&rows);
+                    match seen {
+                        SeenHunks::Fold => assert_eq!(rows.actions.len(), 1, "{text:?}"),
+                        SeenHunks::Show => {
+                            assert!(text.contains("new since the previous push · 4 lines"));
+                        }
+                        SeenHunks::Dim => assert!(
+                            rows.lines[0].spans.iter().all(|span| span
+                                .style
+                                .modifiers
+                                .contains(bmux_tui::style::Modifier::DIM)),
+                            "dimmed: {text:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removed_code_shows_inline_struck_through_or_behind_its_marker() {
+        let theme = theme();
+        let options = DiffRowOptions::new(DiffRowGutter::new(
+            3,
+            DiffGutterShape::LineNumbersThenMarker,
+        ));
+        let item = RemovedSinceItem {
+            file: std::sync::Arc::new(bcode_code_review::document::FileKey::new("s", None, "a")),
+            before_new_line: 3,
+            lines: vec![MIXED.to_owned(), "let old = 1;".to_owned()].into(),
+            expanded: false,
+        };
+        let inline = MarkOptions {
+            removed_inline: true,
+            ..MarkOptions::default()
+        };
+        for width in [0_u16, 1, 2, 7, 15, 40, 100] {
+            let rows = removed_rows(&item, Since::LastLooked, inline, options, &theme, width, 2);
+            assert!(rows.actions.is_empty(), "no marker to click");
+            assert!(rows.height >= 2, "both lines at {width}");
+            assert_eq!(rows.height, rows.lines.len() as u64);
+            for line in &rows.lines {
+                assert!(line.width() <= usize::from(width), "at {width}");
+            }
+            assert!(!painted(&rows).contains("removed since"));
+        }
+        let rows = removed_rows(&item, Since::LastLooked, inline, options, &theme, 60, 2);
+        let text = painted(&rows);
+        assert!(text.contains("let old = 1;"), "{text:?}");
+        let struck = rows.lines[1]
+            .spans
+            .iter()
+            .filter(|span| span.content.contains("old"))
+            .all(|span| {
+                span.style
+                    .modifiers
+                    .contains(bmux_tui::style::Modifier::CROSSED_OUT)
+            });
+        assert!(struck, "{:?}", rows.lines[1]);
+        // The gutter is not struck through.
+        assert!(
+            !rows.lines[1].spans[0]
+                .style
+                .modifiers
+                .contains(bmux_tui::style::Modifier::CROSSED_OUT)
+        );
+        // Off, the marker comes back, folded.
+        let rows = removed_rows(
+            &item,
+            Since::LastLooked,
+            MarkOptions::default(),
+            options,
+            &theme,
+            60,
+            2,
+        );
+        assert_eq!(rows.height, 1);
+        assert!(painted(&rows).contains("2 lines removed since you looked"));
+    }
+
+    #[test]
+    fn patched_cells_keep_the_row_width_and_text_on_grapheme_boundaries() {
+        let line = Line::from_spans(vec![Span::raw(MIXED)]);
+        let style = Style::new().add_modifier(bmux_tui::style::Modifier::DIM);
+        for start in 0..=line.width() + 1 {
+            for end in start..=line.width() + 2 {
+                let patched = patch_cells(&line, start..end, style);
+                assert_eq!(patched.width(), line.width(), "{start}..{end}");
+            }
+        }
+        // `漢字 ` is five cells: a range from there to the end keeps every grapheme.
+        let patched = patch_cells(&line, 5..line.width(), style);
+        assert_eq!(patched.plain_text(), MIXED);
+        assert!(
+            !patched.spans[0]
+                .style
+                .modifiers
+                .contains(bmux_tui::style::Modifier::DIM)
+        );
+        assert!(patched.spans.last().is_some_and(|span| {
+            span.style
+                .modifiers
+                .contains(bmux_tui::style::Modifier::DIM)
+        }));
     }
 }

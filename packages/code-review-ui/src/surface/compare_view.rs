@@ -403,6 +403,8 @@ impl ReviewSurface {
                 .stack_at()
                 .or_else(|| self.comparing.preview_stack_at())
                 .map(|at| super::super::history::ago(at, super::super::history::now_ms())),
+            marks: self.mark_options(),
+            legend: crate::history::badge_legend(&self.theme.icons),
         }
     }
 
@@ -551,6 +553,12 @@ impl ReviewSurface {
             }
             MenuChoice::OnlyChanged => self.toggle_only_changed(),
             MenuChoice::View => self.toggle_compare_view(),
+            MenuChoice::MarkStyle(style) => self.change_marks(|marks| marks.style = style),
+            MenuChoice::Words => self.change_marks(|marks| marks.words = !marks.words),
+            MenuChoice::Seen(seen) => self.change_marks(|marks| marks.seen = seen),
+            MenuChoice::RemovedInline => {
+                self.change_marks(|marks| marks.removed_inline = !marks.removed_inline);
+            }
         }
     }
 

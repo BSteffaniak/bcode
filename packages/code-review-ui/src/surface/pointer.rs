@@ -272,6 +272,12 @@ impl ReviewSurface {
             (CompareAction::ToggleRemoval, ItemKey::RemovedSince { file, before }) => {
                 review.doc.toggle_removal(file, *before)
             }
+            (
+                CompareAction::ToggleHunk,
+                ItemKey::HunkHeader {
+                    file, new_start, ..
+                },
+            ) => review.doc.toggle_seen_hunk(file, *new_start),
             (CompareAction::ShowFiles, ItemKey::CompareNote { source_id, .. }) => {
                 let shown = review.doc.compare_files_shown(source_id);
                 review.doc.set_compare_files_shown(source_id, !shown)

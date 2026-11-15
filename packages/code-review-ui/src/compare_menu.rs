@@ -6,8 +6,11 @@
 //! view option in place and the review behind the menu follows at once; `enter` keeps the
 //! state and closes; `esc` puts back the state the menu opened on. The baseline in effect is
 //! marked like a radio button (with what it resolves to, such as `4m ago`), view options like
-//! check boxes, and the cursor opens on the baseline in effect.
+//! check boxes, and the cursor opens on the baseline in effect. How what is new since the
+//! baseline is marked (the mark style, changed words, hunks seen before, code removed since)
+//! is chosen the same way, and a key to the tab badges closes the menu.
 
+use super::config::compare::{MarkOptions, MarkStyle, SeenHunks};
 use super::history::ago;
 use super::picker::{Picker, PickerItem, PickerOutcome};
 use super::theme::ReviewTheme;
@@ -50,6 +53,31 @@ pub enum MenuChoice {
     OnlyChanged,
     /// View option: only what changed.
     View,
+    /// How lines new since the baseline are marked.
+    MarkStyle(MarkStyle),
+    /// Mark option: the changed words of lines modified since the baseline.
+    Words,
+    /// How hunks with nothing new since the baseline show.
+    Seen(SeenHunks),
+    /// Mark option: code removed since the baseline shows inline.
+    RemovedInline,
+}
+
+const fn mark_style_id(style: MarkStyle) -> &'static str {
+    match style {
+        MarkStyle::Both => "mark:both",
+        MarkStyle::Bar => "mark:bar",
+        MarkStyle::Tint => "mark:tint",
+        MarkStyle::Strong => "mark:strong",
+    }
+}
+
+const fn seen_id(seen: SeenHunks) -> &'static str {
+    match seen {
+        SeenHunks::Show => "seen:show",
+        SeenHunks::Dim => "seen:dim",
+        SeenHunks::Fold => "seen:fold",
+    }
 }
 
 impl MenuChoice {
@@ -64,6 +92,10 @@ impl MenuChoice {
             Self::Off => "off".to_owned(),
             Self::OnlyChanged => "only_changed".to_owned(),
             Self::View => "view".to_owned(),
+            Self::MarkStyle(style) => mark_style_id(style).to_owned(),
+            Self::Words => "words".to_owned(),
+            Self::Seen(seen) => seen_id(seen).to_owned(),
+            Self::RemovedInline => "removed_inline".to_owned(),
         }
     }
 
@@ -77,14 +109,38 @@ impl MenuChoice {
             "off" => Self::Off,
             "only_changed" => Self::OnlyChanged,
             "view" => Self::View,
-            other => Self::Ago(other.strip_prefix("ago:")?.parse().ok()?),
+            "words" => Self::Words,
+            "removed_inline" => Self::RemovedInline,
+            other => {
+                if let Some(style) = MarkStyle::ALL
+                    .into_iter()
+                    .find(|style| mark_style_id(*style) == other)
+                {
+                    Self::MarkStyle(style)
+                } else if let Some(seen) = SeenHunks::ALL
+                    .into_iter()
+                    .find(|seen| seen_id(*seen) == other)
+                {
+                    Self::Seen(seen)
+                } else {
+                    Self::Ago(other.strip_prefix("ago:")?.parse().ok()?)
+                }
+            }
         })
     }
 
-    /// Whether the row is a view option (a check box) rather than a baseline.
+    /// Whether the row is a view or mark option rather than a baseline.
     #[must_use]
     pub const fn is_option(self) -> bool {
-        matches!(self, Self::OnlyChanged | Self::View)
+        matches!(
+            self,
+            Self::OnlyChanged
+                | Self::View
+                | Self::MarkStyle(_)
+                | Self::Words
+                | Self::Seen(_)
+                | Self::RemovedInline
+        )
     }
 
     /// Whether picking the row opens another picker (the push timeline or the version picker)
@@ -151,6 +207,10 @@ pub struct MenuState {
     /// When the whole stack is shown as it was (`3h ago`), while that is in effect or the
     /// menu opened on it: its row is offered.
     pub stack_at: Option<String>,
+    /// How what is new since the baseline is marked.
+    pub marks: MarkOptions,
+    /// What each tab badge glyph means.
+    pub legend: String,
 }
 
 /// What the menu can offer to pick from.
@@ -318,6 +378,82 @@ impl CompareMenu {
         ));
         items.push(section("s.view", "View"));
         items.extend(Self::option_items(state, theme));
+        items.extend(Self::mark_items(state, theme));
+        items.push(PickerItem::section(
+            "s.legend",
+            Line::from_spans(vec![Span::styled(state.legend.clone(), theme.muted)]),
+        ));
+        items
+    }
+
+    /// The rows choosing how what is new since the baseline is marked: radio buttons for the
+    /// mark style and for hunks seen before, check boxes for changed words and removed code.
+    fn mark_items(state: &MenuState, theme: &ReviewTheme) -> Vec<PickerItem> {
+        let ascii = theme.icons.menu.is_ascii();
+        let marks = state.marks;
+        let row = |choice: MenuChoice, mark: &'static str, on: bool, label: &str, hint: &str| {
+            PickerItem::new(
+                choice.id(),
+                Line::from_spans(vec![
+                    Span::styled(mark, if on { theme.accent } else { theme.muted }),
+                    Span::styled(label.to_owned(), if on { theme.title } else { theme.text }),
+                    Span::styled(format!("  {hint}"), theme.muted),
+                ]),
+            )
+        };
+        let radio_row = |choice: MenuChoice, on: bool, label: &str, hint: &str| {
+            row(choice, radio(on, ascii), on, label, hint)
+        };
+        let check_row = |choice: MenuChoice, on: bool, label: &str, hint: &str| {
+            row(choice, check(on), on, label, hint)
+        };
+        let section = |id: &str, label: &str| {
+            PickerItem::section(
+                id,
+                Line::from_spans(vec![Span::styled(label.to_owned(), theme.title)]),
+            )
+        };
+        let mut items = vec![section("s.marks", "Mark new lines")];
+        for style in MarkStyle::ALL {
+            let (label, hint) = match style {
+                MarkStyle::Both => ("bar and tint", "a gutter bar and a tinted row"),
+                MarkStyle::Bar => ("gutter bar only", "rows keep their colors"),
+                MarkStyle::Tint => ("tint only", "no bar in the gutter"),
+                MarkStyle::Strong => ("strong", "accent bar, deeper tint, and a new label"),
+            };
+            items.push(radio_row(
+                MenuChoice::MarkStyle(style),
+                marks.style == style,
+                label,
+                hint,
+            ));
+        }
+        items.push(check_row(
+            MenuChoice::Words,
+            marks.words,
+            "Mark changed words",
+            "in a line changed since, what differs from then",
+        ));
+        items.push(check_row(
+            MenuChoice::RemovedInline,
+            marks.removed_inline,
+            "Show removed code inline",
+            "struck through, instead of behind a marker",
+        ));
+        items.push(section("s.seen", "Hunks with nothing new"));
+        for seen in SeenHunks::ALL {
+            let (label, hint) = match seen {
+                SeenHunks::Show => ("show", "like the others"),
+                SeenHunks::Dim => ("dim", "faint, to read past"),
+                SeenHunks::Fold => ("fold", "to their header; a click shows one"),
+            };
+            items.push(radio_row(
+                MenuChoice::Seen(seen),
+                marks.seen == seen,
+                label,
+                hint,
+            ));
+        }
         items
     }
 
@@ -766,6 +902,8 @@ mod tests {
             view_key: Some("shift+l".into()),
             progress: None,
             stack_at: None,
+            marks: MarkOptions::default(),
+            legend: crate::history::badge_legend(&crate::theme::Icons::UNICODE),
         }
     }
 
@@ -810,6 +948,70 @@ mod tests {
     }
 
     #[test]
+    fn mark_options_are_radio_buttons_and_check_boxes_under_their_headings() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let mut menu = CompareMenu::new(&menu_state(), &theme);
+        let rows = menu.rows();
+        let at = |row: &str| rows.iter().position(|text| text == row);
+        let marks = at("Mark new lines").expect("mark heading");
+        let seen = at("Hunks with nothing new").expect("seen heading");
+        assert!(
+            at("View").is_some_and(|view| view < marks) && marks < seen,
+            "{rows:?}"
+        );
+        assert!(rows[marks + 1].starts_with("◉ bar and tint"), "{rows:?}");
+        assert!(rows.iter().any(|row| row.starts_with("○ strong")));
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("[x] Mark changed words"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("[ ] Show removed code inline"))
+        );
+        assert!(rows[seen + 1].starts_with("◉ show"), "{rows:?}");
+        // The key to the tab badges closes the menu, telling unchanged from approved.
+        let legend = rows.last().expect("legend");
+        assert!(legend.contains("= unchanged since") && legend.contains("✓ approved"));
+        // Every mark row picks in place, and enter on one keeps what is set.
+        for choice in [
+            MenuChoice::MarkStyle(MarkStyle::Strong),
+            MenuChoice::Words,
+            MenuChoice::RemovedInline,
+            MenuChoice::Seen(SeenHunks::Fold),
+        ] {
+            assert_eq!(MenuChoice::from_id(&choice.id()), Some(choice));
+            assert!(choice.is_option());
+            while menu.focused() != Some(choice) {
+                assert_eq!(menu.key(key(KeyCode::Down)), CompareMenuOutcome::Redraw);
+            }
+            assert_eq!(
+                menu.key(key(KeyCode::Space)),
+                CompareMenuOutcome::Apply(choice)
+            );
+            assert_eq!(menu.key(key(KeyCode::Enter)), CompareMenuOutcome::Done);
+            menu.key(key(KeyCode::Home));
+        }
+        // The owner's new state moves the marks, keeping the cursor.
+        let mut state = menu_state();
+        state.marks.style = MarkStyle::Strong;
+        state.marks.words = false;
+        state.marks.seen = SeenHunks::Dim;
+        menu.update(&state, &theme);
+        let rows = menu.rows();
+        assert!(rows.iter().any(|row| row.starts_with("◉ strong")));
+        assert!(rows.iter().any(|row| row.starts_with("○ bar and tint")));
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("[ ] Mark changed words"))
+        );
+        assert!(rows.iter().any(|row| row.starts_with("◉ dim")));
+        let ascii = ReviewTheme::derive(None, IconStyle::Ascii);
+        let rows = CompareMenu::new(&state, &ascii).rows();
+        assert!(rows.iter().any(|row| row.starts_with("(*) strong")));
+    }
+
+    #[test]
     fn space_picks_in_place_enter_keeps_and_esc_cancels() {
         let theme = ReviewTheme::derive(None, IconStyle::Unicode);
         let mut menu = CompareMenu::new(&menu_state(), &theme);
@@ -836,8 +1038,9 @@ mod tests {
                 .any(|row| row.starts_with("○ you last looked · 4m ago"))
         );
         // Space on a view option flips it in place; enter on it keeps what is set.
-        menu.key(key(KeyCode::End));
-        assert_eq!(menu.focused(), Some(MenuChoice::OnlyChanged));
+        while menu.focused() != Some(MenuChoice::OnlyChanged) {
+            menu.key(key(KeyCode::Down));
+        }
         assert_eq!(
             menu.key(key(KeyCode::Space)),
             CompareMenuOutcome::Apply(MenuChoice::OnlyChanged)
