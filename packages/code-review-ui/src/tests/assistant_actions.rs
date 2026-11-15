@@ -463,3 +463,65 @@ fn find_pull_requests_lists_the_stack_with_a_source_ready_to_create() {
         .collect();
     assert!(layers.ends_with(&[101, 102, 103]), "{layers:?}");
 }
+
+#[test]
+fn moving_the_user_off_a_review_saves_it_first_and_never_drops_unsaved_comments() {
+    // A saved review: the move persists what the reviewer changed before leaving, as exiting
+    // does, even inside the presentation save interval.
+    let mut setup = super::assistant::setup(160, 40, true);
+    let session = active_session(&mut setup.scenario);
+    setup.scenario.key("shift+h");
+    let home = done(call_as(
+        &mut setup.scenario,
+        &session,
+        actions::OPEN_REVIEW,
+        r#"{"screen":"home"}"#,
+    ));
+    assert_eq!(home["screen"]["screen"], "home", "{home}");
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+    let stored = setup
+        .backend
+        .call_now(bcode_code_review_models::GetReviewWorkspaceRequest {
+            repo_path: setup.review.repo_root.clone(),
+            workspace_id: setup.review.id.clone(),
+        })
+        .workspace
+        .expect("saved");
+    assert!(
+        stored
+            .presentation
+            .is_some_and(|state| state.hide_resolved_threads),
+        "the review saved its presentation before closing"
+    );
+
+    // An unsaved review with a comment is not left: the user is told how to save it.
+    let fixture = super::app::fixture();
+    let backend = std::sync::Arc::new(TestBackend::default());
+    let entry = crate::entry::Entry::Sources {
+        title: None,
+        sources: vec![bcode_code_review_models::ReviewSourceKind::LastCommit],
+    };
+    let (mut scenario, _) = super::app::open(&fixture, &backend, entry, 160, 40);
+    scenario.key("shift+c");
+    scenario.paste("unsaved note");
+    scenario.key("ctrl+s");
+    settled(&mut scenario);
+    let refusal = refused(call(
+        &mut scenario,
+        actions::OPEN_REVIEW,
+        r#"{"screen":"home"}"#,
+    ));
+    assert!(refusal.contains("not saved"), "{refusal}");
+    assert_eq!(scenario.surface().route_name(), RouteName::Review);
+    let status = scenario
+        .surface()
+        .review()
+        .and_then(crate::ReviewSurface::status)
+        .map(str::to_owned);
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|status| status.contains("not saved")),
+        "{status:?}"
+    );
+}

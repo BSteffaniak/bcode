@@ -122,6 +122,8 @@ pub struct ReviewApp {
     tool_work: Arc<Mutex<Vec<ToolWork>>>,
     /// An `open_review` waiting for its review to load before moving to a place in it.
     awaiting: Option<Awaiting>,
+    /// An assistant move waiting for the review on screen to close.
+    leaving: Option<Leaving>,
 }
 
 /// An assistant tool's work finished on a task.
@@ -132,6 +134,25 @@ enum ToolWork {
         target: crate::surface::GoTo,
         reply: tokio::sync::oneshot::Sender<ClientToolReply>,
     },
+}
+
+/// Where an assistant tool moves the user once the review on screen closed.
+enum Next {
+    /// The reviews home.
+    Home,
+    /// The new-review wizard.
+    Wizard,
+    /// Another review, at a place in it.
+    Review {
+        workspace: Box<ReviewWorkspace>,
+        target: crate::surface::GoTo,
+    },
+}
+
+/// A move waiting for the review on screen to finish closing.
+struct Leaving {
+    next: Next,
+    reply: tokio::sync::oneshot::Sender<ClientToolReply>,
 }
 
 /// A review opened by the assistant, with the place to move to once it loaded.
@@ -189,6 +210,7 @@ impl ReviewApp {
             button: None,
             tool_work: Arc::default(),
             awaiting: None,
+            leaving: None,
         };
         match entry {
             Entry::Home => app.show_home(false),
@@ -683,6 +705,10 @@ impl ReviewApp {
         let Action::Close { edit_sources } = action else {
             return action;
         };
+        if let Some(leaving) = self.leaving.take() {
+            self.go(leaving.next, leaving.reply, host);
+            return Action::Redraw;
+        }
         if edit_sources && let Route::Review(review) = &self.route {
             let workspace = review.edit_target();
             let mut wizard =
@@ -1050,17 +1076,8 @@ impl ReviewApp {
             }
         };
         match open.screen.as_deref().unwrap_or("review") {
-            "home" => {
-                self.show_home(true);
-                let _ = reply.send(self.screen_answer("showing the reviews home"));
-            }
-            "new_review" => {
-                let mut wizard = Wizard::new(self.services.clone(), self.repo.clone());
-                wizard.prepare_keymap(host);
-                self.route = Route::Wizard(Box::new(wizard));
-                self.keymap_stale = true;
-                let _ = reply.send(self.screen_answer("showing the new-review wizard"));
-            }
+            "home" => self.leave_then(Next::Home, reply, host),
+            "new_review" => self.leave_then(Next::Wizard, reply, host),
             "review" => {
                 let Some(id) = open.review.filter(|id| !id.trim().is_empty()) else {
                     let _ = reply.send(Self::refused(
@@ -1117,6 +1134,85 @@ impl ReviewApp {
         }
     }
 
+    /// Move the user to `next` for an assistant tool, leaving the review on screen through its
+    /// close path first (saves finish; an unsaved review with annotations is not left).
+    fn leave_then(
+        &mut self,
+        next: Next,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+        host: &UiContext,
+    ) {
+        let Route::Review(review) = &mut self.route else {
+            self.go(next, reply, host);
+            return;
+        };
+        match review.close_for_assistant(host) {
+            Err(message) => {
+                let _ = reply.send(Self::refused("unsaved_review", message));
+            }
+            Ok(action) => {
+                if let Some(earlier) = self.leaving.replace(Leaving { next, reply }) {
+                    let _ = earlier.reply.send(Self::refused(
+                        "replaced",
+                        "another move replaced this one before the review closed",
+                    ));
+                }
+                if matches!(action, Action::Close { .. }) {
+                    let _ = self.review_action(action, host);
+                }
+            }
+        }
+    }
+
+    /// Show `next` (the review on screen has closed, or there was none) and answer.
+    fn go(
+        &mut self,
+        next: Next,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+        host: &UiContext,
+    ) {
+        match next {
+            Next::Home => {
+                self.show_home(true);
+                let _ = reply.send(self.screen_answer("showing the reviews home"));
+            }
+            Next::Wizard => {
+                let mut wizard = Wizard::new(self.services.clone(), self.repo.clone());
+                wizard.prepare_keymap(host);
+                self.route = Route::Wizard(Box::new(wizard));
+                self.keymap_stale = true;
+                let _ = reply.send(self.screen_answer("showing the new-review wizard"));
+            }
+            Next::Review { workspace, target } => {
+                self.open_review(*workspace, Some(host));
+                self.await_place(target, reply);
+            }
+        }
+    }
+
+    /// Answer an `open_review` of the review now on screen: at once, or once it loaded when the
+    /// call named a place in it.
+    fn await_place(
+        &mut self,
+        target: crate::surface::GoTo,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+    ) {
+        if !target.names_a_place() {
+            let _ = reply.send(self.screen_answer("opened the review"));
+            return;
+        }
+        if let Some(earlier) = self.awaiting.take() {
+            let _ = earlier
+                .reply
+                .send(self.screen_answer("opened; another move replaced this one"));
+        }
+        self.awaiting = Some(Awaiting {
+            target,
+            reply,
+            since: Instant::now(),
+        });
+    }
+
     /// Finish app tool work that ran on a task, and moves waiting for a review to load.
     fn finish_tool_work(&mut self, host: &UiContext) -> bool {
         let work: Vec<ToolWork> = self
@@ -1141,22 +1237,17 @@ impl ReviewApp {
                         .review()
                         .and_then(ReviewSurface::workspace)
                         .is_some_and(|open| open.id == workspace.id);
-                    if !same {
-                        self.open_review(workspace, Some(host));
-                    }
-                    if target.names_a_place() {
-                        if let Some(earlier) = self.awaiting.take() {
-                            let _ = earlier
-                                .reply
-                                .send(self.screen_answer("opened; another move replaced this one"));
-                        }
-                        self.awaiting = Some(Awaiting {
-                            target,
-                            reply,
-                            since: Instant::now(),
-                        });
+                    if same {
+                        self.await_place(target, reply);
                     } else {
-                        let _ = reply.send(self.screen_answer("opened the review"));
+                        self.leave_then(
+                            Next::Review {
+                                workspace: Box::new(workspace),
+                                target,
+                            },
+                            reply,
+                            host,
+                        );
                     }
                 }
             }

@@ -1583,6 +1583,36 @@ impl ReviewSurface {
         Action::Redraw
     }
 
+    /// Leave the review for a screen the assistant moves the user to, as exiting does: the
+    /// presentation is persisted, the final and pending saves finish first, and an unsaved
+    /// review with comments, AI answers or suggestions is not left (the user is told how to save
+    /// it). Returns the action to take (a close once the saves finished), or why the review is
+    /// not left.
+    ///
+    /// # Errors
+    ///
+    /// * The review is not saved and holds annotations that leaving would drop.
+    pub fn close_for_assistant(&mut self, host: &UiContext) -> Result<Action, String> {
+        if self.offers_save() {
+            let save = self
+                .action_keys
+                .get("save_review")
+                .cloned()
+                .unwrap_or_else(|| "the palette".to_owned());
+            self.set_status(
+                format!(
+                    "the assistant wants to leave this review; it is not saved: {save} saves it with its comments"
+                ),
+                StatusSeverity::Warning,
+            );
+            return Err(format!(
+                "the review on screen is not saved and has comments, AI answers or suggestions that leaving would drop; ask the user to save it ({save}) or to leave it themselves"
+            ));
+        }
+        self.edit_requested = false;
+        Ok(self.begin_close(host))
+    }
+
     /// The close action: plain, or asking the app to edit the review's sources.
     const fn close_action(&self) -> Action {
         Action::Close {
