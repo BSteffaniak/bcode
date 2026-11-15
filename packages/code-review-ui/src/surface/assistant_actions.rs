@@ -37,7 +37,9 @@ pub struct GoTo {
     pub side: Option<String>,
     /// The source the file is in, when several have it.
     pub source: Option<String>,
-    /// A thread id.
+    /// A thread id, as `code_review.list_threads`, `current_view` and the question context
+    /// give it (`thread_id` is taken too, as the review tools name it).
+    #[serde(alias = "thread_id")]
     pub thread: Option<String>,
     /// A version (1-based) of the layer (`layer`, else the current one) to show: its whole
     /// change as it was then, read-only where it differs from now.
@@ -45,6 +47,30 @@ pub struct GoTo {
 }
 
 impl GoTo {
+    /// The request with blank strings taken as not given.
+    #[must_use]
+    pub fn without_blanks(&self) -> Self {
+        fn given(text: Option<&String>) -> Option<String> {
+            text.map(|text| text.trim())
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        }
+        Self {
+            review: given(self.review.as_ref()),
+            layer: self.layer.clone().filter(|layer| match layer {
+                serde_json::Value::String(text) => !text.trim().is_empty(),
+                serde_json::Value::Null => false,
+                _ => true,
+            }),
+            path: given(self.path.as_ref()),
+            line: self.line.filter(|line| *line > 0),
+            side: given(self.side.as_ref()),
+            source: given(self.source.as_ref()),
+            thread: given(self.thread.as_ref()),
+            version: self.version.filter(|version| *version > 0),
+        }
+    }
+
     /// Whether the request names a place.
     #[must_use]
     pub const fn names_a_place(&self) -> bool {
@@ -53,6 +79,65 @@ impl GoTo {
             || self.thread.is_some()
             || self.version.is_some()
     }
+}
+
+/// A thread a go-to reaches, checked.
+#[derive(Debug)]
+struct ThreadTarget {
+    /// The id the tools use for it.
+    tool_id: String,
+    /// Where it shows, for the answer.
+    shown: String,
+    /// Its document key.
+    key: ItemKey,
+    /// The source (layer) holding it; `None` for the review as a whole.
+    source: Option<String>,
+    /// The files it is on: where it shows, and where it was written.
+    paths: Vec<String>,
+    /// Where it shows.
+    anchor: Option<bcode_code_review_models::DraftAnchor>,
+}
+
+/// What a go-to to a thread does not use, when it names another place than the thread's.
+fn thread_mismatch(target: &GoTo, thread: &ThreadTarget) -> Vec<String> {
+    let mut notes = Vec::new();
+    let path = target
+        .path
+        .as_deref()
+        .map(|path| path.trim_start_matches("./"));
+    let other_file = path.is_some_and(|path| !thread.paths.iter().any(|shown| shown == path));
+    let other_line = target.line.is_some_and(|line| {
+        thread.anchor.as_ref().is_none_or(|anchor| {
+            let (start, end) = (
+                anchor
+                    .new_start
+                    .or(anchor.new_line)
+                    .or(anchor.old_start)
+                    .or(anchor.old_line),
+                anchor
+                    .new_end
+                    .or(anchor.new_line)
+                    .or(anchor.old_end)
+                    .or(anchor.old_line),
+            );
+            !matches!((start, end), (Some(start), Some(end)) if (start..=end).contains(&line))
+        })
+    });
+    if other_file || other_line {
+        let named = match (path, target.line) {
+            (Some(path), Some(line)) => format!("{path}:{line}"),
+            (Some(path), None) => path.to_owned(),
+            (None, Some(line)) => format!("line {line}"),
+            (None, None) => String::new(),
+        };
+        notes.push(format!(
+            "{named} is not where the thread is shown now; went to the thread"
+        ));
+    }
+    if target.version.is_some() {
+        notes.push("`version` not used: threads show on the review as it is now".to_owned());
+    }
+    notes
 }
 
 /// A comparison baseline, checked.
@@ -206,12 +291,20 @@ impl ReviewSurface {
 
     /// Move to `target` in this review.
     ///
+    /// A thread is the place when one is named: it is reached wherever the review shows it
+    /// (an outdated pull request thread near its code, on its file or on its layer), entering
+    /// its layer when a layer is shown alone; a `path`, `line`, `side`, `source` or `version`
+    /// given with it is not used, and the answer says so when it names another place.
+    ///
     /// # Errors
     ///
     /// * The target names another review, a layer, file or thread this review does not have,
     ///   or nothing at all.
+    /// * The thread or file is hidden by the comparison or by hidden resolved threads (the
+    ///   refusal says which call shows it).
     pub fn assistant_go_to(&mut self, target: &GoTo, host: &UiContext) -> Result<String, String> {
-        if let Some(review) = target.review.as_deref().filter(|id| !id.is_empty())
+        let target = &target.without_blanks();
+        if let Some(review) = target.review.as_deref()
             && self.screen_review_id().as_deref() != Some(review)
         {
             return Err(format!(
@@ -226,21 +319,29 @@ impl ReviewSurface {
         if self.review.is_none() {
             return Err("the review is still loading; try again".to_owned());
         }
-        let layer = target
+        let mut layer = target
             .layer
             .as_ref()
             .map(|layer| self.layer_position(layer))
             .transpose()?;
-        let version = target
-            .version
-            .map(|version| {
-                self.check_version(layer.as_ref().map(|(_, number)| number.clone()), version)
-            })
+        let thread = target
+            .thread
+            .as_deref()
+            .map(|named| self.thread_target(named))
             .transpose()?;
+        let mut notes = Vec::new();
         // Everything is checked before anything moves; a layer shown alone only shows its own
         // files and threads.
         let entries = self.rail_entries();
-        let alone = if self.stack_view == super::stack::StackView::OneLayer {
+        let one_layer = self.stack_view == super::stack::StackView::OneLayer;
+        if let Some(source) = thread.as_ref().and_then(|thread| thread.source.as_deref())
+            && one_layer
+        {
+            let (entered, note) = self.thread_layer(&entries, layer, source);
+            layer = entered;
+            notes.extend(note);
+        }
+        let alone = if one_layer {
             match &layer {
                 Some((position, _)) => entries.get(*position).map(|entry| entry.source_id.clone()),
                 None => self
@@ -251,40 +352,29 @@ impl ReviewSurface {
         } else {
             None
         };
-        let thread = target.thread.as_deref().map(|thread| {
-            let key = ItemKey::Thread {
-                thread_id: thread.to_owned(),
-            };
-            let place = self
-                .review
-                .as_ref()
-                .and_then(|review| review.doc.source_of_key(&key).map(|source| source.map(str::to_owned)));
-            match place {
-                None => Err(format!(
-                    "thread {thread} is not shown in this review (code_review.list_threads lists them)"
-                )),
-                Some(Some(source)) if alone.as_ref().is_some_and(|alone| *alone != source) => {
-                    Err(format!(
-                        "thread {thread} is in another layer ({source}); name its layer with `layer`"
-                    ))
-                }
-                Some(_) => {
-                    let refusal = self.hidden_refusal(&format!("thread {thread}"), &key);
-                    refusal.map_or(Ok((thread, key)), Err)
-                }
-            }
-        });
-        let thread = thread.transpose()?;
-        let file = target
-            .path
-            .as_deref()
-            .map(|path| {
-                let within = alone.as_deref().filter(|_| target.source.is_none());
-                let file = self.find_file(path, target.source.as_deref(), within)?;
-                let refusal = self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone()));
-                refusal.map_or(Ok(file), Err)
-            })
-            .transpose()?;
+        let (version, file) = if let Some(thread) = &thread {
+            notes.extend(thread_mismatch(target, thread));
+            (None, None)
+        } else {
+            let version = target
+                .version
+                .map(|version| {
+                    self.check_version(layer.as_ref().map(|(_, number)| number.clone()), version)
+                })
+                .transpose()?;
+            let file = target
+                .path
+                .as_deref()
+                .map(|path| {
+                    let within = alone.as_deref().filter(|_| target.source.is_none());
+                    let file = self.find_file(path, target.source.as_deref(), within)?;
+                    let refusal =
+                        self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone()));
+                    refusal.map_or(Ok(file), Err)
+                })
+                .transpose()?;
+            (version, file)
+        };
         let mut done = Vec::new();
         if let Some((position, wanted)) = layer {
             let current = self.current_layer(&entries);
@@ -295,16 +385,146 @@ impl ReviewSurface {
             self.show_layer_version(number, index, host);
             done.push(format!("#{number} v{}", index + 1));
         }
-        if let Some((thread, key)) = thread
+        if let Some(thread) = thread
             && let Some(review) = self.review.as_mut()
         {
-            super::annotate::jump_to_annotation(review, &key);
-            done.push(format!("thread {thread}"));
+            super::annotate::jump_to_annotation(review, &thread.key);
+            done.push(format!("thread {} {}", thread.tool_id, thread.shown));
         }
         if let Some(file) = file {
             done.push(self.show_file_location(&file, target.line, target.side.as_deref()));
         }
-        Ok(format!("now showing {}", done.join(", ")))
+        let mut answer = format!("now showing {}", done.join(", "));
+        if !notes.is_empty() {
+            answer.push_str(" (");
+            answer.push_str(&notes.join("; "));
+            answer.push(')');
+        }
+        Ok(answer)
+    }
+
+    /// The layer to enter, shown one layer at a time, to reach a thread in layer `source`
+    /// when `named` was named: the named one when it holds the thread, none when the layer
+    /// shown alone does, else the thread's own (with a note when another was named).
+    fn thread_layer(
+        &self,
+        entries: &[super::stack::RailEntry],
+        named: Option<(usize, String)>,
+        source: &str,
+    ) -> (Option<(usize, String)>, Option<String>) {
+        let named_source = named
+            .as_ref()
+            .and_then(|(position, _)| entries.get(*position))
+            .map(|entry| entry.source_id.as_str());
+        if named_source == Some(source) {
+            return (named, None);
+        }
+        let shown = self.review.as_ref().and_then(|review| review.doc.focus());
+        if named_source.is_none() && shown == Some(source) {
+            return (None, None);
+        }
+        let number = self
+            .layer_sources()
+            .iter()
+            .find(|layer| layer.source_id == source)
+            .map_or_else(|| source.to_owned(), |layer| layer.number.to_string());
+        let entered = entries
+            .iter()
+            .position(|entry| entry.source_id == source)
+            .map(|position| (position, number));
+        let note = named_source.map(|_| {
+            "the thread is in another layer than the one named; went to its layer".to_owned()
+        });
+        (entered, note)
+    }
+
+    /// The thread a tool names `named` (as `code_review.list_threads`, `current_view` and the
+    /// question context give it), checked to be reachable on screen.
+    fn thread_target(&self, named: &str) -> Result<ThreadTarget, String> {
+        let review = self
+            .review
+            .as_ref()
+            .ok_or("the review is still loading; try again")?;
+        let Some(thread_id) = self.notes.thread_for_tool_id(named) else {
+            return Err(self.unknown_thread(named));
+        };
+        let key = ItemKey::Thread {
+            thread_id: thread_id.clone(),
+        };
+        let resolved_hidden = self.hide_resolved && self.notes.thread_resolved(&thread_id);
+        let Some(source) = review.doc.source_of_key(&key) else {
+            return Err(if resolved_hidden {
+                format!(
+                    "thread {named} is resolved and resolved threads are hidden; call \
+                     bcode.code-review.set_view with `hide_resolved_threads: false` first"
+                )
+            } else {
+                format!(
+                    "thread {named} is not placed in the review on screen yet; try again in a \
+                     moment, or go to its file with `path`"
+                )
+            });
+        };
+        let source = source.map(str::to_owned);
+        if let Some(refusal) = self.hidden_refusal(&format!("thread {named}"), &key) {
+            return Err(refusal);
+        }
+        let first = self
+            .notes
+            .thread(&thread_id)
+            .first()
+            .map(|first| first.anchor.clone());
+        let remote = self.notes.remote(&thread_id);
+        let placement = remote.map(|info| match info.placement {
+            bcode_code_review::conversation::Placement::Exact => "",
+            bcode_code_review::conversation::Placement::Moved => "moved with its code, ",
+            bcode_code_review::conversation::Placement::Near => {
+                "near its code, which changed since, "
+            }
+            bcode_code_review::conversation::Placement::OnFile => {
+                "on its file: its lines are gone, "
+            }
+            bcode_code_review::conversation::Placement::OnLayer => {
+                "on its pull request: the review no longer changes its file, "
+            }
+        });
+        let shown = first.as_ref().map_or_else(
+            || "the review".to_owned(),
+            bcode_code_review::assistant::location_label,
+        );
+        let mut paths = Vec::new();
+        if let Some(first) = &first {
+            paths.push(first.file_path.clone());
+        }
+        if let Some(info) = remote {
+            paths.push(info.thread.anchor.path.clone());
+        }
+        Ok(ThreadTarget {
+            tool_id: self.notes.tool_thread_id(&thread_id),
+            shown: format!("({}shown at {shown})", placement.unwrap_or_default()),
+            key,
+            source,
+            paths,
+            anchor: first,
+        })
+    }
+
+    /// Why no thread the review holds is named `named`, and what to do.
+    fn unknown_thread(&self, named: &str) -> String {
+        if bcode_code_review_models::is_pull_thread_ref(named) {
+            if self.notes.remote_threads().is_empty() {
+                return format!(
+                    "pull request thread {named} is not on screen: the review has not read its \
+                     pull request threads yet (try again in a moment), or they are off"
+                );
+            }
+            return format!(
+                "pull request thread {named} is not placed on the review on screen (its code \
+                 could not be followed and such threads show only in the threads panel); go to \
+                 its file with `path` instead"
+            );
+        }
+        format!("thread {named} is not shown in this review (code_review.list_threads lists them)")
     }
 
     /// Why `what` (held at `key`) cannot be shown as the review is shown now, and how to show

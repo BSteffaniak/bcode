@@ -63,7 +63,7 @@ fn location_properties() -> serde_json::Map<String, Value> {
         "line": {"type": "integer", "minimum": 1, "description": "A line of the file."},
         "side": {"type": "string", "enum": ["new", "old"], "description": "Side the line is on (new by default)."},
         "source": {"type": "string", "description": "Source id, when several sources have the file."},
-        "thread": {"type": "string", "description": "A thread id (code_review.list_threads)."},
+        "thread": {"type": "string", "description": "A thread id exactly as code_review.list_threads, current_view or the question gives it (a pull request thread's is `<repository>#<number>:<thread id>`). The thread is the place: it is reached wherever the review shows it (an outdated one near its code, on its file or on its pull request), entering its layer when needed; path, line and version are then not used."},
         "version": {"type": "integer", "minimum": 1, "description": "Show this version (v1 is the first) of the layer (`layer`, else the current one): its whole change as it was then, read-only where it differs from now."}
     }) else {
         return serde_json::Map::new();
