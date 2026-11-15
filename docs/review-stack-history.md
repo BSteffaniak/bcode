@@ -267,7 +267,8 @@ Changes since: [you last looked · 2d ago ▾]   3 of 21 PRs changed · 18 rebas
   since: you last looked · nothing new".
 * The choice of baseline (not the computed result) is kept in the workspace's presentation
   state, so reopening keeps "previous push", a fixed time, or *full change* while nothing moved;
-  *last looked* re-resolves on each open. When some layer moved since the reviewer last looked,
+  *last looked* re-resolves on each open, and a time preset (`ReviewCompareChoice::ago_ms`)
+  resolves again to that long before the open. When some layer moved since the reviewer last looked,
   the reopened review starts with *you last looked* and the banner instead (the saved choice is
   one key away). Versions picked for single pull requests and *the stack as it was* are for the
   session and are not saved.

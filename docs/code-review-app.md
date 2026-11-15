@@ -351,20 +351,26 @@ work the same with or without one.
   looked*, *the previous push*, *1 hour ago*, *yesterday*, *a week ago*, *pushes picked on the
   timeline…* (the timeline takes the keys: `←`/`→`, `f` from, `t` to, `enter`, `esc`; a click on
   a tick compares from before it, with `shift` up to after it), *two versions of #N…* (the
-  version picker), *the stack as it was* (only while a history choice is in effect) and
-  *nothing: show the full change*. The baseline in effect is marked `◉` with what it resolves to
-  (`◉ you last looked · 4m ago`, `◉ pushes picked on the timeline… · 3h ago → now`), and the
-  menu opens with the cursor on it. Under **View** it lists the check boxes *Only what changed*
-  and *Only pull requests with real changes*.
+  version picker), *the whole stack as it was* (listed while that history choice is in effect
+  or the menu opened on it, with its time) and *nothing: show the full change*. The baseline in
+  effect is marked `◉` with what it resolves to (`◉ you last looked · 4m ago`, `◉ pushes picked
+  on the timeline… · 3h ago → 1h ago`, `◉ yesterday · 1d ago`), and the menu opens with the
+  cursor on it. Under **View** it lists the check boxes *Only what changed* and *Only pull
+  requests with real changes*; both can be set while nothing is compared, and apply once
+  something is.
   * `space` (or a click) picks the row in place: the review behind the menu compares with that
     baseline, or flips that option, at once, and the menu stays open; the footer says how far a
     comparison got while one computes. Comparisons computed before are laid again at once.
   * `enter` keeps what is set and closes the menu (on a baseline not yet in effect it picks it
     first); a click outside the menu does the same.
-  * `esc` puts back exactly what the menu opened on.
-  * Rows that open another picker (pushes, versions) close the menu and open it.
+  * `esc` puts back exactly what the menu opened on: the baseline, the options, the banner,
+    and which pull requests show the files the comparison hides.
+  * Rows that open another picker (pushes, versions) close the menu and open it; what the menu
+    previewed stays pending until that picker compares (kept) or is cancelled (put back too).
   Nothing is saved while the menu is open; the choice is kept with the review when it closes,
-  and *you last looked* is worked out again on every open.
+  and *you last looked* is worked out again on every open. A time picked as *1 hour ago*,
+  *yesterday* or *a week ago* is kept as that: a reopened review compares with that long before
+  it reopens, marked as that choice.
 * **The version picker** lists the current pull request's versions newest first (`v1`..`vN`,
   when, what kind of change, and which you looked at or reviewed). `f` sets *from*, `t` sets
   *to* (now by default), `enter` compares; a click sets *from*, a `shift`-click *to*. A
@@ -373,6 +379,8 @@ work the same with or without one.
 * **What shows.** The rebase is taken out: a layer only rebased collapses to one line, files
   unchanged since the baseline fold once viewed (unviewed ones stay open), lines new since then
   are tinted with a bar in the gutter, and code removed since then is a marker you can expand.
+  The summary rows, markers and file badges name the baseline (`Changed since you looked`,
+  `Changed since the previous push`, `since then` for a time, pushes or versions picked).
   `]`/`[` stop on new lines first. `shift+l` switches between that full change and only what
   changed (each changed file from its old version replayed on today's base to the current code).
 * **Badges.** Rail tabs say how each pull request changed: `● +40 −12 · 3 files`, `○ rebased`,
@@ -385,7 +393,10 @@ work the same with or without one.
     looked · 4m ago · only what changed`; a click opens the menu), then what it found: for one
     pull request `1 of 3 files changed since you last looked (4m ago): +1 −0`, or plainly `No
     changes since you last looked (4m ago): only rebased`; with every layer `1 of 3 PRs changed ·
-    2 rebased only`. Without a comparison it says *Full change: no comparison*.
+    2 rebased only`. Without a comparison it says *Full change: no comparison* (with the options
+    set for when something is compared); while looks are still read it says so.
+  * The legend wraps within the panel while that leaves the tree at least three rows; in a
+    shorter panel its rows keep one line each and the later ones are left out.
   * Files changed since the baseline are marked `●` (new to the change since then: `+`) before
     their status, in bold, with their since counts (`Δ+3−1`, `new +12`); files the same as then
     recede (dimmed); files the baseline's change had and the current one dropped are listed,
@@ -407,10 +418,11 @@ work the same with or without one.
   a file header says `changed in 2 of 4 pushes · v4 ◂ ▸`; `alt+,` and `alt+.` (or the arrows;
   `alt+[`/`alt+]` where the terminal reports them) step that file alone to the previous or next
   push that changed it (read-only), and past the newest back to the pull request's comparison.
+  The file panel's row follows the version shown.
 * **The history matrix** (`shift+b`) compares in place too: `enter` the cursor's pull request
   with its version before, `p` the pushes between the pin (`f`) and the cursor, `s` everything
-  since the cursor's column, `a` the whole stack at this push (the menu marks it *the stack as
-  it was*), `r` since you last looked, `i` only real changes.
+  since the cursor's column, `a` the whole stack at this push (the menu marks it *the whole
+  stack as it was*), `r` since you last looked, `i` only real changes.
 
 ### Pull request conversations
 
