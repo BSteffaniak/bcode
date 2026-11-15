@@ -136,7 +136,8 @@ pub struct Icons {
     pub since_changed: &'static str,
     /// A layer only rebased since the baseline.
     pub since_rebased: &'static str,
-    /// A layer at the same version as the baseline.
+    /// A layer at the same version as the baseline: never the approval or viewed check mark,
+    /// which share its tab.
     pub since_unchanged: &'static str,
     /// A layer the reviewer never looked at.
     pub since_new_to_you: &'static str,
@@ -202,7 +203,7 @@ impl Icons {
         since_bar: "▎",
         since_changed: "●",
         since_rebased: "○",
-        since_unchanged: "✓",
+        since_unchanged: "=",
         since_new_to_you: "+",
         since_with_rebase: "≈",
         since_unavailable: "?",
@@ -246,18 +247,18 @@ impl Icons {
         failed: "x",
         output: "|",
         alert: "!",
-        approved: "+",
+        approved: "ok",
         changes: "x",
         awaiting: "o",
         checks: "*",
         external: "->",
-        new: "*",
+        new: "!",
         since_bar: "|",
         since_changed: "*",
         since_rebased: "o",
         since_unchanged: "=",
         since_new_to_you: "+",
-        since_with_rebase: "~",
+        since_with_rebase: "~=",
         since_unavailable: "?",
         tick: "|",
         tick_changed: "#",
@@ -1082,6 +1083,36 @@ pub const fn status_letter(status: ReviewFileStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glyphs_sharing_a_rail_tab_or_file_row_are_distinct_in_every_icon_set() {
+        for icons in [Icons::UNICODE, Icons::ASCII] {
+            // What a rail tab or a file panel row can show side by side.
+            let tab = [
+                ("approved", icons.approved),
+                ("changes", icons.changes),
+                ("new", icons.new),
+                ("draft", icons.draft),
+                ("thread", icons.thread),
+                ("ellipsis", icons.ellipsis),
+                ("since_changed", icons.since_changed),
+                ("since_rebased", icons.since_rebased),
+                ("since_unchanged", icons.since_unchanged),
+                ("since_new_to_you", icons.since_new_to_you),
+                ("since_with_rebase", icons.since_with_rebase),
+                ("since_unavailable", icons.since_unavailable),
+            ];
+            for (index, (name, glyph)) in tab.iter().enumerate() {
+                for (other, other_glyph) in &tab[index + 1..] {
+                    assert_ne!(glyph, other_glyph, "{name} and {other} in {icons:?}");
+                }
+            }
+            // The viewed mark is the approval mark by design, never a comparison badge.
+            for (name, glyph) in &tab[6..] {
+                assert_ne!(*glyph, icons.viewed, "{name} in {icons:?}");
+            }
+        }
+    }
 
     #[test]
     fn roles_are_distinct_where_the_screen_relies_on_them() {

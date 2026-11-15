@@ -68,6 +68,22 @@ pub fn ago(at_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// What each glyph of a rail tab's comparison badge means, next to the approval mark the tab
+/// can also carry.
+#[must_use]
+pub fn badge_legend(icons: &crate::theme::Icons) -> String {
+    format!(
+        "tabs: {} changed since  {} rebased only  {} unchanged since  {} new to you  {} approved  \
+         {} changes requested",
+        icons.since_changed,
+        icons.since_rebased,
+        icons.since_unchanged,
+        icons.since_new_to_you,
+        icons.approved,
+        icons.changes,
+    )
+}
+
 /// `text` in exactly `cells` terminal cells: cut with an ellipsis when wider, padded when
 /// narrower.
 fn fit_cells(text: &str, cells: usize) -> String {
@@ -513,6 +529,10 @@ impl HistoryPanel {
              green: reviewed",
             theme.muted,
         )]));
+        lines.push(
+            Line::from_spans(vec![Span::styled(badge_legend(&theme.icons), theme.muted)])
+                .truncate(width),
+        );
         if let Some(note) = &self.note {
             lines.push(Line::from_spans(vec![Span::styled(
                 note.clone(),
