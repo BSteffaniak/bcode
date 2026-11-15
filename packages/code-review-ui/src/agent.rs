@@ -605,6 +605,7 @@ pub async fn ask(
         title,
     } = question;
     let follow_up = exchange.session_id.clone();
+    let mut refused = None;
     let linked = async {
         if let Some(session) = follow_up {
             services
@@ -627,11 +628,13 @@ pub async fn ask(
             )
             .await
             .map_err(|error| error.message)?;
-        // The app default model and effort apply before the question; a refused model
-        // leaves Bcode's default.
-        let _ =
+        // The app default model and effort apply before the question; a refused one leaves
+        // Bcode's default, and the card says why.
+        refused =
             crate::assistant::models::apply_default(&services, scope.repo_path.clone(), &session)
-                .await;
+                .await
+                .err()
+                .map(|error| format!("{error}; this question runs Bcode's default"));
         services
             .call(bcode_code_review_models::BindReviewAssistantRequest {
                 repo_path: scope.repo_path.clone(),
@@ -664,7 +667,7 @@ pub async fn ask(
         Ok(session) => {
             exchange.session_id = Some(session);
             exchange.status = ReviewAiExchangeStatus::Linked;
-            exchange.error = None;
+            exchange.error = refused;
             exchange.updated_at_ms = now_ms;
             save(exchange.clone())
                 .await
