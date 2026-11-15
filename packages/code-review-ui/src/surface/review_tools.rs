@@ -48,8 +48,14 @@ const NAVIGATE_TOOL: &str = "code_review.navigate";
 /// Result of the review's background work for reflected tools.
 #[derive(Debug)]
 pub enum ToolsResult {
-    /// The review's stored record, read after a tool (or another app) may have changed it.
-    Stored(Result<Option<Box<ReviewWorkspace>>, String>),
+    /// The review's stored record, read after a tool (or another app) may have changed it,
+    /// with the count of the review's own writes taken when the read started.
+    Stored {
+        /// The record read, `None` when the review no longer exists.
+        result: Result<Option<Box<ReviewWorkspace>>, String>,
+        /// [`super::viewed_sync::Tracking::writes`] when the read started.
+        writes: u64,
+    },
 }
 
 /// Card sessions followed, with the finished tool calls already applied.
@@ -262,14 +268,21 @@ impl ReviewSurface {
     }
 
     /// A finished piece of reflection work.
-    pub(super) fn finish_tools(&mut self, result: ToolsResult) {
+    pub(super) fn finish_tools(&mut self, result: ToolsResult, host: &UiContext) {
+        let ToolsResult::Stored { result, writes } = result;
+        if writes != self.viewed_sync.writes {
+            // A save of the review's own was taken while this read ran, so the read may hold
+            // the record from before it; read again rather than undo the save on screen.
+            self.reload_stored(host);
+            return;
+        }
         match result {
-            ToolsResult::Stored(Ok(None)) => {
+            Ok(None) => {
                 if !self.is_transient() {
                     self.deleted_elsewhere();
                 }
             }
-            ToolsResult::Stored(Ok(Some(stored))) => {
+            Ok(Some(stored)) => {
                 if self.is_transient() {
                     self.apply_stored_viewed(&stored);
                 } else {
@@ -281,7 +294,7 @@ impl ReviewSurface {
                     self.rebase_onto(&base, *stored);
                 }
             }
-            ToolsResult::Stored(Err(error)) => {
+            Err(error) => {
                 self.toasts.push(
                     ToastSeverity::Error,
                     "Could not reload the review",
@@ -297,6 +310,7 @@ impl ReviewSurface {
             return;
         }
         let workspace = self.workspace_mut().clone();
+        let writes = self.viewed_sync.writes;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
@@ -308,7 +322,10 @@ impl ReviewSurface {
                 .await
                 .map(|response| response.workspace.map(Box::new))
                 .map_err(|error| error.message);
-            inbox.push(Message::Tools(Box::new(ToolsResult::Stored(result))));
+            inbox.push(Message::Tools(Box::new(ToolsResult::Stored {
+                result,
+                writes,
+            })));
         }));
     }
 
@@ -328,6 +345,7 @@ impl ReviewSurface {
     /// A save of `saving` wrote `written`: take what the store merged in, keeping changes the
     /// reviewer made while the save ran.
     pub(super) fn adopt_written(&mut self, saving: &ReviewWorkspace, written: ReviewWorkspace) {
+        self.viewed_sync.writes += 1;
         if self.is_transient() {
             let local = super::viewed_sync::Viewed::of(self.workspace_mut());
             let written = super::viewed_sync::Viewed::of(&written);

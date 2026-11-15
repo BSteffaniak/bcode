@@ -1302,6 +1302,13 @@ impl<S: View> Scenario<S> {
         self.record(action);
     }
 
+    /// Poll the screen once without running async work, so the work it starts stays queued
+    /// behind work already queued.
+    pub fn poll_only(&mut self) {
+        let action = self.surface.poll(&self.ui);
+        self.record(action);
+    }
+
     /// Render one frame at the current size without settling async work.
     pub fn render(&mut self) -> Screen {
         let area = Rect::new(0, 0, self.size.width, self.size.height);

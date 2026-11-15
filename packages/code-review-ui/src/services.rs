@@ -531,7 +531,14 @@ impl ReviewServices {
                     })?
             }
             #[cfg(test)]
-            Execution::Inline => request.run(&self.data, &self.store),
+            Execution::Inline => {
+                let response = request.run(&self.data, &self.store);
+                // A delayed answer lets work started later finish first, as a slow call would.
+                for _ in 0..self.probe.delay(O::NAME) {
+                    tokio::task::yield_now().await;
+                }
+                response
+            }
         }
     }
 
@@ -546,6 +553,13 @@ impl ReviewServices {
     pub(crate) fn set_failing(&self, operation: &str, fail: bool) {
         self.probe.set_failing(operation, fail);
     }
+
+    /// Answer every later call of `operation` only after `yields` yields to other tasks (none
+    /// when zero), so work started after it finishes first.
+    #[cfg(test)]
+    pub(crate) fn set_delay(&self, operation: &str, yields: u32) {
+        self.probe.set_delay(operation, yields);
+    }
 }
 
 /// Lock `mutex`, recovering the guard if a holder panicked (the registry stays usable).
@@ -557,18 +571,37 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod probe {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     use bcode_code_review::provider::ProviderCallError;
 
-    /// Fails chosen operations.
+    /// Fails or delays chosen operations.
     #[derive(Debug, Default)]
     pub struct Probe {
         failing: Mutex<BTreeSet<String>>,
+        delays: Mutex<BTreeMap<String, u32>>,
     }
 
     impl Probe {
+        pub fn delay(&self, name: &str) -> u32 {
+            self.delays
+                .lock()
+                .expect("delay lock")
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        pub fn set_delay(&self, name: &str, yields: u32) {
+            let mut delays = self.delays.lock().expect("delay lock");
+            if yields == 0 {
+                delays.remove(name);
+            } else {
+                delays.insert(name.to_owned(), yields);
+            }
+        }
+
         pub fn observe(&self, name: &str) -> Result<(), ProviderCallError> {
             if self.failing.lock().expect("failing lock").contains(name) {
                 return Err(ProviderCallError {

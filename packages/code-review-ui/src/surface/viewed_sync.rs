@@ -37,6 +37,9 @@ pub struct Tracking {
     pub saving: Option<ReviewWorkspace>,
     /// The saved review was deleted elsewhere: nothing is saved any more.
     pub deleted: bool,
+    /// How many of the review's own writes were taken as the stored record: a read started
+    /// before the last of them may predate it and is read again instead of applied.
+    pub writes: u64,
 }
 
 /// Why a save failed.

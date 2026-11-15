@@ -165,6 +165,12 @@ impl TestBackend {
         self.services.set_failing(operation, fail);
     }
 
+    /// Answer every later call of `operation` only after `yields` yields to other tasks, so
+    /// work started after it finishes first (zero answers at once again).
+    pub fn set_delay(&self, operation: &str, yields: u32) {
+        self.services.set_delay(operation, yields);
+    }
+
     /// Answer `request` directly (for test setup and assertions), outside the call log and
     /// injected failures.
     ///

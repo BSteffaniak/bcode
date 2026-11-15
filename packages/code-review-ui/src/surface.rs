@@ -1834,6 +1834,7 @@ impl ReviewSurface {
                 self.viewed_sync.transient = None;
                 self.viewed_sync.base = Some(viewed_sync::Viewed::of(&saved));
                 self.viewed_sync.stored = Some(saved);
+                self.viewed_sync.writes += 1;
                 self.request_save();
                 // Annotations now live in the saved review's scope.
                 self.notes_requested = false;
@@ -2149,7 +2150,7 @@ impl ReviewSurface {
             Message::NoteDone(result) => self.finish_note(result),
             Message::Asked(result) => self.finish_ask(*result),
             Message::Feed(outcome) => self.finish_feed(outcome),
-            Message::Tools(result) => self.finish_tools(*result),
+            Message::Tools(result) => self.finish_tools(*result, host),
             Message::SavedAs(result) => self.finish_save_review(*result),
             Message::Publish(result) => self.apply_publish(result),
             Message::Import(result) => self.apply_import(result),

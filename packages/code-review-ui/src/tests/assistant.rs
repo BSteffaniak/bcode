@@ -917,6 +917,52 @@ fn viewed_marks_a_tool_wrote_survive_the_open_reviews_own_saves() {
     assert!(shown(&setup).contains(&paths[0]), "{:?}", shown(&setup));
 }
 
+/// A reload that read the store before the review's own save landed does not undo that save
+/// on screen: it is read again.
+#[test]
+fn a_reload_read_before_a_save_landed_does_not_undo_it_on_screen() {
+    let mut setup = setup(160, 50, true);
+    setup.settle();
+    let shown = |setup: &Setup| {
+        setup
+            .app()
+            .review()
+            .and_then(ReviewSurfaceExt::viewed_paths)
+            .unwrap_or_default()
+    };
+    assert!(shown(&setup).is_empty());
+    // Returning to the app reads the stored record; that read answers late.
+    setup.backend.set_delay(
+        <bcode_code_review_models::GetReviewWorkspaceRequest as crate::services::Operation>::NAME,
+        8,
+    );
+    setup.scenario.send(&bmux_tui::event::Event::Focus(
+        bmux_tui::event::FocusEvent::Gained,
+    ));
+    // Meanwhile the reviewer marks a file viewed, and the review saves it.
+    setup.scenario.key("v");
+    setup.scenario.poll_only();
+    let marked = shown(&setup);
+    assert_eq!(marked.len(), 1, "{marked:?}");
+    for _ in 0..4 {
+        setup.settle();
+    }
+    setup.backend.set_delay(
+        <bcode_code_review_models::GetReviewWorkspaceRequest as crate::services::Operation>::NAME,
+        0,
+    );
+    assert_eq!(
+        shown(&setup),
+        marked,
+        "the late read kept the save on screen"
+    );
+    assert_eq!(
+        stored_review(&setup).expect("saved").viewed_files,
+        marked,
+        "and in the store"
+    );
+}
+
 /// The saved review as the store holds it now, if it still exists.
 fn stored_review(setup: &Setup) -> Option<ReviewWorkspace> {
     setup
