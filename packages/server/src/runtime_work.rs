@@ -238,6 +238,9 @@ pub struct RuntimeWorkManager {
     active:
         super::activity_changes::ActivityMutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
     metrics: MetricsRegistry,
+    /// Work taken out of `active` to be finished whose terminal event is not durable yet.
+    /// Changed only while `active` is locked, so the two read together never show a gap.
+    retiring: std::sync::Mutex<std::collections::BTreeSet<(SessionId, WorkId)>>,
     #[cfg(test)]
     pub(super) progress: tokio::sync::watch::Sender<()>,
 }
@@ -334,6 +337,7 @@ impl RuntimeWorkManager {
         Self {
             active: super::activity_changes::ActivityMutex::default(),
             metrics,
+            retiring: std::sync::Mutex::default(),
             #[cfg(test)]
             progress: tokio::sync::watch::channel(()).0,
         }
@@ -595,6 +599,64 @@ impl RuntimeWorkManager {
             .collect()
     }
 
+    /// Active work identifiers for a session together with work being retired (taken to be
+    /// finished, its terminal event not yet durable): every id whose owner still holds it.
+    pub(super) async fn owned_ids_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> std::collections::BTreeSet<WorkId> {
+        let active = self.active.lock().await;
+        let mut ids: std::collections::BTreeSet<WorkId> = active
+            .keys()
+            .filter_map(|(active_session_id, work_id)| {
+                (*active_session_id == session_id).then_some(work_id.clone())
+            })
+            .collect();
+        ids.extend(
+            self.retiring_set()
+                .iter()
+                .filter(|(retiring_session_id, _)| *retiring_session_id == session_id)
+                .map(|(_, work_id)| work_id.clone()),
+        );
+        drop(active);
+        ids
+    }
+
+    /// Take active work to finish it: it stays among the session's owned ids (see
+    /// [`Self::owned_ids_for_session`]) until [`Self::retired`] says its terminal event is
+    /// durable.
+    pub(super) async fn take_for_retirement(
+        &self,
+        session_id: SessionId,
+        work_id: &WorkId,
+    ) -> Option<RuntimeWorkSpec> {
+        let mut active = self.active.lock_for(session_id).await;
+        let key = (session_id, work_id.clone());
+        let removed = active.remove(&key);
+        if removed.is_some() {
+            self.retiring_set().insert(key);
+        }
+        drop(active);
+        #[cfg(test)]
+        self.progress.send_replace(());
+        removed.map(|work| work.spec)
+    }
+
+    /// Work taken for retirement has its terminal event durable.
+    pub(super) async fn retired(&self, session_id: SessionId, work_id: &WorkId) {
+        let active = self.active.lock().await;
+        self.retiring_set().remove(&(session_id, work_id.clone()));
+        drop(active);
+    }
+
+    fn retiring_set(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<(SessionId, WorkId)>> {
+        self.retiring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Retire only the registration generation captured by this token.
     ///
     /// Stage revisions do not affect retirement authority: an older-stage token
@@ -610,7 +672,11 @@ impl RuntimeWorkManager {
             .get(&key)
             .is_some_and(|work| Arc::ptr_eq(&token.owner, &work.observation_owner));
         let owned = if matches_owner {
-            active.remove(&key).map(|work| work.spec)
+            let owned = active.remove(&key).map(|work| work.spec);
+            if owned.is_some() {
+                self.retiring_set().insert(key);
+            }
+            owned
         } else {
             None
         };

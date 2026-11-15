@@ -6182,6 +6182,46 @@ async fn recover_abandoned_tool_runs(
     Ok(())
 }
 
+/// A test hook pausing runtime-work recovery between its reads of saved and running work, so
+/// tests can start or finish work in that window.
+#[cfg(test)]
+mod recovery_pause {
+    use bcode_session_models::SessionId;
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::oneshot;
+
+    type Hooks = Mutex<BTreeMap<SessionId, (oneshot::Sender<()>, oneshot::Receiver<()>)>>;
+
+    fn hooks() -> &'static Hooks {
+        static HOOKS: OnceLock<Hooks> = OnceLock::new();
+        HOOKS.get_or_init(Hooks::default)
+    }
+
+    /// Pause the next recovery of `session_id` between its reads: the first receiver fires
+    /// when it pauses, and sending on the returned sender resumes it.
+    pub(super) fn arm(session_id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, reached_rx) = oneshot::channel();
+        let (resume, resume_rx) = oneshot::channel();
+        hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, (reached, resume_rx));
+        (reached_rx, resume)
+    }
+
+    pub(super) async fn between_reads(session_id: SessionId) {
+        let hook = hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id);
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
+    }
+}
+
 async fn recover_abandoned_session_runtime_work(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -6219,9 +6259,30 @@ async fn recover_abandoned_session_runtime_work_inner(
     } else {
         None
     };
-    let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
+    // Saved active work is read before the running ids: work is registered as running before
+    // its start is saved, so a turn starting during recovery is either missing from this
+    // snapshot or among the running ids read next.
+    let saved = state.sessions.active_runtime_work(session_id).await?;
+    if state.session_current_turn(session_id).await.is_some() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    recovery_pause::between_reads(session_id).await;
+    // Work being finished stays among the owned ids until its terminal event is saved, and
+    // the second read drops work whose terminal event was saved meanwhile.
+    let active_runtime_ids = state.runtime_work.owned_ids_for_session(session_id).await;
     recover_abandoned_tool_runs(state, session_id, &active_runtime_ids).await?;
-    let active = state.sessions.active_runtime_work(session_id).await?;
+    let still_active = state
+        .sessions
+        .active_runtime_work(session_id)
+        .await?
+        .into_iter()
+        .map(|work| work.work_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let active = saved
+        .into_iter()
+        .filter(|work| still_active.contains(&work.work_id))
+        .collect::<Vec<_>>();
     let work_ids = active
         .iter()
         .map(|work| work.work_id.clone())
@@ -45575,7 +45636,10 @@ async fn finish_registered_runtime_work(
 ) {
     #[cfg(test)]
     trace_workflow_owner_lifecycle(state, session_id, &work_id.0, "take-enter");
-    let owned_work = state.runtime_work.take(session_id, &work_id).await;
+    let owned_work = state
+        .runtime_work
+        .take_for_retirement(session_id, &work_id)
+        .await;
     #[cfg(test)]
     trace_workflow_owner_lifecycle(
         state,
@@ -45627,7 +45691,8 @@ async fn finish_owned_runtime_work(
             tracing::warn!(%session_id, %work_id, %error, "failed to persist workflow outcome presentation");
         }
     }
-    append_runtime_work_finished_event(state, session_id, work_id, status, message).await;
+    append_runtime_work_finished_event(state, session_id, work_id.clone(), status, message).await;
+    state.runtime_work.retired(session_id, &work_id).await;
     drop(owned_work);
     state.release_session_resources_if_idle(session_id).await;
 }
@@ -74327,6 +74392,118 @@ event_symbol = "bcode_plugin_handle_event_v1"
             remaining,
             [] as [bcode_session::db::RuntimeWorkProjection; 0]
         );
+    }
+
+    fn runtime_work_finishes(
+        history: &[bcode_session_models::SessionEvent],
+        work_id: &WorkId,
+    ) -> Vec<RuntimeWorkStatus> {
+        history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::RuntimeWorkFinished {
+                    work_id: id,
+                    status,
+                    ..
+                } if id == work_id => Some(*status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn recovery_leaves_work_that_starts_while_it_reads_running() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let (reached, resume) = recovery_pause::arm(session.id);
+        let recovery = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { recover_abandoned_session_runtime_work(&state, session.id).await }
+        });
+        reached.await.expect("recovery paused");
+        // A first turn starts while recovery is between its reads.
+        let work_id = WorkId::new("model-live-first-turn");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                work_id.clone(),
+                RuntimeWorkKind::ModelTurn,
+                "model turn live".into(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        resume.send(()).expect("resume");
+        recovery.await.expect("joined").expect("recovered");
+        let history = sessions.session_history(session.id).await.expect("history");
+        assert_eq!(
+            runtime_work_finishes(&history, &work_id),
+            [],
+            "a live turn is not abandoned"
+        );
+        state.runtime_work.finish(session.id, &work_id).await;
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn recovery_leaves_work_that_finishes_while_it_reads_running() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let work_id = WorkId::new("model-finishing-turn");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                work_id.clone(),
+                RuntimeWorkKind::ModelTurn,
+                "model turn finishing".into(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        let (reached, resume) = recovery_pause::arm(session.id);
+        let recovery = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { recover_abandoned_session_runtime_work(&state, session.id).await }
+        });
+        reached.await.expect("recovery paused");
+        // The work finishes normally while recovery is between its reads.
+        finish_registered_runtime_work(
+            &state,
+            session.id,
+            work_id.clone(),
+            RuntimeWorkStatus::Completed,
+            None,
+        )
+        .await;
+        resume.send(()).expect("resume");
+        recovery.await.expect("joined").expect("recovered");
+        let history = sessions.session_history(session.id).await.expect("history");
+        assert_eq!(
+            runtime_work_finishes(&history, &work_id),
+            [RuntimeWorkStatus::Completed],
+            "finished once, by its owner"
+        );
+        assert!(
+            state
+                .runtime_work
+                .owned_ids_for_session(session.id)
+                .await
+                .is_empty(),
+            "nothing stays retiring once finished"
+        );
+        drop(state);
     }
 
     #[tokio::test]
