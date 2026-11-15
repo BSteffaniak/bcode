@@ -4510,12 +4510,14 @@ impl ReviewSurface {
         // is laid out in. Rows wrap within the panel; in a panel too short for that, they
         // keep one line each and the later ones are left out, so the tree keeps its rows.
         let mut legend = self.compare_legend();
-        let wrap = match self.legend_rows.get() {
-            None => bmux_tui::text::TextWrap::Word,
-            Some(rows) => {
-                legend.truncate(usize::try_from(rows).unwrap_or(usize::MAX));
-                bmux_tui::text::TextWrap::None
-            }
+        let rows = self.legend_rows.get();
+        if let Some(rows) = rows {
+            legend.truncate(usize::try_from(rows).unwrap_or(usize::MAX));
+        }
+        let wrap = if rows.is_some() {
+            bmux_tui::text::TextWrap::None
+        } else {
+            bmux_tui::text::TextWrap::Word
         };
         self.legend_actions
             .replace(legend.iter().map(|row| row.action).collect());

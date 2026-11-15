@@ -1514,8 +1514,7 @@ impl ReviewSurface {
         let (baseline, only_changed) = (self.comparing.baseline, self.comparing.only_changed);
         let ago = self.comparing.ago;
         let picked = !self.comparing.picks.is_empty();
-        let mut changed = false;
-        if let Some(workspace) = self.workspace.as_mut() {
+        let changed = self.workspace.as_mut().is_some_and(|workspace| {
             let state = workspace.presentation.get_or_insert_with(Default::default);
             let before = state.compare;
             if !picked {
@@ -1523,8 +1522,8 @@ impl ReviewSurface {
                 state.compare.ago_ms = ago;
             }
             state.compare.only_changed = only_changed;
-            changed = state.compare != before;
-        }
+            state.compare != before
+        });
         self.persist_presentation(true);
         // The choice is written into the workspace's state above, so the presentation check
         // sees no difference: save it here.
