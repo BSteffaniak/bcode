@@ -2,8 +2,8 @@
 //!.
 //!
 //! * **Folding.** A thread folds to its header (`fold`, or a click on the header); on an AI
-//!   answer `fold` shows the whole answer or the preview again. `fold_all` collapses every
-//!   thread (or expands them all when every one is collapsed). Resolved threads can be hidden
+//!   answer card `fold` folds the card the same way; an answer itself always shows in full.
+//!   `fold_all` collapses every thread (or expands them all when every one is collapsed). Resolved threads can be hidden
 //!   from the document (`resolved_toggle`). Folds and the resolved filter are presentation
 //!   state saved with the workspace.
 //! * **AI answers.** A question on an anchor that already has a linked session is sent to that
@@ -97,35 +97,6 @@ impl ReviewSurface {
     // ----------------------------------------------------------------------------------------
     // Folding and the resolved filter
     // ----------------------------------------------------------------------------------------
-
-    /// Show the whole (or the preview of the) cursor's AI answer (its More and Less button).
-    pub(super) fn toggle_answer_expanded(&mut self) {
-        let Some(Target::Agent {
-            exchange_id: Some(exchange_id),
-            ..
-        }) = self.target()
-        else {
-            self.set_status("move to an AI answer first", StatusSeverity::Warning);
-            return;
-        };
-        if self.answer_text(&exchange_id).is_none() {
-            self.set_status("this question has no answer yet", StatusSeverity::Warning);
-            return;
-        }
-        let expanded = !self.folds.expanded.remove(&exchange_id);
-        if expanded {
-            self.folds.expanded.insert(exchange_id);
-        }
-        self.folds_changed();
-        self.set_status(
-            if expanded {
-                "showing the whole answer"
-            } else {
-                "showing the answer preview"
-            },
-            StatusSeverity::Info,
-        );
-    }
 
     /// Fold the cursor's thread or AI answer (or its file, or pull request card).
     pub(super) fn fold(&mut self) {

@@ -439,9 +439,6 @@ pub struct ReviewPresentationState {
     /// Threads folded or opened by hand.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub thread_folds: BTreeMap<String, ThreadFoldMark>,
-    /// AI exchange ids whose whole answer is shown instead of the preview.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub expanded_answers: BTreeSet<String>,
     /// Resolved threads are hidden from the document.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_resolved_threads: bool,
@@ -492,7 +489,6 @@ impl Default for ReviewPresentationState {
             layer_positions: BTreeMap::new(),
             collapsed_threads: BTreeSet::new(),
             thread_folds: BTreeMap::new(),
-            expanded_answers: BTreeSet::new(),
             hide_resolved_threads: false,
             hide_viewed_files: false,
             flat_files: None,
@@ -2984,6 +2980,21 @@ impl ReviewRoundOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_state_saved_with_expanded_answers_still_loads() {
+        let json = r#"{
+            "schema_version": 1,
+            "collapsed_threads": ["thread-1"],
+            "expanded_answers": ["exchange-1", "exchange-2"],
+            "hide_resolved_threads": true
+        }"#;
+        let state: ReviewPresentationState = serde_json::from_str(json).expect("loads");
+        assert!(state.collapsed_threads.contains("thread-1"));
+        assert!(state.hide_resolved_threads);
+        let saved = serde_json::to_string(&state).expect("saves");
+        assert!(!saved.contains("exchange-1"), "{saved}");
+    }
 
     fn review_snapshot() -> ReviewRepositorySnapshot {
         ReviewRepositorySnapshot {

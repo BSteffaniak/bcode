@@ -1338,3 +1338,59 @@ fn the_question_composers_model_button_opens_the_picker_only_where_painted() {
         }
     }
 }
+
+#[test]
+fn a_long_answer_shows_in_full_in_the_panel_and_scrolls_to_its_top() {
+    let mut setup = setup(160, 44, true);
+    to_a_line(&mut setup);
+    let session = conversation(&mut setup);
+    let text = super::feed::long_answer("panel", 60);
+    let screen = setup.deliver(&session, snapshot(vec![user("first"), answer(&text)]));
+    // The newest rows show: the answer's end and its buttons, which act where painted.
+    assert!(
+        screen.contains("let panel_end = true;"),
+        "{}",
+        screen.text()
+    );
+    let draft = screen
+        .find("Draft comment")
+        .expect("the answer offers Draft comment");
+    setup.scenario.click(draft.x, draft.y);
+    setup.settle();
+    let drafts = setup
+        .app()
+        .review()
+        .map(|review| review.notes().drafts().to_vec())
+        .unwrap_or_default();
+    assert!(
+        drafts.iter().any(|draft| draft.body.trim() == text.trim()),
+        "{drafts:?}"
+    );
+    // Scrolling up shows every earlier row of the answer, none elided.
+    let mut seen = String::new();
+    for _ in 0..10 {
+        seen.push_str(&setup.settle().text());
+        setup.scenario.key("pageup");
+    }
+    seen.push_str(&setup.settle().text());
+    assert!(seen.contains("panel plan"), "{seen}");
+    for step in 1..=60 {
+        assert!(
+            seen.contains(&format!("panel step {step} done")),
+            "step {step}"
+        );
+    }
+}
+
+#[test]
+fn an_answer_cut_at_its_byte_bound_says_so() {
+    let mut setup = setup(160, 44, true);
+    let session = conversation(&mut setup);
+    let huge = "word ".repeat(20_000);
+    let screen = setup.deliver(&session, snapshot(vec![user("first"), answer(&huge)]));
+    assert!(
+        screen.contains("answer too long; the rest is in Bcode"),
+        "{}",
+        screen.text()
+    );
+}

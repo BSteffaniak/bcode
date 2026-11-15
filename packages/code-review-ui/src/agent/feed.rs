@@ -20,8 +20,9 @@ pub const MAX_TURN_ITEMS: usize = 24;
 pub const MAX_OUTPUT_LINES: usize = 200;
 /// Output lines a collapsed tool line shows.
 pub const TOOL_TAIL_LINES: usize = 3;
-/// Bytes kept of an answer (its start; an answer is read from the top).
-const MAX_ANSWER_BYTES: usize = 64 * 1024;
+/// Bytes kept of an answer (its start; an answer is read from the top). The only bound on an
+/// answer's text: it shows in full up to here, and a marker says when the rest was cut.
+pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
 /// Bytes kept of reasoning, a question, a notice, or an error.
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 /// Bytes kept of a tool call's JSON arguments.
@@ -89,6 +90,8 @@ pub enum FeedItem {
         text: String,
         /// Whether it is still streaming.
         streaming: bool,
+        /// Whether the text was cut at the byte bound (the rest is only in the session).
+        clipped: bool,
     },
     /// A neutral notice (a system message, a compaction).
     Notice(String),
@@ -119,6 +122,7 @@ impl Turn {
                 FeedItem::Answer {
                     text,
                     streaming: false,
+                    ..
                 } if !text.trim().is_empty() => Some(text.trim()),
                 _ => None,
             })
@@ -264,6 +268,7 @@ fn feed_item(item: &TranscriptViewItem) -> Option<FeedItem> {
             .then(|| FeedItem::Answer {
                 text: bounded(&message.text, MAX_ANSWER_BYTES),
                 streaming: item.streaming,
+                clipped: message.text.len() > MAX_ANSWER_BYTES,
             }),
         TranscriptViewItemKind::ReasoningMessage { message } => Some(reasoning(
             format!("reasoning:{}", item.sequence.unwrap_or_default()),

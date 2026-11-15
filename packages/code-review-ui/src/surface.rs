@@ -753,7 +753,7 @@ pub struct ReviewSurface {
     /// A re-open that is not a refresh (the stack's layers were matched again): no
     /// "refreshed" toast.
     switching: bool,
-    /// Folded threads and expanded AI answers (persisted).
+    /// Folded threads (persisted).
     folds: Folds,
     /// Resolved threads are hidden from the document (persisted).
     hide_resolved: bool,
@@ -970,7 +970,6 @@ impl ReviewSurface {
                     },
                 );
             }
-            self.folds.expanded.clone_from(&state.expanded_answers);
             self.hide_resolved = state.hide_resolved_threads;
             self.file_view.hide_viewed = state.hide_viewed_files;
             self.file_view.flat_choice = state.flat_files;

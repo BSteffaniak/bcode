@@ -14,9 +14,9 @@
 //! whatever the session did.
 
 use super::{
-    ActionCells, AgentAction, Folds, ItemAction, ItemRows, Look, MAX_ANSWER_ROWS,
-    MAX_EXPANDED_ANSWER_ROWS, SuggestionAction, action_row, indented, line_reference,
-    markdown_rows, outdated_label, suggestion_rows, thread_card,
+    ActionCells, AgentAction, Folds, ItemAction, ItemRows, Look, SuggestionAction, action_row,
+    indented, line_reference, markdown, markdown_all_rows, outdated_label, suggestion_rows,
+    thread_card,
 };
 use crate::agent::feed::{FeedItem, PendingPermission, TOOL_TAIL_LINES, ToolLine, ToolState, Turn};
 use crate::agent::{AgentPhase, AgentState, AgentStreams};
@@ -263,12 +263,6 @@ impl Card<'_> {
                 theme.tiers.dim,
             )]);
         }
-        let answers = turn
-            .items
-            .iter()
-            .filter(|item| matches!(item, FeedItem::Answer { .. }))
-            .count();
-        let mut answer = 0;
         for (index, item) in turn.items.iter().enumerate() {
             let open = item_id(item)
                 .is_some_and(|id| folds.feed_open.contains(&open_key(exchange_id, id)));
@@ -290,32 +284,33 @@ impl Card<'_> {
                         toggle,
                     );
                     if open && !text.is_empty() {
-                        let rows = markdown_rows(
+                        let rows = markdown(
                             text,
                             self.body_width.saturating_sub(2),
                             REASONING_ROWS,
-                            false,
                             theme,
                         );
                         self.extend_indented(rows, 2);
                     }
                 }
                 FeedItem::Tool(tool) => self.tool(tool, open, toggle),
-                FeedItem::Answer { text, streaming } => {
-                    answer += 1;
-                    // Earlier answers of the turn (between tool calls) are kept short; the
-                    // last one is the answer.
-                    let last = answer == answers;
-                    let expanded = folds.expanded.contains(exchange_id);
-                    let max = if !last {
-                        MAX_ANSWER_ROWS / 2
-                    } else if expanded {
-                        MAX_EXPANDED_ANSWER_ROWS
-                    } else {
-                        MAX_ANSWER_ROWS
-                    };
-                    let rows = markdown_rows(text, self.body_width, max, *streaming && last, theme);
+                FeedItem::Answer {
+                    text,
+                    streaming,
+                    clipped,
+                } => {
+                    // Every answer shows in full; the feed's byte bound is the only limit.
+                    let rows = markdown_all_rows(text, self.body_width, *streaming);
                     self.extend_indented(rows, 0);
+                    if *clipped {
+                        self.push(vec![Span::styled(
+                            format!(
+                                "{} answer too long; the rest is in Bcode",
+                                theme.icons.ellipsis
+                            ),
+                            theme.muted,
+                        )]);
+                    }
                 }
                 FeedItem::Notice(text) => {
                     self.push(vec![Span::styled(
@@ -729,10 +724,6 @@ pub(super) fn agent_rows(
         .zip(state)
         .and_then(|(exchange, state)| exchange_turn(exchange, state, active))
         .is_some_and(|(turn, _)| !turn.answer().is_empty());
-    let expanded = agent
-        .exchange_id
-        .as_ref()
-        .is_some_and(|id| folds.expanded.contains(id));
     let mode = if permission.is_some() {
         CardMode::Prompting
     } else if working {
@@ -740,7 +731,6 @@ pub(super) fn agent_rows(
     } else {
         CardMode::Idle {
             answered,
-            expanded,
             retry: failed,
         }
     };
@@ -785,8 +775,6 @@ enum CardMode {
     Idle {
         /// The turn has a finished answer.
         answered: bool,
-        /// The whole answer shows.
-        expanded: bool,
         /// Following the session stopped and can be retried.
         retry: bool,
     },
@@ -823,24 +811,18 @@ fn card_buttons(card: &CardButtons<'_>) -> Vec<(String, ItemAction)> {
             buttons.push((format!("● {model}"), agent(AgentAction::Model)));
         }
     }
-    let (answered, expanded, retry) = match card.mode {
+    let (answered, retry) = match card.mode {
         CardMode::Prompting => return buttons,
         CardMode::Working => {
             buttons.push((labelled("Stop", &card.keys.stop), agent(AgentAction::Stop)));
             return buttons;
         }
-        CardMode::Idle {
-            answered,
-            expanded,
-            retry,
-        } => (answered, expanded, retry),
+        CardMode::Idle { answered, retry } => (answered, retry),
     };
     if card.linked {
         buttons.push(("Follow up".to_owned(), agent(AgentAction::FollowUp)));
     }
     if answered {
-        let more = if expanded { "Less" } else { "More" };
-        buttons.push((more.to_owned(), agent(AgentAction::Expand)));
         buttons.push(("Copy".to_owned(), agent(AgentAction::Copy)));
         buttons.push(("Suggest comment".to_owned(), agent(AgentAction::Suggest)));
         buttons.push(("Draft".to_owned(), agent(AgentAction::Draft)));

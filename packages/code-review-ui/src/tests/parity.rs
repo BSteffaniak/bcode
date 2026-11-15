@@ -480,14 +480,9 @@ fn ai_answers_follow_up_copy_suggest_draft_and_decide_suggestions() {
     assert_eq!(setup.scenario.surface().status(), Some("answer collapsed"));
     setup.scenario.key("z");
     stable(&mut setup.scenario);
-    // Its More button shows the whole answer (and Less the preview again).
-    let screen = setup.scenario.frame();
-    let more = screen.find("More").expect("More");
-    setup.scenario.click(more.x, more.y);
-    stable(&mut setup.scenario);
-    assert_eq!(
-        setup.scenario.surface().status(),
-        Some("showing the whole answer")
+    assert!(
+        setup.scenario.frame().find("More").is_none(),
+        "answers have no More button"
     );
     // `shift+d` on an answer deletes its exchange.
     let before = exchanges(&setup).len();
@@ -888,18 +883,6 @@ fn motions_reach_open_threads_answers_and_attention_and_answers_reconnect() {
     answer(&mut setup, &session, "Because **reasons**.");
     let screen = stable(&mut setup.scenario);
     assert!(screen.contains("reasons"), "{}", screen.text());
-
-    // Showing the whole answer is kept with the review.
-    let at = index_where(&setup.scenario, is_answer).unwrap();
-    move_to(&mut setup.scenario, at);
-    let screen = setup.scenario.frame();
-    let more = screen.find("More").expect("More");
-    setup.scenario.click(more.x, more.y);
-    stable(&mut setup.scenario);
-    setup.scenario.key("q");
-    stable(&mut setup.scenario);
-    let presentation = stored(&setup).presentation.expect("presentation");
-    assert_eq!(presentation.expanded_answers.len(), 1);
 }
 
 /// Move the file panel's selection down until `wanted` holds; its id.

@@ -1509,9 +1509,11 @@ Each item is a general mechanism with BMUX-owned tests; none carries review sema
   * `ReviewV2PresentationState::layer_positions` (source id → `ReviewItemKey`, omitted when
     empty) keeps the last position in each stack layer (7.3); no migration is needed (it is part
     of `presentation_v2_json`).
-  * Phase 6 part 2 adds `collapsed_threads` and `expanded_answers` (sets, omitted when empty),
+  * Phase 6 part 2 adds `collapsed_threads` (a set, omitted when empty),
     `hide_resolved_threads`, and `hide_viewed_files` (omitted when false) to the same JSON; no
-    migration is needed, and older states read with everything expanded and shown.
+    migration is needed, and older states read with everything expanded and shown. An
+    `expanded_answers` set written by older versions is ignored on read (answers always show
+    in full).
 * Unknown future source kinds are preserved and surfaced as unsupported, not guessed: they
   deserialize as `ReviewSourceKind::Unsupported { kind, raw }`, serialize back verbatim, and
   resolve to an `unsupported_source_kind` diagnostic.

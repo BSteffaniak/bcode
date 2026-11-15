@@ -599,7 +599,6 @@ impl ReviewSurface {
         // Folds by hand (older states listed folded threads in `collapsed_threads`).
         state.collapsed_threads.clear();
         state.thread_folds.clone_from(&self.folds.hand);
-        state.expanded_answers.clone_from(&self.folds.expanded);
         state.hide_resolved_threads = self.hide_resolved;
         state.hide_viewed_files = self.file_view.hide_viewed;
         state.flat_files = self.file_view.flat_choice;

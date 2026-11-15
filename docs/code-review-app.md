@@ -142,9 +142,9 @@ The card:
   cost, and the seconds the turn has run.
 * The body is the question's turn: `▍you` and the question as asked, reasoning collapsed to
   `▸ thinking · N words` (a click opens it), tool lines `◌` running, `✓` done, `✗` failed with
-  the last three lines of output and an `All N lines` expander, the answer as markdown that
-  streams in (its last rows while streaming; More shows the whole answer), notices, and
-  errors.
+  the last three lines of output and an `All N lines` expander, every answer of the turn as
+  markdown shown in full (a streaming answer shows all its text so far; an answer over 64 KiB
+  ends with a line saying the rest is in Bcode), notices, and errors.
 * A pending permission request of the session replaces the card's actions with its prompt:
   `y` allow, `a` always, `n` decline, `d` never (scope `code-review-feed`; Always and Never
   only when the request can be remembered). While the turn runs, `esc` or `ctrl+c` stops it.
@@ -237,7 +237,7 @@ from it, is in [code review assistant](code-review-assistant.md).
   title zooms the focused panel over the whole screen, and another restores it. The screens'
   palettes list the assistant's actions ("Assistant: …").
 * **Turns** show like an AI card: `▍you` and the message, reasoning, tool lines with their output
-  and the answers, with a spinner while the session works; the title row shows `needs you`,
+  and the answers in full (as on an AI card), with a spinner while the session works; the title row shows `needs you`,
   `working…`, tokens (`12.3k tok`) and cost, cutting the title to keep them. `pageup`/`pagedown`
   and the wheel scroll it; clicks open reasoning and tool output. A finished answer offers Copy
   and, in a review, Draft comment (a draft at the cursor's line, range or file). A message Bcode
@@ -787,7 +787,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `alt+.`, `alt+]` | This file's next version (in a comparison) |
 | `shift+m` | Mark the review pass complete |
 | `enter` | Actions of the thread or AI answer (reveals a gap) |
-| `z` | Fold or open the thread or AI answer (its More shows a whole answer) |
+| `z` | Fold or open the thread or AI answer |
 | `shift+z` | Collapse every thread (expand all when all are collapsed); on a file's header, fold every file (open all when all are folded) |
 | `shift+h` | Show / hide resolved threads |
 | `h` | Show / hide viewed files in the file panel |

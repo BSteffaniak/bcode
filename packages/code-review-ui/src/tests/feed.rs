@@ -500,3 +500,102 @@ fn a_session_held_by_another_daemon_says_what_to_do() {
             .starts_with("Lost the connection to Bcode")
     );
 }
+
+/// A markdown answer of a heading, `steps` list items, and a code block.
+pub(super) fn long_answer(label: &str, steps: usize) -> String {
+    use std::fmt::Write as _;
+    let steps = (1..=steps).fold(String::new(), |mut text, step| {
+        let _ = writeln!(text, "- {label} step **{step}** done");
+        text
+    });
+    format!("## {label} plan\n\n{steps}\n```rust\nlet {label}_end = true;\n```\n")
+}
+
+/// Whether every row of [`long_answer`] shows on `screen`.
+pub(super) fn shows_whole_answer(
+    screen: &crate::testing::harness::Screen,
+    label: &str,
+    steps: usize,
+) {
+    let text = screen.text();
+    assert!(screen.contains(&format!("{label} plan")), "{text}");
+    for step in 1..=steps {
+        assert!(
+            screen.contains(&format!("{label} step {step} done")),
+            "step {step}: {text}"
+        );
+    }
+    assert!(
+        screen.contains(&format!("let {label}_end = true;")),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_long_answer_shows_in_full_on_the_card_and_its_buttons_act_where_painted() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 120, 160);
+    let (session, prompt) = ask(&mut setup, "Plan the change");
+    let text = long_answer("final", 60);
+    let screen = send(
+        &mut setup,
+        &session,
+        snapshot(vec![user(&prompt), assistant(&text, false)], false),
+    );
+    shows_whole_answer(&screen, "final", 60);
+    assert!(!screen.contains("More"), "{}", screen.text());
+    // Copy and Draft, below the whole answer, act where they are painted.
+    let draft = screen.find("Draft").expect("Draft");
+    let copy = screen
+        .column_of(draft.y, "Copy")
+        .expect("Copy beside Draft");
+    setup.scenario.click(copy, draft.y);
+    stable(&mut setup.scenario);
+    assert_eq!(
+        setup.scenario.host().clipboard().last().map(String::as_str),
+        Some(text.trim())
+    );
+    let draft = stable(&mut setup.scenario).find("Draft").expect("Draft");
+    setup.scenario.click(draft.x, draft.y);
+    stable(&mut setup.scenario);
+    assert!(
+        setup
+            .scenario
+            .surface()
+            .notes()
+            .drafts()
+            .iter()
+            .any(|draft| draft.body.trim() == text.trim()),
+        "{:?}",
+        setup.scenario.surface().status()
+    );
+}
+
+#[test]
+fn answers_between_tool_calls_and_a_streaming_answer_show_in_full() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 120, 160);
+    let (session, prompt) = ask(&mut setup, "Plan the change");
+    let mut early = assistant(&long_answer("early", 20), false);
+    early.id = TranscriptViewItemId::new("early");
+    let screen = send(
+        &mut setup,
+        &session,
+        snapshot(
+            vec![
+                user(&prompt),
+                early,
+                tool(
+                    ToolInvocationViewStatus::Finished,
+                    r#"{"command":"cargo test"}"#,
+                    Some("ok"),
+                ),
+                assistant(&long_answer("late", 30), true),
+            ],
+            true,
+        ),
+    );
+    // The answer before the tool call, and all the streaming answer's text so far.
+    shows_whole_answer(&screen, "early", 20);
+    shows_whole_answer(&screen, "late", 30);
+}

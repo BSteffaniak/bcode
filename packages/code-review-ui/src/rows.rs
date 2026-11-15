@@ -230,8 +230,6 @@ pub enum AgentAction {
     FollowUp,
     /// Copy the answer to the clipboard.
     Copy,
-    /// Show the whole answer, or the preview again.
-    Expand,
     /// Turn the answer into a suggested comment.
     Suggest,
     /// Turn the answer into a draft comment.
@@ -268,8 +266,6 @@ pub struct Folds {
     pub hand: std::collections::BTreeMap<String, bcode_code_review_models::ThreadFoldMark>,
     /// Each thread's viewed state and the comments new since it was viewed.
     pub threads: std::collections::BTreeMap<String, ThreadLook>,
-    /// AI exchanges whose whole answer is shown.
-    pub expanded: std::collections::BTreeSet<String>,
     /// Opened feed items of AI cards (reasoning text, all tool output), keyed by
     /// [`open_key`]; not saved with the workspace.
     pub feed_open: std::collections::BTreeSet<String>,
@@ -669,7 +665,7 @@ pub struct RowContext<'a> {
     pub notes: &'a super::notes::ReviewNotes,
     /// Live AI answer states.
     pub agents: &'a super::agent::AgentStreams,
-    /// Folded threads and expanded answers.
+    /// Folded threads.
     pub folds: &'a Folds,
     /// The open composer.
     pub composer: Option<&'a super::composer::Composer>,
@@ -1720,10 +1716,6 @@ pub const SELECTION_SCOPE: &str = "review.document";
 
 /// Comment lines shown per comment before eliding the rest.
 const MAX_COMMENT_ROWS: usize = 12;
-/// Answer lines shown per AI answer.
-const MAX_ANSWER_ROWS: usize = 8;
-/// Answer lines shown per expanded AI answer.
-const MAX_EXPANDED_ANSWER_ROWS: usize = 400;
 
 /// `lines` with `prefix` cells of padding before each, clipped to `width`.
 fn indented(lines: Vec<Line>, prefix: &str, width: usize) -> Vec<Line> {
@@ -1737,46 +1729,88 @@ fn indented(lines: Vec<Line>, prefix: &str, width: usize) -> Vec<Line> {
         .collect()
 }
 
-/// Markdown rendered at `width` cells, at most `max` rows (an ellipsis row marks elided rows).
-/// `text` rendered as markdown in `width` cells, at most `max` rows.
+/// `text` rendered as markdown in `width` cells, at most `max` rows (an ellipsis row after
+/// them marks elided rows).
 #[must_use]
 pub fn markdown_lines(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Line> {
     markdown(text, width, max, theme)
 }
 
+/// `text` rendered as markdown in `width` cells: its first `max` rows, with an ellipsis row
+/// after them when rows were elided.
 fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Line> {
-    markdown_rows(text, width, max, false, theme)
-}
-
-/// Markdown rendered at `width` cells, at most `max` rows. A finished text shows its first rows
-/// and an ellipsis row after them; a `streaming` text is rendered as an incomplete document and
-/// shows its last rows (where text arrives) with the ellipsis row before them.
-fn markdown_rows(
-    text: &str,
-    width: usize,
-    max: usize,
-    streaming: bool,
-    theme: &ReviewTheme,
-) -> Vec<Line> {
     let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
-    let mut options = bcode_markdown_render::MarkdownRenderOptions::new(width);
-    options.streaming = streaming;
+    let options = bcode_markdown_render::MarkdownRenderOptions::new(width);
     let mut lines = bcode_markdown_render::render_markdown(text, &options).lines;
     if lines.len() > max {
-        let ellipsis = Line::from_spans(vec![Span::styled(theme.icons.ellipsis, theme.muted)]);
-        let keep = max.saturating_sub(1);
-        if streaming {
-            lines.drain(..lines.len() - keep);
-            lines.insert(0, ellipsis);
-        } else {
-            lines.truncate(keep);
-            lines.push(ellipsis);
-        }
+        lines.truncate(max.saturating_sub(1));
+        lines.push(Line::from_spans(vec![Span::styled(
+            theme.icons.ellipsis,
+            theme.muted,
+        )]));
     }
     if lines.is_empty() {
         lines.push(Line::default());
     }
     lines
+}
+
+/// Rendered markdown kept for reuse, newest last.
+const RENDERED_MARKDOWN_ENTRIES: usize = 32;
+
+/// One rendered markdown text: its inputs and its rows.
+struct RenderedMarkdown {
+    text: String,
+    width: u16,
+    streaming: bool,
+    lines: std::rc::Rc<[Line]>,
+}
+
+thread_local! {
+    /// Recently rendered whole texts. Rows of AI conversations are rebuilt whenever their
+    /// session changes (every spinner frame while it works), and their answers are shown in
+    /// full, so each text is rendered once per width rather than on every rebuild.
+    static RENDERED_MARKDOWN: RefCell<std::collections::VecDeque<RenderedMarkdown>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Every row of `text` rendered as markdown in `width` cells (as an incomplete document while
+/// `streaming`), reusing a recent rendering of the same text at the same width. For AI answers,
+/// which are shown in full and rebuilt often.
+fn markdown_all_rows(text: &str, width: usize, streaming: bool) -> Vec<Line> {
+    let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
+    let cached = RENDERED_MARKDOWN.with_borrow(|entries| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry.width == width && entry.streaming == streaming && entry.text == text
+            })
+            .map(|entry| entry.lines.clone())
+    });
+    let lines = cached.unwrap_or_else(|| {
+        let mut options = bcode_markdown_render::MarkdownRenderOptions::new(width);
+        options.streaming = streaming;
+        let lines: std::rc::Rc<[Line]> = bcode_markdown_render::render_markdown(text, &options)
+            .lines
+            .into();
+        RENDERED_MARKDOWN.with_borrow_mut(|entries| {
+            if entries.len() >= RENDERED_MARKDOWN_ENTRIES {
+                entries.pop_front();
+            }
+            entries.push_back(RenderedMarkdown {
+                text: text.to_owned(),
+                width,
+                streaming,
+                lines: lines.clone(),
+            });
+        });
+        lines
+    });
+    if lines.is_empty() {
+        vec![Line::default()]
+    } else {
+        lines.to_vec()
+    }
 }
 
 /// Action rows: labelled buttons placed left to right after `indent`, wrapping onto further

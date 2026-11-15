@@ -129,7 +129,7 @@ Bottom dock (fewer than 100 columns):
 | --- | --- |
 | Closed | Nothing; the Ask AI button is in the route's header. |
 | Open, empty conversation | The title row, the chips row, a short line naming what it can do on this screen ("Ask about this review, or ask me to mark files viewed, change the comparison, …"; on home: "Ask me to create or open a review, …"), and the input. |
-| Open, conversation | Turns as AI cards show them (`▍you`, reasoning, tool lines, answers), a spinner while working, tokens and cost on the title row. |
+| Open, conversation | Turns as AI cards show them (`▍you`, reasoning, tool lines, answers in full), a spinner while working, tokens and cost on the title row. |
 | Needs you | A permission prompt replaces the input (`y` allow, `a` always, `n` decline, `d` never; Always is not offered for publishing or deleting). |
 | Not connected | Why (Bcode not found, the daemon failed to start) and what to do; the input stays usable and a send retries. |
 | History open | The history picker replaces the conversation area (below). |
