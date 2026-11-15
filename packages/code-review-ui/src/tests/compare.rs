@@ -1488,6 +1488,34 @@ fn the_stack_as_it_was_stays_in_the_menu_while_other_choices_preview() {
 }
 
 #[test]
+fn the_documents_summaries_name_the_baseline_in_effect() {
+    use crate::compare_menu::MenuChoice;
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let screen = settled(&mut scenario);
+    assert!(
+        screen.contains("Changed since you looked:"),
+        "{}",
+        screen.text()
+    );
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::PreviousPush);
+    scenario.key("space");
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    assert!(
+        screen.contains("Changed since the previous push:"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        !screen.contains("Changed since you looked:"),
+        "{}",
+        screen.text()
+    );
+}
+
+#[test]
 fn clicking_menu_rows_picks_them_in_place() {
     use crate::compare_menu::MenuChoice;
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());

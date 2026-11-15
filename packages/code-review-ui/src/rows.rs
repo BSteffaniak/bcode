@@ -173,6 +173,8 @@ pub struct ViewParams {
     pub separation: file::Separation,
     /// How thread cards are laid out.
     pub threads: thread_card::Params,
+    /// What a comparison's rows say the changes are since.
+    pub since: compare::Since,
 }
 
 /// What a gap segment does when clicked.
@@ -802,18 +804,23 @@ impl RowContext<'_> {
                     )
                 },
             ),
-            ReviewItem::CompareNote(item) => {
-                compare::note_rows(item, styles, cells, self.gutter_indent(width))
-            }
+            ReviewItem::CompareNote(item) => compare::note_rows(
+                item,
+                self.params.since,
+                styles,
+                cells,
+                self.gutter_indent(width),
+            ),
             ReviewItem::RemovedSince(item) => compare::removed_rows(
                 item,
+                self.params.since,
                 self.options(),
                 styles,
                 width,
                 self.gutter_indent(width),
             ),
             ReviewItem::FileHeader(item) => {
-                file::header_rows(item, self.params.density, styles, cells)
+                file::header_rows(item, self.params.since, self.params.density, styles, cells)
             }
             ReviewItem::FileDetails(item) => {
                 file::details_rows(item, self.params.density, styles, cells)

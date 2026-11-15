@@ -1221,10 +1221,13 @@ impl ReviewSurface {
             ),
             tab_width: self.config.tab_width(),
             expand_step: EXPAND_STEP,
+            // What the comparison's rows say they are since changes their text.
             layout_revision: self
                 .layout_revision
                 .wrapping_mul(64)
-                .wrapping_add(u64::from(review.gutter_digits)),
+                .wrapping_add(u64::from(review.gutter_digits))
+                .wrapping_mul(4)
+                .wrapping_add(self.compare_since().index()),
             paint_revision: self.paint_revision,
             annotation_revision: self.notes.revision().wrapping_mul(1_000_003)
                 ^ self.folds.revision.wrapping_mul(0x5851_f42d),
@@ -1237,6 +1240,7 @@ impl ReviewSurface {
                     max_width: config.threads.width,
                 }
             },
+            since: self.compare_since(),
         }
     }
 

@@ -28,6 +28,40 @@ pub enum CompareAction {
     ToggleRemoval,
 }
 
+/// What a comparison's rows say the changes are since, as the baseline in effect names it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Since {
+    /// What the reviewer last looked at.
+    #[default]
+    LastLooked,
+    /// The version before the stack's latest push.
+    PreviousPush,
+    /// A time, pushes, or versions picked.
+    Then,
+}
+
+impl Since {
+    /// The words after "since" (`you looked`, `the previous push`, `then`).
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::LastLooked => "you looked",
+            Self::PreviousPush => "the previous push",
+            Self::Then => "then",
+        }
+    }
+
+    /// A small number distinguishing the variants, for cache keys.
+    #[must_use]
+    pub const fn index(self) -> u64 {
+        match self {
+            Self::LastLooked => 0,
+            Self::PreviousPush => 1,
+            Self::Then => 2,
+        }
+    }
+}
+
 /// One labelled part of a row.
 struct Part {
     text: String,
@@ -57,7 +91,8 @@ fn plural(count: usize, one: &str) -> String {
 }
 
 /// The summary variants, widest first.
-fn note_variants(note: &CompareNoteItem, theme: &ReviewTheme) -> Vec<Vec<Part>> {
+fn note_variants(note: &CompareNoteItem, since: Since, theme: &ReviewTheme) -> Vec<Vec<Part>> {
+    let phrase = since.phrase();
     let separator = theme.icons.separator;
     let minus = theme.icons.minus;
     let view_toggle = || match note.view {
@@ -74,15 +109,20 @@ fn note_variants(note: &CompareNoteItem, theme: &ReviewTheme) -> Vec<Vec<Part>> 
     match note.kind {
         None => vec![
             vec![text(format!(
-                "{} Comparing with what you last looked at",
-                theme.icons.ellipsis
+                "{} Comparing with {}",
+                theme.icons.ellipsis,
+                match since {
+                    Since::LastLooked => "what you last looked at",
+                    Since::PreviousPush => "the previous push",
+                    Since::Then => "the versions picked",
+                }
             ))],
             vec![text(format!("{} Comparing", theme.icons.ellipsis))],
             vec![text(theme.icons.ellipsis)],
         ],
         Some(DeltaKind::RebasedOnly) => vec![
             vec![
-                text("Rebased, nothing changed since you looked "),
+                text(format!("Rebased, nothing changed since {phrase} ")),
                 files_toggle(plural(note.unchanged_files, "file")),
             ],
             vec![text("Only rebased "), files_toggle("files".to_owned())],
@@ -90,13 +130,13 @@ fn note_variants(note: &CompareNoteItem, theme: &ReviewTheme) -> Vec<Vec<Part>> 
         ],
         Some(DeltaKind::Unchanged) if note.view == CompareView::Changes => vec![
             vec![
-                text("Unchanged since you looked "),
+                text(format!("Unchanged since {phrase} ")),
                 files_toggle(plural(note.unchanged_files, "file")),
             ],
             vec![text("Unchanged")],
         ],
         Some(DeltaKind::Unchanged) => vec![
-            vec![text("Unchanged since you looked")],
+            vec![text(format!("Unchanged since {phrase}"))],
             vec![text("Unchanged")],
         ],
         Some(DeltaKind::NewToYou) => vec![
@@ -104,9 +144,12 @@ fn note_variants(note: &CompareNoteItem, theme: &ReviewTheme) -> Vec<Vec<Part>> 
             vec![text("New to you")],
         ],
         Some(DeltaKind::Unavailable) => vec![
-            vec![text(
-                "The version you looked at is gone: showing the full change",
-            )],
+            vec![text(match since {
+                Since::LastLooked => "The version you looked at is gone: showing the full change",
+                Since::PreviousPush | Since::Then => {
+                    "The version compared with is gone: showing the full change"
+                }
+            })],
             vec![text("Baseline unavailable")],
         ],
         Some(kind @ (DeltaKind::Changed | DeltaKind::WithRebase)) => {
@@ -125,7 +168,7 @@ fn note_variants(note: &CompareNoteItem, theme: &ReviewTheme) -> Vec<Vec<Part>> 
                 && (note.view == CompareView::Changes || note.files_shown))
                 .then(|| files_toggle(format!("{} unchanged", note.unchanged_files)));
             let mut full = vec![text(format!(
-                "Changed since you looked: {} {counts}{dropped}{rebase} ",
+                "Changed since {phrase}: {} {counts}{dropped}{rebase} ",
                 plural(note.changed_files, "file")
             ))];
             full.push(view_toggle());
@@ -137,7 +180,7 @@ fn note_variants(note: &CompareNoteItem, theme: &ReviewTheme) -> Vec<Vec<Part>> 
                 full,
                 vec![
                     text(format!(
-                        "Since you looked: {} {counts} ",
+                        "Since {phrase}: {} {counts} ",
                         plural(note.changed_files, "file")
                     )),
                     view_toggle(),
@@ -208,17 +251,19 @@ fn fitted(variants: &[Vec<Part>], indent: usize, width: usize, theme: &ReviewThe
 #[must_use]
 pub fn note_rows(
     note: &CompareNoteItem,
+    since: Since,
     theme: &ReviewTheme,
     width: usize,
     indent: usize,
 ) -> ItemRows {
-    fitted(&note_variants(note, theme), indent, width, theme)
+    fitted(&note_variants(note, since, theme), indent, width, theme)
 }
 
 /// A removed-since marker: its label, then, expanded, the removed lines as removed diff rows.
 #[must_use]
 pub fn removed_rows(
     item: &RemovedSinceItem,
+    since: Since,
     options: DiffRowOptions,
     theme: &ReviewTheme,
     width: u16,
@@ -233,7 +278,7 @@ pub fn removed_rows(
     let lines = if count == 1 { "line" } else { "lines" };
     let variants = [
         vec![act(
-            format!("{chevron} {count} {lines} removed since you looked"),
+            format!("{chevron} {count} {lines} removed since {}", since.phrase()),
             CompareAction::ToggleRemoval,
         )],
         vec![act(
@@ -324,16 +369,20 @@ fn overlay_blank(line: &Line, at: usize, glyph: &str, style: Style) -> Option<Li
 
 /// The badge a file header shows for how the file changed since the baseline.
 #[must_use]
-pub fn since_badge(since: FileSince, theme: &ReviewTheme) -> Option<Span> {
+pub fn since_badge(since: FileSince, baseline: Since, theme: &ReviewTheme) -> Option<Span> {
     let minus = theme.icons.minus;
+    let phrase = baseline.phrase();
     match since {
         FileSince::Changed { added, removed } => Some(Span::styled(
-            format!("new since you looked +{added} {minus}{removed}"),
+            format!("new since {phrase} +{added} {minus}{removed}"),
             theme.since.badge,
         )),
-        FileSince::New { .. } => Some(Span::styled("new since you looked", theme.since.badge)),
+        FileSince::New { .. } => Some(Span::styled(
+            format!("new since {phrase}"),
+            theme.since.badge,
+        )),
         FileSince::Unchanged => Some(Span::styled(
-            "unchanged since you looked",
+            format!("unchanged since {phrase}"),
             theme.badge_outdated,
         )),
         FileSince::Unknown => Some(Span::styled(theme.icons.ellipsis, theme.muted)),
@@ -385,7 +434,7 @@ mod tests {
             Some(DeltaKind::Unavailable),
         ] {
             for width in [0, 1, 3, 8, 20, 40, 80, 200] {
-                let rows = note_rows(&note(kind), &theme, width, 4);
+                let rows = note_rows(&note(kind), Since::LastLooked, &theme, width, 4);
                 for line in &rows.lines {
                     assert!(line.width() <= width, "{kind:?} at {width}");
                 }
@@ -400,7 +449,13 @@ mod tests {
                 }
             }
         }
-        let wide = note_rows(&note(Some(DeltaKind::Changed)), &theme, 200, 0);
+        let wide = note_rows(
+            &note(Some(DeltaKind::Changed)),
+            Since::LastLooked,
+            &theme,
+            200,
+            0,
+        );
         assert!(painted(&wide).contains("3 files +40 −12"));
         assert_eq!(wide.actions.len(), 1);
     }
@@ -419,7 +474,7 @@ mod tests {
             expanded: true,
         };
         for width in [0_u16, 1, 2, 5, 12, 40] {
-            let rows = removed_rows(&item, options, &theme, width, 2);
+            let rows = removed_rows(&item, Since::LastLooked, options, &theme, width, 2);
             assert!(rows.height >= 3, "label and two lines at {width}");
             assert_eq!(rows.height, rows.lines.len() as u64);
             for line in &rows.lines {
@@ -430,9 +485,9 @@ mod tests {
             expanded: false,
             ..item
         };
-        let rows = removed_rows(&collapsed, options, &theme, 60, 2);
+        let rows = removed_rows(&collapsed, Since::PreviousPush, options, &theme, 60, 2);
         assert_eq!(rows.height, 1);
-        assert!(painted(&rows).contains("2 lines removed since you looked"));
+        assert!(painted(&rows).contains("2 lines removed since the previous push"));
         assert_eq!(rows.actions[0].cells.start, 2);
     }
 

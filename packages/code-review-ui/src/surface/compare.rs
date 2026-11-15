@@ -1574,6 +1574,19 @@ impl ReviewSurface {
         }
     }
 
+    /// What the comparison's rows say the changes are since.
+    pub(super) fn compare_since(&self) -> crate::rows::compare::Since {
+        use crate::rows::compare::Since;
+        if self.comparing.stack_at.is_some() || !self.comparing.picks.is_empty() {
+            return Since::Then;
+        }
+        match self.comparing.baseline {
+            Baseline::LastLooked => Since::LastLooked,
+            Baseline::PreviousPush => Since::PreviousPush,
+            Baseline::Between { .. } | Baseline::Off => Since::Then,
+        }
+    }
+
     /// When the reviewer last looked, in words (`4m ago`, `nothing new`, `not yet`), once
     /// known.
     pub(super) fn last_looked_detail(&self) -> Option<String> {

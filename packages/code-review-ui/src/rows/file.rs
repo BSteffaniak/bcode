@@ -240,11 +240,16 @@ fn version_spans(
 }
 
 /// Spans of what a header says on the right: flags, layers, threads, counts, change bar.
-fn header_facts(item: &FileHeaderItem, theme: &ReviewTheme, counts: bool) -> Vec<Span> {
+fn header_facts(
+    item: &FileHeaderItem,
+    baseline: super::compare::Since,
+    theme: &ReviewTheme,
+    counts: bool,
+) -> Vec<Span> {
     let mut trailing = Vec::new();
     if let Some(badge) = item
         .since
-        .and_then(|since| super::compare::since_badge(since, theme))
+        .and_then(|since| super::compare::since_badge(since, baseline, theme))
     {
         trailing.push(badge);
         trailing.push(Span::raw(" "));
@@ -351,6 +356,7 @@ fn path_spans(item: &FileHeaderItem, theme: &ReviewTheme, with_dir: bool) -> Vec
 #[must_use]
 pub fn header_rows(
     item: &FileHeaderItem,
+    baseline: super::compare::Since,
     density: Density,
     theme: &ReviewTheme,
     width: usize,
@@ -360,7 +366,7 @@ pub fn header_rows(
         Density::Compact | Density::Comfortable => {
             let mut content = vec![pill(item, theme), Span::raw(" ")];
             content.extend(path_spans(item, theme, true));
-            let mut trailing = header_facts(item, theme, true);
+            let mut trailing = header_facts(item, baseline, theme, true);
             let viewed = viewed_span(item.viewed, false, theme);
             // The viewed mark and its space end the row.
             let mark_cells = display_width(&viewed.content) + 1;
@@ -423,7 +429,7 @@ pub fn header_rows(
                     theme.status_renamed,
                 ));
             }
-            let mut facts = header_facts(item, theme, true);
+            let mut facts = header_facts(item, baseline, theme, true);
             let facts_width: usize = facts.iter().map(|span| display_width(&span.content)).sum();
             let mut actions = vec![
                 chevron_action(theme),
@@ -749,6 +755,7 @@ pub fn end_rows(
 
 #[cfg(test)]
 mod tests {
+    use super::super::compare::Since;
     use super::*;
 
     #[test]
@@ -842,7 +849,7 @@ mod tests {
             let item = header(path, Some(versions));
             for density in [Density::Compact, Density::Spacious] {
                 for width in 0..=160 {
-                    let rows = header_rows(&item, density, &theme, width);
+                    let rows = header_rows(&item, Since::default(), density, &theme, width);
                     for line in &rows.lines {
                         assert!(line.width() <= width.max(1), "{path} {density:?} {width}");
                     }
@@ -868,13 +875,20 @@ mod tests {
         assert_eq!(seen.len(), 2);
         let wide = header_rows(
             &header("src/lib.rs", Some(versions)),
+            Since::default(),
             Density::Compact,
             &theme,
             160,
         );
         assert!(wide.lines[0].plain_text().contains("v3 ◂ ▸"));
         // Without versions, nothing of them shows.
-        let plain = header_rows(&header("src/lib.rs", None), Density::Compact, &theme, 160);
+        let plain = header_rows(
+            &header("src/lib.rs", None),
+            Since::default(),
+            Density::Compact,
+            &theme,
+            160,
+        );
         assert!(!plain.lines[0].plain_text().contains('◂'));
     }
 
