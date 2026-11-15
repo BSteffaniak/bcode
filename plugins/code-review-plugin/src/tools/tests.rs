@@ -1444,3 +1444,33 @@ fn a_stack_review_named_by_id_resolves_from_the_stack_it_last_opened_with() {
         "only layer 102: {marked}"
     );
 }
+
+#[test]
+fn blank_optional_arguments_are_taken_as_not_given() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let path = GitFixture::modified_path(0);
+    let line = harness.added_line(&path);
+    let written = harness.json(
+        "code_review.add_comment",
+        &json!({
+            "path": path, "line": line, "end_line": null, "side": "", "source": "",
+            "kind": "", "severity": " ", "body": "Why this value?", "review": ""
+        }),
+        SESSION,
+    );
+    assert!(written["thread_id"].is_string(), "{written}");
+    let shown = harness.ok(
+        "code_review.navigate",
+        &json!({"path": path, "line": line, "side": "", "source": ""}),
+        SESSION,
+    );
+    assert!(shown.contains(&path), "{shown}");
+    let missing = harness.call(
+        "code_review.reply",
+        &json!({"thread_id": "", "body": "x"}),
+        SESSION,
+    );
+    assert!(missing.is_error, "{}", missing.output);
+    assert!(missing.output.contains("thread_id"), "{}", missing.output);
+}

@@ -7,6 +7,7 @@ mod assistant;
 mod assistant_actions;
 mod assistant_context;
 mod assistant_models;
+mod assistant_threads;
 mod benchmark;
 mod chrome;
 mod compare;
