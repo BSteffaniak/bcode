@@ -44,6 +44,8 @@ pub struct ModelState {
     pub default: Option<ReviewAssistantSettings>,
     /// Whether the app default was asked for.
     pub default_asked: bool,
+    /// Whether a failed listing is tried again on the next poll (the panel was opened).
+    pub relist: bool,
     /// Known session models, by session id.
     sessions: BTreeMap<String, SessionModel>,
     /// Order the sessions were learned in, oldest first (to bound the map).
@@ -343,6 +345,7 @@ mod tests {
                     ..ModelOption::default()
                 },
                 effort: None,
+                unavailable: None,
             },
         );
         assert_eq!(state.model_label(Some("s1")), "Mine 模型 🚀");

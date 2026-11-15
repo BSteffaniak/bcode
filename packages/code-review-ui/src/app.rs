@@ -1620,6 +1620,7 @@ impl View for ReviewApp {
         {
             result = EventResult::from_action(action);
         }
+        self.share_model_labels(host);
         if self.open_requested_appearance(host) && result.action == Action::None {
             result = EventResult::from_action(Action::Redraw);
         }

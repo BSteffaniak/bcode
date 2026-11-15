@@ -92,6 +92,8 @@ pub const TITLE_ONLY_WIDTH: u16 = 12;
 const INPUT_MAX_ROWS: u16 = 6;
 /// Rows a wheel step scrolls the conversation.
 const WHEEL_ROWS: usize = 3;
+/// Cells of a model's name in a question's or card's `model · effort` label at most.
+const MODEL_LABEL_CELLS: usize = 24;
 /// Cells the title keeps when it is cut to leave room for the usage.
 const MIN_TITLE_CELLS: u16 = 12;
 /// Cells of a history row's `✕` (a space and the glyph).
@@ -510,15 +512,23 @@ impl Assistant {
     /// (the app default without one).
     #[must_use]
     pub fn model_effort_label(&self, session: Option<&str>) -> String {
-        let model = self.models.model_label(session);
+        let model = Line::from_spans(vec![Span::raw(self.models.model_label(session))])
+            .truncate(MODEL_LABEL_CELLS);
+        let model: String = model
+            .spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect();
         match self.models.effort_label(session) {
             Some(effort) => format!("{model} · {effort}"),
             None => model,
         }
     }
 
-    /// Ask for the models of `sessions` not known yet (Ask AI cards on screen).
+    /// Ask for the models of `sessions` not known yet (Ask AI cards on screen), reading the
+    /// app default and the models Bcode offers once.
     pub fn learn_models(&mut self, sessions: &[String], ui: &UiContext) {
+        self.load_models(false, ui);
         for session in sessions.iter().take(8) {
             if self.models.session(session).is_none()
                 && self.model_asked.as_deref() != Some(session)
@@ -667,12 +677,15 @@ impl Assistant {
             Shown::Closed | Shown::Open => Shown::Focused,
             Shown::Focused => Shown::Closed,
         };
+        // A listing that failed (Bcode starting, a provider signed out) is tried again.
+        self.models.relist = true;
         self.touch();
     }
 
     /// Open the panel and give it keyboard focus.
     pub const fn focus(&mut self) {
         self.visibility = Shown::Focused;
+        self.models.relist = true;
         self.touch();
     }
 
@@ -1125,7 +1138,8 @@ impl Assistant {
     pub fn poll(&mut self, ui: &UiContext) -> bool {
         self.serve_tools();
         if self.is_open() {
-            self.load_models(false, ui);
+            let relist = std::mem::take(&mut self.models.relist);
+            self.load_models(relist, ui);
         }
         if let Some(session) = self.session.clone()
             && !self.starting
@@ -2104,7 +2118,20 @@ impl Assistant {
             Done::SessionModel {
                 session,
                 result: Ok(model),
-            } => self.models.learn(session, model),
+            } => {
+                if let Some(requested) = model
+                    .unavailable
+                    .as_ref()
+                    .filter(|_| self.session.as_deref() == Some(session.as_str()))
+                {
+                    self.failure = Some(format!(
+                        "Bcode does not offer the model {requested}; this conversation runs {} \
+                         instead — choose a model with the model chip (alt+m)",
+                        super::models::label(&model.model)
+                    ));
+                }
+                self.models.learn(session, model);
+            }
             Done::Chosen {
                 session,
                 default,

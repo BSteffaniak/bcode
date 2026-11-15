@@ -801,21 +801,19 @@ impl ReviewHost for ScriptedHost {
         let catalog = self.models.lock().expect("models lock").clone();
         Box::pin(async move {
             let catalog = catalog.map_err(HostError::failed)?;
-            let model = match &choice.model {
-                Some(model) => catalog
-                    .find(choice.provider.as_deref(), model)
-                    .cloned()
-                    .unwrap_or_else(|| crate::host::ModelOption {
-                        provider: choice.provider.clone(),
-                        model_id: model.clone(),
-                        display_name: model.clone(),
-                        ..crate::host::ModelOption::default()
-                    }),
-                None => catalog.default.and_then(Result::ok).unwrap_or_default(),
-            };
+            // Like Bcode, a model it does not offer falls back to its default.
+            let listed = choice
+                .model
+                .as_deref()
+                .and_then(|model| catalog.find(choice.provider.as_deref(), model).cloned());
+            let unavailable = choice.model.clone().filter(|_| listed.is_none());
+            let model = listed
+                .or_else(|| catalog.default.and_then(Result::ok))
+                .unwrap_or_default();
             Ok(crate::host::SessionModel {
                 model,
                 effort: choice.effort,
+                unavailable,
             })
         })
     }

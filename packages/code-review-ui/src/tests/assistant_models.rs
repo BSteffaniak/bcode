@@ -791,3 +791,33 @@ fn each_screen_shows_its_own_empty_state_and_the_palettes_list_the_assistant() {
         screen.text()
     );
 }
+
+#[test]
+fn a_configured_model_bcode_does_not_offer_says_what_runs_instead() {
+    let config = AssistantConfig {
+        model: Some(format!("{PROVIDER}/fake-gone")),
+        ..AssistantConfig::default()
+    };
+    let mut setup = setup_with(
+        TestBackend::default().with_assistant_config(config),
+        140,
+        40,
+        true,
+    );
+    let session = conversation(&mut setup);
+    assert!(
+        setup
+            .backend
+            .host()
+            .model_log()
+            .contains(&format!("model {session} fake-gone")),
+        "the configured default was asked for"
+    );
+    let failure = setup.app().assistant().failure().map(str::to_owned);
+    assert!(
+        failure.as_deref().is_some_and(|failure| failure
+            .contains("does not offer the model fake-gone")
+            && failure.contains("Fake echo")),
+        "{failure:?}"
+    );
+}

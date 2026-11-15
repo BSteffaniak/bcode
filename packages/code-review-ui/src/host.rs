@@ -250,6 +250,9 @@ pub struct SessionModel {
     pub model: ModelOption,
     /// The selected effort; the model's default when `None`.
     pub effort: Option<String>,
+    /// The model id the session asked for, when Bcode runs another one instead (an id it does
+    /// not offer).
+    pub unavailable: Option<String>,
 }
 
 /// Error code of a turn whose request-only context the daemon no longer holds.
@@ -844,10 +847,11 @@ fn model_option_of_info(
 }
 
 fn model_option_of_status(status: &bcode_model::SessionModelStatus) -> ModelOption {
+    // What runs: the effective model (a requested id Bcode does not offer falls back).
     let model_id = status
-        .requested_model_id
+        .effective_model_id
         .clone()
-        .or_else(|| status.effective_model_id.clone())
+        .or_else(|| status.requested_model_id.clone())
         .or_else(|| status.model_id.clone())
         .unwrap_or_default();
     ModelOption {
@@ -1133,9 +1137,15 @@ impl ReviewHost for StandaloneHost {
                 .session_model_status(id)
                 .await
                 .map_err(|error| bcode.failure(&error))?;
+            let model = model_option_of_status(&status);
+            let unavailable = status
+                .requested_model_id
+                .clone()
+                .filter(|requested| *requested != model.model_id);
             Ok(SessionModel {
-                model: model_option_of_status(&status),
-                effort: status.reasoning_effort.clone(),
+                model,
+                effort: status.reasoning_effort,
+                unavailable,
             })
         })
     }

@@ -25,6 +25,8 @@ use bmux_tui_components::text_input::{
 use std::cell::RefCell;
 
 /// Layout id of the composer's editor.
+/// Cells of a question's `model · effort` label at most.
+const MODEL_LABEL_CELLS: usize = 40;
 pub const EDITOR_ID: &str = "review.composer.editor";
 /// Editor rows shown at least and at most.
 const EDITOR_MIN_ROWS: u16 = 3;
@@ -476,9 +478,6 @@ impl Composer {
         };
         let mut parts: Vec<(String, Option<ComposerButton>)> =
             vec![(submit.to_owned(), Some(ComposerButton::Submit))];
-        if let (ComposerMode::Ask, Some(label)) = (&self.mode, &self.model_label) {
-            parts.push((format!(" ● {label} ▾ "), Some(ComposerButton::Model)));
-        }
         match self.remote_reply {
             Some(ReplyMode::SendNow) => {
                 parts.push((
@@ -504,6 +503,17 @@ impl Composer {
             Some(ComposerButton::Preview),
         ));
         parts.push((" Cancel ".to_owned(), Some(ComposerButton::Cancel)));
+        // Last, so a narrow row drops it before the composer's own buttons.
+        if let (ComposerMode::Ask, Some(label)) = (&self.mode, &self.model_label) {
+            let label =
+                Line::from_spans(vec![Span::raw(label.clone())]).truncate(MODEL_LABEL_CELLS);
+            let label: String = label
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect();
+            parts.push((format!(" ● {label} ▾ "), Some(ComposerButton::Model)));
+        }
         let width = usize::from(width);
         let mut x = usize::from(indent);
         let mut spans = vec![Span::raw(" ".repeat(x.min(width)))];

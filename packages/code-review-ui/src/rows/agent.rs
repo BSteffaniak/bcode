@@ -33,6 +33,8 @@ const QUESTION_ROWS: usize = 3;
 const REASONING_ROWS: usize = 40;
 /// Lines of one error.
 const ERROR_ROWS: usize = 3;
+/// Cells of a card's `model · effort` label at most.
+const MODEL_LABEL_CELLS: usize = 40;
 /// Cells continuation rows of an error are indented by (under its text, past the icon).
 const ERROR_INDENT: usize = 2;
 
@@ -811,6 +813,13 @@ fn card_buttons(card: &CardButtons<'_>) -> Vec<(String, ItemAction)> {
             agent(AgentAction::Open),
         ));
         if let Some(model) = card.model {
+            let model =
+                Line::from_spans(vec![Span::raw(model.to_owned())]).truncate(MODEL_LABEL_CELLS);
+            let model: String = model
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect();
             buttons.push((format!("● {model}"), agent(AgentAction::Model)));
         }
     }
