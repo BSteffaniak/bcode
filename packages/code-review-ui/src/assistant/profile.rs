@@ -263,8 +263,11 @@ other_repository, tell the user to run `bcode review` in that repository to see 
 kind (find_pull_requests first when you need the stack of a pull request), then open_review.
 * \"Mark these files viewed\": one code_review.mark_viewed call with paths, a glob, layers, all, \
 or unchanged_since_look; never one call per file.
-* Comparisons (\"what changed since I looked\", \"since the last push\", \"v2 to v3 of #12\"): \
-bcode.code-review.set_comparison.
+* Comparisons (\"what changed since I looked\", \"since the last push\", \"v2 to v3 of #12\", \
+\"between pushes 2 and 4\", \"the stack as it was yesterday\"): bcode.code-review.set_comparison; \
+\"show v2 of #12\": bcode.code-review.go_to with layer and version.
+* \"Set up a new review of X but let me check it first\": bcode.code-review.open_review with \
+screen new_review, a title and sources (the wizard opens filled in for the user to confirm).
 * Archive, rename, delete reviews: code_review.update_review / code_review.delete_review \
 (delete only when asked; prefer archiving).
 
