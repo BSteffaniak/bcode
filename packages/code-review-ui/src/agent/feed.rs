@@ -273,7 +273,11 @@ fn feed_item(item: &TranscriptViewItem) -> Option<FeedItem> {
             format!("reasoning:{}:{}", activity.turn_id, activity.activity_id),
             &activity.text(),
         )),
-        TranscriptViewItemKind::ToolInvocation { tool } => Some(FeedItem::Tool(tool_line(tool))),
+        // A call without a name is the rest of one requested before the history window starts.
+        TranscriptViewItemKind::ToolInvocation { tool } => tool
+            .tool_name
+            .is_some()
+            .then(|| FeedItem::Tool(tool_line(tool))),
         TranscriptViewItemKind::ToolRequestDraft { draft } => Some(FeedItem::Tool(ToolLine {
             id: draft.tool_call_id.clone(),
             name: draft.tool_name.clone(),
@@ -483,6 +487,58 @@ mod tests {
         assert_eq!(turn.earlier, 2);
         assert_eq!(turn.answer(), format!("answer 10.{}", MAX_TURN_ITEMS + 1));
         assert!(feed.turn_for("question 1").is_none(), "dropped turns");
+    }
+
+    /// A history window that starts after a tool call was requested holds only its result;
+    /// the call is left out instead of shown as a nameless tool line.
+    #[test]
+    fn a_tool_result_without_its_call_in_the_window_is_left_out() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let result =
+            |id: &str| bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: id.to_owned(),
+                    model_output: "{\"done\":\"opened the review\"}".to_owned(),
+                    is_error: false,
+                    content: Vec::new(),
+                    presentation: None,
+                    result: None,
+                },
+            };
+        let mut view = bcode_session_view::SessionView::new();
+        view.apply_history(&[
+            event(10, result("cut-off")),
+            event(
+                11,
+                bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: "whole".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "code_review.summary".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            ),
+            event(12, result("whole")),
+        ]);
+        let feed = Feed::from_snapshot(view.snapshot());
+        let names: Vec<&str> = feed
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .filter_map(|item| match item {
+                FeedItem::Tool(tool) => Some(tool.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["code_review.summary"]);
     }
 
     #[test]
