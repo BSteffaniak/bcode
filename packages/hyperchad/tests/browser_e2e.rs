@@ -196,21 +196,19 @@ fn plugin_ids() -> Vec<String> {
 }
 
 fn plugins() -> TestResult<bcode_plugin::PluginRuntimeHost> {
-    Ok(
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection {
-                mode: bcode_plugin::PluginSelectionMode::Explicit,
-                enabled: BTreeSet::from([
-                    "bcode.fake-provider".into(),
-                    "bcode.question".into(),
-                    "bcode.filesystem".into(),
-                    "bcode.shell".into(),
-                ]),
-                disabled: BTreeSet::new(),
-            },
-            &static_plugins(),
-        )?,
-    )
+    Ok(bcode_server::load_embedded_plugins(
+        &bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::Explicit,
+            enabled: BTreeSet::from([
+                "bcode.fake-provider".into(),
+                "bcode.question".into(),
+                "bcode.filesystem".into(),
+                "bcode.shell".into(),
+            ]),
+            disabled: BTreeSet::new(),
+        },
+        &static_plugins(),
+    )?)
 }
 
 fn config() -> bcode_config::BcodeConfig {

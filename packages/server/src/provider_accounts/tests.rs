@@ -178,7 +178,7 @@ fn fixture_state(
         )
         .expect("fixture definition")
     });
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from([PROVIDER.into()]),

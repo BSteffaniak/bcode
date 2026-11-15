@@ -6587,8 +6587,7 @@ pub fn load_registered_plugin_with_config(
     plugin: &RegisteredPlugin,
     config: ResolvedPluginConfig,
 ) -> Result<LoadedPlugin, PluginLoadError> {
-    let PluginRuntime::Native(runtime) = &plugin.manifest.runtime;
-    let library_path = resolve_library_path(&plugin.manifest_path, &runtime.library);
+    let library_path = check_registered_plugin_before_load(plugin)?;
     let activation = config.shared_activation.clone().ok_or_else(|| {
         shared_instance::error(&plugin.manifest.id, "shared_activation_context_required")
     })?;
@@ -7056,7 +7055,7 @@ library = "libdisabled.dylib"
         )
     }
 
-    fn bundled_test_configs(
+    pub fn bundled_test_configs(
         registrations: &[StaticBundledPlugin],
     ) -> BTreeMap<String, ResolvedPluginConfig> {
         let runtime = bmux_plugin_runtime::PluginRuntimeScopeId::new();
@@ -9090,7 +9089,7 @@ library = "libexample_plugin.dylib"
             &PluginSelection::all_enabled(),
             Vec::new(),
             &bundled,
-            BTreeMap::new(),
+            bundled_test_configs(&bundled),
         )
         .expect("static runtime");
         let mut invocation = Box::pin(runtime.invoke_service(
@@ -9146,7 +9145,7 @@ library = "libexample_plugin.dylib"
             &PluginSelection::all_enabled(),
             Vec::new(),
             &bundled,
-            BTreeMap::new(),
+            bundled_test_configs(&bundled),
         )
         .expect("static runtime");
         let invocation = runtime

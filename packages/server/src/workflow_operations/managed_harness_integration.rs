@@ -770,7 +770,7 @@ fn fixture_with_workflow_family(root: &std::path::Path, production: bool) -> Arc
         include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
         bcode_fake_provider_plugin::plugin_definition,
     );
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from([PLUGIN.into(), "bcode.fake-provider".into()]),

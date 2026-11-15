@@ -170,11 +170,9 @@ async fn constrained_status_only_readiness_crosses_real_ipc_without_login_or_sub
         )
         .expect("fixture definition")
     });
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-        &bcode_plugin::PluginSelection::all_enabled(),
-        &[bundle],
-    )
-    .unwrap();
+    let plugins =
+        crate::tests::load_test_plugins(&bcode_plugin::PluginSelection::all_enabled(), &[bundle])
+            .unwrap();
     let state = Arc::new(crate::tests::test_server_state_with_plugins(
         sessions, plugins,
     ));

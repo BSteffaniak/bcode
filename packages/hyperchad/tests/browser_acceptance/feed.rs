@@ -515,10 +515,7 @@ async fn feed_routes_round_trip_against_a_real_backend() -> TestResult<()> {
     let server = bcode_server::run_embedded_with_locations_and_shutdown(
         endpoint,
         config.clone(),
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &selection,
-            &super::static_plugins(),
-        )?,
+        bcode_server::load_embedded_plugins(&selection, &super::static_plugins())?,
         bcode_model_catalog::ModelCatalogResolver::embedded(),
         super::plugin_ids(),
         shutdown.clone(),

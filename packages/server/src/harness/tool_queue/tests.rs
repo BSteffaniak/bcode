@@ -180,7 +180,7 @@ async fn fresh_start_delivers_open_before_any_tool_grant_and_retry_never_redeliv
 fn start_queue_state(sessions: bcode_session::SessionManager) -> ServerState {
     let mut state = crate::tests::test_server_state_with_plugins(
         sessions,
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection::all_enabled(),
             &[bcode_plugin::StaticBundledPlugin::from_definition(
                 MANIFEST,

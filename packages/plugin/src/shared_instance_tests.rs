@@ -14,14 +14,31 @@ pub fn fixture_config(plugin_id: &str) -> crate::ResolvedPluginConfig {
 mod tests {
     use std::{future::Future, pin::Pin, sync::Arc};
 
-    struct Driver(tokio::runtime::Runtime);
+    struct Driver(Option<tokio::runtime::Runtime>);
+    impl Drop for Driver {
+        fn drop(&mut self) {
+            // Runtime destruction blocks; it must not run on an async test worker.
+            if let Some(runtime) = self.0.take() {
+                std::thread::spawn(move || drop(runtime))
+                    .join()
+                    .expect("fixture runtime cleanup");
+            }
+        }
+    }
     impl crate::SharedLifecycleDriver for Driver {
         fn runtime_handle(&self) -> tokio::runtime::Handle {
-            self.0.handle().clone()
+            self.0.as_ref().expect("fixture runtime").handle().clone()
         }
 
         fn run(&self, work: Pin<Box<dyn Future<Output = ()> + Send + '_>>) {
-            self.0.block_on(work);
+            // Lifecycle work may be entered from an async test; poll it on a
+            // dedicated scoped thread rather than nesting `block_on`.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.0.as_ref().expect("fixture runtime").block_on(work))
+                    .join()
+                    .expect("fixture lifecycle worker");
+            });
         }
     }
     struct Registrations(Arc<std::sync::atomic::AtomicUsize>);
@@ -91,12 +108,12 @@ mod tests {
                 dispatch: Arc::new(Dispatch),
                 concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
                 progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
-                driver: Arc::new(Driver(
+                driver: Arc::new(Driver(Some(
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .expect("test runtime"),
-                )),
+                ))),
                 registrations: Arc::new(Registrations(Arc::new(
                     std::sync::atomic::AtomicUsize::new(0),
                 ))),

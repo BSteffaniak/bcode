@@ -1274,13 +1274,14 @@ mod tests {
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
             bcode_question_plugin::plugin_definition,
         );
-        let plugins = PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
             &crate::PluginSelection {
                 mode: crate::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from(["bcode.question".into()]),
                 disabled: std::collections::BTreeSet::default(),
             },
             &[producer],
+            crate::tests::bundled_test_configs(&[producer]),
         )
         .unwrap();
         let scope = PluginInvocationScope::Session {

@@ -161,7 +161,7 @@ fn fixture_server(
     });
     let mut state = Arc::new(crate::tests::test_server_state_with_plugins(
         sessions,
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection::all_enabled(),
             &[
                 bundle,

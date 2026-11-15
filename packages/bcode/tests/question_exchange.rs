@@ -19,11 +19,18 @@ fn plugin_runtime() -> bcode_plugin::PluginRuntimeHost {
         include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
         bcode_question_plugin::plugin_definition,
     )];
-    bcode_plugin::PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
-        &bcode_plugin::PluginSelection::all_enabled(),
-        Vec::new(),
+    let selection = bcode_plugin::PluginSelection::all_enabled();
+    let configs = bcode_server::bind_shared_plugin_activations(
+        &selection,
         &bundled,
         std::collections::BTreeMap::new(),
+    )
+    .expect("question activation authority");
+    bcode_plugin::PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
+        &selection,
+        Vec::new(),
+        &bundled,
+        configs,
     )
     .expect("question plugin should load from explicit registrations")
 }
