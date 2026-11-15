@@ -1181,6 +1181,8 @@ impl ReviewHost for StandaloneHost {
 
 /// Calls of the app's tools buffered before the provider waits for the UI.
 const TOOL_CALL_BUFFER: usize = 32;
+/// Sessions the tool connection claims again after a reconnect at most (the newest).
+const MAX_RECLAIMED: usize = 32;
 /// Pause before connecting the tool provider again.
 const TOOL_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
@@ -1313,9 +1315,7 @@ impl ToolProvider {
                         // Bcode claims a session created with the provider's origin; claiming
                         // again makes sure, before the first turn is submitted.
                         let claim = handle.claim_session(session.id).await;
-                        if !claimed.contains(&session.id) {
-                            claimed.push(session.id);
-                        }
+                        remember_claim(claimed, session.id);
                         claim
                             .map(|()| session.id.to_string())
                             .map_err(|error| client_error(&error))
@@ -1329,8 +1329,8 @@ impl ToolProvider {
                     .claim_session(session)
                     .await
                     .map_err(|error| client_error(&error));
-                if result.is_ok() && !claimed.contains(&session) {
-                    claimed.push(session);
+                if result.is_ok() {
+                    remember_claim(claimed, session);
                 }
                 let _ = reply.send(result);
             }
@@ -1339,6 +1339,15 @@ impl ToolProvider {
                 let _ = handle.release_session(session).await;
             }
         }
+    }
+}
+
+/// Remember `session` as claimed (newest last), keeping at most [`MAX_RECLAIMED`].
+fn remember_claim(claimed: &mut Vec<SessionId>, session: SessionId) {
+    claimed.retain(|known| *known != session);
+    claimed.push(session);
+    if claimed.len() > MAX_RECLAIMED {
+        claimed.drain(..claimed.len() - MAX_RECLAIMED);
     }
 }
 

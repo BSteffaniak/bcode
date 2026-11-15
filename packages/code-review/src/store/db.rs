@@ -667,18 +667,21 @@ impl<'a> CodeReviewDb<'a> {
                 "repo_root",
                 repo_root.display().to_string(),
             )))
+            // Newest first, and only one row more than asked for (to tell there are more).
+            .sort(
+                "updated_at_ms",
+                switchy::database::query::SortDirection::Desc,
+            )
+            .sort("session_id", switchy::database::query::SortDirection::Asc)
+            .limit(limit.saturating_add(1))
             .execute(self.db)
             .await?;
-        let mut bindings: Vec<ReviewAssistantBinding> =
-            rows.iter().filter_map(assistant_binding_from_row).collect();
-        bindings.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| left.session_id.cmp(&right.session_id))
-        });
-        let truncated = bindings.len() > limit;
-        bindings.truncate(limit);
+        let truncated = rows.len() > limit;
+        let bindings: Vec<ReviewAssistantBinding> = rows
+            .iter()
+            .take(limit)
+            .filter_map(assistant_binding_from_row)
+            .collect();
         Ok((bindings, truncated))
     }
 

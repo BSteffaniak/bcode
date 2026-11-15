@@ -387,14 +387,19 @@ pub async fn find(
     let answer = crate::home::load::pulls(services, repo.clone())
         .await?
         .ok_or("no forge provider lists pull requests for this repository")?;
-    let local: BTreeSet<String> = git(
-        &repo,
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    )
-    .lines()
-    .map(str::to_owned)
-    .collect();
-    let current = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    // Git runs off the async workers.
+    let (local, current) = tokio::task::spawn_blocking(move || {
+        let local: BTreeSet<String> = git(
+            &repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        (local, git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]))
+    })
+    .await
+    .map_err(|error| format!("reading the local branches failed: {error}"))?;
     let found = stacks(
         &answer.repository,
         &answer.pulls,
