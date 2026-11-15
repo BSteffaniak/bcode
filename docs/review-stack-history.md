@@ -206,13 +206,35 @@ The default (`compare.start_view = "full"`) is the **full view**; `shift+l` swit
 
 **Full view: the whole change, with what is new marked.**
 
-* Lines new since the baseline are tinted (`theme.since_new`) and carry a one-cell gutter bar
-  (`theme.icons.since_bar`). Newly removed old-side lines get the same treatment on their side.
+* Lines new since the baseline are marked in the style chosen (`compare.mark_style`, or **Mark
+  new lines** in the menu): a one-cell gutter bar (`theme.icons.since_bar`) and a row tint
+  (`theme.since.diff`) by default, the bar only, the tint only, or *strong*: an accent bar
+  (`theme.since.strong_bar`), a deeper tint (`theme.since.strong_diff`), and a `new` label in
+  the gutter. Newly removed old-side lines get the same treatment on their side.
+* **Changed words.** A line new since the baseline that replaced a line there (the marks pair
+  a hunk's replaced and replacing lines in order, as a line diff pairs a removed run with the
+  added run after it) has the words that differ from that baseline line underlined and tinted
+  (`theme.since.word`, `compare.word_marks`, on by default). The words come from BMUX's
+  intraline token diff, so work per line is bounded (a line over 2,000 graphemes, or a baseline
+  line over 4 KiB, keeps only the line mark), and a line rewritten whole keeps only the line
+  mark. Word marks are styled ranges merged with the syntax ranges, so syntax colors and the
+  diff's own intraline emphasis (which replaces the background, keeping the underline) compose
+  without changing layout.
 * Code removed since the baseline shows as a one-row marker between lines,
-  "▾ 3 lines removed since you looked", which expands (`enter`, click) to the removed text,
-  read-only.
-* A hunk with marked lines says so in its header ("new since you looked"); `]`/`[` (next and
-  previous change) stop on marked lines first while a comparison is active, then on changes.
+  "▾ 3 lines removed since you looked", which expands (click) to the removed text, read-only.
+  With `compare.removed_inline` (or **Show removed code inline**) the removed lines show in
+  place instead, as removed rows with their content struck through and faint.
+* **Hunk labels.** A hunk with marked lines carries a label against the right of its header
+  that names the baseline in effect and counts its lines new or removed since then: `new since
+  you looked · 2 lines`, `new since push 3 · 3 lines`, `new since yesterday · 1 line`,
+  `new since v2 · 4 lines`. `]`/`[` (next and previous change) stop on marked lines first while
+  a comparison is active, then on changes.
+* **Hunks with nothing new** (in a marked file) show like the others by default; with
+  `compare.seen_hunks = "dim"` they are dimmed, with `"fold"` they fold to their header, which
+  reads `[nothing new since you looked · show 7 lines]` (a click shows that hunk, and
+  `[… · fold]` folds it again). A hunk with a comment, an AI answer, or the composer anchored in
+  it never folds. Showing them is the default because the full change is the view for reading
+  the whole change: the labels already point at what is new, and folding is one choice away.
 * Files are folded by state:
   * unchanged since the baseline and viewed: folded to their header, badge
     "unchanged since you looked";
@@ -330,13 +352,18 @@ Each layer's rail tab and file-panel group row carries a badge from its delta:
 |---|---|
 | `● +40 −12 · 3 files` | Changed since the baseline. |
 | `○ rebased` | Only rebased: nothing to review again. |
-| `✓ unchanged` | Same head as the baseline. |
+| `= unchanged` | Same head as the baseline. |
 | `+ new to you` | Never looked at. |
 | `≈ with rebase` | The rebase could not be taken out. |
 | `? unavailable` | The baseline's commits are gone; shown as the full change. |
 | `…` | Still comparing. |
 
-Glyphs come from `theme.icons` with ASCII fallbacks. Tab labels keep their three widths: full
+Glyphs come from `theme.icons` with ASCII fallbacks. Unchanged since is `=` in every icon set,
+never the check mark: a tab can also carry `✓` for an approved pull request, and file rows use
+`✓` for viewed. Every glyph a tab can show side by side (approval, changes requested, new
+activity, drafts, threads, comparing, and the six comparison badges) is distinct in each set;
+the ASCII set reads `ok` for approved, `!` for new activity, and `~=` for a rebase that could
+not be taken out. The history matrix and the comparison menu end with a key to these badges. Tab labels keep their three widths: full
 (`#101 Title  ● +40 −12 · 3 files  2/5`), compact (`#101 ●+40−12`), minimal (`#101●`).
 
 **Only pull requests with real changes** (control toggle, palette, no default key) hides
@@ -460,8 +487,16 @@ and hit regions come from the same layout as the painted variant.
 * **Rail badges:** follow the tab's full, compact and minimal labels.
 * **Push timeline:** with fewer cells than pushes, consecutive pushes share a cell (emphasized
   when any of them changed content); below 12 cells the strip is hidden and the matrix remains.
-* **Line marks:** the gutter bar is part of the line prefix layout and is the first prefix cell
-  dropped at narrow widths; the tint remains.
+* **Line marks:** the gutter bar takes the first cell of the full gutter (BMUX
+  `DiffRowColumn::cells`), so it is dropped with the full gutter at narrow widths and the tint
+  remains. The strong style's `new` label goes in the first blank run of the gutter (between the
+  bar cell and `DiffRowColumn::content`) that holds it with one blank after it, read from the
+  painted row, so it never covers a line number or the hover comment affordance (which takes the
+  bar cell); a unified added line has one where the old-side number is blank, side-by-side rows
+  and gutters too narrow have none and keep the accent bar and deeper tint.
+* **Hunk labels:** the widest variant (`new since push 3 · 3 lines`, `new · 3`, `+3`) that
+  leaves the range and layers in view; a fold button is clickable only on the cells the painted
+  row shows it in.
 * **File header versions:** `changed in 2 of 4 pushes · v4 ◂ ▸` → `v4 ◂ ▸` → omitted (stepping
   keys still work).
 * **Version picker:** columns drop in order: line counts, actor, time; version, kind and marks
@@ -480,6 +515,13 @@ and hit regions come from the same layout as the painted variant.
 * `start_view`: `"full"` (default) or `"changes"`.
 * `rebased_layers`: `"collapse"` (default), `"hide"`, or `"show"`.
 * `timeline`: `"auto"` (default) or `"always"`.
+* `mark_style`: `"both"` (default), `"bar"`, `"tint"`, or `"strong"`.
+* `word_marks`: `true` (default) or `false`.
+* `seen_hunks`: `"show"` (default), `"dim"`, or `"fold"`.
+* `removed_inline`: `false` (default) or `true`.
+
+The comparison menu changes the four mark settings for the session (previewed with `space`,
+put back with `esc`); the configuration stays the default for the next one.
 
 The existing history settings stay: version sources (forge, observation, reflogs), the push
 window, and retention of observed versions.

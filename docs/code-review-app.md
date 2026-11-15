@@ -392,13 +392,27 @@ work the same with or without one.
 * **What shows.** The rebase is taken out: a layer only rebased collapses to one line, files
   unchanged since the baseline fold once viewed (unviewed ones stay open), lines new since then
   are tinted with a bar in the gutter, and code removed since then is a marker you can expand.
-  The summary rows, markers and file badges name the baseline (`Changed since you looked`,
-  `Changed since the previous push`, `since then` for a time, pushes or versions picked).
+  The summary rows, markers, hunk labels and file badges name the baseline (`Changed since you
+  looked`, `Changed since the previous push`, `since yesterday`, `since push 3`, `since v2`;
+  `since then` for any other time).
+* **Marking what is new.** Under **Mark new lines** the menu picks how new lines show: *bar and
+  tint* (the default), *gutter bar only*, *tint only*, or *strong* (an accent bar, a deeper
+  tint, and `new` in the gutter where it has room). **Mark changed words** (on) underlines and
+  tints, within a line that replaced one in the baseline, only the words that differ from it.
+  **Show removed code inline** shows code removed since in place, struck through and faint,
+  instead of behind its marker. A hunk with new lines is labelled with the baseline and a
+  count (`new since push 3 · 3 lines`). Under **Hunks with nothing new**, *show* (the default),
+  *dim*, or *fold* them to their header (`[nothing new since you looked · show 7 lines]`; a
+  click shows one, `[… · fold]` folds it again; a hunk with a comment in it stays open). These
+  preview with `space` and are put back by `esc` like the rest of the menu, and last for the
+  session; `compare.*` settings set the defaults.
   `]`/`[` stop on new lines first. `shift+l` switches between that full change and only what
   changed (each changed file from its old version replayed on today's base to the current code).
 * **Badges.** Rail tabs say how each pull request changed: `● +40 −12 · 3 files`, `○ rebased`,
-  `✓ unchanged`, `+ new to you`, `≈` (the rebase could not be taken out), `?` (the baseline's
-  commits are gone), `⋯` (still comparing). *Only pull requests with real changes* folds the
+  `= unchanged` (never `✓`, which on the same tab means approved), `+ new to you`, `≈` (the
+  rebase could not be taken out), `?` (the baseline's commits are gone), `⋯` (still comparing).
+  The comparison menu and the history matrix (`shift+b`) end with a key to these glyphs next to
+  `✓ approved` and `✕ changes requested`. *Only pull requests with real changes* folds the
   others into one `+N ○` tab (a click shows them again), and `.`/`,` skip them.
 * **The file panel** follows the comparison, one pull request at a time and with every layer
   shown (`shift+o`) alike.
@@ -415,7 +429,7 @@ work the same with or without one.
     recede (dimmed); files the baseline's change had and the current one dropped are listed,
     struck through and inert, as `− path  dropped since` at the end of their group.
   * Group rows (one per layer with every layer shown) carry the same badge as the rail (`●
-    +40 −12 · 3 files`, `○ rebased only`, `✓ no changes`, `⋯ comparing`, `? baseline gone`)
+    +40 −12 · 3 files`, `○ rebased only`, `= no changes`, `⋯ comparing`, `? baseline gone`)
     instead of their whole change's counts; layers with nothing to look at again recede.
   * The panel lists what the document shows: files the comparison hides there (unchanged since
     then in *only what changed*, every file of a layer only rebased) are left out, counted on
@@ -765,7 +779,11 @@ bcode's own (`--print-config-paths` lists them in order):
   looking at it even when something else was recorded; `dwell_seconds` (default 8) is how long
   that takes. `start_view` (`"full"` or `"changes"`) is the view a comparison starts in;
   `rebased_layers` (`"collapse"`, `"hide"`, or `"show"`) how layers that were only rebased show;
-  `timeline` (`"auto"` or `"always"`) when the push timeline shows. Invalid values are reported
+  `timeline` (`"auto"` or `"always"`) when the push timeline shows. How what is new since the
+  baseline is marked: `mark_style` (`"both"`, the default, `"bar"`, `"tint"`, or `"strong"`),
+  `word_marks` (default true: mark the changed words of lines modified since), `seen_hunks`
+  (`"show"`, the default, `"dim"`, or `"fold"`: hunks with nothing new), and `removed_inline`
+  (default false: code removed since shows inline, struck through). Invalid values are reported
   and the defaults are used.
 * `[plugins.config."bcode.code_review".stack]`: how many layers a stack of pull requests may
   have. `max_layers` (default 64) is the limit; `over_limit` says what happens beyond it.
