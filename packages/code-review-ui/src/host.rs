@@ -978,16 +978,7 @@ impl ReviewHost for StandaloneHost {
                 .await
                 .map_err(|error| bcode.failure(&error))?;
             Ok(TurnCount {
-                turns: page
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        matches!(
-                            event.kind,
-                            bcode_session_models::SessionEventKind::UserMessage { .. }
-                        )
-                    })
-                    .count(),
+                turns: user_turns(&page.events),
                 more: page.has_more,
             })
         })
@@ -1416,9 +1407,87 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     Err("no clipboard command found (pbcopy, wl-copy, xclip or xsel)".into())
 }
 
+/// The user turns among `events`: each activated submission (how a user message enters a
+/// session's history), or a user message recorded directly by older sessions.
+fn user_turns(events: &[bcode_session_models::SessionEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                bcode_session_models::SessionEventKind::SubmissionActivated { .. }
+                    | bcode_session_models::SessionEventKind::UserMessage { .. }
+            )
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turns_count_activated_submissions_and_older_user_messages() {
+        let session_id = SessionId::new();
+        let client_id = bcode_session_models::ClientId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let submission = |id: &str| bcode_session_models::PromptSubmission {
+            id: bcode_session_models::SubmissionId(id.to_owned()),
+            client_id,
+            text: "question".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            requested_placement: bcode_session_models::SubmissionPlacement::FollowUp,
+            target: bcode_session_models::SubmissionTarget::OwnTurn {
+                turn_id: bcode_session_models::TurnId(format!("turn-{id}")),
+            },
+            execution_descriptor: None,
+        };
+        let activated = |id: &str| bcode_session_models::SessionEventKind::SubmissionActivated {
+            submission_id: bcode_session_models::SubmissionId(id.to_owned()),
+            turn_id: bcode_session_models::TurnId(format!("turn-{id}")),
+            client_id,
+            text: "question".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        };
+        let events = [
+            event(
+                1,
+                bcode_session_models::SessionEventKind::UserMessage {
+                    client_id,
+                    text: "older".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            event(
+                2,
+                bcode_session_models::SessionEventKind::SubmissionAccepted {
+                    submission: submission("a"),
+                },
+            ),
+            event(3, activated("a")),
+            event(
+                4,
+                bcode_session_models::SessionEventKind::AssistantMessage {
+                    text: "answer".to_owned(),
+                },
+            ),
+            event(
+                5,
+                bcode_session_models::SessionEventKind::SubmissionAccepted {
+                    submission: submission("b"),
+                },
+            ),
+            event(6, activated("b")),
+        ];
+        assert_eq!(user_turns(&events), 3);
+    }
 
     #[test]
     fn origins_record_the_review_and_layer_or_neither() {
