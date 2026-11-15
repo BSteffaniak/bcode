@@ -470,28 +470,6 @@ fn bundled_interaction_adapter(
     bcode_bundled_plugins::interaction_adapter(producer_id, schema, schema_version, platform_id)
 }
 
-#[cfg(any(
-    feature = "static-bundled-code-review-plugin",
-    feature = "static-bundled-filesystem-plugin",
-    feature = "static-bundled-plugins",
-    feature = "static-bundled-question-plugin",
-    feature = "static-bundled-workflow-plugin"
-))]
-fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
-    bcode_bundled_plugins::static_tui_extensions()
-}
-
-#[cfg(not(any(
-    feature = "static-bundled-code-review-plugin",
-    feature = "static-bundled-filesystem-plugin",
-    feature = "static-bundled-plugins",
-    feature = "static-bundled-question-plugin",
-    feature = "static-bundled-workflow-plugin"
-)))]
-const fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
-    Vec::new()
-}
-
 /// Run the main terminal UI and open a plugin-owned surface on startup.
 ///
 /// # Errors

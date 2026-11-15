@@ -883,6 +883,21 @@ impl PluginTuiPresentation {
     }
 
     /// Create production presentation state around an isolated plugin runtime.
+    /// Frontend registries come from the selected components' shared definitions.
+    #[must_use]
+    pub fn with_runtime_config(
+        runtime: PluginRuntimeHost,
+        visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+    ) -> Self {
+        Self::from_backend(
+            PresentationPluginBackend::Runtime(runtime),
+            visual_adapter_config,
+            &[],
+        )
+    }
+
+    /// Create test presentation state with explicitly injected native registries.
+    #[cfg(test)]
     #[must_use]
     pub fn with_runtime_config_and_extensions(
         runtime: PluginRuntimeHost,
@@ -2242,10 +2257,7 @@ fn valid_diagnostic_name(name: &str) -> bool {
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
 pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
-    let registry = super::bundled_tui_extensions()
-        .into_iter()
-        .find(|extension| extension.plugin_id() == plugin_id)
-        .map(bcode_plugin_sdk::tui::StaticPluginTuiExtension::registry);
+    let registry = bcode_bundled_plugins::tui_registry(plugin_id);
     #[cfg(test)]
     let registry = registry.or_else(|| match plugin_id {
         "bcode.filesystem" => Some(bcode_filesystem_plugin::filesystem_tui_registry()),
@@ -2266,7 +2278,6 @@ pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
 pub fn load_default_host_with_static_bundled(
     selection: &bcode_plugin::PluginSelection,
     static_plugins: &[StaticBundledPlugin],
-    _extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginHost, PluginLoadError> {
     // A discovery/activation/compatibility failure is not permission to select a different
     // bundled implementation. In particular an explicit dynamic selection must fail visibly,
@@ -2313,9 +2324,8 @@ pub fn load_default_presentation_with_static_bundled(
     selection: &bcode_plugin::PluginSelection,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
     static_plugins: &[StaticBundledPlugin],
-    extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginTuiPresentation, PluginLoadError> {
-    let host = load_default_host_with_static_bundled(selection, static_plugins, extensions)?;
+    let host = load_default_host_with_static_bundled(selection, static_plugins)?;
     // This function runs on the blocking presentation-preparation worker. Resolve the actual
     // selected component, not a registry with a matching bundled logical ID.
     let handle =
@@ -2340,11 +2350,8 @@ pub fn load_default_presentation_with_static_bundled(
         }
         Ok::<_, PluginLoadError>(selected)
     })?;
-    let mut presentation = PluginTuiPresentation::with_runtime_config_and_extensions(
-        host.into(),
-        visual_adapter_config,
-        &[],
-    );
+    let mut presentation =
+        PluginTuiPresentation::with_runtime_config(host.into(), visual_adapter_config);
     presentation.selected_frontends = selected;
     Ok(presentation)
 }
@@ -2965,7 +2972,6 @@ library = "libcomposer_fixture.dylib"
         let result = load_default_host_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),
             &[invalid_plugin],
-            &[],
         );
         assert!(result.is_err());
     }

@@ -46,12 +46,10 @@ pub fn export_with_plugins(
     selection: &bcode_plugin::PluginSelection,
     plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> Result<String, String> {
-    let extensions = crate::bundled_tui_extensions();
     let presentation = crate::plugin_tui::load_default_presentation_with_static_bundled(
         selection,
         config.tui.visual_adapters.clone(),
         plugins,
-        &extensions,
     )
     .map_err(|error| error.to_string())?;
     let actions = presentation

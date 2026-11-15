@@ -3382,7 +3382,6 @@ pub struct TuiRuntimeSettings {
     runtime_config: bmux_tui_runtime::RuntimeConfig,
     metrics_enabled: bool,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
-    tui_extensions: Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension>,
     launch_working_directory: std::path::PathBuf,
     launch_options: super::TuiLaunchOptions,
 }
@@ -3403,7 +3402,6 @@ impl TuiRuntimeSettings {
             runtime_config: super::runtime_adapter::config(&tui_config, false),
             metrics_enabled: false,
             static_plugins: static_plugins.to_vec(),
-            tui_extensions: super::bundled_tui_extensions(),
             launch_working_directory,
             launch_options: super::TuiLaunchOptions::default(),
         }
@@ -3480,10 +3478,6 @@ impl TuiRuntimeSettings {
 
     pub fn static_plugins(&self) -> &[bcode_plugin::StaticBundledPlugin] {
         &self.static_plugins
-    }
-
-    pub fn tui_extensions(&self) -> &[bcode_plugin_sdk::tui::StaticPluginTuiExtension] {
-        &self.tui_extensions
     }
 
     pub fn launch_working_directory(&self) -> &std::path::Path {
@@ -4521,7 +4515,6 @@ pub fn apply_config_result(
                 &selection,
                 config.tui.visual_adapters.clone(),
                 settings.static_plugins(),
-                settings.tui_extensions(),
             ) {
                 Ok(presentation) => {
                     settings

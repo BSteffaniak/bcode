@@ -283,7 +283,6 @@ fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> Pr
         &selection,
         visual,
         static_plugins,
-        &super::bundled_tui_extensions(),
     );
     PreparedPresentation {
         config,
