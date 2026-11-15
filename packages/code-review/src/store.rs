@@ -80,6 +80,8 @@ const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REPOSITORY_FILE_BYTES: u64 = 1_000_000;
+/// Times a workspace write reads the row again after another writer replaced it first.
+const MAX_WORKSPACE_WRITE_ATTEMPTS: usize = 32;
 
 /// Code review state location preference.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +481,12 @@ pub enum StoreError {
     /// No built-in publisher has the requested id.
     #[error("unsupported review publisher: {0}")]
     UnsupportedPublisher(String),
+    /// A write named a saved review that was deleted meanwhile.
+    #[error("the saved review {0} was deleted")]
+    WorkspaceDeleted(String),
+    /// Other writers kept replacing the review's row before this write could.
+    #[error("the saved review {0} kept changing; try again")]
+    Conflict(String),
 }
 
 fn review_context_for_request(
@@ -1381,9 +1389,13 @@ fn update_review_workspace_for_request(
     let repo_root = resolve_repo_root(&request.repo_path)?;
     let mut workspace = request.workspace;
     workspace.repo_root.clone_from(&repo_root);
+    let base = request.base;
     let saved = with_database(&repo_root, config, move |database| {
         Box::pin(async move {
             let db = CodeReviewDb::new(database);
+            if let Some(base) = base {
+                return db.merge_workspace(&base, &workspace).await;
+            }
             // Presentation state (scroll position, panels) records how the review was last
             // looked at; only changes to the review itself make it updated.
             let stored = db.get_workspace(&workspace.id).await?;

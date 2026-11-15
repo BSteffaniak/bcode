@@ -432,6 +432,15 @@ impl Home {
         self.toasts.titles()
     }
 
+    /// Tell the user the review they had open, titled `title`, was deleted elsewhere.
+    pub fn notify_deleted(&mut self, title: &str) {
+        self.toasts.push(
+            ToastSeverity::Warning,
+            format!("“{title}” was deleted"),
+            None,
+        );
+    }
+
     /// The listed reviews.
     #[must_use]
     pub fn items(&self) -> &[ReviewWorkspaceListItem] {
@@ -1257,6 +1266,7 @@ impl Home {
                 if workspace.title == title {
                     return HomeOutcome::Redraw;
                 }
+                let base = workspace.clone();
                 workspace.title.clone_from(&title);
                 // Show the new title at once; the reload confirms it.
                 if let Some(item) = self.items.iter_mut().find(|item| item.workspace.id == id) {
@@ -1265,7 +1275,7 @@ impl Home {
                 self.rows_dirty = true;
                 self.run_change(host, format!("renamed to “{title}”"), {
                     let services = self.services.clone();
-                    async move { load::update(services, workspace).await }
+                    async move { load::update(services, base, workspace).await }
                 });
                 HomeOutcome::Redraw
             }
@@ -1332,12 +1342,13 @@ impl Home {
             self.set_status("the selected review is not archived", StatusSeverity::Info);
             return;
         }
-        let mut workspace = item.workspace.clone();
+        let base = item.workspace.clone();
+        let mut workspace = base.clone();
         workspace.archived_at_ms = None;
         let title = workspace.title.clone();
         let services = self.services.clone();
         self.run_change(host, format!("restored “{title}”"), async move {
-            load::update(services, workspace).await
+            load::update(services, base, workspace).await
         });
     }
 

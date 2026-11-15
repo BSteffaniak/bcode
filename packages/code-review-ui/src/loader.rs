@@ -88,8 +88,8 @@ pub enum Message {
         /// Whether the user asked for the refresh (reported in the status line).
         manual: bool,
     },
-    /// A workspace save finished, with the viewed state it wrote.
-    Saved(Result<crate::surface::ViewedState, String>),
+    /// A workspace save finished, with the record it wrote.
+    Saved(Result<Box<bcode_code_review_models::ReviewWorkspace>, crate::surface::SaveFailure>),
     /// A transient review was saved as a durable one (or failed to).
     SavedAs(Box<Result<bcode_code_review_models::ReviewWorkspace, String>>),
     /// The review's annotations were listed.
@@ -738,6 +738,7 @@ pub async fn save_workspace(
         .call(bcode_code_review_models::UpdateReviewWorkspaceRequest {
             repo_path: workspace.repo_root.clone(),
             workspace,
+            base: None,
         })
         .await
         .map_err(|error| error.message)?;

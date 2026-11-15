@@ -14,6 +14,7 @@
 //!   replayed.
 
 use super::ReviewSurface;
+use crate::action::Action;
 use crate::context::UiContext;
 use crate::loader::Message;
 use bcode_code_review::document::{FileRef, ItemKey};
@@ -47,8 +48,8 @@ const NAVIGATE_TOOL: &str = "code_review.navigate";
 /// Result of the review's background work for reflected tools.
 #[derive(Debug)]
 pub enum ToolsResult {
-    /// The review's stored viewed state, read after a tool changed it.
-    Viewed(Result<Option<Box<ReviewWorkspace>>, String>),
+    /// The review's stored record, read after a tool (or another app) may have changed it.
+    Stored(Result<Option<Box<ReviewWorkspace>>, String>),
 }
 
 /// Card sessions followed, with the finished tool calls already applied.
@@ -207,6 +208,8 @@ impl ReviewSurface {
                 if WRITE_TOOLS.contains(&tool.name.as_str()) {
                     wrote = true;
                     viewed |= tool.name == "code_review.mark_viewed";
+                } else if REVIEW_LIST_TOOLS.contains(&tool.name.as_str()) {
+                    viewed = true;
                 } else if tool.name == NAVIGATE_TOOL {
                     navigate = Some(tool.arguments.clone());
                 }
@@ -230,6 +233,9 @@ impl ReviewSurface {
             if WRITE_TOOLS.contains(&name.as_str()) {
                 wrote = true;
                 viewed |= name == "code_review.mark_viewed";
+            } else if REVIEW_LIST_TOOLS.contains(&name.as_str()) {
+                // A rename, archive or delete of any review may be this one's.
+                viewed = true;
             } else if name == NAVIGATE_TOOL {
                 navigate = Some(arguments.clone());
             }
@@ -248,7 +254,7 @@ impl ReviewSurface {
             self.notes_requested = false;
         }
         if viewed {
-            self.reload_viewed(host);
+            self.reload_stored(host);
         }
         if let Some(arguments) = navigate {
             self.navigate_to(&arguments);
@@ -258,20 +264,38 @@ impl ReviewSurface {
     /// A finished piece of reflection work.
     pub(super) fn finish_tools(&mut self, result: ToolsResult) {
         match result {
-            ToolsResult::Viewed(Ok(None)) => {}
-            ToolsResult::Viewed(Ok(Some(stored))) => self.apply_stored_viewed(&stored),
-            ToolsResult::Viewed(Err(error)) => {
+            ToolsResult::Stored(Ok(None)) => {
+                if !self.is_transient() {
+                    self.deleted_elsewhere();
+                }
+            }
+            ToolsResult::Stored(Ok(Some(stored))) => {
+                if self.is_transient() {
+                    self.apply_stored_viewed(&stored);
+                } else {
+                    let base = self
+                        .viewed_sync
+                        .stored
+                        .clone()
+                        .unwrap_or_else(|| self.workspace_mut().clone());
+                    self.rebase_onto(&base, *stored);
+                }
+            }
+            ToolsResult::Stored(Err(error)) => {
                 self.toasts.push(
                     ToastSeverity::Error,
-                    "Could not reload viewed files",
+                    "Could not reload the review",
                     Some(error),
                 );
             }
         }
     }
 
-    /// Read the review's stored viewed state again.
-    fn reload_viewed(&mut self, host: &UiContext) {
+    /// Read the review's stored record again (viewed state, title, archive, or its deletion).
+    pub fn reload_stored(&mut self, host: &UiContext) {
+        if self.viewed_sync.deleted {
+            return;
+        }
         let workspace = self.workspace_mut().clone();
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -284,11 +308,12 @@ impl ReviewSurface {
                 .await
                 .map(|response| response.workspace.map(Box::new))
                 .map_err(|error| error.message);
-            inbox.push(Message::Tools(Box::new(ToolsResult::Viewed(result))));
+            inbox.push(Message::Tools(Box::new(ToolsResult::Stored(result))));
         }));
     }
 
-    /// Show viewed files as stored, keeping the reviewer's changes not saved yet.
+    /// Show viewed files as stored, keeping the reviewer's changes not saved yet (an unsaved
+    /// review, whose stored record holds only its viewed state).
     fn apply_stored_viewed(&mut self, stored: &ReviewWorkspace) {
         let stored = super::viewed_sync::Viewed::of(stored);
         let local = super::viewed_sync::Viewed::of(self.workspace_mut());
@@ -300,17 +325,68 @@ impl ReviewSurface {
         self.show_viewed(&merged);
     }
 
-    /// After a save wrote `written` for the local state `saving`: take what the save merged in,
-    /// keeping changes the reviewer made while it ran.
-    pub(super) fn adopt_viewed(
-        &mut self,
-        saving: &super::viewed_sync::Viewed,
-        written: &super::viewed_sync::Viewed,
-    ) {
-        let local = super::viewed_sync::Viewed::of(self.workspace_mut());
-        let merged = super::viewed_sync::merge(saving, &local, written);
-        self.viewed_sync.base = Some(written.clone());
-        self.show_viewed(&merged);
+    /// A save of `saving` wrote `written`: take what the store merged in, keeping changes the
+    /// reviewer made while the save ran.
+    pub(super) fn adopt_written(&mut self, saving: &ReviewWorkspace, written: ReviewWorkspace) {
+        if self.is_transient() {
+            let local = super::viewed_sync::Viewed::of(self.workspace_mut());
+            let written = super::viewed_sync::Viewed::of(&written);
+            let merged = super::viewed_sync::merge(
+                &super::viewed_sync::Viewed::of(saving),
+                &local,
+                &written,
+            );
+            self.viewed_sync.base = Some(written);
+            self.show_viewed(&merged);
+        } else {
+            self.rebase_onto(saving, written);
+        }
+    }
+
+    /// Rebase the review's copy onto `stored` from `base` (what the copy was last based on):
+    /// what the reviewer changed since `base` stays, everything else becomes what is stored.
+    fn rebase_onto(&mut self, base: &ReviewWorkspace, stored: ReviewWorkspace) {
+        let local = self.workspace_mut().clone();
+        let merged = bcode_code_review::workspace_merge::merge_workspace(base, &local, &stored);
+        self.viewed_sync.base = Some(super::viewed_sync::Viewed::of(&stored));
+        self.viewed_sync.stored = Some(stored);
+        let renamed = merged.title != self.title;
+        let workspace = self.workspace_mut();
+        workspace.title.clone_from(&merged.title);
+        workspace.archived_at_ms = merged.archived_at_ms;
+        workspace.sources.clone_from(&merged.sources);
+        workspace
+            .reviewed_revisions
+            .clone_from(&merged.reviewed_revisions);
+        workspace.presentation.clone_from(&merged.presentation);
+        workspace
+            .stack_snapshots
+            .clone_from(&merged.stack_snapshots);
+        workspace.updated_at_ms = merged.updated_at_ms;
+        if renamed {
+            self.title.clone_from(&merged.title);
+            self.set_status(
+                format!("renamed to “{}”", merged.title),
+                StatusSeverity::Info,
+            );
+        }
+        self.show_viewed(&super::viewed_sync::Viewed::of(&merged));
+    }
+
+    /// The saved review was deleted elsewhere: stop saving and leave it.
+    pub(super) fn deleted_elsewhere(&mut self) {
+        if std::mem::replace(&mut self.viewed_sync.deleted, true) {
+            return;
+        }
+        self.pending_action = Some(Action::Close {
+            edit_sources: false,
+        });
+    }
+
+    /// Whether the saved review was deleted while it was open (the review then closes).
+    #[must_use]
+    pub const fn deleted(&self) -> bool {
+        self.viewed_sync.deleted
     }
 
     /// Show `viewed` as the review's viewed state.

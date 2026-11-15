@@ -103,6 +103,7 @@ pub(super) fn update(backend: &TestBackend, workspace: &ReviewWorkspace) {
     let _ = backend.call_now(UpdateReviewWorkspaceRequest {
         repo_path: workspace.repo_root.clone(),
         workspace: workspace.clone(),
+        base: None,
     });
 }
 
@@ -1000,6 +1001,7 @@ fn a_review_with_path_only_viewed_marks_opens_with_its_viewed_files_and_drafts()
     let _ = backend.call_now(UpdateReviewWorkspaceRequest {
         repo_path: fixture.root().to_path_buf(),
         workspace: serde_json::from_value(legacy).expect("stored workspace decodes"),
+        base: None,
     });
     let (mut scenario, screen) = open(&fixture, &backend, resume(), 140, 40);
     assert_eq!(scenario.surface().route_name(), RouteName::Review);

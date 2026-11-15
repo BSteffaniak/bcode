@@ -974,7 +974,17 @@ pub struct UpdateReviewWorkspaceRequest {
     pub repo_path: PathBuf,
     /// Updated workspace.
     pub workspace: ReviewWorkspace,
+    /// The workspace as the caller last read or wrote it. With a base, only what the caller
+    /// changed from it is written: every other field (and every other file's and thread's viewed
+    /// state) keeps what the store holds now, and a saved review that no longer exists fails
+    /// with [`REVIEW_WORKSPACE_DELETED`] instead of being written again. Without one the whole
+    /// workspace is written, and created when missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ReviewWorkspace>,
 }
+
+/// Error code of a workspace write whose saved review was deleted meanwhile.
+pub const REVIEW_WORKSPACE_DELETED: &str = "review_workspace_deleted";
 
 /// Response payload for `review.workspace.update`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

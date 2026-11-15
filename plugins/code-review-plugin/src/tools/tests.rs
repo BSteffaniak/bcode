@@ -1289,6 +1289,7 @@ fn files_are_marked_viewed_by_list_glob_layer_and_unchanged_since_a_pass() {
         .update_workspace(bcode_code_review_models::UpdateReviewWorkspaceRequest {
             repo_path: harness.fixture.root().to_path_buf(),
             workspace,
+            base: None,
         })
         .expect("pass");
     let since = harness.json(
@@ -1405,6 +1406,7 @@ fn a_stack_review_named_by_id_resolves_from_the_stack_it_last_opened_with() {
         .update_workspace(bcode_code_review_models::UpdateReviewWorkspaceRequest {
             repo_path: root,
             workspace,
+            base: None,
         })
         .expect("snapshot");
     let files = harness.json("code_review.list_files", &json!({"review": id}), SESSION);

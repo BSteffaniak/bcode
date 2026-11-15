@@ -107,6 +107,7 @@ fn saved(backend: &TestBackend, workspace: ReviewWorkspace) -> ReviewWorkspace {
     let _ = backend.call_now(UpdateReviewWorkspaceRequest {
         repo_path: workspace.repo_root.clone(),
         workspace: workspace.clone(),
+        base: None,
     });
     workspace
 }
@@ -914,6 +915,109 @@ fn viewed_marks_a_tool_wrote_survive_the_open_reviews_own_saves() {
         setup.settle();
     }
     assert!(shown(&setup).contains(&paths[0]), "{:?}", shown(&setup));
+}
+
+/// The saved review as the store holds it now, if it still exists.
+fn stored_review(setup: &Setup) -> Option<ReviewWorkspace> {
+    setup
+        .backend
+        .call_now(bcode_code_review_models::GetReviewWorkspaceRequest {
+            repo_path: setup.review.repo_root.clone(),
+            workspace_id: setup.review.id.clone(),
+        })
+        .workspace
+}
+
+#[test]
+fn a_rename_and_archive_made_elsewhere_survive_the_open_reviews_saves_and_show() {
+    let mut setup = setup(160, 50, true);
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let tools = ReviewTools::new(&data, services.store());
+    // `code_review.update_review` from an AI card or `bcode tui`, while the review is open.
+    tools
+        .update_review(
+            &setup.review.repo_root,
+            &setup.review.id,
+            &bcode_code_review::assistant::manage::ReviewChange {
+                title: Some("Renamed elsewhere".to_owned()),
+                archived: Some(true),
+            },
+        )
+        .expect("renamed and archived");
+    // The reviewer marks a file viewed, which the review saves at once.
+    setup.scenario.key("v");
+    for _ in 0..4 {
+        setup.settle();
+    }
+    let stored = stored_review(&setup).expect("still saved");
+    assert_eq!(
+        stored.title, "Renamed elsewhere",
+        "the save kept the rename"
+    );
+    assert!(stored.archived_at_ms.is_some(), "the save kept the archive");
+    let review = setup.app().review().expect("review");
+    assert_eq!(
+        review.title(),
+        "Renamed elsewhere",
+        "the review shows the rename"
+    );
+    assert!(
+        review
+            .workspace()
+            .is_some_and(|workspace| workspace.archived_at_ms.is_some()),
+        "the review's copy is archived too, so later saves keep it"
+    );
+}
+
+#[test]
+fn deleting_the_open_review_elsewhere_returns_home_and_never_brings_it_back() {
+    let mut setup = setup(160, 50, true);
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let tools = ReviewTools::new(&data, services.store());
+    // `code_review.delete_review` from `bcode tui`: the app hears nothing of it.
+    tools
+        .delete_review(&setup.review.repo_root, &setup.review.id)
+        .expect("deleted");
+    // The reviewer's next save finds it gone instead of writing it again.
+    setup.scenario.key("v");
+    for _ in 0..4 {
+        setup.settle();
+    }
+    assert_eq!(
+        stored_review(&setup),
+        None,
+        "the save did not bring it back"
+    );
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+    let home = setup.app().home().expect("home");
+    assert!(
+        home.toasts()
+            .iter()
+            .any(|toast| toast.contains("Retry backoff") && toast.contains("deleted")),
+        "{:?}",
+        home.toasts()
+    );
+}
+
+#[test]
+fn returning_to_the_app_notices_the_open_review_was_deleted() {
+    let mut setup = setup(160, 50, true);
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let tools = ReviewTools::new(&data, services.store());
+    tools
+        .delete_review(&setup.review.repo_root, &setup.review.id)
+        .expect("deleted");
+    setup.scenario.send(&bmux_tui::event::Event::Focus(
+        bmux_tui::event::FocusEvent::Gained,
+    ));
+    for _ in 0..4 {
+        setup.settle();
+    }
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+    assert_eq!(stored_review(&setup), None);
 }
 
 /// What the review shows as viewed.

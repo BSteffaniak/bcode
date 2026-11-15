@@ -1426,7 +1426,8 @@ impl<'a> ReviewTools<'a> {
             files.push(self.find_file(review, path, None)?);
         }
         let fingerprints = self.fingerprints_of(review, &files)?;
-        let mut record = review.viewed_record();
+        let base = review.viewed_record();
+        let mut record = base.clone();
         for (index, entry) in &files {
             let (patch, content) = fingerprints
                 .get(&(*index, entry.path.clone()))
@@ -1443,6 +1444,7 @@ impl<'a> ReviewTools<'a> {
         self.store.update_workspace(UpdateReviewWorkspaceRequest {
             repo_path: review.repo_root.clone(),
             workspace: record,
+            base: Some(base),
         })?;
         let names: Vec<&str> = files.iter().map(|(_, entry)| entry.path.as_str()).collect();
         Ok(Written {

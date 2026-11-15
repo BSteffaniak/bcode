@@ -551,6 +551,7 @@ fn workspace_rows_with_only_the_original_columns_list_open_and_save() {
         UpdateReviewWorkspaceRequest {
             repo_path: repo.clone(),
             workspace: renamed,
+            base: None,
         },
         &config,
     )
@@ -596,6 +597,7 @@ fn stack_snapshots_round_trip(
         UpdateReviewWorkspaceRequest {
             repo_path: repo.clone(),
             workspace: with_stack,
+            base: None,
         },
         &config,
     )
@@ -1749,4 +1751,139 @@ fn assistant_rows_written_before_tags_existed_are_tagged_with_their_review_when_
         Some("rv-legacy".to_owned())
     );
     assert_eq!(moved.created_at_ms, 5);
+}
+
+/// A store over a fresh repository and state directory, with one saved review.
+fn store_with_review(temp: &Path) -> (ReviewStore, PathBuf, ReviewWorkspace) {
+    let repo = initialized_test_repository(&temp.join("repo"));
+    let store = ReviewStore::new(CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.join("state")),
+    });
+    let created = store
+        .create_workspace(CreateReviewWorkspaceRequest {
+            repo_path: repo.clone(),
+            title: Some("Original".to_owned()),
+            sources: vec![test_source("last", ReviewSourceKind::LastCommit)],
+        })
+        .expect("create")
+        .workspace;
+    (store, repo, created)
+}
+
+fn stored(store: &ReviewStore, repo: &Path, id: &str) -> Option<ReviewWorkspace> {
+    store
+        .get_workspace(GetReviewWorkspaceRequest {
+            repo_path: repo.to_path_buf(),
+            workspace_id: id.to_owned(),
+        })
+        .expect("get")
+        .workspace
+}
+
+fn write_from(
+    store: &ReviewStore,
+    repo: &Path,
+    base: &ReviewWorkspace,
+    local: ReviewWorkspace,
+) -> Result<ReviewWorkspace, StoreError> {
+    store
+        .update_workspace(UpdateReviewWorkspaceRequest {
+            repo_path: repo.to_path_buf(),
+            workspace: local,
+            base: Some(base.clone()),
+        })
+        .map(|response| response.workspace)
+}
+
+#[test]
+fn a_save_from_an_older_copy_keeps_renames_archives_and_marks_made_elsewhere() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("repo")).expect("repo dir");
+    let (store, repo, opened) = store_with_review(temp.path());
+    // Elsewhere (the assistant's tools): a rename, a viewed mark, then an archive.
+    let mut renamed = opened.clone();
+    renamed.title = "Renamed by the assistant".to_owned();
+    write_from(&store, &repo, &opened, renamed).expect("rename");
+    let mut marked = opened.clone();
+    marked.viewed_files.insert("file.txt".to_owned());
+    write_from(&store, &repo, &opened, marked).expect("mark");
+    assert!(
+        store
+            .archive_workspace(ArchiveReviewWorkspaceRequest {
+                repo_path: repo.clone(),
+                workspace_id: opened.id.clone(),
+            })
+            .expect("archive")
+            .archived
+    );
+    // The open review still holds the copy it opened with and saves its presentation.
+    let mut local = opened.clone();
+    local.presentation = Some(bcode_code_review_models::ReviewPresentationState {
+        hide_resolved_threads: true,
+        ..Default::default()
+    });
+    let written = write_from(&store, &repo, &opened, local).expect("save");
+    let now = stored(&store, &repo, &opened.id).expect("still saved");
+    assert_eq!(written, now, "the answer is what the store holds");
+    assert_eq!(now.title, "Renamed by the assistant");
+    assert!(
+        now.archived_at_ms.is_some(),
+        "the archive survives the save"
+    );
+    assert!(
+        now.viewed_files.contains("file.txt"),
+        "the mark survives the save"
+    );
+    assert!(
+        now.presentation
+            .as_ref()
+            .is_some_and(|state| state.hide_resolved_threads),
+        "the save's own change is written"
+    );
+}
+
+#[test]
+fn a_save_never_brings_back_a_deleted_review() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("repo")).expect("repo dir");
+    let (store, repo, opened) = store_with_review(temp.path());
+    assert!(store.delete_workspace(&repo, &opened.id).expect("delete"));
+    let mut local = opened.clone();
+    local.viewed_files.insert("file.txt".to_owned());
+    let error = write_from(&store, &repo, &opened, local).expect_err("deleted");
+    assert!(matches!(error, StoreError::WorkspaceDeleted(ref id) if *id == opened.id));
+    assert_eq!(stored(&store, &repo, &opened.id), None);
+}
+
+#[test]
+fn concurrent_writers_from_one_copy_each_keep_their_marks() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("repo")).expect("repo dir");
+    let (store, repo, opened) = store_with_review(temp.path());
+    let writers: Vec<_> = (0..8)
+        .map(|index| {
+            let (store, repo, opened) = (store.clone(), repo.clone(), opened.clone());
+            std::thread::spawn(move || {
+                let mut local = opened.clone();
+                local.viewed_files.insert(format!("file{index}.rs"));
+                if index == 0 {
+                    local.title = "Renamed".to_owned();
+                }
+                write_from(&store, &repo, &opened, local).expect("write");
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("writer");
+    }
+    let now = stored(&store, &repo, &opened.id).expect("saved");
+    assert_eq!(
+        now.viewed_files,
+        (0..8)
+            .map(|index| format!("file{index}.rs"))
+            .collect::<BTreeSet<_>>(),
+        "no writer undid another's mark"
+    );
+    assert_eq!(now.title, "Renamed");
 }

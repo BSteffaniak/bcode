@@ -19,6 +19,7 @@
 //!   records, and external imports, and publishes with the built-in file publishers.
 //! * [`provider`] routes pull-request and stack sources to review-source provider plugins.
 //! * [`viewed`] matches identity-pinned viewed marks.
+//! * [`workspace_merge`] merges concurrent writers' changes to one saved review.
 //! * [`scope`] builds transient workspaces and derives the scope annotations are stored under.
 //! * [`assistant`] is what agents read and change in a review: the operations behind the code
 //!   review plugin's tools.
@@ -39,6 +40,7 @@ pub mod store;
 pub mod testing;
 pub mod threads;
 pub mod viewed;
+pub mod workspace_merge;
 
 pub use data::{DataError, ReviewData};
 pub use store::{CodeReviewConfig, CodeReviewStateLocation, ReviewStore, StoreError};

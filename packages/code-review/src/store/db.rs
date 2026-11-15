@@ -2,6 +2,37 @@
 
 use super::*;
 
+/// A workspace's JSON columns.
+struct WorkspaceColumns {
+    sources: String,
+    viewed_files: String,
+    viewed_marks: String,
+    viewed_threads: String,
+    reviewed_revisions: String,
+    presentation: Option<String>,
+    stack_snapshots: Option<String>,
+}
+
+impl WorkspaceColumns {
+    fn of(workspace: &ReviewWorkspace) -> Result<Self, StoreError> {
+        Ok(Self {
+            sources: serde_json::to_string(&workspace.sources)?,
+            viewed_files: serde_json::to_string(&workspace.viewed_files)?,
+            viewed_marks: serde_json::to_string(&workspace.viewed_marks)?,
+            viewed_threads: serde_json::to_string(&workspace.viewed_threads)?,
+            reviewed_revisions: serde_json::to_string(&workspace.reviewed_revisions)?,
+            presentation: workspace
+                .presentation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            stack_snapshots: (!workspace.stack_snapshots.is_empty())
+                .then(|| serde_json::to_string(&workspace.stack_snapshots))
+                .transpose()?,
+        })
+    }
+}
+
 pub struct CodeReviewDb<'a> {
     db: &'a dyn Database,
 }
@@ -67,6 +98,17 @@ impl<'a> CodeReviewDb<'a> {
         &self,
         workspace_id: &str,
     ) -> Result<Option<ReviewWorkspace>, StoreError> {
+        Ok(self
+            .get_workspace_revision(workspace_id)
+            .await?
+            .map(|(workspace, _)| workspace))
+    }
+
+    /// The saved workspace `workspace_id` and its row revision, which every write changes.
+    pub async fn get_workspace_revision(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<(ReviewWorkspace, i64)>, StoreError> {
         let Some(row) = self
             .db
             .select("review_workspaces")
@@ -84,6 +126,7 @@ impl<'a> CodeReviewDb<'a> {
                 "reviewed_revisions_json",
                 "presentation_v2_json",
                 "stack_snapshots_json",
+                "revision",
             ])
             .filter(Box::new(where_eq("workspace_id", workspace_id)))
             .execute_first(self.db)
@@ -91,57 +134,78 @@ impl<'a> CodeReviewDb<'a> {
         else {
             return Ok(None);
         };
-        Ok(Some(workspace_from_row(&row)?))
+        let revision = optional_i64(&row, "revision").unwrap_or(0);
+        Ok(Some((workspace_from_row(&row)?, revision)))
     }
 
+    /// Write `workspace` (whole), creating it when missing. Concurrent writers never lose a
+    /// write halfway: each write replaces the row at the revision it read, or reads again.
     pub async fn save_workspace(&self, workspace: &ReviewWorkspace) -> Result<(), StoreError> {
-        let sources_json = serde_json::to_string(&workspace.sources)?;
-        let viewed_files_json = serde_json::to_string(&workspace.viewed_files)?;
-        let viewed_marks_json = serde_json::to_string(&workspace.viewed_marks)?;
-        let viewed_threads_json = serde_json::to_string(&workspace.viewed_threads)?;
-        let reviewed_revisions_json = serde_json::to_string(&workspace.reviewed_revisions)?;
-        let presentation_json = workspace
-            .presentation
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let stack_snapshots_json = (!workspace.stack_snapshots.is_empty())
-            .then(|| serde_json::to_string(&workspace.stack_snapshots))
-            .transpose()?;
-        if self.get_workspace(&workspace.id).await?.is_some() {
-            self.db
-                .update("review_workspaces")
-                .value("repo_root", workspace.repo_root.display().to_string())
-                .value("title", workspace.title.clone())
-                .value("sources_json", sources_json)
-                .value("viewed_files_json", viewed_files_json.clone())
-                .value("viewed_marks_json", viewed_marks_json.clone())
-                .value("viewed_threads_json", viewed_threads_json.clone())
-                .value("reviewed_revisions_json", reviewed_revisions_json.clone())
-                .value("presentation_v2_json", presentation_json.clone())
-                .value("stack_snapshots_json", stack_snapshots_json.clone())
-                .value(
-                    "updated_at_ms",
-                    u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
-                )
-                .value("archived_at_ms", optional_u64(workspace.archived_at_ms))
-                .filter(Box::new(where_eq("workspace_id", workspace.id.clone())))
-                .execute(self.db)
-                .await?;
-            return Ok(());
+        for _ in 0..MAX_WORKSPACE_WRITE_ATTEMPTS {
+            match self.get_workspace_revision(&workspace.id).await? {
+                Some((_, revision)) => {
+                    if self.update_workspace_if(workspace, revision).await? {
+                        return Ok(());
+                    }
+                }
+                None => match self.insert_workspace(workspace).await {
+                    Ok(()) => return Ok(()),
+                    // Another writer created it meanwhile: replace that row instead.
+                    Err(_) if self.get_workspace(&workspace.id).await?.is_some() => {}
+                    Err(error) => return Err(error),
+                },
+            }
         }
+        Err(StoreError::Conflict(workspace.id.clone()))
+    }
+
+    /// Replace the row of `workspace` when its revision is still `revision`. Returns whether it
+    /// was replaced (false when another write or a delete came first).
+    pub async fn update_workspace_if(
+        &self,
+        workspace: &ReviewWorkspace,
+        revision: i64,
+    ) -> Result<bool, StoreError> {
+        let columns = WorkspaceColumns::of(workspace)?;
+        let updated = self
+            .db
+            .update("review_workspaces")
+            .value("repo_root", workspace.repo_root.display().to_string())
+            .value("title", workspace.title.clone())
+            .value("sources_json", columns.sources)
+            .value("viewed_files_json", columns.viewed_files)
+            .value("viewed_marks_json", columns.viewed_marks)
+            .value("viewed_threads_json", columns.viewed_threads)
+            .value("reviewed_revisions_json", columns.reviewed_revisions)
+            .value("presentation_v2_json", columns.presentation)
+            .value("stack_snapshots_json", columns.stack_snapshots)
+            .value(
+                "updated_at_ms",
+                u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
+            )
+            .value("archived_at_ms", optional_u64(workspace.archived_at_ms))
+            .value("revision", revision.wrapping_add(1))
+            .filter(Box::new(where_eq("workspace_id", workspace.id.clone())))
+            .filter(Box::new(where_eq("revision", revision)))
+            .execute(self.db)
+            .await?;
+        Ok(!updated.is_empty())
+    }
+
+    async fn insert_workspace(&self, workspace: &ReviewWorkspace) -> Result<(), StoreError> {
+        let columns = WorkspaceColumns::of(workspace)?;
         self.db
             .insert("review_workspaces")
             .value("workspace_id", workspace.id.clone())
             .value("repo_root", workspace.repo_root.display().to_string())
             .value("title", workspace.title.clone())
-            .value("sources_json", sources_json)
-            .value("viewed_files_json", viewed_files_json)
-            .value("viewed_marks_json", viewed_marks_json)
-            .value("viewed_threads_json", viewed_threads_json)
-            .value("reviewed_revisions_json", reviewed_revisions_json)
-            .value("presentation_v2_json", presentation_json)
-            .value("stack_snapshots_json", stack_snapshots_json)
+            .value("sources_json", columns.sources)
+            .value("viewed_files_json", columns.viewed_files)
+            .value("viewed_marks_json", columns.viewed_marks)
+            .value("viewed_threads_json", columns.viewed_threads)
+            .value("reviewed_revisions_json", columns.reviewed_revisions)
+            .value("presentation_v2_json", columns.presentation)
+            .value("stack_snapshots_json", columns.stack_snapshots)
             .value(
                 "created_at_ms",
                 u64_to_i64(workspace.created_at_ms.unwrap_or_else(now_ms)),
@@ -151,9 +215,47 @@ impl<'a> CodeReviewDb<'a> {
                 u64_to_i64(workspace.updated_at_ms.unwrap_or_else(now_ms)),
             )
             .value("archived_at_ms", optional_u64(workspace.archived_at_ms))
+            .value("revision", 0_i64)
             .execute(self.db)
             .await?;
         Ok(())
+    }
+
+    /// Write what `local` changed from `base` over the stored workspace (see
+    /// [`crate::workspace_merge`]), stamping it updated when the review itself changed.
+    /// Returns the workspace written.
+    ///
+    /// A saved review that no longer exists fails with [`StoreError::WorkspaceDeleted`]; an
+    /// unsaved review's record (its transient scope) is created when missing.
+    pub async fn merge_workspace(
+        &self,
+        base: &ReviewWorkspace,
+        local: &ReviewWorkspace,
+    ) -> Result<ReviewWorkspace, StoreError> {
+        for _ in 0..MAX_WORKSPACE_WRITE_ATTEMPTS {
+            let Some((stored, revision)) = self.get_workspace_revision(&local.id).await? else {
+                if !crate::scope::is_transient_scope_id(&local.id) {
+                    return Err(StoreError::WorkspaceDeleted(local.id.clone()));
+                }
+                let mut created = local.clone();
+                created.updated_at_ms = Some(now_ms());
+                match self.insert_workspace(&created).await {
+                    Ok(()) => return Ok(created),
+                    Err(_) if self.get_workspace(&local.id).await?.is_some() => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            let mut merged = crate::workspace_merge::merge_workspace(base, local, &stored);
+            merged.updated_at_ms = if super::same_review(&stored, &merged) {
+                stored.updated_at_ms
+            } else {
+                Some(now_ms())
+            };
+            if self.update_workspace_if(&merged, revision).await? {
+                return Ok(merged);
+            }
+        }
+        Err(StoreError::Conflict(local.id.clone()))
     }
 
     pub async fn save_external_import(
@@ -313,17 +415,18 @@ impl<'a> CodeReviewDb<'a> {
         workspace_id: &str,
         now: u64,
     ) -> Result<bool, StoreError> {
-        if self.get_workspace(workspace_id).await?.is_none() {
-            return Ok(false);
+        for _ in 0..MAX_WORKSPACE_WRITE_ATTEMPTS {
+            let Some((mut workspace, revision)) = self.get_workspace_revision(workspace_id).await?
+            else {
+                return Ok(false);
+            };
+            workspace.archived_at_ms = Some(now);
+            workspace.updated_at_ms = Some(now);
+            if self.update_workspace_if(&workspace, revision).await? {
+                return Ok(true);
+            }
         }
-        self.db
-            .update("review_workspaces")
-            .value("archived_at_ms", u64_to_i64(now))
-            .value("updated_at_ms", u64_to_i64(now))
-            .filter(Box::new(where_eq("workspace_id", workspace_id.to_string())))
-            .execute(self.db)
-            .await?;
-        Ok(true)
+        Err(StoreError::Conflict(workspace_id.to_owned()))
     }
 
     /// Delete a workspace's row. Returns whether it existed.
@@ -1543,6 +1646,22 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(workspace_viewed_threads_column_migration());
     source.add_migration(super::conversation::conversation_snapshots_table_migration());
     source.add_migration(super::looks::layer_looks_table_migration());
+    source.add_migration(workspace_revision_column_migration());
+}
+
+/// The revision of a saved review's row, changed by every write, so concurrent writers replace
+/// only the row they read.
+pub fn workspace_revision_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "028_workspace_revision_column".to_string(),
+        Box::new(alter_table("review_workspaces").add_column(
+            "revision".to_string(),
+            DataType::BigInt,
+            false,
+            Some(DatabaseValue::Int64(0)),
+        )),
+        None,
+    )
 }
 
 /// Threads marked viewed (see `ReviewWorkspace::viewed_threads`); older rows read as none.

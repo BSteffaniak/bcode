@@ -69,6 +69,7 @@ pub(super) fn setup(fixture: &GitFixture, width: u16, height: u16) -> Setup {
     let _ = backend.call_now(UpdateReviewWorkspaceRequest {
         repo_path: workspace.repo_root.clone(),
         workspace: workspace.clone(),
+        base: None,
     });
     let mut scenario = Scenario::new(build(&backend, &workspace, Duration::ZERO), width, height);
     stable(&mut scenario);
@@ -502,6 +503,7 @@ fn viewed_state_is_right_on_the_first_frame() {
     let _ = first.backend.call_now(UpdateReviewWorkspaceRequest {
         repo_path: workspace.repo_root.clone(),
         workspace: workspace.clone(),
+        base: None,
     });
 
     let mut scenario = Scenario::new(build(&first.backend, &workspace, Duration::ZERO), 100, 40);

@@ -65,8 +65,12 @@ fn data_error(error: &DataError) -> ProviderCallError {
 }
 
 fn store_error(error: &StoreError) -> ProviderCallError {
+    let code = match error {
+        StoreError::WorkspaceDeleted(_) => models::REVIEW_WORKSPACE_DELETED,
+        _ => STORE_ERROR_FAILED,
+    };
     ProviderCallError {
-        code: STORE_ERROR_FAILED.to_owned(),
+        code: code.to_owned(),
         message: error.to_string(),
     }
 }

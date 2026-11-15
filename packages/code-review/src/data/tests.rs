@@ -1870,6 +1870,7 @@ fn workspace_review_state_persists_and_old_rows_read_as_empty() {
         .update_workspace(UpdateReviewWorkspaceRequest {
             repo_path: repo.clone(),
             workspace: workspace.clone(),
+            base: None,
         })
         .expect("save");
     let get = || {

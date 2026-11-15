@@ -257,16 +257,22 @@ async fn totals(
         .map_err(|error| error.message)
 }
 
-/// Save `workspace` (rename, restore).
+/// Save what `workspace` changed from `base`, the listed copy (rename, restore); everything
+/// else changed since the list was read is kept.
 ///
 /// # Errors
 ///
 /// Returns the service failure message.
-pub async fn update(services: ReviewServices, workspace: ReviewWorkspace) -> Result<(), String> {
+pub async fn update(
+    services: ReviewServices,
+    base: ReviewWorkspace,
+    workspace: ReviewWorkspace,
+) -> Result<(), String> {
     let _: UpdateReviewWorkspaceResponse = services
         .call(UpdateReviewWorkspaceRequest {
             repo_path: workspace.repo_root.clone(),
             workspace,
+            base: Some(base),
         })
         .await
         .map_err(|error| error.message)?;

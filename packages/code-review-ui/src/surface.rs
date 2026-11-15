@@ -169,7 +169,7 @@ mod threads;
 mod view_context;
 mod viewed_sync;
 
-pub(crate) use viewed_sync::Viewed as ViewedState;
+pub(crate) use viewed_sync::SaveFailure;
 
 pub use annotate::COMPOSER_SCOPE;
 pub use assistant_actions::{ComparisonChange, GoTo, ReviewCommand, VersionPick, ViewChange};
@@ -983,6 +983,7 @@ impl ReviewSurface {
         }
         if workspace.id != TRANSIENT_WORKSPACE_ID {
             self.viewed_sync.base = Some(viewed_sync::Viewed::of(&workspace));
+            self.viewed_sync.stored = Some(workspace.clone());
         }
         self.workspace = Some(workspace);
         self
@@ -1180,6 +1181,12 @@ impl ReviewSurface {
     #[must_use]
     pub const fn workspace(&self) -> Option<&ReviewWorkspace> {
         self.workspace.as_ref()
+    }
+
+    /// The review's title.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
     }
 
     /// Whether the review is not saved (a direct entry); `save_review` makes it durable.
@@ -1616,7 +1623,7 @@ impl ReviewSurface {
     }
 
     /// A save finished: save again what changed meanwhile, and take what it merged in.
-    fn finish_save(&mut self, result: Result<viewed_sync::Viewed, String>) {
+    fn finish_save(&mut self, result: Result<Box<ReviewWorkspace>, viewed_sync::SaveFailure>) {
         self.save = if self.save == SaveState::RunningThenPending {
             SaveState::Pending
         } else {
@@ -1626,10 +1633,11 @@ impl ReviewSurface {
         match result {
             Ok(written) => {
                 if let Some(saving) = saving {
-                    self.adopt_viewed(&saving, &written);
+                    self.adopt_written(&saving, *written);
                 }
             }
-            Err(error) => self.toasts.push(
+            Err(viewed_sync::SaveFailure::Deleted) => self.deleted_elsewhere(),
+            Err(viewed_sync::SaveFailure::Failed(error)) => self.toasts.push(
                 ToastSeverity::Error,
                 "Could not save the review state",
                 Some(error),
@@ -1645,18 +1653,33 @@ impl ReviewSurface {
             self.save = SaveState::Idle;
             return;
         };
-        // An unsaved review keeps only its viewed state, under its target's scope.
-        if workspace.id == TRANSIENT_WORKSPACE_ID {
-            workspace = loader::transient_viewed_record(&workspace);
+        if self.viewed_sync.deleted {
+            self.save = SaveState::Idle;
+            return;
         }
+        // An unsaved review keeps only its viewed state, under its target's scope; a saved one
+        // writes what it changed since it last read or wrote the store.
+        let base = if workspace.id == TRANSIENT_WORKSPACE_ID {
+            workspace = loader::transient_viewed_record(&workspace);
+            let mut base = workspace.clone();
+            self.viewed_sync
+                .base
+                .clone()
+                .unwrap_or_default()
+                .apply(&mut base);
+            base
+        } else {
+            self.viewed_sync
+                .stored
+                .clone()
+                .unwrap_or_else(|| workspace.clone())
+        };
         self.save = SaveState::Running;
-        let local = viewed_sync::Viewed::of(&workspace);
-        self.viewed_sync.saving = Some(local.clone());
-        let base = self.viewed_sync.base.clone();
+        self.viewed_sync.saving = Some(workspace.clone());
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
-            let result = save_merging_viewed(services, workspace, base, local).await;
+            let result = save_record(services, workspace, base).await;
             inbox.push(Message::Saved(result));
         }));
     }
@@ -5240,6 +5263,11 @@ impl View for ReviewSurface {
             Event::Focus(FocusEvent::Gained) => {
                 self.request_token(host, false);
                 self.conversation_focus(true, host);
+                // Another client (`bcode tui`, another app) may have renamed, archived, marked
+                // or deleted the review meanwhile.
+                if !self.is_transient() {
+                    self.reload_stored(host);
+                }
                 Action::None
             }
             Event::Focus(FocusEvent::Lost) => {
@@ -5364,28 +5392,25 @@ const fn filter_policy() -> TextInputPolicy {
 /// Tag of the over-the-layer-limit warning, whose dismissal the review remembers.
 const STACK_WARNING_TAG: &str = "stack_limit";
 
-/// Save `workspace`, first merging its viewed state (`local`, changed from `base`) with the
-/// viewed state stored now, so marks written elsewhere since `base` are kept. Returns the viewed
-/// state written.
-async fn save_merging_viewed(
+/// Save what `workspace` changed from `base` over the stored record. Returns the record written.
+async fn save_record(
     services: ReviewServices,
-    mut workspace: ReviewWorkspace,
-    base: Option<viewed_sync::Viewed>,
-    local: viewed_sync::Viewed,
-) -> Result<viewed_sync::Viewed, String> {
-    let mut written = local.clone();
-    if let Some(base) = base {
-        let stored: Result<bcode_code_review_models::GetReviewWorkspaceResponse, _> = services
-            .call(bcode_code_review_models::GetReviewWorkspaceRequest {
-                repo_path: workspace.repo_root.clone(),
-                workspace_id: workspace.id.clone(),
-            })
-            .await;
-        if let Ok(Some(stored)) = stored.map(|response| response.workspace) {
-            written = viewed_sync::merge(&base, &local, &viewed_sync::Viewed::of(&stored));
-            written.apply(&mut workspace);
-        }
-    }
-    loader::save_workspace(services, workspace).await?;
-    Ok(written)
+    workspace: ReviewWorkspace,
+    base: ReviewWorkspace,
+) -> Result<Box<ReviewWorkspace>, viewed_sync::SaveFailure> {
+    services
+        .call(bcode_code_review_models::UpdateReviewWorkspaceRequest {
+            repo_path: workspace.repo_root.clone(),
+            workspace,
+            base: Some(base),
+        })
+        .await
+        .map(|response| Box::new(response.workspace))
+        .map_err(|error| {
+            if error.code == bcode_code_review_models::REVIEW_WORKSPACE_DELETED {
+                viewed_sync::SaveFailure::Deleted
+            } else {
+                viewed_sync::SaveFailure::Failed(error.message)
+            }
+        })
 }

@@ -326,7 +326,8 @@ impl ReviewTools<'_> {
         id: &str,
         change: &ReviewChange,
     ) -> Result<ReviewEntry, AssistantError> {
-        let mut workspace = self.saved_or_missing(repo_path, id)?;
+        let base = self.saved_or_missing(repo_path, id)?;
+        let mut workspace = base.clone();
         if change.title.is_none() && change.archived.is_none() {
             return Err(AssistantError::Invalid(
                 "pass `title`, `archived` or both".to_owned(),
@@ -342,7 +343,7 @@ impl ReviewTools<'_> {
         match change.archived {
             Some(true) if workspace.archived_at_ms.is_none() => {
                 if change.title.is_some() {
-                    self.save(repo_path, workspace)?;
+                    self.save(repo_path, base, workspace)?;
                 }
                 self.store
                     .archive_workspace(ArchiveReviewWorkspaceRequest {
@@ -354,7 +355,7 @@ impl ReviewTools<'_> {
             Some(false) => workspace.archived_at_ms = None,
             _ => {}
         }
-        Ok(ReviewEntry::of(&self.save(repo_path, workspace)?))
+        Ok(ReviewEntry::of(&self.save(repo_path, base, workspace)?))
     }
 
     /// Delete the saved review `id`.
@@ -387,9 +388,11 @@ impl ReviewTools<'_> {
             })
     }
 
+    /// Write what `workspace` changed from `base`, keeping every change made elsewhere since.
     fn save(
         &self,
         repo_path: &Path,
+        base: ReviewWorkspace,
         workspace: ReviewWorkspace,
     ) -> Result<ReviewWorkspace, AssistantError> {
         Ok(self
@@ -397,6 +400,7 @@ impl ReviewTools<'_> {
             .update_workspace(UpdateReviewWorkspaceRequest {
                 repo_path: repo_path.to_path_buf(),
                 workspace,
+                base: Some(base),
             })?
             .workspace)
     }
@@ -426,7 +430,8 @@ impl ReviewTools<'_> {
         // The same path in several layers is one file to the reviewer's marks.
         selected.dedup_by(|a, b| a.1.path == b.1.path);
         let fingerprints = self.fingerprints_of(review, &selected)?;
-        let mut record = review.viewed_record();
+        let base = review.viewed_record();
+        let mut record = base.clone();
         let mut changed = Vec::new();
         let mut kept = Vec::new();
         for (index, entry) in &selected {
@@ -450,9 +455,12 @@ impl ReviewTools<'_> {
             changed.push(entry.path.clone());
         }
         if !changed.is_empty() {
+            // Only these files' marks are written; marks the open review or another writer
+            // changed meanwhile stay.
             self.store.update_workspace(UpdateReviewWorkspaceRequest {
                 repo_path: review.repo_root.clone(),
                 workspace: record,
+                base: Some(base),
             })?;
         }
         let state = if viewed { "viewed" } else { "not viewed" };

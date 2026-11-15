@@ -452,35 +452,11 @@ impl ReviewApp {
             if let Some(home) = self.home.as_mut() {
                 home.refresh();
             }
-            if self.deleted_review_on_screen(&tools) {
-                self.show_home(true);
-                return true;
-            }
         }
         if let Route::Review(review) = &mut self.route {
             review.apply_assistant_tools(&tools, host);
         }
         true
-    }
-
-    /// Whether a finished `code_review.delete_review` named the review on screen.
-    fn deleted_review_on_screen(&self, tools: &[(String, String)]) -> bool {
-        let Some(id) = self
-            .review()
-            .and_then(ReviewSurface::workspace)
-            .map(|workspace| workspace.id.clone())
-        else {
-            return false;
-        };
-        tools.iter().any(|(name, arguments)| {
-            name == "code_review.delete_review"
-                && serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|arguments| {
-                    arguments["review"] == id.as_str()
-                        || arguments["reviews"]
-                            .as_array()
-                            .is_some_and(|ids| ids.iter().any(|named| named == id.as_str()))
-                })
-        })
     }
 
     /// Paint the route in `screen` with the Ask AI button at the end of its header row.
@@ -688,8 +664,8 @@ impl ReviewApp {
                 Action::Redraw
             }
             WizardOutcome::Update { workspace } => {
-                self.editing = None;
-                self.update_sources(*workspace, host);
+                let base = self.editing.take().map(|base| *base);
+                self.update_sources(*workspace, base, host);
                 Action::Redraw
             }
             WizardOutcome::Create { title, sources } => {
@@ -715,12 +691,25 @@ impl ReviewApp {
             self.keymap_stale = true;
             return Action::Redraw;
         }
+        let deleted = match &self.route {
+            Route::Review(review) if review.deleted() => Some(review.title().to_owned()),
+            _ => None,
+        };
         self.show_home(true);
+        if let (Some(title), Some(home)) = (deleted, self.home.as_mut()) {
+            home.notify_deleted(&title);
+        }
         Action::Redraw
     }
 
-    /// Save edited sources (durable reviews) and open the review with them.
-    fn update_sources(&mut self, workspace: ReviewWorkspace, host: &UiContext) {
+    /// Save edited sources (durable reviews; what changed from `base`, the review as it was
+    /// opened for editing) and open the review with them.
+    fn update_sources(
+        &mut self,
+        workspace: ReviewWorkspace,
+        base: Option<ReviewWorkspace>,
+        host: &UiContext,
+    ) {
         if workspace.id == entry::TRANSIENT_WORKSPACE_ID {
             self.open_review(workspace, Some(host));
             return;
@@ -733,6 +722,7 @@ impl ReviewApp {
                 .call(bcode_code_review_models::UpdateReviewWorkspaceRequest {
                     repo_path,
                     workspace,
+                    base,
                 })
                 .await
                 .map_err(|error| error.message)?;

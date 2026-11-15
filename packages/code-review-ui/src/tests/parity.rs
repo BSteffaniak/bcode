@@ -43,6 +43,7 @@ fn setup(fixture: &GitFixture, width: u16, height: u16) -> Setup {
     let _ = backend.call_now(UpdateReviewWorkspaceRequest {
         repo_path: workspace.repo_root.clone(),
         workspace: workspace.clone(),
+        base: None,
     });
     let surface = ReviewSurface::new(
         backend.services(),
