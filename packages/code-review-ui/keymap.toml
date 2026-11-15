@@ -224,6 +224,9 @@ keymap_actions = [
     { id = "bcode.code_review.viewed_files_toggle", scope = "code-review", description = "Show / hide viewed files in the file panel", defaults = [
         "h",
     ] },
+    { id = "bcode.code_review.files_layout_toggle", scope = "code-review", description = "List the file panel's files flat or as a tree", defaults = [
+        "`",
+    ] },
     { id = "bcode.code_review.open_thread_next", scope = "code-review", description = "Next open thread", defaults = [
     ] },
     { id = "bcode.code_review.open_thread_previous", scope = "code-review", description = "Previous open thread", defaults = [

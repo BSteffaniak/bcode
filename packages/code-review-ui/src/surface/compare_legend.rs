@@ -302,7 +302,7 @@ impl ReviewSurface {
     /// Show (or hide again) the files the comparison hides in the panel's sources.
     pub(super) fn show_compare_hidden(&mut self, shown: bool) {
         let sources = self.panel_sources();
-        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        let (theme, file_view) = (self.theme, self.file_view);
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -314,7 +314,7 @@ impl ReviewSurface {
         }
         if changed {
             review.note_splices();
-            review.rebuild_files(&theme, hide_viewed);
+            review.rebuild_files(&theme, file_view);
             // Rows already measured may lay out differently beside the files shown (or hidden)
             // again: measure them again.
             self.layout_revision += 1;

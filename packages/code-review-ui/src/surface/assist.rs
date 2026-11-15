@@ -281,11 +281,58 @@ impl ReviewSurface {
         }
     }
 
+    /// List the file panel's files flat or as a tree. The selected file stays selected; a
+    /// selected directory hands its selection to its first file. Saved with the review.
+    pub(super) fn toggle_file_layout(&mut self) {
+        let flat = !self.file_view.layout.is_flat();
+        self.file_view.flat_choice = Some(flat);
+        self.file_view.layout = self.config.file_layout(Some(flat));
+        let (theme, view) = (self.theme, self.file_view);
+        if let Some(review) = self.review.as_mut() {
+            let selected = review.tree.borrow().selected_id().map(str::to_owned);
+            // A directory has no row in a flat list: its first file takes the selection.
+            let file = selected.as_deref().and_then(|id| {
+                review
+                    .files
+                    .file_of(id)
+                    .or_else(|| review.files.first_file_under(id))
+                    .cloned()
+            });
+            review.rebuild_files(&theme, view);
+            let id = file
+                .as_ref()
+                .and_then(|file| review.files.file_id(file))
+                .map(str::to_owned);
+            if let Some(id) = id {
+                review.tree.borrow_mut().set_selected_id(&id);
+            }
+            self.tree_reveal = true;
+        }
+        self.request_save();
+        self.set_status(
+            if flat {
+                "files listed flat in the file panel"
+            } else {
+                "files shown as a tree in the file panel"
+            },
+            StatusSeverity::Info,
+        );
+    }
+
+    /// The hint for the layout toggle: what it switches to.
+    pub(super) const fn file_layout_hint(&self) -> &'static str {
+        if self.file_view.layout.is_flat() {
+            "tree"
+        } else {
+            "flat"
+        }
+    }
+
     /// Show or hide viewed files in the file panel.
     pub(super) fn toggle_viewed_files(&mut self) {
-        self.hide_viewed_files = !self.hide_viewed_files;
+        self.file_view.hide_viewed = !self.file_view.hide_viewed;
         let theme = self.theme;
-        let hide = self.hide_viewed_files;
+        let hide = self.file_view.hide_viewed;
         if let Some(review) = self.review.as_mut()
             && review.files.set_hide_viewed(hide, &theme)
         {

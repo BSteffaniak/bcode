@@ -243,7 +243,7 @@ impl ReviewSurface {
                 Self::apply_compare_click(review, &click.key, action);
                 // The file panel lists what the document shows.
                 if action == crate::rows::compare::CompareAction::ShowFiles {
-                    review.rebuild_files(&self.theme, self.hide_viewed_files);
+                    review.rebuild_files(&self.theme, self.file_view);
                     // Rows already measured may lay out differently beside the files shown
                     // (or hidden) again: measure them again.
                     self.layout_revision += 1;

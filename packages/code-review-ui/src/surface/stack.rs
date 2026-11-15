@@ -101,14 +101,14 @@ impl ReviewSurface {
         let home = target.home.clone();
         let one_layer = self.stack_view == StackView::OneLayer;
         let theme = self.theme;
-        let hide_viewed = self.hide_viewed_files;
+        let file_view = self.file_view;
         let Some(review) = self.review.as_mut() else {
             return;
         };
         let cursor = review.cursor.clone();
         if review.doc.set_focus(one_layer.then_some(source.as_str())) {
             review.note_splices();
-            review.rebuild_files(&theme, hide_viewed);
+            review.rebuild_files(&theme, file_view);
             let landing = cursor
                 .filter(|key| review.doc.index_of(key).is_some())
                 .unwrap_or(home);

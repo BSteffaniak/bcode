@@ -900,3 +900,132 @@ fn motions_reach_open_threads_answers_and_attention_and_answers_reconnect() {
     let presentation = stored(&setup).presentation.expect("presentation");
     assert_eq!(presentation.expanded_answers.len(), 1);
 }
+
+/// Move the file panel's selection down until `wanted` holds; its id.
+fn select_in_files(
+    scenario: &mut Scenario<ReviewSurface>,
+    wanted: impl Fn(&str) -> bool,
+) -> String {
+    for _ in 0..200 {
+        if let Some(id) = scenario.surface().tree_selection()
+            && wanted(&id)
+        {
+            return id;
+        }
+        scenario.key("down");
+        stable(scenario);
+    }
+    panic!("no such row in the file panel");
+}
+
+#[test]
+fn backtick_lists_files_flat_keeps_the_selection_and_the_tree_comes_back_as_left() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let mut setup = setup(&fixture, 160, 40);
+    setup.scenario.key("tab");
+    stable(&mut setup.scenario);
+    assert_eq!(setup.scenario.surface().focus(), Focus::Files);
+    // Close a directory, then select a file after it.
+    let directory = select_in_files(&mut setup.scenario, |id| id.starts_with('d'));
+    setup.scenario.key("space");
+    stable(&mut setup.scenario);
+    assert!(!setup.scenario.surface().tree_expanded(&directory));
+    let file = select_in_files(&mut setup.scenario, |id| id.starts_with('f'));
+
+    // Flat: no directories, the same file selected, the choice saved with the review.
+    setup.scenario.key("`");
+    stable(&mut setup.scenario);
+    let tree = setup.scenario.surface().file_tree().unwrap();
+    assert!(tree.layout().is_flat());
+    assert!(tree.items().iter().all(|item| !item.id.starts_with('d')));
+    assert_eq!(
+        setup.scenario.surface().tree_selection(),
+        Some(file.clone())
+    );
+
+    // The tree again: the directory closed before is still closed.
+    setup.scenario.key("`");
+    stable(&mut setup.scenario);
+    assert!(
+        !setup
+            .scenario
+            .surface()
+            .file_tree()
+            .unwrap()
+            .layout()
+            .is_flat()
+    );
+    assert!(!setup.scenario.surface().tree_expanded(&directory));
+    assert_eq!(setup.scenario.surface().tree_selection(), Some(file));
+
+    // A selected directory hands the selection to its first file.
+    setup.scenario.key("space");
+    stable(&mut setup.scenario);
+    let open = select_in_files(&mut setup.scenario, |id| id.starts_with('d'));
+    let first = setup
+        .scenario
+        .surface()
+        .file_tree()
+        .unwrap()
+        .first_file_under(&open)
+        .cloned()
+        .expect("a file under the directory");
+    setup.scenario.key("`");
+    stable(&mut setup.scenario);
+    let tree = setup.scenario.surface().file_tree().unwrap();
+    assert_eq!(
+        setup.scenario.surface().tree_selection().as_deref(),
+        tree.file_id(&first)
+    );
+
+    // The choice is saved with the review, and reopening keeps it.
+    setup.scenario.key("q");
+    stable(&mut setup.scenario);
+    let reopened = stored(&setup);
+    assert_eq!(
+        reopened
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .flat_files,
+        Some(true)
+    );
+    let surface = ReviewSurface::new(
+        setup.backend.services(),
+        reopened.repo_root.clone(),
+        reopened.sources.clone(),
+        reopened.title.clone(),
+        ReviewViewConfig::default(),
+    )
+    .with_scroll_motion(Duration::ZERO)
+    .with_workspace(reopened);
+    let mut scenario = Scenario::new(surface, 160, 40);
+    stable(&mut scenario);
+    assert!(scenario.surface().file_tree().unwrap().layout().is_flat());
+}
+
+#[test]
+fn a_configured_flat_list_applies_until_the_reviewer_chooses() {
+    let fixture = GitFixture::generate(FixtureSpec::small());
+    let config: ReviewViewConfig = toml::from_str("file_layout = \"flat\"").expect("config");
+    let workspace = ReviewWorkspace {
+        id: "configured-flat".to_owned(),
+        ..ReviewWorkspace::from_target(fixture.root().to_path_buf(), fixture_branch_compare())
+    };
+    let backend = Arc::new(TestBackend::default());
+    let surface = ReviewSurface::new(
+        backend.services(),
+        workspace.repo_root.clone(),
+        workspace.sources.clone(),
+        workspace.title.clone(),
+        config,
+    )
+    .with_scroll_motion(Duration::ZERO)
+    .with_workspace(workspace);
+    let mut scenario = Scenario::new(surface, 160, 40);
+    stable(&mut scenario);
+    assert!(scenario.surface().file_tree().unwrap().layout().is_flat());
+    scenario.key("`");
+    stable(&mut scenario);
+    assert!(!scenario.surface().file_tree().unwrap().layout().is_flat());
+}

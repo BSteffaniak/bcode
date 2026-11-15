@@ -28,7 +28,7 @@ use super::agent::AgentStreams;
 use super::chrome::{self, HeaderModel, HeaderPart, HeaderPlan, Status, Toasts};
 use super::composer::{Composer, ComposerInput};
 use super::config::{ReviewViewConfig, resolve};
-use super::files::FileTree;
+use super::files::{FilePanelView, FileTree};
 use super::loader::{self, Inbox, Message, NeedResult, Opened};
 use super::notes::ReviewNotes;
 use super::palette::Overlay;
@@ -373,6 +373,9 @@ struct Review {
     totals: (u64, u64),
     files: FileTree,
     tree: RefCell<TreeViewState>,
+    /// Directories and groups the reviewer closed, kept while a flat list has no directories
+    /// so they are closed again when the tree comes back.
+    closed_dirs: BTreeSet<String>,
     /// Files whose header the document rebuilt since the tree last looked.
     dirty_files: BTreeSet<FileRef>,
     threads: RefCell<ThreadRows>,
@@ -387,6 +390,7 @@ impl Review {
         opened: Opened,
         config: DocumentConfig,
         theme: &ReviewTheme,
+        view: FilePanelView,
     ) -> Self {
         let Opened {
             inputs,
@@ -422,7 +426,8 @@ impl Review {
             },
         );
         let doc = ReviewDocument::new(repo_path, inputs, config);
-        let files = FileTree::new(&doc, theme);
+        let mut files = FileTree::with_layout(&doc, theme, view.layout);
+        files.set_hide_viewed(view.hide_viewed, theme);
         let mut tree = TreeViewState::new(None);
         tree.set_expanded_ids(files.expandable_ids().map(str::to_owned));
         let mut review = Self {
@@ -455,6 +460,7 @@ impl Review {
             totals,
             files,
             tree: RefCell::new(tree),
+            closed_dirs: BTreeSet::new(),
             dirty_files: BTreeSet::new(),
             threads: RefCell::new(ThreadRows::default()),
             threads_state: RefCell::new(TreeViewState::new(None)),
@@ -464,19 +470,23 @@ impl Review {
         review
     }
 
-    /// Rebuild the file panel from the document (after its focus or a comparison changed):
-    /// directories and groups the reviewer closed stay closed, every other one is open.
-    fn rebuild_files(&mut self, theme: &ReviewTheme, hide_viewed: bool) {
-        let closed: BTreeSet<String> = {
+    /// Rebuild the file panel from the document (after its focus, a comparison or the
+    /// panel's view changed): directories and groups the reviewer closed stay closed, every other
+    /// one is open. Directories closed in a tree stay remembered through a flat list.
+    fn rebuild_files(&mut self, theme: &ReviewTheme, view: FilePanelView) {
+        {
             let tree = self.tree.borrow();
-            self.files
-                .expandable_ids()
-                .filter(|id| !tree.is_expanded(id))
-                .map(str::to_owned)
-                .collect()
-        };
-        self.files = FileTree::new(&self.doc, theme);
-        self.files.set_hide_viewed(hide_viewed, theme);
+            for id in self.files.expandable_ids() {
+                if tree.is_expanded(id) {
+                    self.closed_dirs.remove(id);
+                } else {
+                    self.closed_dirs.insert(id.to_owned());
+                }
+            }
+        }
+        self.files = FileTree::with_layout(&self.doc, theme, view.layout);
+        self.files.set_hide_viewed(view.hide_viewed, theme);
+        let closed = &self.closed_dirs;
         self.tree.borrow_mut().set_expanded_ids(
             self.files
                 .expandable_ids()
@@ -747,8 +757,9 @@ pub struct ReviewSurface {
     folds: Folds,
     /// Resolved threads are hidden from the document (persisted).
     hide_resolved: bool,
-    /// Viewed files are hidden from the file panel (persisted).
-    hide_viewed_files: bool,
+    /// What the file panel shows besides the document: viewed files hidden, tree or flat list
+    /// (persisted).
+    file_view: FilePanelView,
     /// How a step-through stack review is shown (persisted).
     stack_view: stack::StackView,
     /// The review shown has sources still loading; they arrive one by one.
@@ -886,7 +897,7 @@ impl ReviewSurface {
             switching: false,
             folds: Folds::default(),
             hide_resolved: false,
-            hide_viewed_files: false,
+            file_view: config.file_view(),
             stack_view: stack::StackView::default(),
             filling: false,
             filling_note: None,
@@ -958,7 +969,9 @@ impl ReviewSurface {
             }
             self.folds.expanded.clone_from(&state.expanded_answers);
             self.hide_resolved = state.hide_resolved_threads;
-            self.hide_viewed_files = state.hide_viewed_files;
+            self.file_view.hide_viewed = state.hide_viewed_files;
+            self.file_view.flat_choice = state.flat_files;
+            self.file_view.layout = self.config.file_layout(state.flat_files);
             self.stack_view = if state.all_stack_layers {
                 stack::StackView::AllLayers
             } else {
@@ -1071,6 +1084,14 @@ impl ReviewSurface {
     #[must_use]
     pub fn file_tree(&self) -> Option<&FileTree> {
         self.review.as_ref().map(|review| &review.files)
+    }
+
+    /// Whether tree row `id` of the file panel is open.
+    #[must_use]
+    pub fn tree_expanded(&self, id: &str) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.tree.borrow().is_expanded(id))
     }
 
     /// Id of the tree row selected in the file panel.
@@ -2142,10 +2163,8 @@ impl ReviewSurface {
             opened,
             self.document_config,
             &self.theme,
+            self.file_view,
         );
-        review
-            .files
-            .set_hide_viewed(self.hide_viewed_files, &self.theme);
         if let Some(previous) = self.review.as_ref() {
             // Refresh: keep expansions, layout, the cursor, the top item, and the tree state.
             review.doc.restore_expansions(&previous.doc.expansions());
@@ -2251,7 +2270,7 @@ impl ReviewSurface {
         }
         self.comparing.layers_moved();
         review.totals = review.doc.totals();
-        review.rebuild_files(&self.theme, self.hide_viewed_files);
+        review.rebuild_files(&self.theme, self.file_view);
         review.note_splices();
         self.apply_stack_view();
     }
@@ -2369,7 +2388,7 @@ impl ReviewSurface {
         if let Some((input, at)) = failed
             && review.doc.upsert_group(input, at)
         {
-            review.rebuild_files(&self.theme, self.hide_viewed_files);
+            review.rebuild_files(&self.theme, self.file_view);
             review.note_splices();
         }
     }
@@ -2748,6 +2767,7 @@ impl ReviewSurface {
             "fold_all" => self.fold_all(),
             "resolved_toggle" => self.toggle_resolved(),
             "viewed_files_toggle" => self.toggle_viewed_files(),
+            "files_layout_toggle" => self.toggle_file_layout(),
             "copy_answer" => self.copy_answer(),
             "suggest_comment" => self.suggest_from_answer(),
             "draft_answer" => self.draft_from_answer(),
@@ -3883,6 +3903,7 @@ impl ReviewSurface {
                 push(key("files_fold"), "fold");
                 push(key("files_filter"), "filter");
                 push(key("viewed_files_toggle"), "hide viewed");
+                push(key("files_layout_toggle"), self.file_layout_hint());
                 push(key("files_toggle"), "hide");
                 push(key("focus_next"), "next pane");
                 push(key("files_back"), "back");
@@ -5109,6 +5130,7 @@ const HINT_ACTIONS: &[&str] = &[
     "suggest_comment",
     "accept_suggestion",
     "viewed_files_toggle",
+    "files_layout_toggle",
 ];
 
 impl ReviewSurface {

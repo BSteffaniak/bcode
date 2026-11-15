@@ -448,6 +448,10 @@ pub struct ReviewPresentationState {
     /// Viewed files are hidden from the file panel.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_viewed_files: bool,
+    /// The file panel lists files flat (`Some(true)`) or as a tree (`Some(false)`); unset
+    /// follows the configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat_files: Option<bool>,
     /// A step-through stack review shows every layer in one document instead of one layer at a
     /// time.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -491,6 +495,7 @@ impl Default for ReviewPresentationState {
             expanded_answers: BTreeSet::new(),
             hide_resolved_threads: false,
             hide_viewed_files: false,
+            flat_files: None,
             all_stack_layers: false,
             conversation_seen: BTreeMap::new(),
             collapsed_files: BTreeSet::new(),

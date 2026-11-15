@@ -3,6 +3,12 @@
 //! * The tree is built once per document from the file index: one group per source (or part)
 //!   when there is more than one, directories in path order with single-directory chains
 //!   compacted (`src/review/tui`), and file rows in document order.
+//! * Flattened ([`FileLayout::Flat`]), the panel lists files without directories, each by its
+//!   whole path (the directories dimmed, and the first to give way when the row is narrow), in
+//!   document or path order ([`FlatOrder`]). Source groups stay unless merged
+//!   ([`FlatLayout::merge_groups`]); merged rows name their source at their end, since layers of
+//!   a stack can change the same path. File ids are the same in both layouts, so selection and
+//!   the open file carry across a switch.
 //! * File rows carry a status-colored label and right-aligned decorations, leftmost dropped
 //!   first when narrow: stack layers, drafts, threads, a change bar, `+/−` counts, and the viewed
 //!   mark. Directory and group rows carry aggregate threads, counts, and viewed progress.
@@ -32,6 +38,56 @@ use std::collections::BTreeMap;
 
 /// Separator inside tree ids (never part of a path).
 const SEP: char = '\u{1f}';
+
+/// How the file panel lists files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileLayout {
+    /// Directories and the files in them.
+    #[default]
+    Tree,
+    /// Files by their whole paths, without directories.
+    Flat(FlatLayout),
+}
+
+impl FileLayout {
+    /// Whether files are listed flat.
+    #[must_use]
+    pub const fn is_flat(self) -> bool {
+        matches!(self, Self::Flat(_))
+    }
+}
+
+/// How a flat file list is arranged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlatLayout {
+    /// Order of the files.
+    pub order: FlatOrder,
+    /// One list for every source instead of one per source (or part).
+    pub merge_groups: bool,
+}
+
+/// Order of a flat file list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlatOrder {
+    /// The document's order, so moving down the list follows the review.
+    #[default]
+    Document,
+    /// By path.
+    Path,
+}
+
+/// What the file panel shows besides the document, as the reviewer chose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FilePanelView {
+    /// Viewed files are left out.
+    pub hide_viewed: bool,
+    /// Tree or flat list.
+    pub layout: FileLayout,
+    /// The reviewer's flat (`Some(true)`) or tree choice for this review, saved with it; unset
+    /// follows the configuration.
+    pub flat_choice: Option<bool>,
+}
 
 /// What a file row shows besides its index data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,6 +128,8 @@ struct Totals {
 struct FileRow {
     file: FileRef,
     name: String,
+    /// The row's source, named at its end when a flat list merges sources.
+    source_tag: Option<String>,
     status: ReviewFileStatus,
     additions: u64,
     deletions: u64,
@@ -151,22 +209,40 @@ pub struct FileTree {
     total: usize,
     /// The sources the tree shows, in order.
     sources: Vec<String>,
+    /// Tree or flat list.
+    layout: FileLayout,
 }
 
 impl FileTree {
     /// The tree of every file in `doc`.
     #[must_use]
     pub fn new(doc: &ReviewDocument, theme: &ReviewTheme) -> Self {
+        Self::with_layout(doc, theme, FileLayout::Tree)
+    }
+
+    /// Every file in `doc`, as a tree or a flat list.
+    #[must_use]
+    pub fn with_layout(doc: &ReviewDocument, theme: &ReviewTheme, layout: FileLayout) -> Self {
         let (groups, hideable_shown) = collect_groups(doc);
-        let grouped = groups.len() > 1;
+        let flat = match layout {
+            FileLayout::Flat(flat) => Some(flat),
+            FileLayout::Tree => None,
+        };
+        let merge = flat.is_some_and(|flat| flat.merge_groups);
+        let grouped = groups.len() > 1 && !merge;
+        let tag_sources = merge && groups.len() > 1;
         let mut tree = Self {
             hideable_shown,
+            layout,
             ..Self::default()
         };
+        // A merged flat list: every source's files, then every source's dropped files.
+        let mut merged = Vec::new();
+        let mut merged_gone = Vec::new();
         for GroupRows {
             source,
             part,
-            rows,
+            mut rows,
             hidden,
         } in groups
         {
@@ -193,44 +269,88 @@ impl FileTree {
                 0
             };
             let parent = grouped.then(|| tree.nodes.len() - 1);
-            let mut dirs = vec![TrieDir::default()];
-            for row in rows {
-                let mut dir = 0;
-                let mut components: Vec<&str> = row.file.path.split('/').collect();
-                components.pop();
-                for component in components {
-                    let existing = dirs[dir].dirs.get(component).copied();
-                    let next = existing.unwrap_or_else(|| {
-                        dirs.push(TrieDir::default());
-                        let next = dirs.len() - 1;
-                        dirs[dir].dirs.insert(component.to_owned(), next);
-                        dirs[dir]
-                            .children
-                            .push(TrieChild::Dir(component.to_owned(), next));
-                        next
-                    });
-                    dir = next;
-                }
-                dirs[dir].children.push(TrieChild::File(row));
-            }
             let prefix = format!("{source}{SEP}{}{SEP}", part_text(part));
-            tree.emit(&mut dirs, 0, depth, parent, &prefix, "");
+            match flat {
+                None => tree.emit_tree(rows, depth, parent, &prefix),
+                Some(flat) => {
+                    if tag_sources {
+                        let label = group_label(doc, &source, part);
+                        for row in &mut rows {
+                            row.source_tag = Some(label.clone());
+                        }
+                    }
+                    if merge {
+                        merged.extend(rows);
+                    } else {
+                        tree.emit_flat(rows, flat.order, depth, parent);
+                    }
+                }
+            }
             // Files the baseline's change had and the current one dropped, once per source.
             if part.is_none_or(|part| part == 0) {
                 for path in dropped_paths(doc, &source) {
-                    tree.push(
-                        format!("x{SEP}{prefix}{path}"),
-                        depth,
-                        parent,
-                        NodeKind::Gone { path },
-                    );
+                    let id = format!("x{SEP}{prefix}{path}");
+                    if merge {
+                        merged_gone.push((id, path));
+                    } else {
+                        tree.push(id, depth, parent, NodeKind::Gone { path });
+                    }
                 }
+            }
+        }
+        if let Some(flat) = flat.filter(|_| merge) {
+            tree.emit_flat(merged, flat.order, 0, None);
+            for (id, path) in merged_gone {
+                tree.push(id, 0, None, NodeKind::Gone { path });
             }
         }
         tree.aggregate();
         tree.item_of = vec![None; tree.nodes.len()];
         tree.rebuild_items(theme);
         tree
+    }
+
+    /// Emit `rows` (one source's files, in document order) as directories and files.
+    fn emit_tree(&mut self, rows: Vec<FileRow>, depth: u16, parent: Option<usize>, prefix: &str) {
+        let mut dirs = vec![TrieDir::default()];
+        for row in rows {
+            let mut dir = 0;
+            let mut components: Vec<&str> = row.file.path.split('/').collect();
+            components.pop();
+            for component in components {
+                let existing = dirs[dir].dirs.get(component).copied();
+                let next = existing.unwrap_or_else(|| {
+                    dirs.push(TrieDir::default());
+                    let next = dirs.len() - 1;
+                    dirs[dir].dirs.insert(component.to_owned(), next);
+                    dirs[dir]
+                        .children
+                        .push(TrieChild::Dir(component.to_owned(), next));
+                    next
+                });
+                dir = next;
+            }
+            dirs[dir].children.push(TrieChild::File(row));
+        }
+        self.emit(&mut dirs, 0, depth, parent, prefix, "");
+    }
+
+    /// Emit `rows` (in document order) as a flat list in `order`.
+    fn emit_flat(
+        &mut self,
+        mut rows: Vec<FileRow>,
+        order: FlatOrder,
+        depth: u16,
+        parent: Option<usize>,
+    ) {
+        if order == FlatOrder::Path {
+            // Stable: one path in several sources keeps their document order.
+            rows.sort_by(|left, right| left.file.path.cmp(&right.file.path));
+        }
+        for row in rows {
+            let id = file_node_id(&row.file);
+            self.push(id, depth, parent, NodeKind::File(row));
+        }
     }
 
     fn push(&mut self, id: String, depth: u16, parent: Option<usize>, kind: NodeKind) -> usize {
@@ -263,7 +383,7 @@ impl FileTree {
         for child in children {
             match child {
                 TrieChild::File(row) => {
-                    let id = format!("f{SEP}{prefix}{}", row.file.path);
+                    let id = file_node_id(&row.file);
                     self.push(id, depth, parent, NodeKind::File(row));
                 }
                 TrieChild::Dir(mut name, mut next) => {
@@ -470,6 +590,12 @@ impl FileTree {
         self.hide_viewed
     }
 
+    /// Tree or flat list.
+    #[must_use]
+    pub const fn layout(&self) -> FileLayout {
+        self.layout
+    }
+
     /// Rebuild every displayed item (after a filter, the hide-viewed toggle, or a theme change).
     pub fn rebuild_items(&mut self, theme: &ReviewTheme) {
         let filtering = !self.query.is_empty();
@@ -570,7 +696,7 @@ impl FileTree {
     }
 
     /// A file row: status, name, and decorations, marked by how it changed since the baseline.
-    fn file_item(node: &Node, row: &FileRow, theme: &ReviewTheme) -> TreeViewItem {
+    fn file_item(node: &Node, row: &FileRow, theme: &ReviewTheme, flat: bool) -> TreeViewItem {
         let icons = &theme.icons;
         let decorations = &row.decorations;
         let since = decorations.since;
@@ -606,9 +732,22 @@ impl FileTree {
         };
         spans.push(Span::styled(status_letter(row.status), status_style));
         spans.push(Span::raw(" "));
+        // Flat, a file reads by its whole path; its directories give way first when narrow.
+        let mut shrink = None;
+        if flat && let Some((directory, _)) = row.file.path.rsplit_once('/') {
+            shrink = Some(spans.len());
+            spans.push(Span::styled(format!("{directory}/"), theme.muted));
+        }
         spans.push(Span::styled(row.name.clone(), name_style));
         let label = Line::from_spans(spans);
         let mut trailing = Vec::new();
+        // Leftmost, so the first to go when the row is narrow.
+        if let Some(tag) = &row.source_tag {
+            trailing.push(Line::from_spans(vec![Span::styled(
+                tag.clone(),
+                theme.muted,
+            )]));
+        }
         if !decorations.layers.is_empty() {
             let layers: Vec<String> = decorations
                 .layers
@@ -651,14 +790,18 @@ impl FileTree {
         } else {
             Span::styled(icons.unviewed, theme.muted)
         }]));
-        TreeViewItem::rich(node.id.clone(), label, node.depth).trailing(trailing)
+        let item = TreeViewItem::rich(node.id.clone(), label, node.depth).trailing(trailing);
+        match shrink {
+            Some(span) => item.shrink_span(span),
+            None => item,
+        }
     }
 
     fn item(&self, index: usize, theme: &ReviewTheme, filtering: bool) -> TreeViewItem {
         let node = &self.nodes[index];
         let icons = &theme.icons;
         match &node.kind {
-            NodeKind::File(row) => Self::file_item(node, row, theme),
+            NodeKind::File(row) => Self::file_item(node, row, theme, self.layout.is_flat()),
             NodeKind::Gone { path } => TreeViewItem::rich(
                 node.id.clone(),
                 Line::from_spans(vec![
@@ -740,6 +883,16 @@ fn badge(icon: &str, count: u32, style: bmux_tui::style::Style) -> Line {
     Line::from_spans(vec![Span::styled(format!("{icon}{count}"), style)])
 }
 
+/// A file row's id: the same in a tree and a flat list.
+fn file_node_id(file: &FileRef) -> String {
+    format!(
+        "f{SEP}{}{SEP}{}{SEP}{}",
+        file.source_id,
+        part_text(file.part),
+        file.path
+    )
+}
+
 fn join(path: &str, name: &str) -> String {
     if path.is_empty() {
         name.to_owned()
@@ -787,6 +940,7 @@ fn file_row(doc: &ReviewDocument, file: &FileRef) -> Option<FileRow> {
     Some(FileRow {
         file: file.clone(),
         name,
+        source_tag: None,
         status: header.status,
         additions: u64::from(header.additions),
         deletions: u64::from(header.deletions),
@@ -1376,5 +1530,135 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn flat(order: FlatOrder, merge_groups: bool) -> FileLayout {
+        FileLayout::Flat(FlatLayout {
+            order,
+            merge_groups,
+        })
+    }
+
+    #[test]
+    fn a_flat_list_shows_whole_paths_with_the_tree_ids() {
+        let doc = sample().document(DocumentConfig::default());
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let tree = FileTree::new(&doc, &theme);
+        let list = FileTree::with_layout(&doc, &theme, flat(FlatOrder::Document, false));
+        assert!(list.layout().is_flat());
+        assert_eq!(list.file_count(), tree.file_count());
+        // No directories: every row is a file at the top level.
+        assert!(
+            list.items()
+                .iter()
+                .all(|item| item.depth == 0 && !item.expandable)
+        );
+        assert_eq!(list.items().len(), 7);
+        let deep = list
+            .items()
+            .iter()
+            .find(|item| item.label.ends_with("deep.rs"))
+            .unwrap();
+        assert_eq!(deep.label, "A a/b/c/deep.rs");
+        // The directories give way first when the row is narrow; the name stays.
+        let span = deep.shrink_span.expect("a directory span");
+        let narrow = deep
+            .rich_label
+            .as_ref()
+            .unwrap()
+            .truncate_shrinking(12, span);
+        assert!(narrow.plain_text().ends_with("deep.rs"), "{narrow:?}");
+        let top = list
+            .items()
+            .iter()
+            .find(|item| item.label.ends_with("top.rs"))
+            .unwrap();
+        assert_eq!((top.label.as_str(), top.shrink_span), ("A top.rs", None));
+        // Ids are the tree's: selection carries across a switch.
+        for file in doc.file_keys() {
+            assert_eq!(list.file_id(file), tree.file_id(file));
+        }
+        // The filter matches whole paths, as in the tree.
+        let mut list = list;
+        assert!(list.set_filter("DEEP", &theme));
+        let labels: Vec<&str> = list
+            .items()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(labels, ["A a/b/c/deep.rs"]);
+    }
+
+    #[test]
+    fn a_flat_list_keeps_or_merges_groups_in_document_or_path_order() {
+        let fake = Fake::new(vec![
+            SynthFile::added("a/two.rs", 2),
+            SynthFile::added("z/one.rs", 1),
+        ]);
+        let doc = ReviewDocument::new(
+            std::path::PathBuf::from("/repo"),
+            vec![fake.input("first"), fake.input("second")],
+            DocumentConfig::default(),
+        );
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let rows = |tree: &FileTree| -> Vec<(u16, String, Option<String>)> {
+            tree.items()
+                .iter()
+                .map(|item| {
+                    let tag = item
+                        .trailing
+                        .first()
+                        .map(Line::plain_text)
+                        .filter(|tag| tag == "first" || tag == "second");
+                    (item.depth, item.label.clone(), tag)
+                })
+                .collect()
+        };
+        // Kept groups: each source's files under its group row.
+        let kept = FileTree::with_layout(&doc, &theme, flat(FlatOrder::Document, false));
+        let kept_rows = rows(&kept);
+        assert_eq!(kept_rows.len(), 6, "{kept_rows:?}");
+        assert_eq!(kept_rows[0].0, 0);
+        assert_eq!(
+            kept_rows[1..3]
+                .iter()
+                .map(|row| (row.0, row.1.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "A a/two.rs"), (1, "A z/one.rs")]
+        );
+        assert_eq!(kept.group_ids().count(), 2);
+        // Merged, in document order: one source after the other, each row naming its source.
+        let merged = FileTree::with_layout(&doc, &theme, flat(FlatOrder::Document, true));
+        let document_order = |tree: &FileTree| -> Vec<(String, Option<String>)> {
+            rows(tree)
+                .into_iter()
+                .map(|(depth, label, tag)| {
+                    assert_eq!(depth, 0);
+                    (label, tag)
+                })
+                .collect()
+        };
+        let tagged = |label: &str, tag: &str| (label.to_owned(), Some(tag.to_owned()));
+        assert_eq!(
+            document_order(&merged),
+            [
+                tagged("A a/two.rs", "first"),
+                tagged("A z/one.rs", "first"),
+                tagged("A a/two.rs", "second"),
+                tagged("A z/one.rs", "second"),
+            ]
+        );
+        assert_eq!(merged.group_ids().count(), 0);
+        // Merged, by path: one path's rows together, in document order among themselves.
+        let by_path = FileTree::with_layout(&doc, &theme, flat(FlatOrder::Path, true));
+        assert_eq!(
+            document_order(&by_path),
+            [
+                tagged("A a/two.rs", "first"),
+                tagged("A a/two.rs", "second"),
+                tagged("A z/one.rs", "first"),
+                tagged("A z/one.rs", "second"),
+            ]
+        );
     }
 }

@@ -601,7 +601,8 @@ impl ReviewSurface {
         state.thread_folds.clone_from(&self.folds.hand);
         state.expanded_answers.clone_from(&self.folds.expanded);
         state.hide_resolved_threads = self.hide_resolved;
-        state.hide_viewed_files = self.hide_viewed_files;
+        state.hide_viewed_files = self.file_view.hide_viewed;
+        state.flat_files = self.file_view.flat_choice;
         state.all_stack_layers = self.stack_view == super::stack::StackView::AllLayers;
         state.conversation_seen.clone_from(&self.talk.seen);
         if let Some(review) = &self.review {

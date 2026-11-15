@@ -75,6 +75,16 @@ pub struct ReviewViewConfig {
     /// or `off`.
     #[serde(default)]
     pub file_page: FilePage,
+    /// How the file panel lists files when a review has no choice saved: `tree` (the default)
+    /// or `flat`.
+    #[serde(default)]
+    pub file_layout: FileLayoutChoice,
+    /// Order of a flat file list: `document` (the default) or `path`.
+    #[serde(default)]
+    pub flat_order: crate::files::FlatOrder,
+    /// Source groups in a flat file list: `keep` (the default) or `merge`.
+    #[serde(default)]
+    pub flat_groups: FlatGroups,
     /// What makes a viewed file stale (`viewed_reset` in the plugin table, not `review_v2`).
     #[serde(skip)]
     pub viewed_reset: bcode_code_review::viewed::ViewedReset,
@@ -114,6 +124,28 @@ pub enum FileSeparator {
     Gap,
     /// Nothing.
     None,
+}
+
+/// How the file panel lists files by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileLayoutChoice {
+    /// Directories and the files in them.
+    #[default]
+    Tree,
+    /// Files by their whole paths.
+    Flat,
+}
+
+/// Source groups in a flat file list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlatGroups {
+    /// One list per source (or part), under its group row.
+    #[default]
+    Keep,
+    /// One list for every source.
+    Merge,
 }
 
 /// Whether files read as pages on a desk.
@@ -177,6 +209,39 @@ impl ReviewViewConfig {
             self.color_depth
                 .unwrap_or(bmux_tui::capabilities::TerminalColorDepth::TrueColor),
         )
+    }
+
+    /// The flat list's arrangement.
+    #[must_use]
+    pub const fn flat_layout(self) -> crate::files::FlatLayout {
+        crate::files::FlatLayout {
+            order: self.flat_order,
+            merge_groups: matches!(self.flat_groups, FlatGroups::Merge),
+        }
+    }
+
+    /// The file panel's layout: flat when `flat` (a review's saved choice), else as configured.
+    #[must_use]
+    pub const fn file_layout(self, flat: Option<bool>) -> crate::files::FileLayout {
+        let flat = match flat {
+            Some(flat) => flat,
+            None => matches!(self.file_layout, FileLayoutChoice::Flat),
+        };
+        if flat {
+            crate::files::FileLayout::Flat(self.flat_layout())
+        } else {
+            crate::files::FileLayout::Tree
+        }
+    }
+
+    /// The file panel's view before a review's saved choices apply.
+    #[must_use]
+    pub const fn file_view(self) -> crate::files::FilePanelView {
+        crate::files::FilePanelView {
+            hide_viewed: false,
+            layout: self.file_layout(None),
+            flat_choice: None,
+        }
     }
 
     /// Whether viewed files fold by themselves.

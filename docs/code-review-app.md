@@ -294,6 +294,19 @@ its marked files are loaded with the file list, so viewed files show as viewed o
 frame. An unsaved review keeps its viewed files per target, like its comments: reopening the same
 target shows them again, and saving the review takes them along.
 
+### File panel layout
+
+`` ` `` lists the file panel's files flat or as a tree. Flat, each file reads by its whole path,
+its directories dimmed and the first to give way when the panel is narrow
+(`M …review/files.rs`), in document order by default, so moving down the list follows the
+review. Source groups (several sources, parts or stack layers) stay, each with its files under it;
+merged, one list holds every source's files and each row names its source at its end (the first
+thing to go when the row is narrow), since layers of a stack can change the same path. The filter,
+hidden viewed files, comparison marks and dropped files work the same in both layouts. Switching
+keeps the selected file selected (a selected directory hands its selection to its first file),
+and directories closed in the tree are closed again when it comes back. The choice is saved with
+the review; until a review has one, `file_layout` decides (see Configuration).
+
 ### Review list
 
 Home's "Updated" column, its order, and `resume` follow when a review last changed: its title,
@@ -641,6 +654,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `shift+z` | Collapse every thread (expand all when all are collapsed); on a file's header, fold every file (open all when all are folded) |
 | `shift+h` | Show / hide resolved threads |
 | `h` | Show / hide viewed files in the file panel |
+| `` ` `` | List the file panel's files flat or as a tree |
 | palette only | Next open thread |
 | palette only | Previous open thread |
 | palette only | Next AI answer |
@@ -768,7 +782,10 @@ bcode's own (`--print-config-paths` lists them in order):
   or `none`), with `file_separator_rows` (1 to 3; unset follows the density),
   `file_separator_label` (default true) and `file_separator_inset` (default false);
   `file_page` (`auto`, `on` or `off`: whether a desk color is used; without one cards become a
-  rule); and `fold_viewed_files` (default true: a viewed file folds to its header). Themes can
+  rule); `fold_viewed_files` (default true: a viewed file folds to its header); and the file
+  panel's `file_layout` (`tree`, the default, or `flat`: for reviews with no choice saved),
+  `flat_order` (`document`, the default, or `path`) and `flat_groups` (`keep`, the default: one
+  list per source under its group row; or `merge`: one list for every source). Themes can
   set the `source.file.header`, `source.file.desk`, `source.file.edge` and `source.file.label`
   roles. See [`review-separators-and-folding.md`](review-separators-and-folding.md).
 * `[plugins.config."bcode.code_review".conversation]`: pull request conversations.

@@ -1059,7 +1059,7 @@ impl ReviewSurface {
             Err(error) => {
                 // The layers still computing show the full change.
                 let pending: Vec<String> = self.comparing.pairs.keys().cloned().collect();
-                let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+                let (theme, file_view) = (self.theme, self.file_view);
                 if let Some(review) = self.review.as_mut() {
                     for source_id in &pending {
                         if review
@@ -1073,7 +1073,7 @@ impl ReviewSurface {
                     }
                     review.note_splices();
                     // The panel's group rows and the open menu stop saying "comparing".
-                    review.rebuild_files(&theme, hide_viewed);
+                    review.rebuild_files(&theme, file_view);
                 }
                 self.apply_compare_filter();
                 self.sync_compare_menu();
@@ -1102,7 +1102,7 @@ impl ReviewSurface {
     fn lay_deltas(&mut self, deltas: Vec<LayerDelta>) {
         let view = self.comparing.view;
         let show_rebased = self.services.compare_config().rebased_layers == RebasedLayers::Show;
-        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        let (theme, file_view) = (self.theme, self.file_view);
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -1134,7 +1134,7 @@ impl ReviewSurface {
         }
         review.note_splices();
         // The file panel's group rows carry each layer's badge.
-        review.rebuild_files(&theme, hide_viewed);
+        review.rebuild_files(&theme, file_view);
         self.apply_compare_filter();
         self.decide_banner();
         self.sync_compare_menu();
@@ -1142,9 +1142,9 @@ impl ReviewSurface {
 
     /// Rebuild the file panel after how compared files show changed.
     pub(super) fn rebuild_compared_files(&mut self) {
-        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        let (theme, file_view) = (self.theme, self.file_view);
         if let Some(review) = self.review.as_mut() {
-            review.rebuild_files(&theme, hide_viewed);
+            review.rebuild_files(&theme, file_view);
         }
     }
 
@@ -1255,12 +1255,12 @@ impl ReviewSurface {
             BTreeSet::new()
         };
         let theme = self.theme;
-        let hide_viewed = self.hide_viewed_files;
+        let file_view = self.file_view;
         if let Some(review) = self.review.as_mut()
             && review.doc.set_filtered_sources(filtered)
         {
             review.note_splices();
-            review.rebuild_files(&theme, hide_viewed);
+            review.rebuild_files(&theme, file_view);
         }
     }
 
@@ -1478,7 +1478,7 @@ impl ReviewSurface {
 
     /// Show the hidden files of exactly the sources in `shown`.
     pub(super) fn restore_compare_files_shown(&mut self, shown: &BTreeSet<String>) {
-        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        let (theme, file_view) = (self.theme, self.file_view);
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -1495,7 +1495,7 @@ impl ReviewSurface {
         }
         if changed {
             review.note_splices();
-            review.rebuild_files(&theme, hide_viewed);
+            review.rebuild_files(&theme, file_view);
             self.layout_revision += 1;
         }
     }
@@ -1982,13 +1982,13 @@ impl ReviewSurface {
                 file.path, step.from, step.to
             ))
         });
-        let (theme, hide_viewed) = (self.theme, self.hide_viewed_files);
+        let (theme, file_view) = (self.theme, self.file_view);
         if let Some(review) = self.review.as_mut()
             && review.doc.set_file_comparison(&file, delta)
         {
             review.note_splices();
             // The file's mark, its counts, and whether it is hidden follow the version shown.
-            review.rebuild_files(&theme, hide_viewed);
+            review.rebuild_files(&theme, file_view);
         }
         self.set_status(
             label.unwrap_or_else(|| format!("{}: as its layer is compared", file.path)),
