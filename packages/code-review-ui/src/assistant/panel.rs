@@ -143,6 +143,12 @@ pub enum Outcome {
 /// Background work of the panel that finished.
 #[derive(Debug)]
 enum Done {
+    /// The conversation's session exists (claimed for the app's tools); its first message is
+    /// being sent.
+    Created {
+        epoch: u64,
+        session: String,
+    },
     Started {
         epoch: u64,
         result: Result<String, String>,
@@ -217,7 +223,12 @@ pub struct Assistant {
     /// Where the active conversation started, once known.
     tag: Option<Tag>,
     starting: bool,
-    queued: VecDeque<(u64, TurnRequest)>,
+    /// Messages not sent yet, with the conversation (epoch) they were written in and the
+    /// attachment to write before sending.
+    queued: VecDeque<(u64, TurnRequest, Option<Attachment>)>,
+    /// Where the conversation's first message was sent from, while its session waits to be
+    /// created (until the app's tools are registered).
+    start_place: Option<Place>,
     epoch: u64,
     /// The place the session was last attached for.
     attached: Option<PlaceKey>,
@@ -239,8 +250,6 @@ pub struct Assistant {
     tools: Option<crate::host::ClientToolLink>,
     /// Whether the connection was asked for (once per run).
     tools_asked: bool,
-    /// Sessions claimed on the connection.
-    claimed: BTreeSet<String>,
     picker: Option<Picker>,
     mode: Mode,
     notice: Option<(String, bool)>,
@@ -282,6 +291,7 @@ impl Assistant {
             tag: None,
             starting: false,
             queued: VecDeque::new(),
+            start_place: None,
             epoch: 0,
             attached: None,
             input: RefCell::new(empty_input()),
@@ -297,7 +307,6 @@ impl Assistant {
             resend: None,
             tools: None,
             tools_asked: false,
-            claimed: BTreeSet::new(),
             picker: None,
             mode: Mode::Chat,
             notice: None,
@@ -553,7 +562,11 @@ impl Assistant {
     /// Start an empty conversation: its session is created by its first message, tagged with
     /// the place it is sent from.
     pub fn new_conversation(&mut self) {
-        self.session = None;
+        // Only the active conversation is offered the app's tools.
+        if let (Some(session), Some(_)) = (self.session.take(), &self.tools) {
+            drop(self.services.host().release_tool_session(session));
+        }
+        self.start_place = None;
         self.title = None;
         self.tag = None;
         self.starting = false;
@@ -647,6 +660,10 @@ impl Assistant {
     }
 
     /// Send the input's text from `place`.
+    ///
+    /// Every message names the assistant's profile, so it is sent only while the app's tools
+    /// and profile are registered with Bcode; until then it waits (fail closed: a turn never
+    /// runs without the profile's tool limits).
     fn send_input(&mut self, place: &Place, ui: &UiContext) -> Outcome {
         let text = self.input.borrow().buffer().text().to_string();
         let text = text.trim_end().to_owned();
@@ -657,33 +674,90 @@ impl Assistant {
             self.notice = Some(("the message is too long for the assistant".to_owned(), true));
             return Outcome::Redraw;
         }
+        self.serve_tools();
+        if self.tools.is_none() {
+            self.notice = Some((
+                "the assistant needs the review app's tools, which this host cannot provide"
+                    .to_owned(),
+                true,
+            ));
+            return Outcome::Redraw;
+        }
         let request = TurnRequest {
             text,
             context: self.context_blocks(place),
-            // The profile exists only while the app's tool connection is registered.
-            agent: self
-                .tools_ready()
-                .then(|| super::profile::PROFILE_ID.to_owned()),
+            agent: Some(super::profile::PROFILE_ID.to_owned()),
         };
         *self.input.borrow_mut() = empty_input();
         self.scroll.set(0);
         self.notice = None;
         self.touch();
-        if self.starting {
-            self.queued.push_back((self.epoch, request));
-        } else if let Some(session) = self.session.clone() {
+        let attachment = match self.session.clone() {
             // Rebinding first keeps the session's default review the one on screen.
-            let binding = (self.attached.as_ref() != Some(&place.key()))
-                .then(|| Attachment::of(self.binding_for(place, &session)));
+            Some(session) if !self.starting => (self.attached.as_ref() != Some(&place.key()))
+                .then(|| Attachment::of(self.binding_for(place, &session))),
+            _ => None,
+        };
+        if self.session.is_some() && !self.starting {
             self.attached = Some(place.key());
-            self.submit(session, binding, request, ui);
-        } else {
-            self.start(place, request, ui);
+        } else if self.session.is_none() && !self.starting && self.start_place.is_none() {
+            self.start_place = Some(Place {
+                context: None,
+                ..place.clone()
+            });
         }
+        self.queued.push_back((self.epoch, request, attachment));
+        self.flush(ui);
         Outcome::Redraw
     }
 
-    /// Create the conversation's session from `place`, attach it, and send `request`.
+    /// Send the active conversation's waiting messages once the app's tools are registered:
+    /// the first creates the session when it has none.
+    fn flush(&mut self, ui: &UiContext) {
+        if self.starting || !self.queued.iter().any(|(epoch, _, _)| *epoch == self.epoch) {
+            return;
+        }
+        if !self.tools_ready() {
+            self.notice = Some((self.waiting_notice(), false));
+            return;
+        }
+        if matches!(&self.notice, Some((_, false))) {
+            self.notice = None;
+        }
+        if let Some(session) = self.session.clone() {
+            for (request, attachment) in self.take_queued(self.epoch) {
+                self.submit(session.clone(), attachment, request, ui);
+            }
+            return;
+        }
+        let Some(place) = self.start_place.take() else {
+            return;
+        };
+        let index = self
+            .queued
+            .iter()
+            .position(|(epoch, _, _)| *epoch == self.epoch);
+        if let Some((_, request, _)) = index.and_then(|index| self.queued.remove(index)) {
+            self.start(&place, request, ui);
+        }
+    }
+
+    /// Why waiting messages are not sent yet.
+    fn waiting_notice(&self) -> String {
+        let state = self
+            .tools
+            .as_ref()
+            .and_then(|link| link.state.lock().ok().map(|state| state.clone()));
+        match state {
+            Some(crate::host::ToolLinkState::Failed(error)) => format!(
+                "waiting for the review app's tools to register with Bcode ({error}); retrying"
+            ),
+            _ => "waiting for the review app's tools to register with Bcode…".to_owned(),
+        }
+    }
+
+    /// Create the conversation's session from `place` on the tool connection (so its first
+    /// turn already has the app's tools), attach it, and send `request`.
     fn start(&mut self, place: &Place, request: TurnRequest, ui: &UiContext) {
         self.starting = true;
         self.tag = Some(place.history_tag());
@@ -707,9 +781,16 @@ impl Assistant {
             let result = async {
                 let session = services
                     .host()
-                    .create_session(title, repo.clone(), origin)
+                    .create_tool_session(title, repo.clone(), origin)
                     .await
                     .map_err(|error| error.message)?;
+                push(
+                    &inbox,
+                    Done::Created {
+                        epoch,
+                        session: session.clone(),
+                    },
+                );
                 if let Some(mut binding) = template {
                     binding.session_id.clone_from(&session);
                     services
@@ -761,6 +842,9 @@ impl Assistant {
                         .await
                         .map_err(crate::host::HostError::failed)?;
                 }
+                // Claimed before the turn starts, which fixes the tools it is offered (a
+                // conversation from the history, or after Bcode restarted).
+                services.host().claim_tool_session(session.clone()).await?;
                 services
                     .host()
                     .submit_turn(session.clone(), request.clone())
@@ -809,20 +893,18 @@ impl Assistant {
         })
     }
 
-    /// Register the app's tools and the assistant's profile once, and claim the active session.
-    fn serve_tools(&mut self, ui: &UiContext) {
+    /// Register the app's tools and the assistant's profile once. Sessions are claimed when a
+    /// message is sent to them.
+    fn serve_tools(&mut self) {
         if !self.tools_asked {
             self.tools_asked = true;
             let config = self.services.assistant_config();
-            self.tools = ui
+            // On the host that creates the sessions and submits their turns.
+            self.tools = self
+                .services
                 .host()
                 .serve_client_tools(super::profile::client_tools(), vec![config.profile()])
                 .ok();
-        }
-        if let (Some(link), Some(session)) = (&self.tools, &self.session)
-            && self.claimed.insert(session.clone())
-        {
-            let _ = link.claims.send(session.clone());
         }
     }
 
@@ -840,7 +922,7 @@ impl Assistant {
     /// Collect finished work, follow the active session and advance its spinner. Returns
     /// whether anything changed.
     pub fn poll(&mut self, ui: &UiContext) -> bool {
-        self.serve_tools(ui);
+        self.serve_tools();
         let done: Vec<Done> = self
             .inbox
             .lock()
@@ -849,6 +931,11 @@ impl Assistant {
         let mut changed = !done.is_empty();
         for done in done {
             self.finish(done, ui);
+        }
+        if !self.queued.is_empty() {
+            let notice = self.notice.clone();
+            self.flush(ui);
+            changed |= self.notice != notice;
         }
         changed |= self
             .agents
@@ -874,22 +961,28 @@ impl Assistant {
     fn finish(&mut self, done: Done, ui: &UiContext) {
         self.touch();
         match done {
+            Done::Created { epoch, session } => {
+                if epoch == self.epoch {
+                    // Every review tool call of a session the panel created answers its
+                    // messages, so none is skipped as already applied.
+                    self.applied.entry(session.clone()).or_default();
+                    self.session = Some(session);
+                }
+            }
             Done::Started {
                 epoch,
                 result: Ok(session),
             } => {
-                let queued = self.take_queued(epoch);
-                // A new conversation may have started meanwhile: the earlier one keeps its
-                // session and gets the messages written for it.
                 if epoch == self.epoch {
                     self.starting = false;
-                    // Every review tool call of a session the panel created answers its
-                    // messages, so none is skipped as already applied.
-                    self.applied.entry(session.clone()).or_default();
-                    self.session = Some(session.clone());
-                }
-                for request in queued {
-                    self.submit(session.clone(), None, request, ui);
+                    self.session = Some(session);
+                    self.flush(ui);
+                } else {
+                    // A new conversation started meanwhile: the earlier one keeps its session
+                    // and gets the messages written for it.
+                    for (request, attachment) in self.take_queued(epoch) {
+                        self.submit(session.clone(), attachment, request, ui);
+                    }
                 }
             }
             Done::Started {
@@ -899,6 +992,7 @@ impl Assistant {
                 if epoch == self.epoch {
                     self.starting = false;
                     self.attached = None;
+                    self.session = None;
                 }
                 drop(self.take_queued(epoch));
                 self.notice = Some((format!("could not start the assistant: {error}"), true));
@@ -1006,12 +1100,15 @@ impl Assistant {
         }
     }
 
-    fn take_queued(&mut self, epoch: u64) -> Vec<TurnRequest> {
+    fn take_queued(&mut self, epoch: u64) -> Vec<(TurnRequest, Option<Attachment>)> {
         let (taken, kept) = std::mem::take(&mut self.queued)
             .into_iter()
-            .partition::<VecDeque<_>, _>(|(queued, _)| *queued == epoch);
+            .partition::<VecDeque<_>, _>(|(queued, _, _)| *queued == epoch);
         self.queued = kept;
-        taken.into_iter().map(|(_, request)| request).collect()
+        taken
+            .into_iter()
+            .map(|(_, request, attachment)| (request, attachment))
+            .collect()
     }
 
     /// Note finished `code_review.*` calls of the active session not applied yet.

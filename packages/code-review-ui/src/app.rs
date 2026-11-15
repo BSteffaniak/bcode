@@ -141,6 +141,9 @@ struct Awaiting {
     since: Instant,
 }
 
+/// Error code of an app tool called by a session that is not the panel's active conversation.
+pub const NOT_ACTIVE_CONVERSATION: &str = "not_active_conversation";
+
 /// How long `open_review` waits for a review to load before answering without the place.
 const OPEN_WAIT: Duration = Duration::from_secs(20);
 
@@ -448,10 +451,9 @@ impl ReviewApp {
         if tools
             .iter()
             .any(|(name, _)| crate::surface::REVIEW_LIST_TOOLS.contains(&name.as_str()))
+            && let Some(home) = self.home.as_mut()
         {
-            if let Some(home) = self.home.as_mut() {
-                home.refresh();
-            }
+            home.refresh();
         }
         if let Route::Review(review) = &mut self.route {
             review.apply_assistant_tools(&tools, host);
@@ -898,11 +900,23 @@ impl ReviewApp {
     fn answer_tool(&mut self, call: crate::host::ClientToolCall, host: &UiContext) {
         use crate::assistant::actions;
         let crate::host::ClientToolCall {
+            session_id,
             tool,
             arguments,
             reply,
-            ..
         } = call;
+        // Only the conversation open in the panel sees and moves the screen; a session that
+        // still holds the tools from before (a conversation switched away from, a turn still
+        // running) is refused.
+        if self.assistant.session() != Some(session_id.as_str()) {
+            let _ = reply.send(Self::refused(
+                NOT_ACTIVE_CONVERSATION,
+                "this conversation is not the one open in the review app's assistant panel, so \
+                 it cannot read or change the screen; the user can switch to it from the \
+                 panel's history",
+            ));
+            return;
+        }
         let answer = match tool.as_str() {
             crate::assistant::profile::CURRENT_VIEW => {
                 match self.view_context().tool_answer(&arguments) {

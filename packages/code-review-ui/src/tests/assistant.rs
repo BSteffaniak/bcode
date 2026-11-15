@@ -44,7 +44,7 @@ fn item(id: &str, kind: TranscriptViewItemKind) -> TranscriptViewItem {
     }
 }
 
-fn user(text: &str) -> TranscriptViewItem {
+pub(super) fn user(text: &str) -> TranscriptViewItem {
     item(
         "user",
         TranscriptViewItemKind::UserMessage {
@@ -85,7 +85,7 @@ fn tool(id: &str, name: &str, arguments: &str) -> TranscriptViewItem {
     )
 }
 
-fn snapshot(items: Vec<TranscriptViewItem>) -> SessionViewSnapshot {
+pub(super) fn snapshot(items: Vec<TranscriptViewItem>) -> SessionViewSnapshot {
     let mut snapshot = SessionViewSnapshot::empty();
     snapshot.connection_status = SessionConnectionViewStatus::Attached;
     snapshot.transcript.items = items;
@@ -202,7 +202,7 @@ impl Setup {
     }
 
     /// Deliver `snapshot` to the followed `session`.
-    fn deliver(&mut self, session: &str, snapshot: SessionViewSnapshot) -> Screen {
+    pub(super) fn deliver(&mut self, session: &str, snapshot: SessionViewSnapshot) -> Screen {
         self.backend
             .host()
             .session_view(session)

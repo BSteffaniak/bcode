@@ -71,7 +71,9 @@ pub(super) fn open(
     width: u16,
     height: u16,
 ) -> (Scenario<ReviewApp>, Screen) {
-    let mut scenario = Scenario::new(app(fixture, backend, entry), width, height);
+    // One host serves the screen and Bcode, as in the app.
+    let mut scenario =
+        Scenario::with_shared_host(app(fixture, backend, entry), backend.host(), width, height);
     let screen = settled(&mut scenario);
     (scenario, screen)
 }

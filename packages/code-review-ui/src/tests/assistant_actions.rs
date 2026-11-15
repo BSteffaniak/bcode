@@ -11,12 +11,41 @@ use crate::testing::backend::TestBackend;
 use crate::testing::harness::Scenario;
 use bcode_tool_models::client_tool::ClientToolPolicy;
 
-const SESSION: &str = "11111111-2222-4333-8444-555555555555";
+/// The panel's active conversation, started (and the panel closed again) when there is none:
+/// only that conversation may use the app's tools.
+pub(super) fn active_session(scenario: &mut Scenario<ReviewApp>) -> String {
+    if let Some(session) = scenario.surface().assistant().session() {
+        return session.to_owned();
+    }
+    scenario.key("ctrl+k");
+    scenario.paste("Help me with this review");
+    scenario.key("enter");
+    settled(scenario);
+    scenario.key("ctrl+k");
+    settled(scenario);
+    scenario
+        .surface()
+        .assistant()
+        .session()
+        .expect("the conversation started")
+        .to_owned()
+}
 
-/// Call the app's tool `tool` with `arguments` on `host`, as the daemon does once the call
-/// passed the permission rules, and let the app answer.
+/// Call the app's tool `tool` with `arguments` as the panel's conversation, as the daemon does
+/// once the call passed the permission rules, and let the app answer.
 fn call(scenario: &mut Scenario<ReviewApp>, tool: &str, arguments: &str) -> ClientToolReply {
-    let mut answer = scenario.host().call_client_tool(SESSION, tool, arguments);
+    let session = active_session(scenario);
+    call_as(scenario, &session, tool, arguments)
+}
+
+/// Call the app's tool `tool` with `arguments` as `session`, and let the app answer.
+fn call_as(
+    scenario: &mut Scenario<ReviewApp>,
+    session: &str,
+    tool: &str,
+    arguments: &str,
+) -> ClientToolReply {
+    let mut answer = scenario.host().call_client_tool(session, tool, arguments);
     for _ in 0..40 {
         settled(scenario);
         if let Ok(reply) = answer.try_recv() {
@@ -222,17 +251,185 @@ fn moving_the_user_to_another_screen_asks_and_moves_within_a_review_do_not() {
     ] {
         assert_eq!(policy(name), ClientToolPolicy::ReadOnly, "{name} runs");
     }
-    // A call Bcode denied never reaches the app: the screen stays as it was.
-    let setup = super::assistant::setup(160, 40, true);
+}
+
+/// The permission request the daemon shows for `tool` called with `arguments`.
+fn asking(id: &str, tool: &str, arguments: &str) -> bcode_session_view_models::PermissionView {
+    bcode_session_view_models::PermissionView {
+        permission_id: id.to_owned(),
+        session_id: None,
+        tool_call_id: format!("call-{id}"),
+        tool_name: tool.to_owned(),
+        producer_plugin_id: None,
+        arguments_json: arguments.to_owned(),
+        batch: None,
+        agent_id: crate::assistant::profile::PROFILE_ID.to_owned(),
+        title: None,
+        policy_source: None,
+        detail: None,
+        resolved: false,
+        approved: None,
+        can_remember: true,
+    }
+}
+
+/// The open review's id, if a review is on screen.
+fn open_review_id(setup: &super::assistant::Setup) -> Option<String> {
+    setup
+        .app()
+        .review()
+        .and_then(crate::ReviewSurface::workspace)
+        .map(|workspace| workspace.id.clone())
+}
+
+#[test]
+fn a_declined_open_review_never_changes_the_screen_and_an_allowed_one_does() {
+    let mut setup = super::assistant::setup(160, 40, true);
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Take me home");
+    let arguments = r#"{"screen":"home"}"#;
+    // The model calls open_review; Bcode asks before the call reaches the app.
+    let mut declined =
+        setup
+            .backend
+            .host()
+            .gate_client_tool("p-1", &session, actions::OPEN_REVIEW, arguments);
+    let mut prompt = super::assistant::snapshot(vec![super::assistant::user("Take me home")]);
+    prompt.runtime.active_turn_id = Some("turn-1".to_owned());
+    prompt
+        .permissions
+        .push(asking("p-1", actions::OPEN_REVIEW, arguments));
+    let screen = setup.deliver(&session, prompt.clone());
+    assert!(screen.contains("y allow"), "{}", screen.text());
+    setup.scenario.key("n");
+    setup.settle();
+    assert!(matches!(
+        declined.try_recv(),
+        Ok(ClientToolReply::Failed { ref code, .. }) if code == "permission_denied"
+    ));
+    assert_eq!(setup.app().route_name(), RouteName::Review);
+    assert_eq!(open_review_id(&setup), Some(setup.review.id.clone()));
+
+    // Allowed, the same call moves the user.
+    let mut allowed =
+        setup
+            .backend
+            .host()
+            .gate_client_tool("p-2", &session, actions::OPEN_REVIEW, arguments);
+    prompt.permissions = vec![asking("p-2", actions::OPEN_REVIEW, arguments)];
+    setup.deliver(&session, prompt);
+    setup.scenario.key("y");
+    for _ in 0..4 {
+        setup.settle();
+    }
+    assert!(matches!(
+        allowed.try_recv(),
+        Ok(ClientToolReply::Completed(_))
+    ));
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+}
+
+#[test]
+fn the_first_turn_of_a_new_conversation_already_has_the_apps_tools_and_profile() {
+    let mut setup = super::assistant::setup(160, 40, false);
+    assert_eq!(setup.app().route_name(), RouteName::Home);
+    setup.scenario.key("ctrl+k");
+    let session = setup.send("Create a review for my most recent PR stack");
+    let host = setup.backend.host();
+    let (turn_session, offered) = host.turn_tools().first().cloned().expect("a turn");
+    assert_eq!(turn_session, session);
+    for tool in [
+        crate::assistant::profile::CURRENT_VIEW,
+        actions::FIND_PULL_REQUESTS,
+        actions::OPEN_REVIEW,
+    ] {
+        assert!(
+            offered.iter().any(|name| name == tool),
+            "{tool} in {offered:?}"
+        );
+    }
+    let (_, request) = host.turns().first().cloned().expect("a turn");
+    assert_eq!(
+        request.agent.as_deref(),
+        Some(crate::assistant::profile::PROFILE_ID)
+    );
+    // A conversation switched to from the history is claimed before its next turn.
+    setup.scenario.key("ctrl+n");
+    let other = setup.send("Another question");
+    assert_ne!(other, session);
+    assert_eq!(host.released_sessions(), vec![session]);
+    let (_, offered) = host.turn_tools().last().cloned().expect("a turn");
+    assert!(offered.iter().any(|name| name == actions::OPEN_REVIEW));
+}
+
+#[test]
+fn messages_wait_for_the_profile_while_the_tool_connection_is_down() {
+    let mut setup = super::assistant::setup(160, 40, false);
+    let host = setup.backend.host();
+    host.set_tool_link_state(crate::host::ToolLinkState::Failed(
+        "Bcode restarted".to_owned(),
+    ));
+    setup.scenario.key("ctrl+k");
+    setup.scenario.paste("Hello");
+    setup.scenario.key("enter");
+    setup.settle();
+    assert!(host.turns().is_empty(), "no turn runs without the profile");
+    let notice = setup.app().assistant().notice().map(str::to_owned);
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("waiting") && notice.contains("Bcode restarted")),
+        "{notice:?}"
+    );
+    // Registered again: the message goes, with the profile and the tools.
+    host.set_tool_link_state(crate::host::ToolLinkState::Ready);
+    setup.settle();
+    let (session, request) = host.turns().first().cloned().expect("sent once registered");
+    assert_eq!(request.text, "Hello");
+    assert_eq!(
+        request.agent.as_deref(),
+        Some(crate::assistant::profile::PROFILE_ID)
+    );
+    let (_, offered) = host.turn_tools().first().cloned().expect("a turn");
+    assert!(offered.iter().any(|name| name == actions::OPEN_REVIEW));
+    assert_eq!(setup.app().assistant().session(), Some(session.as_str()));
+    assert_eq!(setup.app().assistant().notice(), None);
+}
+
+#[test]
+fn only_the_panels_active_conversation_reads_or_moves_the_screen() {
+    let mut setup = super::assistant::setup(160, 40, true);
+    setup.scenario.key("ctrl+k");
+    let first = setup.send("First conversation");
+    setup.scenario.key("ctrl+n");
+    let second = setup.send("Second conversation");
+    // The first conversation's turns may still call the tools it was offered: refused.
+    for tool in [
+        crate::assistant::profile::CURRENT_VIEW,
+        actions::OPEN_REVIEW,
+    ] {
+        let answer = call_as(&mut setup.scenario, &first, tool, r#"{"screen":"home"}"#);
+        assert!(
+            matches!(
+                answer,
+                ClientToolReply::Failed { ref code, .. }
+                    if code == crate::app::NOT_ACTIVE_CONVERSATION
+            ),
+            "{tool}: {answer:?}"
+        );
+    }
     assert_eq!(setup.app().route_name(), RouteName::Review);
     assert_eq!(
-        setup
-            .app()
-            .review()
-            .and_then(crate::ReviewSurface::workspace)
-            .map(|workspace| workspace.id.clone()),
-        Some(setup.review.id.clone())
+        setup.backend.host().claimed_sessions(),
+        vec![second.clone()]
     );
+    let view = done(call_as(
+        &mut setup.scenario,
+        &second,
+        crate::assistant::profile::CURRENT_VIEW,
+        "{}",
+    ));
+    assert_eq!(view["screen"], "review");
 }
 
 #[test]

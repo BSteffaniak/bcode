@@ -281,14 +281,33 @@ pub enum ToolLinkState {
 }
 
 /// The app's connection that provides its tools and agent profile.
+///
+/// Sessions are created, claimed and released on it with [`ReviewHost::create_tool_session`],
+/// [`ReviewHost::claim_tool_session`] and [`ReviewHost::release_tool_session`]; claimed sessions
+/// are claimed again after every reconnect.
 #[derive(Debug)]
 pub struct ClientToolLink {
     /// Calls of the app's tools, oldest first.
     pub calls: mpsc::Receiver<ClientToolCall>,
-    /// Sessions to claim (claimed again after every reconnect).
-    pub claims: mpsc::UnboundedSender<String>,
     /// Registration state.
     pub state: Arc<Mutex<ToolLinkState>>,
+}
+
+/// A session request sent to the tool connection.
+enum ToolSessionRequest {
+    Create {
+        title: String,
+        working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+        reply: tokio::sync::oneshot::Sender<Result<String, HostError>>,
+    },
+    Claim {
+        session: SessionId,
+        reply: tokio::sync::oneshot::Sender<Result<(), HostError>>,
+    },
+    Release {
+        session: SessionId,
+    },
 }
 
 /// Sessions listed per catalog page at most.
@@ -380,6 +399,31 @@ pub trait ReviewHost: Send + Sync {
     ) -> Result<ClientToolLink, HostError> {
         let _ = (tools, profiles);
         Err(HostError::failed("this host cannot provide tools"))
+    }
+
+    /// Create a session on the tool connection (see [`Self::serve_client_tools`]), claimed for
+    /// the app's tools before it is returned, so its first turn already offers them.
+    fn create_tool_session(
+        &self,
+        title: String,
+        working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> HostFuture<String> {
+        let _ = (title, working_directory, origin);
+        Box::pin(async { Err(HostError::failed("this host cannot provide tools")) })
+    }
+
+    /// Claim `session_id` for the app's tools; resolves once Bcode offers them from its next
+    /// turn on.
+    fn claim_tool_session(&self, session_id: String) -> HostFuture<()> {
+        let _ = session_id;
+        Box::pin(async { Err(HostError::failed("this host cannot provide tools")) })
+    }
+
+    /// Stop offering the app's tools to `session_id` from its next turn on.
+    fn release_tool_session(&self, session_id: String) -> HostFuture<()> {
+        let _ = session_id;
+        Box::pin(async { Ok(()) })
     }
 
     /// User messages in the newest history page of `session_id`.
@@ -580,6 +624,8 @@ pub struct StandaloneHost {
     runtime: tokio::runtime::Handle,
     theme: Mutex<(HostTheme, u64)>,
     redraw: Arc<OnceLock<Redraw>>,
+    /// Session requests for the tool connection, once it was asked for.
+    tool_sessions: Mutex<Option<mpsc::UnboundedSender<ToolSessionRequest>>>,
 }
 
 impl std::fmt::Debug for StandaloneHost {
@@ -607,7 +653,19 @@ impl StandaloneHost {
             runtime: tokio::runtime::Handle::current(),
             theme: Mutex::new((theme, 0)),
             redraw: Arc::default(),
+            tool_sessions: Mutex::new(None),
         }
+    }
+
+    /// Send `request` to the tool connection.
+    fn tool_session_request(&self, request: ToolSessionRequest) -> Result<(), HostError> {
+        self.tool_sessions
+            .lock()
+            .ok()
+            .and_then(|sender| sender.clone())
+            .ok_or_else(|| HostError::failed("the app's tools are not being served"))?
+            .send(request)
+            .map_err(|_| HostError::failed("the app's tool connection closed"))
     }
 
     /// Present `theme` from now on and request a redraw.
@@ -843,23 +901,63 @@ impl ReviewHost for StandaloneHost {
         profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
     ) -> Result<ClientToolLink, HostError> {
         let (call_sender, calls) = mpsc::channel(TOOL_CALL_BUFFER);
-        let (claims, claim_receiver) = mpsc::unbounded_channel();
+        let (sessions, session_receiver) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(ToolLinkState::Connecting));
         let provider = ToolProvider {
             bcode: Arc::clone(&self.bcode),
             tools,
             profiles,
             calls: call_sender,
-            claims: claim_receiver,
+            sessions: session_receiver,
             state: Arc::clone(&state),
             redraw: Arc::clone(&self.redraw),
         };
+        if let Ok(mut current) = self.tool_sessions.lock() {
+            *current = Some(sessions);
+        }
         drop(self.runtime.spawn(provider.run()));
-        Ok(ClientToolLink {
-            calls,
-            claims,
-            state,
+        Ok(ClientToolLink { calls, state })
+    }
+
+    fn create_tool_session(
+        &self,
+        title: String,
+        working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> HostFuture<String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = self.tool_session_request(ToolSessionRequest::Create {
+            title,
+            working_directory,
+            origin,
+            reply,
+        });
+        Box::pin(async move {
+            sent?;
+            answer
+                .await
+                .map_err(|_| HostError::failed("the app's tool connection closed"))?
         })
+    }
+
+    fn claim_tool_session(&self, session_id: String) -> HostFuture<()> {
+        let session = parse_session(&session_id);
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = session.and_then(|session| {
+            self.tool_session_request(ToolSessionRequest::Claim { session, reply })
+        });
+        Box::pin(async move {
+            sent?;
+            answer
+                .await
+                .map_err(|_| HostError::failed("the app's tool connection closed"))?
+        })
+    }
+
+    fn release_tool_session(&self, session_id: String) -> HostFuture<()> {
+        let sent = parse_session(&session_id)
+            .and_then(|session| self.tool_session_request(ToolSessionRequest::Release { session }));
+        Box::pin(async move { sent })
     }
 
     fn count_turns(&self, session_id: String) -> HostFuture<TurnCount> {
@@ -1092,7 +1190,7 @@ struct ToolProvider {
     tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
     profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
     calls: mpsc::Sender<ClientToolCall>,
-    claims: mpsc::UnboundedReceiver<String>,
+    sessions: mpsc::UnboundedReceiver<ToolSessionRequest>,
     state: Arc<Mutex<ToolLinkState>>,
     redraw: Arc<OnceLock<Redraw>>,
 }
@@ -1181,18 +1279,64 @@ impl ToolProvider {
                         let _ = handle.respond(invocation_id, outcome).await;
                     });
                 }
-                claim = self.claims.recv() => {
-                    let Some(session) = claim else {
+                request = self.sessions.recv() => {
+                    let Some(request) = request else {
                         return Ok(());
                     };
-                    let Ok(session) = session.parse::<SessionId>() else {
-                        continue;
-                    };
-                    if !claimed.contains(&session) {
-                        claimed.push(session);
-                    }
-                    let _ = handle.claim_session(session).await;
+                    Self::session_request(&handle, claimed, request).await;
                 }
+            }
+        }
+    }
+}
+
+impl ToolProvider {
+    /// Create, claim or release a session on the connection, keeping `claimed` (claimed again
+    /// after a reconnect) in step.
+    async fn session_request(
+        handle: &bcode_client::client_tools::ClientToolHandle,
+        claimed: &mut Vec<SessionId>,
+        request: ToolSessionRequest,
+    ) {
+        match request {
+            ToolSessionRequest::Create {
+                title,
+                working_directory,
+                origin,
+                reply,
+            } => {
+                let result = match handle
+                    .create_session(Some(title), working_directory, Some(origin))
+                    .await
+                {
+                    Ok(session) => {
+                        // Bcode claims a session created with the provider's origin; claiming
+                        // again makes sure, before the first turn is submitted.
+                        let claim = handle.claim_session(session.id).await;
+                        if !claimed.contains(&session.id) {
+                            claimed.push(session.id);
+                        }
+                        claim
+                            .map(|()| session.id.to_string())
+                            .map_err(|error| client_error(&error))
+                    }
+                    Err(error) => Err(client_error(&error)),
+                };
+                let _ = reply.send(result);
+            }
+            ToolSessionRequest::Claim { session, reply } => {
+                let result = handle
+                    .claim_session(session)
+                    .await
+                    .map_err(|error| client_error(&error));
+                if result.is_ok() && !claimed.contains(&session) {
+                    claimed.push(session);
+                }
+                let _ = reply.send(result);
+            }
+            ToolSessionRequest::Release { session } => {
+                claimed.retain(|known| *known != session);
+                let _ = handle.release_session(session).await;
             }
         }
     }

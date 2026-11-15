@@ -374,7 +374,7 @@ impl ReviewSurface {
     }
 
     /// The saved review was deleted elsewhere: stop saving and leave it.
-    pub(super) fn deleted_elsewhere(&mut self) {
+    pub(super) const fn deleted_elsewhere(&mut self) {
         if std::mem::replace(&mut self.viewed_sync.deleted, true) {
             return;
         }

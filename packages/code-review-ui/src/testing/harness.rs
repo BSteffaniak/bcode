@@ -82,6 +82,11 @@ pub struct ScriptedHost {
     submit_failures: Mutex<VecDeque<String>>,
     /// Fake clock of session activity.
     clock: std::sync::atomic::AtomicU64,
+    /// The app tools each submitted turn was offered (fixed when the turn started, as Bcode
+    /// does), oldest first.
+    turn_tools: Mutex<Vec<(String, Vec<String>)>>,
+    /// App tool calls waiting on a permission answer, by permission id.
+    gated: Mutex<BTreeMap<String, crate::host::ClientToolCall>>,
     /// The app's registered tools and profiles, and where their calls go.
     client_tools: Mutex<Option<ClientTools>>,
 }
@@ -91,8 +96,11 @@ struct ClientTools {
     tools: Vec<bcode_tool_models::client_tool::ClientToolDescriptor>,
     profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
     calls: tokio::sync::mpsc::Sender<crate::host::ClientToolCall>,
-    claims: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Sessions offered the tools now, in the order they were claimed.
     claimed: Vec<String>,
+    /// Sessions released, oldest first.
+    released: Vec<String>,
+    state: Arc<Mutex<crate::host::ToolLinkState>>,
 }
 
 impl std::fmt::Debug for ScriptedHost {
@@ -150,6 +158,8 @@ impl ScriptedHost {
             deleted: Mutex::default(),
             submit_failures: Mutex::default(),
             clock: std::sync::atomic::AtomicU64::new(1_000),
+            turn_tools: Mutex::default(),
+            gated: Mutex::default(),
             client_tools: Mutex::default(),
         }
     }
@@ -182,21 +192,111 @@ impl ScriptedHost {
             .unwrap_or_default()
     }
 
-    /// Sessions the app claimed for its tools, oldest first.
+    /// Sessions the app's tools are offered to now, in the order they were claimed.
     ///
     /// # Panics
     ///
     /// Panics when the tools lock is poisoned.
     pub fn claimed_sessions(&self) -> Vec<String> {
+        self.client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .map_or_else(Vec::new, |tools| tools.claimed.clone())
+    }
+
+    /// Sessions the app released from its tools, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tools lock is poisoned.
+    pub fn released_sessions(&self) -> Vec<String> {
+        self.client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .map_or_else(Vec::new, |tools| tools.released.clone())
+    }
+
+    /// The app tools each submitted turn was offered, oldest first: the registered tools when
+    /// its session was claimed at submission, else none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn turn_tools(&self) -> Vec<(String, Vec<String>)> {
+        self.turn_tools.lock().expect("turn tools lock").clone()
+    }
+
+    /// Set the tool connection's registration state, as a Bcode restart or a failed
+    /// registration does.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the app registered no tools.
+    pub fn set_tool_link_state(&self, state: crate::host::ToolLinkState) {
+        let link = self
+            .client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .map(|tools| Arc::clone(&tools.state))
+            .expect("the app registered its tools");
+        *link.lock().expect("state lock") = state;
+    }
+
+    fn create_now(
+        &self,
+        title: String,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> Result<String, HostError> {
+        self.session_origins
+            .lock()
+            .expect("origins lock")
+            .push(origin.clone());
+        let failure = self.session_failure.lock().expect("failure lock").clone();
+        if let Some(message) = failure {
+            return Err(HostError::failed(message));
+        }
+        let id = SessionId::new().to_string();
+        let now = self.tick();
+        self.catalog.lock().expect("catalog lock").insert(
+            id.clone(),
+            crate::host::AppSession {
+                id: id.clone(),
+                title: Some(title.clone()),
+                created_at_ms: now,
+                updated_at_ms: now,
+                origin_app: Some(origin.app_id.clone()),
+                origin_context: origin.context,
+            },
+        );
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .push((id.clone(), title));
+        Ok(id)
+    }
+
+    fn claim(&self, session: &str) -> Result<(), HostError> {
         let mut guard = self.client_tools.lock().expect("tools lock");
-        let claimed = guard.as_mut().map_or_else(Vec::new, |tools| {
-            while let Ok(session) = tools.claims.try_recv() {
-                tools.claimed.push(session);
+        let result = match guard.as_mut() {
+            None => Err(HostError::failed("the app registered no tools")),
+            Some(tools)
+                if *tools.state.lock().expect("state lock")
+                    != crate::host::ToolLinkState::Ready =>
+            {
+                Err(HostError::failed("the tool connection is not registered"))
             }
-            tools.claimed.clone()
-        });
+            Some(tools) => {
+                if !tools.claimed.iter().any(|known| known == session) {
+                    tools.claimed.push(session.to_owned());
+                }
+                Ok(())
+            }
+        };
         drop(guard);
-        claimed
+        result
     }
 
     /// Call the app's tool `tool` as `session` with JSON `arguments`, as the daemon does after
@@ -225,6 +325,33 @@ impl ScriptedHost {
                 reply,
             })
             .expect("the app serves its tools");
+        answer
+    }
+
+    /// Call the app's tool `tool` as `session` behind the permission request `permission_id`,
+    /// as the daemon does for a call its rules ask about: the call reaches the app only once the
+    /// request is allowed; a declined request answers `permission_denied` without it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the gate lock is poisoned.
+    pub fn gate_client_tool(
+        &self,
+        permission_id: &str,
+        session: &str,
+        tool: &str,
+        arguments: &str,
+    ) -> tokio::sync::oneshot::Receiver<crate::host::ClientToolReply> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.gated.lock().expect("gate lock").insert(
+            permission_id.to_owned(),
+            crate::host::ClientToolCall {
+                session_id: session.to_owned(),
+                tool: tool.to_owned(),
+                arguments: arguments.to_owned(),
+                reply,
+            },
+        );
         answer
     }
 
@@ -542,32 +669,8 @@ impl ReviewHost for ScriptedHost {
         _working_directory: PathBuf,
         origin: bcode_session_models::SessionOrigin,
     ) -> HostFuture<String> {
-        self.session_origins
-            .lock()
-            .expect("origins lock")
-            .push(origin.clone());
-        let failure = self.session_failure.lock().expect("failure lock").clone();
-        if let Some(message) = failure {
-            return Box::pin(async move { Err(HostError::failed(message)) });
-        }
-        let id = SessionId::new().to_string();
-        let now = self.tick();
-        self.catalog.lock().expect("catalog lock").insert(
-            id.clone(),
-            crate::host::AppSession {
-                id: id.clone(),
-                title: Some(title.clone()),
-                created_at_ms: now,
-                updated_at_ms: now,
-                origin_app: Some(origin.app_id.clone()),
-                origin_context: origin.context,
-            },
-        );
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .push((id.clone(), title));
-        Box::pin(async move { Ok(id) })
+        let created = self.create_now(title, origin);
+        Box::pin(async move { created })
     }
 
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()> {
@@ -601,6 +704,18 @@ impl ReviewHost for ScriptedHost {
                 })
             });
         }
+        let offered = self
+            .client_tools
+            .lock()
+            .expect("tools lock")
+            .as_ref()
+            .filter(|tools| tools.claimed.contains(&session_id))
+            .map(|tools| tools.tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default();
+        self.turn_tools
+            .lock()
+            .expect("turn tools lock")
+            .push((session_id.clone(), offered));
         self.turns
             .lock()
             .expect("turns lock")
@@ -679,19 +794,43 @@ impl ReviewHost for ScriptedHost {
         profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
     ) -> Result<crate::host::ClientToolLink, HostError> {
         let (call_sender, calls) = tokio::sync::mpsc::channel(FOLLOW_BUFFER);
-        let (claims, claim_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(crate::host::ToolLinkState::Ready));
         *self.client_tools.lock().expect("tools lock") = Some(ClientTools {
             tools,
             profiles,
             calls: call_sender,
-            claims: claim_receiver,
             claimed: Vec::new(),
+            released: Vec::new(),
+            state: Arc::clone(&state),
         });
-        Ok(crate::host::ClientToolLink {
-            calls,
-            claims,
-            state: Arc::new(Mutex::new(crate::host::ToolLinkState::Ready)),
-        })
+        Ok(crate::host::ClientToolLink { calls, state })
+    }
+
+    fn create_tool_session(
+        &self,
+        title: String,
+        working_directory: PathBuf,
+        origin: bcode_session_models::SessionOrigin,
+    ) -> HostFuture<String> {
+        let _ = working_directory;
+        // Created on the tool connection with the app's origin: claimed before it is returned.
+        let id = self
+            .create_now(title, origin)
+            .and_then(|id| self.claim(&id).map(|()| id));
+        Box::pin(async move { id })
+    }
+
+    fn claim_tool_session(&self, session_id: String) -> HostFuture<()> {
+        let result = self.claim(&session_id);
+        Box::pin(async move { result })
+    }
+
+    fn release_tool_session(&self, session_id: String) -> HostFuture<()> {
+        if let Some(tools) = self.client_tools.lock().expect("tools lock").as_mut() {
+            tools.claimed.retain(|known| *known != session_id);
+            tools.released.push(session_id);
+        }
+        Box::pin(async { Ok(()) })
     }
 
     fn pending_permissions(&self) -> HostFuture<Vec<crate::host::PendingPermission>> {
@@ -716,6 +855,20 @@ impl ReviewHost for ScriptedHost {
         approved: bool,
         remember: bool,
     ) -> HostFuture<()> {
+        let gated = self.gated.lock().expect("gate lock").remove(&permission_id);
+        if let Some(call) = gated {
+            if approved {
+                let tools = self.client_tools.lock().expect("tools lock");
+                if let Some(tools) = tools.as_ref() {
+                    let _ = tools.calls.try_send(call);
+                }
+            } else {
+                let _ = call.reply.send(crate::host::ClientToolReply::Failed {
+                    code: "permission_denied".to_owned(),
+                    message: "the user declined".to_owned(),
+                });
+            }
+        }
         self.permissions.lock().expect("permissions lock").push((
             permission_id,
             approved,
