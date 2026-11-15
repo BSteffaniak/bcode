@@ -221,7 +221,7 @@ impl Icons {
     pub const ASCII: Self = Self {
         viewed: "v",
         unviewed: "o",
-        thread: "#",
+        thread: "\"",
         draft: "~",
         ai: "AI",
         accent_bar: "|",
@@ -234,10 +234,10 @@ impl Icons {
         reveal_down: "v",
         reveal_all: "<>",
         ellipsis: "...",
-        bar_filled: "#",
+        bar_filled: "|",
         bar_empty: ".",
-        progress_filled: "#",
-        progress_empty: "-",
+        progress_filled: ":",
+        progress_empty: ".",
         menu: "v",
         selection_bar: ">",
         filter: "/",
@@ -1125,14 +1125,16 @@ mod tests {
     #[test]
     fn glyphs_sharing_a_rail_tab_or_file_row_are_distinct_in_every_icon_set() {
         for icons in [Icons::UNICODE, Icons::ASCII] {
-            // What a rail tab or a file panel row can show side by side.
-            let tab = [
+            // What a rail tab and a file panel row both can show side by side, pull request
+            // numbers (`#3`) among them.
+            let badges = [
                 ("approved", icons.approved),
                 ("changes", icons.changes),
                 ("new", icons.new),
                 ("draft", icons.draft),
                 ("thread", icons.thread),
                 ("ellipsis", icons.ellipsis),
+                ("pull request number", "#"),
                 ("since_changed", icons.since_changed),
                 ("since_rebased", icons.since_rebased),
                 ("since_unchanged", icons.since_unchanged),
@@ -1140,13 +1142,26 @@ mod tests {
                 ("since_with_rebase", icons.since_with_rebase),
                 ("since_unavailable", icons.since_unavailable),
             ];
-            for (index, (name, glyph)) in tab.iter().enumerate() {
-                for (other, other_glyph) in &tab[index + 1..] {
-                    assert_ne!(glyph, other_glyph, "{name} and {other} in {icons:?}");
+            // A tab adds its viewed progress cells; a file row its change bar.
+            let tab = [
+                ("progress_filled", icons.progress_filled),
+                ("progress_empty", icons.progress_empty),
+            ];
+            let row = [
+                ("bar_filled", icons.bar_filled),
+                ("bar_empty", icons.bar_empty),
+            ];
+            for extra in [&tab, &row] {
+                let glyphs: Vec<(&str, &str)> =
+                    badges.iter().chain(extra.iter()).copied().collect();
+                for (index, (name, glyph)) in glyphs.iter().enumerate() {
+                    for (other, other_glyph) in &glyphs[index + 1..] {
+                        assert_ne!(glyph, other_glyph, "{name} and {other} in {icons:?}");
+                    }
                 }
             }
             // The viewed mark is the approval mark by design, never a comparison badge.
-            for (name, glyph) in &tab[6..] {
+            for (name, glyph) in &badges[7..] {
                 assert_ne!(*glyph, icons.viewed, "{name} in {icons:?}");
             }
         }

@@ -983,7 +983,10 @@ them in when the same target opens again; saving the review moves them.
   rename arrow, the minus sign, gap rules and reveal arrows, ellipses, change-bar and progress
   cells, the publish menu toggle, the filter prompt, and the panel's hide action; the loading
   spinner switches to ASCII frames too. BMUX-owned glyphs (pane borders, tree disclosure
-  markers) are not part of it.
+  markers) are not part of it. In both sets, the glyphs a rail tab or a file panel row can show
+  side by side (badges, the `#` of pull request numbers, progress cells, change-bar cells) are
+  distinct from each other: ASCII threads are `"`, its progress cells `:`/`.`, and its change
+  bar `|`/`.`.
 * Every row is composed from styled spans (rows, tree labels and decorations, header parts,
   hints, toasts).
 
