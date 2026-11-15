@@ -3278,7 +3278,7 @@ library = "libcomposer_fixture.dylib"
             Err(ScopeError::Capacity)
         ));
         drop(view);
-        // The scoped cleanup task releases registration after its admission ends.
+        // Dropping the view on an idle activation releases its registration.
         let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match scope.register_resource(Arc::new(())) {

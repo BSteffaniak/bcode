@@ -90,9 +90,18 @@ pub struct RetainedFrontend {
 }
 
 struct ActivationRegistration {
-    scope: bmux_plugin_runtime::ActivationScope,
+    resources: bcode_plugin_sdk::definition::ActivationResources,
     resource: bmux_plugin_runtime::PluginResourceId,
-    close: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The activation-charged owner of a view's renderer resources. The activation
+/// owner retires it at teardown when the view could not release it earlier.
+struct RegisteredState(Arc<Mutex<State>>);
+
+impl bcode_plugin_sdk::definition::ActivationResource for RegisteredState {
+    fn retire(&self) {
+        RetainedFrontend::retire_state(&self.0);
+    }
 }
 
 struct State {
@@ -184,9 +193,10 @@ impl RetainedFrontend {
         descriptor: &bcode_plugin_sdk::definition::ProductExtensionDescriptor,
         limits: PortablePresentationLimits,
     ) -> Result<Arc<Self>, String> {
-        let scope = owner
-            .activation_scope()
+        let resources = owner
+            .activation_resources()
             .map_err(|_| "selected frontend activation unavailable".to_owned())?;
+        let scope = resources.scope().clone();
         let admission = scope
             .try_admit()
             .map_err(|_| "selected frontend activation closed".to_owned())?;
@@ -203,41 +213,16 @@ impl RetainedFrontend {
             return Err("selected frontend lacks rich-v2 contract".to_owned());
         }
         let mut view = Self::from_owner(owner, &namespace, 1, limits)?;
-        let resource = scope
-            .register_resource(Arc::clone(&view.state))
+        let resource = resources
+            .register(Arc::new(RegisteredState(Arc::clone(&view.state))))
             .map_err(|_| "frontend resource registration failed".to_owned())?;
-        let cleanup_scope = scope.clone();
-        let (close, closed) = tokio::sync::oneshot::channel();
-        let cleanup_state = Arc::clone(&view.state);
-        let cleanup = scope.spawn(
-            "bcode.frontend.retained",
-            move |mut cancellation| async move {
-                tokio::select! {
-                    () = cancellation.cancelled() => {},
-                    _ = closed => {},
-                }
-                Self::retire_state(&cleanup_state);
-                // The scoped task itself holds admission. Release from a separate
-                // cleanup observer after this task returns and drops that admission.
-                tokio::spawn(async move {
-                    let _ = Self::release_registration(&cleanup_scope, resource).await;
-                });
-                Ok(())
-            },
-        );
-        if cleanup.is_err() {
-            drop(admission);
-            let _ = scope.release_resource(resource);
-            return Err("frontend resource cancellation registration failed".to_owned());
-        }
+        drop(admission);
         let unique = Arc::get_mut(&mut view)
             .ok_or_else(|| "frontend registration unexpectedly shared".to_owned())?;
         unique.registration = Mutex::new(Some(ActivationRegistration {
-            scope,
+            resources,
             resource,
-            close,
         }));
-        drop(admission);
         Ok(view)
     }
 
@@ -591,47 +576,15 @@ impl RetainedFrontend {
             .ok()
             .and_then(|mut registration| registration.take());
         if let Some(ActivationRegistration {
-            scope,
+            resources,
             resource,
-            close,
         }) = registration
         {
-            let _ = close.send(());
-            match scope.release_resource(resource) {
-                Ok(owner) => drop(owner),
-                Err(bmux_plugin_runtime::ScopeError::Outstanding(_)) => {
-                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                        runtime.spawn(async move {
-                            let _ = Self::release_registration(&scope, resource).await;
-                        });
-                    }
-                    // Without an executor the activation's registered cancellation task owns
-                    // cleanup. No failed release is treated as successful teardown.
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    async fn release_registration(
-        scope: &bmux_plugin_runtime::ActivationScope,
-        resource: bmux_plugin_runtime::PluginResourceId,
-    ) -> Result<(), String> {
-        loop {
-            match scope.release_resource(resource) {
-                Ok(owner) => {
-                    drop(owner);
-                    return Ok(());
-                }
-                Err(
-                    bmux_plugin_runtime::ScopeError::UnknownResource
-                    | bmux_plugin_runtime::ScopeError::Closed,
-                ) => return Ok(()),
-                Err(bmux_plugin_runtime::ScopeError::Outstanding(_)) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(error) => return Err(error.to_string()),
-            }
+            // Release now when the activation is idle. Otherwise the entry stays
+            // in the activation's ledger and its owner releases it during
+            // deactivation, after draining and before finishing the activation.
+            // No failed release is treated as successful teardown.
+            let _ = resources.release(resource);
         }
     }
 

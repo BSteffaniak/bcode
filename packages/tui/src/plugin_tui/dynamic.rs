@@ -1827,6 +1827,13 @@ impl PluginTuiSurface for SurfaceProxy {
                 };
                 self.completion = token;
                 let _ = received.send(());
+                if matches!(action, PluginTuiAction::Close { .. }) {
+                    // Closing re-renders the host, which satisfies any redraw an
+                    // earlier input requested while this drain was in flight.
+                    self.pending.retain(|(queued, token)| {
+                        token.is_some() || !matches!(queued, PluginTuiAction::Redraw)
+                    });
+                }
                 action
             } else {
                 self.view.display_failed();

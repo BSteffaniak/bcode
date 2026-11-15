@@ -128,8 +128,13 @@ pub(super) fn config(plugin_id: &str) -> bcode_plugin::ResolvedPluginConfig {
             dispatch: Arc::new(Dispatch),
             concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            // The selected reactor must keep running accepted callback work
+            // between lifecycle calls (`SharedLifecycleDriver::runtime_handle`),
+            // as the serving runtime does; a current-thread runtime only runs
+            // while a lifecycle call blocks on it.
             driver: Arc::new(Driver(Some(
-                tokio::runtime::Builder::new_current_thread()
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                     .unwrap(),

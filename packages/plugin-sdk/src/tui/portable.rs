@@ -214,6 +214,22 @@ struct Surface {
     bindings: Option<Bindings>,
     edit_pending: bool,
 }
+
+impl Surface {
+    fn deliver_update(&mut self, update: PluginTuiSurfaceUpdate) -> PluginResult<Response> {
+        match self.updates.try_send(update) {
+            // A surface that never attached its update stream (the trait
+            // default drops it) declines updates; delivery is a no-op, exactly
+            // as for the same surface linked statically.
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(failure("frontend update queue full; refresh required"));
+            }
+        }
+        self.dirty = true;
+        Ok(Response::Applied)
+    }
+}
 struct State {
     registry: Option<Arc<PluginTuiRegistry>>,
     surfaces: BTreeMap<uuid::Uuid, Surface>,
@@ -882,14 +898,7 @@ impl AuthorFrontend {
                 surface.dirty = true;
                 Ok(Response::Event(result))
             }
-            Request::Update { update, .. } => {
-                surface
-                    .updates
-                    .try_send(update)
-                    .map_err(|_| failure("frontend update queue unavailable; refresh required"))?;
-                surface.dirty = true;
-                Ok(Response::Applied)
-            }
+            Request::Update { update, .. } => surface.deliver_update(update),
             Request::Edit {
                 expected_revision,
                 edit,
