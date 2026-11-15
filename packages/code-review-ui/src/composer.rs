@@ -24,9 +24,9 @@ use bmux_tui_components::text_input::{
 };
 use std::cell::RefCell;
 
-/// Layout id of the composer's editor.
 /// Cells of a question's `model · effort` label at most.
 const MODEL_LABEL_CELLS: usize = 40;
+/// Layout id of the composer's editor.
 pub const EDITOR_ID: &str = "review.composer.editor";
 /// Editor rows shown at least and at most.
 const EDITOR_MIN_ROWS: u16 = 3;

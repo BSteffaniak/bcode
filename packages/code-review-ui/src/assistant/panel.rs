@@ -3510,7 +3510,7 @@ fn failure_text(what: &str, code: Option<&str>, message: &str) -> String {
     text
 }
 
-/// Editing policy of the rename input./// Editing policy of the rename input.
+/// Editing policy of the rename input.
 static RENAME_POLICY: std::sync::LazyLock<TextInputPolicy> =
     std::sync::LazyLock::new(single_line_policy);
 
