@@ -1906,13 +1906,32 @@ pub async fn set_model(
             selected_model.as_deref(),
         ),
     };
+    // The model change restores the reasoning remembered for the incoming provider/model pair in
+    // the session's persisted state; the live selection must agree with it, or a later request for
+    // that same reasoning is treated as unchanged while turns run at the daemon-wide effort.
+    let (reasoning_effort, reasoning_summary) = super::remembered_reasoning(
+        state,
+        session_id,
+        selected_provider.as_deref(),
+        selected_model.as_deref(),
+    )
+    .await
+    .map_or_else(
+        || {
+            (
+                state.selected_reasoning.effort.clone(),
+                state.selected_reasoning.summary.clone(),
+            )
+        },
+        |remembered| (remembered.effort, remembered.summary),
+    );
     let selection = super::SessionModelSelection {
         provider_plugin_id: selected_provider,
         requested_model_id: None,
         model_id: selected_model,
         thinking_level: None,
-        reasoning_effort: state.selected_reasoning.effort.clone(),
-        reasoning_summary: state.selected_reasoning.summary.clone(),
+        reasoning_effort,
+        reasoning_summary,
         reasoning_capabilities: state.selected_reasoning_capabilities.clone(),
         provider_context,
         native_default: false,

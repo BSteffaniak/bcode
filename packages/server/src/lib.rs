@@ -85767,6 +85767,88 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    /// Switching back to a model restores the reasoning the session remembered for it, both in the
+    /// persisted state and in the selection the next turn runs with, so asking for that same
+    /// reasoning again is a no-op that keeps it rather than leaving the daemon-wide effort.
+    #[tokio::test]
+    async fn set_model_runs_with_the_reasoning_remembered_for_the_incoming_model() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("keep effort".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let mut state = test_server_state(sessions);
+        state.selected_reasoning.effort = Some("low".to_owned());
+        async fn selected_effort(state: &ServerState, session_id: SessionId) -> Option<String> {
+            state
+                .session_model_selections
+                .lock()
+                .await
+                .get(&session_id)
+                .and_then(|selection| selection.reasoning_effort.clone())
+        }
+
+        session_operations::set_model(
+            &state,
+            session_id,
+            Some("p".to_owned()),
+            "a".to_owned(),
+            None,
+        )
+        .await
+        .expect("select a");
+        assert!(
+            session_operations::set_reasoning(&state, session_id, Some("high".to_owned()), None)
+                .await
+                .expect("reasoning")
+        );
+        assert_eq!(
+            selected_effort(&state, session_id).await.as_deref(),
+            Some("high")
+        );
+
+        session_operations::set_model(
+            &state,
+            session_id,
+            Some("p".to_owned()),
+            "b".to_owned(),
+            None,
+        )
+        .await
+        .expect("select b");
+        assert_eq!(
+            selected_effort(&state, session_id).await.as_deref(),
+            Some("low"),
+            "a model with nothing remembered starts at the daemon-wide effort"
+        );
+
+        session_operations::set_model(
+            &state,
+            session_id,
+            Some("p".to_owned()),
+            "a".to_owned(),
+            None,
+        )
+        .await
+        .expect("select a again");
+        assert_eq!(
+            selected_effort(&state, session_id).await.as_deref(),
+            Some("high")
+        );
+        assert!(
+            !session_operations::set_reasoning(&state, session_id, Some("high".to_owned()), None)
+                .await
+                .expect("reasoning"),
+            "the remembered reasoning is already in effect"
+        );
+        assert_eq!(
+            selected_effort(&state, session_id).await.as_deref(),
+            Some("high")
+        );
+        drop(state);
+    }
+
     #[tokio::test]
     async fn client_runtime_auth_for_another_provider_does_not_overlay_auto_provider_selection() {
         // `/model <id>` submits `<auto>` for the provider, which persists as `None`. The selection
