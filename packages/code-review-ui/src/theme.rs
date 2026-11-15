@@ -1044,16 +1044,19 @@ const SINCE_WORD_SHARE: f64 = 0.55;
 /// strongly and colors the gutter bar and badges.
 fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyle) -> SinceStyles {
     let hue = tiers.accent_alt.fg.or(component.info.fg);
+    // Terminal palette colors blend by their usual values, so themes built on the terminal's
+    // own colors get tints too.
+    let blend = |base: Option<Color>, share: f64| base?.mix(hue?, share);
     let tint = |row: Style| {
-        mixed(hue, row.bg.or(tiers.canvas.bg), SINCE_TINT_SHARE).map_or(row, |bg| row.bg(bg))
+        blend(row.bg.or(tiers.canvas.bg), SINCE_TINT_SHARE).map_or(row, |bg| row.bg(bg))
     };
     let ink = hue.map_or(tiers.accent, |fg| Style::new().fg(fg));
     let strong = |row: Style| {
-        mixed(hue, row.bg.or(tiers.canvas.bg), SINCE_STRONG_TINT_SHARE).map_or(row, |bg| row.bg(bg))
+        blend(row.bg.or(tiers.canvas.bg), SINCE_STRONG_TINT_SHARE).map_or(row, |bg| row.bg(bg))
     };
     let accent = tiers.accent.fg.map_or(ink, |fg| Style::new().fg(fg));
-    let word = mixed(hue, tiers.canvas.bg, SINCE_WORD_SHARE)
-        .map_or(Style::new(), |bg| Style::new().bg(bg))
+    let word = blend(diff.added_row.bg.or(tiers.canvas.bg), SINCE_WORD_SHARE)
+        .map_or_else(Style::new, |bg| Style::new().bg(bg))
         .add_modifier(Modifier::UNDERLINE);
     SinceStyles {
         diff: DiffViewerStyle {
@@ -1146,6 +1149,27 @@ mod tests {
             for (name, glyph) in &tab[6..] {
                 assert_ne!(*glyph, icons.viewed, "{name} in {icons:?}");
             }
+        }
+    }
+
+    #[test]
+    fn marks_of_what_is_new_stand_out_in_every_bundled_theme() {
+        for (name, theme) in bundled_themes() {
+            let since = theme.since;
+            // Rows new since are tinted, more deeply in the strong style, wherever the plain
+            // row has a background to tint.
+            if theme.diff.added_row.bg.is_some() {
+                assert_ne!(since.diff.added_row, theme.diff.added_row, "{name}");
+                assert_ne!(since.strong_diff.added_row, since.diff.added_row, "{name}");
+            }
+            assert!(since.word.modifiers.contains(Modifier::UNDERLINE), "{name}");
+            assert!(
+                since
+                    .removed_inline
+                    .modifiers
+                    .contains(Modifier::CROSSED_OUT),
+                "{name}"
+            );
         }
     }
 
