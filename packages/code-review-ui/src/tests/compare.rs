@@ -1982,3 +1982,25 @@ fn hunks_seen_before_stay_folded_after_a_refresh() {
         "the refreshed document folds hunks seen before as the menu says"
     );
 }
+
+#[test]
+fn a_version_picked_while_a_baseline_is_in_effect_is_not_named_for_every_row() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("new since you looked"), "{}", screen.text());
+    // #101's versions picked: the layers above are still compared with what was looked at.
+    let screen = run(&mut scenario, "Compare versions of this pull request");
+    assert!(screen.contains("Versions of #101"), "{}", screen.text());
+    scenario.key("down");
+    scenario.key("enter");
+    let screen = settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert!(review.comparing().picks().contains_key(&101));
+    assert!(
+        screen.contains("Changes since: [mixed"),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.contains("new since v"), "{}", screen.text());
+    assert!(screen.contains("new since then"), "{}", screen.text());
+}

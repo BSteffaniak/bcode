@@ -1636,6 +1636,16 @@ impl ReviewSurface {
             return Since::Then;
         }
         if !self.comparing.picks.is_empty() {
+            // Versions picked while a baseline is in effect compare the other layers by that
+            // baseline: no one version names what every row is new since.
+            if self.comparing.baseline != Baseline::Off
+                && self
+                    .layer_sources()
+                    .iter()
+                    .any(|layer| !self.comparing.picks.contains_key(&layer.number))
+            {
+                return Since::Then;
+            }
             return self
                 .picked_from_version()
                 .map_or(Since::Then, Since::Version);
