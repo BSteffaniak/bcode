@@ -268,7 +268,10 @@ impl ReviewSurface {
                         "thread {thread} is in another layer ({source}); name its layer with `layer`"
                     ))
                 }
-                Some(_) => Ok((thread, key)),
+                Some(_) => match self.hidden_refusal(&format!("thread {thread}"), &key) {
+                    Some(refusal) => Err(refusal),
+                    None => Ok((thread, key)),
+                },
             }
         });
         let thread = thread.transpose()?;
@@ -277,7 +280,11 @@ impl ReviewSurface {
             .as_deref()
             .map(|path| {
                 let within = alone.as_deref().filter(|_| target.source.is_none());
-                self.find_file(path, target.source.as_deref(), within)
+                let file = self.find_file(path, target.source.as_deref(), within)?;
+                match self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone())) {
+                    Some(refusal) => Err(refusal),
+                    None => Ok(file),
+                }
             })
             .transpose()?;
         let mut done = Vec::new();
@@ -300,6 +307,26 @@ impl ReviewSurface {
             done.push(self.show_file_location(&file, target.line, target.side.as_deref()));
         }
         Ok(format!("now showing {}", done.join(", ")))
+    }
+
+    /// Why `what` (held at `key`) cannot be shown as the review is shown now, and how to show
+    /// it: the comparison hides its file or leaves its layer out. A layer shown alone is not a
+    /// refusal; naming the layer shows it.
+    fn hidden_refusal(&self, what: &str, key: &ItemKey) -> Option<String> {
+        use bcode_code_review::document::KeyHidden;
+        match self.review.as_ref()?.doc.key_hidden(key)? {
+            KeyHidden::Comparison { source } => Some(format!(
+                "{what} is not shown: the comparison shows only what changed and its file in \
+                 {source} did not; call bcode.code-review.set_comparison with \
+                 `show_hidden_files: true` (or `view: full`) first"
+            )),
+            KeyHidden::Filtered { source } => Some(format!(
+                "{what} is not shown: its layer {source} did not change and the comparison shows \
+                 only changed layers; call bcode.code-review.set_comparison with \
+                 `only_changed: false` first"
+            )),
+            KeyHidden::Focused { .. } => None,
+        }
     }
 
     /// The rail position of the stack layer `layer` names, and its number as named.

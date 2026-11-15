@@ -659,6 +659,67 @@ fn a_go_to_with_one_bad_place_does_not_move_the_layer() {
 }
 
 #[test]
+fn a_go_to_a_file_the_comparison_hides_refuses_and_says_how_to_show_it() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let session = active_session(&mut scenario);
+    done(call_as(
+        &mut scenario,
+        &session,
+        actions::GO_TO,
+        r#"{"layer":101,"path":"restacked.txt"}"#,
+    ));
+    done(call_as(
+        &mut scenario,
+        &session,
+        actions::SET_COMPARISON,
+        r#"{"view":"changes"}"#,
+    ));
+    let doc = scenario
+        .surface()
+        .review()
+        .and_then(crate::ReviewSurface::document)
+        .expect("doc");
+    let hidden = doc
+        .file_keys()
+        .find(|file| file.path == bcode_code_review::testing::fixture::STACK_SHARED_FILE)
+        .filter(|file| {
+            doc.jump_to(&bcode_code_review::document::ItemKey::FileHeader(
+                (*file).clone(),
+            ))
+            .is_none()
+        })
+        .cloned()
+        .expect("the comparison hides the unchanged shared file of the edited layer");
+    let before = settled(&mut scenario).text();
+    let refusal = refused(call_as(
+        &mut scenario,
+        &session,
+        actions::GO_TO,
+        &format!(r#"{{"layer":101,"path":"{}"}}"#, hidden.path),
+    ));
+    assert!(refusal.contains("not shown"), "{refusal}");
+    assert!(refusal.contains("show_hidden_files"), "{refusal}");
+    assert_eq!(settled(&mut scenario).text(), before, "nothing moved");
+    // Shown again, the same place is reached.
+    done(call_as(
+        &mut scenario,
+        &session,
+        actions::SET_COMPARISON,
+        r#"{"show_hidden_files":true}"#,
+    ));
+    let moved = done(call_as(
+        &mut scenario,
+        &session,
+        actions::GO_TO,
+        &format!(r#"{{"layer":101,"path":"{}"}}"#, hidden.path),
+    ));
+    assert_eq!(
+        moved["screen"]["review"]["file"]["path"], hidden.path,
+        "{moved}"
+    );
+}
+
+#[test]
 fn pushes_stack_at_and_versions_are_reachable_like_the_compare_menu() {
     let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
     let compared = done(call_until_loaded(

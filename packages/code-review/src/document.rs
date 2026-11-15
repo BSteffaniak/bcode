@@ -50,6 +50,6 @@ pub use navigation::{
 };
 pub use review::{
     DEFAULT_RESIDENCY_BUDGET_BYTES, DocumentConfig, DocumentNeed, FileChrome, FileFold, GroupInfo,
-    REVIEW_LEVEL_PATH, ReviewDocument, Sections, SourceInput, SourceStack, Splice, Ticket,
-    ViewedProgress,
+    KeyHidden, REVIEW_LEVEL_PATH, ReviewDocument, Sections, SourceInput, SourceStack, Splice,
+    Ticket, ViewedProgress,
 };

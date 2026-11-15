@@ -329,6 +329,26 @@ pub(super) struct FileState {
     pub fold: FileFold,
 }
 
+/// Why the document holds an item without showing it (see [`ReviewDocument::key_hidden`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyHidden {
+    /// The comparison shows only what changed and the item's file did not.
+    Comparison {
+        /// The source (stack layer) of the file.
+        source: String,
+    },
+    /// The item's layer is left out (the comparison shows only changed layers).
+    Filtered {
+        /// The source left out.
+        source: String,
+    },
+    /// Another layer is shown alone.
+    Focused {
+        /// The source of the item.
+        source: String,
+    },
+}
+
 /// Whether a file shows only its header. Folding never changes the file's viewed mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FileFold {
@@ -2255,6 +2275,29 @@ impl ReviewDocument {
                     .as_str(),
             ),
         })
+    }
+
+    /// Why the document holds `key` without showing it, when it does: the comparison hides
+    /// its file, its layer is filtered out, or another layer is shown alone. `None` when the
+    /// key is shown or not held at all.
+    #[must_use]
+    pub fn key_hidden(&self, key: &ItemKey) -> Option<KeyHidden> {
+        let block = self.block_of_key(key)?;
+        let (group, file) = match self.blocks.get(block)?.kind {
+            BlockKind::ReviewNotes => return None,
+            BlockKind::SourceHeader(group) => (group, None),
+            BlockKind::File(file) => (self.files[file].group, Some(file)),
+        };
+        let source = self.groups[group].source.source_id.clone();
+        if self.filtered.contains(&source) {
+            Some(KeyHidden::Filtered { source })
+        } else if self.groups[group].hidden {
+            Some(KeyHidden::Focused { source })
+        } else if file.is_some_and(|file| self.compare_hidden(file)) {
+            Some(KeyHidden::Comparison { source })
+        } else {
+            None
+        }
     }
 
     /// The source shown alone (see [`Self::set_focus`]), when one is.
