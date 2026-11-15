@@ -1009,7 +1009,9 @@ impl ReviewApp {
             arguments
         };
         let result = match tool {
-            actions::GO_TO => parse(arguments).and_then(|target| review.assistant_go_to(&target)),
+            actions::GO_TO => {
+                parse(arguments).and_then(|target| review.assistant_go_to(&target, host))
+            }
             actions::SET_COMPARISON => {
                 parse(arguments).and_then(|change| review.assistant_set_comparison(&change, host))
             }
@@ -1258,7 +1260,7 @@ impl ReviewApp {
         if let Some(awaiting) = self.awaiting.take() {
             if loaded {
                 let result = match &mut self.route {
-                    Route::Review(review) => review.assistant_go_to(&awaiting.target),
+                    Route::Review(review) => review.assistant_go_to(&awaiting.target, host),
                     _ => Err("the review was left before it loaded".to_owned()),
                 };
                 let answer = match result {

@@ -1432,6 +1432,49 @@ impl ReviewSurface {
         );
     }
 
+    /// Show pull request `number` as it was at its version `index` (into its timeline's
+    /// versions): its whole change then, from its fork point then (read-only where it differs
+    /// from now).
+    pub(super) fn show_layer_version(&mut self, number: u64, index: usize, host: &UiContext) {
+        let Some(layer) = self
+            .layer_sources()
+            .into_iter()
+            .find(|layer| layer.number == number)
+        else {
+            return;
+        };
+        let Some(versions) = self
+            .stack_history
+            .as_ref()
+            .and_then(|history| history.layers.iter().find(|item| item.number == number))
+        else {
+            return;
+        };
+        if index >= versions.versions.len() {
+            return;
+        }
+        let to = point_of(versions, index, &layer);
+        let from = to.fork_oid.clone().map(|fork| VersionPoint {
+            head_oid: fork.clone(),
+            fork_oid: Some(fork),
+        });
+        let historical = to.head_oid != layer.head;
+        self.comparing
+            .picks
+            .insert(number, LayerPair { number, from, to });
+        self.comparing.banner = BannerState::Hidden;
+        self.comparing.stack_at = None;
+        self.refresh_comparison(host);
+        self.set_status(
+            if historical {
+                format!("#{number} as it was at v{} (read-only)", index + 1)
+            } else {
+                format!("#{number} at v{} (current)", index + 1)
+            },
+            StatusSeverity::Info,
+        );
+    }
+
     /// How what is new since the baseline is marked now.
     pub(super) fn mark_options(&self) -> MarkOptions {
         self.comparing

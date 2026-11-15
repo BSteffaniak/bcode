@@ -39,22 +39,54 @@ pub struct GoTo {
     pub source: Option<String>,
     /// A thread id.
     pub thread: Option<String>,
+    /// A version (1-based) of the layer (`layer`, else the current one) to show: its whole
+    /// change as it was then, read-only where it differs from now.
+    pub version: Option<usize>,
 }
 
 impl GoTo {
     /// Whether the request names a place.
     #[must_use]
     pub const fn names_a_place(&self) -> bool {
-        self.layer.is_some() || self.path.is_some() || self.thread.is_some()
+        self.layer.is_some()
+            || self.path.is_some()
+            || self.thread.is_some()
+            || self.version.is_some()
     }
+}
+
+/// A comparison baseline, checked.
+#[derive(Debug, Clone, Copy)]
+enum BaselinePlan {
+    Set(ReviewCompareBaseline),
+    Ago(u64),
+    StackAt(u64),
+}
+
+/// A comparison change, checked before anything is applied.
+#[derive(Debug, Default)]
+struct ComparisonPlan {
+    baseline: Option<(BaselinePlan, String)>,
+    view: Option<bcode_code_review::document::CompareView>,
+    versions: Option<(u64, usize, usize)>,
+    mark_style: Option<MarkStyle>,
+    seen: Option<SeenHunks>,
+}
+
+/// A view change, checked before anything is applied.
+#[derive(Debug, Default)]
+struct ViewPlan {
+    side_by_side: Option<bool>,
+    flat: Option<bool>,
 }
 
 /// A change to the comparison, as the Compare menu makes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ComparisonChange {
-    /// `off` (the full change), `last_looked`, `previous_push`, `ago` (with `ago_minutes`) or
-    /// `between` (with `from_ms` and optionally `to_ms`).
+    /// `off` (the full change), `last_looked`, `previous_push`, `ago` (with `ago_minutes`),
+    /// `between` (with `from_ms` and optionally `to_ms`), `pushes` (with `from_push` and
+    /// optionally `to_push`) or `stack_at` (with `at_ms`).
     pub baseline: Option<String>,
     /// Minutes before now, for `ago`.
     pub ago_minutes: Option<u64>,
@@ -62,6 +94,14 @@ pub struct ComparisonChange {
     pub from_ms: Option<u64>,
     /// To, for `between` (now when absent).
     pub to_ms: Option<u64>,
+    /// For `pushes`: the first push compared (1-based, oldest first, as `current_view` lists
+    /// the stack's pushes): the stack just before it is the baseline.
+    pub from_push: Option<usize>,
+    /// For `pushes`: the last push compared (1-based); the stack after it is compared (now
+    /// when absent).
+    pub to_push: Option<usize>,
+    /// For `stack_at`: show every layer as it was then (milliseconds since the Unix epoch).
+    pub at_ms: Option<u64>,
     /// `full` (the full change with what is new marked) or `changes` (only what changed).
     pub view: Option<String>,
     /// Only pull requests with real changes since the baseline.
@@ -170,7 +210,7 @@ impl ReviewSurface {
     ///
     /// * The target names another review, a layer, file or thread this review does not have,
     ///   or nothing at all.
-    pub fn assistant_go_to(&mut self, target: &GoTo) -> Result<String, String> {
+    pub fn assistant_go_to(&mut self, target: &GoTo, host: &UiContext) -> Result<String, String> {
         if let Some(review) = target.review.as_deref().filter(|id| !id.is_empty())
             && self.screen_review_id().as_deref() != Some(review)
         {
@@ -186,9 +226,27 @@ impl ReviewSurface {
         if self.review.is_none() {
             return Err("the review is still loading; try again".to_owned());
         }
+        let layer = target
+            .layer
+            .as_ref()
+            .map(|layer| self.layer_position(layer))
+            .transpose()?;
+        let version = target
+            .version
+            .map(|version| {
+                self.check_version(layer.as_ref().map(|(_, number)| number.clone()), version)
+            })
+            .transpose()?;
         let mut done = Vec::new();
-        if let Some(layer) = &target.layer {
-            done.push(self.go_to_layer(layer)?);
+        if let Some((position, wanted)) = layer {
+            let entries = self.rail_entries();
+            let current = self.current_layer(&entries);
+            self.enter_layer(&entries, current, position);
+            done.push(format!("layer {wanted}"));
+        }
+        if let Some((number, index)) = version {
+            self.show_layer_version(number, index, host);
+            done.push(format!("#{number} v{}", index + 1));
         }
         if let Some(thread) = target.thread.as_deref() {
             let review = self.review.as_mut().ok_or("the review is not loaded")?;
@@ -214,7 +272,8 @@ impl ReviewSurface {
         Ok(format!("now showing {}", done.join(", ")))
     }
 
-    fn go_to_layer(&mut self, layer: &serde_json::Value) -> Result<String, String> {
+    /// The rail position of the stack layer `layer` names, and its number as named.
+    fn layer_position(&self, layer: &serde_json::Value) -> Result<(usize, String), String> {
         let wanted = match layer {
             serde_json::Value::Number(number) => number.to_string(),
             serde_json::Value::String(text) => text.trim().trim_start_matches('#').to_owned(),
@@ -232,14 +291,54 @@ impl ReviewSurface {
                         .any(|number| number.to_string() == wanted)
                 })
         });
-        let Some(next) = position else {
-            return Err(format!(
+        position.map(|position| (position, wanted.clone())).ok_or_else(|| {
+            format!(
                 "{wanted} is not a stack layer of this review (bcode.code-review.current_view lists them)"
-            ));
-        };
-        let current = self.current_layer(&entries);
-        self.enter_layer(&entries, current, next);
-        Ok(format!("layer {wanted}"))
+            )
+        })
+    }
+
+    /// The pull request (`named`, else the current layer's) and version index `version`
+    /// (1-based) names, once its versions are known.
+    fn check_version(&self, named: Option<String>, version: usize) -> Result<(u64, usize), String> {
+        let layers = self.layer_sources();
+        let number = named
+            .map_or_else(
+                || self.current_layer_number(),
+                |named| {
+                    layers
+                        .iter()
+                        .find(|layer| layer.number.to_string() == named || layer.source_id == named)
+                        .map(|layer| layer.number)
+                },
+            )
+            .ok_or("name the pull request whose version to show with `layer`")?;
+        let count = self.version_count(number)?;
+        if version == 0 || version > count {
+            return Err(format!("#{number} has versions v1 to v{count}"));
+        }
+        Ok((number, version - 1))
+    }
+
+    /// How many versions pull request `number` has, once the stack history is loaded.
+    fn version_count(&self, number: u64) -> Result<usize, String> {
+        if !self
+            .layer_sources()
+            .iter()
+            .any(|layer| layer.number == number)
+        {
+            return Err(format!("#{number} is not a pull request of this review"));
+        }
+        self.stack_history
+            .as_ref()
+            .ok_or_else(|| {
+                format!("the versions of #{number} are loading; call again in a moment")
+            })?
+            .layers
+            .iter()
+            .find(|layer| layer.number == number)
+            .map(|layer| layer.versions.len())
+            .ok_or_else(|| format!("#{number} has no recorded versions yet"))
     }
 
     /// Change the comparison as `change` says.
@@ -253,48 +352,33 @@ impl ReviewSurface {
         change: &ComparisonChange,
         host: &UiContext,
     ) -> Result<String, String> {
-        if change == &ComparisonChange::default() {
-            return Err("change at least one comparison setting".to_owned());
-        }
-        let mut done = Vec::new();
-        if let Some(baseline) = change.baseline.as_deref() {
-            match baseline {
-                "off" => self.set_compare_baseline(ReviewCompareBaseline::Off, host),
-                "last_looked" => self.set_compare_baseline(ReviewCompareBaseline::LastLooked, host),
-                "previous_push" => {
-                    self.set_compare_baseline(ReviewCompareBaseline::PreviousPush, host);
+        let plan = match self.plan_comparison(change) {
+            Ok(plan) => plan,
+            Err(error) => {
+                // Versions and pushes need the stack history: start loading it for the retry.
+                if self.stack_history.is_none() {
+                    self.load_history_quietly(host);
                 }
-                "ago" => {
-                    let minutes = change
-                        .ago_minutes
-                        .filter(|minutes| *minutes > 0)
-                        .ok_or("`ago` needs `ago_minutes`")?;
-                    self.compare_ago(minutes.saturating_mul(60_000), host);
-                }
-                "between" => {
-                    let from_ms = change.from_ms.ok_or("`between` needs `from_ms`")?;
-                    self.set_compare_baseline(
-                        ReviewCompareBaseline::Between {
-                            from_ms,
-                            to_ms: change.to_ms,
-                        },
-                        host,
-                    );
-                }
-                other => return Err(format!("unknown baseline {other:?}")),
+                return Err(error);
             }
-            done.push(self.status_or(format!("baseline {baseline}")));
+        };
+        let mut done = Vec::new();
+        if let Some((baseline, name)) = plan.baseline {
+            match baseline {
+                BaselinePlan::Set(baseline) => self.set_compare_baseline(baseline, host),
+                BaselinePlan::Ago(ms) => self.compare_ago(ms, host),
+                BaselinePlan::StackAt(at_ms) => self.compare_stack_at(at_ms, host),
+            }
+            done.push(self.status_or(format!("baseline {name}")));
         }
-        if let Some(view) = change.view.as_deref() {
-            let wanted = match view {
-                "full" => bcode_code_review::document::CompareView::Full,
-                "changes" => bcode_code_review::document::CompareView::Changes,
-                other => return Err(format!("unknown view {other:?} (full or changes)")),
-            };
+        if let Some(wanted) = plan.view {
             if self.comparing.view() != wanted {
                 self.toggle_compare_view();
             }
-            done.push(format!("view {view}"));
+            done.push(format!(
+                "view {}",
+                change.view.as_deref().unwrap_or_default()
+            ));
         }
         if let Some(only) = change.only_changed {
             if self.comparing.only_changed() != only {
@@ -307,9 +391,6 @@ impl ReviewSurface {
             done.push(format!("hidden files shown: {shown}"));
         }
         if let Some(all) = change.all_layers {
-            if !self.steps_through_stack() {
-                return Err("only a review that steps through a stack has layers".to_owned());
-            }
             if (self.stack_view == StackView::AllLayers) != all {
                 self.toggle_stack_view();
             }
@@ -322,68 +403,15 @@ impl ReviewSurface {
                 .to_owned(),
             );
         }
-        if let Some(pick) = change.versions {
-            done.push(self.pick_versions_for(pick, host)?);
+        if let Some((number, from, to)) = plan.versions {
+            self.pick_versions(number, from, to, host);
+            done.push(format!("#{number} v{} → v{}", from + 1, to + 1));
         }
-        done.extend(self.change_mark_options(change)?);
-        Ok(done.join("; "))
-    }
-
-    fn pick_versions_for(&mut self, pick: VersionPick, host: &UiContext) -> Result<String, String> {
-        if !self
-            .layer_sources()
-            .iter()
-            .any(|layer| layer.number == pick.number)
-        {
-            return Err(format!(
-                "#{} is not a pull request of this review",
-                pick.number
-            ));
-        }
-        let Some(count) = self.stack_history.as_ref().and_then(|history| {
-            history
-                .layers
-                .iter()
-                .find(|layer| layer.number == pick.number)
-                .map(|layer| layer.versions.len())
-        }) else {
-            self.load_history_quietly(host);
-            return Err(format!(
-                "the versions of #{} are loading; call again in a moment",
-                pick.number
-            ));
-        };
-        let to = pick.to.unwrap_or(count);
-        if pick.from == 0 || to == 0 || pick.from > count || to > count || pick.from > to {
-            return Err(format!(
-                "#{} has versions v1 to v{count}; pick from <= to within them",
-                pick.number
-            ));
-        }
-        self.pick_versions(pick.number, pick.from - 1, to - 1, host);
-        Ok(format!("#{} v{} → v{to}", pick.number, pick.from))
-    }
-
-    fn change_mark_options(&mut self, change: &ComparisonChange) -> Result<Vec<String>, String> {
-        let mut done = Vec::new();
-        if let Some(style) = change.mark_style.as_deref() {
-            let style = match style {
-                "both" => MarkStyle::Both,
-                "bar" => MarkStyle::Bar,
-                "tint" => MarkStyle::Tint,
-                "strong" => MarkStyle::Strong,
-                other => return Err(format!("unknown mark style {other:?}")),
-            };
+        if let Some(style) = plan.mark_style {
             self.change_marks(|marks| marks.style = style);
             done.push("mark style changed".to_owned());
         }
-        if let Some(seen) = change.seen_hunks.as_deref() {
-            let seen = match seen {
-                "show" => SeenHunks::Show,
-                "dim" => SeenHunks::Dim,
-                "fold" => SeenHunks::Fold,
-                other => return Err(format!("unknown seen_hunks {other:?}")),
-            };
+        if let Some(seen) = plan.seen {
             self.change_marks(|marks| marks.seen = seen);
             done.push("seen hunks changed".to_owned());
         }
@@ -395,7 +423,110 @@ impl ReviewSurface {
             self.change_marks(|marks| marks.removed_inline = inline);
             done.push(format!("removed code inline: {inline}"));
         }
-        Ok(done)
+        Ok(done.join("; "))
+    }
+
+    /// Check every argument of `change`; nothing is applied when one is wrong.
+    fn plan_comparison(&self, change: &ComparisonChange) -> Result<ComparisonPlan, String> {
+        if change == &ComparisonChange::default() {
+            return Err("change at least one comparison setting".to_owned());
+        }
+        let mut plan = ComparisonPlan::default();
+        if let Some(baseline) = change.baseline.as_deref() {
+            let checked = match baseline {
+                "off" => BaselinePlan::Set(ReviewCompareBaseline::Off),
+                "last_looked" => BaselinePlan::Set(ReviewCompareBaseline::LastLooked),
+                "previous_push" => BaselinePlan::Set(ReviewCompareBaseline::PreviousPush),
+                "ago" => BaselinePlan::Ago(
+                    change
+                        .ago_minutes
+                        .filter(|minutes| *minutes > 0)
+                        .ok_or("`ago` needs `ago_minutes`")?
+                        .saturating_mul(60_000),
+                ),
+                "between" => BaselinePlan::Set(ReviewCompareBaseline::Between {
+                    from_ms: change.from_ms.ok_or("`between` needs `from_ms`")?,
+                    to_ms: change.to_ms,
+                }),
+                "pushes" => BaselinePlan::Set(self.pushes_baseline(change)?),
+                "stack_at" => {
+                    let at_ms = change.at_ms.ok_or("`stack_at` needs `at_ms`")?;
+                    if self.stack_history.is_none() {
+                        return Err(
+                            "the stack's history is loading; call again in a moment".to_owned()
+                        );
+                    }
+                    BaselinePlan::StackAt(at_ms)
+                }
+                other => return Err(format!("unknown baseline {other:?}")),
+            };
+            plan.baseline = Some((checked, baseline.to_owned()));
+        }
+        if let Some(view) = change.view.as_deref() {
+            plan.view = Some(match view {
+                "full" => bcode_code_review::document::CompareView::Full,
+                "changes" => bcode_code_review::document::CompareView::Changes,
+                other => return Err(format!("unknown view {other:?} (full or changes)")),
+            });
+        }
+        if change.all_layers.is_some() && !self.steps_through_stack() {
+            return Err("only a review that steps through a stack has layers".to_owned());
+        }
+        if let Some(pick) = change.versions {
+            let count = self.version_count(pick.number)?;
+            let to = pick.to.unwrap_or(count);
+            if pick.from == 0 || to == 0 || pick.from > count || to > count || pick.from > to {
+                return Err(format!(
+                    "#{} has versions v1 to v{count}; pick from <= to within them",
+                    pick.number
+                ));
+            }
+            plan.versions = Some((pick.number, pick.from - 1, to - 1));
+        }
+        if let Some(style) = change.mark_style.as_deref() {
+            plan.mark_style = Some(match style {
+                "both" => MarkStyle::Both,
+                "bar" => MarkStyle::Bar,
+                "tint" => MarkStyle::Tint,
+                "strong" => MarkStyle::Strong,
+                other => return Err(format!("unknown mark style {other:?}")),
+            });
+        }
+        if let Some(seen) = change.seen_hunks.as_deref() {
+            plan.seen = Some(match seen {
+                "show" => SeenHunks::Show,
+                "dim" => SeenHunks::Dim,
+                "fold" => SeenHunks::Fold,
+                other => return Err(format!("unknown seen_hunks {other:?}")),
+            });
+        }
+        Ok(plan)
+    }
+
+    /// The baseline comparing the stack just before push `from_push` with the stack after push
+    /// `to_push` (now when absent), as the push timeline picks it.
+    fn pushes_baseline(&self, change: &ComparisonChange) -> Result<ReviewCompareBaseline, String> {
+        let from = change.from_push.ok_or("`pushes` needs `from_push`")?;
+        let history = self
+            .stack_history
+            .as_ref()
+            .ok_or("the stack's pushes are loading; call again in a moment")?;
+        let count = history.pushes.len();
+        let to = change.to_push.unwrap_or(count);
+        if count == 0 {
+            return Err("the stack has no recorded pushes".to_owned());
+        }
+        if from == 0 || to == 0 || from > count || to > count || from > to {
+            return Err(format!(
+                "the stack has pushes 1 to {count}; pick from_push <= to_push within them"
+            ));
+        }
+        let from_ms = super::compare::column_time(history, from - 1)
+            .ok_or("that push is not on the timeline")?;
+        Ok(ReviewCompareBaseline::Between {
+            from_ms,
+            to_ms: super::compare::column_time(history, to),
+        })
     }
 
     /// Change how the review is shown, as `change` says.
@@ -408,16 +539,9 @@ impl ReviewSurface {
         change: &ViewChange,
         host: &UiContext,
     ) -> Result<String, String> {
-        if change == &ViewChange::default() {
-            return Err("change at least one view setting".to_owned());
-        }
+        let plan = Self::plan_view(change)?;
         let mut done = Vec::new();
-        if let Some(layout) = change.layout.as_deref() {
-            let side_by_side = match layout {
-                "unified" => false,
-                "side_by_side" => true,
-                other => return Err(format!("unknown layout {other:?}")),
-            };
+        if let (Some(side_by_side), Some(layout)) = (plan.side_by_side, change.layout.as_deref()) {
             let now = self.review.as_ref().is_some_and(|review| {
                 review.doc.layout() == bcode_code_review::document::LayoutMode::SideBySide
             });
@@ -444,12 +568,7 @@ impl ReviewSurface {
             }
             done.push(format!("viewed files hidden: {hide}"));
         }
-        if let Some(list) = change.file_list.as_deref() {
-            let flat = match list {
-                "flat" => true,
-                "tree" => false,
-                other => return Err(format!("unknown file list {other:?} (tree or flat)")),
-            };
+        if let (Some(flat), Some(list)) = (plan.flat, change.file_list.as_deref()) {
             if self.file_view.layout.is_flat() != flat {
                 self.run_action("files_layout_toggle", None, host);
             }
@@ -491,6 +610,29 @@ impl ReviewSurface {
             );
         }
         Ok(done.join("; "))
+    }
+
+    /// Check every argument of `change`; nothing is applied when one is wrong.
+    fn plan_view(change: &ViewChange) -> Result<ViewPlan, String> {
+        if change == &ViewChange::default() {
+            return Err("change at least one view setting".to_owned());
+        }
+        let mut plan = ViewPlan::default();
+        if let Some(layout) = change.layout.as_deref() {
+            plan.side_by_side = Some(match layout {
+                "unified" => false,
+                "side_by_side" => true,
+                other => return Err(format!("unknown layout {other:?}")),
+            });
+        }
+        if let Some(list) = change.file_list.as_deref() {
+            plan.flat = Some(match list {
+                "flat" => true,
+                "tree" => false,
+                other => return Err(format!("unknown file list {other:?} (tree or flat)")),
+            });
+        }
+        Ok(plan)
     }
 
     /// Run `command` as its key does.

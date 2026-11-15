@@ -525,3 +525,217 @@ fn moving_the_user_off_a_review_saves_it_first_and_never_drops_unsaved_comments(
         "{status:?}"
     );
 }
+
+/// Call `tool` until it answers without asking to be called again (history loading).
+fn call_until_loaded(
+    scenario: &mut Scenario<ReviewApp>,
+    tool: &str,
+    arguments: &str,
+) -> ClientToolReply {
+    for _ in 0..10 {
+        let reply = call(scenario, tool, arguments);
+        match &reply {
+            ClientToolReply::Failed { message, .. } if message.contains("loading") => {
+                settled(scenario);
+            }
+            _ => return reply,
+        }
+    }
+    panic!("{tool} kept loading");
+}
+
+#[test]
+fn a_comparison_or_view_change_with_one_bad_argument_changes_nothing() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let session = active_session(&mut scenario);
+    let before = settled(&mut scenario).text();
+    let view_before = scenario
+        .surface()
+        .view_context()
+        .review
+        .and_then(|review| review.comparison)
+        .map(|comparison| comparison.view);
+    let bad = refused(call_as(
+        &mut scenario,
+        &session,
+        actions::SET_COMPARISON,
+        r#"{"view":"changes","only_changed":true,"mark_style":"sparkles"}"#,
+    ));
+    assert!(bad.contains("sparkles"), "{bad}");
+    let bad = refused(call_as(
+        &mut scenario,
+        &session,
+        actions::SET_VIEW,
+        r#"{"wrap":true,"hide_resolved_threads":true,"layout":"diagonal"}"#,
+    ));
+    assert!(bad.contains("diagonal"), "{bad}");
+    assert_eq!(
+        scenario
+            .surface()
+            .view_context()
+            .review
+            .and_then(|review| review.comparison)
+            .map(|comparison| comparison.view),
+        view_before,
+        "the view did not change"
+    );
+    assert_eq!(
+        settled(&mut scenario).text(),
+        before,
+        "the screen is as it was"
+    );
+}
+
+#[test]
+fn pushes_stack_at_and_versions_are_reachable_like_the_compare_menu() {
+    let (_fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    let compared = done(call_until_loaded(
+        &mut scenario,
+        actions::SET_COMPARISON,
+        r#"{"baseline":"pushes","from_push":1}"#,
+    ));
+    let comparison = &compared["screen"]["review"]["comparison"];
+    assert!(
+        comparison["baseline"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("between=")),
+        "{compared}"
+    );
+    let pushes = comparison["pushes"]["items"]
+        .as_array()
+        .expect("pushes listed");
+    assert_eq!(pushes[0]["number"], 1, "{compared}");
+    let beyond = refused(call(
+        &mut scenario,
+        actions::SET_COMPARISON,
+        r#"{"baseline":"pushes","from_push":99}"#,
+    ));
+    assert!(beyond.contains("pushes 1 to"), "{beyond}");
+
+    let at = pushes[0]["at_ms"].as_u64().expect("time");
+    let then = done(call(
+        &mut scenario,
+        actions::SET_COMPARISON,
+        &format!(r#"{{"baseline":"stack_at","at_ms":{at}}}"#),
+    ));
+    assert!(
+        then["screen"]["review"]["comparison"]["baseline"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("stack_at=")),
+        "{then}"
+    );
+
+    let version = done(call(
+        &mut scenario,
+        actions::GO_TO,
+        r#"{"layer":101,"version":1}"#,
+    ));
+    assert!(
+        version["done"]
+            .as_str()
+            .is_some_and(|done| done.contains("#101 v1")),
+        "{version}"
+    );
+    let missing = refused(call(
+        &mut scenario,
+        actions::GO_TO,
+        r#"{"layer":101,"version":50}"#,
+    ));
+    assert!(missing.contains("versions v1 to"), "{missing}");
+}
+
+#[test]
+fn complete_pass_refresh_publish_and_pull_request_verdicts_act_as_their_keys() {
+    let (fixture, backend, id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    // Refresh checks for changes, as `r` does.
+    let refreshed = done(call(&mut scenario, actions::REFRESH, "{}"));
+    assert_eq!(refreshed["screen"]["screen"], "review", "{refreshed}");
+    // Completing the pass records the revisions on screen, as `shift+m` does.
+    let before = super::app::stored(&backend, &fixture, &id).reviewed_revisions;
+    let passed = done(call(&mut scenario, actions::COMPLETE_PASS, "{}"));
+    assert!(passed["done"].is_string(), "{passed}");
+    settled(&mut scenario);
+    let after = super::app::stored(&backend, &fixture, &id).reviewed_revisions;
+    assert!(!after.is_empty(), "the pass was recorded");
+    assert!(
+        after
+            .values()
+            .any(|revision| !before.values().any(|kept| kept == revision))
+            || before.is_empty(),
+        "the pass recorded the revisions on screen now"
+    );
+    // A verdict opens the pull request dialog for the reviewer to confirm; nothing is sent.
+    let approve = done(call(
+        &mut scenario,
+        actions::PULL_REQUEST_REVIEW,
+        r#"{"action":"approve"}"#,
+    ));
+    assert!(
+        approve["done"]
+            .as_str()
+            .is_some_and(|done| done.contains("confirm")),
+        "{approve}"
+    );
+    let unknown = refused(call(
+        &mut scenario,
+        actions::PULL_REQUEST_REVIEW,
+        r#"{"action":"merge"}"#,
+    ));
+    assert!(unknown.contains("merge"), "{unknown}");
+    // The reviewer dismisses the dialog.
+    if scenario
+        .surface()
+        .review()
+        .is_some_and(|review| review.modal().is_some())
+    {
+        scenario.key("esc");
+        settled(&mut scenario);
+    }
+    assert_eq!(scenario.surface().route_name(), RouteName::Review);
+    // Publishing opens the publish dialog, never publishing by itself.
+    let publish = done(call(&mut scenario, actions::PUBLISH, "{}"));
+    assert!(
+        publish["done"]
+            .as_str()
+            .is_some_and(|done| done.contains("confirm")),
+        "{publish}"
+    );
+    assert!(matches!(
+        scenario
+            .surface()
+            .review()
+            .and_then(crate::ReviewSurface::modal),
+        Some(crate::surface::Modal::Publish(_))
+    ));
+    // Publishing and verdicts always ask, and the panel never offers to remember them.
+    for name in [actions::PUBLISH, actions::PULL_REQUEST_REVIEW] {
+        assert!(
+            crate::assistant::panel::NEVER_REMEMBER.contains(&name),
+            "{name} is asked every time"
+        );
+    }
+}
+
+#[test]
+fn verdicts_need_pull_requests_and_refresh_reloads_home() {
+    let mut setup = super::assistant::setup(160, 40, true);
+    let no_pulls = refused(call(
+        &mut setup.scenario,
+        actions::PULL_REQUEST_REVIEW,
+        r#"{"action":"approve"}"#,
+    ));
+    assert!(no_pulls.contains("no pull requests"), "{no_pulls}");
+    done(call(
+        &mut setup.scenario,
+        actions::OPEN_REVIEW,
+        r#"{"screen":"home"}"#,
+    ));
+    let reloaded = done(call(&mut setup.scenario, actions::REFRESH, "{}"));
+    assert_eq!(reloaded["screen"]["screen"], "home", "{reloaded}");
+    assert!(
+        reloaded["done"]
+            .as_str()
+            .is_some_and(|done| done.contains("reloading")),
+        "{reloaded}"
+    );
+}

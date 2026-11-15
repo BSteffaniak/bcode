@@ -63,7 +63,8 @@ fn location_properties() -> serde_json::Map<String, Value> {
         "line": {"type": "integer", "minimum": 1, "description": "A line of the file."},
         "side": {"type": "string", "enum": ["new", "old"], "description": "Side the line is on (new by default)."},
         "source": {"type": "string", "description": "Source id, when several sources have the file."},
-        "thread": {"type": "string", "description": "A thread id (code_review.list_threads)."}
+        "thread": {"type": "string", "description": "A thread id (code_review.list_threads)."},
+        "version": {"type": "integer", "minimum": 1, "description": "Show this version (v1 is the first) of the layer (`layer`, else the current one): its whole change as it was then, read-only where it differs from now."}
     }) else {
         return serde_json::Map::new();
     };
@@ -102,18 +103,21 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
         descriptor(
             GO_TO,
             ClientToolPolicy::ReadOnly,
-            "Move the user's view within the review on screen to a stack layer, a file and line, or a thread, as the keys do. Fails when the place is in another review: use open_review then. Returns what is on screen now.",
+            "Move the user's view within the review on screen to a stack layer, a file and line, a thread, or an earlier version of a layer, as the keys do. Fails when the place is in another review: use open_review then. Returns what is on screen now.",
             &Value::Object(go_to),
         ),
         descriptor(
             SET_COMPARISON,
             ClientToolPolicy::ReadOnly,
-            "Change the comparison of the review on screen, as the Compare menu (b) does: what changes are shown since (baseline: off = the full change, last_looked, previous_push, ago with ago_minutes, between with from_ms/to_ms), the view (full = whole change with what is new marked, changes = only what changed), only pull requests with real changes, showing the files the comparison hides, one pull request or all of them, versions vN..vM of one pull request, and how new lines are marked. Returns the comparison as it is now (it may still be computing).",
+            "Change the comparison of the review on screen, as the Compare menu (b) does: what changes are shown since (baseline: off = the full change, last_looked, previous_push, ago with ago_minutes, between with from_ms/to_ms, pushes with from_push/to_push = the stack just before push from_push compared with the stack after push to_push (pushes are numbered from 1, oldest first, as current_view lists them), stack_at with at_ms = every layer as it was then), the view (full = whole change with what is new marked, changes = only what changed), only pull requests with real changes, showing the files the comparison hides, one pull request or all of them, versions vN..vM of one pull request, and how new lines are marked. Returns the comparison as it is now (it may still be computing).",
             &json!({
-                "baseline": {"type": "string", "enum": ["off", "last_looked", "previous_push", "ago", "between"]},
+                "baseline": {"type": "string", "enum": ["off", "last_looked", "previous_push", "ago", "between", "pushes", "stack_at"]},
                 "ago_minutes": {"type": "integer", "minimum": 1},
                 "from_ms": {"type": "integer", "minimum": 0},
                 "to_ms": {"type": "integer", "minimum": 0},
+                "from_push": {"type": "integer", "minimum": 1, "description": "For pushes: the first push compared."},
+                "to_push": {"type": "integer", "minimum": 1, "description": "For pushes: the last push compared (the latest when omitted)."},
+                "at_ms": {"type": "integer", "minimum": 0, "description": "For stack_at: the time to show the stack at."},
                 "view": {"type": "string", "enum": ["full", "changes"]},
                 "only_changed": {"type": "boolean"},
                 "show_hidden_files": {"type": "boolean"},
