@@ -348,57 +348,29 @@ fn inline_removed_rows(
 ) -> ItemRows {
     let mut rows = ItemRows::lines(Vec::new(), Vec::new());
     for line in item.lines.iter() {
+        // The strike covers the text's own graphemes, never the padding out to the edge.
+        let struck = [DiffSyntaxRange::new(
+            0,
+            line.len(),
+            theme.since.removed_inline,
+        )];
         let layout = layout_diff_row(
             DiffRowItem::Unified {
                 kind: DiffLineKind::Removed,
                 old_line: None,
                 new_line: None,
-                text: DiffRowText::plain(line),
+                text: DiffRowText::plain(line).with_syntax(&struck),
             },
             width,
             options,
             mark_styles(marks, true, theme),
         );
         let mut lines = layout.rows().to_vec();
-        for column in layout.columns().iter().filter(|column| column.present) {
-            for painted in &mut lines {
-                *painted = patch_cells(painted, column.content.clone(), theme.since.removed_inline);
-            }
-        }
         paint_marks(&mut lines, &layout, |_| true, marks, theme);
         rows.lines.extend(lines);
     }
     rows.height = rows.lines.len().max(1) as u64;
     rows
-}
-
-/// `line` with `style` patched over the cells in `cells`.
-///
-/// Composed from BMUX viewports: the row keeps its width, and a wide grapheme cut by an edge is blanked rather than split (the
-/// callers' ranges are column boundaries of a BMUX row layout, which no grapheme straddles).
-#[must_use]
-pub fn patch_cells(line: &Line, cells: std::ops::Range<usize>, style: Style) -> Line {
-    let width = line.width();
-    let (start, end) = (cells.start.min(width), cells.end.min(width));
-    if start >= end {
-        return line.clone();
-    }
-    let mut spans = cells_of(line, 0, start).spans;
-    spans.extend(cells_of(line, start, end - start).patch_style(style).spans);
-    spans.extend(cells_of(line, end, width - end).spans);
-    Line::from_spans(spans)
-}
-
-/// Exactly `cells` cells of `line` from `start`: its BMUX viewport, with the cells of a wide
-/// grapheme cut by an edge left blank.
-fn cells_of(line: &Line, start: usize, cells: usize) -> Line {
-    let mut part = line.viewport(start, cells);
-    let short = cells.saturating_sub(part.width());
-    if short > 0 {
-        let style = part.spans.last().map_or_else(Style::new, |span| span.style);
-        part.spans.push(Span::styled(" ".repeat(short), style));
-    }
-    part
 }
 
 /// The diff styles of a row with a side `marked` new since the baseline: tinted when the mark
@@ -1239,6 +1211,27 @@ mod tests {
                     .contains(bmux_tui::style::Modifier::CROSSED_OUT)
             });
         assert!(struck, "{:?}", rows.lines[1]);
+        // Only the text's own cells are struck through: never the padding out to the edge,
+        // including on rows a wrapped line continues on (CJK, emoji, combining marks).
+        for width in [12_u16, 15, 40, 60] {
+            let rows = removed_rows(&item, Since::LastLooked, inline, options, &theme, width, 2);
+            let struck: usize = rows
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| {
+                    span.style
+                        .modifiers
+                        .contains(bmux_tui::style::Modifier::CROSSED_OUT)
+                })
+                .map(|span| display_width(&span.content))
+                .sum();
+            let text = display_width(MIXED) + display_width("let old = 1;");
+            assert!(struck <= text, "{struck} struck cells at {width}");
+            if width == 60 {
+                assert_eq!(struck, text, "every cell of the text at {width}");
+            }
+        }
         // The gutter is not struck through.
         assert!(
             !rows.lines[1].spans[0]
@@ -1258,31 +1251,5 @@ mod tests {
         );
         assert_eq!(rows.height, 1);
         assert!(painted(&rows).contains("2 lines removed since you looked"));
-    }
-
-    #[test]
-    fn patched_cells_keep_the_row_width_and_text_on_grapheme_boundaries() {
-        let line = Line::from_spans(vec![Span::raw(MIXED)]);
-        let style = Style::new().add_modifier(bmux_tui::style::Modifier::DIM);
-        for start in 0..=line.width() + 1 {
-            for end in start..=line.width() + 2 {
-                let patched = patch_cells(&line, start..end, style);
-                assert_eq!(patched.width(), line.width(), "{start}..{end}");
-            }
-        }
-        // `漢字 ` is five cells: a range from there to the end keeps every grapheme.
-        let patched = patch_cells(&line, 5..line.width(), style);
-        assert_eq!(patched.plain_text(), MIXED);
-        assert!(
-            !patched.spans[0]
-                .style
-                .modifiers
-                .contains(bmux_tui::style::Modifier::DIM)
-        );
-        assert!(patched.spans.last().is_some_and(|span| {
-            span.style
-                .modifiers
-                .contains(bmux_tui::style::Modifier::DIM)
-        }));
     }
 }
