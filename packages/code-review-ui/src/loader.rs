@@ -819,6 +819,7 @@ pub async fn save_as(
     let mut left = transient_viewed_record(&transient);
     left.viewed_files.clear();
     left.viewed_marks.clear();
+    left.viewed_threads.clear();
     save_workspace(services.clone(), left).await?;
     let (from, to) = (
         super::notes::NoteScope::for_workspace(&transient),

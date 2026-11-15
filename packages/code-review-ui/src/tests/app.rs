@@ -820,6 +820,60 @@ fn unsaved_reviews_keep_their_viewed_files_per_target() {
     assert_eq!(viewed(&scenario), 0, "the unsaved scope no longer has it");
 }
 
+/// Saving an unsaved review moves every viewed mark, threads included, out of the unsaved
+/// scope: reopening the same target unsaved starts with nothing viewed.
+#[test]
+fn saving_an_unsaved_review_leaves_no_viewed_threads_behind() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let (scenario, _) = open(
+        &fixture,
+        &backend,
+        Entry::Sources {
+            title: None,
+            sources: vec![ReviewSourceKind::LastCommit],
+        },
+        140,
+        40,
+    );
+    let mut transient = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.workspace())
+        .cloned()
+        .expect("an unsaved review");
+    assert_eq!(transient.id, TRANSIENT_WORKSPACE_ID);
+    transient
+        .viewed_threads
+        .push(bcode_code_review_models::ThreadViewMark {
+            thread_id: "thread-1".to_owned(),
+            comment_ids: vec!["comment-1".to_owned()],
+            viewed_at_ms: 1,
+        });
+    let scope = bcode_code_review::scope::annotation_workspace_id(&transient);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let saved = runtime
+        .block_on(crate::loader::save_as(
+            backend.services(),
+            transient,
+            crate::notes::LoadedNotes::default(),
+        ))
+        .expect("saved");
+    assert_eq!(
+        stored(&backend, &fixture, &saved.id).viewed_threads.len(),
+        1
+    );
+    let left = stored(&backend, &fixture, &scope);
+    assert!(
+        left.viewed_threads.is_empty(),
+        "the unsaved scope kept {:?}",
+        left.viewed_threads
+    );
+}
+
 #[test]
 fn home_clicks_start_suggestions_and_open_reviews_where_painted() {
     let fixture = fixture();
