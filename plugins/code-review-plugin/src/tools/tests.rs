@@ -1474,3 +1474,21 @@ fn blank_optional_arguments_are_taken_as_not_given() {
     assert!(missing.is_error, "{}", missing.output);
     assert!(missing.output.contains("thread_id"), "{}", missing.output);
 }
+
+#[test]
+fn an_empty_replacement_suggests_deleting_the_lines() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let path = GitFixture::modified_path(0);
+    let line = harness.added_line(&path);
+    harness.ok(
+        "code_review.suggest_change",
+        &json!({"path": path, "line": line, "replacement": "", "body": "Drop this line.", "source": ""}),
+        SESSION,
+    );
+    let threads = harness.json("code_review.list_threads", &json!({}), SESSION);
+    let suggestion = threads["suggestions"][0]["body"]
+        .as_str()
+        .expect("suggestion");
+    assert!(suggestion.contains("```suggestion\n\n```"), "{suggestion}");
+}
