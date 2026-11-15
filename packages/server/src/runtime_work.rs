@@ -232,6 +232,52 @@ pub struct CancelledRuntimeWork {
     pub work_id: WorkId,
 }
 
+type RetiringSet = Arc<std::sync::Mutex<std::collections::BTreeSet<(SessionId, WorkId)>>>;
+
+fn lock_retiring(
+    retiring: &RetiringSet,
+) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<(SessionId, WorkId)>> {
+    retiring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Work taken out of the registry to be finished. It stays among the session's owned ids (see
+/// [`RuntimeWorkManager::owned_ids_for_session`]) until this value is dropped, which the finisher
+/// does once the terminal event is durable. Dropping it early, for example when the finishing
+/// future is cancelled, releases the id as well, so it never stays owned for good.
+#[derive(Debug)]
+pub(super) struct RetiringWork {
+    spec: RuntimeWorkSpec,
+    key: (SessionId, WorkId),
+    retiring: RetiringSet,
+}
+
+impl RetiringWork {
+    fn new(spec: RuntimeWorkSpec, key: (SessionId, WorkId), retiring: &RetiringSet) -> Self {
+        lock_retiring(retiring).insert(key.clone());
+        Self {
+            spec,
+            key,
+            retiring: Arc::clone(retiring),
+        }
+    }
+}
+
+impl std::ops::Deref for RetiringWork {
+    type Target = RuntimeWorkSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl Drop for RetiringWork {
+    fn drop(&mut self) {
+        lock_retiring(&self.retiring).remove(&self.key);
+    }
+}
+
 /// Central server registry and cancellation router for active runtime work.
 #[derive(Debug, Default)]
 pub struct RuntimeWorkManager {
@@ -239,8 +285,9 @@ pub struct RuntimeWorkManager {
         super::activity_changes::ActivityMutex<BTreeMap<(SessionId, WorkId), ActiveRuntimeWork>>,
     metrics: MetricsRegistry,
     /// Work taken out of `active` to be finished whose terminal event is not durable yet.
-    /// Changed only while `active` is locked, so the two read together never show a gap.
-    retiring: std::sync::Mutex<std::collections::BTreeSet<(SessionId, WorkId)>>,
+    /// Entries are added only while `active` is locked, so the two read together never show a
+    /// gap; each entry is removed when its [`RetiringWork`] is dropped.
+    retiring: RetiringSet,
     #[cfg(test)]
     pub(super) progress: tokio::sync::watch::Sender<()>,
 }
@@ -337,7 +384,7 @@ impl RuntimeWorkManager {
         Self {
             active: super::activity_changes::ActivityMutex::default(),
             metrics,
-            retiring: std::sync::Mutex::default(),
+            retiring: RetiringSet::default(),
             #[cfg(test)]
             progress: tokio::sync::watch::channel(()).0,
         }
@@ -623,38 +670,27 @@ impl RuntimeWorkManager {
     }
 
     /// Take active work to finish it: it stays among the session's owned ids (see
-    /// [`Self::owned_ids_for_session`]) until [`Self::retired`] says its terminal event is
-    /// durable.
+    /// [`Self::owned_ids_for_session`]) until the returned [`RetiringWork`] is dropped.
     pub(super) async fn take_for_retirement(
         &self,
         session_id: SessionId,
         work_id: &WorkId,
-    ) -> Option<RuntimeWorkSpec> {
+    ) -> Option<RetiringWork> {
         let mut active = self.active.lock_for(session_id).await;
         let key = (session_id, work_id.clone());
-        let removed = active.remove(&key);
-        if removed.is_some() {
-            self.retiring_set().insert(key);
-        }
+        let retiring = active
+            .remove(&key)
+            .map(|work| RetiringWork::new(work.spec, key, &self.retiring));
         drop(active);
         #[cfg(test)]
         self.progress.send_replace(());
-        removed.map(|work| work.spec)
-    }
-
-    /// Work taken for retirement has its terminal event durable.
-    pub(super) async fn retired(&self, session_id: SessionId, work_id: &WorkId) {
-        let active = self.active.lock().await;
-        self.retiring_set().remove(&(session_id, work_id.clone()));
-        drop(active);
+        retiring
     }
 
     fn retiring_set(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<(SessionId, WorkId)>> {
-        self.retiring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_retiring(&self.retiring)
     }
 
     /// Retire only the registration generation captured by this token.
@@ -662,21 +698,16 @@ impl RuntimeWorkManager {
     /// Stage revisions do not affect retirement authority: an older-stage token
     /// may retire its same owner, but can never remove a replacement owner.
     /// Missing or stale generations return `None` without changing live work.
-    pub(super) async fn take_observed(
-        &self,
-        token: &WorkObservationToken,
-    ) -> Option<RuntimeWorkSpec> {
+    pub(super) async fn take_observed(&self, token: &WorkObservationToken) -> Option<RetiringWork> {
         let mut active = self.active.lock_for(token.session_id).await;
         let key = (token.session_id, token.work_id.clone());
         let matches_owner = active
             .get(&key)
             .is_some_and(|work| Arc::ptr_eq(&token.owner, &work.observation_owner));
         let owned = if matches_owner {
-            let owned = active.remove(&key).map(|work| work.spec);
-            if owned.is_some() {
-                self.retiring_set().insert(key);
-            }
-            owned
+            active
+                .remove(&key)
+                .map(|work| RetiringWork::new(work.spec, key, &self.retiring))
         } else {
             None
         };
@@ -1007,6 +1038,20 @@ mod tests {
             manager.observation_page(session, None, 1).await.entries[0].stage,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn retiring_work_stays_owned_until_released_even_when_never_finished() {
+        let manager = RuntimeWorkManager::default();
+        let session = SessionId::new();
+        let id = WorkId::new("retiring");
+        start_observation_fixture(&manager, session, &id).await;
+        let retiring = manager.take_for_retirement(session, &id).await.unwrap();
+        assert!(manager.active_ids_for_session(session).await.is_empty());
+        assert!(manager.owned_ids_for_session(session).await.contains(&id));
+        // A finisher cancelled before its terminal event was saved still releases the id.
+        drop(retiring);
+        assert!(manager.owned_ids_for_session(session).await.is_empty());
     }
 
     #[tokio::test]

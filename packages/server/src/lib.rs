@@ -45676,7 +45676,7 @@ async fn finish_owned_runtime_work(
     work_id: WorkId,
     status: RuntimeWorkStatus,
     message: Option<String>,
-    owned_work: RuntimeWorkSpec,
+    owned_work: runtime_work::RetiringWork,
 ) {
     if owned_work.kind == RuntimeWorkKind::Workflow && status.is_terminal() {
         let outcome = match status {
@@ -45704,7 +45704,7 @@ async fn finish_owned_runtime_work(
         }
     }
     append_runtime_work_finished_event(state, session_id, work_id.clone(), status, message).await;
-    state.runtime_work.retired(session_id, &work_id).await;
+    // Releases the id from the session's owned work now that its terminal event is saved.
     drop(owned_work);
     state.release_session_resources_if_idle(session_id).await;
 }
