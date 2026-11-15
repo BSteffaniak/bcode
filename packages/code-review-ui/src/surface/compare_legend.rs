@@ -134,11 +134,16 @@ impl ReviewSurface {
         let doc = &self.review.as_ref()?.doc;
         let since = self.since_phrase();
         let Some(comparison) = doc.comparison(source) else {
+            let text = if self.compare_settling() {
+                format!(
+                    "{} Reading what you looked at{}",
+                    theme.icons.ellipsis, theme.icons.ellipsis
+                )
+            } else {
+                "Not compared: no earlier version to compare with".to_owned()
+            };
             return Some(LegendRow {
-                line: Line::from_spans(vec![Span::styled(
-                    "Not compared: no earlier version to compare with",
-                    theme.muted,
-                )]),
+                line: Line::from_spans(vec![Span::styled(text, theme.muted)]),
                 action: None,
             });
         };

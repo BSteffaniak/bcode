@@ -793,6 +793,12 @@ impl ReviewSurface {
         }
     }
 
+    /// Whether the comparison is still being set up: started not yet, or some pull request's
+    /// looks not listed yet (a source not compared may be compared once they are).
+    pub(super) fn compare_settling(&self) -> bool {
+        !self.comparing.started || !self.looks_settled()
+    }
+
     /// Whether every pull request's looks were listed (or could not be read).
     fn looks_settled(&self) -> bool {
         self.layer_sources().iter().all(|layer| {
