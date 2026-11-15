@@ -33,7 +33,7 @@ pub fn source_preview_limit(reference: &str, content_type: Option<&str>) -> Opti
         .then_some(SOURCE_PREVIEW_BYTES as u64)
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapter {
     fn supports(&self, kind: &str) -> bool {
         // Keep the old plugin-view schema as a local TUI-only replay shim for pre-artifact logs.
@@ -624,7 +624,7 @@ const fn syntax_palette(
     theme
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 mod tests {
     #[test]
     fn retained_diff_is_advertised_without_confusing_missing_or_partial_data() {

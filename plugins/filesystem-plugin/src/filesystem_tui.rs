@@ -18,13 +18,13 @@ thread_local! {
 }
 
 /// Filesystem request/result TUI visual adapter.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[derive(Default)]
 pub struct FilesystemTuiVisualAdapter {
     selection: std::sync::Mutex<Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>>,
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapter {
     fn projection(
         &self,
@@ -306,7 +306,7 @@ pub fn multi_edit_draft_layout(
     (rows, anchors)
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 fn request_draft_rows(
     kind: &str,
     payload: &Value,
@@ -536,7 +536,7 @@ fn decode_partial_json_string(encoded: &str) -> Option<String> {
     serde_json::from_str::<String>(&format!("\"{fragment}\"")).ok()
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 fn request_rows(
     payload: &Value,
     context: &impl crate::filesystem_portable::VisualContext,
@@ -612,7 +612,7 @@ pub fn request_layout(
     (rows, Vec::new())
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 fn read_rows(
     kind: &str,
     payload: &Value,
@@ -1109,7 +1109,7 @@ fn muted() -> Style {
     theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 mod tests {
     #[test]
     fn draft_layout_emits_source_lines_not_border_guesses() {

@@ -49,5 +49,3 @@ presentation = [
 # Frontend capability for hosts that run the native implementation; it is
 # independent of packaging. `presentation` alone stays renderer-only (browser).
 tui = ["native", "presentation", "bcode_plugin_sdk/tui"]
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]

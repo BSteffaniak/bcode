@@ -6,24 +6,24 @@ use bmux_tui::composition::TextBlock;
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::text::{Text, TextWrap};
 use std::ops::Range;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use std::sync::{Arc, Mutex};
 
 /// One retained semantic document; rendering geometry remains BMUX-owned and width-specific.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[derive(Default)]
 pub(super) struct PresentationState {
     state: Mutex<AcceptedDocument>,
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[derive(Default)]
 struct AcceptedDocument {
     generation: u64,
     accepted: Option<(bcode_config::ShellOutputPresentationPolicy, Arc<Document>)>,
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 impl PresentationState {
     pub(super) fn invalidate(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -75,7 +75,7 @@ impl PresentationState {
     }
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 use super::{partial_json_string, shell_command_projection};
 
 struct Segment {
@@ -83,7 +83,7 @@ struct Segment {
     provenance: Provenance,
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 pub(super) fn project(
     command: &str,
     cwd: Option<&str>,
@@ -96,7 +96,7 @@ pub(super) fn project(
     project_with_policy(command, cwd, &policy, width, context)
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 pub(super) fn project_with_policy(
     command: &str,
     cwd: Option<&str>,
@@ -114,7 +114,7 @@ pub(super) fn project_with_policy(
     )
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub(super) fn project_with_state(
     command: &str,
     cwd: Option<&str>,
@@ -440,7 +440,7 @@ fn command_prompt(
     }
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub(super) fn append_metadata(
     target: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     command: bcode_plugin_sdk::tui::PluginTuiVisualProjection,
@@ -449,7 +449,7 @@ pub(super) fn append_metadata(
     target.selection.extend(command.selection);
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 pub(super) fn declared_copy(
     projection: &bcode_plugin_sdk::tui::PluginTuiVisualProjection,
 ) -> String {
@@ -460,7 +460,7 @@ pub(super) fn declared_copy(
         .collect()
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
 

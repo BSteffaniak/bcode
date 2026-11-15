@@ -47,14 +47,14 @@ url = { workspace = true }
 bcode_agent_runtime = { workspace = true }
 bcode_config = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_filesystem_plugin = { workspace = true, features = ["tui"] }
 bcode_ipc = { workspace = true }
 bcode_model_catalog = { workspace = true }
 bcode_plugin = { workspace = true }
-bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_question_plugin = { workspace = true, features = ["tui"] }
 bcode_server = { workspace = true }
 bcode_shell_plugin = { workspace = true, default-features = false, features = [
-    "static-bundled",
+    "tui",
 ] }
 bcode_tui = { workspace = true }
 bcode_tui_transcript = { workspace = true }

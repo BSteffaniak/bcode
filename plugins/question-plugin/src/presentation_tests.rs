@@ -25,7 +25,7 @@ fn paint(
     form.render_slice(snapshot, offset, area, &mut PaintCx::new(&mut backend));
     buffer
 }
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[test]
 fn rejected_fork_preserves_native_focused_field_identity_and_geometry() {
     use bcode_plugin_sdk::tui::TerminalInteractionRenderer;
@@ -206,7 +206,7 @@ fn resolved_editor_actions_move_select_delete_insert_and_consume_unknown() {
     assert_eq!(state.buffer().text(), "👩‍💻λ\n");
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[test]
 fn all_resolved_editor_actions_match_native_control_behavior() {
     use bcode_plugin_sdk::tui::keymap::controls::ControlAction;

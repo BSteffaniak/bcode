@@ -1,5 +1,5 @@
 //! Shared question form. Ports provide input bindings, never application or daemon access.
-#[cfg(not(feature = "static-bundled"))]
+#[cfg(not(feature = "tui"))]
 use bcode_tool::InteractionInput;
 use bcode_tool::InteractionOutput;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -13,9 +13,9 @@ pub use crate::question_outcome::question_outcome_rows;
 use crate::question_tui::QuestionTerminalRenderer;
 
 /// Result of translating a BMUX event, before producer controller application.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub use bcode_plugin_sdk::tui::TerminalInteractionInput as QuestionInputResult;
-#[cfg(not(feature = "static-bundled"))]
+#[cfg(not(feature = "tui"))]
 #[derive(Debug)]
 pub enum QuestionInputResult {
     /// No matching input.
@@ -278,9 +278,9 @@ impl QuestionPresentation {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub(crate) struct NativeQuestionPort<'a>(pub &'a dyn bcode_plugin_sdk::tui::PluginTuiHost);
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 impl QuestionInputPort for NativeQuestionPort<'_> {
     fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
         self.0.keymap_action(scope, stroke)

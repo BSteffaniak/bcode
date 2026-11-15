@@ -24,6 +24,4 @@ serde_json.workspace       = true
 default          = []
 fail-on-warnings = []
 native-dictation = ["bcode_vox/linux-desktop"]
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]
 tui            = ["bcode_plugin_sdk/tui"]

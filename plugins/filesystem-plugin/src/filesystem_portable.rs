@@ -65,7 +65,7 @@ impl VisualContext for PortableVisualContext<'_> {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 impl VisualContext for bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
     fn width(&self) -> u16 {
         self.width()
@@ -616,7 +616,7 @@ mod tests {
             "bcode.filesystem/filesystem-change-card"
         );
     }
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     #[test]
     fn native_and_portable_source_projections_match_exactly() {
         use bcode_plugin_sdk::tui::{

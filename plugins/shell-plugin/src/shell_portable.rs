@@ -10,16 +10,16 @@ use bcode_tui_components::plugin_visual::{
 use bmux_tui::prelude::{Color, Line, Span, Style};
 use std::collections::BTreeSet;
 
-#[cfg(not(feature = "static-bundled"))]
+#[cfg(not(feature = "tui"))]
 #[path = "shell_run_tui/command.rs"]
 mod command;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use crate::shell_run_tui::command;
 
-#[cfg(not(feature = "static-bundled"))]
+#[cfg(not(feature = "tui"))]
 #[path = "shell_run_tui/partial_json.rs"]
 mod partial_json;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use crate::shell_run_tui::partial_json;
 
 #[derive(Default)]
@@ -47,7 +47,7 @@ pub struct CommandSyntax {
     pub number: Color,
 }
 impl CommandContext {
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     pub(super) fn from_native(
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Self {
@@ -202,7 +202,7 @@ fn semantic_payload(payload: &serde_json::Value) -> serde_json::Value {
     payload
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub fn native_projection(
     kind: &str,
     payload: &serde_json::Value,
@@ -538,7 +538,7 @@ mod tests {
                 .iter()
                 .any(|row| row.plain_text().contains("running"))
         );
-        #[cfg(feature = "static-bundled")]
+        #[cfg(feature = "tui")]
         {
             let native = native_projection(
                 "bcode.shell.run",

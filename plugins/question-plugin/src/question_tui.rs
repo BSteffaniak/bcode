@@ -1,16 +1,16 @@
 //! Native TUI renderer for the interactive question tool.
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::presentation::{QuestionInputPort, QuestionInputResult as TerminalInteractionInput};
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 use bcode_plugin_sdk::composer::ComposerTextRange;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use bcode_plugin_sdk::composer::ComposerValidationError;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use bcode_plugin_sdk::tui::{
     FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
     FocusedTextFieldSnapshot, PluginTuiTheme, TerminalFocusedTextFieldEditResult,
@@ -22,7 +22,7 @@ use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitRegion, HitRole};
@@ -42,12 +42,12 @@ use super::QuestionSelectionMode;
 use super::question_interaction::{
     QuestionFocusTarget, QuestionSnapshot, custom_control_id, option_control_id,
 };
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use super::{QUESTION_INLINE_SURFACE, question_interaction::QuestionInteractionController};
 
 const QUESTION_SCOPE: &str = "question";
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub fn register_keymap(registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry) {
     use bcode_plugin_sdk::tui::keymap::KeymapAction;
     for (action, description, defaults) in [
@@ -117,7 +117,7 @@ pub struct QuestionTerminalRenderer {
     controls: Vec<ControlRegion>,
     logical_origin: u16,
     custom_inputs: BTreeMap<usize, TextInputState>,
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     custom_fields: RefCell<BTreeMap<usize, FocusedTextFieldAdapter>>,
     custom_areas: BTreeMap<usize, Rect>,
     custom_mouse_row_offsets: BTreeMap<usize, u16>,
@@ -125,9 +125,9 @@ pub struct QuestionTerminalRenderer {
     pending_custom_mouse_focus: Option<usize>,
     theme: QuestionSurfaceTheme,
     measurement: Option<QuestionMeasurement>,
-    #[cfg(all(test, feature = "static-bundled"))]
+    #[cfg(all(test, feature = "tui"))]
     rendered_questions: usize,
-    #[cfg(all(test, feature = "static-bundled"))]
+    #[cfg(all(test, feature = "tui"))]
     visited_question_spans: usize,
     wrapped_rows_visited: std::cell::Cell<u64>,
 }
@@ -212,7 +212,7 @@ impl QuestionSurfaceTheme {
             canvas: theme.canvas,
         })
     }
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     fn resolve(theme: Option<&PluginTuiTheme>) -> Self {
         Self::from_component_theme(theme.and_then(PluginTuiTheme::component_theme).as_ref())
     }
@@ -263,7 +263,7 @@ impl QuestionTerminalRenderer {
                 .buffer_mut()
                 .move_cursor(bmux_text_edit::TextMotion::End);
             self.custom_inputs.insert(question_index, state);
-            #[cfg(feature = "static-bundled")]
+            #[cfg(feature = "tui")]
             {
                 let fields = self.custom_fields.get_mut();
                 if let Some(field) = fields.get_mut(&question_index) {
@@ -284,13 +284,13 @@ impl QuestionTerminalRenderer {
             .expect("custom editor synchronized")
     }
 
-    #[cfg(not(feature = "static-bundled"))]
+    #[cfg(not(feature = "tui"))]
     const fn observe_field(&self, _snapshot: &QuestionSnapshot) {
-        // Native caret observation exists only in the static-bundled adapter.
+        // Native caret observation exists only in the terminal (`tui`) adapter.
         let _ = self;
     }
 
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     fn observe_field(&self, snapshot: &QuestionSnapshot) {
         for (question_index, field) in self.custom_fields.borrow_mut().iter_mut() {
             if let Some(state) = self.custom_inputs.get(question_index) {
@@ -478,7 +478,7 @@ impl QuestionTerminalRenderer {
         question_index: usize,
         geometry: &QuestionGeometry,
     ) {
-        #[cfg(all(test, feature = "static-bundled"))]
+        #[cfg(all(test, feature = "tui"))]
         {
             self.rendered_questions = self.rendered_questions.saturating_add(1);
         }
@@ -693,7 +693,7 @@ impl QuestionTerminalRenderer {
                 ),
                 &TextInputPolicy::chat_composer(),
             );
-            #[cfg(feature = "static-bundled")]
+            #[cfg(feature = "tui")]
             if matches!(snapshot.focus, QuestionFocusTarget::Custom { question_index: focused } if focused == question_index)
                 && let Some((x, y)) = frame.logical_cursor()
                 && let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y))
@@ -821,14 +821,14 @@ impl QuestionTerminalRenderer {
         self.custom_areas.clear();
         self.custom_mouse_row_offsets.clear();
         self.visible_custom_carets.clear();
-        #[cfg(feature = "static-bundled")]
+        #[cfg(feature = "tui")]
         for (question_index, field) in self.custom_fields.get_mut().iter_mut() {
             // Invalidate the previous presentation before a possibly hidden/clipped paint.
             if let Some(state) = self.custom_inputs.get(question_index) {
                 field.painted_input(state, Rect::default(), Rect::default());
             }
         }
-        #[cfg(all(test, feature = "static-bundled"))]
+        #[cfg(all(test, feature = "tui"))]
         {
             self.rendered_questions = 0;
             self.visited_question_spans = 0;
@@ -863,7 +863,7 @@ impl QuestionTerminalRenderer {
                 measurement.hint_rows.clone(),
             )
         };
-        #[cfg(all(test, feature = "static-bundled"))]
+        #[cfg(all(test, feature = "tui"))]
         {
             self.visited_question_spans = questions.len();
         }
@@ -1100,7 +1100,7 @@ impl QuestionTerminalRenderer {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerminalRenderer {
     const SURFACE_KIND: &'static str = QUESTION_INLINE_SURFACE;
 
@@ -1550,7 +1550,7 @@ const fn question_input_styles(
     }
 }
 
-#[cfg(all(test, feature = "static-bundled"))]
+#[cfg(all(test, feature = "tui"))]
 mod tests {
     fn routed_surface_input(
         surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,

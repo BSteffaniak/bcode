@@ -28,7 +28,7 @@ pub mod presentation;
 pub mod recording;
 #[cfg(feature = "tui")]
 pub mod shell_run_tui;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod shell_summary;
 #[cfg(feature = "native")]
 mod terminal_clean;

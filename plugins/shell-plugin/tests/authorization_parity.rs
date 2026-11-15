@@ -72,7 +72,7 @@ fn concurrent_entrypoint_produces_stable_authorization_facts() {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[test]
 fn static_bundled_entrypoint_produces_same_fact_as_concurrent_plugin() {
     let source = "printf ok; rm generated";

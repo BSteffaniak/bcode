@@ -86,7 +86,7 @@ the renderer does not retain historical layouts or materialize a full-surface sc
 The deterministic work-shape checks are:
 
 ```sh
-cargo test -p bcode_question_plugin --features static-bundled question_tui
+cargo test -p bcode_question_plugin --features tui question_tui
 cargo test -p bcode_plugin_sdk --features tui typed_interaction_surface_tests
 cargo test -p bcode_tui interactive_surface
 cargo test -p bcode_tui stable_interaction_redraw

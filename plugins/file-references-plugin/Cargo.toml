@@ -26,8 +26,6 @@ serde_json              = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]
 tui            = ["bcode_plugin_sdk/tui"]
 
 [build-dependencies]

@@ -6,7 +6,7 @@
 mod file_change_tui;
 #[cfg(feature = "presentation")]
 mod filesystem_portable;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod filesystem_summary;
 #[cfg(feature = "presentation")]
 mod filesystem_tui;

@@ -109,5 +109,3 @@ tui = [
     "dep:bmux_keyboard",
     "dep:bmux_terminal_grid",
 ]
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]

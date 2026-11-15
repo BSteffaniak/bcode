@@ -32,5 +32,4 @@ thiserror = { workspace = true }
 default          = []
 fail-on-warnings = []
 # Kept for existing consumers; packaging does not select frontend behavior.
-static-bundled = ["tui"]
 tui            = ["dep:bcode_tui_components", "dep:bmux_tui"]

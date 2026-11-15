@@ -35,8 +35,6 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]
 tui            = ["bcode_plugin_sdk/tui", "bcode_tui_components", "bmux_tui"]
 # Interactive `bcode git` client. Disable to build bcode without it.
-git-ui = ["dep:bcode_forge", "dep:bcode_git_ui", "dep:clap", "static-bundled"]
+git-ui = ["dep:bcode_forge", "dep:bcode_git_ui", "dep:clap", "tui"]

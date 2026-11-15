@@ -57,8 +57,6 @@ bundled-tesseract-v5-5-2 = [
 default = []
 external-tesseract-cli = []
 fail-on-warnings = []
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]
 system-tesseract = [
     "dep:bcode_tesseract_ocr",
     "dep:image",

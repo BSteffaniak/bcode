@@ -25,7 +25,7 @@ run_probe() {
 {
     printf '%s\n' '{"schema_version":1,"kind":"live_shell_tui_performance_baseline"}'
     run_probe bcode_shell_plugin tests::live_shell_output_chunk_baseline_report
-    run_probe bcode_shell_plugin shell_run_tui::tests::incremental_replay_work_baseline_report --features static-bundled
+    run_probe bcode_shell_plugin shell_run_tui::tests::incremental_replay_work_baseline_report --features tui
     run_probe bcode_tui telemetry::tests::telemetry_enabled_disabled_overhead_baseline_report
     run_probe bcode_server tests::transient_streaming_fixed_workload_baseline_report
 } >"${output}"

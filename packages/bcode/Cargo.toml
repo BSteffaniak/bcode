@@ -97,9 +97,9 @@ bcode_hello_plugin         = { workspace = true }
 bcode_ipc                  = { workspace = true }
 bcode_plugin               = { workspace = true }
 bcode_provider_auth        = { workspace = true }
-bcode_question_plugin      = { workspace = true, features = ["static-bundled"] }
+bcode_question_plugin      = { workspace = true, features = ["tui"] }
 bcode_server               = { workspace = true }
-bcode_shell_plugin         = { workspace = true, features = ["static-bundled"] }
+bcode_shell_plugin         = { workspace = true, features = ["tui"] }
 bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 bmux_plugin_runtime        = { workspace = true }

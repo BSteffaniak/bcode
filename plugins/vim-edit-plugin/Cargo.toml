@@ -29,8 +29,6 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-# Compatibility alias; frontend capability is independent of packaging.
-static-bundled = ["tui"]
 tui            = ["bcode_plugin_sdk/tui", "bcode_tui_components", "bmux_tui"]
 
 [dependencies.bmux_tui]

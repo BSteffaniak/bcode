@@ -116,9 +116,9 @@ bcode_default_agents_plugin = { workspace = true, features = [
 bcode_eval = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_file_references_plugin = { workspace = true, features = [
-    "static-bundled",
+    "tui",
 ] }
-bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_filesystem_plugin = { workspace = true, features = ["tui"] }
 bcode_hyperchad = { workspace = true, features = [
     "renderer-html-actix",
     "static-bundled-question-plugin",
@@ -135,7 +135,7 @@ bcode_pi_session_import_plugin = { workspace = true, features = [
 bcode_prompt_profile_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
-bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_question_plugin = { workspace = true, features = ["tui"] }
 bcode_sdk_session_import_plugin = { workspace = true }
 bcode_session_derivation_plugin = { workspace = true, features = [
     "static-bundled",
@@ -143,15 +143,15 @@ bcode_session_derivation_plugin = { workspace = true, features = [
 bcode_session_milestones_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
-bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_shell_plugin = { workspace = true, features = ["tui"] }
 bcode_skills_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_tantivy_session_search_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
-bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_vim_edit_plugin = { workspace = true, features = ["tui"] }
 bcode_web_search_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_workflow_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_worktree_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_worktree_plugin = { workspace = true, features = ["tui"] }
 bmux_keyboard = { workspace = true }
 bmux_tui = { workspace = true }
 hyperchad = { workspace = true, features = ["router", "router-form"] }

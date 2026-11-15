@@ -136,7 +136,7 @@ static-bundled-default-agents-plugin = [
 ]
 static-bundled-document-plugin = [
     "dep:bcode_document_plugin",
-    "bcode_document_plugin/static-bundled",
+    "bcode_document_plugin/tui",
 ]
 static-bundled-eval-plugin = [
     "dep:bcode_eval_plugin",
@@ -148,15 +148,15 @@ static-bundled-fake-provider-plugin = [
 ]
 static-bundled-file-references-plugin = [
     "dep:bcode_file_references_plugin",
-    "bcode_file_references_plugin/static-bundled",
+    "bcode_file_references_plugin/tui",
 ]
 static-bundled-filesystem-plugin = [
     "dep:bcode_filesystem_plugin",
-    "bcode_filesystem_plugin/static-bundled",
+    "bcode_filesystem_plugin/tui",
 ]
 static-bundled-git-plugin = [
     "dep:bcode_git_plugin",
-    "bcode_git_plugin/static-bundled",
+    "bcode_git_plugin/tui",
 ]
 static-bundled-github-review-publisher-plugin = [
     "dep:bcode_github_review_publisher_plugin",
@@ -187,7 +187,7 @@ static-bundled-model-plugin = [
 ]
 static-bundled-ocr-plugin = [
     "dep:bcode_ocr_plugin",
-    "bcode_ocr_plugin/static-bundled",
+    "bcode_ocr_plugin/tui",
 ]
 static-bundled-openai-compatible-provider-plugin = [
     "dep:bcode_openai_compatible_provider_plugin",
@@ -252,11 +252,11 @@ static-bundled-prompt-profile-plugin = [
 ]
 static-bundled-question-plugin = [
     "dep:bcode_question_plugin",
-    "bcode_question_plugin/static-bundled",
+    "bcode_question_plugin/tui",
 ]
 static-bundled-read-plugin = [
     "dep:bcode_read_plugin",
-    "bcode_read_plugin/static-bundled",
+    "bcode_read_plugin/tui",
 ]
 static-bundled-recap-plugin = [
     "dep:bcode_recap_plugin",
@@ -275,7 +275,7 @@ static-bundled-session-milestones-plugin = [
 ]
 static-bundled-shell-plugin = [
     "dep:bcode_shell_plugin",
-    "bcode_shell_plugin/static-bundled",
+    "bcode_shell_plugin/tui",
 ]
 static-bundled-skills-plugin = [
     "dep:bcode_skills_plugin",
@@ -291,11 +291,11 @@ static-bundled-usage-plugin = [
 ]
 static-bundled-vim-edit-plugin = [
     "dep:bcode_vim_edit_plugin",
-    "bcode_vim_edit_plugin/static-bundled",
+    "bcode_vim_edit_plugin/tui",
 ]
 static-bundled-vox-plugin = [
     "dep:bcode_vox_plugin",
-    "bcode_vox_plugin/static-bundled",
+    "bcode_vox_plugin/tui",
 ]
 static-bundled-web-search-plugin = [
     "dep:bcode_web_search_plugin",
@@ -307,7 +307,7 @@ static-bundled-workflow-plugin = [
 ]
 static-bundled-worktree-plugin = [
     "dep:bcode_worktree_plugin",
-    "bcode_worktree_plugin/static-bundled",
+    "bcode_worktree_plugin/tui",
 ]
 static-bundled-xray-plugin = [
     "dep:bcode_xray_plugin",
