@@ -529,8 +529,9 @@ fn prepare(
     }
     // Arguments the model got wrong fail at invocation with a clear message; here they only
     // decide which resources the call declares.
-    let arguments = serde_json::from_value::<Arguments>(request.invocation.arguments.clone())
-        .unwrap_or_default();
+    let arguments =
+        serde_json::from_value::<Arguments>(without_blanks(request.invocation.arguments.clone()))
+            .unwrap_or_default();
     let output_path = match (access, arguments.output_path.as_deref()) {
         (Access::Publish, Some(path)) if !path.is_empty() => {
             Some(inside(&workspace.working_directory, path, "output_path")?)
@@ -802,6 +803,29 @@ impl Arguments {
     }
 }
 
+/// Tool arguments with blank optional values taken as not given: a field whose value is an
+/// empty or whitespace-only string, or `null`, is dropped from every object, including objects
+/// inside arrays (array items themselves are kept). Required fields dropped this way are
+/// refused as missing.
+fn without_blanks(mut value: Value) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.retain(|_, value| match value {
+                    Value::String(text) => !text.trim().is_empty(),
+                    Value::Null => false,
+                    _ => true,
+                });
+                map.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
 /// Run one invocation.
 fn invoke(
     data: &ReviewData,
@@ -814,10 +838,11 @@ fn invoke(
             Ok(descriptor) => descriptor,
             Err(error) => return failure(&format!("invalid review tool descriptor: {error}")),
         };
-    let mut arguments = match serde_json::from_value::<Arguments>(invocation.arguments.clone()) {
-        Ok(arguments) => arguments,
-        Err(error) => return failure(&format!("invalid arguments: {error}")),
-    };
+    let mut arguments =
+        match serde_json::from_value::<Arguments>(without_blanks(invocation.arguments.clone())) {
+            Ok(arguments) => arguments,
+            Err(error) => return failure(&format!("invalid arguments: {error}")),
+        };
     data.evict_idle();
     match run(
         data,

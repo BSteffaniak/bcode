@@ -907,6 +907,37 @@ impl ReviewApp {
     }
 }
 
+/// An app tool's arguments with blank optional values taken as not given: a field whose value
+/// is an empty or whitespace-only string, or `null`, is dropped from every object, including
+/// objects inside arrays (array items themselves are kept). Arguments that are not a JSON
+/// object are returned unchanged, to be refused by the tool's own parsing.
+pub(crate) fn without_blank_arguments(arguments: &str) -> String {
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.retain(|_, value| match value {
+                    serde_json::Value::String(text) => !text.trim().is_empty(),
+                    serde_json::Value::Null => false,
+                    _ => true,
+                });
+                map.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    if arguments.trim().is_empty() {
+        return "{}".to_owned();
+    }
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(mut value @ serde_json::Value::Object(_)) => {
+            strip(&mut value);
+            value.to_string()
+        }
+        _ => arguments.to_owned(),
+    }
+}
+
 /// Tool arguments as `T`.
 fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     serde_json::from_str(text).map_err(|error| format!("invalid arguments: {error}"))
@@ -952,6 +983,7 @@ impl ReviewApp {
             ));
             return;
         }
+        let arguments = without_blank_arguments(&arguments);
         let answer = match tool.as_str() {
             crate::assistant::profile::CURRENT_VIEW => {
                 match self.view_context().tool_answer(&arguments) {

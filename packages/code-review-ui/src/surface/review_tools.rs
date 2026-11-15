@@ -442,11 +442,12 @@ impl ReviewSurface {
         let Some(path) = target.path.filter(|path| !path.trim().is_empty()) else {
             return;
         };
+        let given = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
         if let Ok(label) = self.show_location(
             &path,
             target.line,
-            target.side.as_deref(),
-            target.source.as_deref(),
+            given(target.side).as_deref(),
+            given(target.source).as_deref(),
         ) {
             self.set_status(
                 format!("the assistant showed {label}"),
