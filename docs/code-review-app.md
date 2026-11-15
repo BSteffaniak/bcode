@@ -167,8 +167,8 @@ a turn that has left the observed window says so and `o` reads it in Bcode.
 
 The review assistant is one docked conversation with a Bcode session for the whole app: it is
 available on the reviews home, in the new-review wizard and in every review, and stays open with
-the same conversation while you move between them. The full design, including what is still to
-come, is in [code review assistant](code-review-assistant.md).
+the same conversation while you move between them. The full design, and where the build differs
+from it, is in [code review assistant](code-review-assistant.md).
 
 * **Opening it.** The `✦ Ask AI` button at the right end of every screen's header, `ctrl+k`, the
   palette entry "Ask AI" (`:` or `ctrl+p`, on home too) and the footer hint all open and focus
@@ -187,15 +187,23 @@ come, is in [code review assistant](code-review-assistant.md).
   with each layer's result, the file, cursor and selection, threads and loaded pull request
   state) and, for that turn only, a `review app detail` block (the selected lines, threads on the
   file, the focused thread, per-layer changes, files changed since the baseline, pull request
-  state). Both are bounded, and every cut names the tool with the rest. The app's own tool
-  `bcode.code-review.current_view` returns the live screen in full (`sections` narrows it).
+  state). Both are bounded, and every cut names the tool with the rest. A review without pull
+  request layers whose sources are compared with their last completed pass lists each source's
+  result instead (`source_results`, `source_deltas`). The app's own tool
+  `bcode.code-review.current_view` returns the live screen in full as JSON (`sections` narrows
+  it, `max_files` lists fewer files per layer or source); an answer that would exceed 64 KiB
+  shortens lists and then drops sections, always as valid JSON with a `truncated` object naming
+  what was left out.
 * **Conversation.** The title row names the active conversation and where it started (`✦
   Assistant · <title> · <review #layer or home>`) and carries `+ new`, `⟲` (history) and `↗`
   (open in Bcode). The chips row names what is on screen (`⌖ src/retry.rs:42`, `⌖ home`, `⌖ new
   review`); `ctrl+x` detaches it. The first message creates a Bcode session with the review app's
   origin, titled after the message and tagged with the review and stack layer on screen (or with
-  none on home and in the wizard), and sends it with the review assistant agent profile (when
-  the app's tools are registered); the conversation shows the text as typed.
+  none on home and in the wizard), on the app's tool connection, so its first turn already has
+  the app's tools. Every message names the review assistant agent profile; while the app's tools
+  and profile are not registered with Bcode (Bcode starting or restarting), messages wait and
+  the panel says so, rather than running without the profile's tool limits. The conversation
+  shows the text as typed.
 * **Which review the tools act on.** The session's binding names the review its `code_review.*`
   tools act on when no `review` is passed. It is rewritten before each message and whenever the
   screen changes: the review on screen, or detached on home and in the wizard, where a review
@@ -207,6 +215,13 @@ come, is in [code review assistant](code-review-assistant.md).
   wizard. So "create a review for my most recent PR stack", "create a review for my uncommitted
   changes in `src/`" or "mark all these files viewed" work from the conversation: the review is
   created, home lists it at once, and the assistant opens it (after asking).
+* **Only the open conversation acts on the screen.** The app's tools answer only the
+  conversation open in the panel; a conversation switched away from (a turn still running, or
+  one continued in `bcode tui`) gets `not_active_conversation`, and switching or starting a
+  conversation stops offering the app's tools to the previous one.
+* **Leaving a review.** When the assistant takes you to home, the wizard or another review, the
+  review closes as exiting does (its state saved first); an unsaved review with comments, AI
+  answers or suggestions is not left, and the assistant is told to ask you to save it.
 * **History.** `alt+h` (or `⟲`) opens the picker of every conversation of the repository, newest
   first: title, where it started, how long ago, turns, and `needs you` or `working`; Ask AI card
   sessions are labelled `card`. Typing searches; `enter` switches (and attaches the conversation
@@ -226,6 +241,14 @@ come, is in [code review assistant](code-review-assistant.md).
   files as it does for the reviewer's own edits, and `code_review.navigate` moves the cursor to
   the place it names. In a session the app started every finished call is applied; in one
   switched to from the history, calls that had already finished are not replayed.
+* **Changes made elsewhere.** The open review never writes its whole copy over the store: each
+  save writes only what you changed since it last read or wrote the review, and keeps renames,
+  archiving and viewed marks made meanwhile by the assistant, an AI card, `bcode tui`, home or
+  another app (concurrent writes are checked against the row's revision and merged again when
+  another write came first). The review then shows them: a rename changes its title. A review
+  deleted elsewhere is never saved again; the app returns home with a toast. Changes are picked
+  up on the next save, after any `create_review`, `update_review` or `delete_review` call the
+  app sees, and when the terminal regains focus.
 
 #### Review tools
 
@@ -296,11 +319,11 @@ and what is on screen now (`current_view`'s sections `screen`, `review`, `stack`
 |---|---|---|
 | `bcode.code-review.current_view` | read-only | The live screen (see What it knows). |
 | `bcode.code-review.find_pull_requests` | read-only | Open pull requests chained into stacks, newest first, each layer with its branches and update time and each stack with a `create_review_source` for `code_review.create_review`. `filter`: `mine` (a layer's branch is a local branch: your own work), `review_requested`, `current_branch`, `all`; `query`; `limit` (10, at most 50). |
-| `bcode.code-review.go_to` | read-only | Moves within the review on screen to a `layer` (pull request number or source id), a `path` and `line` (`side`), or a `thread`, as the keys do. Another review's place fails, naming `open_review`. |
-| `bcode.code-review.set_comparison` | read-only | Any Compare menu choice: `baseline` (`off`, `last_looked`, `previous_push`, `ago` with `ago_minutes`, `between` with `from_ms`/`to_ms`), `view` (`full`, `changes`), `only_changed`, `show_hidden_files`, `all_layers`, `versions` (`number`, `from`, `to`: vN to vM of one pull request), `mark_style`, `word_marks`, `seen_hunks`, `removed_inline`. |
+| `bcode.code-review.go_to` | read-only | Moves within the review on screen to a `layer` (pull request number or source id), a `path` and `line` (`side`), a `thread`, or a `version` of the layer (its whole change as it was then, read-only where it differs from now), as the keys do. Another review's place fails, naming `open_review`. |
+| `bcode.code-review.set_comparison` | read-only | Any Compare menu choice: `baseline` (`off`, `last_looked`, `previous_push`, `ago` with `ago_minutes`, `between` with `from_ms`/`to_ms`, `pushes` with `from_push`/`to_push` as the push timeline picks them, `stack_at` with `at_ms`), `view` (`full`, `changes`), `only_changed`, `show_hidden_files`, `all_layers`, `versions` (`number`, `from`, `to`: vN to vM of one pull request), `mark_style`, `word_marks`, `seen_hunks`, `removed_inline`. Every argument is checked first: one bad argument changes nothing. Pushes and versions need the stack history; while it loads the call asks to be repeated. |
 | `bcode.code-review.set_view` | read-only | `layout` (`unified`, `side_by_side`), `wrap`, `hide_resolved_threads`, `hide_viewed_files`, `file_list` (`tree`, `flat`), `files_panel`, `threads_panel`, `fold_files`, `fold_threads`. |
 | `bcode.code-review.refresh` | read-only | Reloads home, or checks the review on screen for changes (`r`). |
-| `bcode.code-review.open_review` | mutating | Opens a saved review of the repository (`review`), optionally at a `layer`, `path`, `line` or `thread` once it loaded; or `screen = "home"` or `"new_review"`. |
+| `bcode.code-review.open_review` | mutating | Opens a saved review of the repository (`review`), optionally at a `layer`, `path`, `line`, `thread` or `version` once it loaded; or `screen = "home"`, or `"new_review"` (the wizard, filled in with `title` and `sources` as `create_review` takes them, at its last step for you to confirm). The review on screen is left through its close path first. |
 | `bcode.code-review.complete_pass` | mutating | Marks the review pass complete (`shift+m`). |
 | `bcode.code-review.pull_request_review` | mutating | Opens the dialog to `approve`, `request_changes`, `comment` or `approve_viewed_layers`; you confirm it. |
 | `bcode.code-review.publish` | mutating | Opens the publish dialog (`shift+p`); you confirm it. |
@@ -885,7 +908,9 @@ bcode's own (`--print-config-paths` lists them in order):
   selected tools when it starts; the profile is based on Bcode's `build` agent and can only
   narrow it, so every call is still allowed, asked or denied by the `build` agent's rules
   (`[agent.build.permission.tools]`, for example `"code_review.mark_viewed" = "allow"`). With
-  the defaults, reads and moves within the review run; review writes, opening another screen,
+  the defaults, reads and moves within the review run (except `code_review.pull_request`, which
+  asks unless a web rule allows the repository's address; see [Tool
+  permissions](#tool-permissions)); review writes, opening another screen,
   file writes and shell commands ask each time; publishing asks every time (the panel never
   offers Always for it or for deleting reviews). An unknown key or a non-boolean value is reported and the default is used.
 

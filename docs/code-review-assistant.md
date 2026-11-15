@@ -30,16 +30,22 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
   snapshot of the screen; a message whose request-only context the daemon no longer holds at
   admission is sent again once with a fresh snapshot. The app registers
   `bcode.code-review.current_view` and the profile `bcode.code-review.assistant` (built from the
-  category configuration) on its own provider connection, reconnecting after Bcode restarts,
-  claims the active conversation's session, and names the profile on every turn while the
-  connection is registered.
+  category configuration) on its own provider connection, reconnecting after Bcode restarts;
+  creates new conversations' sessions on that connection and claims a session before each of
+  its turns; names the profile on every turn and holds messages while the connection is not
+  registered (fail closed).
 * **Built: plugin data tools (build step 4).** `create_review` (every kind, and the new
   `working_tree_paths` source kind), `update_review`, `delete_review`, the `mark_viewed`
   selectors, `add_comments`, `resolve_threads` and the extended `list_reviews`; every review tool
-  works on any saved review by id. The open review's saves merge viewed marks written elsewhere.
-* **Built: app action tools and acceptance (build step 5).** `find_pull_requests`, `go_to`,
-  `set_comparison`, `set_view`, `open_review`, `refresh`, `complete_pass`,
-  `pull_request_review` and `publish`; the profile instructions carry the recipes.
+  works on any saved review by id. Every writer of a saved review writes only what it changed
+  (field-level merge over the stored row, checked against the row's revision), so nothing undoes
+  another writer's change or brings back a deleted review.
+* **Built: app action tools and acceptance (build step 5).** `find_pull_requests`, `go_to`
+  (with `version`), `set_comparison` (every baseline, including `pushes` and `stack_at`),
+  `set_view`, `open_review` (including the prefilled `new_review`), `refresh`,
+  `complete_pass`, `pull_request_review` and `publish`; the profile instructions carry the
+  recipes. Only the panel's active conversation may use them. The acceptance requests were run
+  live against a debug daemon with the fake model provider (see [As built](#as-built)).
 * **Built and relied on.** Session origin, client tools with claims, contributed agent profiles
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
@@ -467,7 +473,7 @@ Bcode's `build` policy decides every exposed call, and a category can only remov
 
 | Category | Tools | Default | Decided by default as |
 | --- | --- | --- | --- |
-| `review_reads` | read plugin tools, `current_view`, `find_pull_requests` | on | allowed (read-only) |
+| `review_reads` | read plugin tools, `current_view`, `find_pull_requests` | on | allowed (read-only); `code_review.pull_request` declares the repository's web address, so it asks unless a web rule allows it |
 | `review_writes` | write plugin tools, `complete_pass` | on | asks (mutating) |
 | `publish` | `code_review.publish`, `bcode.code-review.publish`, `pull_request_review` | on | asks every time in the panel (Always is not offered) |
 | `navigation` | `go_to`, `set_comparison`, `set_view`, `refresh`, `open_review` | on | allowed; `open_review` asks (it changes the screen) |
@@ -604,10 +610,19 @@ Where the built panel differs from the design above:
   against `build` caught it). `navigation` holds `go_to`, `set_comparison`, `set_view`, `refresh`
   and `open_review`; `review_reads` also holds `find_pull_requests`, `review_writes` the new
   plugin writes and `complete_pass`, and `publish` the app's `publish` and `pull_request_review`.
-  Turns name the profile only while the app's tool connection is registered; before
-  that (or with a host that cannot provide tools) they use the session's agent.
-* **`current_view`** returns the snapshot's JSON; `max_files` is not an argument yet, and lists
-  are shortened (20 items, 10 files per layer) only when the answer would exceed 64 KiB.
+  Every panel message names the profile. While the app's tool connection is not registered
+  (Bcode starting or restarting, a failed registration) messages wait in the panel, which says
+  why, and go once it is; a host that cannot provide tools refuses to send. So no panel turn
+  runs without the profile's category limits.
+* **`current_view`** returns the snapshot's JSON with at most `max_files` files per layer or
+  source (100 by default). An answer over 64 KiB shortens lists (files per layer, selection,
+  threads, sources, pushes), then drops sections (pull request, threads, selection, comparison,
+  sources, home, wizard), then keeps only the screen; it is always valid JSON, and a `truncated`
+  object lists what was shortened or dropped and where to read it in full. The comparison also
+  lists the stack's newest 20 pushes (numbered as `set_comparison pushes` takes them) and, for
+  sources that are not pull request layers but are compared with their last completed pass,
+  each source's result (`sources` in JSON; `source_results` in the view block, `source_deltas`
+  in the detail block).
 * **Resubmission** covers a submit rejected with `request_only_context_unavailable`. A queued turn
   that fails later for that reason shows its failure in the conversation and is not resent.
 * **Saved reviews by id.** Plugin tools resolve a saved review's pull request and stack sources
@@ -635,15 +650,42 @@ Where the built panel differs from the design above:
   its list.
 * **`publish` and `pull_request_review`** open the app's dialog (as `shift+p` and the pull
   request card's actions do) for the reviewer to confirm; they do not submit by themselves.
-* **`set_comparison versions`** needs the stack history: when it is not loaded yet the call
-  starts loading it and asks to be repeated.
+* **`set_comparison`** checks every argument before applying any, so a call with one bad
+  argument changes nothing. `pushes` takes `from_push` and `to_push` (1-based, oldest first): the
+  stack just before `from_push` against the stack after `to_push` (now when absent), as the push
+  timeline picks them; `stack_at` takes `at_ms`. `versions`, `pushes` and `stack_at` need the
+  stack history: when it is not loaded yet the call starts loading it and asks to be repeated.
+* **`go_to version`** shows one layer (`layer`, else the current one) at that version: its whole
+  change then, from its fork point then, read-only where it differs from now. It is also a
+  place `open_review` can name.
+* **`open_review new_review`** takes `title` and `sources` (as `create_review` takes them; the
+  source planning lives in the code review crate, shared with the plugin) and shows the wizard at
+  its last step with them filled in; nothing is created until the user confirms.
 * **`open_review`** reads the review from the store, opens it, and answers once it loaded when a
   place was named (or after 20 seconds, saying it is still loading). A review of another
-  repository is not found; the profile instructions say to run `bcode review` there.
-* **The viewed-mark race** in the open questions was real: the open review saved its whole
-  workspace with its older viewed state. Saves and reloads now merge per file and per thread
-  (the reviewer's own changes since the last read or write win; everything else comes from the
-  store).
+  repository is not found; the profile instructions say to run `bcode review` there. Every move
+  to another screen leaves the review on screen through its close path (presentation persisted,
+  final and pending saves finished first); an unsaved review with comments, AI answers or
+  suggestions is not left: the call fails with `unsaved_review` and the review's status tells
+  the user how to save it.
+* **Claims.** A new conversation's session is created on the tool connection (Bcode claims it
+  there before it returns), and every message claims its session before submitting, so each
+  turn, the first included, is offered the app's tools. Starting or switching a conversation
+  releases the previous one's claim, and the app answers its tools only for the panel's active
+  conversation: any other session gets `not_active_conversation`. The connection reclaims at
+  most the 32 newest claimed sessions after a reconnect.
+* **Concurrent writers.** The open review saved its whole workspace, undoing viewed marks,
+  renames and archiving written meanwhile and recreating a review deleted meanwhile. Workspace
+  rows now carry a revision that every write checks and bumps. `review.workspace.update` takes
+  the writer's `base` (the row as it last read or wrote it); the store then writes only what
+  the writer changed from it (whole fields, and per file and per thread for viewed state) over
+  the stored row, reading again when another write came first, and refuses with
+  `review_workspace_deleted` instead of inserting a saved review that is gone. The open review,
+  home's rename and restore, source edits and the plugin's `mark_viewed` and `update_review`
+  send their base. The open review rebases its copy onto every save answer and reload (renames
+  and archives show at once), reloads after any `create_review`, `update_review` or
+  `delete_review` call it sees and when the terminal regains focus, and returns home with a
+  toast when its review was deleted.
 
 ## Decisions
 
@@ -674,3 +716,6 @@ Where the built panel differs from the design above:
   the model to point the user at `bcode review` there.
 * `find_pull_requests mine` relies on local branches; a provider that reports the viewer's login
   with its list would allow matching by author too.
+* A review renamed, archived or deleted by another client is noticed on the open review's next
+  save, after a review-list tool call the app sees, or when the terminal regains focus; the
+  store does not notify the app of other processes' writes.
