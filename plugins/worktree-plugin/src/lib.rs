@@ -162,13 +162,35 @@ fn worktree_workspace_root(
     Ok(Some(root))
 }
 
+/// Tool arguments with blank optional values taken as not given: a top-level field whose value
+/// is an empty or whitespace-only string, or `null`, is dropped. Models commonly fill every
+/// schema property and send `""` for the ones they do not mean to use; none of the worktree
+/// tool fields has a meaningful empty value. Required fields dropped this way are refused as
+/// missing.
+fn without_blank_arguments(mut arguments: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut arguments {
+        map.retain(|_, value| match value {
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        });
+    }
+    arguments
+}
+
+/// Parse a tool request from invocation arguments with blank optional values taken as not given.
+fn invocation_arguments<T: serde::de::DeserializeOwned>(
+    invocation: &ToolInvocationRequest,
+) -> Result<T, serde_json::Error> {
+    serde_json::from_value(without_blank_arguments(invocation.arguments.clone()))
+}
+
 fn worktree_preparation_descriptor(
     request: &bcode_tool::ToolPreparationRequest,
 ) -> Result<WorktreePreparationDescriptor, String> {
     let workspace_root = worktree_workspace_root(request)?;
-    let explicit_cwd = request
-        .invocation
-        .arguments
+    let arguments = without_blank_arguments(request.invocation.arguments.clone());
+    let explicit_cwd = arguments
         .get("cwd")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from);
@@ -182,9 +204,7 @@ fn worktree_preparation_descriptor(
         ),
         None => workspace_root,
     };
-    let remove_path = request
-        .invocation
-        .arguments
+    let remove_path = arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
@@ -373,7 +393,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     );
     let _ = presentation.replace(&worktree_request_payload(
         &invocation.name,
-        &invocation.arguments,
+        &without_blank_arguments(invocation.arguments.clone()),
     ));
     let response = match invocation.name.as_str() {
         "worktree.list" => invoke_list(&invocation, &descriptor),
@@ -394,8 +414,7 @@ fn invoke_list(
     invocation: &ToolInvocationRequest,
     descriptor: &WorktreePreparationDescriptor,
 ) -> ToolInvocationResponse {
-    let _request = match serde_json::from_value::<WorktreeListRequest>(invocation.arguments.clone())
-    {
+    let _request = match invocation_arguments::<WorktreeListRequest>(invocation) {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
@@ -418,11 +437,10 @@ fn invoke_create(
     invocation: &ToolInvocationRequest,
     descriptor: &WorktreePreparationDescriptor,
 ) -> ToolInvocationResponse {
-    let mut request =
-        match serde_json::from_value::<WorktreeCreateRequest>(invocation.arguments.clone()) {
-            Ok(request) => request,
-            Err(error) => return tool_error(error.to_string()),
-        };
+    let mut request = match invocation_arguments::<WorktreeCreateRequest>(invocation) {
+        Ok(request) => request,
+        Err(error) => return tool_error(error.to_string()),
+    };
     let Some(cwd) = descriptor.cwd.clone() else {
         return tool_error("worktree.create preparation descriptor is missing cwd".to_string());
     };
@@ -448,11 +466,10 @@ fn invoke_remove(
     invocation: &ToolInvocationRequest,
     descriptor: &WorktreePreparationDescriptor,
 ) -> ToolInvocationResponse {
-    let mut request =
-        match serde_json::from_value::<WorktreeRemoveRequest>(invocation.arguments.clone()) {
-            Ok(request) => request,
-            Err(error) => return tool_error(error.to_string()),
-        };
+    let mut request = match invocation_arguments::<WorktreeRemoveRequest>(invocation) {
+        Ok(request) => request,
+        Err(error) => return tool_error(error.to_string()),
+    };
     let Some(cwd) = descriptor.cwd.clone() else {
         return tool_error("worktree.remove preparation descriptor is missing cwd".to_string());
     };
@@ -1703,6 +1720,138 @@ mod tests {
                 category: "worktree.remove".to_owned(),
             }
         );
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn committed_repository() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("repository directory");
+        git(repo.path(), &["init", "--initial-branch", "main"]);
+        git(repo.path(), &["config", "user.email", "bcode@example.test"]);
+        git(repo.path(), &["config", "user.name", "Bcode Test"]);
+        std::fs::write(repo.path().join("README.md"), "test\n").expect("readme");
+        git(repo.path(), &["add", "README.md"]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn create_invocation(arguments: serde_json::Value) -> ToolInvocationRequest {
+        ToolInvocationRequest {
+            tool_call_id: "call".to_owned(),
+            name: "worktree.create".to_owned(),
+            arguments,
+            preparation_descriptor: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn worktree_create_takes_blank_optional_arguments_as_not_given() {
+        let repo = committed_repository();
+        let workspaces = tempfile::tempdir().expect("worktree directory");
+        let descriptor = WorktreePreparationDescriptor {
+            cwd: Some(repo.path().to_path_buf()),
+            remove_path: None,
+        };
+        for (index, arguments) in [
+            serde_json::json!({
+                "name": "new-branch",
+                "new_branch": "feature-new",
+                "branch": "",
+                "base_ref": "head",
+                "detach": false,
+                "no_setup": true,
+            }),
+            serde_json::json!({
+                "name": "detached",
+                "branch": " ",
+                "new_branch": null,
+                "base_ref": "head",
+                "detach": true,
+                "no_setup": true,
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = workspaces.path().join(format!("worktree-{index}"));
+            let mut arguments = arguments;
+            arguments["path"] = serde_json::json!(path);
+            arguments["cwd"] = serde_json::json!("");
+            let response = invoke_create(&create_invocation(arguments), &descriptor);
+            assert!(!response.is_error, "{}", response.output);
+            assert!(path.join("README.md").is_file());
+        }
+        assert_eq!(
+            git(
+                &workspaces.path().join("worktree-0"),
+                &["branch", "--show-current"]
+            ),
+            "feature-new"
+        );
+        assert_eq!(
+            git(
+                &workspaces.path().join("worktree-1"),
+                &["branch", "--show-current"]
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn worktree_create_still_refuses_conflicting_or_missing_arguments() {
+        let repo = committed_repository();
+        let descriptor = WorktreePreparationDescriptor {
+            cwd: Some(repo.path().to_path_buf()),
+            remove_path: None,
+        };
+        let conflicting = invoke_create(
+            &create_invocation(serde_json::json!({
+                "name": "both",
+                "branch": "main",
+                "new_branch": "feature",
+            })),
+            &descriptor,
+        );
+        assert!(conflicting.is_error);
+        assert!(conflicting.output.contains("either branch or new_branch"));
+
+        let missing_name = invoke_create(
+            &create_invocation(serde_json::json!({"name": "  ", "new_branch": "feature"})),
+            &descriptor,
+        );
+        assert!(missing_name.is_error);
+        assert!(missing_name.output.contains("name"));
+    }
+
+    #[test]
+    fn worktree_preparation_takes_blank_cwd_and_path_as_not_given() {
+        let definition = remove_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name,
+                arguments: serde_json::json!({"cwd": "", "path": "  "}),
+            },
+            host_context: workspace_context(Path::new("/tmp/workspace")),
+        };
+
+        let descriptor = worktree_preparation_descriptor(&request).expect("preparation");
+
+        assert_eq!(descriptor.cwd, Some(PathBuf::from("/tmp/workspace")));
+        assert_eq!(descriptor.remove_path, None);
     }
 
     #[test]
