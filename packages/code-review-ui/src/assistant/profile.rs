@@ -280,10 +280,12 @@ pub fn client_tools() -> Vec<ClientToolDescriptor> {
         description: "The screen the user is looking at in the code review app, live: which \
                       screen (home, wizard, review), the review (id, title, kind, sources with \
                       pull request numbers and heads), its stack layers and the current one, \
-                      the active comparison (baseline, view, toggles, each layer's result and \
-                      changed files), the file, cursor and selected lines, threads on the file \
-                      and the focused thread, and loaded pull request state. Pass `sections` to \
-                      read only some of it."
+                      the active comparison (baseline, view, toggles, each layer's or other \
+                      source's result and changed files, the stack's recent pushes), the file, \
+                      cursor and selected lines, threads on the file and the focused thread, \
+                      and loaded pull request state. Pass `sections` to read only some of it \
+                      and `max_files` to list fewer files per layer. A `truncated` object says \
+                      what was left out to fit."
             .to_owned(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -298,6 +300,11 @@ pub fn client_tools() -> Vec<ClientToolDescriptor> {
                         ]
                     },
                     "description": "Sections to return; all when omitted."
+                },
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Files listed per layer or source at most (default 100)."
                 }
             },
             "additionalProperties": false

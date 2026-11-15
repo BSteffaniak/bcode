@@ -228,6 +228,37 @@ pub struct FileDelta {
     pub removed: u32,
 }
 
+/// A source that is not a pull request layer, compared with the revisions its last completed
+/// review pass recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SourceResult {
+    /// Workspace source id.
+    pub id: String,
+    /// Label.
+    pub label: String,
+    /// `changed`, `rebased_only`, `unchanged`, `new_to_you`, `with_rebase`, `unavailable`, or
+    /// `computing`.
+    pub state: String,
+    /// Head of the baseline (the pass's recorded revision), when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Head compared with it.
+    pub to: String,
+    /// Files differing from the baseline.
+    pub files: Vec<FileDelta>,
+}
+
+/// One push of the stack, as the comparison can pick it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PushView {
+    /// Push number (1-based, oldest first), as `set_comparison pushes` takes it.
+    pub number: usize,
+    /// When it happened, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+    /// What it changed.
+    pub summary: String,
+}
+
 /// The review's active comparison.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ComparisonView {
@@ -243,6 +274,12 @@ pub struct ComparisonView {
     pub marks: Option<String>,
     /// Per-layer results, review order.
     pub layers: Vec<LayerView>,
+    /// Per-source results of the sources that are not pull request layers, review order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceResult>,
+    /// The stack's recorded pushes (the newest ones), when its history is loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushes: Option<Listed<PushView>>,
     /// Files hidden as unchanged since the baseline.
     pub hidden_files: usize,
 }
@@ -524,12 +561,46 @@ pub const TOOL_BUDGET: usize = 64 * 1024;
 struct ToolArguments {
     #[serde(default)]
     sections: Option<Vec<String>>,
+    /// Files listed per layer or source at most.
+    #[serde(default)]
+    max_files: Option<usize>,
 }
+
+/// Files listed per layer or source when `max_files` is not given.
+const DEFAULT_TOOL_FILES: usize = 100;
+
+/// Lists the answer shortens, in order, when it does not fit: (JSON pointer of the array, or
+/// of arrays inside the array's items with `/*/`, items kept).
+const SHORTENED: &[(&str, usize)] = &[
+    ("/review/comparison/layers/*/files", 10),
+    ("/review/comparison/sources/*/files", 10),
+    ("/review/selection/items", 20),
+    ("/review/threads/on_file/items", 20),
+    ("/review/sources/items", 20),
+    ("/review/comparison/pushes/items", 5),
+    ("/review/comparison/layers/*/files", 0),
+    ("/review/comparison/sources/*/files", 0),
+    ("/review/selection/items", 0),
+    ("/review/threads/on_file/items", 0),
+];
+
+/// Sections dropped, in order, when shortened lists still do not fit.
+const DROPPED: &[&str] = &[
+    "/review/pull_request",
+    "/review/threads",
+    "/review/selection",
+    "/review/comparison",
+    "/review/sources",
+    "/home",
+    "/wizard",
+];
 
 impl ViewContext {
     /// The context tool's answer for JSON `arguments`: this snapshot as JSON, only the
-    /// `sections` asked for, within [`TOOL_BUDGET`] bytes (long lists are shortened first and
-    /// the answer says so).
+    /// `sections` asked for, with at most `max_files` files per layer or source, within
+    /// [`TOOL_BUDGET`] bytes. The answer is always valid JSON: when it does not fit, long lists
+    /// are shortened, then whole sections dropped, and a `truncated` object names what was
+    /// left out and where to read it in full.
     ///
     /// # Errors
     ///
@@ -545,44 +616,129 @@ impl ViewContext {
         if let Some(sections) = &arguments.sections {
             keep_sections(&mut value, sections);
         }
-        let mut text = value.to_string();
-        if text.len() > TOOL_BUDGET {
-            // Shorten the bulky lists, then say so.
-            for pointer in [
-                "/review/selection/items",
-                "/review/threads/on_file/items",
-                "/review/sources/items",
-            ] {
-                if let Some(serde_json::Value::Array(items)) = value.pointer_mut(pointer) {
-                    items.truncate(20);
-                }
-            }
-            if let Some(serde_json::Value::Array(layers)) =
-                value.pointer_mut("/review/comparison/layers")
-            {
-                for layer in layers {
-                    if let Some(serde_json::Value::Array(files)) = layer.get_mut("files") {
-                        files.truncate(10);
-                    }
-                }
-            }
-            if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "truncated".to_owned(),
-                    serde_json::Value::String(
-                        "lists were shortened to fit; code_review.list_files, \
-                         code_review.list_threads and code_review.file_diff read them in full"
-                            .to_owned(),
-                    ),
-                );
-            }
-            text = value.to_string();
-            if text.len() > TOOL_BUDGET {
-                text = cut(&text, TOOL_BUDGET);
+        let max_files = arguments.max_files.unwrap_or(DEFAULT_TOOL_FILES);
+        let mut shortened = Vec::new();
+        for pointer in [
+            "/review/comparison/layers/*/files",
+            "/review/comparison/sources/*/files",
+        ] {
+            if shorten(&mut value, pointer, max_files) {
+                shortened.push(pointer.replace("/*/", "[]/"));
             }
         }
-        Ok(text)
+        Ok(fit_json(value, shortened, TOOL_BUDGET))
     }
+}
+
+/// `value` as JSON within `budget` bytes, shortening lists and dropping sections as needed;
+/// `shortened` names lists already shortened.
+fn fit_json(mut value: serde_json::Value, mut shortened: Vec<String>, budget: usize) -> String {
+    let mut dropped: Vec<&str> = Vec::new();
+    let mark = |value: &mut serde_json::Value, shortened: &[String], dropped: &[&str]| {
+        if shortened.is_empty() && dropped.is_empty() {
+            return;
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "truncated".to_owned(),
+                serde_json::json!({
+                    "shortened": shortened,
+                    "dropped": dropped,
+                    "read_in_full": "code_review.summary, code_review.list_files, \
+                        code_review.file_diff, code_review.list_threads, and \
+                        bcode.code-review.current_view with fewer sections or max_files",
+                }),
+            );
+        }
+    };
+    mark(&mut value, &shortened, &dropped);
+    let mut text = value.to_string();
+    for (pointer, keep) in SHORTENED {
+        if text.len() <= budget {
+            return text;
+        }
+        if shorten(&mut value, pointer, *keep) {
+            let name = pointer.replace("/*/", "[]/");
+            if !shortened.contains(&name) {
+                shortened.push(name);
+            }
+            mark(&mut value, &shortened, &dropped);
+            text = value.to_string();
+        }
+    }
+    for pointer in DROPPED {
+        if text.len() <= budget {
+            return text;
+        }
+        if remove_pointer(&mut value, pointer) {
+            dropped.push(pointer);
+            mark(&mut value, &shortened, &dropped);
+            text = value.to_string();
+        }
+    }
+    if text.len() <= budget {
+        return text;
+    }
+    // Only the screen's identity is left.
+    serde_json::json!({
+        "screen": value.get("screen").cloned().unwrap_or_default(),
+        "screen_generation": value.get("screen_generation").cloned().unwrap_or_default(),
+        "truncated": {
+            "dropped": "everything but the screen",
+            "read_in_full": "bcode.code-review.current_view with fewer sections",
+        },
+    })
+    .to_string()
+}
+
+/// Keep at most `keep` items of the array at `pointer` (`/*/` reaches into every item of an
+/// array on the way). Returns whether anything was left out.
+fn shorten(value: &mut serde_json::Value, pointer: &str, keep: usize) -> bool {
+    if let Some((head, tail)) = pointer.split_once("/*/") {
+        let Some(serde_json::Value::Array(items)) = value.pointer_mut(head) else {
+            return false;
+        };
+        let mut cut = false;
+        for item in items {
+            cut |= shorten(item, &format!("/{tail}"), keep);
+        }
+        return cut;
+    }
+    let cut = match value.pointer_mut(pointer) {
+        Some(serde_json::Value::Array(items)) if items.len() > keep => {
+            items.truncate(keep);
+            true
+        }
+        _ => false,
+    };
+    // A bounded list (`items`, `total`, `omitted`) keeps saying how many are left out.
+    if cut
+        && let Some(parent) = pointer.strip_suffix("/items")
+        && let Some(list) = value
+            .pointer_mut(parent)
+            .and_then(|list| list.as_object_mut())
+        && let Some(total) = list.get("total").and_then(serde_json::Value::as_u64)
+    {
+        let kept = u64::try_from(keep).unwrap_or(u64::MAX).min(total);
+        list.insert("omitted".to_owned(), serde_json::Value::from(total - kept));
+    }
+    cut
+}
+
+/// Remove the field at `pointer`. Returns whether it was there.
+fn remove_pointer(value: &mut serde_json::Value, pointer: &str) -> bool {
+    let Some((parent, field)) = pointer.rsplit_once('/') else {
+        return false;
+    };
+    let parent = if parent.is_empty() {
+        Some(value)
+    } else {
+        value.pointer_mut(parent)
+    };
+    parent
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|object| object.remove(field))
+        .is_some()
 }
 
 /// Keep only `sections` of the snapshot `value` (the screen fields always stay).
@@ -799,9 +955,45 @@ fn comparison_lines(review: &ReviewView, lines: &mut Vec<String>) {
                 comparison.hidden_files
             ));
         }
+        if !comparison.sources.is_empty() {
+            let mut sources = String::from("source_results:");
+            for (index, source) in comparison.sources.iter().take(VIEW_LAYERS).enumerate() {
+                sources.push_str(if index == 0 { " " } else { " · " });
+                sources.push_str(&source_summary(source));
+            }
+            if comparison.sources.len() > VIEW_LAYERS {
+                let _ = write!(
+                    sources,
+                    "  {}",
+                    more(
+                        comparison.sources.len() - VIEW_LAYERS,
+                        "sources",
+                        CURRENT_VIEW_TOOL
+                    )
+                );
+            }
+            lines.push(sources);
+        }
     } else {
         lines.push("comparison: off".to_owned());
     }
+}
+
+fn source_summary(source: &SourceResult) -> String {
+    let mut text = format!("{} {}", value(&source.label), source.state);
+    if source.state == "changed" || source.state == "with_rebase" {
+        let (added, removed) = source
+            .files
+            .iter()
+            .fold((0, 0), |(a, r), file| (a + file.added, r + file.removed));
+        let _ = write!(
+            text,
+            " {} file{} +{added} −{removed}",
+            source.files.len(),
+            if source.files.len() == 1 { "" } else { "s" }
+        );
+    }
+    text
 }
 
 /// The file, cursor, threads and pull request state.
@@ -1083,7 +1275,7 @@ fn deltas_section(review: &ReviewView) -> Vec<String> {
         return Vec::new();
     };
     if comparison.layers.is_empty() {
-        return Vec::new();
+        return source_deltas_section(comparison);
     }
     let lines = comparison.layers.iter().map(|layer| {
         let mut line = format!(
@@ -1112,6 +1304,38 @@ fn deltas_section(review: &ReviewView) -> Vec<String> {
         DETAIL_LAYERS,
         DETAIL_DELTAS_BYTES,
         |left| format!("  {}", more(left, "layers", CURRENT_VIEW_TOOL)),
+    )
+}
+
+/// The non-layer sources' results, in a review without pull request layers.
+fn source_deltas_section(comparison: &ComparisonView) -> Vec<String> {
+    if comparison.sources.is_empty() {
+        return Vec::new();
+    }
+    let lines = comparison.sources.iter().map(|source| {
+        let mut line = format!(
+            "  {} {}  {}→{}",
+            value(&source.label),
+            source.state,
+            source.from.as_deref().map_or("none", short),
+            short(&source.to)
+        );
+        let files: Vec<String> = source.files.iter().take(6).map(file_delta).collect();
+        if !files.is_empty() {
+            let _ = write!(line, ": {}", files.join(", "));
+            if source.files.len() > 6 {
+                let _ = write!(line, " +{} more", source.files.len() - 6);
+            }
+        }
+        cut(&line, 400)
+    });
+    bounded(
+        "source_deltas:".to_owned(),
+        lines,
+        comparison.sources.len(),
+        DETAIL_LAYERS,
+        DETAIL_DELTAS_BYTES,
+        |left| format!("  {}", more(left, "sources", CURRENT_VIEW_TOOL)),
     )
 }
 
@@ -1206,6 +1430,42 @@ fn pull_section(review: &ReviewView) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn huge_comparison(layers: Vec<LayerView>) -> ComparisonView {
+        ComparisonView {
+            baseline: "last_looked".to_owned(),
+            view: "changes".to_owned(),
+            only_changed: true,
+            marks: None,
+            layers,
+            sources: (0..300)
+                .map(|index| SourceResult {
+                    id: format!("source-{index}"),
+                    label: format!("branch {index} {}", "é".repeat(100)),
+                    state: "changed".to_owned(),
+                    from: Some("a".repeat(40)),
+                    to: "b".repeat(40),
+                    files: (0..200)
+                        .map(|file| FileDelta {
+                            path: format!("src/{}/f{file}.rs", "日本".repeat(30)),
+                            since: "changed".to_owned(),
+                            added: 3,
+                            removed: 1,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            pushes: Some(Listed::of(
+                (1..=20).map(|number| PushView {
+                    number,
+                    at_ms: 1_000 * number as u64,
+                    summary: "#101 changed".to_owned(),
+                }),
+                20,
+            )),
+            hidden_files: 14,
+        }
+    }
+
     fn huge_review() -> ViewContext {
         let layers: Vec<LayerView> = (1..=200)
             .map(|number| LayerView {
@@ -1250,14 +1510,7 @@ mod tests {
                     current: Some(7),
                     view: "one_pr".to_owned(),
                 }),
-                comparison: Some(ComparisonView {
-                    baseline: "last_looked".to_owned(),
-                    view: "changes".to_owned(),
-                    only_changed: true,
-                    marks: None,
-                    layers,
-                    hidden_files: 14,
-                }),
+                comparison: Some(huge_comparison(layers)),
                 files: (5_000, 10),
                 file: Some(FileView {
                     path: "p".repeat(2_000),
@@ -1363,6 +1616,52 @@ mod tests {
         assert!(
             detail.contains("more comments (code_review.get_thread"),
             "{detail}"
+        );
+    }
+
+    #[test]
+    fn the_tool_answer_is_always_valid_bounded_json_that_says_what_it_left_out() {
+        let context = huge_review();
+        for arguments in ["", r#"{"max_files":2}"#, r#"{"sections":["comparison"]}"#] {
+            let answer = context.tool_answer(arguments).expect("answer");
+            assert!(answer.len() <= TOOL_BUDGET, "{} bytes", answer.len());
+            let value: serde_json::Value = serde_json::from_str(&answer).expect("valid JSON");
+            assert_eq!(value["screen"], "review");
+            assert!(
+                value["truncated"].is_object(),
+                "{arguments}: says what was cut"
+            );
+        }
+        // A small answer is whole and unmarked; `max_files` bounds each layer's files.
+        let mut small = huge_review();
+        let review = small.review.as_mut().expect("review");
+        review.selection = None;
+        review.threads = ThreadsView::default();
+        review.sources = Listed::of(Vec::new(), 1);
+        let comparison = review.comparison.as_mut().expect("comparison");
+        comparison.layers.truncate(2);
+        comparison.sources.truncate(1);
+        review.file = None;
+        let answer = small.tool_answer(r#"{"max_files":3}"#).expect("answer");
+        let value: serde_json::Value = serde_json::from_str(&answer).expect("valid JSON");
+        assert!(
+            value["review"]["comparison"]["sources"][0]["files"]
+                .as_array()
+                .is_some_and(|files| files.len() == 3),
+            "{answer}"
+        );
+        assert_eq!(
+            value["review"]["comparison"]["pushes"]["items"][0]["number"], 1,
+            "{answer}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                &small
+                    .tool_answer(r#"{"max_files":"x"}"#)
+                    .unwrap_or_default()
+            )
+            .is_err(),
+            "bad arguments are refused"
         );
     }
 

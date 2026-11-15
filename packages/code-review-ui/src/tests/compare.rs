@@ -872,6 +872,47 @@ fn a_branch_is_compared_with_the_last_completed_pass() {
 }
 
 #[test]
+fn a_compared_branch_tells_the_assistant_its_result() {
+    use crate::testing::fixture::HEAD_BRANCH;
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let branch = bcode_code_review_models::ReviewSourceKind::BranchCompare {
+        base_branch: HEAD_BRANCH.to_owned(),
+        head_branch: STACK_BRANCHES[0].to_owned(),
+        merge_base: true,
+    };
+    let workspace = create(&backend, &fixture, "Branch", vec![branch]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("shift+m");
+    scenario.key("q");
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[0], "pushed-later.txt");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let context = scenario.surface().view_context();
+    let comparison = context
+        .review
+        .as_ref()
+        .and_then(|review| review.comparison.clone())
+        .expect("a comparison");
+    assert!(comparison.layers.is_empty(), "no pull request layers");
+    let result = comparison.sources.first().expect("the branch's result");
+    assert_eq!(result.state, "changed", "{result:?}");
+    assert!(result.from.is_some(), "compared with the pass: {result:?}");
+    assert!(
+        result
+            .files
+            .iter()
+            .any(|file| file.path == "pushed-later.txt" && file.since == "new"),
+        "{result:?}"
+    );
+    let view = context.view_text();
+    assert!(view.contains("source_results:"), "{view}");
+    assert!(context.detail_text().contains("source_deltas:"));
+}
+
+#[test]
 fn a_files_versions_step_with_alt_comma_and_alt_period() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));

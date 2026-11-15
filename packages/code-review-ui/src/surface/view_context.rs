@@ -4,7 +4,7 @@
 use super::ReviewSurface;
 use crate::assistant::context::{
     ComparisonView, CursorView, FileDelta, FileView, FocusedThread, LayerView, Listed, PullView,
-    ReviewView, SourceView, StackView, ThreadsView,
+    PushView, ReviewView, SourceResult, SourceView, StackView, ThreadsView,
 };
 use bcode_code_review::document::{AnchorTarget, CompareView, ItemKey, ReviewItem};
 use bcode_code_review_models::{
@@ -25,6 +25,8 @@ const MAX_COMMENTS: usize = 12;
 const MAX_COMMENT_BYTES: usize = 1_024;
 /// Files of a layer's comparison described at most.
 const MAX_DELTA_FILES: usize = 400;
+/// The stack's newest pushes listed for the comparison.
+const MAX_PUSHES: usize = 20;
 
 impl ReviewSurface {
     /// The review on screen, for the assistant.
@@ -311,6 +313,8 @@ impl ReviewSurface {
                 }
             })
             .collect();
+        let sources = self.source_results();
+        let pushes = self.recent_pushes();
         Some(ComparisonView {
             baseline: name,
             view: match comparing.view() {
@@ -321,7 +325,75 @@ impl ReviewSurface {
             only_changed: comparing.only_changed(),
             marks: comparing.marks().map(|marks| format!("{marks:?}")),
             layers,
+            sources,
+            pushes,
             hidden_files,
+        })
+    }
+
+    /// Results of the compared sources that are not pull request layers.
+    fn source_results(&self) -> Vec<SourceResult> {
+        let Some(review) = self.review.as_ref() else {
+            return Vec::new();
+        };
+        let doc = &review.doc;
+        let layer_ids: Vec<String> = self
+            .layer_sources()
+            .into_iter()
+            .map(|layer| layer.source_id)
+            .collect();
+        self.sources
+            .iter()
+            .filter(|source| source.included && !layer_ids.contains(&source.id))
+            .filter_map(|source| {
+                let comparison = doc.comparison(&source.id)?;
+                let delta = comparison.delta.as_ref();
+                Some(SourceResult {
+                    id: source.id.clone(),
+                    label: source.label.clone(),
+                    state: delta.map_or_else(
+                        || "computing".to_owned(),
+                        |delta| delta_name(delta.kind).to_owned(),
+                    ),
+                    from: delta.and_then(|delta| {
+                        delta.pair.from.as_ref().map(|from| from.head_oid.clone())
+                    }),
+                    to: delta.map_or_else(String::new, |delta| delta.pair.to.head_oid.clone()),
+                    files: delta
+                        .map(|delta| {
+                            delta
+                                .files
+                                .iter()
+                                .take(MAX_DELTA_FILES)
+                                .map(|file| file_delta(&file.path, file.since))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// The stack's newest pushes, once its history is loaded.
+    fn recent_pushes(&self) -> Option<Listed<PushView>> {
+        self.stack_history.as_ref().map(|history| {
+            let total = history.pushes.len();
+            let first = total.saturating_sub(MAX_PUSHES);
+            Listed {
+                items: history
+                    .pushes
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .map(|(index, push)| PushView {
+                        number: index + 1,
+                        at_ms: push.at_ms,
+                        summary: bcode_code_review::history::push_summary(push),
+                    })
+                    .collect(),
+                total,
+                omitted: first,
+            }
         })
     }
 
