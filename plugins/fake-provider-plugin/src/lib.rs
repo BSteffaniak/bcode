@@ -56,6 +56,13 @@ const FAKE_EVENT_SCRIPT_SETTING: &str = "fake_event_script";
 /// A JSON array of event scripts, one per model request of a user turn: the request after the
 /// user's message gets the first, and each request after a response that called tools the next.
 const FAKE_EVENT_SCRIPT_TURNS_SETTING: &str = "fake_event_script_turns";
+/// A JSON object of [`FAKE_EVENT_SCRIPT_TURNS_SETTING`] arrays selected by a marker in the
+/// user's message (at most 32 markers; exactly one may match).
+const FAKE_EVENT_SCRIPT_TURNS_BY_MARKER_SETTING: &str = "fake_event_script_turns_by_prompt_marker";
+/// In a turn script, `{{last_tool_result:<JSON pointer>}}` inside a string becomes that value of
+/// the turn's latest tool result (parsed as JSON), so a scripted call can use what an earlier one
+/// returned (a created id).
+const LAST_TOOL_RESULT_PLACEHOLDER: &str = "{{last_tool_result:";
 
 /// One deterministic fake-provider event script.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1094,18 +1101,40 @@ fn selected_event_script(request: &ModelTurnRequest) -> Result<Option<String>, S
 /// The script of [`FAKE_EVENT_SCRIPT_TURNS_SETTING`] for this request, if configured and not
 /// exhausted.
 fn turn_event_script(request: &ModelTurnRequest) -> Result<Option<String>, String> {
-    let Some(encoded) = request
-        .provider_context
-        .settings
-        .get(FAKE_EVENT_SCRIPT_TURNS_SETTING)
-    else {
-        return Ok(None);
+    let settings = &request.provider_context.settings;
+    let scripts: Vec<FakeProviderEventScript> = if let Some(encoded) =
+        settings.get(FAKE_EVENT_SCRIPT_TURNS_BY_MARKER_SETTING)
+    {
+        if encoded.len() > 1_048_576 {
+            return Err("fake script turns exceed byte budget".into());
+        }
+        let by_marker: BTreeMap<String, Vec<FakeProviderEventScript>> =
+            serde_json::from_str(encoded)
+                .map_err(|error| format!("invalid fake script turns by marker: {error}"))?;
+        if by_marker.len() > 32 || by_marker.keys().any(String::is_empty) {
+            return Err("fake script turn selectors require at most 32 nonempty markers".into());
+        }
+        let text = last_user_text(&request.messages);
+        let mut matches = by_marker
+            .into_iter()
+            .filter(|(marker, _)| text.contains(marker.as_str()));
+        let Some((_, scripts)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err("ambiguous fake script turn selectors".into());
+        }
+        scripts
+    } else {
+        let Some(encoded) = settings.get(FAKE_EVENT_SCRIPT_TURNS_SETTING) else {
+            return Ok(None);
+        };
+        if encoded.len() > 1_048_576 {
+            return Err("fake script turns exceed byte budget".into());
+        }
+        serde_json::from_str(encoded)
+            .map_err(|error| format!("invalid fake script turns: {error}"))?
     };
-    if encoded.len() > 1_048_576 {
-        return Err("fake script turns exceed byte budget".into());
-    }
-    let scripts: Vec<FakeProviderEventScript> = serde_json::from_str(encoded)
-        .map_err(|error| format!("invalid fake script turns: {error}"))?;
     // Each earlier request of the turn ended in tool calls; hosts may split one response into
     // several assistant messages, so count the messages carrying calls.
     let index = request
@@ -1123,8 +1152,59 @@ fn turn_event_script(request: &ModelTurnRequest) -> Result<Option<String>, Strin
         .count();
     scripts
         .get(index)
-        .map(|script| serde_json::to_string(script).map_err(|error| error.to_string()))
+        .map(|script| {
+            serde_json::to_string(script)
+                .map(|encoded| with_last_tool_result(&encoded, &request.messages))
+                .map_err(|error| error.to_string())
+        })
         .transpose()
+}
+
+/// `encoded` with every [`LAST_TOOL_RESULT_PLACEHOLDER`] replaced by the value its JSON pointer
+/// names in the turn's latest tool result (empty when there is none or it is not JSON).
+fn with_last_tool_result(encoded: &str, messages: &[ModelMessage]) -> String {
+    if !encoded.contains(LAST_TOOL_RESULT_PLACEHOLDER) {
+        return encoded.to_owned();
+    }
+    let latest: Option<serde_json::Value> = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+        .filter(|message| message.role == MessageRole::Tool)
+        .flat_map(|message| message.content.iter().rev())
+        .find_map(|block| match block {
+            ContentBlock::ToolResult { result } => serde_json::from_str(&result.output).ok(),
+            _ => None,
+        });
+    let mut out = String::new();
+    let mut rest = encoded;
+    while let Some(start) = rest.find(LAST_TOOL_RESULT_PLACEHOLDER) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + LAST_TOOL_RESULT_PLACEHOLDER.len()..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let pointer = &after[..end];
+        let value = latest
+            .as_ref()
+            .and_then(|value| value.pointer(pointer))
+            .map(|value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        // The placeholder sits inside a JSON string of the encoded script.
+        let escaped = serde_json::to_string(&value).unwrap_or_default();
+        let inner = escaped
+            .strip_prefix('"')
+            .and_then(|escaped| escaped.strip_suffix('"'))
+            .unwrap_or_default();
+        out.push_str(inner);
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn fake_event_script(
@@ -4492,6 +4572,56 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
         // A new user message starts the scripts again.
         request.messages.push(message("user"));
         assert_eq!(fake_event_script(&request).unwrap(), Some(text("first")));
+    }
+
+    #[test]
+    fn marked_script_turns_use_what_an_earlier_call_returned() {
+        let call = |id: &str, arguments: serde_json::Value| FakeProviderEventScript {
+            steps: vec![FakeProviderEventScriptStep {
+                gate: None,
+                delay_ms: None,
+                event: ProviderTurnEvent::ToolCallFinished {
+                    call: ToolCall {
+                        id: id.to_owned(),
+                        name: "open".to_owned(),
+                        arguments,
+                    },
+                },
+            }],
+        };
+        let by_marker = serde_json::to_string(&serde_json::json!({
+            "create it": [
+                call("c1", serde_json::json!({"title": "x"})),
+                call("c2", serde_json::json!({"review": "{{last_tool_result:/id}}"})),
+            ],
+            "other": [call("o1", serde_json::json!({}))],
+        }))
+        .unwrap();
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id":"00000000-0000-0000-0000-000000000000", "turn_id":"activation", "model_id":"fake-echo",
+            "provider_context":{"settings":{"fake_event_script_turns_by_prompt_marker": by_marker}},
+            "messages":[{"role":"user","content":[{"type":"text","text":"please create it"}]}]
+        }))
+        .unwrap();
+        assert_eq!(
+            fake_event_script(&request).unwrap(),
+            Some(call("c1", serde_json::json!({"title": "x"})))
+        );
+        request.messages.push(
+            serde_json::from_value(serde_json::json!({"role":"assistant","content":[
+                {"type":"tool_call","call":{"id":"c1","name":"open","arguments":{"title":"x"}}}]}))
+            .unwrap(),
+        );
+        request.messages.push(
+            serde_json::from_value(serde_json::json!({"role":"tool","content":[
+                {"type":"tool_result","result":{"call_id":"c1","output":"{\"id\":\"rv \\\"7\\\"\"}"}}]}))
+            .unwrap(),
+        );
+        assert_eq!(
+            fake_event_script(&request).unwrap(),
+            Some(call("c2", serde_json::json!({"review": "rv \"7\""}))),
+            "the id the first call returned, escaped into the arguments"
+        );
     }
 
     #[test]
