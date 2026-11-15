@@ -280,19 +280,46 @@ impl ReviewSurface {
         }));
     }
 
-    /// Show viewed files as stored.
+    /// Show viewed files as stored, keeping the reviewer's changes not saved yet.
     fn apply_stored_viewed(&mut self, stored: &ReviewWorkspace) {
+        let stored = super::viewed_sync::Viewed::of(stored);
+        let local = super::viewed_sync::Viewed::of(self.workspace_mut());
+        let merged = self.viewed_base.as_ref().map_or_else(
+            || stored.clone(),
+            |base| super::viewed_sync::merge(base, &local, &stored),
+        );
+        self.viewed_base = Some(stored);
+        self.show_viewed(merged);
+    }
+
+    /// After a save wrote `written` for the local state `saving`: take what the save merged in,
+    /// keeping changes the reviewer made while it ran.
+    pub(super) fn adopt_viewed(
+        &mut self,
+        saving: &super::viewed_sync::Viewed,
+        written: &super::viewed_sync::Viewed,
+    ) {
+        let local = super::viewed_sync::Viewed::of(self.workspace_mut());
+        let merged = super::viewed_sync::merge(saving, &local, written);
+        self.viewed_base = Some(written.clone());
+        self.show_viewed(merged);
+    }
+
+    /// Show `viewed` as the review's viewed state.
+    fn show_viewed(&mut self, viewed: super::viewed_sync::Viewed) {
         let workspace = self.workspace_mut();
-        if workspace.viewed_files == stored.viewed_files
-            && workspace.viewed_marks == stored.viewed_marks
-            && workspace.viewed_threads == stored.viewed_threads
-        {
+        if super::viewed_sync::Viewed::of(workspace) == viewed {
             return;
         }
-        workspace.viewed_files.clone_from(&stored.viewed_files);
-        workspace.viewed_marks.clone_from(&stored.viewed_marks);
-        workspace.viewed_threads.clone_from(&stored.viewed_threads);
+        viewed.apply(workspace);
         let workspace = workspace.clone();
+        if workspace.id == super::TRANSIENT_WORKSPACE_ID {
+            self.transient_viewed = Some((
+                workspace.viewed_files.clone(),
+                workspace.viewed_marks.clone(),
+                workspace.viewed_threads.clone(),
+            ));
+        }
         if let Some(review) = self.review.as_mut() {
             review.doc.set_viewed_marks(&workspace);
             review.note_splices();

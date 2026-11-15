@@ -88,8 +88,8 @@ pub enum Message {
         /// Whether the user asked for the refresh (reported in the status line).
         manual: bool,
     },
-    /// A workspace save finished.
-    Saved(Result<(), String>),
+    /// A workspace save finished, with the viewed state it wrote.
+    Saved(Result<crate::surface::ViewedState, String>),
     /// A transient review was saved as a durable one (or failed to).
     SavedAs(Box<Result<bcode_code_review_models::ReviewWorkspace, String>>),
     /// The review's annotations were listed.

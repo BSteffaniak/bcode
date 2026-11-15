@@ -166,6 +166,9 @@ mod stack;
 mod stack_files;
 mod threads;
 mod view_context;
+mod viewed_sync;
+
+pub(crate) use viewed_sync::Viewed as ViewedState;
 
 pub use annotate::COMPOSER_SCOPE;
 pub use conversation::{BarState, ConversationMessage, WatchCancel};
@@ -735,6 +738,10 @@ pub struct ReviewSurface {
         Vec<bcode_code_review_models::ViewedMark>,
         Vec<bcode_code_review_models::ThreadViewMark>,
     )>,
+    /// Viewed state as last read from or written to the store (see [`viewed_sync`]).
+    viewed_base: Option<viewed_sync::Viewed>,
+    /// Viewed state being saved, while a save runs.
+    viewed_saving: Option<viewed_sync::Viewed>,
     /// The open publish or import flow.
     modal: Option<Modal>,
     /// Stack rail tab state, and the rail's area and layout in the last frame.
@@ -889,6 +896,8 @@ impl ReviewSurface {
             notes_requested: false,
             saving_as: false,
             transient_viewed: None,
+            viewed_base: None,
+            viewed_saving: None,
             modal: None,
             rail_state: RefCell::new(bmux_tui_components::tab_bar::TabBarState::new(None)),
             rail: None,
@@ -979,6 +988,9 @@ impl ReviewSurface {
             } else {
                 stack::StackView::OneLayer
             };
+        }
+        if workspace.id != TRANSIENT_WORKSPACE_ID {
+            self.viewed_base = Some(viewed_sync::Viewed::of(&workspace));
         }
         self.workspace = Some(workspace);
         self
@@ -1624,10 +1636,13 @@ impl ReviewSurface {
             workspace = loader::transient_viewed_record(&workspace);
         }
         self.save = SaveState::Running;
+        let local = viewed_sync::Viewed::of(&workspace);
+        self.viewed_saving = Some(local.clone());
+        let base = self.viewed_base.clone();
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
-            let result = loader::save_workspace(services, workspace).await;
+            let result = save_merging_viewed(services, workspace, base, local).await;
             inbox.push(Message::Saved(result));
         }));
     }
@@ -2040,12 +2055,18 @@ impl ReviewSurface {
                 } else {
                     SaveState::Idle
                 };
-                if let Err(error) = result {
-                    self.toasts.push(
+                let saving = self.viewed_saving.take();
+                match result {
+                    Ok(written) => {
+                        if let Some(saving) = saving {
+                            self.adopt_viewed(&saving, &written);
+                        }
+                    }
+                    Err(error) => self.toasts.push(
                         ToastSeverity::Error,
                         "Could not save the review state",
                         Some(error),
-                    );
+                    ),
                 }
             }
             Message::NotesLoaded { generation, result } => {
@@ -2117,6 +2138,7 @@ impl ReviewSurface {
     /// An unsaved review's state stored for its target: viewed files and marks, and dismissed
     /// notices.
     fn adopt_transient_record(&mut self, stored: Option<ReviewWorkspace>) {
+        let stored_viewed = stored.as_ref().map(viewed_sync::Viewed::of);
         let workspace = self.workspace_mut();
         if let Some(stored) = stored {
             if let Some(stored) = &stored.presentation
@@ -2148,6 +2170,7 @@ impl ReviewSurface {
             workspace.viewed_threads.clone(),
         );
         self.transient_viewed = Some(viewed);
+        self.viewed_base = Some(stored_viewed.unwrap_or_default());
     }
 
     fn apply_opened(&mut self, mut opened: Opened) {
@@ -5346,3 +5369,29 @@ const fn filter_policy() -> TextInputPolicy {
 
 /// Tag of the over-the-layer-limit warning, whose dismissal the review remembers.
 const STACK_WARNING_TAG: &str = "stack_limit";
+
+/// Save `workspace`, first merging its viewed state (`local`, changed from `base`) with the
+/// viewed state stored now, so marks written elsewhere since `base` are kept. Returns the viewed
+/// state written.
+async fn save_merging_viewed(
+    services: ReviewServices,
+    mut workspace: ReviewWorkspace,
+    base: Option<viewed_sync::Viewed>,
+    local: viewed_sync::Viewed,
+) -> Result<viewed_sync::Viewed, String> {
+    let mut written = local.clone();
+    if let Some(base) = base {
+        let stored: Result<bcode_code_review_models::GetReviewWorkspaceResponse, _> = services
+            .call(bcode_code_review_models::GetReviewWorkspaceRequest {
+                repo_path: workspace.repo_root.clone(),
+                workspace_id: workspace.id.clone(),
+            })
+            .await;
+        if let Ok(Some(stored)) = stored.map(|response| response.workspace) {
+            written = viewed_sync::merge(&base, &local, &viewed_sync::Viewed::of(&stored));
+            written.apply(&mut workspace);
+        }
+    }
+    loader::save_workspace(services, workspace).await?;
+    Ok(written)
+}

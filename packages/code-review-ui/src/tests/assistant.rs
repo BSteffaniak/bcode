@@ -852,3 +852,78 @@ fn opening_a_conversation_in_bcode_hands_over_the_terminal() {
         crate::action::Action::OpenSession { .. }
     ));
 }
+
+#[test]
+fn viewed_marks_a_tool_wrote_survive_the_open_reviews_own_saves() {
+    let mut setup = setup(160, 50, true);
+    let paths: Vec<String> = {
+        let review = setup.app().review().expect("review");
+        review
+            .document()
+            .expect("document")
+            .file_keys()
+            .map(|file| file.path.clone())
+            .collect()
+    };
+    assert!(paths.len() >= 2, "{paths:?}");
+    // The tool marks the first file viewed while the review is open, as the plugin does.
+    let services = setup.backend.services();
+    let data = bcode_code_review::ReviewData::default();
+    let mut tools = ReviewTools::new(&data, services.store());
+    let opened = tools
+        .open(
+            &setup.review.repo_root,
+            &ReviewRef::Workspace(setup.review.id.clone()),
+        )
+        .expect("saved review");
+    tools
+        .mark_viewed(&opened, std::slice::from_ref(&paths[0]), true)
+        .expect("marked");
+    // Before the review hears of it, the reviewer changes something the review saves, and
+    // marks the second file viewed.
+    setup.scenario.key("shift+h");
+    setup.settle();
+    let stored = |setup: &Setup| {
+        setup
+            .backend
+            .call_now(bcode_code_review_models::GetReviewWorkspaceRequest {
+                repo_path: setup.review.repo_root.clone(),
+                workspace_id: setup.review.id.clone(),
+            })
+            .workspace
+            .expect("stored")
+            .viewed_files
+    };
+    assert!(
+        stored(&setup).contains(&paths[0]),
+        "the review's save kept the tool's mark: {:?}",
+        stored(&setup)
+    );
+    // The review shows the tool's mark once it has saved (it merged the stored state in).
+    let shown = |setup: &Setup| {
+        setup
+            .app()
+            .review()
+            .and_then(ReviewSurfaceExt::viewed_paths)
+            .unwrap_or_default()
+    };
+    for _ in 0..4 {
+        if shown(&setup).contains(&paths[0]) {
+            break;
+        }
+        setup.settle();
+    }
+    assert!(shown(&setup).contains(&paths[0]), "{:?}", shown(&setup));
+}
+
+/// What the review shows as viewed.
+trait ReviewSurfaceExt {
+    fn viewed_paths(&self) -> Option<std::collections::BTreeSet<String>>;
+}
+
+impl ReviewSurfaceExt for crate::ReviewSurface {
+    fn viewed_paths(&self) -> Option<std::collections::BTreeSet<String>> {
+        self.workspace()
+            .map(|workspace| workspace.viewed_files.clone())
+    }
+}
