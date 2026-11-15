@@ -839,3 +839,51 @@ fn hunks_seen_before_count_nothing_new_and_fold_until_shown_again() {
         .is_some()
     );
 }
+
+#[test]
+fn a_document_that_replaces_another_folds_and_shows_hunks_as_it_did() {
+    let layer = two_hunk_layer();
+    let service = ReviewData::default();
+    let compared = |doc: &mut ReviewDocument| {
+        doc.set_comparison(
+            SOURCE,
+            Some(GroupComparison {
+                delta: Some(delta(&service, &layer)),
+                view: CompareView::Full,
+                ..GroupComparison::default()
+            }),
+        );
+        serve(&service, doc);
+    };
+    let mut previous = open(&service, &layer);
+    serve(&service, &mut previous);
+    compared(&mut previous);
+    let seen_start = hunk_headers(&previous)[0].0;
+    assert!(previous.set_fold_seen_hunks(true));
+    assert!(hunk_headers(&previous)[0].2);
+    // The replacement starts unfolded, then takes over the fold and nothing shown anyway.
+    let mut refreshed = open(&service, &layer);
+    serve(&service, &mut refreshed);
+    refreshed.carry_compare_choices(&previous);
+    compared(&mut refreshed);
+    assert!(refreshed.fold_seen_hunks());
+    assert!(
+        hunk_headers(&refreshed)[0].2,
+        "{:?}",
+        hunk_headers(&refreshed)
+    );
+    // A hunk shown anyway stays shown in the replacement.
+    assert!(previous.toggle_seen_hunk(&file("e.txt"), seen_start));
+    let mut refreshed = open(&service, &layer);
+    serve(&service, &mut refreshed);
+    compared(&mut refreshed);
+    refreshed.carry_compare_choices(&previous);
+    assert!(refreshed.fold_seen_hunks());
+    assert!(
+        !hunk_headers(&refreshed)[0].2,
+        "{:?}",
+        hunk_headers(&refreshed)
+    );
+    assert!(refreshed.toggle_seen_hunk(&file("e.txt"), seen_start));
+    assert!(hunk_headers(&refreshed)[0].2);
+}

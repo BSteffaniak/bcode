@@ -1957,3 +1957,28 @@ fn mark_options_preview_live_in_the_menu_and_escape_puts_them_back() {
         screen.text()
     );
 }
+
+#[test]
+fn hunks_seen_before_stay_folded_after_a_refresh() {
+    use crate::compare_menu::MenuChoice;
+    use crate::config::compare::SeenHunks;
+    let (fixture, _backend, _id, mut scenario) = reopened_after_a_restack(TestBackend::default());
+    settled(&mut scenario);
+    scenario.key("b");
+    settled(&mut scenario);
+    menu_to(&mut scenario, MenuChoice::Seen(SeenHunks::Fold));
+    scenario.key("space");
+    scenario.key("enter");
+    settled(&mut scenario);
+    assert!(document(&scenario).fold_seen_hunks());
+    refresh(&fixture, &mut scenario, "fold");
+    let review = scenario.surface().review().expect("review");
+    assert_eq!(
+        review.comparing().marks().map(|marks| marks.seen),
+        Some(SeenHunks::Fold)
+    );
+    assert!(
+        document(&scenario).fold_seen_hunks(),
+        "the refreshed document folds hunks seen before as the menu says"
+    );
+}

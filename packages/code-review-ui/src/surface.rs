@@ -2169,9 +2169,11 @@ impl ReviewSurface {
             self.file_view,
         );
         if let Some(previous) = self.review.as_ref() {
-            // Refresh: keep expansions, layout, the cursor, the top item, and the tree state.
+            // Refresh: keep expansions, layout, how hunks seen before fold, the cursor, the top
+            // item, and the tree state.
             review.doc.restore_expansions(&previous.doc.expansions());
             review.doc.set_layout(previous.doc.layout());
+            review.doc.carry_compare_choices(&previous.doc);
             let _ = review.doc.take_splices();
             let top = previous
                 .list

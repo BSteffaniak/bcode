@@ -14,7 +14,7 @@ use bcode_code_review_models::{
     DeltaKind, FileSince, LayerDelta, LineSpan, RemovedSince, ReviewCompareMarksRequest,
     ReviewCompareMarksResponse,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// One source's comparison.
@@ -330,6 +330,36 @@ impl ReviewDocument {
             self.rebuild_file(file);
         }
         true
+    }
+
+    /// Take over from `previous`, the document this one replaces, whether hunks seen before
+    /// fold, the folded hunks shown anyway, and the removed-since markers opened, for the files
+    /// both have.
+    pub fn carry_compare_choices(&mut self, previous: &Self) {
+        let kept = |entries: &BTreeSet<(FileKey, u32)>| -> BTreeSet<(FileKey, u32)> {
+            entries
+                .iter()
+                .filter(|(file, _)| self.file_index.contains_key(file))
+                .cloned()
+                .collect()
+        };
+        let revealed = kept(&previous.revealed_hunks);
+        let removals = kept(&previous.expanded_removals);
+        if self.fold_seen_hunks == previous.fold_seen_hunks
+            && revealed == self.revealed_hunks
+            && removals == self.expanded_removals
+        {
+            return;
+        }
+        self.fold_seen_hunks = previous.fold_seen_hunks;
+        self.revealed_hunks = revealed;
+        self.expanded_removals = removals;
+        let marked: Vec<usize> = (0..self.files.len())
+            .filter(|file| self.file_marks(*file).is_some())
+            .collect();
+        for file in marked {
+            self.rebuild_file(file);
+        }
     }
 
     /// Whether hunks with nothing new since the baseline fold.
