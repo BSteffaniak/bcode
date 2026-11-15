@@ -915,7 +915,14 @@ impl ReviewSurface {
             .filter(|draft| draft.anchor.file_path == path && seen.insert(&draft.thread_id))
             .filter(|draft| Some(draft.thread_id.as_str()) != except)
             .filter_map(|draft| self.notes.thread(&draft.thread_id).first().copied())
-            .map(|first| format!("{}: {}", location_label(&first.anchor), first.body.trim()));
+            .map(|first| {
+                format!(
+                    "{} (thread id {}): {}",
+                    location_label(&first.anchor),
+                    first.thread_id,
+                    first.body.trim()
+                )
+            });
         let review_level = path == bcode_code_review::document::REVIEW_LEVEL_PATH;
         let remote = self
             .notes
@@ -955,11 +962,7 @@ impl ReviewSurface {
                     info.provider_label,
                     info.repository,
                     info.number,
-                    bcode_code_review_models::pull_thread_ref(
-                        &info.repository,
-                        info.number,
-                        &info.remote_id
-                    ),
+                    info.tool_id(),
                     first.map_or("", |comment| comment.body.trim()),
                 )
             });
@@ -1007,11 +1010,7 @@ impl ReviewSurface {
                     "a {} thread on pull request {}#{}",
                     info.provider_label, info.repository, info.number
                 ),
-                id: bcode_code_review_models::pull_thread_ref(
-                    &info.repository,
-                    info.number,
-                    &info.remote_id,
-                ),
+                id: info.tool_id(),
                 resolved: info.resolved,
                 outdated: info.outdated,
                 written_on: Some(agent::WrittenOn {

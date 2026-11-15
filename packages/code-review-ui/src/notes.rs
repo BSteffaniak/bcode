@@ -168,6 +168,15 @@ pub struct RemoteThreadInfo {
     pub thread: bcode_code_review_models::RemoteThread,
 }
 
+impl RemoteThreadInfo {
+    /// The id the review tools and the assistant use for this thread
+    /// ([`bcode_code_review_models::pull_thread_ref`]): `<repository>#<number>:<thread id>`.
+    #[must_use]
+    pub fn tool_id(&self) -> String {
+        bcode_code_review_models::pull_thread_ref(&self.repository, self.number, &self.remote_id)
+    }
+}
+
 /// One remote thread to show: its info and comments (already anchored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteNote {
@@ -427,6 +436,41 @@ impl ReviewNotes {
     #[must_use]
     pub const fn remote_threads(&self) -> &std::collections::BTreeMap<String, RemoteThreadInfo> {
         &self.remote
+    }
+
+    /// The id the review tools (`code_review.*`), the app's tools and the assistant's context
+    /// use for the thread the review knows as `thread_id`.
+    ///
+    /// The review keys a pull request thread by its provider and pull request
+    /// ([`remote_thread_id`]); the tools name it by repository, number and thread
+    /// ([`RemoteThreadInfo::tool_id`]). Local and imported threads have one id for both.
+    /// [`Self::thread_for_tool_id`] maps the other way.
+    #[must_use]
+    pub fn tool_thread_id(&self, thread_id: &str) -> String {
+        self.remote
+            .get(thread_id)
+            .map_or_else(|| thread_id.to_owned(), RemoteThreadInfo::tool_id)
+    }
+
+    /// The review's own id of the thread a tool names `id` ([`Self::tool_thread_id`]; the
+    /// review's own id is taken too). `None` when no thread the review holds has it.
+    #[must_use]
+    pub fn thread_for_tool_id(&self, id: &str) -> Option<String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        if self.remote.contains_key(id) {
+            return Some(id.to_owned());
+        }
+        if bcode_code_review_models::is_pull_thread_ref(id) {
+            return self
+                .remote
+                .iter()
+                .find(|(_, info)| info.tool_id() == id)
+                .map(|(thread_id, _)| thread_id.clone());
+        }
+        self.thread_ids().contains(id).then(|| id.to_owned())
     }
 
     /// Mark the pull request thread `thread_id` resolved or open at once (until the next read).
