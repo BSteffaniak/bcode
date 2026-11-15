@@ -854,7 +854,7 @@ impl ReviewSurface {
     /// The other threads on `path` (or the review, for the review-level path) a question lists:
     /// the review's own and its pull requests', one line each, without `except`; and how many
     /// were left out past [`agent::MAX_PROMPT_THREADS`].
-    fn other_threads(&self, path: &str, except: Option<&str>) -> (Vec<String>, usize) {
+    pub(super) fn other_threads(&self, path: &str, except: Option<&str>) -> (Vec<String>, usize) {
         let mut seen = std::collections::BTreeSet::new();
         let local = self
             .notes
@@ -921,7 +921,7 @@ impl ReviewSurface {
     }
 
     /// The thread `thread_id` as a question asked from it carries it.
-    fn ask_thread(&self, thread_id: &str) -> Option<agent::AskThread> {
+    pub(super) fn ask_thread(&self, thread_id: &str) -> Option<agent::AskThread> {
         let comments = self.notes.thread(thread_id);
         let first = comments.first()?;
         let shown_at = location_label(&first.anchor);
@@ -1020,7 +1020,7 @@ impl ReviewSurface {
     }
 
     /// Diff lines of a line anchor, `+`/`-`/` ` prefixed (bounded).
-    fn anchor_lines(&self, anchor: &DocAnchor) -> Vec<String> {
+    pub(super) fn anchor_lines(&self, anchor: &DocAnchor) -> Vec<String> {
         let (Some(review), Some(file), AnchorTarget::Lines(lines)) =
             (self.review.as_ref(), anchor.file.as_ref(), &anchor.target)
         else {

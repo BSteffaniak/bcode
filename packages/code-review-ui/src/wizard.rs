@@ -2186,6 +2186,33 @@ fn provisional_items(
     items
 }
 
+impl Wizard {
+    /// The wizard as the assistant sees it.
+    #[must_use]
+    pub fn view_context(&self) -> crate::assistant::context::WizardView {
+        crate::assistant::context::WizardView {
+            step: match self.step {
+                Step::Type => "type",
+                Step::Details(_) => "details",
+                Step::Confirm => "confirm",
+            }
+            .to_owned(),
+            kind: self
+                .chosen_type
+                .map(|kind| format!("{kind:?}").to_lowercase()),
+            editing: self
+                .editing
+                .as_ref()
+                .map(|workspace| workspace.title.clone()),
+            sources: self
+                .sources
+                .iter()
+                .map(|source| source.label.clone())
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SourceType, Wizard, split_range};

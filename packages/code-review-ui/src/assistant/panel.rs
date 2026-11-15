@@ -100,8 +100,6 @@ pub const NEVER_REMEMBER: &[&str] = &[
     "bcode.code-review.publish",
     "bcode.code-review.pull_request_review",
 ];
-/// Label of the stored context block.
-pub const VIEW_BLOCK_LABEL: &str = "review app view";
 
 /// Whether the panel is shown and has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +147,12 @@ enum Done {
         epoch: u64,
         result: Result<String, String>,
     },
-    Sent(Result<(), String>),
+    Sent {
+        session: String,
+        request: Box<TurnRequest>,
+        retried: bool,
+        result: Result<(), crate::host::HostError>,
+    },
     Attached(Result<(), String>),
     History(Result<super::picker::HistoryLoad, String>),
     Turns(Vec<(String, crate::host::TurnCount)>),
@@ -230,6 +233,8 @@ pub struct Assistant {
     /// Finished tool calls already applied, per followed session.
     applied: BTreeMap<String, BTreeSet<String>>,
     finished: Vec<(String, String)>,
+    /// A message to send again with a fresh snapshot (its request-only context was lost).
+    resend: Option<(String, TurnRequest)>,
     picker: Option<Picker>,
     mode: Mode,
     notice: Option<(String, bool)>,
@@ -283,6 +288,7 @@ impl Assistant {
             shown: Cell::new((0, 0)),
             applied: BTreeMap::new(),
             finished: Vec::new(),
+            resend: None,
             picker: None,
             mode: Mode::Chat,
             notice: None,
@@ -367,6 +373,15 @@ impl Assistant {
             .permission
             .as_ref()
             .filter(|permission| !self.agents.is_answering(&permission.permission_id))
+    }
+
+    /// Whether the panel was painted over `point` in the last frame.
+    #[must_use]
+    pub fn contains(&self, point: Point) -> bool {
+        self.painted
+            .borrow()
+            .panel
+            .is_some_and(|(rect, _)| rect.contains(point))
     }
 
     /// The badge the Ask AI button shows: only while the panel is not on screen.
@@ -605,34 +620,21 @@ impl Assistant {
         Some(binding)
     }
 
-    /// The context blocks of a message sent from `place`.
+    /// The context blocks of a message sent from `place`: the snapshot taken when it was sent,
+    /// shrunk to the screen and review when the user detached the context.
     fn context_blocks(&self, place: &Place) -> Vec<ContextBlock> {
-        use std::fmt::Write as _;
-        let mut text = format!(
-            "screen: {}\nrepo: {}",
-            place.screen.name(),
-            self.repo.display()
-        );
-        if let Some(review) = &place.review {
-            let _ = write!(
-                text,
-                "\nreview: id={} title={:?}",
-                review.workspace_id, review.title
-            );
-            if let Some(layer) = review.layer {
-                let _ = write!(text, "\nlayer: #{layer}");
-            }
-            if self.context
-                && let Some(chip) = &review.chip
-            {
-                let _ = write!(text, "\ncursor: {chip}");
-            }
-        }
-        vec![ContextBlock {
-            label: VIEW_BLOCK_LABEL.to_owned(),
-            text,
-            request_only: false,
-        }]
+        let mut context =
+            place
+                .context
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| super::context::ViewContext {
+                    screen: place.screen.name().to_owned(),
+                    repo: self.repo.display().to_string(),
+                    ..super::context::ViewContext::default()
+                });
+        context.detached = !self.context;
+        context.blocks()
     }
 
     /// Send the input's text from `place`.
@@ -726,23 +728,59 @@ impl Assistant {
         request: TurnRequest,
         ui: &UiContext,
     ) {
+        self.submit_once(session, attachment, request, false, ui);
+    }
+
+    fn submit_once(
+        &self,
+        session: String,
+        attachment: Option<Attachment>,
+        request: TurnRequest,
+        retried: bool,
+        ui: &UiContext,
+    ) {
         let services = self.services.clone();
         let repo = self.repo.clone();
         let inbox = Arc::clone(&self.inbox);
         ui.spawn(Box::pin(async move {
             let result = async {
                 if let Some(attachment) = attachment {
-                    attach(&services, &repo, &session, attachment).await?;
+                    attach(&services, &repo, &session, attachment)
+                        .await
+                        .map_err(crate::host::HostError::failed)?;
                 }
                 services
                     .host()
-                    .submit_turn(session, request)
+                    .submit_turn(session.clone(), request.clone())
                     .await
-                    .map_err(|error| error.message)
             }
             .await;
-            push(&inbox, Done::Sent(result));
+            push(
+                &inbox,
+                Done::Sent {
+                    session,
+                    request: Box::new(request),
+                    retried,
+                    result,
+                },
+            );
         }));
+    }
+
+    /// A message whose request-only context the daemon no longer held, waiting to be sent again
+    /// with a fresh snapshot.
+    #[must_use]
+    pub const fn wants_resend(&self) -> bool {
+        self.resend.is_some()
+    }
+
+    /// Send the waiting message again, once, with the context of `place`.
+    pub fn resend(&mut self, place: &Place, ui: &UiContext) {
+        let Some((session, mut request)) = self.resend.take() else {
+            return;
+        };
+        request.context = self.context_blocks(place);
+        self.submit_once(session, None, request, true, ui);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -814,14 +852,23 @@ impl Assistant {
                 drop(self.take_queued(epoch));
                 self.notice = Some((format!("could not start the assistant: {error}"), true));
             }
-            Done::Sent(Err(error)) => {
-                self.notice = Some((format!("could not send: {error}"), true));
+            Done::Sent {
+                session,
+                request,
+                retried,
+                result: Err(error),
+            } => {
+                if !retried && error.code == crate::host::REQUEST_ONLY_CONTEXT_UNAVAILABLE {
+                    self.resend = Some((session, *request));
+                } else {
+                    self.notice = Some((format!("could not send: {}", error.message), true));
+                }
             }
             Done::Attached(Err(error)) => {
                 self.attached = None;
                 self.notice = Some((format!("could not attach the review: {error}"), true));
             }
-            Done::Sent(Ok(())) | Done::Attached(Ok(())) => {}
+            Done::Sent { result: Ok(()), .. } | Done::Attached(Ok(())) => {}
             other @ (Done::History(_)
             | Done::Turns(_)
             | Done::Renamed { .. }

@@ -2266,6 +2266,36 @@ fn publish_line(theme: &ReviewTheme, item: &ReviewWorkspaceListItem, now: u64) -
     }
 }
 
+impl Home {
+    /// Home as the assistant sees it.
+    #[must_use]
+    pub fn view_context(&self) -> crate::assistant::context::HomeView {
+        let mut view = crate::assistant::context::HomeView {
+            loading: self.loading() > 0 || !self.loaded,
+            ..crate::assistant::context::HomeView::default()
+        };
+        for item in &self.items {
+            match model::group_of(item, self.stats.get(&item.workspace.id)) {
+                Group::NeedsAttention => view.needs_attention += 1,
+                Group::InProgress => view.in_progress += 1,
+                Group::Published => view.published += 1,
+                Group::Archived => view.archived += 1,
+            }
+        }
+        view.selected = self
+            .selected_item()
+            .map(|item| (item.workspace.id.clone(), item.workspace.title.clone()));
+        let filter = self.filter_text();
+        view.filter = (!filter.trim().is_empty()).then_some(filter);
+        view.suggestions = self
+            .suggestions
+            .iter()
+            .map(|suggestion| format!("{} ({})", suggestion.title, suggestion.detail))
+            .collect();
+        view
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Home;

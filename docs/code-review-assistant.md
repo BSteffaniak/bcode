@@ -24,6 +24,10 @@ app-contributed agent profiles, turn context blocks), [permissions](permissions.
   history merge.
 * **Built: app-wide panel, Ask AI button and history picker (build step 2).** As specified, with
   the deviations listed under [As built](#as-built).
+* **Built: context blocks (first part of build step 3).** Every message carries the stored view
+  block and the request-only detail block rendered from one snapshot of the screen; a message
+  whose request-only context the daemon no longer holds at admission is sent again once with a
+  fresh snapshot.
 * **Built and relied on.** Session origin, client tools with claims, contributed agent profiles
   and turn context blocks ([embedded sessions](embedded-sessions.md#what-is-built)); the review
   app's per-review dock (`surface/dock.rs`), AI cards (`agent.rs`), the `code_review.*` plugin
@@ -577,8 +581,14 @@ Where the built panel differs from the design above:
 * **Turn counts** are read for the first 30 rows after a load, not per visible row.
 * **The wizard** binds `ctrl+k` before its pickers, so `ctrl+k` opens the panel there even while
   typing a picker filter.
-* **Context** is a single stored `review app view` block (screen, repository, review, layer and
-  cursor) until build step 3 replaces it with the view and detail blocks.
+* **Context snapshot.** The view block also carries a `files:` line (files and viewed). A
+  `pull_request:` line says `not loaded` when the review has pull requests whose conversation
+  the app has not read; versions show as `version=vN of M` on the `file:` line. Selection text is
+  the selected diff lines (`+`/`-`/` ` prefixed) as Ask AI cards send them. Section budgets are
+  as specified; within a section, items are kept while they fit, each cut to 400 bytes (240 for a
+  quoted value).
+* **Resubmission** covers a submit rejected with `request_only_context_unavailable`. A queued turn
+  that fails later for that reason shows its failure in the conversation and is not resent.
 
 ## Decisions
 

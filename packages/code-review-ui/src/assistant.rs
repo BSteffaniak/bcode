@@ -12,6 +12,7 @@
 //!   its id, title, stack layer, cursor place and the binding that attaches a session to it.
 
 pub mod button;
+pub mod context;
 pub mod history;
 pub mod panel;
 pub mod picker;
@@ -97,6 +98,9 @@ pub struct Place {
     pub screen: Screen,
     /// The review, on a review screen.
     pub review: Option<ReviewPlace>,
+    /// What the user is looking at, in full; taken only when a message is sent or the context
+    /// tool is called.
+    pub context: Option<Box<context::ViewContext>>,
 }
 
 /// Identity of a place: changes when the session's attachment must change.
@@ -114,6 +118,7 @@ impl Place {
         Self {
             screen,
             review: None,
+            context: None,
         }
     }
 

@@ -209,7 +209,7 @@ fn restack(fixture: &GitFixture) {
 }
 
 /// A three-layer review looked at (a completed pass), then restacked, reopened.
-fn reopened_after_a_restack(
+pub(super) fn reopened_after_a_restack(
     backend: TestBackend,
 ) -> (GitFixture, Arc<TestBackend>, String, Scenario<ReviewApp>) {
     let fixture = fixture();

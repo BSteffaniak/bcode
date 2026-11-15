@@ -347,12 +347,6 @@ fn a_conversation_started_in_a_review_is_tagged_with_it_and_follows_its_tools() 
             _ => None,
         })
         .expect("a new-side line");
-    // Another file is marked viewed (a viewed file folds).
-    let viewed_path = doc
-        .file_keys()
-        .map(|file| file.path.clone())
-        .find(|other| *other != path)
-        .expect("a second file");
     let services = setup.backend.services();
     let data = bcode_code_review::ReviewData::default();
     let mut tools = ReviewTools::new(&data, services.store());
@@ -363,31 +357,48 @@ fn a_conversation_started_in_a_review_is_tagged_with_it_and_follows_its_tools() 
         )
         .expect("bound review");
     tools
-        .mark_viewed(&opened, std::slice::from_ref(&viewed_path), true)
-        .expect("viewed");
+        .add_comment(
+            &opened,
+            &bcode_code_review::assistant::Location {
+                path: Some(path.clone()),
+                line: Some(line),
+                end_line: None,
+                side: bcode_code_review::assistant::Side::New,
+                source: None,
+            },
+            "TOOL_DRAFTED_COMMENT",
+            None,
+        )
+        .expect("drafted");
     let navigate = format!(r#"{{"path":"{path}","line":{line}}}"#);
     let screen = setup.deliver(
         &session,
         snapshot(vec![
             user("Review this file."),
-            tool("view-1", "code_review.mark_viewed", "{}"),
+            tool("write-1", "code_review.add_comment", "{}"),
             tool("nav-1", "code_review.navigate", &navigate),
-            answer("Marked it viewed: ASSISTANT_ANSWER"),
+            answer("Drafted it: ASSISTANT_ANSWER"),
         ]),
     );
     assert!(screen.contains("ASSISTANT_ANSWER"), "{}", screen.text());
+    // The review reloaded its comments: the drafted one shows at its line.
+    let drafted = |setup: &Setup| {
+        setup.app().review().is_some_and(|review| {
+            review
+                .notes()
+                .drafts()
+                .iter()
+                .any(|draft| draft.body == "TOOL_DRAFTED_COMMENT")
+        })
+    };
+    for _ in 0..8 {
+        if drafted(&setup) {
+            break;
+        }
+        setup.settle();
+    }
+    assert!(drafted(&setup), "the review shows the drafted comment");
     let review = setup.app().review().expect("review");
-    let doc = review.document().expect("document");
-    let file = doc
-        .file_keys()
-        .find(|file| file.path == viewed_path)
-        .cloned()
-        .expect("file");
-    assert!(
-        doc.viewed_state(&file)
-            .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed),
-        "the file shows as viewed"
-    );
     match review.cursor() {
         Some(ItemKey::Line { file, line: at, .. }) => {
             assert_eq!((file.path.as_str(), *at), (path.as_str(), line));

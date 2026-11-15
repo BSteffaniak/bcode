@@ -185,6 +185,18 @@ impl ScriptedHost {
         *self.pending.lock().expect("pending lock") = pending;
     }
 
+    /// Fail the next submit with error `code`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the failures lock is poisoned.
+    pub fn fail_next_submit(&self, code: &str) {
+        self.submit_failures
+            .lock()
+            .expect("failures lock")
+            .push_back(code.to_owned());
+    }
+
     /// Sessions deleted, oldest first.
     ///
     /// # Panics

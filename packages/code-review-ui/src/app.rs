@@ -27,6 +27,7 @@ use super::wizard::{Wizard, WizardOutcome};
 use super::{ReviewSurface, entry::transient_workspace};
 use crate::action::Action;
 use crate::action::EventResult;
+use crate::assistant::context::ViewContext;
 use crate::assistant::{Assistant, Place, Screen};
 use crate::context::UiContext;
 use crate::services::ReviewServices;
@@ -269,17 +270,50 @@ impl ReviewApp {
         self.button
     }
 
-    /// What is on screen, for the assistant; with `binding` the review's binding template.
-    fn place(&mut self, binding: bool) -> Place {
-        match &mut self.route {
+    /// What is on screen, for the assistant; with `full` the review's binding template and
+    /// the whole view context.
+    fn place(&mut self, full: bool) -> Place {
+        let mut place = match &mut self.route {
             Route::Home => Place::screen(Screen::Home),
             Route::Wizard(_) => Place::screen(Screen::Wizard),
             Route::Opening(_) => Place::screen(Screen::Opening),
             Route::Review(review) => Place {
                 screen: Screen::Review,
-                review: Some(review.assistant_review_place(binding)),
+                review: Some(review.assistant_review_place(full)),
+                context: None,
             },
+        };
+        if full {
+            place.context = Some(Box::new(self.view_context()));
         }
+        place
+    }
+
+    /// What the user is looking at, read from the route on screen now.
+    #[must_use]
+    pub fn view_context(&self) -> ViewContext {
+        let mut context = ViewContext {
+            repo: self.repo.display().to_string(),
+            as_of_ms: crate::assistant::panel::now_ms(),
+            ..ViewContext::default()
+        };
+        match &self.route {
+            Route::Home => {
+                Screen::Home.name().clone_into(&mut context.screen);
+                context.home = self.home.as_ref().map(|home| home.view_context());
+            }
+            Route::Wizard(wizard) => {
+                Screen::Wizard.name().clone_into(&mut context.screen);
+                context.wizard = Some(wizard.view_context());
+            }
+            Route::Opening(_) => Screen::Opening.name().clone_into(&mut context.screen),
+            Route::Review(review) => {
+                Screen::Review.name().clone_into(&mut context.screen);
+                context.review = Some(review.view_context());
+            }
+        }
+        context.screen_generation = context.generation();
+        context
     }
 
     /// Whether the route asked to open, focus or close the assistant.
@@ -333,7 +367,8 @@ impl ReviewApp {
                 return Some(Action::Redraw);
             }
             let down = matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_));
-            let place = self.place(down);
+            // The whole place (binding and view) only for a press in the panel.
+            let place = self.place(down && self.assistant.contains(mouse.position));
             if let Some(outcome) = self.assistant.mouse(event, &place, host) {
                 return Some(assistant_action(&outcome));
             }
@@ -367,6 +402,11 @@ impl ReviewApp {
         if self.assistant.needs_attach(&key) {
             let place = self.place(true);
             self.assistant.attach(&place, host);
+            changed = true;
+        }
+        if self.assistant.wants_resend() {
+            let place = self.place(true);
+            self.assistant.resend(&place, host);
             changed = true;
         }
         let tools = self.assistant.take_finished_tools();

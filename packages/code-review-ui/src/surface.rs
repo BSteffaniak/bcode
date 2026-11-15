@@ -165,6 +165,7 @@ mod review_tools;
 mod stack;
 mod stack_files;
 mod threads;
+mod view_context;
 
 pub use annotate::COMPOSER_SCOPE;
 pub use conversation::{BarState, ConversationMessage, WatchCancel};
