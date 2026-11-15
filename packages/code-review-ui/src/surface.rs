@@ -675,6 +675,9 @@ pub struct ReviewSurface {
     /// How many rows the comparison legend may take over the file tree: `None` lets every
     /// row wrap; `Some(rows)` keeps that many rows, one line each (the panel is too short).
     legend_rows: Cell<Option<u64>>,
+    /// The actions of the legend rows last built into the file panel, by row index: clicks
+    /// run the action of the row painted where they land.
+    legend_actions: RefCell<Vec<Option<compare_legend::LegendAction>>>,
     tree_reveal: bool,
     synced_file: Option<FileRef>,
     filter: RefCell<TextInputState>,
@@ -843,6 +846,7 @@ impl ReviewSurface {
             threads_pane: Cell::new(PaneState::new(Rect::default())),
             tree_scroll: Cell::new(ScrollViewState::new()),
             legend_rows: Cell::new(None),
+            legend_actions: RefCell::new(Vec::new()),
             tree_reveal: true,
             synced_file: None,
             filter: RefCell::new(TextInputState::new(bmux_text_edit::TextEditBuffer::new())),
@@ -4509,6 +4513,8 @@ impl ReviewSurface {
                 bmux_tui::text::TextWrap::None
             }
         };
+        self.legend_actions
+            .replace(legend.iter().map(|row| row.action).collect());
         for (index, row) in legend.into_iter().enumerate() {
             content = content.child(
                 TextBlock::new(Text::from_lines(vec![row.line]))

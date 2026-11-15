@@ -268,10 +268,11 @@ impl ReviewSurface {
 
     /// Run a click on the legend at `position`; returns whether it was on an active row.
     pub(super) fn legend_click(&mut self, position: Point) -> bool {
-        let legend = self.compare_legend();
-        let Some(action) = legend.iter().enumerate().find_map(|(index, row)| {
+        // The rows as built into the panel last laid out: each action with its painted rect.
+        let actions = self.legend_actions.borrow().clone();
+        let Some(action) = actions.iter().enumerate().find_map(|(index, action)| {
             let area = self.body_area(&format!("{LEGEND_ROW_ID}{index}"))?;
-            area.contains(position).then_some(row.action).flatten()
+            area.contains(position).then_some(*action).flatten()
         }) else {
             return false;
         };
