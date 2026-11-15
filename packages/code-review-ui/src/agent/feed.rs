@@ -273,11 +273,23 @@ fn feed_item(item: &TranscriptViewItem) -> Option<FeedItem> {
             format!("reasoning:{}:{}", activity.turn_id, activity.activity_id),
             &activity.text(),
         )),
-        // A call without a name is the rest of one requested before the history window starts.
-        TranscriptViewItemKind::ToolInvocation { tool } => tool
-            .tool_name
-            .is_some()
-            .then(|| FeedItem::Tool(tool_line(tool))),
+        // A call without a name is the rest of one requested before the history window starts:
+        // a success is left out, a failure stays as a compact line so it is not lost.
+        TranscriptViewItemKind::ToolInvocation { tool } => {
+            let line = tool_line(tool);
+            if tool.tool_name.is_some() {
+                Some(FeedItem::Tool(line))
+            } else {
+                (line.state == ToolState::Failed).then(|| {
+                    FeedItem::Tool(ToolLine {
+                        name: EARLIER_TOOL_RESULT.to_owned(),
+                        summary: String::new(),
+                        arguments: String::new(),
+                        ..line
+                    })
+                })
+            }
+        }
         TranscriptViewItemKind::ToolRequestDraft { draft } => Some(FeedItem::Tool(ToolLine {
             id: draft.tool_call_id.clone(),
             name: draft.tool_name.clone(),
@@ -310,6 +322,9 @@ fn reasoning(id: String, text: &str) -> FeedItem {
         text: bounded(text.trim(), MAX_TEXT_BYTES),
     }
 }
+
+/// The name a failed tool result shows when its call precedes the history window.
+pub const EARLIER_TOOL_RESULT: &str = "earlier tool result";
 
 fn tool_line(tool: &ToolInvocationView) -> ToolLine {
     let state = match tool.status {
@@ -490,9 +505,10 @@ mod tests {
     }
 
     /// A history window that starts after a tool call was requested holds only its result;
-    /// the call is left out instead of shown as a nameless tool line.
+    /// a successful one is left out instead of shown as a nameless tool line, and a failed
+    /// one shows as a compact earlier tool result.
     #[test]
-    fn a_tool_result_without_its_call_in_the_window_is_left_out() {
+    fn a_tool_result_without_its_call_in_the_window_is_left_out_unless_it_failed() {
         let session_id = bcode_session_models::SessionId::new();
         let event = |sequence, kind| bcode_session_models::SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -527,6 +543,19 @@ mod tests {
                 },
             ),
             event(12, result("whole")),
+            event(
+                13,
+                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "cut-off-failed".to_owned(),
+                        model_output: "permission denied".to_owned(),
+                        is_error: true,
+                        content: Vec::new(),
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
         ]);
         let feed = Feed::from_snapshot(view.snapshot());
         let names: Vec<&str> = feed
@@ -538,7 +567,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(names, ["code_review.summary"]);
+        assert_eq!(names, ["code_review.summary", EARLIER_TOOL_RESULT]);
     }
 
     #[test]
