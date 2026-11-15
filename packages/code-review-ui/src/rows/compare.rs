@@ -575,7 +575,7 @@ pub fn hunk_label(
             None,
         )),
         0 if marks.seen == SeenHunks::Fold && item.folded => {
-            let lines = plural(item.new_count.max(item.old_count) as usize, "line");
+            let lines = plural(item.rows as usize, "line");
             Some((
                 vec![
                     format!("[nothing new since {phrase}{separator}show {lines}]"),
@@ -1074,6 +1074,7 @@ mod tests {
             since_lines,
             folded,
             held_open: false,
+            rows: 8,
         }
     }
 
@@ -1119,7 +1120,7 @@ mod tests {
         // Folded hunks are a button to show them; shown again, a button to fold.
         let (variants, action) =
             label(&hunk(Some(0), true), Since::Push(2), SeenHunks::Fold).expect("label");
-        assert_eq!(variants[0], "[nothing new since push 2 · show 7 lines]");
+        assert_eq!(variants[0], "[nothing new since push 2 · show 8 lines]");
         assert_eq!(action, Some(CompareAction::ToggleHunk));
         let (variants, _) =
             label(&hunk(Some(0), false), Since::Push(2), SeenHunks::Fold).expect("label");

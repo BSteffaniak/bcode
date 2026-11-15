@@ -935,3 +935,26 @@ fn a_hunk_held_open_by_a_draft_does_not_toggle_and_folds_once_the_draft_is_gone(
     let new_start = hunk_headers(&doc)[1].0;
     assert!(!doc.toggle_seen_hunk(&file("e.txt"), new_start));
 }
+
+#[test]
+fn a_hunk_header_counts_the_rows_its_lines_take_in_each_layout() {
+    let layer = two_hunk_layer();
+    let service = ReviewData::default();
+    let mut doc = open(&service, &layer);
+    serve(&service, &mut doc);
+    let rows = |doc: &ReviewDocument| {
+        items(doc)
+            .iter()
+            .filter_map(|item| match item {
+                ReviewItem::HunkHeader(hunk) => Some((hunk.new_count, hunk.rows)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // One line replaced amid three lines of context on each side: seven lines a side, eight
+    // rows unified (the old line and the new one), seven side by side.
+    assert_eq!(rows(&doc), vec![(7, 8), (7, 8)]);
+    doc.set_layout(LayoutMode::SideBySide);
+    serve(&service, &mut doc);
+    assert_eq!(rows(&doc), vec![(7, 7), (7, 7)]);
+}

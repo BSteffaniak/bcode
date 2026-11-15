@@ -328,6 +328,8 @@ pub struct HunkHeaderItem {
     /// Whether the hunk has nothing new since the baseline but cannot fold, because a comment,
     /// a draft, or the composer is anchored in it.
     pub held_open: bool,
+    /// Rows the hunk's lines take in the document's layout: what a folded hunk hides.
+    pub rows: u32,
 }
 
 impl HunkHeaderItem {

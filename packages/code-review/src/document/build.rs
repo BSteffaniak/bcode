@@ -668,6 +668,33 @@ fn notice(file: &FileRef, kind: FileNoticeKind, reason: Option<Arc<str>>) -> Rev
     })
 }
 
+/// Rows `lines` (one hunk's) take in `layout`: one per line unified; side by side, one per
+/// context line and one per pair of a run of removed lines with the added lines after it.
+fn diff_rows(lines: &[DocLine], layout: LayoutMode) -> u32 {
+    let rows = match layout {
+        LayoutMode::Unified => lines.len(),
+        LayoutMode::SideBySide => {
+            let (mut rows, mut removed, mut added) = (0, 0, 0);
+            for line in lines {
+                match line.kind {
+                    ReviewLineKind::Removed => {
+                        if added > 0 {
+                            rows += std::mem::take(&mut removed).max(std::mem::take(&mut added));
+                        }
+                        removed += 1;
+                    }
+                    ReviewLineKind::Added => added += 1,
+                    ReviewLineKind::Context => {
+                        rows += std::mem::take(&mut removed).max(std::mem::take(&mut added)) + 1;
+                    }
+                }
+            }
+            rows + removed.max(added)
+        }
+    };
+    u32::try_from(rows).unwrap_or(u32::MAX)
+}
+
 const fn line_kind(kind: ReviewLineKind) -> LineKind {
     match kind {
         ReviewLineKind::Context => LineKind::Context,
@@ -879,6 +906,7 @@ impl FileBuilder<'_> {
                 since_lines,
                 folded,
                 held_open,
+                rows: diff_rows(&hunk.lines, self.doc.layout),
             }),
             header,
         );
