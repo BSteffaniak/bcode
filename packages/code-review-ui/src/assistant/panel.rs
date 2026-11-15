@@ -88,6 +88,8 @@ pub const COMPACT_WIDTH: u16 = 24;
 pub const COMPACT_HEIGHT: u16 = 6;
 /// Below this width the panel shows its title row only.
 pub const TITLE_ONLY_WIDTH: u16 = 12;
+/// Conversations whose turned-off categories are remembered at most.
+const MAX_REMEMBERED_CATEGORIES: usize = 64;
 /// Rows of the message input at most.
 const INPUT_MAX_ROWS: u16 = 6;
 /// Rows a wheel step scrolls the conversation.
@@ -329,6 +331,8 @@ pub struct Assistant {
     models: ModelState,
     /// Categories turned off for the active conversation.
     off: BTreeSet<Category>,
+    /// Categories turned off for the other conversations of this run, by session (bounded).
+    off_elsewhere: BTreeMap<String, BTreeSet<Category>>,
     /// The open model, permissions or tools overlay.
     overlay: Option<(OverlayPurpose, crate::palette::Overlay)>,
     /// Why the last message was not sent or its conversation not started.
@@ -406,6 +410,7 @@ impl Assistant {
             revision: 0,
             models: ModelState::default(),
             off: BTreeSet::new(),
+            off_elsewhere: BTreeMap::new(),
             overlay: None,
             failure: None,
             chip_plan: RefCell::default(),
@@ -761,6 +766,18 @@ impl Assistant {
     /// Start an empty conversation: its session is created by its first message, tagged with
     /// the place it is sent from.
     pub fn new_conversation(&mut self) {
+        // The categories turned off stay off when the conversation is opened again.
+        if let Some(session) = self.session.clone() {
+            let off = std::mem::take(&mut self.off);
+            if off.is_empty() {
+                self.off_elsewhere.remove(&session);
+            } else {
+                self.off_elsewhere.insert(session, off);
+                while self.off_elsewhere.len() > MAX_REMEMBERED_CATEGORIES {
+                    self.off_elsewhere.pop_first();
+                }
+            }
+        }
         // Only the active conversation is offered the app's tools.
         if let (Some(session), Some(_)) = (self.session.take(), &self.tools) {
             drop(self.services.host().release_tool_session(session));
@@ -786,6 +803,7 @@ impl Assistant {
         }
         self.new_conversation();
         self.session = Some(session.to_owned());
+        self.off = self.off_elsewhere.remove(session).unwrap_or_default();
         self.title = title;
         self.tag = tag;
     }
