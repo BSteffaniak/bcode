@@ -23,8 +23,10 @@ pub const TOOL_TAIL_LINES: usize = 3;
 /// Bytes kept of an answer (its start; an answer is read from the top). The only bound on an
 /// answer's text: it shows in full up to here, and a marker says when the rest was cut.
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
-/// Bytes kept of reasoning, a question, a notice, or an error.
+/// Bytes kept of reasoning, a notice, or an error.
 const MAX_TEXT_BYTES: usize = 8 * 1024;
+/// Bytes kept of a question: the reviewer's message shows in full up to here.
+const MAX_QUESTION_BYTES: usize = 64 * 1024;
 /// Bytes kept of a tool call's JSON arguments.
 pub const MAX_ARGUMENTS_BYTES: usize = 4 * 1024;
 /// Bytes kept of one output line or a tool summary.
@@ -240,7 +242,7 @@ impl Feed {
     /// The newest turn asking `question` (trimmed), with its index.
     #[must_use]
     pub fn turn_for(&self, question: &str) -> Option<(usize, &Turn)> {
-        let question = question.trim();
+        let question = bounded(question.trim(), MAX_QUESTION_BYTES);
         self.turns
             .iter()
             .enumerate()
@@ -259,7 +261,7 @@ pub fn question_of(text: &str) -> String {
     let question = question
         .rfind(CONTEXT_MARKER)
         .map_or(question, |at| &question[..at]);
-    bounded(question.trim(), MAX_TEXT_BYTES)
+    bounded(question.trim(), MAX_QUESTION_BYTES)
 }
 
 fn feed_item(item: &TranscriptViewItem) -> Option<FeedItem> {

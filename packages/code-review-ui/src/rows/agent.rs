@@ -27,8 +27,6 @@ use bmux_tui::text::{Line, Span};
 use bmux_tui::text_width::display_width;
 use bmux_tui_components::spinner::{DEFAULT_INTERVAL, Spinner};
 
-/// Lines of the question shown under `▍you`.
-const QUESTION_ROWS: usize = 3;
 /// Rows of open reasoning.
 const REASONING_ROWS: usize = 40;
 /// Lines of one error.
@@ -226,6 +224,8 @@ impl Card<'_> {
         self.actions.extend(placed);
     }
 
+    /// The reviewer's message under `▍you`, in full: every line word-wrapped under the bar,
+    /// blank lines between paragraphs kept.
     fn question(&mut self, question: &str) {
         let theme = self.theme;
         let bar = theme.icons.accent_bar;
@@ -233,23 +233,27 @@ impl Card<'_> {
             Span::styled(bar, theme.accent),
             Span::styled("you", theme.accent.add_modifier(Modifier::BOLD)),
         ]);
-        let lines: Vec<&str> = question
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        for line in lines.iter().take(QUESTION_ROWS) {
-            self.push(vec![
-                Span::styled(bar, theme.accent),
-                Span::raw(" "),
-                Span::styled((*line).to_owned(), theme.tiers.strong),
-            ]);
-        }
-        if lines.len() > QUESTION_ROWS {
-            self.push(vec![
-                Span::styled(bar, theme.accent),
-                Span::raw(" "),
-                Span::styled(theme.icons.ellipsis, theme.muted),
-            ]);
+        let prefix = || vec![Span::styled(bar, theme.accent), Span::raw(" ")];
+        let prefix_width = display_width(bar) + 1;
+        let width = self
+            .width
+            .saturating_sub(self.pad.len() + prefix_width)
+            .max(1);
+        for line in question.trim().lines() {
+            if line.trim().is_empty() {
+                self.push(vec![Span::styled(bar, theme.accent)]);
+                continue;
+            }
+            let rows = bmux_tui::text::wrap_line_bounded(
+                &Line::from_spans(vec![Span::styled(line.to_owned(), theme.tiers.strong)]),
+                bmux_tui::text::TextWrapGeometry::with_continuation(width, width),
+                bmux_tui::text::TextWrap::Word,
+            );
+            for row in rows {
+                let mut spans = prefix();
+                spans.extend(row.spans);
+                self.push(spans);
+            }
         }
     }
 

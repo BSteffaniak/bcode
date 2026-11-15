@@ -140,7 +140,8 @@ The card:
 * The title shows a spinner while the turn runs, the status (`asking…`, `working…`,
   `needs you`, `stopping…`, `answered`, `stopped`, `failed`), the session's tokens and estimated
   cost, and the seconds the turn has run.
-* The body is the question's turn: `▍you` and the question as asked, reasoning collapsed to
+* The body is the question's turn: `▍you` and the question as asked, in full (wrapped, with its
+  blank lines), reasoning collapsed to
   `▸ thinking · N words` (a click opens it), tool lines `◌` running, `✓` done, `✗` failed with
   the last three lines of output and an `All N lines` expander, every answer of the turn as
   markdown shown in full (a streaming answer shows all its text so far; an answer over 64 KiB
@@ -236,7 +237,7 @@ from it, is in [code review assistant](code-review-assistant.md).
   (before that, `ctrl+o` says to start or open one); `✕` closes the panel; a double click on the
   title zooms the focused panel over the whole screen, and another restores it. The screens'
   palettes list the assistant's actions ("Assistant: …").
-* **Turns** show like an AI card: `▍you` and the message, reasoning, tool lines with their output
+* **Turns** show like an AI card: `▍you` and the message in full, reasoning, tool lines with their output
   and the answers in full (as on an AI card), with a spinner while the session works; the title row shows `needs you`,
   `working…`, tokens (`12.3k tok`) and cost, cutting the title to keep them. `pageup`/`pagedown`
   and the wheel scroll it; clicks open reasoning and tool output. A finished answer offers Copy

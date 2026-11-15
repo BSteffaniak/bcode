@@ -1394,3 +1394,32 @@ fn an_answer_cut_at_its_byte_bound_says_so() {
         screen.text()
     );
 }
+
+#[test]
+fn a_long_message_shows_in_full_in_the_panel_wrapped_with_its_paragraphs() {
+    use std::fmt::Write as _;
+    let mut setup = setup(160, 44, true);
+    let session = conversation(&mut setup);
+    let mut message = String::new();
+    for line in 1..=12 {
+        let _ = writeln!(message, "message line {line}");
+    }
+    message.push('\n');
+    let long: Vec<String> = (1..=40).map(|word| format!("word{word}")).collect();
+    message.push_str(&long.join(" "));
+    let screen = setup.deliver(&session, snapshot(vec![user(&message), answer("ok")]));
+    let mut seen = screen.text();
+    for _ in 0..6 {
+        setup.scenario.key("pageup");
+        seen.push_str(&setup.settle().text());
+    }
+    for line in 1..=12 {
+        assert!(
+            seen.contains(&format!("message line {line}")),
+            "line {line}: {seen}"
+        );
+    }
+    // The long line wraps under the bar instead of being cut at the panel's edge.
+    assert!(seen.contains("word1 "), "{seen}");
+    assert!(seen.contains("word40"), "{seen}");
+}
