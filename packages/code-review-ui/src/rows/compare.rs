@@ -1153,7 +1153,11 @@ mod tests {
                     let text = painted(&rows);
                     match seen {
                         SeenHunks::Fold => {
-                            assert_eq!(rows.actions.len(), usize::from(!item.held_open), "{text:?}")
+                            assert_eq!(
+                                rows.actions.len(),
+                                usize::from(!item.held_open),
+                                "{text:?}"
+                            );
                         }
                         SeenHunks::Show => {
                             assert!(text.contains("new since the previous push · 4 lines"));
