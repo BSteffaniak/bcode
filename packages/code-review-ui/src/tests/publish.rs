@@ -1123,3 +1123,43 @@ fn a_step_through_review_follows_its_stack_when_layers_were_closed() {
     let kept = stored(&backend, &fixture, &workspace.id);
     assert_eq!(kept.sources[1].id, "source-1");
 }
+
+/// Saving an unsaved stack review keeps its whole record: the stack it confirmed and what the
+/// reviewer marked while the save ran, on screen and in the store.
+#[test]
+fn saving_an_unsaved_stack_review_keeps_its_stack_and_marks_made_while_saving() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let entry = Entry::Sources {
+        title: None,
+        sources: vec![layer(101), layer(102)],
+    };
+    let (mut scenario, _) = open(&fixture, &backend, entry, 140, 40);
+    let workspace = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .and_then(|review| review.workspace())
+            .cloned()
+            .expect("workspace")
+    };
+    assert_eq!(
+        workspace(&scenario).id,
+        crate::entry::TRANSIENT_WORKSPACE_ID
+    );
+    assert_eq!(workspace(&scenario).stack_snapshots.len(), 1);
+    assert!(workspace(&scenario).viewed_files.is_empty());
+    // Save, and mark the file under the cursor viewed before the save has run.
+    scenario.key("n");
+    settled(&mut scenario);
+    scenario.key("ctrl+s");
+    scenario.key("v");
+    settled(&mut scenario);
+    let review = workspace(&scenario);
+    assert_ne!(review.id, crate::entry::TRANSIENT_WORKSPACE_ID);
+    assert_eq!(review.stack_snapshots.len(), 1, "{review:?}");
+    assert_eq!(review.viewed_files.len(), 1, "{review:?}");
+    let saved = stored(&backend, &fixture, &review.id);
+    assert_eq!(saved.stack_snapshots, review.stack_snapshots);
+    assert_eq!(saved.viewed_files, review.viewed_files);
+}

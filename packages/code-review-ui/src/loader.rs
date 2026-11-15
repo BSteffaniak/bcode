@@ -776,10 +776,11 @@ pub fn transient_viewed_record(
     }
 }
 
-/// Save a transient review as a durable workspace and return it.
+/// Save a transient review as a durable workspace and return the record written.
 ///
-/// The workspace is created with the same title and sources, gets the viewed, presentation, and
-/// reviewed-revision state, and the drafts, AI exchanges, and suggestions move into its scope.
+/// The workspace is created with the same title and sources and gets the whole local record
+/// (viewed, presentation, reviewed-revision and stack state); the drafts, AI exchanges, and
+/// suggestions move into its scope.
 ///
 /// # Errors
 ///
@@ -797,14 +798,23 @@ pub async fn save_as(
         })
         .await
         .map_err(|error| error.message)?;
-    let mut workspace = created.workspace;
-    workspace.viewed_files.clone_from(&transient.viewed_files);
-    workspace.viewed_marks.clone_from(&transient.viewed_marks);
-    workspace
-        .reviewed_revisions
-        .clone_from(&transient.reviewed_revisions);
-    workspace.presentation.clone_from(&transient.presentation);
-    save_workspace(services.clone(), workspace.clone()).await?;
+    let workspace = bcode_code_review_models::ReviewWorkspace {
+        id: created.workspace.id,
+        repo_root: created.workspace.repo_root,
+        created_at_ms: created.workspace.created_at_ms,
+        updated_at_ms: created.workspace.updated_at_ms,
+        archived_at_ms: None,
+        ..transient.clone()
+    };
+    let written: bcode_code_review_models::UpdateReviewWorkspaceResponse = services
+        .call(bcode_code_review_models::UpdateReviewWorkspaceRequest {
+            repo_path: workspace.repo_root.clone(),
+            workspace,
+            base: None,
+        })
+        .await
+        .map_err(|error| error.message)?;
+    let workspace = written.workspace;
     // The viewed state moves with the review, like its notes.
     let mut left = transient_viewed_record(&transient);
     left.viewed_files.clear();

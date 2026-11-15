@@ -1662,7 +1662,15 @@ impl ReviewSurface {
         let saving = self.viewed_sync.saving.take();
         match result {
             Ok(written) => {
-                if let Some(saving) = saving {
+                // A save of the unsaved scope that finishes after the review was saved is not
+                // the saved review's record; the saved review's next save writes the copy.
+                let current = self
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.id.as_str());
+                let superseded =
+                    current.is_some_and(|id| id != TRANSIENT_WORKSPACE_ID && id != written.id);
+                if let Some(saving) = saving.filter(|_| !superseded) {
                     self.adopt_written(&saving, *written);
                 }
             }
@@ -1685,6 +1693,11 @@ impl ReviewSurface {
         };
         if self.viewed_sync.deleted {
             self.save = SaveState::Idle;
+            return;
+        }
+        // While an unsaved review is being saved, its viewed state waits for the saved record
+        // instead of going back to the unsaved scope the save empties.
+        if self.saving_as && workspace.id == TRANSIENT_WORKSPACE_ID {
             return;
         }
         // An unsaved review keeps only its viewed state, under its target's scope; a saved one
@@ -1811,12 +1824,16 @@ impl ReviewSurface {
         self.saving_as = false;
         match result {
             Ok(saved) => {
-                // Keep what changed while saving; take the durable identity.
+                // Take the durable identity and keep what changed while saving: the record the
+                // save wrote is the base of the next save, which writes what changed since.
                 let workspace = self.workspace_mut();
-                workspace.id = saved.id;
+                workspace.id.clone_from(&saved.id);
                 workspace.created_at_ms = saved.created_at_ms;
                 workspace.updated_at_ms = saved.updated_at_ms;
-                workspace.repo_root = saved.repo_root;
+                workspace.repo_root.clone_from(&saved.repo_root);
+                self.viewed_sync.transient = None;
+                self.viewed_sync.base = Some(viewed_sync::Viewed::of(&saved));
+                self.viewed_sync.stored = Some(saved);
                 self.request_save();
                 // Annotations now live in the saved review's scope.
                 self.notes_requested = false;
