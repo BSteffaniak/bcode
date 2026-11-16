@@ -720,10 +720,13 @@ impl ReviewDocument {
     ) -> Option<bcode_code_review_models::ReviewWorktreeMarksRequest> {
         let state = &self.files[file];
         let source = &self.groups[state.group].source;
+        // A binary file is asked about too: it shows as changed, without lines.
         (self.config.uncommitted_marks
             && matches!(state.marks, MarksState::Missing)
             && state.loaded().is_some()
-            && state.expandable()
+            && !state
+                .entry
+                .has(bcode_code_review_models::ReviewIndexFlag::Submodule)
             && source.mode == bcode_code_review_models::ResolvedSourceMode::Browse
             && matches!(
                 source.head,
@@ -762,6 +765,8 @@ impl ReviewDocument {
                 Some(super::items::Uncommitted {
                     additions: found.additions,
                     deletions: found.deletions,
+                    binary: found.binary,
+                    renamed: found.renamed_from.is_some(),
                 }),
             ),
             _ => (Marks::default(), None),

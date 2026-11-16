@@ -417,22 +417,62 @@ fn zero_hunks(output: &str, paths: &[&str]) -> Vec<ZeroHunk> {
         .unwrap_or_default()
 }
 
+/// One file section of a `git diff -U0`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ZeroSection {
+    /// The new-side path (empty for a deleted file).
+    pub(crate) path: String,
+    /// The old-side path of a rename.
+    pub(crate) renamed_from: Option<String>,
+    /// git said "Binary files … differ": the content changed, without hunks.
+    pub(crate) binary: bool,
+    pub(crate) hunks: Vec<ZeroHunk>,
+}
+
 /// Every file section of `output` (a `git diff -U0`): its new-side path and its hunks.
 pub(crate) fn zero_hunk_sections(output: &str) -> Vec<(String, Vec<ZeroHunk>)> {
-    let mut sections: Vec<(String, Vec<ZeroHunk>)> = Vec::new();
+    zero_sections(output)
+        .into_iter()
+        .map(|section| (section.path, section.hunks))
+        .collect()
+}
+
+/// Every file section of `output` (a `git diff -U0`, with or without rename detection).
+///
+/// Paths are read as git prints them: a name with a space ends its `+++` line with a tab, and a
+/// name with a quote, backslash, or control character is C-quoted (`core.quotepath=false` keeps
+/// other names as they are).
+pub(crate) fn zero_sections(output: &str) -> Vec<ZeroSection> {
+    let mut sections: Vec<ZeroSection> = Vec::new();
     let mut in_header = false;
     for line in output.lines() {
         if line.starts_with("diff --git ") {
-            sections.push((String::new(), Vec::new()));
+            sections.push(ZeroSection::default());
             in_header = true;
             continue;
         }
-        let Some((name, hunks)) = sections.last_mut() else {
+        let Some(section) = sections.last_mut() else {
             continue;
         };
         if in_header {
             if let Some(path) = line.strip_prefix("+++ ") {
-                path.strip_prefix("b/").unwrap_or(path).clone_into(name);
+                if let Some(path) = header_path(path, "b/") {
+                    section.path = path;
+                }
+            } else if let Some(path) = line.strip_prefix("rename to ") {
+                section.path = unquote(path);
+            } else if let Some(path) = line.strip_prefix("rename from ") {
+                section.renamed_from = Some(unquote(path));
+            } else if let Some(pair) = line
+                .strip_prefix("Binary files ")
+                .and_then(|rest| rest.strip_suffix(" differ"))
+            {
+                section.binary = true;
+                if section.path.is_empty()
+                    && let Some(path) = binary_new_path(pair)
+                {
+                    section.path = path;
+                }
             }
             if !line.starts_with("@@") {
                 continue;
@@ -446,7 +486,7 @@ pub(crate) fn zero_hunk_sections(output: &str) -> Vec<(String, Vec<ZeroHunk>)> {
             if let (Some((old_start, old_count)), Some((new_start, new_count))) =
                 (old.and_then(parse_range), new.and_then(parse_range))
             {
-                hunks.push(ZeroHunk {
+                section.hunks.push(ZeroHunk {
                     old_start,
                     old_count,
                     new_start,
@@ -455,12 +495,84 @@ pub(crate) fn zero_hunk_sections(output: &str) -> Vec<(String, Vec<ZeroHunk>)> {
                 });
             }
         } else if let Some(text) = line.strip_prefix('-')
-            && let Some(hunk) = hunks.last_mut()
+            && let Some(hunk) = section.hunks.last_mut()
         {
             hunk.removed.push(text.to_owned());
         }
     }
     sections
+}
+
+/// The path of a `---`/`+++` header value without its `prefix` (`a/` or `b/`): `None` for
+/// `/dev/null`. git ends the value with a tab when the name has a space.
+fn header_path(value: &str, prefix: &str) -> Option<String> {
+    let value = value.strip_suffix('\t').unwrap_or(value);
+    if value == "/dev/null" {
+        return None;
+    }
+    let path = unquote(value);
+    Some(
+        path.strip_prefix(prefix)
+            .map_or_else(|| path.clone(), str::to_owned),
+    )
+}
+
+/// The new-side path of a `Binary files A and B differ` pair: `B` without `b/`, when `A` names
+/// the same path (or `/dev/null`, a new file). Names containing " and " are told apart by
+/// trying every split.
+fn binary_new_path(pair: &str) -> Option<String> {
+    pair.match_indices(" and ").find_map(|(at, separator)| {
+        let (old, new) = (&pair[..at], &pair[at + separator.len()..]);
+        let new = header_path(new, "b/")?;
+        let same = old == "/dev/null" || header_path(old, "a/").is_some_and(|old| old == new);
+        same.then_some(new)
+    })
+}
+
+/// A path as git prints it: C-quoted (`"…"` with backslash escapes and octal bytes) or as is.
+fn unquote(text: &str) -> String {
+    let Some(inner) = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return text.to_owned();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(byte) = chars.next() {
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some(escape) = chars.next() else {
+            bytes.push(b'\\');
+            break;
+        };
+        bytes.push(match escape {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'0'..=b'7' => {
+                let mut value = u32::from(escape - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(digit @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(digit - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                u8::try_from(value).unwrap_or(u8::MAX)
+            }
+            other => other,
+        });
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Where new-side line `line` of `hunks` (old → new) is on the old side: `None` when the hunks
@@ -648,6 +760,71 @@ mod tests {
             new_count: new.1,
             removed: removed.iter().map(|text| (*text).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn sections_read_paths_with_spaces_quotes_renames_and_binary_changes() {
+        let output = "diff --git a/my file.txt b/my file.txt\n\
+            index 1..2 100644\n\
+            --- a/my file.txt\t\n\
+            +++ b/my file.txt\t\n\
+            @@ -1 +1 @@\n\
+            -old\n\
+            +new\n\
+            diff --git \"a/tab\\there.txt\" \"b/tab\\there.txt\"\n\
+            --- \"a/tab\\there.txt\"\n\
+            +++ \"b/tab\\there.txt\"\n\
+            @@ -0,0 +1 @@\n\
+            +x\n\
+            diff --git a/caf\u{e9}.txt b/caf\u{e9}.txt\n\
+            --- \"a/caf\\303\\251.txt\"\n\
+            +++ \"b/caf\\303\\251.txt\"\n\
+            @@ -2,0 +3 @@\n\
+            +y\n\
+            diff --git a/old name.rs b/new name.rs\n\
+            similarity index 100%\n\
+            rename from old name.rs\n\
+            rename to new name.rs\n\
+            diff --git a/img and pic.png b/img and pic.png\n\
+            index 1..2 100644\n\
+            Binary files a/img and pic.png and b/img and pic.png differ\n\
+            diff --git a/new.bin b/new.bin\n\
+            new file mode 100644\n\
+            Binary files /dev/null and b/new.bin differ\n\
+            diff --git a/gone.rs b/gone.rs\n\
+            deleted file mode 100644\n\
+            --- a/gone.rs\n\
+            +++ /dev/null\n\
+            @@ -1 +0,0 @@\n\
+            -z\n";
+        let sections = zero_sections(output);
+        let summary: Vec<(&str, Option<&str>, bool, usize)> = sections
+            .iter()
+            .map(|section| {
+                (
+                    section.path.as_str(),
+                    section.renamed_from.as_deref(),
+                    section.binary,
+                    section.hunks.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("my file.txt", None, false, 1),
+                ("tab\there.txt", None, false, 1),
+                ("caf\u{e9}.txt", None, false, 1),
+                ("new name.rs", Some("old name.rs"), false, 0),
+                ("img and pic.png", None, true, 0),
+                ("new.bin", None, true, 0),
+                ("", None, false, 1),
+            ]
+        );
+        assert_eq!(
+            zero_hunks(output, &["my file.txt"]),
+            [hunk((1, 1), (1, 1), &["old"])]
+        );
     }
 
     #[test]

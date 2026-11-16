@@ -647,13 +647,23 @@ pub struct ReviewWorktreeFileMarks {
     /// The file is over [`REVIEW_WORKTREE_MARKS_MAX_BYTES`]; nothing is marked.
     #[serde(default)]
     pub too_large: bool,
+    /// The file is binary and its content changed since `HEAD`: no lines are marked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
+    /// The path the file had at `HEAD`, when it was renamed (staged) since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
 }
 
 impl ReviewWorktreeFileMarks {
-    /// Whether anything is marked.
+    /// Whether the file changed since `HEAD`: new, renamed, binary content, or marked lines.
     #[must_use]
     pub const fn is_changed(&self) -> bool {
-        self.untracked || !self.added.is_empty() || !self.removed.is_empty()
+        self.untracked
+            || self.binary
+            || self.renamed_from.is_some()
+            || !self.added.is_empty()
+            || !self.removed.is_empty()
     }
 }
 

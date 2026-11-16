@@ -98,6 +98,10 @@ pub struct Uncommitted {
     pub additions: u32,
     /// Lines removed.
     pub deletions: u32,
+    /// The file is binary and its content changed (no lines are counted).
+    pub binary: bool,
+    /// The file was renamed (staged) since `HEAD`.
+    pub renamed: bool,
 }
 
 /// Kind of one displayed line.

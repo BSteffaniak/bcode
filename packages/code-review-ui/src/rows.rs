@@ -517,7 +517,7 @@ enum ContentStamp {
         /// shown, and whether it can step back and forward.
         versions: Option<(usize, usize, usize, Option<usize>, bool, bool)>,
         /// Lines added and removed since `HEAD` (the uncommitted badge).
-        uncommitted: Option<(u32, u32)>,
+        uncommitted: Option<(u32, u32, bool, bool)>,
     },
     /// A file's break: whether the file (and the next) is folded, and the next file's place.
     End {
@@ -590,9 +590,14 @@ impl ContentStamp {
                         versions.next,
                     )
                 }),
-                uncommitted: header
-                    .uncommitted
-                    .map(|counts| (counts.additions, counts.deletions)),
+                uncommitted: header.uncommitted.map(|counts| {
+                    (
+                        counts.additions,
+                        counts.deletions,
+                        counts.binary,
+                        counts.renamed,
+                    )
+                }),
             },
             ReviewItem::FileDetails(details) => Self::File {
                 flags: u8::from(details.viewed) | u8::from(details.collapsed) << 1,

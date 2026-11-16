@@ -1,14 +1,17 @@
 //! Uncommitted-change marks (`review.worktree.marks`): the lines of working-tree files that
 //! differ from `HEAD`, staged or not.
 //!
-//! One request runs at most three git processes whatever its size: `rev-parse` for `HEAD`,
-//! `ls-files` for which files are tracked, and one `git diff -U0 HEAD` for the tracked files
-//! not already cached. Answers are cached per file by `HEAD`, the index, and the file's size and
-//! modification time, in a bounded cache.
+//! One request runs at most four git processes whatever its size: `rev-parse` for `HEAD`,
+//! `ls-files` for which files are tracked, `diff --cached --name-status` for the renames staged
+//! since `HEAD` (a file's previous path is outside the request's paths, so rename detection needs
+//! the whole index), and one `git diff -U0 HEAD` for the tracked files not already cached, with
+//! the previous paths of renamed ones. A renamed file is compared with its previous content, a
+//! binary file is marked as changed without lines. Answers are cached per file by `HEAD`, the
+//! index, and the file's size and modification time, in a bounded cache.
 
 use super::paths::{index_stamp, working_tree_file};
 use super::{DataError, git};
-use crate::history::delta::{ZeroHunk, zero_hunk_sections};
+use crate::history::delta::{ZeroHunk, ZeroSection, zero_sections};
 use bcode_code_review_models::{
     REVIEW_WORKTREE_MARKS_MAX_BYTES, REVIEW_WORKTREE_MARKS_MAX_PATHS, RemovedSince,
     ReviewWorktreeFileMarks, ReviewWorktreeMarksRequest, ReviewWorktreeMarksResponse,
@@ -183,10 +186,19 @@ fn compute(
         Some(head) => head.to_owned(),
         None => git::empty_tree_oid(root)?,
     };
+    let renamed = if head.is_some() {
+        staged_renames(root, &base, &diffed)?
+    } else {
+        BTreeMap::new()
+    };
     let mut args = vec![
         "diff",
         "-U0",
-        "--no-renames",
+        if renamed.is_empty() {
+            "--no-renames"
+        } else {
+            "-M"
+        },
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
@@ -196,23 +208,58 @@ fn compute(
         "--",
     ];
     args.extend(diffed.iter().copied());
+    args.extend(renamed.values().map(String::as_str));
     let output = String::from_utf8_lossy(&git::output(root, &args)?).into_owned();
-    let mut sections: BTreeMap<String, Vec<ZeroHunk>> =
-        zero_hunk_sections(&output).into_iter().collect();
+    let mut sections: BTreeMap<String, ZeroSection> = zero_sections(&output)
+        .into_iter()
+        .filter(|section| !section.path.is_empty())
+        .map(|section| (section.path.clone(), section))
+        .collect();
     for path in diffed {
-        let hunks = sections.remove(path).unwrap_or_default();
-        answers.insert(path.to_owned(), file_marks(path, &hunks));
+        let section = sections.remove(path).unwrap_or_default();
+        answers.insert(path.to_owned(), file_marks(path, section));
     }
     Ok(answers)
 }
 
+/// The previous path of each of `paths` that was renamed in the index since `base`.
+fn staged_renames(
+    root: &Path,
+    base: &str,
+    paths: &[&str],
+) -> Result<BTreeMap<String, String>, DataError> {
+    let output = git::output(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "-M",
+            "-z",
+            "--name-status",
+            "--diff-filter=R",
+            "--no-ext-diff",
+            base,
+        ],
+    )?;
+    let records = git::split_nul(&output);
+    let wanted: BTreeSet<&str> = paths.iter().copied().collect();
+    Ok(records
+        .chunks_exact(3)
+        .filter(|record| record[0].starts_with('R') && wanted.contains(record[2].as_str()))
+        .map(|record| (record[2].clone(), record[1].clone()))
+        .collect())
+}
+
 /// Marks from one file's `HEAD` → working tree hunks: added and changed lines, the text a
 /// changed line had at `HEAD`, and removed lines as a marker before the line they preceded.
-fn file_marks(path: &str, hunks: &[ZeroHunk]) -> ReviewWorktreeFileMarks {
+fn file_marks(path: &str, section: ZeroSection) -> ReviewWorktreeFileMarks {
     let mut marks = ReviewWorktreeFileMarks {
         path: path.to_owned(),
+        binary: section.binary,
+        renamed_from: section.renamed_from,
         ..ReviewWorktreeFileMarks::default()
     };
+    let hunks: &[ZeroHunk] = &section.hunks;
     for hunk in hunks {
         marks.additions = marks.additions.saturating_add(hunk.new_count);
         marks.deletions = marks.deletions.saturating_add(hunk.old_count);

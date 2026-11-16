@@ -306,6 +306,8 @@ fn nested_repositories_are_not_files_and_submodules_are_listed_once() {
         &format!("160000,{},sub/module", head.trim()),
     ]);
     fixture.run(&["commit", "-q", "-m", "sub"]);
+    // Its folder, as an uninitialized submodule has.
+    std::fs::create_dir_all(repo.join("sub/module")).expect("mkdir");
     // A nested repository that is not a submodule (an untracked clone), with a file inside.
     write(repo, "sub/nested/inner.txt", "inner\n");
     fixture.run(&["-C", "sub/nested", "init", "-q"]);
@@ -657,4 +659,58 @@ fn uncommitted_marks_in_a_repository_without_commits_mark_every_staged_line() {
     let found = marks(&service, repo, &["a.txt"]);
     assert_eq!(found[0].added, [(1, 2)]);
     assert!(!found[0].untracked);
+}
+
+#[test]
+fn uncommitted_marks_read_names_with_spaces_binary_changes_and_renames() {
+    let fixture = repository();
+    let repo = fixture.root();
+    write(repo, "docs/my notes.txt", "one\ntwo\n");
+    write(repo, "docs/quote\"d.txt", "one\n");
+    std::fs::write(repo.join("docs/image.png"), [0_u8, 1, 2, 3, 0, 5]).expect("write");
+    write(repo, "docs/moved.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+    write(repo, "docs/edited.rs", "fn x() {}\nfn y() {}\nfn z() {}\n");
+    fixture.run(&["add", "-A"]);
+    fixture.run(&["commit", "-q", "-m", "docs"]);
+    write(repo, "docs/my notes.txt", "one\nTWO\n");
+    write(repo, "docs/quote\"d.txt", "one\nmore\n");
+    std::fs::write(repo.join("docs/image.png"), [0_u8, 9, 9, 9, 0, 5]).expect("write");
+    fixture.run(&["mv", "docs/moved.rs", "docs/renamed.rs"]);
+    fixture.run(&["mv", "docs/edited.rs", "docs/edited-now.rs"]);
+    write(
+        repo,
+        "docs/edited-now.rs",
+        "fn x() {}\nfn Y() {}\nfn z() {}\n",
+    );
+    let service = ReviewData::default();
+    let found = marks(
+        &service,
+        repo,
+        &[
+            "docs/my notes.txt",
+            "docs/quote\"d.txt",
+            "docs/image.png",
+            "docs/renamed.rs",
+            "docs/edited-now.rs",
+        ],
+    );
+    assert_eq!(found[0].added, [(2, 2)], "a name with a space");
+    assert_eq!((found[0].additions, found[0].deletions), (1, 1));
+    assert_eq!(found[1].added, [(2, 2)], "a C-quoted name");
+    assert!(found[2].binary && found[2].is_changed(), "{:?}", found[2]);
+    assert!(found[2].added.is_empty());
+    assert_eq!(
+        found[3].renamed_from.as_deref(),
+        Some("docs/moved.rs"),
+        "{:?}",
+        found[3]
+    );
+    assert!(found[3].added.is_empty(), "a pure rename marks no lines");
+    assert!(found[3].is_changed());
+    assert_eq!(found[4].renamed_from.as_deref(), Some("docs/edited.rs"));
+    assert_eq!(
+        found[4].added,
+        [(2, 2)],
+        "only the edited line of a renamed file"
+    );
 }

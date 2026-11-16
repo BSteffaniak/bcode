@@ -174,3 +174,45 @@ fn ignored_files_are_listed_on_request_and_folders_list_again_on_reopen() {
     assert!(screen.contains("added.md"), "{}", screen.text());
     assert!(screen.contains("untracked"), "{}", screen.text());
 }
+
+#[test]
+fn renamed_binary_and_spaced_files_show_their_uncommitted_change() {
+    let fixture = fixture();
+    let root = fixture.root();
+    let folder = root.join("notes");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    std::fs::write(folder.join("my plan.md"), "one\ntwo\n").expect("write");
+    std::fs::write(folder.join("logo.png"), [0_u8, 1, 2, 0, 4]).expect("write");
+    std::fs::write(folder.join("old.md"), "kept\n").expect("write");
+    fixture.run(&["add", "notes"]);
+    fixture.run(&["commit", "-q", "-m", "notes"]);
+    std::fs::write(folder.join("my plan.md"), "one\nTWO\nthree\n").expect("write");
+    std::fs::write(folder.join("logo.png"), [0_u8, 9, 9, 0, 4]).expect("write");
+    fixture.run(&["mv", "notes/old.md", "notes/new.md"]);
+    let backend = Arc::new(TestBackend::default());
+    let (_, screen) = open_with(
+        &fixture,
+        &backend,
+        ReviewViewConfig::default(),
+        Entry::Sources {
+            title: None,
+            sources: vec![notes()],
+        },
+    );
+    let line = |name: &str| {
+        screen
+            .text()
+            .lines()
+            .find(|line| line.contains(name) && line.contains("uncommitted"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("no uncommitted header for {name}:\n{}", screen.text()))
+    };
+    assert!(line("my plan.md").contains("uncommitted +2"));
+    assert!(line("logo.png").contains("uncommitted binary"));
+    let renamed = line("new.md");
+    assert!(renamed.contains("uncommitted renamed"), "{renamed}");
+    assert!(
+        !renamed.contains("+1"),
+        "a pure rename has no new lines: {renamed}"
+    );
+}

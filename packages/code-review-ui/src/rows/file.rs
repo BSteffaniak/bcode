@@ -239,6 +239,26 @@ fn version_spans(
     None
 }
 
+/// What a header says about a file's changes since `HEAD`: renamed, binary, and line counts
+/// (left out when a renamed or binary file has none).
+fn uncommitted_text(uncommitted: bcode_code_review::document::Uncommitted, minus: &str) -> String {
+    let mut text = "uncommitted".to_owned();
+    if uncommitted.renamed {
+        text.push_str(" renamed");
+    }
+    if uncommitted.binary {
+        text.push_str(" binary");
+    }
+    let lines = uncommitted.additions > 0 || uncommitted.deletions > 0;
+    if lines || !(uncommitted.renamed || uncommitted.binary) {
+        text.push_str(&format!(
+            " +{} {minus}{}",
+            uncommitted.additions, uncommitted.deletions
+        ));
+    }
+    text
+}
+
 /// Spans of what a header says on the right: flags, layers, threads, counts, change bar.
 fn header_facts(
     item: &FileHeaderItem,
@@ -256,10 +276,7 @@ fn header_facts(
     }
     if let Some(uncommitted) = item.uncommitted {
         trailing.push(Span::styled(
-            format!(
-                "uncommitted +{} {}{}",
-                uncommitted.additions, theme.icons.minus, uncommitted.deletions
-            ),
+            uncommitted_text(uncommitted, theme.icons.minus),
             theme.status_modified,
         ));
         trailing.push(Span::raw(" "));
