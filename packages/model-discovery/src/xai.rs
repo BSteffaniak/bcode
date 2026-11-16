@@ -225,6 +225,7 @@ fn capabilities_from_modalities<'a>(
         parallel_tool_calls: Some(true),
         required_tool_choice: None,
         named_tool_choice: None,
+        strict_tool_schemas: None,
         structured_outputs: false,
         reasoning: false,
         prompt_cache: false,

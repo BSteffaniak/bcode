@@ -504,6 +504,12 @@ pub struct CatalogCapabilities {
     /// Supports requiring one named tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named_tool_choice: Option<bool>,
+    /// Accepts strict tool schemas (`strict: true` function definitions).
+    ///
+    /// When unset, `tool_use` implies strict support. Set `false` for models whose serving route
+    /// accepts tools but rejects strict schema semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_tool_schemas: Option<bool>,
     /// Supports structured output controls.
     #[serde(default)]
     pub structured_outputs: bool,

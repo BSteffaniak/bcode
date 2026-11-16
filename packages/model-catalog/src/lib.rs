@@ -1384,7 +1384,14 @@ fn feature_support_from_catalog(
                 ToolSchemaMode::Permissive,
                 CapabilitySupport::supported(source),
             ),
-            (ToolSchemaMode::Strict, CapabilitySupport::supported(source)),
+            (
+                ToolSchemaMode::Strict,
+                catalog_boolean_support(
+                    capabilities.strict_tool_schemas.unwrap_or(true),
+                    source,
+                    "model catalog explicitly marks strict tool schemas unsupported",
+                ),
+            ),
         ]);
     }
     if capabilities.structured_outputs {
@@ -2346,6 +2353,7 @@ pub(crate) fn merge_capabilities(
         parallel_tool_calls: right.parallel_tool_calls.or(left.parallel_tool_calls),
         required_tool_choice: right.required_tool_choice.or(left.required_tool_choice),
         named_tool_choice: right.named_tool_choice.or(left.named_tool_choice),
+        strict_tool_schemas: right.strict_tool_schemas.or(left.strict_tool_schemas),
         structured_outputs: left.structured_outputs || right.structured_outputs,
         reasoning: left.reasoning || right.reasoning,
         prompt_cache: left.prompt_cache || right.prompt_cache,

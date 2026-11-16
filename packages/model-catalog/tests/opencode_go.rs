@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bcode_model::ModelCapability;
+use bcode_model::{CapabilitySupport, ModelCapability, ToolSchemaMode};
 use bcode_model_catalog::{ModelCatalog, load_embedded_catalog};
 use bcode_model_catalog_models::ModelSupportTarget;
 
@@ -49,4 +49,34 @@ fn go_baseline_has_exact_api_key_chat_deployments_without_cache_claims() {
     }
     assert!(catalog.model("opencode-go", "beam-free").is_none());
     assert!(catalog.model("opencode-go", "unlisted-model").is_none());
+}
+
+#[test]
+fn go_gemini_accepts_tools_without_strict_tool_schemas() {
+    let catalog = ModelCatalog::new(load_embedded_catalog().unwrap());
+    let target =
+        ModelSupportTarget::new("opencode-go", "api_key", "chat_completions", Some("bcode"));
+    let models = catalog.provider_models_for_support_target("opencode-go", &target, false);
+    let support = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.model_id == id)
+            .unwrap()
+            .feature_support
+            .clone()
+    };
+
+    let gemini = support("gemini-4-argon");
+    assert!(matches!(
+        gemini.tool_schema(ToolSchemaMode::Permissive),
+        CapabilitySupport::Supported { .. }
+    ));
+    assert!(matches!(
+        gemini.tool_schema(ToolSchemaMode::Strict),
+        CapabilitySupport::Unsupported { .. }
+    ));
+    assert!(matches!(
+        support("glm-5.3").tool_schema(ToolSchemaMode::Strict),
+        CapabilitySupport::Supported { .. }
+    ));
 }

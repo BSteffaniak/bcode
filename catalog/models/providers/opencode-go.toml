@@ -96,6 +96,8 @@ notes = "The public listing documents tools and limits on the native generate-co
 text_input = true
 text_output = true
 tool_use = true
+# The Go translation route rejects `strict` function definitions for Google models.
+strict_tool_schemas = false
 
 [[models."gemini-4-argon".deployments]]
 provider = "opencode-go"
