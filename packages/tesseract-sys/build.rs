@@ -550,10 +550,6 @@ mod bundled {
             );
         }
         download_runtime_tessdata(&catalog, &versions, &runtimes_dir);
-        println!(
-            "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_RUNTIMES={}",
-            runtimes_dir.display()
-        );
         emit_bundled_version_metadata(&catalog, &versions);
     }
 

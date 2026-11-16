@@ -8,6 +8,7 @@ pub mod application;
 
 #[cfg(test)]
 mod image_retention_tests;
+mod resources;
 mod target;
 pub use target::{DaemonTarget, DaemonTargetError};
 mod installed;
@@ -23,6 +24,7 @@ pub use execution_lifetime::{
 };
 
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};
+use bcode_plugin_sdk::artifact_resources::BCODE_ARTIFACT_RESOURCES_ENV;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1209,7 +1211,7 @@ fn remove_interrupted_image_publications(state_dir: &Path) -> Result<(), DaemonL
             .to_string_lossy()
             .starts_with(".bcode.tmp-")
         {
-            fs::remove_file(&path).map_err(|source| DaemonLifecycleError::Io { path, source })?;
+            remove_interrupted_publication(&path)?;
             continue;
         }
         if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
@@ -1229,15 +1231,25 @@ fn remove_interrupted_image_publications(state_dir: &Path) -> Result<(), DaemonL
                 .to_string_lossy()
                 .starts_with(".bcode.tmp-")
             {
-                let child_path = child.path();
-                fs::remove_file(&child_path).map_err(|source| DaemonLifecycleError::Io {
-                    path: child_path,
-                    source,
-                })?;
+                remove_interrupted_publication(&child.path())?;
             }
         }
     }
     Ok(())
+}
+
+/// Removes an interrupted executable (file) or resource snapshot (directory) publication.
+fn remove_interrupted_publication(path: &Path) -> Result<(), DaemonLifecycleError> {
+    let is_dir = fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    if is_dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .map_err(|source| DaemonLifecycleError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn current_cached_daemon_image(
@@ -3029,8 +3041,10 @@ fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
     config_dir.to_path_buf()
 }
 
-fn daemon_command(exe: &Path) -> tokio::process::Command {
+/// Build the daemon launch for an image and the resource snapshot pinned with it.
+fn daemon_command(exe: &Path, resources: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(exe);
+    command.env(BCODE_ARTIFACT_RESOURCES_ENV, resources);
     detach_daemon_process(&mut command);
     configure_daemon_config(
         &mut command,
@@ -3143,6 +3157,7 @@ pub async fn ensure_daemon_running_with_budget(
                 let spawn_started_at = std::time::Instant::now();
                 let phase = bcode_metrics::startup::phase("launcher.artifact_prepare");
                 let cached_exe = ensure_current_executable_cached()?;
+                let resources = resources::publish_daemon_resources(&cached_exe)?;
                 phase.finish();
                 let executable_digest = require_cached_executable_digest(&cached_exe)?;
                 // Always spawn from the immutable content-addressed image. Spawning from the
@@ -3167,7 +3182,7 @@ pub async fn ensure_daemon_running_with_budget(
                     &descriptor_file?,
                     &StartupOwnerDescriptor::current("handoff_pending", handoff.clone())?,
                 )?;
-                let mut command = daemon_command(&exe);
+                let mut command = daemon_command(&exe, &resources);
                 #[cfg(unix)]
                 command.env("BCODE_STARTUP_HANDOFF_V1", handoff);
                 let spawn_phase = bcode_metrics::startup::phase("launcher.process_spawn");

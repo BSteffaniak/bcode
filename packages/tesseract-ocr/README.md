@@ -53,8 +53,11 @@ let text = engine.recognize(ImageView {
 Dynamic bundled runtime lookup order:
 
 1. `BCODE_TESSERACT_RUNTIME_ROOT`
-2. executable-relative `bcode-runtimes/tesseract`
-3. Cargo build-script `OUT_DIR` fallback
+2. `bcode-runtimes/tesseract` in the artifact's resources: beside the executable, or in the
+   daemon's pinned resource snapshot (see `bcode_plugin_sdk::artifact_resources`)
+
+Runtimes are never loaded from the Cargo build directory, so a dynamic build must be packaged
+(`cargo xtask package-tesseract-runtimes`) before it can OCR.
 
 ## Build/download caches
 

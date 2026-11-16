@@ -88,7 +88,10 @@ publication, and auto-updater are outside the v1 Windows milestone. Every archiv
 catalog default Tesseract version and embeds its tessdata in the executable, so OCR needs no files
 beside the binary. Builds that add `bundled-ocr-tesseract-dynamic` (or select several versions with
 `bundled-ocr-tesseract-all`) instead ship loadable runtime trees under `bcode-runtimes/tesseract`;
-release packaging stages and verifies that tree only for those builds. Windows source
+release packaging stages and verifies that tree only for those builds. Web-renderer builds embed the
+browser TUI distribution named by `BCODE_TUI_WEB_BUNDLE` (verified before compiling), and every
+build embeds the X-ray web assets, so archives contain no other runtime files. Daemons pin any
+shipped resource trees in their image; see [Daemon lifecycle](daemon-lifecycle-architecture.md). Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
 CI verifies `cmake`, `cl.exe`, and `link.exe` explicitly and initializes the Visual Studio amd64
 developer shell when those tools are not already in the runner environment.

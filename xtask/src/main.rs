@@ -1368,7 +1368,13 @@ fn build_bcode_release(
     let artifact_id = generated_artifact_id();
     // Build deliberately before Cargo; build.rs only verifies and snapshots these bytes.
     let web_dist = xray_dev::build_web_dist(&workspace_root())?;
+    let tui_bundle = selected_browser_bundle(features, purpose)?;
     let mut command = Command::new("cargo");
+    // Embed only a bundle verified here; never one merely inherited from the environment.
+    match &tui_bundle {
+        Some(bundle) => command.env(TUI_WEB_BUNDLE_ENV, bundle),
+        None => command.env_remove(TUI_WEB_BUNDLE_ENV),
+    };
     command
         .env("BCODE_XRAY_WEB_DIST", &web_dist)
         .env("BCODE_ARTIFACT_ID", &artifact_id)
@@ -1405,6 +1411,35 @@ fn build_bcode_release(
 fn build(options: &Options) -> Result<()> {
     let features = selected_features(options, false);
     build_bcode_release(&options.target, &features, BcodeBuildPurpose::Developer)
+}
+
+const TUI_WEB_BUNDLE_ENV: &str = "BCODE_TUI_WEB_BUNDLE";
+
+fn features_enable_web_renderer(features: &[String]) -> bool {
+    features
+        .iter()
+        .any(|feature| matches!(feature.as_str(), "distribution" | "web-renderer"))
+}
+
+/// Selects the browser TUI distribution to embed. Distribution builds with the web renderer
+/// require one; developer builds embed one only when `BCODE_TUI_WEB_BUNDLE` names it.
+fn selected_browser_bundle(
+    features: &[String],
+    purpose: BcodeBuildPurpose,
+) -> Result<Option<PathBuf>> {
+    if !features_enable_web_renderer(features) {
+        return Ok(None);
+    }
+    let Some(source) = env::var_os(TUI_WEB_BUNDLE_ENV).map(PathBuf::from) else {
+        if purpose == BcodeBuildPurpose::Distribution {
+            return Err(format_error(
+                "web releases require BCODE_TUI_WEB_BUNDLE pointing to a built immutable distribution",
+            ));
+        }
+        return Ok(None);
+    };
+    verified_browser_bundle(&source)?;
+    Ok(Some(source.canonicalize()?))
 }
 
 const BROWSER_BUNDLE_FILES: [&str; 7] = [
@@ -1500,6 +1535,8 @@ fn release(options: &Options) -> Result<()> {
     let features = selected_features(options, true);
     let tesseract = TesseractPackaging::from_features(&features);
     let target_kind = TargetKind::parse(&options.target)?;
+    // Fail before compiling when a required browser bundle is missing or invalid.
+    selected_browser_bundle(&features, BcodeBuildPurpose::Distribution)?;
     if target_kind == TargetKind::Windows {
         windows_signing_configuration()?;
     }
@@ -1531,26 +1568,7 @@ fn release(options: &Options) -> Result<()> {
     }
 
     let staging_dir = staging_dir(options);
-    let browser_bundle = if features
-        .iter()
-        .any(|feature| matches!(feature.as_str(), "distribution" | "web-renderer"))
-    {
-        let source = env::var_os("BCODE_TUI_WEB_BUNDLE")
-            .map(PathBuf::from)
-            .ok_or_else(|| format_error("web releases require BCODE_TUI_WEB_BUNDLE pointing to a built immutable distribution"))?;
-        Some(verified_browser_bundle(&source)?)
-    } else {
-        None
-    };
     recreate_dir(&staging_dir)?;
-    if let Some(files) = browser_bundle {
-        let destination = staging_dir.join("bcode-runtimes/tui");
-        fs::create_dir_all(&destination)?;
-        for (name, bytes) in files {
-            fs::write(destination.join(name), bytes)?;
-        }
-        verified_browser_bundle(&destination)?;
-    }
     let staged_binary = staging_dir.join(binary_file_name(target_kind));
     copy_release_binary(&binary, &staged_binary)?;
     if let Some(expected_artifact_id) = artifact_id_before_postprocessing.as_deref() {
@@ -1593,32 +1611,6 @@ fn verify_release(options: &Options) -> Result<()> {
     ensure_file(&checksum_path(&archive))?;
     verify_checksum(&archive)?;
     verify_archive_contents(&archive, target_kind, tesseract)?;
-    if features
-        .iter()
-        .any(|feature| matches!(feature.as_str(), "distribution" | "web-renderer"))
-    {
-        let entries: BTreeSet<String> = if target_kind == TargetKind::Linux {
-            command_output(Command::new("tar").arg("-tzf").arg(&archive))?
-                .lines()
-                .map(|entry| entry.trim_start_matches("./").to_owned())
-                .collect()
-        } else {
-            let mut zip = zip::ZipArchive::new(File::open(&archive)?)?;
-            let mut entries = BTreeSet::new();
-            for index in 0..zip.len() {
-                entries.insert(zip.by_index(index)?.name().to_owned());
-            }
-            entries
-        };
-        for name in BROWSER_BUNDLE_FILES {
-            if !entries.contains(&format!("bcode-runtimes/tui/{name}")) {
-                return Err(format_error(format!(
-                    "web release missing browser asset: {name}"
-                )));
-            }
-        }
-    }
-
     if target_kind == TargetKind::Macos {
         let binary = built_binary(&options.target, target_kind);
         ensure_file(&binary)?;
@@ -1631,6 +1623,7 @@ fn verify_release(options: &Options) -> Result<()> {
             &archive,
             target_kind,
             tesseract,
+            features_enable_web_renderer(&features),
             normalize_release_version(&options.version)?,
         )?;
     } else {
@@ -2596,6 +2589,7 @@ fn smoke_test_release_archive(
     archive: &Path,
     target_kind: TargetKind,
     tesseract: TesseractPackaging,
+    web_renderer: bool,
     expected_version: &str,
 ) -> Result<()> {
     let extraction = verification_extraction_path(archive);
@@ -2606,6 +2600,7 @@ fn smoke_test_release_archive(
         target_kind,
         &extraction,
         tesseract,
+        web_renderer,
         expected_version,
     );
     let cleanup = fs::remove_dir_all(&extraction);
@@ -2667,6 +2662,7 @@ fn smoke_test_release_archive_in(
     target_kind: TargetKind,
     extraction: &Path,
     tesseract: TesseractPackaging,
+    web_renderer: bool,
     expected_version: &str,
 ) -> Result<()> {
     if target_kind == TargetKind::Linux {
@@ -2695,12 +2691,11 @@ fn smoke_test_release_archive_in(
         verify_binary_version(&mut version, expected_version)?;
     }
     verify_extracted_artifact_identity(&binary)?;
-    let browser_bundle = extraction.join("bcode-runtimes/tui");
-    if browser_bundle.exists() {
-        verified_browser_bundle(&browser_bundle)?;
-        // Exercise packaged discovery without a daemon or provider: invalid assets
-        // must fail before startup and must not downgrade to the HTML frontend.
-        smoke_test_packaged_browser_rejection(&binary, &browser_bundle, extraction)?;
+    if web_renderer {
+        verify_embedded_browser_bundle(&binary)?;
+        // Exercise explicit-bundle validation without a daemon or provider: invalid
+        // assets must fail before startup and must not downgrade to the HTML frontend.
+        smoke_test_packaged_browser_rejection(&binary, extraction)?;
     }
     match tesseract {
         TesseractPackaging::None => {}
@@ -2721,85 +2716,143 @@ fn smoke_test_release_archive_in(
     Ok(())
 }
 
-fn smoke_test_packaged_browser_rejection(
-    binary: &Path,
-    bundle: &Path,
-    extraction: &Path,
-) -> Result<()> {
-    let asset = bundle.join("bootstrap.js");
-    let original = fs::read(&asset)?;
-    fs::write(&asset, b"deliberately mismatched release")?;
-    let probe = (|| {
-        let root = extraction.join("browser rejection smoke");
-        fs::create_dir_all(root.join("home"))?;
-        let config = root.join("config.toml");
-        fs::write(&config, "[skills]\nenabled = false\n")?;
-        let output_file = root.join("output.log");
-        let mut command = Command::new(binary);
-        command.env_clear();
-        for name in [
-            "PATH",
-            "SYSTEMROOT",
-            "SystemRoot",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "LD_LIBRARY_PATH",
-            "DYLD_LIBRARY_PATH",
-        ] {
-            if let Some(value) = env::var_os(name) {
-                command.env(name, value);
-            }
+/// Checks that the packaged binary embeds a valid browser TUI distribution.
+fn verify_embedded_browser_bundle(binary: &Path) -> Result<()> {
+    let digest = command_output(Command::new(binary).args(["web", "--verify-tui-assets"]))?;
+    let digest = digest.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format_error(format!(
+            "packaged web release reported no embedded browser TUI digest: {digest:?}"
+        )));
+    }
+    println!("verified embedded browser TUI: {digest}");
+    Ok(())
+}
+
+/// Writes a complete browser distribution whose manifest digests do not match its files.
+fn write_mismatched_browser_bundle(directory: &Path) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    let mut files = serde_json::Map::new();
+    for name in BROWSER_BUNDLE_FILES {
+        if name == "manifest.json" {
+            continue;
         }
-        command
-            .args(["--state-root"])
-            .arg(root.join("state"))
-            .arg("web")
-            .env("BCODE_CONFIG", &config)
-            .env("HOME", root.join("home"))
-            .env("USERPROFILE", root.join("home"))
-            .env("XDG_CONFIG_HOME", root.join("home/config"))
-            .env("XDG_STATE_HOME", root.join("home/state"))
-            .env("APPDATA", root.join("home/config"))
-            .env("LOCALAPPDATA", root.join("home/state"))
-            .stdin(Stdio::null())
-            .stdout(File::create(&output_file)?)
-            .stderr(File::create(root.join("error.log"))?);
-        let mut child = command.spawn()?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let diagnostics = fs::read_to_string(root.join("error.log"))?;
-                if status.success() || !diagnostics.contains("TUI asset digest mismatch") {
-                    return Err(format_error(format!(
-                        "packaged web launch did not reject mismatched bundled assets: {status}: {diagnostics}"
-                    )));
-                }
-                if root.join("state").exists() {
-                    let entries = fs::read_dir(root.join("state"))?;
-                    if entries.count() > 0 {
-                        return Err(format_error(
-                            "invalid packaged browser assets initialized daemon state",
-                        ));
+        let bytes: &[u8] = if name == "bcode_tui_web_bg.wasm" {
+            b"\0asm\x01\0\0\0\0"
+        } else {
+            b"deliberately mismatched release"
+        };
+        fs::write(directory.join(name), bytes)?;
+        files.insert(
+            name.to_owned(),
+            serde_json::json!({ "bytes": bytes.len(), "sha256": "0".repeat(64) }),
+        );
+    }
+    let manifest = serde_json::json!({
+        "schema_version": 2,
+        "artifact_sha256": "0".repeat(64),
+        "protocol": { "session_view": 1, "browser_bridge": 1, "canvas": 1 },
+        "files": files,
+    });
+    fs::write(
+        directory.join("manifest.json"),
+        serde_json::to_vec(&manifest).map_err(|error| format_error(error.to_string()))?,
+    )?;
+    Ok(())
+}
+
+/// Every client pins its executable image before dispatching a command, so a rejected launch
+/// may leave that pin (image, lease, and lock files) but no daemon record, log, or session.
+fn state_holds_only_client_image_pin(state: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(state) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        match name.to_str() {
+            Some("daemon-images" | "daemon-image-leases") => {}
+            Some("daemons") => {
+                for daemon_entry in fs::read_dir(state.join("daemons"))? {
+                    if daemon_entry?.file_name() != "daemon-images.lock" {
+                        return Ok(false);
                     }
                 }
-                break;
             }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn smoke_test_packaged_browser_rejection(binary: &Path, extraction: &Path) -> Result<()> {
+    let root = extraction.join("browser rejection smoke");
+    fs::create_dir_all(root.join("home"))?;
+    let bundle = root.join("mismatched tui");
+    write_mismatched_browser_bundle(&bundle)?;
+    let config = root.join("config.toml");
+    fs::write(&config, "[skills]\nenabled = false\n")?;
+    let output_file = root.join("output.log");
+    let mut command = Command::new(binary);
+    command.env_clear();
+    for name in [
+        "PATH",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .args(["--state-root"])
+        .arg(root.join("state"))
+        .arg("web")
+        .arg("--tui-assets")
+        .arg(&bundle)
+        .env("BCODE_CONFIG", &config)
+        .env("HOME", root.join("home"))
+        .env("USERPROFILE", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("home/config"))
+        .env("XDG_STATE_HOME", root.join("home/state"))
+        .env("APPDATA", root.join("home/config"))
+        .env("LOCALAPPDATA", root.join("home/state"))
+        .stdin(Stdio::null())
+        .stdout(File::create(&output_file)?)
+        .stderr(File::create(root.join("error.log"))?);
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let diagnostics = fs::read_to_string(root.join("error.log"))?;
+            if status.success() || !diagnostics.contains("TUI asset digest mismatch") {
+                return Err(format_error(format!(
+                    "packaged web launch did not reject mismatched bundled assets: {status}: {diagnostics}"
+                )));
+            }
+            if !state_holds_only_client_image_pin(&root.join("state"))? {
                 return Err(format_error(
-                    "packaged invalid-browser launch did not terminate before daemon startup",
+                    "invalid packaged browser assets initialized daemon state",
                 ));
             }
-            std::thread::sleep(Duration::from_millis(25));
+            break;
         }
-        Ok(())
-    })();
-    // Restore exact verified bytes even when the executable probe fails.
-    fs::write(&asset, original)?;
-    verified_browser_bundle(bundle)?;
-    probe
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format_error(
+                "packaged invalid-browser launch did not terminate before daemon startup",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
 }
 
 fn smoke_test_extracted_tesseract(extraction: &Path, target_kind: TargetKind) -> Result<()> {
@@ -3824,16 +3877,6 @@ fn verify_required_archive_entries(
             )));
         }
     }
-    let browser_prefix = "bcode-runtimes/tui/";
-    if entries.iter().any(|name| name.starts_with(browser_prefix)) {
-        for name in BROWSER_BUNDLE_FILES {
-            if !entries.contains(&format!("{browser_prefix}{name}")) {
-                return Err(format_error(format!(
-                    "release archive is missing browser asset: {name}"
-                )));
-            }
-        }
-    }
     if !tesseract.ships_runtime_tree() {
         return Ok(());
     }
@@ -4161,6 +4204,22 @@ mod tests {
     }
 
     #[test]
+    fn rejected_web_launch_may_leave_only_the_client_image_pin() {
+        let state = tempfile::tempdir().expect("state");
+        assert!(state_holds_only_client_image_pin(&state.path().join("missing")).expect("missing"));
+        fs::create_dir_all(state.path().join("daemon-images/artifact")).expect("images");
+        fs::create_dir_all(state.path().join("daemon-image-leases")).expect("leases");
+        fs::create_dir_all(state.path().join("daemons")).expect("daemons");
+        fs::write(state.path().join("daemons/daemon-images.lock"), b"").expect("lock");
+        assert!(state_holds_only_client_image_pin(state.path()).expect("pin only"));
+        fs::write(state.path().join("daemons/daemon.json"), b"{}").expect("record");
+        assert!(!state_holds_only_client_image_pin(state.path()).expect("record"));
+        fs::remove_file(state.path().join("daemons/daemon.json")).expect("remove record");
+        fs::create_dir(state.path().join("sessions")).expect("sessions");
+        assert!(!state_holds_only_client_image_pin(state.path()).expect("sessions"));
+    }
+
+    #[test]
     fn tesseract_packaging_ships_runtime_trees_only_for_dynamic_bundles() {
         let packaging = |features: &[&str]| {
             TesseractPackaging::from_features(
@@ -4314,23 +4373,6 @@ mod tests {
             serde_json::from_slice(assets.get("manifest.json").expect("real manifest"))
                 .expect("manifest JSON");
         assert!(verified_browser_bundle(directory.path()).is_ok());
-        let archive = directory.path().join("roundtrip.zip");
-        let stage = directory.path().join("stage");
-        let staged = stage.join("bcode-runtimes/tui");
-        fs::create_dir_all(&staged).expect("staging directory");
-        for (name, bytes) in verified_browser_bundle(directory.path()).expect("verified bytes") {
-            fs::write(staged.join(name), bytes).expect("staged bytes");
-        }
-        create_zip_archive(&archive, &stage).expect("distribution archive");
-        let extracted = directory.path().join("extracted");
-        fs::create_dir(&extracted).expect("extraction directory");
-        let mut zip =
-            zip::ZipArchive::new(File::open(&archive).expect("archive file")).expect("ZIP");
-        extract_zip_confined(&mut zip, &extracted).expect("confined extraction");
-        assert_eq!(
-            verified_browser_bundle(directory.path()).expect("source"),
-            verified_browser_bundle(&extracted.join("bcode-runtimes/tui")).expect("extracted"),
-        );
         fs::write(directory.path().join("bootstrap.js"), b"tampered").expect("tamper");
         assert!(verified_browser_bundle(directory.path()).is_err());
         fs::write(
@@ -4714,6 +4756,7 @@ mod tests {
                 &archive,
                 TargetKind::Windows,
                 TesseractPackaging::Dynamic,
+                false,
                 "0.0.1-alpha.0",
             )
             .is_err()

@@ -458,20 +458,20 @@ fn bundled_runtime_root() -> Result<PathBuf> {
             .canonicalize()
             .map_err(|_| Error::BundledRuntimePathUnavailable);
     }
-    if let Some(root) = executable_relative_runtime_root() {
-        return Ok(root);
-    }
-    bcode_tesseract_sys::compiled_bundled_runtime_root()
-        .map(PathBuf::from)
-        .ok_or(Error::BundledRuntimePathUnavailable)
+    artifact_runtime_root().ok_or(Error::BundledRuntimePathUnavailable)
 }
 
-fn executable_relative_runtime_root() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?.canonicalize().ok()?;
-    let exe_dir = exe.parent()?;
-    let root = exe_dir.join("bcode-runtimes").join("tesseract");
-    let canonical = root.canonicalize().ok()?;
-    canonical.starts_with(exe_dir).then_some(canonical)
+/// Returns `bcode-runtimes/tesseract` from this artifact's resources, confined to them.
+fn artifact_runtime_root() -> Option<PathBuf> {
+    let resources = bcode_plugin_sdk::artifact_resources::artifact_resource_root()?
+        .canonicalize()
+        .ok()?;
+    let root = resources
+        .join("bcode-runtimes")
+        .join("tesseract")
+        .canonicalize()
+        .ok()?;
+    root.starts_with(&resources).then_some(root)
 }
 
 #[cfg(not(windows))]

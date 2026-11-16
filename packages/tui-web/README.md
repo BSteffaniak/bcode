@@ -32,9 +32,11 @@ For a checkout-built executable with the web-renderer feature, use:
 /path/to/bcode web --tui-assets /absolute/path/to/NEW_OUTPUT_DIRECTORY
 ```
 
-A web-enabled release places those same files in `bcode-runtimes/tui` beside
-`bcode`. Its normal `bcode web` launch discovers them automatically; it does not
-need checkout paths or an acceptance-only route. The command opens the private
+A web-enabled build embeds those same files in the executable when
+`BCODE_TUI_WEB_BUNDLE` names the built directory; release builds require it. Its
+normal `bcode web` launch uses the embedded copy and never reads files beside the
+executable, checkout paths, or an acceptance-only route. `bcode web --verify-tui-assets`
+validates the embedded distribution and prints its artifact digest. The command opens the private
 launch URL through the platform browser opener; console output contains only a
 redacted address, not a reusable capability URL. The browser receives a scoped
 session launch token, not a daemon credential. Bootstrap removes the token from

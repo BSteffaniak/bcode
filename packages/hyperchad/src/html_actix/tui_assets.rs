@@ -5,16 +5,11 @@ use std::path::Path;
 use hyperchad::app::AppBuilder;
 use hyperchad::renderer::assets::{AssetPathTarget, StaticAssetRoute};
 
-/// Concrete files produced by the browser TUI distribution builder.
-pub const TUI_ASSET_FILES: [&str; 7] = [
-    "index.html",
-    "bootstrap.js",
-    "browser-session.js",
-    "interactive-surface.js",
-    "bcode_tui_web.js",
-    "bcode_tui_web_bg.wasm",
-    "manifest.json",
-];
+include!("tui_asset_files.rs");
+
+/// Browser TUI files embedded at build time from `BCODE_TUI_WEB_BUNDLE`, if any.
+const EMBEDDED_TUI_ASSETS: Option<&[(&str, &[u8])]> =
+    include!(concat!(env!("OUT_DIR"), "/tui_assets_embedded.rs"));
 
 const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: usize = 96 * 1024 * 1024;
@@ -105,9 +100,40 @@ fn validate_manifest(files: &[(&str, Vec<u8>)]) -> Result<AssetManifest, String>
 pub struct TuiAssets {
     files: Vec<(&'static str, Vec<u8>)>,
     compatibility: Vec<u8>,
+    artifact_sha256: String,
 }
 
 impl TuiAssets {
+    /// Validate the distribution embedded in this binary at build time.
+    ///
+    /// Returns `None` when the binary was built without `BCODE_TUI_WEB_BUNDLE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the embedded files fail the same validation as [`Self::load`].
+    #[must_use]
+    pub fn embedded() -> Option<Result<Self, String>> {
+        EMBEDDED_TUI_ASSETS.map(|embedded| {
+            let files = TUI_ASSET_FILES
+                .into_iter()
+                .map(|name| {
+                    embedded
+                        .iter()
+                        .find(|(embedded_name, _)| *embedded_name == name)
+                        .map(|(_, bytes)| (name, bytes.to_vec()))
+                        .ok_or_else(|| format!("missing embedded TUI asset: {name}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Self::from_files(files)
+        })
+    }
+
+    /// Return the distribution's artifact digest from its validated manifest.
+    #[must_use]
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
     /// Read and validate every required file before daemon or listener initialization.
     ///
     /// # Errors
@@ -123,7 +149,6 @@ impl TuiAssets {
             return Err("TUI assets path must be a directory".to_owned());
         }
         let mut files = Vec::with_capacity(TUI_ASSET_FILES.len());
-        let mut total = 0_usize;
         for name in TUI_ASSET_FILES {
             let source = root.join(name);
             let source_metadata = std::fs::symlink_metadata(&source)
@@ -156,6 +181,20 @@ impl TuiAssets {
             file.take(max_file_bytes + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|_| format!("cannot read TUI asset: {name}"))?;
+            files.push((name, bytes));
+        }
+        Self::from_files(files)
+    }
+
+    /// Validate complete distribution contents, in [`TUI_ASSET_FILES`] order.
+    fn from_files(files: Vec<(&'static str, Vec<u8>)>) -> Result<Self, String> {
+        let mut total = 0_usize;
+        for (name, bytes) in &files {
+            let max_file_bytes = if *name == "manifest.json" {
+                64 * 1024
+            } else {
+                MAX_ASSET_BYTES
+            };
             total = total.saturating_add(bytes.len());
             if bytes.is_empty()
                 || bytes.len() as u64 > max_file_bytes
@@ -163,14 +202,13 @@ impl TuiAssets {
             {
                 return Err(format!("TUI assets exceed distribution bounds: {name}"));
             }
-            if name == "bcode_tui_web_bg.wasm" {
+            if *name == "bcode_tui_web_bg.wasm" {
                 if !bytes.starts_with(b"\0asm\x01\0\0\0") || bytes.len() == 8 {
                     return Err("invalid or empty TUI WASM module".to_owned());
                 }
-            } else if std::str::from_utf8(&bytes).is_err() {
+            } else if std::str::from_utf8(bytes).is_err() {
                 return Err(format!("TUI text asset is not UTF-8: {name}"));
             }
-            files.push((name, bytes));
         }
         let manifest = validate_manifest(&files)?;
         let compatibility = serde_json::to_vec(&serde_json::json!({
@@ -182,6 +220,7 @@ impl TuiAssets {
         Ok(Self {
             files,
             compatibility,
+            artifact_sha256: manifest.artifact_sha256,
         })
     }
 

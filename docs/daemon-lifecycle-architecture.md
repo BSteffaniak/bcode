@@ -206,6 +206,12 @@ A state-root image lock coordinates publication and shared lease acquisition aga
 
 Malformed records, unreadable registry evidence, and unknown record schemas also make routine image cleanup fail closed so a newer or historical daemon image is never removed merely because the current build cannot interpret its evidence. This cache lifecycle does not change canonical session storage locations.
 
+### Artifact resources
+
+An artifact is its executable plus the resource trees beside it named by `bcode_plugin_sdk::artifact_resources::ARTIFACT_RESOURCE_TREES` (`bcode-runtimes/` for loadable native runtimes and `plugins/` for native plugins). Before spawning a daemon, lifecycle snapshots those trees from the spawning process's resource root into the image as `resources-<sha256>`, where the digest covers every file's relative path, length, SHA-256, and executable bit. Files are hashed, then copied with a second hash that must match, so a tree that changes mid-copy fails publication rather than being pinned. Snapshots publish atomically through a temporary directory under the image publication lock, and an artifact without resource trees still receives an empty snapshot. They live inside the image directory, so image retention and cleanup cover them.
+
+The daemon receives the snapshot path in `BCODE_ARTIFACT_RESOURCES`. Every resource lookup goes through `artifact_resource_root`, which honors that variable only when the snapshot sits in the running executable's own image directory. Otherwise it uses the executable's directory. A daemon therefore never reads plugins or runtimes from a mutable installation, a Cargo build directory, or its own image directory, and an unrelated `bcode` started from a daemon child process resolves its own installation. Assets with a fixed build-time shape (OCR language data, the browser TUI, X-ray web assets, Mermaid) are embedded in the executable instead of shipped as resources.
+
 ## Startup coordination and readiness
 
 The startup lock is artifact-scoped through the namespace. A lock holder rechecks readiness before spawn, owns stale endpoint recovery, materializes the image, spawns the child, and waits for readiness. Other processes wait for the lock and recheck rather than intentionally launching another child.

@@ -105,13 +105,6 @@ pub const fn compiled_tessdata_prefix() -> Option<&'static str> {
     option_env!("BCODE_TESSDATA_PREFIX")
 }
 
-/// Returns the bundled runtime root emitted by the build script, when bundled
-/// dynamic runtimes were built.
-#[must_use]
-pub const fn compiled_bundled_runtime_root() -> Option<&'static str> {
-    option_env!("BCODE_TESSERACT_BUNDLED_RUNTIMES")
-}
-
 /// Returns the bundled versions emitted by the build script, when bundled
 /// runtimes were built or statically linked.
 #[must_use]

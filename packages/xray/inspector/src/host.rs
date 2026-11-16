@@ -491,12 +491,14 @@ fn secure_response(mut response: Response, csp: &str) -> Response {
 }
 
 fn launch_assets(explicit: Option<&Path>) -> Result<BTreeMap<String, Asset>, CliError> {
-    if explicit.is_some() {
+    if let Some(explicit) = explicit {
         return load_assets(&resolve_assets(explicit)?);
     }
+    // Only assets embedded in this exact artifact; never the working directory or
+    // files beside the executable.
     let bundled = crate::assets::bundled_assets();
     if bundled.is_empty() {
-        return load_assets(&resolve_assets(None)?);
+        return Err(missing_assets());
     }
     let mut assets = BTreeMap::new();
     let mut total = 0_usize;
@@ -533,29 +535,16 @@ fn launch_assets(explicit: Option<&Path>) -> Result<BTreeMap<String, Asset>, Cli
     Ok(assets)
 }
 
-fn resolve_assets(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
-    if let Some(path) = explicit {
-        return std::fs::canonicalize(path).map_err(|_| missing_assets());
-    }
-    let mut candidates = vec![PathBuf::from("packages/xray/web/dist")];
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-    {
-        candidates.push(parent.join("xray-web"));
-    }
-    candidates
-        .into_iter()
-        .find_map(|path| {
-            std::fs::canonicalize(path)
-                .ok()
-                .filter(|root| root.join("index.html").is_file())
-        })
+fn resolve_assets(explicit: &Path) -> Result<PathBuf, CliError> {
+    std::fs::canonicalize(explicit)
+        .ok()
+        .filter(|root| root.join("index.html").is_file())
         .ok_or_else(missing_assets)
 }
 
 fn missing_assets() -> CliError {
     invalid(
-        "X-ray web assets unavailable. Build packages/xray/web, then pass --asset-dir /absolute/path/to/dist (or install xray-web beside bcode). Other Bcode commands do not require these assets.",
+        "X-ray web assets unavailable. This build embeds none; build bcode with `cargo xtask build` to embed them, or build packages/xray/web and pass --asset-dir /absolute/path/to/dist. Other Bcode commands do not require these assets.",
     )
 }
 

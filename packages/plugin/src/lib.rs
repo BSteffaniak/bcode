@@ -2348,10 +2348,9 @@ pub fn default_plugin_roots() -> Vec<PathBuf> {
                 .join("plugins"),
         );
     }
-    if let Ok(exe) = env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        roots.push(parent.join("plugins"));
+    // Plugins shipped with this artifact; a daemon reads them from its pinned snapshot.
+    if let Some(plugins) = bcode_plugin_sdk::artifact_resources::artifact_resource_path("plugins") {
+        roots.push(plugins);
     }
     roots
 }

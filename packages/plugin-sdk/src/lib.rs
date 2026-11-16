@@ -6,6 +6,7 @@
 //! Plugin author SDK for Bcode native plugins.
 
 pub mod application;
+pub mod artifact_resources;
 pub mod auxiliary_generation;
 pub mod composer;
 pub mod generation;
