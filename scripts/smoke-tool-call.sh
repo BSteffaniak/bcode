@@ -20,67 +20,6 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features distribution
 
-cargo build --quiet -p bcode_fake_provider_plugin -p bcode_filesystem_plugin
-
-case "$(uname -s)" in
-    Darwin)
-        fake_dylib="${root}/target/debug/libbcode_fake_provider_plugin.dylib"
-        fs_dylib="${root}/target/debug/libbcode_filesystem_plugin.dylib"
-        ;;
-    Linux)
-        fake_dylib="${root}/target/debug/libbcode_fake_provider_plugin.so"
-        fs_dylib="${root}/target/debug/libbcode_filesystem_plugin.so"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        fake_dylib="${root}/target/debug/bcode_fake_provider_plugin.dll"
-        fs_dylib="${root}/target/debug/bcode_filesystem_plugin.dll"
-        ;;
-    *)
-        echo "unsupported platform: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
-fake_dir="${workdir}/config/bcode/plugins/fake-provider"
-fs_dir="${workdir}/config/bcode/plugins/filesystem"
-mkdir -p "${fake_dir}" "${fs_dir}"
-cat >"${fake_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.fake-provider"
-name = "Bcode Fake Model Provider"
-version = "0.0.1"
-
-[[services]]
-interface_id = "bcode.model-provider/v1"
-name = "Fake Model Provider"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${fake_dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
-cat >"${fs_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.filesystem"
-name = "Bcode Filesystem Plugin"
-version = "0.0.1"
-
-[[services]]
-interface_id = "bcode.filesystem/v1"
-name = "Filesystem"
-
-[[services]]
-interface_id = "bcode.tool/v1"
-name = "Filesystem Tools"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${fs_dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
-
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
 mkdir -p "${workdir}/tmp"
@@ -93,6 +32,10 @@ enabled = ["bcode.fake-provider", "bcode.filesystem"]
 [model]
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
+
+# The fake provider does not implement prompt caching.
+[model.prompt_cache]
+mode = "off"
 EOF
 
 target_file="${workdir}/tool-input.txt"

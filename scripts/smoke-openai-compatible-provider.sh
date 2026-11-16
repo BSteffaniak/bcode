@@ -25,44 +25,6 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features distribution
 
-cargo build --quiet -p bcode_openai_compatible_provider_plugin
-
-case "$(uname -s)" in
-    Darwin)
-        dylib="${root}/target/debug/libbcode_openai_compatible_provider_plugin.dylib"
-        ;;
-    Linux)
-        dylib="${root}/target/debug/libbcode_openai_compatible_provider_plugin.so"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        dylib="${root}/target/debug/bcode_openai_compatible_provider_plugin.dll"
-        ;;
-    *)
-        echo "unsupported platform: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
-plugin_dir="${workdir}/config/bcode/plugins/openai-compatible"
-mkdir -p "${plugin_dir}"
-cat >"${plugin_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.openai-compatible"
-name = "Bcode OpenAI-Compatible Provider"
-version = "0.0.1"
-
-[[services]]
-description = "OpenAI-compatible chat completions model provider"
-interface_id = "bcode.model-provider/v1"
-name = "OpenAI-Compatible Model Provider"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
-
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
 mkdir -p "${workdir}/tmp"

@@ -55,20 +55,11 @@ esac
 cd "${root}"
 
 if [[ "${BCODE_TUI_PTY_SKIP_BUILD:-0}" != "1" ]]; then
-    cargo build "${cargo_profile_args[@]}" --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
+    cargo build "${cargo_profile_args[@]}" --quiet -p bcode --features distribution
     cargo build "${cargo_profile_args[@]}" --quiet -p bcode_tui_components --features grid-probe --bin bcode_terminal_grid_probe
 fi
 
-case "$(uname -s)" in
-    Darwin)
-        fake_dylib="${root}/target/${target_profile}/libbcode_fake_provider_plugin.dylib"
-        ;;
-    Linux)
-        fake_dylib="${root}/target/${target_profile}/libbcode_fake_provider_plugin.so"
-        ;;
-esac
-
-mkdir -p "${workdir}/tmp" "${workdir}/config/bcode/plugins/fake-provider"
+mkdir -p "${workdir}/tmp"
 export TMPDIR="${workdir}/tmp"
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
@@ -76,23 +67,6 @@ export BCODE_STATE_DIR="${workdir}/state"
 export BCODE_NO_ONBOARD=1
 # This acceptance owns isolated state; never contact the caller's resurrection host.
 export BCODE_NO_SESSION_RESURRECTION=1
-python3 - "${root}/plugins/fake-provider-plugin/bcode-plugin.toml" \
-    "${workdir}/config/bcode/plugins/fake-provider/bcode-plugin.toml" "${fake_dylib}" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-source_path, destination_path, library_path = sys.argv[1:]
-manifest = Path(source_path).read_text()
-manifest, replacements = re.subn(
-    r'(?m)^library\s*=\s*"[^"]+"$',
-    f'library      = "{library_path}"',
-    manifest,
-)
-if replacements != 1:
-    raise SystemExit(f"{source_path}: expected exactly one runtime library declaration")
-Path(destination_path).write_text(manifest)
-PY
 cat >"${BCODE_CONFIG}" <<'EOF'
 [plugins]
 default = "none"

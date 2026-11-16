@@ -25,33 +25,6 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features distribution
 
-cargo build --quiet \
-    -p bcode_openai_compatible_provider_plugin \
-    -p bcode_filesystem_plugin \
-    -p bcode_shell_plugin
-
-case "$(uname -s)" in
-    Darwin)
-        openai_dylib="${root}/target/debug/libbcode_openai_compatible_provider_plugin.dylib"
-        fs_dylib="${root}/target/debug/libbcode_filesystem_plugin.dylib"
-        shell_dylib="${root}/target/debug/libbcode_shell_plugin.dylib"
-        ;;
-    Linux)
-        openai_dylib="${root}/target/debug/libbcode_openai_compatible_provider_plugin.so"
-        fs_dylib="${root}/target/debug/libbcode_filesystem_plugin.so"
-        shell_dylib="${root}/target/debug/libbcode_shell_plugin.so"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        openai_dylib="${root}/target/debug/bcode_openai_compatible_provider_plugin.dll"
-        fs_dylib="${root}/target/debug/bcode_filesystem_plugin.dll"
-        shell_dylib="${root}/target/debug/bcode_shell_plugin.dll"
-        ;;
-    *)
-        echo "unsupported platform: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
 cat >"${workdir}/mock_openai_coding.js" <<'JS'
 const fs = require('fs');
 const http = require('http');
@@ -152,63 +125,6 @@ if [[ ! -s "${workdir}/mock-port" ]]; then
     exit 1
 fi
 mock_port="$(cat "${workdir}/mock-port")"
-
-openai_dir="${workdir}/config/bcode/plugins/openai-compatible"
-fs_dir="${workdir}/config/bcode/plugins/filesystem"
-shell_dir="${workdir}/config/bcode/plugins/shell"
-mkdir -p "${openai_dir}" "${fs_dir}" "${shell_dir}"
-cat >"${openai_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.openai-compatible"
-name = "Bcode OpenAI-Compatible Provider"
-version = "0.0.1"
-
-[[services]]
-interface_id = "bcode.model-provider/v1"
-name = "OpenAI-Compatible Model Provider"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${openai_dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
-cat >"${fs_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.filesystem"
-name = "Bcode Filesystem Plugin"
-version = "0.0.1"
-
-[[services]]
-interface_id = "bcode.filesystem/v1"
-name = "Filesystem"
-
-[[services]]
-interface_id = "bcode.tool/v1"
-name = "Filesystem Tools"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${fs_dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
-cat >"${shell_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.shell"
-name = "Bcode Shell Plugin"
-version = "0.0.1"
-
-[[services]]
-interface_id = "bcode.tool/v1"
-name = "Shell Tools"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${shell_dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
 
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"

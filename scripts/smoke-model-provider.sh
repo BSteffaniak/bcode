@@ -20,49 +20,6 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features distribution
 
-cargo build --quiet -p bcode_fake_provider_plugin
-
-case "$(uname -s)" in
-    Darwin)
-        dylib="${root}/target/debug/libbcode_fake_provider_plugin.dylib"
-        ;;
-    Linux)
-        dylib="${root}/target/debug/libbcode_fake_provider_plugin.so"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        dylib="${root}/target/debug/bcode_fake_provider_plugin.dll"
-        ;;
-    *)
-        echo "unsupported platform: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
-if [[ ! -f "${dylib}" ]]; then
-    echo "plugin library was not built: ${dylib}" >&2
-    exit 1
-fi
-
-plugin_dir="${workdir}/config/bcode/plugins/fake-provider"
-mkdir -p "${plugin_dir}"
-cat >"${plugin_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.fake-provider"
-name = "Bcode Fake Model Provider"
-version = "0.0.1"
-
-[[services]]
-description = "Deterministic model provider used by tests and smoke flows"
-interface_id = "bcode.model-provider/v1"
-name = "Fake Model Provider"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
-
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
 mkdir -p "${workdir}/tmp"
@@ -75,6 +32,10 @@ enabled = ["bcode.fake-provider"]
 [model]
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
+
+# The fake provider does not implement prompt caching.
+[model.prompt_cache]
+mode = "off"
 EOF
 
 "${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
@@ -92,7 +53,7 @@ done
 "${root}/target/debug/bcode" model list | grep "fake-echo" >/dev/null
 "${root}/target/debug/bcode" model capabilities | grep "bcode.fake-provider" >/dev/null
 session_id="$("${root}/target/debug/bcode" session create model-provider-smoke)"
-"${root}/target/debug/bcode" model set "${session_id}" --provider bcode.fake-provider fake-echo | grep "session model set" >/dev/null
+"${root}/target/debug/bcode" model set "${session_id}" --provider bcode.fake-provider fake-echo | grep "model_set: ${session_id}" >/dev/null
 "${root}/target/debug/bcode" session history "${session_id}" | grep "model changed: bcode.fake-provider/fake-echo" >/dev/null
 "${root}/target/debug/bcode" send "${session_id}" "hello model" >/dev/null
 for _ in {1..100}; do

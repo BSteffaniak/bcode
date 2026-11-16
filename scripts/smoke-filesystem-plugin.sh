@@ -15,48 +15,10 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features distribution
 
-cargo build --quiet -p bcode_filesystem_plugin
-
-case "$(uname -s)" in
-    Darwin)
-        dylib="${root}/target/debug/libbcode_filesystem_plugin.dylib"
-        ;;
-    Linux)
-        dylib="${root}/target/debug/libbcode_filesystem_plugin.so"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        dylib="${root}/target/debug/bcode_filesystem_plugin.dll"
-        ;;
-    *)
-        echo "unsupported platform: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
-if [[ ! -f "${dylib}" ]]; then
-    echo "plugin library was not built: ${dylib}" >&2
-    exit 1
-fi
-
-plugin_dir="${workdir}/plugins/filesystem"
-mkdir -p "${plugin_dir}"
-cat >"${plugin_dir}/bcode-plugin.toml" <<EOF
-id = "bcode.filesystem"
-name = "Bcode Filesystem Plugin"
-version = "0.0.1"
-
-[[services]]
-description = "Filesystem read/write utility service"
-interface_id = "bcode.filesystem/v1"
-name = "Filesystem"
-
-[runtime]
-type = "native"
-abi_version = 2
-library = "${dylib}"
-event_symbol = "bcode_plugin_handle_event_v1"
-service_symbol = "bcode_plugin_invoke_service_v1"
-EOF
+# Package the filesystem backend as a shared-ABI thin wrapper and stage it with its
+# verbatim declaration. `plugin check` loads the staged wrapper itself; service calls go
+# through the CLI host, where this distribution's bundled registration takes precedence.
+python3 scripts/stage-plugin-wrapper.py plugins/filesystem-plugin "${workdir}/plugins/filesystem" >/dev/null
 
 export BCODE_CONFIG="${workdir}/bcode.toml"
 cat >"${BCODE_CONFIG}" <<EOF
@@ -69,6 +31,7 @@ write_payload="{\"path\":\"${target_file}\",\"contents\":\"hello filesystem\"}"
 read_payload="{\"path\":\"${target_file}\"}"
 
 "${root}/target/debug/bcode" plugin services --root "${workdir}/plugins" | grep "bcode.filesystem/v1" >/dev/null
+"${root}/target/debug/bcode" plugin check --root "${workdir}/plugins" | grep $'bcode.filesystem\tOK' >/dev/null
 "${root}/target/debug/bcode" plugin call --root "${workdir}/plugins" bcode.filesystem/v1 write "${write_payload}" | grep '"bytes_written"' >/dev/null
 "${root}/target/debug/bcode" plugin call --root "${workdir}/plugins" bcode.filesystem/v1 read "${read_payload}" | grep "hello filesystem" >/dev/null
 

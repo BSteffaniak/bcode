@@ -20,34 +20,13 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features "distribution${BCODE_SMOKE_EXTRA_FEATURES:+,${BCODE_SMOKE_EXTRA_FEATURES}}"
 
-cargo build --quiet -p bcode_hello_plugin
-
-case "$(uname -s)" in
-    Darwin)
-        dylib="${root}/target/debug/libbcode_hello_plugin.dylib"
-        ;;
-    Linux)
-        dylib="${root}/target/debug/libbcode_hello_plugin.so"
-        ;;
-    MINGW*|MSYS*|CYGWIN*)
-        dylib="${root}/target/debug/bcode_hello_plugin.dll"
-        ;;
-    *)
-        echo "unsupported platform: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
-if [[ ! -f "${dylib}" ]]; then
-    echo "plugin library was not built: ${dylib}" >&2
-    exit 1
-fi
-
 plugin_dir="${workdir}/plugins/hello"
 daemon_plugin_dir="${workdir}/config/bcode/plugins/hello"
-mkdir -p "${plugin_dir}" "${daemon_plugin_dir}"
-sed "s|^library .*|library = \"${dylib}\"|" examples/hello-plugin/bcode-plugin.toml >"${plugin_dir}/bcode-plugin.toml"
-cp "${plugin_dir}/bcode-plugin.toml" "${daemon_plugin_dir}/bcode-plugin.toml"
+# Build the hello backend as a shared-ABI thin wrapper through the shared packager and
+# stage it with its verbatim declaration; the implementation crate is export-free.
+python3 scripts/stage-plugin-wrapper.py examples/hello-plugin "${plugin_dir}" >/dev/null
+mkdir -p "${daemon_plugin_dir}"
+cp "${plugin_dir}"/* "${daemon_plugin_dir}/"
 
 export BCODE_CONFIG="${workdir}/bcode.toml"
 cat >"${BCODE_CONFIG}" <<EOF
