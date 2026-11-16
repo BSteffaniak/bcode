@@ -191,6 +191,9 @@ struct Chosen {
     /// Id of a source the edited review already had.
     id: Option<String>,
     included: bool,
+    /// Files it selected when it was chosen in the tree picker (changed files, for uncommitted
+    /// changes in paths); folders are listed again whenever the review opens.
+    files: Option<u32>,
 }
 
 /// Step 2 of one source type.
@@ -497,6 +500,7 @@ impl Wizard {
                 label: source.label.clone(),
                 id: Some(source.id.clone()),
                 included: source.included,
+                files: None,
             })
             .collect();
         wizard.typed_title = Some(workspace.title.clone());
@@ -522,6 +526,7 @@ impl Wizard {
                 kind,
                 id: None,
                 included: true,
+                files: None,
             })
             .collect();
         wizard.typed_title = title.filter(|title| !title.trim().is_empty());
@@ -1151,6 +1156,7 @@ impl Wizard {
     fn paths_done(&mut self, purpose: PathPurpose, replace: Option<usize>, choice: PathChoice) {
         self.show_ignored = choice.show_ignored;
         self.chose_ignored = Some(choice.show_ignored);
+        let files = self.paths.as_ref().and_then(PathPicker::total);
         let kind = match purpose {
             PathPurpose::Files => {
                 bcode_code_review::selectors::files_source(choice.include, choice.exclude)
@@ -1201,9 +1207,16 @@ impl Wizard {
             Some(source) => {
                 source.kind = kind;
                 source.label = label;
+                source.files = files;
                 self.enter_confirm();
             }
-            None => self.add_sources(vec![(kind, label)]),
+            None => {
+                self.add_sources(vec![(kind.clone(), label)]);
+                if let Some(source) = self.sources.iter_mut().find(|source| source.kind == kind) {
+                    source.files = files;
+                }
+                self.pending_items = true;
+            }
         }
     }
 
@@ -1280,6 +1293,7 @@ impl Wizard {
                 label,
                 id: None,
                 included: true,
+                files: None,
             });
         }
         self.enter_confirm();
@@ -1659,7 +1673,16 @@ impl Wizard {
                     .cloned()
                     .unwrap_or_else(|| "ctrl+e".to_owned());
                 items.extend(self.sources.iter().enumerate().map(|(index, source)| {
-                    let mut detail = match (editing, source.included) {
+                    let mut detail = source.files.map_or_else(String::new, |files| {
+                        let what =
+                            if matches!(source.kind, ReviewSourceKind::WorkingTreePaths { .. }) {
+                                "changed file"
+                            } else {
+                                "file"
+                            };
+                        format!("{files} {what}{} now · ", if files == 1 { "" } else { "s" })
+                    });
+                    detail += &match (editing, source.included) {
                         (false, _) => "enter removes".to_owned(),
                         (true, true) => "included · tab excludes · enter removes".to_owned(),
                         (true, false) => "excluded · tab includes · enter removes".to_owned(),

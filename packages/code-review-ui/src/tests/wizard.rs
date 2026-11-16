@@ -394,7 +394,9 @@ fn the_tree_selects_folders_files_and_exclusions_with_tri_state_checks() {
     scenario.key("alt+l");
     settled(&mut scenario);
     scenario.key("enter");
-    settled(&mut scenario);
+    let screen = settled(&mut scenario);
+    // Step 3 says how many files the source selected.
+    assert!(screen.contains("1 file now"), "{}", screen.text());
     let created = create(&mut scenario, &backend, &fixture);
     assert_eq!(
         kinds(&created),
