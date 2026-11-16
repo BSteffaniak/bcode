@@ -1541,6 +1541,8 @@ dependencies = [
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_workflow_view_models",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
  "futures 0.3.34",
  "hex",
  "jsonschema",
@@ -1656,12 +1658,14 @@ dependencies = [
 name = "bcode_auth_broker_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_command",
  "bcode_confined_fs",
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_xray",
  "bcode_xray_models",
+ "bmux_plugin_sdk",
  "clap",
  "reqwest 0.12.28",
  "serde",
@@ -1704,6 +1708,7 @@ name = "bcode_blims_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
+ "bcode_command",
  "bcode_config",
  "bcode_ipc",
  "bcode_plugin_sdk",
@@ -1784,8 +1789,11 @@ dependencies = [
  "bcode_workflow_plugin",
  "bcode_worktree_plugin",
  "bcode_xray_plugin",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
  "serde_json",
  "tokio",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -1863,6 +1871,7 @@ dependencies = [
  "bcode_xray",
  "bcode_xray_inspector",
  "bcode_xray_models",
+ "bmux_plugin_sdk",
  "bmux_terminal",
  "chrono",
  "clap",
@@ -2084,6 +2093,7 @@ dependencies = [
  "bcode_model",
  "bcode_session_models",
  "bmux_plugin_schema",
+ "clap",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2339,9 +2349,21 @@ dependencies = [
 name = "bcode_file_references_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_filesystem_plugin",
+ "bcode_filesystem_models",
  "bcode_plugin_sdk",
  "bcode_tool",
+ "bmux_ipc",
+ "bmux_plugin_schema",
+ "bmux_plugin_sdk",
+ "futures 0.3.34",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_filesystem_models"
+version = "0.0.1-alpha.0"
+dependencies = [
  "serde",
  "serde_json",
 ]
@@ -2351,15 +2373,20 @@ name = "bcode_filesystem_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_confined_fs",
+ "bcode_filesystem_models",
  "bcode_plugin_models",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_syntax_render",
  "bcode_tool",
  "bcode_tui_components",
+ "bmux_ipc",
+ "bmux_plugin_schema",
+ "bmux_plugin_sdk",
  "bmux_tui",
  "bmux_tui_components",
  "devicons",
+ "futures 0.3.34",
  "gix-config",
  "hex",
  "ignore",
@@ -2557,6 +2584,9 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_provider_auth_models",
  "bcode_tool",
+ "bmux_keyboard",
+ "bmux_text_edit",
+ "bmux_tui",
  "serde_json",
 ]
 
@@ -2983,11 +3013,10 @@ dependencies = [
  "bcode_tool",
  "bcode_workflow",
  "bcode_xray",
- "bcode_xray_models",
  "bmux_plugin",
+ "bmux_plugin_runtime",
  "bmux_plugin_sdk",
  "hex",
- "libloading 0.9.0",
  "semver",
  "serde",
  "serde_json",
@@ -2996,6 +3025,7 @@ dependencies = [
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3048,21 +3078,21 @@ dependencies = [
  "bcode_usage_models",
  "bcode_workflow",
  "bcode_workflow_view_models",
- "bcode_xray",
- "bcode_xray_models",
  "bmux_keyboard",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
  "clap",
- "hex",
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "toml 1.1.8+spec-1.1.0",
  "trybuild",
+ "uuid",
  "zeroize",
 ]
 
@@ -3179,8 +3209,8 @@ dependencies = [
 name = "bcode_question_dynamic_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_plugin_sdk",
  "bcode_question_plugin",
+ "bmux_plugin_sdk",
 ]
 
 [[package]]
@@ -3898,6 +3928,9 @@ dependencies = [
  "bmux_image",
  "bmux_keyboard",
  "bmux_mermaid_render",
+ "bmux_plugin",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
  "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_text_edit",
@@ -4636,9 +4669,11 @@ source = "git+https://github.com/BSteffaniak/bmux?branch=master#97d5ebbe69eb1f3a
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
+ "bmux_keyboard",
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
  "bmux_plugin_sdk",
+ "bmux_tui",
  "libc",
  "libloading 0.9.0",
  "semver",
