@@ -1,8 +1,8 @@
 //! The repository's path index: what the path picker, `find_paths`, and selector counts read.
 //!
-//! One index lists the repository as it is now: tracked files, untracked files that are not
-//! ignored, and, when asked, ignored files with ignored folders collapsed to one entry each (an
-//! ignored `target/` costs one entry, not millions). It holds at most
+//! One index lists the repository as it is now: tracked files still in the working tree,
+//! untracked files that are not ignored, and, when asked, ignored files with ignored folders
+//! collapsed to one entry each (an ignored `target/` costs one entry, not millions). It holds at most
 //! [`REVIEW_PATH_INDEX_MAX_PATHS`] paths; beyond that it is marked truncated.
 //!
 //! Indexes are kept per repository and ignored-files choice, at most [`MAX_CACHED_INDEXES`],
@@ -107,6 +107,12 @@ impl PathIndex {
             Ok(listed)
         };
         let tracked = run(&["ls-files", "-z", "--cached"])?;
+        // Tracked files deleted from the working tree are not there now.
+        let deleted = git::limited_records(
+            git::command(root, &["ls-files", "-z", "--deleted"]),
+            REVIEW_PATH_INDEX_MAX_PATHS,
+        )?;
+        let gone: BTreeSet<&str> = deleted.records.iter().map(String::as_str).collect();
         let untracked = run(&["ls-files", "-z", "--others", "--exclude-standard"])?;
         let ignored = if include_ignored {
             run(&[
@@ -137,7 +143,7 @@ impl PathIndex {
             (&ignored.records, ReviewPathStatus::Ignored),
         ] {
             for path in records {
-                if path.ends_with('/') || files.contains_key(path) {
+                if path.ends_with('/') || files.contains_key(path) || gone.contains(path.as_str()) {
                     continue;
                 }
                 files.insert(
@@ -177,7 +183,12 @@ impl PathIndex {
             ignored_folders,
             folders,
             truncated,
-            generation: fingerprint(&[&tracked.digest, &untracked.digest, &ignored.digest]),
+            generation: fingerprint(&[
+                &tracked.digest,
+                &deleted.digest,
+                &untracked.digest,
+                &ignored.digest,
+            ]),
             packages: OnceLock::new(),
         })
     }

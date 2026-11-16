@@ -714,3 +714,22 @@ fn uncommitted_marks_read_names_with_spaces_binary_changes_and_renames() {
         "only the edited line of a renamed file"
     );
 }
+
+#[test]
+fn a_file_deleted_from_the_working_tree_leaves_folder_reviews_and_counts() {
+    let fixture = repository();
+    let repo = fixture.root();
+    std::fs::remove_file(repo.join("examples/hello-plugin/src/greet.rs")).expect("remove");
+    let service = ReviewData::default();
+    let source = resolved(&service, repo, file_set(vec![folder(HELLO)], Vec::new()));
+    let entries = full_index(&service, repo, &source);
+    assert!(
+        !paths(&entries).contains(&"examples/hello-plugin/src/greet.rs"),
+        "{:?}",
+        paths(&entries)
+    );
+    assert_eq!(
+        counted(&service, repo, vec![folder(HELLO)], false),
+        u32::try_from(entries.len()).expect("count")
+    );
+}
