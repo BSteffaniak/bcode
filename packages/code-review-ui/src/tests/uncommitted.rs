@@ -216,3 +216,52 @@ fn renamed_binary_and_spaced_files_show_their_uncommitted_change() {
         "a pure rename has no new lines: {renamed}"
     );
 }
+
+#[test]
+fn a_listing_cut_at_the_file_limit_says_so_once() {
+    let fixture = changed_fixture();
+    for name in ["a.md", "b.md", "c.md"] {
+        std::fs::write(fixture.root().join("notes").join(name), "x\n").expect("write");
+    }
+    let backend = Arc::new(TestBackend::default());
+    let config = ReviewViewConfig {
+        files: FilesConfig {
+            max_files: Some(2),
+            ..FilesConfig::default()
+        },
+        ..ReviewViewConfig::default()
+    };
+    let (mut scenario, screen) = open_with(
+        &fixture,
+        &backend,
+        config,
+        Entry::Sources {
+            title: None,
+            sources: vec![notes()],
+        },
+    );
+    assert!(
+        screen.contains("Some files are not listed"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        screen.contains("resolves to 4 files; showing"),
+        "{}",
+        screen.text()
+    );
+    let surface = scenario.surface().review().expect("review");
+    assert_eq!(surface.file_tree().expect("tree").file_count(), 2);
+    let warnings = |surface: &crate::surface::ReviewSurface| {
+        surface
+            .toasts()
+            .into_iter()
+            .filter(|toast| *toast == "Some files are not listed")
+            .count()
+    };
+    assert_eq!(warnings(surface), 1);
+    // A refresh lists the same cut again without repeating the warning.
+    scenario.key("r");
+    settled(&mut scenario);
+    assert_eq!(warnings(scenario.surface().review().expect("review")), 1);
+}

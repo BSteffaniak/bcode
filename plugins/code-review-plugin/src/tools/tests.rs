@@ -1571,3 +1571,29 @@ fn find_paths_names_a_folder_that_create_review_reviews_as_it_is_now() {
         missing.output
     );
 }
+
+#[test]
+fn list_files_says_when_a_folder_is_cut_at_the_file_limit() {
+    let mut harness = Harness::new();
+    let root = harness.fixture.root().join("bulk");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let limit = bcode_code_review_models::REVIEW_FILES_DEFAULT_MAX_FILES;
+    for index in 0..=limit {
+        std::fs::write(root.join(format!("{index:05}.txt")), "x\n").expect("write");
+    }
+    let review = created(
+        &mut harness,
+        &json!({"sources": [{"kind": "files", "paths": ["bulk/"]}]}),
+    );
+    let id = review["id"].as_str().expect("id").to_owned();
+    // The answer is long enough to be cut to the output limit; the warning comes first.
+    let files = harness.ok("code_review.list_files", &json!({"review": id}), SESSION);
+    let head: String = files.chars().take(400).collect();
+    assert!(
+        head.contains(&format!(
+            "resolves to {} files; showing the first {limit}",
+            limit + 1
+        )),
+        "{head}"
+    );
+}

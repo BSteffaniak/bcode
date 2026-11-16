@@ -156,7 +156,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.list_files",
         access: Access::Read,
-        description: "List the review's changed files with status, added and removed lines, and whether the reviewer marked each viewed.",
+        description: "List the review's changed files with status, added and removed lines, and whether the reviewer marked each viewed. `truncated` says which folder, glob or repository sources were cut to their file limit (files.max_files) and how many files they select in all.",
         schema: || with_review(json!({}), &[]),
     },
     Spec {

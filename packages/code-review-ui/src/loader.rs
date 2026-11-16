@@ -194,6 +194,9 @@ pub struct Opened {
     /// Every source is listed; when `false`, some inputs are loading groups and a complete
     /// [`Opened`] follows.
     pub complete: bool,
+    /// What each source cut to its file limit says (see
+    /// [`bcode_code_review_models::listing_truncated_message`]).
+    pub truncated: Vec<String>,
 }
 
 /// Viewed state an opening review loads before its first frame.
@@ -234,6 +237,8 @@ pub struct Arrived {
     pub position: usize,
     /// Fingerprints of its files with viewed marks.
     pub fingerprints: Option<(String, ReviewPatchIdsResponse)>,
+    /// What it says when its listing was cut to its file limit.
+    pub truncated: Option<String>,
 }
 
 /// How [`open`] runs.
@@ -399,7 +404,7 @@ impl Streamer<'_> {
 
     /// Push the first frame: what is listed, and what is known to be loading.
     async fn first_frame(&mut self) {
-        let opened = opened_from(
+        let mut opened = opened_from(
             self.services,
             self.repo_path,
             self.known.inputs(self.labels),
@@ -409,6 +414,7 @@ impl Streamer<'_> {
             false,
         )
         .await;
+        opened.truncated = self.known.truncated(self.labels);
         self.inbox.push(Message::Opened(Box::new(opened)));
         for news in std::mem::take(&mut self.stacks) {
             self.inbox.push(Message::StackConfirmed(Box::new(news)));
@@ -418,6 +424,7 @@ impl Streamer<'_> {
 
     /// Push a source that arrived after the first frame.
     async fn arrived(&self, opened: session::OpenedSource, pending: bool) {
+        let truncated = truncation(self.labels, &opened);
         let input = document_input(self.labels, opened, pending);
         let fingerprints = if pending {
             None
@@ -435,6 +442,7 @@ impl Streamer<'_> {
             position: position(self.labels, &input.source.source_id),
             input,
             fingerprints,
+            truncated,
         })));
     }
 
@@ -462,18 +470,19 @@ impl Streamer<'_> {
         }
         let inputs = self.known.inputs(self.labels);
         let complete = !inputs.iter().any(|input| input.loading);
-        Ok(Some(
-            opened_from(
-                self.services,
-                self.repo_path,
-                inputs,
-                self.known.diagnostics,
-                &self.marked,
-                self.stored_viewed,
-                complete,
-            )
-            .await,
-        ))
+        let truncated = self.known.truncated(self.labels);
+        let mut opened = opened_from(
+            self.services,
+            self.repo_path,
+            inputs,
+            self.known.diagnostics,
+            &self.marked,
+            self.stored_viewed,
+            complete,
+        )
+        .await;
+        opened.truncated = truncated;
+        Ok(Some(opened))
     }
 }
 
@@ -534,6 +543,21 @@ impl Known {
             .retain(|(source, _)| source.source.source_id != id);
     }
 
+    /// What every listed source cut to its file limit says, in workspace order.
+    fn truncated(&self, labels: &[(String, String, bool)]) -> Vec<String> {
+        let mut cut: Vec<(usize, String)> = self
+            .sources
+            .iter()
+            .filter(|(_, pending)| !pending)
+            .filter_map(|(source, _)| {
+                truncation(labels, source)
+                    .map(|text| (position(labels, &source.source.source_id), text))
+            })
+            .collect();
+        cut.sort();
+        cut.into_iter().map(|(_, text)| text).collect()
+    }
+
     /// The sources as document groups, in workspace order.
     fn inputs(&self, labels: &[(String, String, bool)]) -> Vec<SourceInput> {
         let mut inputs: Vec<SourceInput> = self
@@ -564,6 +588,22 @@ fn stage_text(stage: &session::OpenStage) -> String {
             format!("listing files of every layer: {done} of {total}")
         }
     }
+}
+
+/// What `source` says when its listing was cut to its file limit.
+fn truncation(labels: &[(String, String, bool)], source: &session::OpenedSource) -> Option<String> {
+    let total = source.untruncated_entries?;
+    let label = labels
+        .iter()
+        .find(|(id, _, _)| *id == source.source.source_id)
+        .map_or(source.source.source_id.as_str(), |(_, label, _)| {
+            label.as_str()
+        });
+    Some(bcode_code_review_models::listing_truncated_message(
+        label,
+        total,
+        u32::try_from(source.entries.len()).unwrap_or(u32::MAX),
+    ))
 }
 
 /// `source` as a document group.
@@ -637,6 +677,7 @@ async fn opened_from(
         fingerprints,
         stored_viewed,
         complete,
+        truncated: Vec::new(),
     }
 }
 

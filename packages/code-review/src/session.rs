@@ -83,6 +83,9 @@ pub struct OpenedSource {
     pub entries: Vec<ReviewIndexEntry>,
     /// Its stack, for stack and stack-layer sources once the stack is known.
     pub stack: Option<ResolvedReviewStack>,
+    /// Files the source selects when its listing was cut to its file limit (`entries` holds
+    /// the limit's worth).
+    pub untruncated_entries: Option<u32>,
 }
 
 /// A stack the review's stack sources follow, and when its provider last vouched for it.
@@ -426,6 +429,7 @@ fn resolve_and_list(
             let event = match outcome.index {
                 Some(first_page) => OpenEvent::Ready(OpenedSource {
                     source: (*source).clone(),
+                    untruncated_entries: first_page.untruncated_entries,
                     entries: rest_of_index(data, request, source, first_page)?,
                     stack: resolved
                         .stacks
@@ -626,6 +630,7 @@ fn placeholder(
             part: None,
         },
         entries: Vec::new(),
+        untruncated_entries: None,
         stack: Some(ResolvedReviewStack {
             source_id: source.id.clone(),
             trunk: stack.trunk.clone(),

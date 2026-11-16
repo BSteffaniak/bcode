@@ -779,6 +779,8 @@ pub struct ReviewSurface {
     stack_confirmed_at: Option<std::time::SystemTime>,
     /// Sources that failed after the first frame.
     failed_sources: BTreeSet<String>,
+    /// Listing-cut warnings already shown, so a refresh does not repeat them.
+    truncation_noted: BTreeSet<String>,
     /// The stack this review last saw (and its provider), for its history.
     stack_news: Option<bcode_code_review::session::StackNews>,
     /// Stack layers whose pull requests left the stack, held until the stack is known (see
@@ -915,6 +917,7 @@ impl ReviewSurface {
             filling_note: None,
             stack_confirmed_at: None,
             failed_sources: BTreeSet::new(),
+            truncation_noted: BTreeSet::new(),
             stack_news: None,
             gone_layers: std::collections::BTreeSet::new(),
             reopen_pending: false,
@@ -2261,6 +2264,7 @@ impl ReviewSurface {
         self.refreshing = false;
         self.generation += 1;
         let fingerprints = std::mem::take(&mut opened.fingerprints);
+        let truncated = std::mem::take(&mut opened.truncated);
         // An unsaved review picks up the state stored for its target when it first opens.
         let stored = opened.stored_viewed.take();
         if self.review.is_none() && self.is_transient() {
@@ -2317,6 +2321,7 @@ impl ReviewSurface {
         }
         self.pass_revisions.clone_from(&review.revisions);
         self.note_failed_sources(&review.diagnostics, opened_complete);
+        self.note_truncated(truncated);
         if first_open {
             self.warn_about_stack_size(deepest_stack);
         }
@@ -2343,7 +2348,8 @@ impl ReviewSurface {
 
     /// Fill in (or add) the group of a source that arrived after the first frame, in place: the
     /// cursor, the scroll position, and every other group stay as they are.
-    fn apply_arrived(&mut self, arrived: loader::Arrived) {
+    fn apply_arrived(&mut self, mut arrived: loader::Arrived) {
+        self.note_truncated(arrived.truncated.take().into_iter().collect());
         let order: Vec<&str> = self
             .sources
             .iter()
@@ -2453,6 +2459,21 @@ impl ReviewSurface {
         }
         if complete {
             self.report_gone_layers();
+        }
+    }
+
+    /// Warn about sources cut to their file limit (each message once per review).
+    fn note_truncated(&mut self, messages: Vec<String>) {
+        let fresh: Vec<String> = messages
+            .into_iter()
+            .filter(|message| self.truncation_noted.insert(message.clone()))
+            .collect();
+        if !fresh.is_empty() {
+            self.toasts.push(
+                ToastSeverity::Warning,
+                "Some files are not listed",
+                Some(fresh.join("; ")),
+            );
         }
     }
 

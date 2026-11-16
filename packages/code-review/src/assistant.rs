@@ -272,6 +272,11 @@ pub struct FileView {
 /// Files of a review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesView {
+    /// Sources whose listing was cut to their file limit, and by how much (see
+    /// [`bcode_code_review_models::listing_truncated_message`]). First, so a long answer cut to
+    /// the output limit still says it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncated: Vec<String>,
     /// Files in review order.
     pub files: Vec<FileView>,
     /// Files left out by the limit.
@@ -572,7 +577,16 @@ impl<'a> ReviewTools<'a> {
         &self,
         review: &OpenReview,
     ) -> Result<Vec<(usize, ReviewIndexEntry)>, AssistantError> {
+        self.listed(review).map(|(entries, _)| entries)
+    }
+
+    /// [`Self::entries`], and what each source cut to its file limit says.
+    fn listed(
+        &self,
+        review: &OpenReview,
+    ) -> Result<(Vec<(usize, ReviewIndexEntry)>, Vec<String>), AssistantError> {
         let mut entries = Vec::new();
+        let mut truncated = Vec::new();
         for (index, source) in review.resolved.iter().enumerate() {
             let mut cursor = None;
             let mut read = 0;
@@ -583,6 +597,23 @@ impl<'a> ReviewTools<'a> {
                     cursor: cursor.take(),
                     limit: None,
                 })?;
+                if read == 0
+                    && let Some(total) = page.untruncated_entries
+                {
+                    let label = review
+                        .workspace
+                        .sources
+                        .iter()
+                        .find(|candidate| candidate.id == source.source_id)
+                        .map_or(source.source_id.as_str(), |candidate| {
+                            candidate.label.as_str()
+                        });
+                    truncated.push(bcode_code_review_models::listing_truncated_message(
+                        label,
+                        total,
+                        page.total_entries,
+                    ));
+                }
                 read += page.entries.len();
                 entries.extend(page.entries.into_iter().map(|entry| (index, entry)));
                 match page.next_cursor {
@@ -591,7 +622,7 @@ impl<'a> ReviewTools<'a> {
                 }
             }
         }
-        Ok(entries)
+        Ok((entries, truncated))
     }
 
     /// What `review` is: its sources, size, and annotation counts.
@@ -686,7 +717,7 @@ impl<'a> ReviewTools<'a> {
         review: &OpenReview,
         reset: ViewedReset,
     ) -> Result<FilesView, AssistantError> {
-        let entries = self.entries(review)?;
+        let (entries, truncated) = self.listed(review)?;
         let fingerprints = self.fingerprints(review, &entries);
         let several = review.resolved.len() > 1;
         let omitted = entries.len().saturating_sub(MAX_FILES);
@@ -715,7 +746,11 @@ impl<'a> ReviewTools<'a> {
                 }
             })
             .collect();
-        Ok(FilesView { files, omitted })
+        Ok(FilesView {
+            truncated,
+            files,
+            omitted,
+        })
     }
 
     /// Diff fingerprints and working-tree content ids of the files that have viewed marks. Files
