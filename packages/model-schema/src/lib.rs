@@ -5,9 +5,11 @@
 //! Portable JSON Schema normalization for model-provider output contracts.
 
 mod object_maps;
+mod optional_properties;
 mod references;
 mod traversal;
 pub use object_maps::ObjectMapEncoding;
+pub use optional_properties::{has_optional_properties, omit_null_optional_properties};
 pub use references::inline_local_references;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +25,17 @@ pub enum ObjectPropertyPolicy {
     #[default]
     Preserve,
     /// Require every declared property and reject undeclared properties.
+    ///
+    /// An optional source property becomes mandatory, so a provider must always produce a value
+    /// for it.
     RequireAllAndClose,
+    /// Require every declared property and reject undeclared properties, letting each optional
+    /// source property that does not already accept `null` also accept `null`.
+    ///
+    /// `null` then stands for an omitted property; [`omit_null_optional_properties`] restores
+    /// the canonical value. Annotations (`description`, `title`, `$comment`) stay on the
+    /// property so models still see them.
+    RequireAllNullableOptionalAndClose,
 }
 
 /// Policy for a JSON Schema keyword unsupported by a provider dialect.
@@ -238,6 +250,7 @@ fn normalize_object(
     if matches!(
         dialect.object_properties,
         ObjectPropertyPolicy::RequireAllAndClose
+            | ObjectPropertyPolicy::RequireAllNullableOptionalAndClose
     ) && is_object_schema(object)
     {
         if object
@@ -250,9 +263,24 @@ fn normalize_object(
             ));
         }
         object.insert("additionalProperties".to_string(), Value::Bool(false));
+        let source_required = optional_properties::required_names(object)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         let properties = object
             .entry("properties".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
+        if dialect.object_properties == ObjectPropertyPolicy::RequireAllNullableOptionalAndClose
+            && let Some(properties) = properties.as_object_mut()
+        {
+            for (key, property) in properties.iter_mut() {
+                if !source_required.contains(key)
+                    && !optional_properties::schema_allows_null(property)
+                {
+                    *property = nullable_property(std::mem::take(property));
+                }
+            }
+        }
         let required = properties
             .as_object()
             .map(|properties| properties.keys().cloned().map(Value::String).collect())
@@ -260,6 +288,27 @@ fn normalize_object(
         object.insert("required".to_string(), Value::Array(required));
     }
     Ok(())
+}
+
+/// Wrap a property schema so it also accepts `null`, keeping its annotations on the wrapper.
+fn nullable_property(property: Value) -> Value {
+    let mut wrapper = Map::new();
+    let branch = match property {
+        Value::Object(mut object) => {
+            for annotation in ["description", "title", "$comment"] {
+                if let Some(value) = object.remove(annotation) {
+                    wrapper.insert(annotation.to_owned(), value);
+                }
+            }
+            Value::Object(object)
+        }
+        other => other,
+    };
+    wrapper.insert(
+        "anyOf".to_owned(),
+        Value::Array(vec![branch, serde_json::json!({"type": "null"})]),
+    );
+    Value::Object(wrapper)
 }
 
 fn collapse_annotated_constant_one_of(
@@ -682,5 +731,63 @@ mod tests {
         )
         .expect_err("recursive reference should fail");
         assert!(recursive.message().contains("recursive"));
+    }
+
+    #[test]
+    fn nullable_optional_policy_requires_every_property_and_lets_optionals_be_null() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {"type": "string"},
+                "branch": {"type": "string", "description": "Existing branch"},
+                "note": {"type": ["string", "null"]},
+                "target": {"$ref": "#/$defs/Target"}
+            },
+            "$defs": {"Target": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        });
+        let dialect = SchemaDialect {
+            object_properties: ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
+            ..SchemaDialect::default()
+        };
+
+        let wire = normalize(&schema, &dialect).expect("wire schema");
+
+        assert_eq!(
+            wire["required"],
+            serde_json::json!(["branch", "name", "note", "target"])
+        );
+        assert_eq!(wire["additionalProperties"], false);
+        assert_eq!(
+            wire["properties"]["name"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            wire["properties"]["branch"],
+            serde_json::json!({
+                "description": "Existing branch",
+                "anyOf": [{"type": "string"}, {"type": "null"}]
+            })
+        );
+        assert_eq!(wire["properties"]["note"], schema["properties"]["note"]);
+        assert_eq!(
+            wire["properties"]["target"],
+            serde_json::json!({"anyOf": [{"$ref": "#/$defs/Target"}, {"type": "null"}]})
+        );
+        assert_eq!(
+            wire["$defs"]["Target"]["properties"]["path"],
+            serde_json::json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        );
+        assert_eq!(
+            normalize(
+                &schema,
+                &SchemaDialect {
+                    object_properties: ObjectPropertyPolicy::RequireAllAndClose,
+                    ..SchemaDialect::default()
+                }
+            )
+            .expect("value-required wire schema")["properties"]["branch"],
+            schema["properties"]["branch"]
+        );
     }
 }

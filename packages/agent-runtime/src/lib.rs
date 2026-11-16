@@ -3417,6 +3417,7 @@ where
             terminal.insert(index, Err(RuntimeError::ToolNotFound(call.name.clone())));
             continue;
         };
+        let call = &canonical_tool_call(call, &tool.definition);
         let invocation = tool_invocation_descriptor(call);
         let preparation_request = ToolPreparationRequest {
             invocation: invocation.clone(),
@@ -3944,6 +3945,21 @@ fn validate_tool_host_context(host_context: &[bcode_tool::ToolHostContextEntry])
         )));
     }
     Ok(())
+}
+
+/// The provider tool call with its arguments in the tool's canonical representation.
+///
+/// Strict provider dialects require every declared property, so an optional argument the model
+/// leaves out arrives as `null`. Those `null`s are removed before preparation, permission
+/// checks and invocation see the arguments; values the tool schema accepts are unchanged.
+fn canonical_tool_call(call: &ToolCall, definition: &ToolDefinition) -> ToolCall {
+    ToolCall {
+        arguments: bcode_model_schema::omit_null_optional_properties(
+            &definition.input_schema,
+            call.arguments.clone(),
+        ),
+        ..call.clone()
+    }
 }
 
 fn tool_invocation_descriptor(call: &ToolCall) -> ToolInvocationDescriptor {
@@ -8603,6 +8619,92 @@ mod tests {
                 .call_id,
             "call-2"
         );
+    }
+
+    #[derive(Default)]
+    struct ArgumentRecordingInvoker {
+        prepared: std::sync::Mutex<Vec<serde_json::Value>>,
+        invoked: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl ToolInvoker for ArgumentRecordingInvoker {
+        fn prepare_tool<'a>(
+            &'a self,
+            tool: &'a RegisteredTool,
+            request: &'a ToolPreparationRequest,
+            scope: &'a PreparationScope,
+        ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+            self.prepared
+                .lock()
+                .expect("prepared arguments")
+                .push(request.invocation.arguments.clone());
+            FakeToolInvoker.prepare_tool(tool, request, scope)
+        }
+
+        fn invoke_tool<'a>(
+            &'a self,
+            tool: &'a RegisteredTool,
+            invocation: &'a PreparedToolInvocation,
+            scope: &'a InvocationScope,
+        ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+            self.invoked
+                .lock()
+                .expect("invoked arguments")
+                .push(invocation.invocation.arguments.clone());
+            FakeToolInvoker.invoke_tool(tool, invocation, scope)
+        }
+    }
+
+    #[tokio::test]
+    async fn null_for_an_optional_argument_reaches_tools_as_omitted() {
+        let catalog = UnifiedToolCatalog::new().with_inline_tool(ToolDefinition {
+            name: "create".to_string(),
+            description: "test tool".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "branch": {"type": "string"},
+                    "detach": {"type": "boolean"},
+                    "note": {"type": ["string", "null"]}
+                }
+            }),
+        });
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "create".to_string(),
+            arguments: serde_json::json!({
+                "name": "feature", "branch": null, "detach": null, "note": null
+            }),
+        };
+        let invoker = ArgumentRecordingInvoker::default();
+        let authorization = PermissionPolicyAuthorization::new(&AllowAllPolicy);
+        let scope = TurnScope::without_events("test-tool-batch", TurnGeneration::new(0));
+        let mut rounds = ToolRoundState::new(u32::MAX);
+
+        AgentRuntime::new()
+            .execute_prepared_tool_batch(
+                &catalog,
+                &authorization,
+                &invoker,
+                std::slice::from_ref(&call),
+                &mut rounds,
+                &RuntimePermissionContext::default(),
+                ToolExecutionOptions::default(),
+                &scope,
+            )
+            .await
+            .expect("tool batch")
+            .results
+            .into_iter()
+            .next()
+            .expect("single call result")
+            .expect("single call should succeed");
+
+        let canonical = serde_json::json!({"name": "feature", "note": null});
+        assert_eq!(*invoker.prepared.lock().unwrap(), vec![canonical.clone()]);
+        assert_eq!(*invoker.invoked.lock().unwrap(), vec![canonical]);
     }
 
     #[tokio::test]

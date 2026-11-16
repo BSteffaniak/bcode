@@ -1620,6 +1620,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_model",
+ "bcode_model_schema",
  "bcode_session_models",
  "bcode_tool",
  "bcode_xray",
@@ -2846,6 +2847,7 @@ dependencies = [
 name = "bcode_model_schema"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "jsonschema",
  "serde",
  "serde_json",
 ]
@@ -2909,6 +2911,7 @@ dependencies = [
  "bcode_xray",
  "bcode_xray_models",
  "flate2",
+ "jsonschema",
  "rand 0.9.5",
  "reqwest 0.12.28",
  "rustls 0.23.45",

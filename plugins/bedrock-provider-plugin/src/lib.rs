@@ -3166,136 +3166,17 @@ fn bedrock_tool_input_schema(tool: &ToolDefinition) -> Result<&serde_json::Value
     Ok(&tool.input_schema)
 }
 
-/// Make a tool schema strict by adding `additionalProperties: false` and wrapping optional
-/// properties.
+/// Strict tool-schema dialect for `OpenAI` models on Bedrock.
 ///
-/// `OpenAI` models on Bedrock require strict schemas with:
-/// - `additionalProperties: false` on every object
-/// - `required` listing ALL properties on every object
-/// - Optional properties wrapped with `{ anyOf: [property, { type: "null" }] }`
-///
-/// This transforms a schema to meet those requirements while preserving optional/required
-/// semantics.
-fn make_tool_schema_strict(schema: &serde_json::Value) -> serde_json::Value {
-    match schema {
-        serde_json::Value::Object(obj) => {
-            let mut new_obj = serde_json::Map::new();
-
-            // For object types, handle properties, required, and additionalProperties
-            if obj.get("type").and_then(|v| v.as_str()) == Some("object") {
-                let original_required = obj
-                    .get("required")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(String::from)
-                            .collect::<std::collections::HashSet<_>>()
-                    })
-                    .unwrap_or_default();
-
-                // Process properties
-                if let Some(serde_json::Value::Object(properties)) = obj.get("properties") {
-                    let mut new_properties = serde_json::Map::new();
-                    for (key, value) in properties {
-                        let strict_value = make_tool_schema_strict(value);
-                        // If property was not originally required and doesn't allow null, wrap it
-                        if !original_required.contains(key.as_str())
-                            && !schema_allows_null(&strict_value)
-                        {
-                            new_properties.insert(
-                                key.clone(),
-                                serde_json::json!({
-                                    "anyOf": [strict_value, {"type": "null"}]
-                                }),
-                            );
-                        } else {
-                            new_properties.insert(key.clone(), strict_value);
-                        }
-                    }
-                    new_obj.insert(
-                        "properties".to_string(),
-                        serde_json::Value::Object(new_properties.clone()),
-                    );
-
-                    // Set required to ALL property keys
-                    let required_keys: Vec<_> = new_properties
-                        .keys()
-                        .map(|k| serde_json::Value::String(k.clone()))
-                        .collect();
-                    new_obj.insert(
-                        "required".to_string(),
-                        serde_json::Value::Array(required_keys),
-                    );
-                }
-
-                // Add additionalProperties: false
-                if !obj.contains_key("additionalProperties") {
-                    new_obj.insert(
-                        "additionalProperties".to_string(),
-                        serde_json::Value::Bool(false),
-                    );
-                }
-
-                // Copy other fields
-                for (key, value) in obj {
-                    if key != "properties" && key != "required" && key != "additionalProperties" {
-                        new_obj.insert(key.clone(), make_tool_schema_strict(value));
-                    }
-                }
-            } else {
-                // Not an object type, just recursively process
-                for (key, value) in obj {
-                    new_obj.insert(key.clone(), make_tool_schema_strict(value));
-                }
-            }
-            serde_json::Value::Object(new_obj)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(make_tool_schema_strict).collect())
-        }
-        other => other.clone(),
+/// Every object is closed and requires all of its properties; optional properties also accept
+/// `null`, which the host removes again before dispatching the call.
+fn bedrock_strict_tool_schema_dialect() -> bcode_model_schema::SchemaDialect {
+    bcode_model_schema::SchemaDialect {
+        object_properties:
+            bcode_model_schema::ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
+        reject_recursive_references: false,
+        ..bcode_model_schema::SchemaDialect::default()
     }
-}
-
-/// Check if a JSON schema allows null values.
-fn schema_allows_null(schema: &serde_json::Value) -> bool {
-    let Some(obj) = schema.as_object() else {
-        return false;
-    };
-
-    // Check type field
-    if let Some(type_val) = obj.get("type") {
-        if type_val.as_str() == Some("null") {
-            return true;
-        }
-        if let Some(types) = type_val.as_array()
-            && types.iter().any(|v| v.as_str() == Some("null"))
-        {
-            return true;
-        }
-    }
-
-    // Check const field
-    if obj.get("const").is_some_and(serde_json::Value::is_null) {
-        return true;
-    }
-
-    // Check enum field
-    if let Some(enum_arr) = obj.get("enum").and_then(|v| v.as_array())
-        && enum_arr.iter().any(serde_json::Value::is_null)
-    {
-        return true;
-    }
-
-    // Check anyOf field
-    if let Some(any_of) = obj.get("anyOf").and_then(|v| v.as_array())
-        && any_of.iter().any(schema_allows_null)
-    {
-        return true;
-    }
-
-    false
 }
 
 fn bedrock_tool_input_schema_for_model(
@@ -3303,9 +3184,19 @@ fn bedrock_tool_input_schema_for_model(
     model_id: &str,
 ) -> Result<serde_json::Value, ProviderError> {
     let schema = bedrock_tool_input_schema(tool)?;
-    // OpenAI models require strict schemas with additionalProperties: false
     if model_id.contains(".openai.") {
-        Ok(make_tool_schema_strict(schema))
+        bcode_model_schema::normalize(schema, &bedrock_strict_tool_schema_dialect()).map_err(
+            |error| {
+                provider_error(
+                    "bedrock_tool_schema_unsupported",
+                    ProviderErrorCategory::InvalidRequest,
+                    format!(
+                        "Bedrock tool '{}' input schema cannot be made strict: {error}",
+                        tool.name
+                    ),
+                )
+            },
+        )
     } else {
         Ok(schema.clone())
     }
@@ -7362,6 +7253,58 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 mod tests {
     use super::*;
 
+    #[test]
+    fn openai_model_tool_schemas_require_every_argument_and_let_optionals_be_null() {
+        let tool = ToolDefinition {
+            name: "worktree.create".to_string(),
+            description: "Create a worktree".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "branch": {"type": "string", "description": "Existing branch"},
+                    "note": {"type": ["string", "null"]},
+                    "next": {"$ref": "#/$defs/Node"}
+                },
+                "$defs": {"Node": {"type": "object", "required": ["next"], "properties": {
+                    "next": {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]}
+                }}}
+            }),
+        };
+
+        let strict = bedrock_tool_input_schema_for_model(&tool, "us.openai.gpt-oss-120b-1:0")
+            .expect("strict schema");
+
+        assert_eq!(strict["additionalProperties"], false);
+        assert_eq!(
+            strict["required"],
+            serde_json::json!(["branch", "name", "next", "note"])
+        );
+        assert_eq!(
+            strict["properties"]["name"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            strict["properties"]["branch"],
+            serde_json::json!({
+                "description": "Existing branch",
+                "anyOf": [{"type": "string"}, {"type": "null"}]
+            })
+        );
+        assert_eq!(
+            strict["properties"]["note"],
+            tool.input_schema["properties"]["note"]
+        );
+        assert_eq!(
+            strict["properties"]["next"]["anyOf"][1],
+            serde_json::json!({"type": "null"})
+        );
+        assert_eq!(
+            bedrock_tool_input_schema_for_model(&tool, "anthropic.claude-model").expect("schema"),
+            tool.input_schema
+        );
+    }
     #[tokio::test]
     async fn worker_abort_and_panic_publish_terminal_outcomes() {
         let runtime = ProviderRuntime::new().unwrap();

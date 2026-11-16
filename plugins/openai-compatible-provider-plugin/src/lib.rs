@@ -3437,9 +3437,13 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
 }
 
 /// `OpenAI` requires an object root even when the canonical result is a scalar or array.
+///
+/// Strict schemas also require every property, so optional properties accept `null` on the
+/// wire and decoding removes those `null`s again.
 struct StructuredWireEncoding {
     maps: bcode_model_schema::ObjectMapEncoding,
     enveloped: bool,
+    optionals: bool,
 }
 
 impl StructuredWireEncoding {
@@ -3469,14 +3473,20 @@ impl StructuredWireEncoding {
                 error.to_string(),
             )
         })?;
-        Ok(Self { maps, enveloped })
+        let optionals = bcode_model_schema::has_optional_properties(maps.schema());
+        Ok(Self {
+            maps,
+            enveloped,
+            optionals,
+        })
     }
 
     const fn is_adapted(&self) -> bool {
-        self.enveloped || self.maps.is_adapted()
+        self.enveloped || self.optionals || self.maps.is_adapted()
     }
 
     fn decode(&self, value: serde_json::Value) -> Result<serde_json::Value, String> {
+        let value = bcode_model_schema::omit_null_optional_properties(self.maps.schema(), value);
         let value = self.maps.decode(value).map_err(|error| error.to_string())?;
         if !self.enveloped {
             return Ok(value);
@@ -3514,7 +3524,7 @@ async fn stream_encoded_completion(
         .schema = encoding.maps.schema().clone();
     wire.messages.push(bcode_model::ModelMessage {
         role: bcode_model::MessageRole::System,
-        content: vec![bcode_model::ContentBlock::Text { text: "For this structured response, follow the wire response schema: when a result envelope is present, put the requested result in its result field. Dynamic JSON maps are represented on the wire as arrays of {\"key\": string, \"value\": value} records. Use unique keys. The provider adapter restores the original result representation.".into() }],
+        content: vec![bcode_model::ContentBlock::Text { text: "For this structured response, follow the wire response schema: when a result envelope is present, put the requested result in its result field. Dynamic JSON maps are represented on the wire as arrays of {\"key\": string, \"value\": value} records. Use unique keys. Use null for an optional field you leave out. The provider adapter restores the original result representation.".into() }],
     });
     *turn.structured_text.lock().expect("structured text lock") = Some(Ok(String::new()));
     let outcome = stream_chat_completion_with_failover(&wire, turn).await;
@@ -6405,7 +6415,8 @@ fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value,
             .into_iter()
             .map(str::to_owned)
             .collect(),
-            object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+            object_properties:
+                bcode_model_schema::ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
             one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
             reference_siblings:
                 bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
@@ -12417,6 +12428,7 @@ mod tests {
     fn strict_schema_preserves_numeric_bounds_without_rust_format_annotations() {
         let schema = strict_openai_schema(&serde_json::json!({
             "type": "object",
+            "required": ["iteration", "threshold", "timestamp", "note"],
             "properties": {
                 "iteration": {"type": "integer", "format": "uint32", "minimum": 0},
                 "threshold": {"type": "integer", "format": "uint8", "minimum": 0, "maximum": 255},
@@ -12542,13 +12554,13 @@ mod tests {
         let schema = &body["text"]["format"]["schema"];
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"], serde_json::json!(["nested", "ok"]));
+        let nested = &schema["properties"]["nested"];
+        assert_eq!(nested["anyOf"][1], serde_json::json!({"type": "null"}));
+        assert_eq!(nested["anyOf"][0]["additionalProperties"], false);
+        assert_eq!(nested["anyOf"][0]["required"], serde_json::json!(["value"]));
         assert_eq!(
-            schema["properties"]["nested"]["additionalProperties"],
-            false
-        );
-        assert_eq!(
-            schema["properties"]["nested"]["required"],
-            serde_json::json!(["value"])
+            nested["anyOf"][0]["properties"]["value"],
+            serde_json::json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
         );
     }
 
@@ -12568,6 +12580,7 @@ mod tests {
                     }
                 },
                 "type": "object",
+                "required": ["confidence"],
                 "properties": {
                     "confidence": {
                         "$ref": "#/$defs/confidence",
@@ -12592,7 +12605,7 @@ mod tests {
         request.structured_output = Some(bcode_model::StructuredOutputRequest {
             name: "NestedCheck".into(),
             strict: true,
-            schema: serde_json::json!({"type":"object","properties":{"check":{"$ref":"#/$defs/Check"}},"$defs":{"Check":{"type":"object","properties":{"execution":{"anyOf":[{"$ref":"#/$defs/Execution"},{"type":"null"}]}}},"Execution":{"type":"object","properties":{"argv":{"type":"array","minItems":1,"items":{"type":"string"}}}}}}),
+            schema: serde_json::json!({"type":"object","required":["check"],"properties":{"check":{"$ref":"#/$defs/Check"}},"$defs":{"Check":{"type":"object","properties":{"execution":{"anyOf":[{"$ref":"#/$defs/Execution"},{"type":"null"}]}}},"Execution":{"type":"object","required":["argv"],"properties":{"argv":{"type":"array","minItems":1,"items":{"type":"string"}}}}}}),
         });
         let canonical = request.structured_output.as_ref().unwrap().schema.clone();
         let chat = serde_json::to_value(chat_response_format(&request).unwrap()).unwrap();
@@ -12720,10 +12733,92 @@ mod tests {
                 .unwrap(),
             serde_json::json!([{"a":"b"}])
         );
-        let object = serde_json::json!({"type":"object","properties":{"ok":{"type":"boolean"}}});
+        let object = serde_json::json!({
+            "type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}
+        });
         let encoding = StructuredWireEncoding::compile(&object).unwrap();
         assert!(!encoding.is_adapted());
         assert_eq!(encoding.maps.schema(), &object);
+    }
+
+    #[test]
+    fn structured_wire_optional_properties_accept_null_and_decode_as_omitted() {
+        let schema = serde_json::json!({
+            "type":"object",
+            "required":["verdict"],
+            "properties":{
+                "verdict":{"type":"string"},
+                "reason":{"type":"string"},
+                "details":{"type":"object","properties":{"line":{"type":"integer"}}}
+            }
+        });
+        let encoding = StructuredWireEncoding::compile(&schema).unwrap();
+        assert!(encoding.is_adapted());
+        let wire = strict_openai_schema(encoding.maps.schema()).unwrap();
+        assert_eq!(
+            wire["properties"]["reason"],
+            serde_json::json!({"anyOf":[{"type":"string"},{"type":"null"}]})
+        );
+        let model_output =
+            serde_json::json!({"verdict":"ok","reason":null,"details":{"line":null}});
+        assert!(
+            jsonschema::validator_for(&wire)
+                .unwrap()
+                .is_valid(&model_output)
+        );
+
+        let decoded = encoding.decode(model_output).unwrap();
+
+        assert_eq!(decoded, serde_json::json!({"verdict":"ok","details":{}}));
+        assert!(
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .is_valid(&decoded)
+        );
+    }
+
+    #[test]
+    fn strict_tool_schemas_let_optional_arguments_be_null() {
+        let mut request = test_request(Vec::new());
+        request.tool_schema_mode = Some(bcode_model::ToolSchemaMode::Strict);
+        request.tools = vec![bcode_model::ToolDefinition {
+            name: "worktree.create".to_string(),
+            description: "Create a worktree".to_string(),
+            input_schema: serde_json::json!({
+                "type":"object",
+                "required":["name"],
+                "properties":{
+                    "name":{"type":"string"},
+                    "branch":{"type":"string"},
+                    "detach":{"type":"boolean"}
+                }
+            }),
+        }];
+
+        let tools = model_tools_to_responses_tools(&request, OpenAiCompatibleDialect::ResponsesApi)
+            .expect("strict tools");
+
+        let parameters = &tools[0].parameters;
+        assert_eq!(tools[0].strict, Some(true));
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["branch", "detach", "name"])
+        );
+        assert_eq!(
+            parameters["properties"]["name"],
+            serde_json::json!({"type":"string"})
+        );
+        for optional in ["branch", "detach"] {
+            assert_eq!(
+                parameters["properties"][optional]["anyOf"][1],
+                serde_json::json!({"type":"null"})
+            );
+        }
+        assert!(
+            jsonschema::validator_for(parameters)
+                .unwrap()
+                .is_valid(&serde_json::json!({"name":"x","branch":null,"detach":null}))
+        );
     }
 
     #[test]
