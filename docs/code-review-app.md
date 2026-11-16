@@ -1089,3 +1089,5 @@ shared database run one at a time under the lock file `code-review.db.migrate.lo
 * [`code-review-v2-architecture.md`](code-review-v2-architecture.md): the design record and
   measurements.
 * [Permissions](permissions.md): the rules the review tools follow.
+* [Reviewing files and folders as they are now](review-files-and-folders.md): folder and glob
+  sources, the tree picker, uncommitted marks, and the path tools.
