@@ -11,10 +11,10 @@ use bcode_config::{
     BcodeConfig, ModelConfig, ModelProfileConfig, RuntimeAuthBinding, RuntimeAuthProfile,
     RuntimeAuthSubscriptions,
 };
-use bcode_plugin::{PluginRuntimeHost, PluginSelection};
+use bcode_plugin::PluginSelection;
 
 fn configured_bcode() -> Bcode {
-    let plugins = PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &PluginSelection::all_enabled(),
         &bcode_bundled_plugins::static_bundled_plugins(),
     )

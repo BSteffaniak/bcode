@@ -72,7 +72,7 @@ async fn open_ralph_home_surface(
     repo_path: PathBuf,
     flash_message: Option<&str>,
 ) -> Result<bcode_plugin_sdk::tui::BoxedPluginTuiSurface, TuiError> {
-    let runtime = load_ralph_tui_runtime()?;
+    let runtime = crate::load_launcher_runtime(&crate::static_bundled_plugins())?;
     let options = flash_message.map_or(
         serde_json::Value::Null,
         |message| serde_json::json!({ "flash_message": message }),
@@ -92,17 +92,6 @@ async fn open_ralph_home_surface(
     .await
     .map_err(|error| TuiError::PluginService {
         code: "tui_surface_open_failed".to_string(),
-        message: error.to_string(),
-    })
-}
-
-fn load_ralph_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
-    bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-        &bcode_plugin::PluginSelection::all_enabled(),
-        &crate::static_bundled_plugins(),
-    )
-    .map_err(|error| TuiError::PluginService {
-        code: "plugin_runtime_load_failed".to_string(),
         message: error.to_string(),
     })
 }

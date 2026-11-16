@@ -236,11 +236,8 @@ fn run(
     let config = bcode_config::load_config().map_err(|_| "Cannot load configuration.")?;
     let selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, std::iter::empty::<&str>());
-    let mut host = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
-        &selection,
-        &super::static_bundled_plugins(),
-    )
-    .map_err(|_| "Cannot load authentication providers.")?;
+    let mut host = crate::load_local_plugin_host(&selection, &crate::static_bundled_plugins())
+        .map_err(|_| "Cannot load authentication providers.")?;
     let result = flow(&host, provider_id, method_id, profile, vault, cancel, send);
     let cleanup = host
         .deactivate_all()

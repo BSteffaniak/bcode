@@ -45,7 +45,6 @@ mod model_check;
 mod model_evidence;
 mod model_ignores;
 mod model_request_target;
-mod shared_plugin_runtime;
 pub use command_application::CommandApplicationHandle;
 mod activity_changes;
 mod activity_watch;
@@ -4251,34 +4250,20 @@ fn daemon_log_path() -> PathBuf {
     )
 }
 
-/// Plugin configuration for every known plugin, bound to this daemon's shared plugin runtime.
+/// Plugin configuration for every known plugin.
 ///
 /// Configuration, state roots, and invocation-time secret resolution come from
-/// [`bcode_plugin_config::resolve_plugin_configs`]; this daemon then grants each plugin
-/// explicit activation authority from one shared runtime scope. Activation is never
-/// inferred from ambient host state.
+/// [`bcode_plugin_config::resolve_plugin_configs`]; activation authority is granted
+/// when the daemon loads its host (see [`bcode_plugin_config::load_plugin_runtime_host`]).
 fn resolve_plugin_configs(
     config: &bcode_config::BcodeConfig,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
 ) -> std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig> {
-    let configs = bcode_plugin_config::resolve_plugin_configs(
+    bcode_plugin_config::resolve_plugin_configs(
         config,
         static_plugins,
         &managed_plugin_state_base(),
-    );
-    let shared_runtime = shared_plugin_runtime::Runtime::new();
-    let enabled_plugins = configs.keys().cloned().collect::<Vec<_>>();
-    configs
-        .into_iter()
-        .map(|(plugin_id, plugin_config)| {
-            let activation = shared_runtime.activation(
-                &plugin_id,
-                &plugin_config.config,
-                enabled_plugins.clone(),
-            );
-            (plugin_id, plugin_config.with_shared_activation(activation))
-        })
-        .collect()
+    )
 }
 
 /// Where this daemon's plugins keep state.
@@ -5081,8 +5066,9 @@ async fn run_with_config(
     )?;
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
     let plugin_configs = resolve_plugin_configs(&config, static_plugins);
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
+    let plugins = bcode_plugin_config::load_plugin_runtime_host(
         &plugin_selection,
+        bcode_plugin::discover_plugins()?,
         static_plugins,
         plugin_configs,
     )?;
@@ -5231,40 +5217,6 @@ pub fn load_embedded_plugins(
     load_embedded_plugins_with_config(selection, plugins, std::collections::BTreeMap::new())
 }
 
-/// Grant every enabled static registration explicit activation authority from one
-/// new shared plugin runtime scope. Supplied activation contexts are preserved.
-///
-/// # Errors
-/// Returns an error when a registration manifest cannot be parsed.
-pub fn bind_shared_plugin_activations(
-    selection: &bcode_plugin::PluginSelection,
-    plugins: &[bcode_plugin::StaticBundledPlugin],
-    mut configs: std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
-) -> Result<
-    std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
-    bcode_plugin::PluginLoadError,
-> {
-    let runtime = shared_plugin_runtime::Runtime::new();
-    let ids = bcode_plugin::static_bundled_plugin_ids(plugins)?;
-    let enabled = ids
-        .iter()
-        .filter(|id| selection.is_enabled(id))
-        .cloned()
-        .collect::<Vec<_>>();
-    for id in ids {
-        if selection.is_enabled(&id) {
-            let config = configs.remove(&id).unwrap_or_default();
-            if config.shared_activation.is_some() {
-                configs.insert(id, config);
-            } else {
-                let activation = runtime.activation(&id, &config.config, enabled.clone());
-                configs.insert(id, config.with_shared_activation(activation));
-            }
-        }
-    }
-    Ok(configs)
-}
-
 /// [`load_embedded_plugins`] with caller-resolved plugin configuration. Supplied
 /// activation contexts are preserved; other enabled plugins share one runtime scope.
 ///
@@ -5275,10 +5227,7 @@ pub fn load_embedded_plugins_with_config(
     plugins: &[bcode_plugin::StaticBundledPlugin],
     configs: std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
 ) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
-    let configs = bind_shared_plugin_activations(selection, plugins, configs)?;
-    bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
-        selection, plugins, configs,
-    )
+    bcode_plugin_config::load_plugin_runtime_host(selection, Vec::new(), plugins, configs)
 }
 
 /// Borrowed workflow application available only while its embedded host is alive.
@@ -86867,13 +86816,15 @@ library = "libbcode_shell_plugin.dylib"
                 .await,
             bcode_prompt_profile::PromptProfileResponse::default()
         );
-        state.plugins =
-            bcode_plugin::PluginRuntimeHost::load_defaults(&bcode_plugin::PluginSelection {
+        state.plugins = crate::load_embedded_plugins(
+            &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::new(),
                 disabled: BTreeSet::new(),
-            })
-            .expect("load empty plugin host");
+            },
+            &[],
+        )
+        .expect("load empty plugin host");
         config.system_prompt.sections.model_profile = true;
         let absent =
             resolve_prompt_profile(&state, SessionId::new(), "build", &config, &target, &tools)

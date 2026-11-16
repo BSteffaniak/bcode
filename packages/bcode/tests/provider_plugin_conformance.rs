@@ -5,7 +5,7 @@
 
 use bcode::{Bcode, ModelSelector, ToolExecutionOptions};
 use bcode_model::{ModelCapability, ProviderCapability, StopReason};
-use bcode_plugin::{PluginRuntimeHost, PluginSelection};
+use bcode_plugin::PluginSelection;
 use std::num::NonZeroUsize;
 
 #[cfg(all(feature = "config", unix))]
@@ -35,7 +35,7 @@ async fn retained_custody_refreshes_through_real_plugin_bridge() {
                 .unwrap())
         }
     }
-    let plugins = PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &PluginSelection::all_enabled(),
         &bcode_bundled_plugins::static_bundled_plugins(),
     )
@@ -199,7 +199,7 @@ fn custody_test_storage(
 }
 
 fn fake_bcode() -> Bcode {
-    let plugins = PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &PluginSelection::all_enabled(),
         &bcode_bundled_plugins::static_bundled_plugins(),
     )

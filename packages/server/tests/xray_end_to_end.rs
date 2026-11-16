@@ -846,10 +846,19 @@ fn load_dynamic_capture_provider() -> bcode_plugin::LoadedPlugin {
     .expect("real fake-provider manifest");
     let bcode_plugin::PluginRuntime::Native(runtime) = &mut manifest.runtime;
     runtime.library.clone_from(&library);
-    let plugin = bcode_plugin::load_registered_plugin(&bcode_plugin::RegisteredPlugin {
-        manifest,
-        manifest_path: library.with_file_name("fixture-manifest.toml"),
-    })
+    let id = manifest.id.clone();
+    let mut configs = bcode_plugin_config::bind_shared_plugin_activations(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        [id.clone()],
+        std::collections::BTreeMap::new(),
+    );
+    let plugin = bcode_plugin::load_registered_plugin_with_config(
+        &bcode_plugin::RegisteredPlugin {
+            manifest,
+            manifest_path: library.with_file_name("fixture-manifest.toml"),
+        },
+        configs.remove(&id).expect("activation authority"),
+    )
     .expect("real native plugin load");
     plugin.activate().expect("activate");
     plugin

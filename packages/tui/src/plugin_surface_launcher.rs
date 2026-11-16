@@ -126,14 +126,7 @@ pub async fn prepare(
 ) -> Result<PreparedPluginSurface, TuiError> {
     let handle = tokio::runtime::Handle::current();
     let (runtime, plugin_id, surface) = tokio::task::spawn_blocking(move || {
-        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection::all_enabled(),
-            &crate::static_bundled_plugins(),
-        )
-        .map_err(|error| TuiError::PluginService {
-            code: "plugin_runtime_load_failed".to_owned(),
-            message: error.to_string(),
-        })?;
+        let runtime = crate::load_launcher_runtime(&crate::static_bundled_plugins())?;
         // Factories may perform synchronous native initialization before yielding; keep it off
         // the terminal scheduler.
         let (plugin_id, surface) = handle.block_on(open_startup_surface(

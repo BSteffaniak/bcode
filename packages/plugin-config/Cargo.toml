@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Per-plugin configuration, state roots, and invocation secrets for bcode hosts"
+description = "Per-plugin configuration, activation authority, state roots, and invocation secrets for bcode hosts"
 edition     = { workspace = true }
 keywords    = ["bcode", "plugin", "config"]
 license     = { workspace = true }
@@ -12,10 +12,19 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_config        = { workspace = true }
+bcode_ipc           = { workspace = true }
 bcode_plugin        = { workspace = true }
+bcode_plugin_sdk    = { workspace = true }
 bcode_provider_auth = { workspace = true }
+bmux_plugin_runtime = { workspace = true }
+bmux_plugin_sdk     = { workspace = true }
 serde_json          = { workspace = true }
+tokio               = { workspace = true, features = ["rt-multi-thread"] }
 toml                = { workspace = true }
+
+[dev-dependencies]
+bcode_hello_plugin = { workspace = true }
+tempfile           = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sshenv_vault = { workspace = true, features = [

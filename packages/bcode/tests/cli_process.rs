@@ -14,17 +14,15 @@ fn embedded_workflow_public_entry_external_consumer() {
     if std::env::var_os(CHILD).is_some() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             use bcode_workflow::{WorkflowAuthoringApplication as _, WorkflowRunApplication as _};
-            let (plugins,) = (
-                bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                    &bcode_plugin::PluginSelection {
-                        mode: bcode_plugin::PluginSelectionMode::Explicit,
-                        enabled: std::collections::BTreeSet::new(),
-                        disabled: std::collections::BTreeSet::new(),
-                    },
-                    &[],
-                )
-                .unwrap(),
-            );
+            let (plugins,) = (bcode_server::load_embedded_plugins(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::new(),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &[],
+            )
+            .unwrap(),);
             let shutdown = bcode_agent_runtime::CancellationToken::new();
             let signal = shutdown.clone();
             let (sender, receiver) = tokio::sync::oneshot::channel();

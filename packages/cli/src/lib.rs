@@ -5137,6 +5137,9 @@ async fn selected_cli_registrations(
 }
 
 #[cfg(test)]
+mod plugin_host_tests;
+
+#[cfg(test)]
 mod selected_cli_dispatch_tests {
     use super::*;
     use std::sync::{
@@ -15182,51 +15185,78 @@ fn write_plugin_services<'a, W: std::io::Write>(
 fn check_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let selection = plugin_selection_for_config(&config);
-    let plugins =
-        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
+    let plugins = discover_plugins_for_cli(roots)?;
     if json {
-        let mut checked = Vec::with_capacity(plugins.len());
-        for plugin in plugins {
-            let loaded = bcode_plugin::load_registered_plugin(&plugin)?;
-            loaded.activate()?;
-            loaded.deactivate()?;
+        let mut checked = Vec::new();
+        check_selected_plugins(&selection, plugins, |plugin_id| {
             checked.push(serde_json::json!({
-                "plugin_id": loaded.manifest().id,
+                "plugin_id": plugin_id,
                 "status": "ok",
             }));
-        }
+            Ok(())
+        })?;
         return print_json(&checked);
     }
-    if plugins.is_empty() {
-        let mut output = std::io::stdout().lock();
-        writeln!(output, "no plugins discovered")?;
-        output.flush()?;
-        return Ok(());
-    }
-
-    for plugin in plugins {
-        let loaded = bcode_plugin::load_registered_plugin(&plugin)?;
-        loaded.activate()?;
-        loaded.deactivate()?;
+    let checked = check_selected_plugins(&selection, plugins, |plugin_id| {
         // Do not hold the stdout lock while executing plugin lifecycle callbacks.
         let mut output = std::io::stdout().lock();
-        writeln!(output, "{}\tOK", loaded.manifest().id)?;
+        writeln!(output, "{plugin_id}\tOK")?;
+        output.flush()?;
+        Ok(())
+    })?;
+    if checked == 0 {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "no plugins discovered")?;
         output.flush()?;
     }
     Ok(())
 }
 
+/// Load, activate and deactivate each selected discovered plugin in turn, every one
+/// with activation authority from one owned shared runtime scope. Returns the count.
+fn check_selected_plugins(
+    selection: &bcode_plugin::PluginSelection,
+    discovered: Vec<bcode_plugin::RegisteredPlugin>,
+    mut checked: impl FnMut(&str) -> Result<(), CliError>,
+) -> Result<usize, CliError> {
+    let plugins = bcode_plugin::filter_selected_plugins(discovered, selection);
+    let mut configs = bcode_plugin_config::bind_shared_plugin_activations(
+        selection,
+        plugins.iter().map(|plugin| plugin.manifest.id.clone()),
+        BTreeMap::new(),
+    );
+    for plugin in &plugins {
+        let config = configs.remove(&plugin.manifest.id).unwrap_or_default();
+        let loaded = bcode_plugin::load_registered_plugin_with_config(plugin, config)?;
+        loaded.activate()?;
+        loaded.deactivate()?;
+        checked(&loaded.manifest().id)?;
+    }
+    Ok(plugins.len())
+}
+
 fn load_plugin_service_host(roots: &[PathBuf]) -> Result<bcode_plugin::PluginHost, CliError> {
     let config = bcode_config::load_config()?;
-    let selection = plugin_selection_for_config(&config);
-    Ok(
-        bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
-            &selection,
-            discover_plugins_for_cli(roots)?,
-            &static_bundled_plugins(),
-            BTreeMap::new(),
-        )?,
+    plugin_service_host(
+        &config,
+        discover_plugins_for_cli(roots)?,
+        &static_bundled_plugins(),
     )
+}
+
+/// The host behind local `plugin` service commands: discovered and bundled plugins
+/// selected by `config`, with activation authority but no resolved plugin settings.
+fn plugin_service_host(
+    config: &bcode_config::BcodeConfig,
+    discovered: Vec<bcode_plugin::RegisteredPlugin>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<bcode_plugin::PluginHost, CliError> {
+    Ok(bcode_plugin_config::load_plugin_host(
+        &plugin_selection_for_config(config),
+        discovered,
+        static_plugins,
+        BTreeMap::new(),
+    )?)
 }
 
 async fn invoke_plugin_service(
@@ -15511,12 +15541,8 @@ async fn publish_plugin_event(
     }
 
     let config = bcode_config::load_config()?;
-    let selection = plugin_selection_for_config(&config);
-    let plugins =
-        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
-    let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
-    let delivered = host.publish_event(topic, &payload)?;
-    host.deactivate_all()?;
+    let delivered =
+        publish_local_plugin_event(&config, discover_plugins_for_cli(roots)?, topic, &payload)?;
     print_plugin_delivery(delivered, json)
 }
 
@@ -16534,21 +16560,49 @@ fn plugin_service_call_error(error: bcode_plugin::PluginServiceCallError) -> Cli
     }
 }
 
+/// Publish an event to the selected discovered plugins of a one-shot local host.
+fn publish_local_plugin_event(
+    config: &bcode_config::BcodeConfig,
+    discovered: Vec<bcode_plugin::RegisteredPlugin>,
+    topic: &str,
+    payload: &[u8],
+) -> Result<usize, CliError> {
+    let mut host = plugin_service_host(config, discovered, &[])?;
+    let delivered = host.publish_event(topic, payload);
+    let deactivation = host.deactivate_all();
+    let delivered = delivered?;
+    deactivation?;
+    Ok(delivered)
+}
+
 fn load_cli_plugin_host() -> Result<bcode_plugin::PluginHost, CliError> {
     let config = bcode_config::load_config()?;
-    let selection = plugin_selection_for_config(&config);
-    let static_plugins = static_bundled_plugins();
-    let configs = bcode_plugin_config::resolve_plugin_configs(
+    cli_plugin_host(
         &config,
-        &static_plugins,
+        bcode_plugin::discover_plugins()?,
+        &static_bundled_plugins(),
+    )
+}
+
+/// The host behind local CLI provider/auth commands: discovered and bundled plugins
+/// selected by `config`, with their resolved settings and activation authority.
+fn cli_plugin_host(
+    config: &bcode_config::BcodeConfig,
+    discovered: Vec<bcode_plugin::RegisteredPlugin>,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<bcode_plugin::PluginHost, CliError> {
+    let configs = bcode_plugin_config::resolve_plugin_configs(
+        config,
+        static_plugins,
         &bcode_config::default_state_dir()
             .join("derived")
             .join("plugins")
             .join(bcode_ipc::daemon_namespace()),
     );
-    bcode_plugin::PluginHost::load_defaults_with_static_bundled_and_config(
-        &selection,
-        &static_plugins,
+    bcode_plugin_config::load_plugin_host(
+        &plugin_selection_for_config(config),
+        discovered,
+        static_plugins,
         configs,
     )
     .map_err(CliError::Plugin)

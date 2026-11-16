@@ -101,8 +101,9 @@ sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
 sshenv_vault = { workspace = true }
 
 [dev-dependencies]
-switchy  = { workspace = true, features = ["database"] }
-tempfile = { workspace = true }
+bcode_hello_plugin = { workspace = true }
+switchy            = { workspace = true, features = ["database"] }
+tempfile           = { workspace = true }
 
 [features]
 _static-bundled = []

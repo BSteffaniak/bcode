@@ -4512,50 +4512,6 @@ impl PluginRuntimeHost {
         result
     }
 
-    /// Discover, load, activate, and start plugin executors from default roots.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when discovery, loading, activation, or executor startup fails.
-    pub fn load_defaults(selection: &PluginSelection) -> Result<Self, PluginLoadError> {
-        Self::load_defaults_with_static_bundled(selection, &[])
-    }
-
-    /// Discover, load, activate, and start plugin executors from default roots plus static bundled registrations.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when discovery, loading, activation, or executor startup fails.
-    pub fn load_defaults_with_static_bundled(
-        selection: &PluginSelection,
-        static_plugins: &[StaticBundledPlugin],
-    ) -> Result<Self, PluginLoadError> {
-        PluginHost::load_defaults_with_static_bundled(selection, static_plugins)
-            .map(Self::from)
-            .map(|mut runtime| {
-                runtime.selection = Arc::new(selection.clone());
-                runtime
-            })
-    }
-
-    /// Discover, load, activate, and start plugin executors from default roots plus static bundled registrations and config.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when discovery, loading, activation, or executor startup fails.
-    pub fn load_defaults_with_static_bundled_and_config(
-        selection: &PluginSelection,
-        static_plugins: &[StaticBundledPlugin],
-        configs: BTreeMap<String, ResolvedPluginConfig>,
-    ) -> Result<Self, PluginLoadError> {
-        PluginHost::load_defaults_with_static_bundled_and_config(selection, static_plugins, configs)
-            .map(Self::from)
-            .map(|mut runtime| {
-                runtime.selection = Arc::new(selection.clone());
-                runtime
-            })
-    }
-
     /// Load explicitly discovered plugins and start their normal runtime executors.
     ///
     /// No default filesystem roots are discovered. Selection, static-registration precedence,
@@ -6085,49 +6041,6 @@ impl PluginHost {
             .next()
     }
 
-    /// Discover, load, and activate plugins from default roots.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when discovery, loading, or activation fails.
-    pub fn load_defaults(selection: &PluginSelection) -> Result<Self, PluginLoadError> {
-        Self::load_defaults_with_static_bundled(selection, &[])
-    }
-
-    /// Discover, load, and activate plugins from default roots plus static bundled registrations.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when discovery, loading, or activation fails.
-    pub fn load_defaults_with_static_bundled(
-        selection: &PluginSelection,
-        static_plugins: &[StaticBundledPlugin],
-    ) -> Result<Self, PluginLoadError> {
-        Self::load_defaults_with_static_bundled_and_config(
-            selection,
-            static_plugins,
-            BTreeMap::new(),
-        )
-    }
-
-    /// Discover, load, and activate plugins from default roots plus static bundled registrations and config.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when discovery, loading, or activation fails.
-    pub fn load_defaults_with_static_bundled_and_config(
-        selection: &PluginSelection,
-        static_plugins: &[StaticBundledPlugin],
-        configs: BTreeMap<String, ResolvedPluginConfig>,
-    ) -> Result<Self, PluginLoadError> {
-        Self::load_discovered_with_static_bundled_and_config(
-            selection,
-            discover_plugins()?,
-            static_plugins,
-            configs,
-        )
-    }
-
     /// Select, load, and activate explicitly discovered plugins and static registrations.
     ///
     /// Does not discover plugins from ambient filesystem roots. Static registrations take
@@ -6213,19 +6126,6 @@ impl PluginHost {
             loaded_plugin_count = host.loaded.len(),
             "plugin startup complete"
         );
-        Ok(host)
-    }
-
-    /// Load and activate registered plugins.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when loading or activation fails.
-    pub fn load_registered_plugins(plugins: &[RegisteredPlugin]) -> Result<Self, PluginLoadError> {
-        validate_tool_presentation_declarations(plugins.iter().map(|plugin| &plugin.manifest))?;
-        let mut host = Self::default();
-        host.load_registered_plugins_into(plugins)?;
-        host.validate_tool_presentation_ownership()?;
         Ok(host)
     }
 
@@ -6570,15 +6470,6 @@ impl Drop for PluginHost {
     }
 }
 
-/// Load a registered plugin.
-///
-/// # Errors
-///
-/// Returns an error if the plugin cannot be loaded or exports invalid metadata.
-pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin, PluginLoadError> {
-    load_registered_plugin_with_config(plugin, ResolvedPluginConfig::default())
-}
-
 /// Load a selected native artifact with caller-owned runtime authority.
 ///
 /// # Errors
@@ -6597,17 +6488,6 @@ pub fn load_registered_plugin_with_config(
         backend: LoadedPluginBackend::SharedNative(Arc::new(instance)),
         config,
     })
-}
-
-/// Load a shared implementation definition with a fresh host-owned instance.
-///
-/// # Errors
-/// Returns an error for mismatched metadata or failed instance creation.
-pub fn load_plugin_definition(
-    manifest: PluginManifest,
-    definition: bcode_plugin_sdk::definition::PluginDefinition,
-) -> Result<LoadedPlugin, PluginLoadError> {
-    load_plugin_definition_with_config(manifest, definition, ResolvedPluginConfig::default())
 }
 
 /// Load a shared definition with explicit serving runtime and activation authority.
@@ -10094,7 +9974,11 @@ library = "libexample_plugin.dylib"
             .iter()
             .find(|plugin| plugin.manifest.id == "bcode.workflow")
             .expect("workflow manifest");
-        let loaded = load_registered_plugin(plugin).expect("dynamic workflow plugin loads");
+        let loaded = load_registered_plugin_with_config(
+            plugin,
+            crate::shared_instance_tests::fixture_config("bcode.workflow"),
+        )
+        .expect("dynamic workflow plugin loads");
         assert_eq!(loaded.manifest().id, "bcode.workflow");
     }
 

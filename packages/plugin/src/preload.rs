@@ -125,7 +125,10 @@ library = "{library}"
         );
         // The native loader applies the same check.
         assert!(matches!(
-            crate::load_registered_plugin(&plugin),
+            crate::load_registered_plugin_with_config(
+                &plugin,
+                crate::ResolvedPluginConfig::default()
+            ),
             Err(PluginLoadError::LibraryNotFound { .. })
         ));
     }

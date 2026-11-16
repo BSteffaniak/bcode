@@ -1453,7 +1453,7 @@ async fn host() {
         .collect();
     let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &ids);
     assert_eq!(selection.enabled, config.plugins.enabled);
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &selection,
         &bcode_bundled_plugins::static_bundled_plugins(),
     )

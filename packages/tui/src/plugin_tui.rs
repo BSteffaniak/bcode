@@ -2282,7 +2282,12 @@ pub fn load_default_host_with_static_bundled(
     // A discovery/activation/compatibility failure is not permission to select a different
     // bundled implementation. In particular an explicit dynamic selection must fail visibly,
     // never be replaced with a similarly named static presentation adapter.
-    PluginHost::load_defaults_with_static_bundled(selection, static_plugins)
+    bcode_plugin_config::load_plugin_host(
+        selection,
+        bcode_plugin::discover_plugins()?,
+        static_plugins,
+        BTreeMap::new(),
+    )
 }
 
 #[cfg(test)]
@@ -2364,9 +2369,11 @@ pub fn load_default_presentation_with_static_bundled(
 pub fn load_default_runtime_with_static_bundled(
     static_plugins: &[StaticBundledPlugin],
 ) -> Result<PluginRuntimeHost, PluginLoadError> {
-    PluginRuntimeHost::load_defaults_with_static_bundled(
+    bcode_plugin_config::load_plugin_runtime_host(
         &bcode_plugin::PluginSelection::all_enabled(),
+        bcode_plugin::discover_plugins()?,
         static_plugins,
+        BTreeMap::new(),
     )
 }
 

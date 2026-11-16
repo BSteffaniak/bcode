@@ -11,6 +11,15 @@
 //! or explicit `env`/`sshenv` references) when a service is invoked. The
 //! daemon and embedded SDK hosts both use [`resolve_plugin_configs`], so a
 //! plugin behaves the same wherever it runs.
+//!
+//! Every host that loads plugins also grants them explicit activation authority
+//! from one owned shared runtime scope through [`load_plugin_host`],
+//! [`load_plugin_runtime_host`] or [`bind_shared_plugin_activations`];
+//! activation is never inferred from ambient host state.
+
+mod activation;
+
+pub use activation::{bind_shared_plugin_activations, load_plugin_host, load_plugin_runtime_host};
 
 use std::path::{Path, PathBuf};
 

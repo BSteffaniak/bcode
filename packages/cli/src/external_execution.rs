@@ -283,17 +283,11 @@ library = "unused.dylib"
             },
         )];
         let selection = bcode_plugin::PluginSelection::all_enabled();
-        let configs = bcode_server::bind_shared_plugin_activations(
-            &selection,
-            &registrations,
-            std::collections::BTreeMap::new(),
-        )
-        .unwrap();
-        bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
+        bcode_plugin_config::load_plugin_host(
             &selection,
             Vec::new(),
             &registrations,
-            configs,
+            std::collections::BTreeMap::new(),
         )
         .unwrap()
     }

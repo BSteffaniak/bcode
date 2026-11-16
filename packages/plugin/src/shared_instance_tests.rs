@@ -482,8 +482,12 @@ mod tests {
         ))
         .expect("manifest");
         assert!(
-            crate::load_plugin_definition(manifest, bcode_hello_plugin::plugin_definition())
-                .is_err()
+            crate::load_plugin_definition_with_config(
+                manifest,
+                bcode_hello_plugin::plugin_definition(),
+                crate::ResolvedPluginConfig::default()
+            )
+            .is_err()
         );
     }
 

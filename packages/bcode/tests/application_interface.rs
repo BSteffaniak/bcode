@@ -828,7 +828,7 @@ fn host_services(
             enabled: ids.iter().cloned().collect(),
             disabled: std::collections::BTreeSet::new(),
         };
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = bcode_server::load_embedded_plugins(
             &selection,
             &bcode_bundled_plugins::static_bundled_plugins(),
         )
@@ -849,7 +849,7 @@ fn host_services(
         !fake_provider,
         "offline execution requires both static plugin features"
     );
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: std::collections::BTreeSet::new(),

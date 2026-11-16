@@ -431,6 +431,46 @@ pub const fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> 
     Vec::new()
 }
 
+/// Load a local plugin host for client-side services from installed plugins and
+/// `static_plugins`. Every selected plugin receives explicit activation authority
+/// from one owned shared runtime scope, released when the host is dropped.
+fn load_local_plugin_host(
+    selection: &bcode_plugin::PluginSelection,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<bcode_plugin::PluginHost, bcode_plugin::PluginLoadError> {
+    bcode_plugin_config::load_plugin_host(
+        selection,
+        bcode_plugin::discover_plugins()?,
+        static_plugins,
+        std::collections::BTreeMap::new(),
+    )
+}
+
+/// The local plugin runtime behind standalone plugin launchers (eval, metrics,
+/// ralph and plugin surfaces): every installed plugin and `static_plugins`, each
+/// with explicit activation authority from one owned shared runtime scope.
+fn load_launcher_runtime(
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
+    bcode_plugin_config::load_plugin_runtime_host(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        bcode_plugin::discover_plugins().map_err(launcher_load_error)?,
+        static_plugins,
+        std::collections::BTreeMap::new(),
+    )
+    .map_err(launcher_load_error)
+}
+
+fn launcher_load_error(error: bcode_plugin::PluginLoadError) -> TuiError {
+    TuiError::PluginService {
+        code: "plugin_runtime_load_failed".to_owned(),
+        message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod local_plugin_host_tests;
+
 #[cfg(any(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",

@@ -374,7 +374,7 @@ mod tests {
             bcode_server::run_embedded_with_locations_and_shutdown(
                 endpoint,
                 bcode_config::BcodeConfig::default(),
-                bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                bcode_server::load_embedded_plugins(
                     &bcode_plugin::PluginSelection {
                         mode: bcode_plugin::PluginSelectionMode::Explicit,
                         enabled: std::collections::BTreeSet::new(),

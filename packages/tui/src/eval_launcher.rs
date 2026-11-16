@@ -79,7 +79,7 @@ async fn run_surface<W: Write>(
     instance_id: String,
     options: serde_json::Value,
 ) -> Result<(), TuiError> {
-    let runtime = load_eval_tui_runtime()?;
+    let runtime = crate::load_launcher_runtime(&crate::static_bundled_plugins())?;
     let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
         EVAL_PLUGIN_ID,
@@ -106,15 +106,4 @@ async fn run_surface<W: Write>(
     drop(runtime);
     outcome?;
     Ok(())
-}
-
-fn load_eval_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
-    bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-        &bcode_plugin::PluginSelection::all_enabled(),
-        &crate::static_bundled_plugins(),
-    )
-    .map_err(|error| TuiError::PluginService {
-        code: "plugin_runtime_load_failed".to_string(),
-        message: error.to_string(),
-    })
 }

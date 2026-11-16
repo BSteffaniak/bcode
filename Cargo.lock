@@ -1827,6 +1827,7 @@ dependencies = [
  "bcode_daemon_lifecycle",
  "bcode_eval",
  "bcode_harness_models",
+ "bcode_hello_plugin",
  "bcode_hyperchad",
  "bcode_ipc",
  "bcode_metrics",
@@ -3002,10 +3003,17 @@ name = "bcode_plugin_config"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
+ "bcode_hello_plugin",
+ "bcode_ipc",
  "bcode_plugin",
+ "bcode_plugin_sdk",
  "bcode_provider_auth",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
  "serde_json",
  "sshenv_vault",
+ "tempfile",
+ "tokio",
  "toml 1.1.8+spec-1.1.0",
 ]
 
@@ -3859,6 +3867,7 @@ dependencies = [
  "bcode_model",
  "bcode_model_catalog",
  "bcode_plugin",
+ "bcode_plugin_config",
  "bcode_plugin_sdk",
  "bcode_presentation_policy",
  "bcode_provider_auth",

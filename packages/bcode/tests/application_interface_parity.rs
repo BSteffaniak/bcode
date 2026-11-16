@@ -720,7 +720,7 @@ async fn host_fixture() {
     let directory = std::env::current_dir().unwrap().canonicalize().unwrap();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("parity.sock"));
     let ipc = bcode_client::BcodeClient::new(endpoint.clone());
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: std::collections::BTreeSet::new(),

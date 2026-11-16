@@ -6537,13 +6537,12 @@ fn load_configured_plugins(
         &state_base,
         overlays,
     );
-    Ok(
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
-            selection,
-            static_plugins,
-            configs,
-        )?,
-    )
+    Ok(bcode_plugin_config::load_plugin_runtime_host(
+        selection,
+        bcode_plugin::discover_plugins()?,
+        static_plugins,
+        configs,
+    )?)
 }
 
 /// Builder for [`Bcode`].

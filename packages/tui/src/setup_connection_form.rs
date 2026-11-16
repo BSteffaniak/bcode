@@ -390,11 +390,8 @@ impl ConnectionForm {
             &config,
             std::iter::empty::<&str>(),
         );
-        let mut host = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
-            &selection,
-            &super::static_bundled_plugins(),
-        )
-        .map_err(|_| "Cannot load authentication providers".to_owned())?;
+        let mut host = crate::load_local_plugin_host(&selection, &crate::static_bundled_plugins())
+            .map_err(|_| "Cannot load authentication providers".to_owned())?;
         let result = (|| {
             let provider = host
                 .auth_provider_registry()
@@ -539,11 +536,8 @@ impl ConnectionForm {
             &config,
             std::iter::empty::<&str>(),
         );
-        let mut host = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
-            &selection,
-            &super::static_bundled_plugins(),
-        )
-        .map_err(|_| "Cannot load enabled authentication providers".to_owned())?;
+        let mut host = crate::load_local_plugin_host(&selection, &crate::static_bundled_plugins())
+            .map_err(|_| "Cannot load enabled authentication providers".to_owned())?;
         let result = self.save_with_host(&config, &host);
         let cleanup = host
             .deactivate_all()
@@ -969,11 +963,8 @@ fn load_connection_choices()
     let config = bcode_config::load_config().map_err(|_| "Configuration unavailable".to_owned())?;
     let selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, std::iter::empty::<&str>());
-    let mut host = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
-        &selection,
-        &super::static_bundled_plugins(),
-    )
-    .map_err(|_| "Provider registration unavailable".to_owned())?;
+    let mut host = crate::load_local_plugin_host(&selection, &crate::static_bundled_plugins())
+        .map_err(|_| "Provider registration unavailable".to_owned())?;
     let mut providers = host
         .auth_provider_registry()
         .providers()

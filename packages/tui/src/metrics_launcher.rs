@@ -21,7 +21,7 @@ pub async fn run_dashboard<W: Write>(
     repo_path: PathBuf,
     metrics_path: Option<PathBuf>,
 ) -> Result<(), TuiError> {
-    let runtime = load_metrics_tui_runtime()?;
+    let runtime = crate::load_launcher_runtime(&crate::static_bundled_plugins())?;
     let metrics_path = metrics_path.unwrap_or_else(default_metrics_path);
     let surface = crate::plugin_tui::open_plugin_tui_surface(
         &runtime,
@@ -55,15 +55,4 @@ fn default_metrics_path() -> PathBuf {
     bcode_config::default_state_dir()
         .join("metrics")
         .join("events.jsonl")
-}
-
-fn load_metrics_tui_runtime() -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
-    bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-        &bcode_plugin::PluginSelection::all_enabled(),
-        &crate::static_bundled_plugins(),
-    )
-    .map_err(|error| TuiError::PluginService {
-        code: "plugin_runtime_load_failed".to_string(),
-        message: error.to_string(),
-    })
 }
