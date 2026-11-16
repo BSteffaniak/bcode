@@ -12,7 +12,10 @@
 //!
 //! `screen_benchmark_sizes` repeats the scroll phases at larger terminals in both diff
 //! layouts and presents every frame through a BMUX terminal, reporting paint, diff-encode, and
-//! input-handling time and the bytes each frame writes.
+//! input-handling time and the bytes each frame writes. With `BCODE_BENCH_CAPTURE=<dir>`, each
+//! case also writes every presented frame's terminal bytes to `<dir>/<W>x<H>-<layout>.frames`
+//! (records of an 8-byte little-endian length and the bytes, from the first full repaint), so
+//! the exact output can be replayed through a terminal multiplexer or emulator.
 
 use super::chrome::{host_theme, rgb};
 use super::surface;
@@ -31,6 +34,33 @@ use std::time::{Duration, Instant};
 
 const WIDTH: u16 = 200;
 const HEIGHT: u16 = 60;
+
+thread_local! {
+    /// Where the current case's presented frames are captured, when `BCODE_BENCH_CAPTURE` is set.
+    static CAPTURE: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start capturing case `name`'s frames when `BCODE_BENCH_CAPTURE` names a directory.
+fn start_capture(name: &str) {
+    let file = std::env::var_os("BCODE_BENCH_CAPTURE").map(|dir| {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("capture directory");
+        std::fs::File::create(dir.join(format!("{name}.frames"))).expect("capture file")
+    });
+    CAPTURE.with(|capture| *capture.borrow_mut() = file);
+}
+
+/// Append one presented frame's bytes to the capture.
+fn capture_frame(bytes: &[u8]) {
+    use std::io::Write as _;
+    CAPTURE.with(|capture| {
+        if let Some(file) = capture.borrow_mut().as_mut() {
+            let length = u64::try_from(bytes.len()).expect("frame length");
+            file.write_all(&length.to_le_bytes()).expect("capture");
+            file.write_all(bytes).expect("capture");
+        }
+    });
+}
 
 fn ms(duration: Duration) -> String {
     format!("{:.3} ms", duration.as_secs_f64() * 1_000.0)
@@ -276,6 +306,7 @@ fn present(
         .draw_prepared_with_output_hooks(prepared, |_| Ok(false), |_, _, _| Ok(()))
         .expect("draw");
     costs.encode.push(started.elapsed());
+    capture_frame(terminal.writer());
     costs.bytes.push(terminal.writer().len());
     costs.cells.push(drawn.changed_cells);
 }
@@ -327,6 +358,7 @@ fn sized_case(fixture: &GitFixture, width: u16, height: u16, layout: ConfiguredL
     scenario.set_theme(Some(&host_theme(rgb(190, 120, 250))));
     let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, width, height));
     terminal.set_scroll_region_acceleration(scroll_acceleration());
+    start_capture(&format!("{width}x{height}-{layout:?}"));
 
     // First frame with content after the index (paint only, as in `screen_benchmark`).
     scenario.render();
