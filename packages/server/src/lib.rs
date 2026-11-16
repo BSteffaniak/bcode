@@ -4998,8 +4998,14 @@ async fn run_with_static_bundled_inner(
     let stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let (config, launch) = bcode_config::recovery::load_current_config_with_recovery_context()?;
+    // One daemon serves clients launched with different explicit files (such as another
+    // `BCODE_CONFIG`); it reads those only inside its own user configuration directory.
     let authority = launch.recovery_sources.as_ref().and_then(|sources| {
-        bcode_config::recovery::ConfigSourceAuthority::capture_read_only(sources).ok()
+        bcode_config::recovery::ConfigSourceAuthority::capture_read_only(sources)
+            .ok()
+            .map(|authority| {
+                authority.with_explicit_source_root(&bcode_config::default_config_dir())
+            })
     });
     config_phase.finish();
     tracing::debug!(

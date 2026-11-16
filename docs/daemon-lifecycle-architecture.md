@@ -51,13 +51,22 @@ configuration equals the daemon's startup configuration uses the loaded baseline
 the daemon must reproduce the supplied configuration from the source provenance it captured
 at startup, re-reading the files itself and comparing the execution fingerprint.
 
-Only workspace-discovery layers may differ between the client and the daemon's startup. The
-daemon derives the client's workspace layers from the client's working directory with the
-standard discovery rules (`bcode.toml` and `.bcode/bcode.toml` under the nearest `.git`
-root). A substituted layer is read only when its canonical target stays inside that canonical
-workspace root; symlinks leaving the root are rejected. Supplied paths are checked against
-the derived set and never select files. Everything else stays pinned to startup: user
-layers, explicit base/environment/CLI/exclusive files, context and profile selectors,
+Workspace-discovery layers and explicit file layers may differ between the client and the
+daemon's startup; the daemon derives a read target for each and confines it to a root it
+owns. Workspace layers come from the client's working directory with the standard discovery
+rules (`bcode.toml` and `.bcode/bcode.toml` under the nearest `.git` root). A substituted
+workspace layer is read only when its canonical target stays inside that canonical workspace
+root; symlinks leaving the root are rejected. Supplied paths are checked against the derived
+set and never select files.
+
+One daemon serves every client of the same artifact and state location, so clients launched
+with different explicit files (for example another `BCODE_CONFIG`) share it. A substituted
+explicit base/environment/CLI/exclusive file, and a shared pool first referenced by one, is
+read only when its parent directory canonicalizes inside the daemon's own user
+configuration directory. The file itself may be a symlink (generated configuration is
+commonly linked from a read-only store), read exactly like the daemon's own selected
+sources; traversal and directory symlinks leaving that directory are rejected. Everything
+else stays pinned to startup: user layers, context and profile selectors, the remaining
 shared-pool targets, and the plugin selection. Inline overrides that change configuration
 have no verifiable source and are rejected.
 

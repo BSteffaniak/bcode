@@ -1137,6 +1137,105 @@ fn config_only_starts_daemon_without_parsing_repository_config() {
     assert!(!log.contains("invalid exclusive configuration"));
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_admits_sessions_from_clients_selecting_another_config_file() {
+    let root = tempfile::tempdir().expect("isolated daemon directory");
+    let providers = root.path().join("config/bcode/providers");
+    let store = root.path().join("store");
+    std::fs::create_dir_all(&providers).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    // Generated configuration is commonly symlinked into the user config directory, with
+    // a shared auth pool referenced relative to the selected file.
+    std::fs::write(
+        store.join("auth-pools.toml"),
+        "schema_version = 1\n[auth.pools.accounts]\nprofiles = [\"one\"]\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        store.join("auth-pools.toml"),
+        root.path().join("config/bcode/auth-pools.toml"),
+    )
+    .unwrap();
+    for (name, prefix) in [("daemon", "daemon/"), ("client", "client/")] {
+        let target = store.join(format!("{name}.toml"));
+        std::fs::write(
+            &target,
+            format!(
+                "auth_pool_config = \"../auth-pools.toml\"\n[worktree]\nbranch_prefix = \"{prefix}\"\n"
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, providers.join(format!("{name}.toml"))).unwrap();
+    }
+    std::fs::write(
+        store.join("outside.toml"),
+        "[worktree]\nbranch_prefix = \"outside/\"\n",
+    )
+    .unwrap();
+    let repository = root.path().join("repository");
+    std::fs::create_dir_all(repository.join(".git")).unwrap();
+    std::fs::write(
+        repository.join("bcode.toml"),
+        "[worktree]\nroot = \"../worktrees\"\n",
+    )
+    .unwrap();
+    let log_path = root.path().join("daemon.log");
+    let mut daemon = ForegroundDaemon(
+        isolated_cli(root.path())
+            .env("BCODE_CONFIG", providers.join("daemon.toml"))
+            .args(["server", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log_path).unwrap())
+            .spawn()
+            .expect("start daemon"),
+    );
+    let client = |config: &std::path::Path, arguments: &[&str]| {
+        let mut command = isolated_cli(root.path());
+        command.env("BCODE_CONFIG", config).current_dir(&repository);
+        run_cli_command(command, arguments, Stdio::piped(), Stdio::null())
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        let output = client(&providers.join("daemon.toml"), &["server", "status"]);
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never became ready: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for config in ["daemon.toml", "client.toml"] {
+        let config = providers.join(config);
+        let created = client(&config, &["session", "create"]);
+        assert!(
+            created.status.success(),
+            "session for {config:?} was refused: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let session = String::from_utf8_lossy(&created.stdout).trim().to_owned();
+        let sent = client(&config, &["send", &session, "hello"]);
+        assert!(
+            sent.status.success(),
+            "turn for {config:?} was refused: {}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+    }
+    // Files outside the daemon's own config directory remain unverifiable.
+    let created = client(&store.join("outside.toml"), &["session", "create"]);
+    assert!(!created.status.success());
+    assert!(String::from_utf8_lossy(&created.stderr).contains("managed_configuration_unavailable"));
+}
+
 fn run_cli(arguments: &[&str]) -> Output {
     run_cli_with_state(arguments, false)
 }

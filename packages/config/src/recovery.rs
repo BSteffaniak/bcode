@@ -82,6 +82,37 @@ pub struct ConfigSourceAuthority {
     roots: Vec<PathBuf>,
     read_only: bool,
     pool_targets: std::collections::BTreeMap<PathBuf, PathBuf>,
+    explicit_root: Option<PathBuf>,
+}
+
+/// Position of a file layer in the loader's application order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerRole {
+    Exclusive,
+    Base,
+    Discovered(usize),
+    Environment,
+    Cli,
+}
+
+/// Roles of `authority_paths(sources)`, in the same order.
+fn layer_roles(sources: &ConfigRecoverySources) -> Vec<LayerRole> {
+    if sources.exclusive_config_path.is_some() {
+        return vec![LayerRole::Exclusive];
+    }
+    sources
+        .base_config_path
+        .iter()
+        .map(|_| LayerRole::Base)
+        .chain((0..sources.discovered_paths.len()).map(LayerRole::Discovered))
+        .chain(
+            sources
+                .env_config_path
+                .iter()
+                .map(|_| LayerRole::Environment),
+        )
+        .chain(sources.cli_config_path.iter().map(|_| LayerRole::Cli))
+        .collect()
 }
 
 impl ConfigSourceAuthority {
@@ -157,7 +188,26 @@ impl ConfigSourceAuthority {
             roots,
             read_only,
             pool_targets,
+            explicit_root: None,
         })
+    }
+
+    /// Accept explicit file layers and shared pools a client selected inside `root`.
+    ///
+    /// One daemon serves clients launched with different explicit files (for example
+    /// different `BCODE_CONFIG` selections). The root is host authority, normally the
+    /// daemon's own user configuration directory, never a client-supplied path. A client
+    /// file is accepted when its parent directory canonicalizes inside the root; the file
+    /// itself may be a symlink, read like the daemon's own selected sources. The daemon
+    /// still reads every source itself and requires the supplied configuration to match.
+    /// A root that cannot be canonicalized grants nothing.
+    #[must_use]
+    pub fn with_explicit_source_root(mut self, root: &Path) -> Self {
+        self.explicit_root = root
+            .canonicalize()
+            .ok()
+            .filter(|root| self.read_only && root.is_dir());
+        self
     }
 
     /// Verify retained provenance and current path confinement, then use existing replay.
@@ -208,7 +258,10 @@ impl ConfigSourceAuthority {
                 sources,
                 &self.roots,
                 Some(targets),
-                Some(&self.pool_targets),
+                Some(&PinnedPools {
+                    targets: &self.pool_targets,
+                    root: self.explicit_root.as_deref(),
+                }),
             )?;
             let execution_digest = execution_fingerprint(config)?;
             if execution_digest != execution_fingerprint(&replayed)? {
@@ -225,15 +278,21 @@ impl ConfigSourceAuthority {
         }
     }
 
-    /// Verify the same retained sources from another client workspace.
-    /// Only workspace-discovery layers may differ. The host derives each substituted layer
-    /// from the client's working directory with the standard discovery rules and reads it
-    /// only when its target stays inside that canonical workspace root; supplied paths never
-    /// select files. Explicit sources, selectors, user layers and shared pools stay pinned.
+    /// Verify a client's sources, which may come from another workspace or name other
+    /// explicit files, against this retained authority.
+    ///
+    /// Each client layer gets a host-derived read target. A layer identical to startup keeps
+    /// its retained target. A substituted workspace-discovery layer is derived from the
+    /// client's working directory with the standard discovery rules and read only when its
+    /// target stays inside that canonical workspace root. A substituted explicit file layer
+    /// (exclusive, base, environment or command-line) is read only inside the explicit source
+    /// root (see [`Self::with_explicit_source_root`]). Supplied paths never select files
+    /// outside those rules. User layers and context/profile selectors stay pinned, and the
+    /// supplied configuration must match what the host replays.
     ///
     /// # Errors
-    /// Rejects substituted non-workspace sources, workspace layers outside the canonical
-    /// workspace root, changed targets, and contents inconsistent with the supplied configuration.
+    /// Rejects substituted user layers or selectors, layers outside their authorized roots,
+    /// changed targets, and contents inconsistent with the supplied configuration.
     pub fn verify_workspace(
         &self,
         config: &BcodeConfig,
@@ -246,6 +305,14 @@ impl ConfigSourceAuthority {
             return Err(ConfigRecoveryError::SourceBounds);
         }
         authority_paths(sources)?;
+        // Selectors are applied by value during replay and are not file sources.
+        if sources.active_context != self.sources.active_context
+            || sources.model_profile != self.sources.model_profile
+            || sources.inline_overrides != self.sources.inline_overrides
+        {
+            return Err(ConfigRecoveryError::Changed);
+        }
+        let targets = self.client_targets(sources)?;
         let mut normalized = sources.clone();
         normalized.cwd.clone_from(&self.sources.cwd);
         // Exclusive-file loads do not consume discovered paths at all.
@@ -253,67 +320,110 @@ impl ConfigSourceAuthority {
             normalized
                 .discovered_paths
                 .clone_from(&self.sources.discovered_paths);
-        } else if sources.discovered_paths != self.sources.discovered_paths {
-            // Everything except the workspace discovery layers stays pinned to startup.
-            let pinned = ConfigRecoverySources {
-                discovered_paths: sources.discovered_paths.clone(),
-                ..self.sources.read_provenance()
-            };
-            if normalized.read_provenance() != pinned {
-                return Err(ConfigRecoveryError::Changed);
-            }
-            let targets = self.workspace_targets(sources)?;
-            return self
-                .verify_targets(config, &normalized, &targets)
-                .map(|_| ());
         }
-        self.verify(config, &normalized).map(|_| ())
+        self.verify_targets(config, &normalized, &targets)
+            .map(|_| ())
     }
 
-    /// Retained targets with each differing discovery layer replaced by its confined
-    /// workspace target, derived by the host rather than taken from the client.
-    fn workspace_targets(
+    /// Host-derived read target for each layer of `sources`, in application order.
+    fn client_targets(
         &self,
         sources: &ConfigRecoverySources,
     ) -> Result<Vec<PathBuf>, ConfigRecoveryError> {
-        if sources.discovered_paths.len() != self.sources.discovered_paths.len() {
+        let startup = layer_roles(&self.sources)
+            .into_iter()
+            .zip(authority_paths(&self.sources)?)
+            .zip(&self.targets)
+            .map(|((role, (path, _)), target)| (role, path, target))
+            .collect::<Vec<_>>();
+        let mut workspace = None;
+        layer_roles(sources)
+            .into_iter()
+            .zip(authority_paths(sources)?)
+            .map(|(role, (path, _))| {
+                if let Some((_, _, target)) =
+                    startup.iter().find(|(startup_role, startup_path, _)| {
+                        *startup_role == role && *startup_path == path
+                    })
+                {
+                    return Ok((*target).clone());
+                }
+                match role {
+                    LayerRole::Discovered(_) => {
+                        if sources.discovered_paths.len() != self.sources.discovered_paths.len() {
+                            return Err(ConfigRecoveryError::Changed);
+                        }
+                        if workspace.is_none() {
+                            workspace = Some(client_workspace(&sources.cwd)?);
+                        }
+                        let (paths, root) = workspace
+                            .as_ref()
+                            .ok_or(ConfigRecoveryError::SourceBounds)?;
+                        self.workspace_target(path, paths, root)
+                    }
+                    _ => self.explicit_target(path),
+                }
+            })
+            .collect()
+    }
+
+    /// Confined target of a substituted standard discovery layer of the client workspace.
+    fn workspace_target(
+        &self,
+        path: &Path,
+        workspace: &[PathBuf],
+        root: &Path,
+    ) -> Result<PathBuf, ConfigRecoveryError> {
+        if !workspace.iter().any(|candidate| candidate == path) {
             return Err(ConfigRecoveryError::Changed);
         }
-        let environment = crate::ConfigEnvironmentSnapshot::new(
-            std::collections::BTreeMap::new(),
-            sources.cwd.clone(),
-        );
-        let workspace =
-            crate::default_config_paths_from_with_environment(&sources.cwd, &environment);
-        let root = bcode_config_layers::discover_config_root(&sources.cwd)
-            .unwrap_or_else(|| sources.cwd.clone())
-            .canonicalize()
-            .map_err(|_| ConfigRecoveryError::SourceBounds)?;
-        let offset = usize::from(self.sources.base_config_path.is_some());
-        let mut targets = self.targets.clone();
-        for (index, (previous, current)) in self
-            .sources
-            .discovered_paths
-            .iter()
-            .zip(&sources.discovered_paths)
-            .enumerate()
-        {
-            if previous == current {
-                continue;
-            }
-            if !workspace.contains(current) {
-                return Err(ConfigRecoveryError::Changed);
-            }
-            let (target, _) = authority_target_kind(current, &self.sources.cwd, false, true)?;
-            if !target.starts_with(&root) {
-                return Err(ConfigRecoveryError::SourceBounds);
-            }
-            *targets
-                .get_mut(offset + index)
-                .ok_or(ConfigRecoveryError::SourceBounds)? = target;
+        let (target, _) = authority_target_kind(path, &self.sources.cwd, false, true)?;
+        if !target.starts_with(root) {
+            return Err(ConfigRecoveryError::SourceBounds);
         }
-        Ok(targets)
+        Ok(target)
     }
+
+    /// Target of a substituted explicit file layer inside the explicit source root.
+    fn explicit_target(&self, path: &Path) -> Result<PathBuf, ConfigRecoveryError> {
+        let root = self
+            .explicit_root
+            .as_deref()
+            .ok_or(ConfigRecoveryError::Changed)?;
+        if !path.is_absolute() || !inside_root(path, root) {
+            return Err(ConfigRecoveryError::SourceBounds);
+        }
+        let (target, _) = authority_target_kind(path, &self.sources.cwd, true, true)?;
+        Ok(target)
+    }
+}
+
+/// Standard discovery layers of a client workspace and their canonical root, derived by
+/// the host from the client's working directory rather than taken from the client.
+fn client_workspace(cwd: &Path) -> Result<(Vec<PathBuf>, PathBuf), ConfigRecoveryError> {
+    let environment =
+        crate::ConfigEnvironmentSnapshot::new(std::collections::BTreeMap::new(), cwd.to_owned());
+    let paths = crate::default_config_paths_from_with_environment(cwd, &environment);
+    let root = bcode_config_layers::discover_config_root(cwd)
+        .unwrap_or_else(|| cwd.to_owned())
+        .canonicalize()
+        .map_err(|_| ConfigRecoveryError::SourceBounds)?;
+    Ok((paths, root))
+}
+
+/// Whether `path`'s parent directory canonicalizes inside `root`. The file itself may be a
+/// symlink; traversal and directory symlinks leaving the root are rejected.
+fn inside_root(path: &Path, root: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .is_some_and(|parent| parent.starts_with(root))
+}
+
+/// Shared-pool targets retained at startup, plus the explicit source root that confines
+/// pools first referenced by a client's substituted layers.
+struct PinnedPools<'a> {
+    targets: &'a std::collections::BTreeMap<PathBuf, PathBuf>,
+    root: Option<&'a Path>,
 }
 
 // References come from a captured declaring document, not client-supplied paths.
@@ -639,7 +749,7 @@ fn replay_inner(
     sources: &ConfigRecoverySources,
     allowed_roots: &[PathBuf],
     exact_targets: Option<&[PathBuf]>,
-    pool_targets: Option<&std::collections::BTreeMap<PathBuf, PathBuf>>,
+    pool_targets: Option<&PinnedPools<'_>>,
 ) -> Result<(BcodeConfig, Vec<bool>), ConfigRecoveryError> {
     if sources.inline_overrides || !sources.cwd.is_absolute() {
         return Err(ConfigRecoveryError::Unavailable);
@@ -734,7 +844,7 @@ fn replay_layer(
     logical: &Path,
     sources: &ConfigRecoverySources,
     roots: &[PathBuf],
-    pool_targets: Option<&std::collections::BTreeMap<PathBuf, PathBuf>>,
+    pool_targets: Option<&PinnedPools<'_>>,
     remaining: &mut u64,
 ) -> Result<toml::Value, ConfigRecoveryError> {
     let mut layer = toml::from_str(raw).map_err(|_| ConfigRecoveryError::InvalidSource)?;
@@ -746,7 +856,8 @@ fn replay_layer(
     crate::shared_pools::expand_with_reader(&mut layer, &logical, |pool| {
         let target = if let Some(pinned) = pool_targets {
             let (target, _) = pool_target(pool, &sources.cwd, true).map_err(pool_source_error)?;
-            if pinned.get(pool) != Some(&target) {
+            let retained = pinned.targets.get(pool) == Some(&target);
+            if !retained && !pinned.root.is_some_and(|root| inside_root(pool, root)) {
                 return Err(pool_source_error(ConfigRecoveryError::Changed));
             }
             target
@@ -1390,6 +1501,228 @@ mod tests {
         assert_eq!(
             authority.verify_workspace(&effective, &client),
             Err(ConfigRecoveryError::Changed)
+        );
+    }
+
+    /// Daemon started in one workspace with one symlinked explicit file; a client in another
+    /// workspace (with a project file) selecting another symlinked explicit file.
+    #[cfg(unix)]
+    struct ExplicitRootFixture {
+        dir: tempfile::TempDir,
+        pinned: ConfigSourceAuthority,
+        client: ConfigRecoverySources,
+        client_effective: BcodeConfig,
+        daemon_effective: BcodeConfig,
+    }
+
+    #[cfg(unix)]
+    fn explicit_root_fixture() -> ExplicitRootFixture {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let providers = config.join("providers");
+        let store = dir.path().join("store");
+        let daemon_workspace = dir.path().join("daemon");
+        let client_workspace = dir.path().join("client");
+        for directory in [&providers, &store, &daemon_workspace, &client_workspace] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::create_dir(client_workspace.join(".git")).unwrap();
+        std::fs::write(
+            client_workspace.join("bcode.toml"),
+            "[worktree]\nroot = \"../worktrees\"\n",
+        )
+        .unwrap();
+        // Generated user files are symlinks into a read-only store.
+        let link = |name: &str, contents: &str| {
+            std::fs::write(store.join(name), contents).unwrap();
+            symlink(store.join(name), providers.join(name)).unwrap();
+            providers.join(name)
+        };
+        let daemon_file = link("daemon.toml", "[worktree]\nbranch_prefix = \"daemon/\"\n");
+        let client_file = link("client.toml", "[worktree]\nbranch_prefix = \"client/\"\n");
+        let user = config.join("bcode.toml");
+        std::fs::write(&user, "").unwrap();
+        let startup = ConfigRecoverySources {
+            cwd: daemon_workspace.clone(),
+            discovered_paths: vec![
+                user.clone(),
+                daemon_workspace.join("bcode.toml"),
+                daemon_workspace.join(".bcode/bcode.toml"),
+            ],
+            env_config_path: Some(daemon_file),
+            ..Default::default()
+        };
+        let pinned = ConfigSourceAuthority::capture_read_only(&startup).unwrap();
+        let daemon_effective = replay(&startup, &[dir.path().to_owned()]).unwrap().0;
+        let client = ConfigRecoverySources {
+            cwd: client_workspace.clone(),
+            discovered_paths: vec![
+                user,
+                client_workspace.join("bcode.toml"),
+                client_workspace.join(".bcode/bcode.toml"),
+            ],
+            env_config_path: Some(client_file),
+            ..Default::default()
+        };
+        let client_effective = replay(&client, &[dir.path().to_owned()]).unwrap().0;
+        ExplicitRootFixture {
+            dir,
+            pinned,
+            client,
+            client_effective,
+            daemon_effective,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_authority_reads_explicit_files_selected_inside_its_config_root() {
+        let ExplicitRootFixture {
+            dir,
+            pinned,
+            client,
+            client_effective,
+            daemon_effective,
+        } = explicit_root_fixture();
+        let authority = pinned
+            .clone()
+            .with_explicit_source_root(&dir.path().join("config"));
+        assert_eq!(
+            authority.verify_workspace(&client_effective, &client),
+            Ok(())
+        );
+        // Without the root, explicit files stay pinned to startup.
+        assert_eq!(
+            pinned.verify_workspace(&client_effective, &client),
+            Err(ConfigRecoveryError::Changed)
+        );
+        // The host still reads the selected file; a configuration it does not produce fails.
+        assert_eq!(
+            authority.verify_workspace(&daemon_effective, &client),
+            Err(ConfigRecoveryError::Changed)
+        );
+        // An explicit layer the daemon started without is admitted on the same terms.
+        let mut added = client.clone();
+        added.cli_config_path.clone_from(&client.env_config_path);
+        assert_eq!(
+            authority.verify_workspace(&client_effective, &added),
+            Ok(())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_authority_rejects_explicit_files_outside_its_config_root() {
+        use std::os::unix::fs::symlink;
+        let ExplicitRootFixture {
+            dir,
+            pinned,
+            client,
+            client_effective,
+            ..
+        } = explicit_root_fixture();
+        let config = dir.path().join("config");
+        let providers = config.join("providers");
+        let store = dir.path().join("store");
+        let authority = pinned.with_explicit_source_root(&config);
+        // Files outside the root, including through a directory symlink, are not read.
+        let outside = |path: PathBuf| ConfigRecoverySources {
+            env_config_path: Some(path),
+            ..client.clone()
+        };
+        assert_eq!(
+            authority.verify_workspace(&client_effective, &outside(store.join("client.toml"))),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+        symlink(&store, config.join("escape")).unwrap();
+        assert_eq!(
+            authority.verify_workspace(
+                &client_effective,
+                &outside(config.join("escape/client.toml"))
+            ),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+        assert_eq!(
+            authority.verify_workspace(
+                &client_effective,
+                &outside(providers.join("../../store/client.toml"))
+            ),
+            Err(ConfigRecoveryError::SourceBounds)
+        );
+        // User layers and selectors stay pinned.
+        let mut substituted = client.clone();
+        substituted.discovered_paths[0] = providers.join("client.toml");
+        assert_eq!(
+            authority.verify_workspace(&client_effective, &substituted),
+            Err(ConfigRecoveryError::Changed)
+        );
+        let mut profile = client;
+        profile.model_profile = Some("substituted".into());
+        assert_eq!(
+            authority.verify_workspace(&client_effective, &profile),
+            Err(ConfigRecoveryError::Changed)
+        );
+    }
+
+    #[test]
+    fn read_authority_reads_shared_pools_of_explicit_files_inside_its_config_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let providers = config.join("providers");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let pool = "schema_version=1\n[auth.pools.accounts]\nprofiles=['one']\n";
+        std::fs::write(config.join("pools.toml"), pool).unwrap();
+        std::fs::write(outside.join("pools.toml"), pool).unwrap();
+        std::fs::write(providers.join("daemon.toml"), "").unwrap();
+        std::fs::write(
+            providers.join("client.toml"),
+            "auth_pool_config = \"../pools.toml\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            providers.join("escaping.toml"),
+            "auth_pool_config = \"../../outside/pools.toml\"\n",
+        )
+        .unwrap();
+        let startup = ConfigRecoverySources {
+            cwd: dir.path().to_owned(),
+            env_config_path: Some(providers.join("daemon.toml")),
+            ..Default::default()
+        };
+        let authority = ConfigSourceAuthority::capture_read_only(&startup)
+            .unwrap()
+            .with_explicit_source_root(&config);
+        let selecting = |name: &str| ConfigRecoverySources {
+            env_config_path: Some(providers.join(name)),
+            ..startup.clone()
+        };
+        let load = |name: &str| {
+            crate::load_config_from_paths_with_overrides_and_environment(
+                &[],
+                &ConfigLoadOverrides {
+                    env_config_path: Some(providers.join(name)),
+                    ..Default::default()
+                },
+                &crate::ConfigEnvironmentSnapshot::new(
+                    std::collections::BTreeMap::new(),
+                    dir.path().to_owned(),
+                ),
+            )
+            .unwrap()
+        };
+        let client = selecting("client.toml");
+        assert_eq!(
+            authority.verify_workspace(&load("client.toml"), &client),
+            Ok(())
+        );
+        let escaping = selecting("escaping.toml");
+        assert!(
+            authority
+                .verify_workspace(&load("escaping.toml"), &escaping)
+                .is_err()
         );
     }
 
